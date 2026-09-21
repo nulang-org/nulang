@@ -1,0 +1,443 @@
+{
+  "schema": "nulang.host-effects/v0alpha1",
+  "operations": [
+    {
+      "canonical_id": "nulang.host-effects/v0alpha1:nulang:inference/inference#chat",
+      "effect_id": "nulang:inference/inference",
+      "operation_id": "chat",
+      "request": {
+        "arity": 1,
+        "template": {
+          "operation": "chat",
+          "messages": [
+            {
+              "role": "user",
+              "content": {
+                "$arg": 0
+              }
+            }
+          ]
+        }
+      },
+      "response": {
+        "kind": "field",
+        "field": "content"
+      },
+      "authority": {
+        "kind": "checked-effect-row",
+        "effect": "Inference"
+      },
+      "replay_class": "journal-result"
+    },
+    {
+      "canonical_id": "nulang.host-effects/v0alpha1:nulang:storage/string#Write",
+      "effect_id": "nulang:storage/string",
+      "operation_id": "Write",
+      "request": {
+        "arity": 2,
+        "template": {
+          "operation": "Write",
+          "key": {
+            "$arg": 0
+          },
+          "value": {
+            "$arg": 1
+          }
+        }
+      },
+      "response": {
+        "kind": "discard"
+      },
+      "authority": {
+        "kind": "checked-effect-row",
+        "effect": "Storage"
+      },
+      "replay_class": "journal-result"
+    },
+    {
+      "canonical_id": "nulang.host-effects/v0alpha1:nulang:storage/string#Read",
+      "effect_id": "nulang:storage/string",
+      "operation_id": "Read",
+      "request": {
+        "arity": 1,
+        "template": {
+          "operation": "Read",
+          "key": {
+            "$arg": 0
+          }
+        }
+      },
+      "response": {
+        "kind": "field",
+        "field": "value"
+      },
+      "authority": {
+        "kind": "checked-effect-row",
+        "effect": "Storage"
+      },
+      "replay_class": "journal-result"
+    },
+    {
+      "canonical_id": "nulang.host-effects/v0alpha1:nulang:storage/string#Delete",
+      "effect_id": "nulang:storage/string",
+      "operation_id": "Delete",
+      "request": {
+        "arity": 1,
+        "template": {
+          "operation": "Delete",
+          "key": {
+            "$arg": 0
+          }
+        }
+      },
+      "response": {
+        "kind": "discard"
+      },
+      "authority": {
+        "kind": "checked-effect-row",
+        "effect": "Storage"
+      },
+      "replay_class": "journal-result"
+    },
+    {
+      "canonical_id": "nulang.host-effects/v0alpha1:nulang:queue/string#Send",
+      "effect_id": "nulang:queue/string",
+      "operation_id": "Send",
+      "request": {
+        "arity": 2,
+        "template": {
+          "operation": "Send",
+          "queue_name": {
+            "$arg": 0
+          },
+          "message": {
+            "$arg": 1
+          }
+        }
+      },
+      "response": {
+        "kind": "discard"
+      },
+      "authority": {
+        "kind": "checked-effect-row",
+        "effect": "Queue"
+      },
+      "replay_class": "journal-result"
+    },
+    {
+      "canonical_id": "nulang.host-effects/v0alpha1:nulang:queue/string#Receive",
+      "effect_id": "nulang:queue/string",
+      "operation_id": "Receive",
+      "request": {
+        "arity": 1,
+        "template": {
+          "operation": "Receive",
+          "queue_name": {
+            "$arg": 0
+          }
+        }
+      },
+      "response": {
+        "kind": "field",
+        "field": "message"
+      },
+      "authority": {
+        "kind": "checked-effect-row",
+        "effect": "Queue"
+      },
+      "replay_class": "journal-result"
+    },
+    {
+      "canonical_id": "nulang.host-effects/v0alpha1:nulang:http/string#GET",
+      "effect_id": "nulang:http/string",
+      "operation_id": "GET",
+      "request": {
+        "arity": 1,
+        "template": {
+          "url": {
+            "$arg": 0
+          },
+          "method": "GET",
+          "headers": {},
+          "body": ""
+        }
+      },
+      "response": {
+        "kind": "field",
+        "field": "body"
+      },
+      "authority": {
+        "kind": "checked-effect-row",
+        "effect": "Http"
+      },
+      "replay_class": "journal-result"
+    },
+    {
+      "canonical_id": "nulang.host-effects/v0alpha1:nulang:timer/timer#sleep",
+      "effect_id": "nulang:timer/timer",
+      "operation_id": "sleep",
+      "request": {
+        "arity": 1,
+        "template": {
+          "ms": {
+            "$arg": 0
+          }
+        }
+      },
+      "response": {
+        "kind": "discard"
+      },
+      "authority": {
+        "kind": "checked-effect-row",
+        "effect": "Timer"
+      },
+      "replay_class": "journal-result"
+    },
+    {
+      "canonical_id": "nulang.host-effects/v0alpha1:nulang:comms/comms#send",
+      "effect_id": "nulang:comms/comms",
+      "operation_id": "send",
+      "request": {
+        "arity": 8,
+        "template": {
+          "operation": "send",
+          "provider": {
+            "$arg": 0
+          },
+          "channel": {
+            "$arg": 1
+          },
+          "from": {
+            "$arg": 2
+          },
+          "to": {
+            "$arg": 3
+          },
+          "body": {
+            "$arg": 4
+          },
+          "media_urls": {
+            "$arg": 5
+          },
+          "idempotency_key": {
+            "$arg": 6
+          },
+          "metadata": {
+            "$arg": 7
+          }
+        }
+      },
+      "response": {
+        "kind": "passthrough"
+      },
+      "authority": {
+        "kind": "checked-effect-row",
+        "effect": "Comms"
+      },
+      "replay_class": "external-requires-idempotency-key"
+    },
+    {
+      "canonical_id": "nulang.host-effects/v0alpha1:nulang:comms/comms#call",
+      "effect_id": "nulang:comms/comms",
+      "operation_id": "call",
+      "request": {
+        "arity": 4,
+        "template": {
+          "operation": "call",
+          "provider": {
+            "$arg": 0
+          },
+          "from": {
+            "$arg": 1
+          },
+          "to": {
+            "$arg": 2
+          },
+          "metadata": {
+            "$arg": 3
+          }
+        }
+      },
+      "response": {
+        "kind": "passthrough"
+      },
+      "authority": {
+        "kind": "checked-effect-row",
+        "effect": "Comms"
+      },
+      "replay_class": "external-nonreplayable"
+    },
+    {
+      "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#create",
+      "effect_id": "nulang:agent/agent",
+      "operation_id": "create",
+      "request": {
+        "arity": 3,
+        "template": {
+          "operation": "create",
+          "name": {
+            "$arg": 0
+          },
+          "system_prompt": {
+            "$arg": 1
+          },
+          "max_turns": {
+            "$arg": 2
+          }
+        }
+      },
+      "response": {
+        "kind": "passthrough"
+      },
+      "authority": {
+        "kind": "checked-effect-row",
+        "effect": "Agent"
+      },
+      "replay_class": "journal-result"
+    },
+    {
+      "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#send",
+      "effect_id": "nulang:agent/agent",
+      "operation_id": "send",
+      "request": {
+        "arity": 2,
+        "template": {
+          "operation": "send",
+          "session_id": {
+            "$arg": 0
+          },
+          "text": {
+            "$arg": 1
+          }
+        }
+      },
+      "response": {
+        "kind": "passthrough"
+      },
+      "authority": {
+        "kind": "checked-effect-row",
+        "effect": "Agent"
+      },
+      "replay_class": "journal-result"
+    },
+    {
+      "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#state",
+      "effect_id": "nulang:agent/agent",
+      "operation_id": "state",
+      "request": {
+        "arity": 1,
+        "template": {
+          "operation": "state",
+          "session_id": {
+            "$arg": 0
+          }
+        }
+      },
+      "response": {
+        "kind": "passthrough"
+      },
+      "authority": {
+        "kind": "checked-effect-row",
+        "effect": "Agent"
+      },
+      "replay_class": "journal-result"
+    },
+    {
+      "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#list",
+      "effect_id": "nulang:agent/agent",
+      "operation_id": "list",
+      "request": {
+        "arity": 0,
+        "template": {
+          "operation": "list"
+        }
+      },
+      "response": {
+        "kind": "passthrough"
+      },
+      "authority": {
+        "kind": "checked-effect-row",
+        "effect": "Agent"
+      },
+      "replay_class": "journal-result"
+    },
+    {
+      "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#delete",
+      "effect_id": "nulang:agent/agent",
+      "operation_id": "delete",
+      "request": {
+        "arity": 1,
+        "template": {
+          "operation": "delete",
+          "session_id": {
+            "$arg": 0
+          }
+        }
+      },
+      "response": {
+        "kind": "passthrough"
+      },
+      "authority": {
+        "kind": "checked-effect-row",
+        "effect": "Agent"
+      },
+      "replay_class": "journal-result"
+    },
+    {
+      "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#remember",
+      "effect_id": "nulang:agent/agent",
+      "operation_id": "remember",
+      "request": {
+        "arity": 3,
+        "template": {
+          "operation": "remember",
+          "session_id": {
+            "$arg": 0
+          },
+          "text": {
+            "$arg": 1
+          },
+          "metadata": {
+            "$arg": 2
+          }
+        }
+      },
+      "response": {
+        "kind": "passthrough"
+      },
+      "authority": {
+        "kind": "checked-effect-row",
+        "effect": "Agent"
+      },
+      "replay_class": "journal-result"
+    },
+    {
+      "canonical_id": "nulang.host-effects/v0alpha1:nulang:agent/agent#recall",
+      "effect_id": "nulang:agent/agent",
+      "operation_id": "recall",
+      "request": {
+        "arity": 3,
+        "template": {
+          "operation": "recall",
+          "session_id": {
+            "$arg": 0
+          },
+          "query": {
+            "$arg": 1
+          },
+          "top_k": {
+            "$arg": 2
+          }
+        }
+      },
+      "response": {
+        "kind": "passthrough"
+      },
+      "authority": {
+        "kind": "checked-effect-row",
+        "effect": "Agent"
+      },
+      "replay_class": "journal-result"
+    }
+  ]
+}
