@@ -12,7 +12,7 @@
 //!
 //! ```json
 //! {
-//!   "schema_version": 1,
+//!   "schema_version": 2,
 //!   "command": "check",
 //!   "file": "path/to/source.nula",
 //!   "ok": false,
@@ -37,7 +37,10 @@ use serde::Serialize;
 use crate::types::{current_source_text, source_map_file, NuError, Span};
 
 /// Current JSON diagnostics schema version.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v2 adds semantic diagnostic kinds, structured compiler facts, and exact
+/// byte offsets so coding agents do not need to parse human-facing prose.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Top-level report object emitted on stdout in `--json` mode.
 #[derive(Debug, Clone, Serialize)]
@@ -69,7 +72,7 @@ impl JsonReport {
     /// Serialize as a single-line JSON object (one trailing newline).
     pub fn to_json_string(&self) -> String {
         let mut s = serde_json::to_string(self).unwrap_or_else(|_| {
-            "{\"schema_version\":1,\"ok\":false,\"diagnostics\":[]}".to_string()
+            "{\"schema_version\":2,\"ok\":false,\"diagnostics\":[]}".to_string()
         });
         s.push('\n');
         s
@@ -83,13 +86,53 @@ pub struct JsonDiagnostic {
     pub code: Option<String>,
     /// "error" | "warning" | "note"
     pub severity: String,
+    /// Stable semantic category such as "type", "effect", or "capability".
+    pub kind: String,
     pub message: String,
+    /// Structured compiler facts. Agents should prefer these fields over
+    /// parsing `message` or `notes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<JsonDiagnosticData>,
     pub span: Option<JsonSpan>,
     pub notes: Vec<String>,
     pub suggestion: Option<JsonSuggestion>,
 }
 
-/// 1-indexed source span.
+/// Structured facts carried by the compiler's native error variants.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct JsonDiagnosticData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub found: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub found_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similar_names: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing_effects: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_effects: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability_explanation: Option<String>,
+}
+
+impl JsonDiagnosticData {
+    fn is_empty(&self) -> bool {
+        self.expected.is_none()
+            && self.found.is_none()
+            && self.expected_type.is_none()
+            && self.found_type.is_none()
+            && self.similar_names.is_none()
+            && self.missing_effects.is_none()
+            && self.allowed_effects.is_none()
+            && self.capability_explanation.is_none()
+    }
+}
+
+/// 1-indexed source span plus exact UTF-8 byte offsets.
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonSpan {
     pub file: String,
@@ -97,6 +140,8 @@ pub struct JsonSpan {
     pub col: usize,
     pub end_line: usize,
     pub end_col: usize,
+    pub start_byte: u32,
+    pub end_byte: u32,
 }
 
 /// A suggested fix. `message` mirrors the existing human-facing help text;
@@ -136,7 +181,9 @@ fn diagnostic_from_single(err: &NuError) -> JsonDiagnostic {
     JsonDiagnostic {
         code: err.stable_code().map(|s| s.to_string()),
         severity: "error".to_string(),
+        kind: diagnostic_kind(err).to_string(),
         message: json_message(err),
+        data: diagnostic_data(err),
         span: err.primary_span().and_then(json_span),
         notes: crate::diagnostic::diagnostic_notes(err),
         suggestion: err.suggestion().map(|msg| JsonSuggestion {
@@ -144,6 +191,62 @@ fn diagnostic_from_single(err: &NuError) -> JsonDiagnostic {
             replacement: None,
         }),
     }
+}
+
+fn diagnostic_kind(err: &NuError) -> &'static str {
+    match err {
+        NuError::LexError { .. } => "lex",
+        NuError::ParseError { .. } => "parse",
+        NuError::TypeError { .. } => "type",
+        NuError::EffectError { .. } => "effect",
+        NuError::CapError { .. } => "capability",
+        NuError::FFIError { .. } => "ffi",
+        NuError::NotYetImplemented { .. } => "implementation",
+        NuError::RuntimeError { .. } => "runtime",
+        NuError::VMError { .. } => "vm",
+        NuError::PythonError { .. } => "python",
+        NuError::PackageError { .. } => "package",
+        NuError::Suspended(_) => "suspension",
+        NuError::Multiple(_) => "aggregate",
+    }
+}
+
+fn diagnostic_data(err: &NuError) -> Option<JsonDiagnosticData> {
+    let data = match err {
+        NuError::ParseError {
+            expected, found, ..
+        } => JsonDiagnosticData {
+            expected: expected.clone(),
+            found: found.clone(),
+            ..JsonDiagnosticData::default()
+        },
+        NuError::TypeError {
+            expected_type,
+            found_type,
+            similar_names,
+            ..
+        } => JsonDiagnosticData {
+            expected_type: expected_type.clone(),
+            found_type: found_type.clone(),
+            similar_names: similar_names.clone(),
+            ..JsonDiagnosticData::default()
+        },
+        NuError::EffectError {
+            missing_effects,
+            allowed_effects,
+            ..
+        } => JsonDiagnosticData {
+            missing_effects: missing_effects.clone(),
+            allowed_effects: allowed_effects.clone(),
+            ..JsonDiagnosticData::default()
+        },
+        NuError::CapError { explanation, .. } => JsonDiagnosticData {
+            capability_explanation: explanation.clone(),
+            ..JsonDiagnosticData::default()
+        },
+        _ => JsonDiagnosticData::default(),
+    };
+    (!data.is_empty()).then_some(data)
 }
 
 /// The core message without position prefixes or structured-field suffixes.
@@ -182,6 +285,8 @@ fn json_span(span: Span) -> Option<JsonSpan> {
         col,
         end_line,
         end_col,
+        start_byte: start,
+        end_byte: end,
     })
 }
 
@@ -210,7 +315,9 @@ pub fn diagnostic_from_message(message: String) -> JsonDiagnostic {
     JsonDiagnostic {
         code: None,
         severity: "error".to_string(),
+        kind: "external".to_string(),
         message,
+        data: None,
         span: None,
         notes: Vec::new(),
         suggestion: None,
@@ -236,10 +343,18 @@ mod tests {
         let d = &diags[0];
         assert_eq!(d.code.as_deref(), Some("E0202"));
         assert_eq!(d.severity, "error");
+        assert_eq!(d.kind, "type");
+        let data = d.data.as_ref().expect("structured diagnostic data");
+        assert_eq!(
+            data.similar_names.as_deref(),
+            Some(&["counter".to_string()][..])
+        );
         let span = d.span.as_ref().expect("span");
         assert_eq!(span.line, 1);
         assert_eq!(span.col, 13);
         assert_eq!(span.end_col, 19);
+        assert_eq!(span.start_byte, start);
+        assert_eq!(span.end_byte, start + 6);
         assert_eq!(span.file, "test.nula");
         assert!(d
             .notes
@@ -249,11 +364,30 @@ mod tests {
         let report = JsonReport::new("check", Some("test.nula".to_string()), diags);
         let v: serde_json::Value =
             serde_json::from_str(&report.to_json_string()).expect("valid json");
-        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["schema_version"], 2);
         assert_eq!(v["command"], "check");
         assert_eq!(v["ok"], false);
         assert!(v["diagnostics"].is_array());
         clear_source_map();
+    }
+
+    #[test]
+    fn test_type_mismatch_exposes_structured_types() {
+        let err = NuError::TypeError {
+            msg: "Type mismatch".into(),
+            span: Span::new(4, 9),
+            expected_type: Some("Result[User, AuthError]".into()),
+            found_type: Some("User".into()),
+            similar_names: None,
+        };
+        let diags = diagnostics_from_error(&err);
+        let data = diags[0].data.as_ref().expect("structured type data");
+        assert_eq!(diags[0].kind, "type");
+        assert_eq!(
+            data.expected_type.as_deref(),
+            Some("Result[User, AuthError]")
+        );
+        assert_eq!(data.found_type.as_deref(), Some("User"));
     }
 
     #[test]
