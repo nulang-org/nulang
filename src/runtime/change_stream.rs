@@ -14,15 +14,7 @@ use super::persistence::{EventEntry, JournalEntry, PersistenceStore, WorkflowEve
 /// records share the same actor sequence, message delivery is observed first,
 /// followed by state events and then workflow events.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    serde::Serialize,
-    serde::Deserialize,
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 #[repr(u8)]
 #[serde(rename_all = "snake_case")]
@@ -39,15 +31,7 @@ pub enum DurableChangeLane {
 /// same actor sequence. `lane` and `ordinal` prevent consumers from skipping
 /// same-sequence records when resuming.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    serde::Serialize,
-    serde::Deserialize,
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub struct DurableChangeCursor {
     pub sequence: u64,
@@ -102,9 +86,7 @@ pub fn scan_durable_changes(
     let lane_window = |lane: DurableChangeLane| -> (u64, usize) {
         match after {
             None => (0, limit),
-            Some(cursor) if lane < cursor.lane => {
-                (cursor.sequence.saturating_add(1), limit)
-            }
+            Some(cursor) if lane < cursor.lane => (cursor.sequence.saturating_add(1), limit),
             Some(cursor) if lane == cursor.lane => (
                 cursor.sequence,
                 limit.saturating_add(cursor.ordinal.saturating_add(1) as usize),
@@ -119,8 +101,7 @@ pub fn scan_durable_changes(
 
     let journals = store.scan_journal_from(actor_id, journal_start, journal_limit);
     let events = store.scan_events_from(actor_id, event_start, event_limit);
-    let workflows =
-        store.scan_workflow_events_from(actor_id, workflow_start, workflow_limit);
+    let workflows = store.scan_workflow_events_from(actor_id, workflow_start, workflow_limit);
 
     let mut changes = Vec::with_capacity(
         journals
@@ -254,7 +235,10 @@ mod tests {
         let changes = read_durable_changes(&store, 7, None);
         assert_eq!(changes.len(), 3);
         assert_eq!(
-            changes.iter().map(DurableChange::sequence).collect::<Vec<_>>(),
+            changes
+                .iter()
+                .map(DurableChange::sequence)
+                .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
     }
@@ -331,8 +315,7 @@ mod tests {
         assert_eq!(first[0].cursor.ordinal, 0);
         assert_eq!(first[1].cursor.ordinal, 1);
 
-        let second =
-            scan_durable_changes(&store, 21, Some(first[1].cursor), 2).unwrap();
+        let second = scan_durable_changes(&store, 21, Some(first[1].cursor), 2).unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].cursor.sequence, 8);
         assert_eq!(second[0].cursor.ordinal, 2);
@@ -371,8 +354,7 @@ mod tests {
         let first = scan_durable_changes(&store, 22, None, 1).unwrap();
         assert!(matches!(first[0].record, DurableChangeRecord::Journal(_)));
 
-        let second =
-            scan_durable_changes(&store, 22, Some(first[0].cursor), 1).unwrap();
+        let second = scan_durable_changes(&store, 22, Some(first[0].cursor), 1).unwrap();
         assert!(matches!(second[0].record, DurableChangeRecord::Event(_)));
         assert_eq!(second[0].cursor.sequence, 5);
     }
