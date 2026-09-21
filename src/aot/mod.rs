@@ -99,6 +99,16 @@ impl AotModule {
                         &mut constants,
                         &mir_module.foreign_functions,
                     );
+                    if let mir::Stmt::Assign {
+                        op: mir::RValue::Panic(message),
+                        ..
+                    } = stmt
+                    {
+                        let panic_constant = crate::bytecode::Constant::String(message.clone());
+                        if !constants.contains(&panic_constant) {
+                            constants.push(panic_constant);
+                        }
+                    }
                 }
             }
         }
@@ -112,6 +122,16 @@ impl AotModule {
                         &mut constants,
                         &mir_module.foreign_functions,
                     );
+                    if let mir::Stmt::Assign {
+                        op: mir::RValue::Panic(message),
+                        ..
+                    } = stmt
+                    {
+                        let panic_constant = crate::bytecode::Constant::String(message.clone());
+                        if !constants.contains(&panic_constant) {
+                            constants.push(panic_constant);
+                        }
+                    }
                 }
             }
         }
@@ -236,6 +256,27 @@ impl AotModule {
         let mut behavior_names: Vec<String> = Vec::new();
         let mut behavior_fids: Vec<cranelift_module::FuncId> = Vec::new();
         for (idx, func) in mir_module.behaviors.iter().enumerate() {
+            let behavior_has_panic = func.blocks.iter().any(|block| {
+                block.stmts.iter().any(|stmt| {
+                    matches!(
+                        stmt,
+                        mir::Stmt::Assign {
+                            op: mir::RValue::Panic(..),
+                            ..
+                        }
+                    )
+                })
+            });
+            if behavior_has_panic {
+                return Err(crate::types::NuError::VMError {
+                    msg: format!(
+                        "AOT actor behavior '{}' uses runtime panic, but the native behavior adapter cannot propagate actor faults yet; use the bytecode backend",
+                        func.name
+                    ),
+                    span: Span::default(),
+                });
+            }
+
             let func_name = format!("nulang_behavior_{}", idx);
             let mut sig = jit_module.make_signature();
             for _ in &func.params {

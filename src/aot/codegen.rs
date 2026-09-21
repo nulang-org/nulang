@@ -1182,6 +1182,7 @@ pub fn compile_mir_function_body(
             "nulang_itof",
             "nulang_ftoi",
             "nulang_fneg",
+            "nulang_panic",
         ];
         for name in unary_helpers {
             let mut h_sig = module.make_signature();
@@ -1773,7 +1774,30 @@ pub fn compile_mir_function_body(
             // resuming performs in this block, threaded into later
             // continuations so they can read earlier perform results.
             let mut cont_thread: Vec<u32> = Vec::new();
+            let mut terminated_by_panic = false;
             for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
+                if let mir::Stmt::Assign {
+                    op: mir::RValue::Panic(message),
+                    ..
+                } = stmt
+                {
+                    let message_value = compile_const(
+                        &mut builder,
+                        &crate::bytecode::Constant::String(message.clone()),
+                        mode,
+                        constants,
+                    )?;
+                    let panic_result =
+                        call_helper(&mut builder, &h, "nulang_panic", &[message_value])?;
+                    // Panic is a diverging MIR expression. Native code cannot
+                    // unwind across the JIT ABI, so record the pending error
+                    // above and return immediately. AotModule::run observes
+                    // AOT_PENDING_ERROR and converts this return into NuError.
+                    builder.ins().return_(&[panic_result]);
+                    terminated_by_panic = true;
+                    break;
+                }
+
                 compile_stmt(
                     &mut builder,
                     stmt,
@@ -1799,16 +1823,18 @@ pub fn compile_mir_function_body(
                     bid,
                 )?;
             }
-            compile_terminator_with_params(
-                &mut builder,
-                &block.terminator,
-                &block_map,
-                &block_params,
-                &local_vals,
-                mode,
-                block.id,
-                &handler_continuations,
-            )?;
+            if !terminated_by_panic {
+                compile_terminator_with_params(
+                    &mut builder,
+                    &block.terminator,
+                    &block_map,
+                    &block_params,
+                    &local_vals,
+                    mode,
+                    block.id,
+                    &handler_continuations,
+                )?;
+            }
         }
 
         builder.seal_all_blocks();
@@ -2268,8 +2294,8 @@ fn compile_rvalue(
 ) -> AotResult<Value> {
     match rv {
         mir::RValue::Const(c) => compile_const(builder, c, mode, constants),
-        mir::RValue::Panic(_) => Err(AotCompileError::Unsupported(
-            "Panic: contract violations require the bytecode backend (unavailable with --backend native)".into(),
+        mir::RValue::Panic(_) => Err(AotCompileError::Internal(
+            "Panic must be lowered by the statement-level diverging path".into(),
         )),
 
         mir::RValue::Load(id) => {

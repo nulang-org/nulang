@@ -155,6 +155,10 @@ define_helpers! {
     IToF   => nulang_itof,   Unary,
     FToI   => nulang_ftoi,   Unary,
     FNeg   => nulang_fneg,   Unary,
+    // Diverging runtime error helper used by native AOT. The helper records
+    // the error in AOT_PENDING_ERROR; AOT codegen immediately returns after
+    // calling it, so later source statements cannot execute.
+    Panic  => nulang_panic,  Unary,
     // Logical
     And    => nulang_and,    Bin,
     Or     => nulang_or,     Bin,
