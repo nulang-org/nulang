@@ -55,14 +55,16 @@ two major versions.*
   `Polygon[CRS]`; envelopes; planar line length/perimeter/area/centroid; and
   WKT writers for points, line strings, and polygons; plus a dependency-free
   immutable `RTree[CRS, T]` with bulk loading, hierarchical bounding-box
-  pruning, and intersection queries. The implementation is
+  pruning, intersection queries, leaf-level STR-style packing, point queries,
+  contained-by queries, and optional traversal statistics for tuning. The
+  implementation is
   pure user-space Nulang,
   preserving the Core Admission Rule rather than adding GIS-specific syntax or
   runtime concepts.
 - **First-party package regression coverage** (Experimental, CI). The Nula
   package job now runs `packages/nulang-geo`'s test suite and compile-fail
   CRS fixtures so library/compiler compatibility and aggregate/index CRS safety
-  are continuously checked.
+  are continuously checked, including both box and point index queries.
 
 ### Actor protocol rolling-upgrade compatibility — 2026-09-20
 - **Directional structural compatibility** (Experimental, `src/protocol.rs`).
