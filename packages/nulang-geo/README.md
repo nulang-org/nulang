@@ -10,7 +10,7 @@ expanding the language kernel.
 ## Current scope
 
 - CRS-tagged `Point[CRS]` and `BoundingBox[CRS]` values
-- marker types for WGS84, Web Mercator, and local Cartesian coordinates
+- marker types for WGS84 (CRS84-style longitude/latitude storage), Web Mercator, and local Cartesian coordinates
 - WGS84 range validation and longitude normalization
 - axis-aligned bounding-box containment/intersection
 - planar Euclidean distance
@@ -34,6 +34,10 @@ fn main() {
     }
 }
 ```
+
+`wgs84(longitude, latitude)` always stores `x=longitude` and `y=latitude`.
+This matches OGC:CRS84 ordering rather than EPSG:4326's formal latitude-first
+axis order.
 
 CRS parameters are shared across spatial operations, so APIs such as
 `contains`, `intersects`, and `distance_2d` require compatible instantiated
