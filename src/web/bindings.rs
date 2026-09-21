@@ -12,6 +12,7 @@
 //! missing.
 
 pub use crate::web::contracts::RequestParamSource as RouteBindingSource;
+use crate::web::codec::{body_codec_for_type, BodyCodecContract};
 use crate::web::contracts::RouteContract;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -25,6 +26,9 @@ pub struct RouteBindingContract {
     pub handler_index: usize,
     /// Resolved source-level type, when known.
     pub ty: Option<String>,
+    /// Explicit wire codec metadata for whole-body bindings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<BodyCodecContract>,
 }
 
 /// Result of lowering a route contract into direct handler bindings.
@@ -79,12 +83,18 @@ pub fn compile_route_bindings(contract: &RouteContract) -> BindingCompilation {
             handler_param.ty.clone()
         };
 
+        let codec = if request.source == RouteBindingSource::Body {
+            body_codec_for_type(ty.as_deref())
+        } else {
+            None
+        };
         out.bindings.push(RouteBindingContract {
             source: request.source,
             source_name: request.source_name.clone(),
             handler_param: handler_param.name.clone(),
             handler_index,
             ty,
+            codec,
         });
     }
 
@@ -116,6 +126,7 @@ pub fn compile_route_bindings(contract: &RouteContract) -> BindingCompilation {
             handler_param: handler_param.name.clone(),
             handler_index,
             ty: route_param.ty.clone().or_else(|| handler_param.ty.clone()),
+            codec: None,
         });
     }
 
