@@ -839,14 +839,7 @@ impl Runtime {
         init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
         state_models: HashMap<String, StateModel>,
     ) -> std::io::Result<u64> {
-        spawn::try_spawn_actor_with_models(
-            self,
-            init,
-            state_models,
-            true,
-            Some(name),
-            None,
-        )
+        spawn::try_spawn_actor_with_models(self, init, state_models, true, Some(name), None)
     }
 
     /// Spawn an actor for `module`'s behavior `behavior_idx`, seeded with
