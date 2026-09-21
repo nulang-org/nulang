@@ -4,7 +4,7 @@
 //! snapshot of durable actor state and an append-only journal of messages.
 //! On recovery the runtime loads the latest snapshot and replays the journal.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -1814,7 +1814,8 @@ impl PersistenceStore for RocksDbStore {
         // If both encodings exist for the same logical row, iteration visits
         // the shorter legacy key first and the v2 key later; BTreeMap
         // replacement therefore prefers the v2 value.
-        let mut entries: BTreeMap<(u64, String), EventEntry> = BTreeMap::new();
+        let mut entries: std::collections::BTreeMap<(u64, String), EventEntry> =
+            std::collections::BTreeMap::new();
         let start = Self::actor_seq_key(actor_id, 0);
         let mut iter = self.db.iterator_cf(
             cf,
@@ -2795,6 +2796,41 @@ mod rocksdb_store_tests {
         assert_eq!(loaded.actor_id, 1);
         assert_eq!(loaded.sequence, 3);
         assert_eq!(loaded.state.get("count"), Some(&PersistedValue::Int(42)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rocksdb_store_preserves_multiple_event_fields_at_same_sequence() {
+        let dir = fresh_dir("multi_field_events");
+        let mut store = RocksDbStore::new(&dir).unwrap();
+
+        for (field, value) in [("balance", 10), ("reserved", 3)] {
+            store
+                .append_event(
+                    1,
+                    EventEntry {
+                        sequence: 7,
+                        schema_owner: Some("Account".to_string()),
+                        schema_version: 2,
+                        field_name: field.to_string(),
+                        event_name: "Adjusted".to_string(),
+                        args: vec![PersistedValue::Int(1)],
+                        value: PersistedValue::Int(value),
+                    },
+                )
+                .unwrap();
+        }
+
+        let events = store.read_events(1);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 7);
+        assert_eq!(events[1].sequence, 7);
+        assert_eq!(events[0].field_name, "balance");
+        assert_eq!(events[1].field_name, "reserved");
+        assert_eq!(events[0].value, PersistedValue::Int(10));
+        assert_eq!(events[1].value, PersistedValue::Int(3));
+        assert_eq!(store.latest_sequence(1), 7);
+
         let _ = fs::remove_dir_all(&dir);
     }
 
