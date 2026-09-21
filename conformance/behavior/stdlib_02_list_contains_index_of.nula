@@ -6,10 +6,16 @@ import stdlib::list
 fn main() {
     let xs = [1, 2, 3, 4, 5]
     let b2i = fn(b) { if b then 1 else 0 }
+    let show = fn(opt) {
+        match opt {
+            Some(x) => perform Int.to_string(x),
+            None => "None",
+        }
+    }
     perform IO.print("contains3=" + perform Int.to_string(b2i(contains(3, xs))))
     perform IO.print("contains9=" + perform Int.to_string(b2i(contains(9, xs))))
     perform IO.print("contains_empty=" + perform Int.to_string(b2i(contains(1, []))))
-    perform IO.print("idx2=" + perform Int.to_string(index_of(2, xs)))
-    perform IO.print("idx_first=" + perform Int.to_string(index_of(1, xs)))
-    perform IO.print("idx_miss=" + perform Int.to_string(index_of(99, xs)))
+    perform IO.print("idx2=" + show(index_of(2, xs)))
+    perform IO.print("idx_first=" + show(index_of(1, xs)))
+    perform IO.print("idx_miss=" + show(index_of(99, xs)))
 }
