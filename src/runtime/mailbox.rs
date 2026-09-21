@@ -24,7 +24,7 @@ pub struct Message {
     pub behavior_id: u16,
     /// Payload values, shared via `Arc` to avoid cloning on every
     /// `receive_match` scan. The VM never mutates incoming payloads.
-    pub payload: Arc<Vec<Value>>,
+    pub payload: Arc<[Value]>,
     pub sender: u64,
     pub priority: MessagePriority,
     /// W3C traceparent for distributed tracing.
@@ -198,7 +198,7 @@ impl Mailbox {
     fn scan_staged(
         buffer: &mut VecDeque<(Message, bool)>,
         behavior_ids: &[u16],
-    ) -> Option<(usize, usize, Arc<Vec<Value>>)> {
+    ) -> Option<(usize, usize, Arc<[Value]>)> {
         for (idx, (msg, tried)) in buffer.iter_mut().enumerate() {
             if *tried {
                 continue;
@@ -215,7 +215,7 @@ impl Mailbox {
     /// as tried. The message stays logically queued and capacity-accounted
     /// until `commit_receive_match` consumes the candidate whose pattern and
     /// guard actually succeeded.
-    pub fn receive_match(&mut self, behavior_ids: &[u16]) -> Option<(usize, Arc<Vec<Value>>)> {
+    pub fn receive_match(&mut self, behavior_ids: &[u16]) -> Option<(usize, Arc<[Value]>)> {
         // If the VM asks for another candidate before commit, the previous
         // candidate was rejected by its pattern/guard. It remains `tried` for
         // this receive expression but is no longer the commit target.
@@ -307,7 +307,7 @@ impl Mailbox {
     /// Commit exactly the most recently returned candidate and return its
     /// payload so the runtime can establish receiver-side ORCA ownership only
     /// after the pattern+guard succeeds.
-    pub fn commit_receive_match(&mut self) -> Option<Arc<Vec<Value>>> {
+    pub fn commit_receive_match(&mut self) -> Option<Arc<[Value]>> {
         let (lane, idx) = self.active_match.take()?;
         let removed = match lane {
             MatchLane::System => self.system_skip_buffer.remove(idx),
@@ -335,7 +335,7 @@ mod tests {
     fn make_msg(behavior_id: u16, sender: u64) -> Message {
         Message {
             behavior_id,
-            payload: Arc::new(vec![Value::int(42)]),
+            payload: Arc::from(vec![Value::int(42)]),
             sender,
             priority: MessagePriority::Normal,
             trace_id: None,
@@ -484,7 +484,7 @@ mod tests {
         mb.push(make_msg(2, 200)).unwrap();
         mb.push(make_msg(3, 300)).unwrap();
         let found = mb.receive_match(&[2]);
-        assert_eq!(found, Some((0, Arc::new(vec![Value::int(42)]))));
+        assert_eq!(found, Some((0, Arc::from(vec![Value::int(42)]))));
         mb.commit_receive_match();
         assert_eq!(mb.len(), 2);
         assert_eq!(mb.pop().unwrap().behavior_id, 1);
