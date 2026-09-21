@@ -843,6 +843,54 @@ fn main() {
     }
 
     #[test]
+    fn identical_checked_inputs_emit_identical_manifest_bytes() {
+        let source = r#"
+persistent actor Counter {
+    state durable count: Int = 0
+    behavior add(by: Int) { self.count = self.count + by }
+}
+pub fn read() -> Int { perform IO.read() }
+fn main() { 0 }
+"#;
+        let first = emit(source).to_pretty_json().unwrap();
+        let second = emit(source).to_pretty_json().unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn serialized_manifest_cannot_hide_effect_or_exact_spawn_authority() {
+        let manifest = emit(
+            r#"
+actor Worker {
+    behavior fetch() { perform Http.get("https://api.example.com") }
+}
+fn main() {
+    let worker = spawn Worker {} with [Net::TcpOut("api.example.com:443")]
+    worker ! fetch()
+}
+"#,
+        );
+        let json = serde_json::to_value(&manifest).unwrap();
+
+        assert!(json["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["effect"] == "Net"));
+        assert!(json["authority"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["kind"] == "network"
+                    && entry["resource"] == "api.example.com:443"
+                    && entry["operations"]
+                        .as_array()
+                        .is_some_and(|ops| ops.iter().any(|op| op == "connect"))
+            }));
+    }
+
+    #[test]
     fn artifact_digest_is_bound_to_exact_bytes() {
         let manifest = emit("fn main() { 0 }");
         assert_eq!(
