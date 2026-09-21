@@ -143,8 +143,14 @@ jobs:
       - name: Build (release)
         run: cargo build --release
 
-      - name: Test (release)
-        run: cargo test --release
+      - name: Optimized semantic smoke
+        # The Build & Test job already runs the full suite. Keep release mode
+        # focused on optimization/link correctness plus representative runtime
+        # invariants instead of duplicating every test a second time.
+        run: |
+          cargo test --release --test raw_value_provenance
+          cargo test --release --test actor_protocol_nominal
+          cargo test --release --test semantic_closure_actor_turns
 
 
   # -----------------------------------------------------------------------
