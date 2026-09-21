@@ -97,7 +97,10 @@ pub use cache_routing::*;
 #[cfg(feature = "cache-server")]
 pub use cache_server::*;
 pub use callbacks::RuntimeVmCallbacks;
-pub(crate) use callbacks::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks};
+pub(crate) use callbacks::{
+    BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, QueryDistributedCallbacks,
+    QueryPurityGuard,
+};
 pub use cluster::*;
 pub use crdt::*;
 pub use crdt_manager::*;
