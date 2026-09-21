@@ -66,24 +66,30 @@ export default defineConfig({
           ],
         },
         {
-          label: 'Language Syntax',
+          label: 'Language Core · Stable',
           collapsed: true,
           items: [
             { label: 'Syntax Basics', link: 'language/syntax/' },
             { label: 'Type System', link: 'language/types/' },
             { label: 'Algebraic Effects', link: 'language/effects/' },
-            { label: 'Performance', link: 'language/performance/' },
             { label: 'Safety', link: 'language/safety/' },
+            { label: 'Performance', link: 'language/performance/' },
             { label: 'Python & FFI Interop', link: 'language/interop/' },
           ],
         },
         {
-          label: 'Distributed Actors',
+          label: 'Actor Surface · Stable',
           collapsed: true,
           items: [
             { label: 'Actor Model', link: 'actors/overview/' },
-            { label: 'Distribution & Clustering', link: 'actors/distribution/' },
             { label: 'Supervision Trees', link: 'actors/supervision/' },
+          ],
+        },
+        {
+          label: 'Distribution · Experimental',
+          collapsed: true,
+          items: [
+            { label: 'Distribution & Clustering', link: 'actors/distribution/' },
             { label: 'Running a Cluster', link: 'actors/cluster-ops/' },
           ],
         },
@@ -120,7 +126,7 @@ export default defineConfig({
           ],
         },
         {
-          label: 'AI Agents',
+          label: 'AI Runtime · Experimental',
           collapsed: true,
           items: [
             { label: 'Overview', link: 'ai/overview/' },
@@ -129,7 +135,7 @@ export default defineConfig({
           ],
         },
         {
-          label: 'Durable Workflows',
+          label: 'Workflows · Experimental',
           collapsed: true,
           items: [
             { label: 'Overview', link: 'workflows/overview/' },
@@ -137,7 +143,7 @@ export default defineConfig({
           ],
         },
         {
-          label: 'Web Services',
+          label: 'Web Services · Experimental',
           collapsed: true,
           items: [
             { label: 'HTTP Servers & Routing', link: 'web/overview/' },
