@@ -343,12 +343,7 @@ mod tests {
         ]
     }
 
-    fn snapshot(
-        actor_id: u64,
-        email: &str,
-        company: &str,
-        status: &str,
-    ) -> ActorSnapshot {
+    fn snapshot(actor_id: u64, email: &str, company: &str, status: &str) -> ActorSnapshot {
         ActorSnapshot {
             actor_id,
             sequence: 1,
@@ -487,7 +482,10 @@ mod tests {
             residual_predicates: vec![QueryPredicate::eq("status")],
         };
 
-        assert_eq!(indexes.candidates(&plan, &HashMap::new()).unwrap(), vec![4, 7]);
+        assert_eq!(
+            indexes.candidates(&plan, &HashMap::new()).unwrap(),
+            vec![4, 7]
+        );
     }
 
     #[test]
