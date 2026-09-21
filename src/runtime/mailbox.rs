@@ -78,9 +78,7 @@ impl MessagePayload {
     #[inline]
     fn into_shared(self) -> Arc<Vec<Value>> {
         match self {
-            MessagePayload::Inline { len, values } => {
-                Arc::new(values[..len as usize].to_vec())
-            }
+            MessagePayload::Inline { len, values } => Arc::new(values[..len as usize].to_vec()),
             MessagePayload::Shared(values) => values,
         }
     }
@@ -446,7 +444,10 @@ mod tests {
         for len in 0..=INLINE_MESSAGE_VALUES {
             let values: Vec<Value> = (0..len).map(|i| Value::int(i as i64)).collect();
             let payload = MessagePayload::from_slice(&values);
-            assert!(payload.is_inline(), "{len}-value payload should stay inline");
+            assert!(
+                payload.is_inline(),
+                "{len}-value payload should stay inline"
+            );
             assert_eq!(payload.as_slice(), values.as_slice());
         }
 
