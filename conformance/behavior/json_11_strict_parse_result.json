@@ -1,0 +1,1 @@
+{"exit_code":0,"stdout":"valid={\"a\":[1,true,null,\"x\"]}\nempty=error\nws_only=error\ntrailing=error\ntrunc_obj=error\ntrunc_arr=error\narray_comma=error\nobject_comma=error\nmissing_colon=error\nleading_zero=error\nfraction=error\nexponent=error\nplus=error\nnumber_ok=ok","stderr":""}
