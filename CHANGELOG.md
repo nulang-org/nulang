@@ -53,14 +53,16 @@ two major versions.*
   Euclidean distance; canonical meter-based `Distance` values; spherical
   WGS84 great-circle distance; CRS-tagged `LineString[CRS]` and single-ring
   `Polygon[CRS]`; envelopes; planar line length/perimeter/area/centroid; and
-  WKT writers for points, line strings, and polygons. The implementation is
+  WKT writers for points, line strings, and polygons; plus a dependency-free
+  immutable `RTree[CRS, T]` with bulk loading, hierarchical bounding-box
+  pruning, and intersection queries. The implementation is
   pure user-space Nulang,
   preserving the Core Admission Rule rather than adding GIS-specific syntax or
   runtime concepts.
 - **First-party package regression coverage** (Experimental, CI). The Nula
   package job now runs `packages/nulang-geo`'s test suite and compile-fail
-  CRS fixtures so library/compiler compatibility and aggregate CRS safety are
-  continuously checked.
+  CRS fixtures so library/compiler compatibility and aggregate/index CRS safety
+  are continuously checked.
 
 ### Actor protocol rolling-upgrade compatibility — 2026-09-20
 - **Directional structural compatibility** (Experimental, `src/protocol.rs`).
