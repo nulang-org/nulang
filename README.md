@@ -38,18 +38,28 @@ location-transparent distribution, and durable persistence.
 ## Installation
 
 ### Pre-built binaries
-Download the latest release from [GitHub Releases](https://github.com/nulang-org/nulang/releases)
-*(prebuilt binaries coming with the first tagged release — for now build from source below)*.
+Tagged releases publish checksummed archives from the release CI matrix:
+
 - **Linux (x86_64)**: `nulang-linux-x86_64.tar.gz`
 - **Linux (aarch64)**: `nulang-linux-aarch64.tar.gz`
-- **macOS (x86_64)**: `nulang-macos-x86_64.tar.gz`
-- **macOS (aarch64)**: `nulang-macos-aarch64.tar.gz`
+- **macOS (Apple Silicon / aarch64)**: `nulang-macos-aarch64.tar.gz`
+- **Windows (x86_64)**: `nulang-windows-x86_64.tar.gz`
 
-Extract and place `nulang` in your PATH:
+Download the latest archive and its matching `.sha256` file from
+[GitHub Releases](https://github.com/nulang-org/nulang/releases), verify the
+checksum, then put the extracted executable on your PATH.
+
+Linux x86_64 example:
+
 ```bash
+sha256sum -c nulang-linux-x86_64.tar.gz.sha256
 tar xzf nulang-linux-x86_64.tar.gz
-sudo mv nulang /usr/local/bin/
+install -m 0755 nulang-linux-x86_64 ~/.local/bin/nulang
 ```
+
+Windows x86_64 archives contain the release executable under its
+platform-qualified name; rename it to `nulang.exe` after extraction and place
+it in a directory on PATH.
 
 ### From source
 ```bash
@@ -57,12 +67,15 @@ git clone https://github.com/nulang-org/nulang.git
 cd nulang
 cargo build --release
 ```
-Requires Rust 1.95.0 (pinned by `rust-toolchain.toml`), Linux or macOS. Windows is not supported yet — use [WSL](https://learn.microsoft.com/windows/wsl/) and build inside a Linux environment.
 
+Source builds use Rust 1.95.0, pinned by `rust-toolchain.toml`. The tagged
+release matrix currently validates Linux x86_64/aarch64, macOS aarch64, and
+Windows x86_64; other platform/architecture combinations are not release-tested.
 
 ## Quick Start
 
-**Prerequisites:** Rust 1.95.0, Linux or macOS. Windows is unsupported for now — Windows users should build under WSL.
+A pre-built release binary needs no Rust toolchain. To build from source, use
+Rust 1.95.0:
 
 ```bash
 git clone https://github.com/nulang-org/nulang.git
