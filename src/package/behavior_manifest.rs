@@ -21,6 +21,7 @@ use crate::format::constants::LANGUAGE_VERSION_STR;
 use crate::package::identity::source_id_for_package_dir;
 use crate::package::lockfile::LOCKFILE_FILE;
 use crate::package::manifest::Manifest;
+use crate::semantic_inventory::CompilerSemanticInventory;
 
 pub const BEHAVIOR_MANIFEST_SCHEMA: &str = "nulang.behavior/v0alpha1";
 
@@ -181,6 +182,50 @@ impl BehaviorManifest {
         })
     }
 
+    /// Merge compiler-derived semantics into the artifact-bound package
+    /// manifest. The compiler inventory is authoritative for program meaning;
+    /// package declarations remain visible as user-declared configuration.
+    pub fn with_compiler_semantics(
+        mut self,
+        inventory: &CompilerSemanticInventory,
+    ) -> Result<Self, BehaviorManifestError> {
+        self.effects = inventory
+            .effects
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(BehaviorManifestError::Json)?;
+        self.actors = inventory
+            .actors
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(BehaviorManifestError::Json)?;
+
+        for capability in &inventory.required_authority {
+            self.authority.push(AuthorityRequirement {
+                capability: capability.clone(),
+                source: "compiler-effect-inference".to_string(),
+                status: "required-category".to_string(),
+            });
+        }
+        self.authority.sort_by(|left, right| {
+            (&left.capability, &left.source).cmp(&(&right.capability, &right.source))
+        });
+        self.authority.dedup_by(|left, right| {
+            left.capability == right.capability
+                && left.source == right.source
+                && left.status == right.status
+        });
+
+        self.completeness.actors = "compiler-derived-with-per-actor-status".to_string();
+        self.completeness.effects = "compiler-module-conservative".to_string();
+        self.completeness.authority =
+            "compiler-inferred-categories+package-declared".to_string();
+
+        Ok(self)
+    }
+
     /// Deterministic JSON bytes used as the canonical v0alpha1 representation.
     ///
     /// Struct field order is fixed by this schema, maps are BTreeMaps, and
@@ -298,6 +343,56 @@ capabilities = ["net", "fs", "net"]
                 .collect::<Vec<_>>(),
             vec!["fs", "net"]
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compiler_semantics_promote_effect_actor_and_authority_completeness() {
+        use crate::semantic_inventory::{
+            SemanticActor, SemanticBehavior, SemanticEffect,
+            COMPILER_SEMANTIC_INVENTORY_SCHEMA,
+        };
+
+        let (root, package, wasm_path) = fixture("semantics");
+        let inventory = CompilerSemanticInventory {
+            schema: COMPILER_SEMANTIC_INVENTORY_SCHEMA.to_string(),
+            effects: vec![SemanticEffect {
+                subject_kind: "function".to_string(),
+                subject: "fetch".to_string(),
+                effects: vec!["Net".to_string()],
+                open: false,
+            }],
+            actors: vec![SemanticActor {
+                name: "Worker".to_string(),
+                protocol_id: Some(format!("blake3:{}", "a".repeat(64))),
+                protocol_status: "complete".to_string(),
+                protocol_error: None,
+                behaviors: vec![SemanticBehavior {
+                    name: "ping".to_string(),
+                    effects: vec!["Net".to_string()],
+                    open_effects: false,
+                }],
+            }],
+            required_authority: vec!["net".to_string()],
+        };
+
+        let manifest = BehaviorManifest::for_wasm(&root, &package, &wasm_path)
+            .unwrap()
+            .with_compiler_semantics(&inventory)
+            .unwrap();
+
+        assert_eq!(manifest.effects.len(), 1);
+        assert_eq!(manifest.actors.len(), 1);
+        assert_eq!(manifest.completeness.effects, "compiler-module-conservative");
+        assert_eq!(
+            manifest.completeness.authority,
+            "compiler-inferred-categories+package-declared"
+        );
+        assert!(manifest.authority.iter().any(|entry| {
+            entry.capability == "net"
+                && entry.source == "compiler-effect-inference"
+                && entry.status == "required-category"
+        }));
         let _ = fs::remove_dir_all(root);
     }
 
