@@ -143,6 +143,52 @@ impl SecretBroker {
     }
 }
 
+impl super::Runtime {
+    /// Execute a runtime Secret.* operation after the caller has applied
+    /// ordinary actor authority admission.
+    ///
+    /// `get`/`read` mint a VM-visible integer handle but do not read secret
+    /// material from any provider. The handle is valid only for the actor that
+    /// requested it. `revoke` invalidates a handle and returns whether the
+    /// caller owned a live entry.
+    pub(crate) fn perform_secret_builtin(
+        &mut self,
+        actor_id: Option<u64>,
+        op_name: Option<&str>,
+        constants: &[crate::bytecode::Constant],
+        regs: &[crate::vm::Value],
+    ) -> Option<crate::vm::Value> {
+        let owner_actor = actor_id.unwrap_or(0);
+        match op_name {
+            Some("get" | "read") => {
+                let value = *regs.first()?;
+                let name = crate::vm::resolve_value_string(constants, value);
+                let handle = self.secrets.issue(owner_actor, &name).ok()?;
+                Some(crate::vm::Value::int(handle as i64))
+            }
+            Some("revoke") => {
+                let raw = regs.first()?.as_int()?;
+                if raw <= 0 {
+                    return Some(crate::vm::Value::bool(false));
+                }
+                Some(crate::vm::Value::bool(
+                    self.secrets.revoke(owner_actor, raw as u64),
+                ))
+            }
+            Some("valid") => {
+                let raw = regs.first()?.as_int()?;
+                if raw <= 0 {
+                    return Some(crate::vm::Value::bool(false));
+                }
+                Some(crate::vm::Value::bool(
+                    self.secrets.resolve_name(owner_actor, raw as u64).is_some(),
+                ))
+            }
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
