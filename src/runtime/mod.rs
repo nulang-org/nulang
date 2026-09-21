@@ -3627,9 +3627,7 @@ impl Runtime {
             let trace_ctx = match &msg.trace_id {
                 Some(tp) => TraceContext::from_traceparent(tp)
                     .map(|incoming| incoming.child())
-                    .or_else(|| {
-                        tracing::enabled!(tracing::Level::TRACE).then(TraceContext::root)
-                    }),
+                    .or_else(|| tracing::enabled!(tracing::Level::TRACE).then(TraceContext::root)),
                 None => tracing::enabled!(tracing::Level::TRACE).then(TraceContext::root),
             };
             self.current_trace = trace_ctx;
