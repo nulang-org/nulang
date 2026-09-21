@@ -131,11 +131,33 @@ pub fn canonical_actor_definition_mir_bytes(
     module: &mir::Module,
     actor_name: &str,
 ) -> Result<Option<Vec<u8>>, SemanticIdentityError> {
-    let Some(actor) = module
+    let mut matches = module
         .actor_metadata
         .iter()
-        .find(|actor| actor.name == actor_name)
-    else {
+        .enumerate()
+        .filter(|(_, actor)| actor.name == actor_name)
+        .map(|(index, _)| index);
+    let Some(actor_index) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(SemanticIdentityError::AmbiguousActorName {
+            actor: actor_name.to_string(),
+        });
+    }
+    canonical_actor_definition_mir_bytes_at(module, actor_index)
+}
+
+/// Index-addressed actor-definition semantics.
+///
+/// Typed compiler code should prefer this entry point because MIR actor
+/// metadata currently stores short names. Index alignment with typed HIR
+/// preserves namespace-distinct definitions that share a short name.
+pub fn canonical_actor_definition_mir_bytes_at(
+    module: &mir::Module,
+    actor_index: usize,
+) -> Result<Option<Vec<u8>>, SemanticIdentityError> {
+    let Some(actor) = module.actor_metadata.get(actor_index) else {
         return Ok(None);
     };
 
@@ -290,6 +312,7 @@ fn collect_function_refs_from_rvalue(value: &RValue, out: &mut BTreeSet<usize>) 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticIdentityError {
     UnterminatedBlock { function: String, block: u32 },
+    AmbiguousActorName { actor: String },
 }
 
 impl fmt::Display for SemanticIdentityError {
@@ -298,6 +321,10 @@ impl fmt::Display for SemanticIdentityError {
             Self::UnterminatedBlock { function, block } => write!(
                 f,
                 "cannot derive semantic identity: MIR function '{function}' contains unterminated block {block}"
+            ),
+            Self::AmbiguousActorName { actor } => write!(
+                f,
+                "cannot derive actor semantic identity by short name '{actor}': multiple MIR actor definitions share that name"
             ),
         }
     }
@@ -1371,6 +1398,21 @@ mod tests {
                 .unwrap()
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn actor_definition_name_lookup_rejects_ambiguous_short_names() {
+        let mut module = mir::Module::new("ambiguous");
+        module.actor_metadata.push(ActorMeta::new("Counter"));
+        module.actor_metadata.push(ActorMeta::new("Counter"));
+
+        assert!(matches!(
+            canonical_actor_definition_mir_bytes(&module, "Counter"),
+            Err(SemanticIdentityError::AmbiguousActorName { .. })
+        ));
+        assert!(canonical_actor_definition_mir_bytes_at(&module, 1)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
