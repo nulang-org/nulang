@@ -1581,6 +1581,7 @@ unsafe fn call_closure_dispatch(fn_ptr: u64, all: &[u64]) -> u64 {
     }
 }
 
+#[cfg(feature = "native-aot")]
 macro_rules! define_aot_call_closure {
     ($name:ident, $($arg:ident),*) => {
         /// Invoke a closure value: an uncaptured closure is a tagged fn index
@@ -1624,14 +1625,23 @@ macro_rules! define_aot_call_closure {
     };
 }
 
+#[cfg(feature = "native-aot")]
 define_aot_call_closure!(nulang_aot_call_closure_0,);
+#[cfg(feature = "native-aot")]
 define_aot_call_closure!(nulang_aot_call_closure_1, a0);
+#[cfg(feature = "native-aot")]
 define_aot_call_closure!(nulang_aot_call_closure_2, a0, a1);
+#[cfg(feature = "native-aot")]
 define_aot_call_closure!(nulang_aot_call_closure_3, a0, a1, a2);
+#[cfg(feature = "native-aot")]
 define_aot_call_closure!(nulang_aot_call_closure_4, a0, a1, a2, a3);
+#[cfg(feature = "native-aot")]
 define_aot_call_closure!(nulang_aot_call_closure_5, a0, a1, a2, a3, a4);
+#[cfg(feature = "native-aot")]
 define_aot_call_closure!(nulang_aot_call_closure_6, a0, a1, a2, a3, a4, a5);
+#[cfg(feature = "native-aot")]
 define_aot_call_closure!(nulang_aot_call_closure_7, a0, a1, a2, a3, a4, a5, a6);
+#[cfg(feature = "native-aot")]
 define_aot_call_closure!(nulang_aot_call_closure_8, a0, a1, a2, a3, a4, a5, a6, a7);
 
 // ---------------------------------------------------------------------------
@@ -1647,6 +1657,7 @@ define_aot_call_closure!(nulang_aot_call_closure_8, a0, a1, a2, a3, a4, a5, a6, 
 // (LLM.ask, Timer.sleep with a positive delay) degrade to nil — the native
 // backend has no VM suspension, so the actor cannot be parked mid-behavior.
 
+#[cfg(feature = "native-aot")]
 macro_rules! define_aot_perform_async {
     ($name:ident, $($arg:ident),*) => {
         /// Dispatch an async effect from AOT-compiled code.
@@ -1675,14 +1686,23 @@ macro_rules! define_aot_perform_async {
     };
 }
 
+#[cfg(feature = "native-aot")]
 define_aot_perform_async!(nulang_aot_perform_async_0,);
+#[cfg(feature = "native-aot")]
 define_aot_perform_async!(nulang_aot_perform_async_1, a0);
+#[cfg(feature = "native-aot")]
 define_aot_perform_async!(nulang_aot_perform_async_2, a0, a1);
+#[cfg(feature = "native-aot")]
 define_aot_perform_async!(nulang_aot_perform_async_3, a0, a1, a2);
+#[cfg(feature = "native-aot")]
 define_aot_perform_async!(nulang_aot_perform_async_4, a0, a1, a2, a3);
+#[cfg(feature = "native-aot")]
 define_aot_perform_async!(nulang_aot_perform_async_5, a0, a1, a2, a3, a4);
+#[cfg(feature = "native-aot")]
 define_aot_perform_async!(nulang_aot_perform_async_6, a0, a1, a2, a3, a4, a5);
+#[cfg(feature = "native-aot")]
 define_aot_perform_async!(nulang_aot_perform_async_7, a0, a1, a2, a3, a4, a5, a6);
+#[cfg(feature = "native-aot")]
 define_aot_perform_async!(nulang_aot_perform_async_8, a0, a1, a2, a3, a4, a5, a6, a7);
 
 // ---------------------------------------------------------------------------
