@@ -480,7 +480,7 @@ fn stress_mailbox_never_drops_system_messages() {
     for i in 0..1_000 {
         let msg = Message {
             behavior_id: 1,
-            payload: Arc::new(vec![Value::int(i)]),
+            payload: MessagePayload::from_slice(&[Value::int(i)]),
             sender: 0,
             priority: MessagePriority::Normal,
             trace_id: None,
@@ -1389,7 +1389,7 @@ fn stress_mailbox_system_priority_preservation() {
     for i in 0..1_000 {
         let msg = Message {
             behavior_id: 1,
-            payload: Arc::new(vec![Value::int(i)]),
+            payload: MessagePayload::from_slice(&[Value::int(i)]),
             sender: 0,
             priority: MessagePriority::Normal,
             trace_id: None,
