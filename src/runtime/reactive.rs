@@ -10,7 +10,7 @@
 //! query. Scopes are stackable; every read is recorded in every active scope,
 //! which makes an outer query depend on fields read by nested queries.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
 /// Runtime-local identity of one actor-state field value.
@@ -115,11 +115,20 @@ impl StateReadSet {
 #[derive(Debug, Default)]
 pub(crate) struct ReactiveReadTracker {
     scopes: RefCell<Vec<StateReadSet>>,
+    /// Fast-path depth check used by every StateGet. Keeping this separate
+    /// avoids borrowing the scope vector when no query is being tracked.
+    active_depth: Cell<usize>,
 }
 
 impl ReactiveReadTracker {
     pub(crate) fn begin(&self) {
         self.scopes.borrow_mut().push(StateReadSet::default());
+        self.active_depth.set(self.active_depth.get() + 1);
+    }
+
+    #[inline]
+    pub(crate) fn is_active(&self) -> bool {
+        self.active_depth.get() != 0
     }
 
     /// Record a read in every active scope.
@@ -128,18 +137,22 @@ impl ReactiveReadTracker {
     /// outer subscription: if A queries B and B reads `B.status`, A's read set
     /// also contains that dependency.
     pub(crate) fn record(&self, actor_id: u64, field: &str, version: StateVersion) {
+        debug_assert!(self.is_active());
         for scope in self.scopes.borrow_mut().iter_mut() {
             scope.record(actor_id, field, version);
         }
     }
 
     pub(crate) fn finish(&self) -> Option<StateReadSet> {
-        self.scopes.borrow_mut().pop()
+        let mut scopes = self.scopes.borrow_mut();
+        let result = scopes.pop();
+        self.active_depth.set(scopes.len());
+        result
     }
 
     #[cfg(test)]
     fn depth(&self) -> usize {
-        self.scopes.borrow().len()
+        self.active_depth.get()
     }
 }
 
