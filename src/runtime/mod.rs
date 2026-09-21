@@ -5014,6 +5014,20 @@ impl Runtime {
                     return None;
                 }
             };
+        if let Some(event) = self.persistence.read_events(actor_id).into_iter().find(|event| {
+            !durable_schema_compatible(
+                event.schema_owner.as_deref(),
+                event.schema_version,
+                schema_owner.as_deref(),
+                schema_version,
+            )
+        }) {
+            warn!(
+                "nulang-recover: refusing actor {} because event sequence {} was committed under incompatible schema {:?}@v{}",
+                actor_id, event.sequence, event.schema_owner, event.schema_version
+            );
+            return None;
+        }
         let authority_manifest =
             match crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens) {
                 Ok(manifest) => manifest,
