@@ -247,6 +247,12 @@ struct MigrationDistributedCallbacks {
 }
 
 impl DistributedVmCallbacks for MigrationDistributedCallbacks {
+    fn node_id(&self) -> u64 {
+        self.violation
+            .record("migration transform attempted to observe runtime node identity");
+        0
+    }
+
     fn migrate(&mut self, _actor_id: u64, _target_node_id: u64) {
         self.violation
             .record("migration transform attempted actor node migration");
@@ -630,9 +636,12 @@ pub(crate) fn migrate_snapshot_state(
         if *model != StateModel::Durable {
             continue;
         }
-        let Some(value) = actor.get_state_field(name) else {
-            continue;
-        };
+        let value = actor.get_state_field(name).ok_or_else(|| {
+            format!(
+                "migration for '{}' did not produce required durable field '{}'",
+                meta.name, name
+            )
+        })?;
         state.insert(
             name.clone(),
             persist_migrated_value(&actor, name, &value)?,
@@ -780,6 +789,36 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("old-schema journal entries"), "{error}");
+    }
+
+    #[test]
+    fn refuses_event_sourced_schema_until_event_executor_exists() {
+        let module = compile_module(
+            r#"
+            entity Counter {
+                version: 2
+                state event_sourced count: Int = 0
+                migration from 1 to 2 {
+                    state => { self.count = self.count + 1 }
+                }
+            }
+            "#,
+        );
+        let snapshot = ActorSnapshot {
+            actor_id: 46,
+            sequence: 1,
+            schema_owner: Some("Counter".to_string()),
+            schema_version: 1,
+            ..ActorSnapshot::default()
+        };
+
+        let error = migrate_snapshot_state(
+            &module,
+            &snapshot,
+            StateMigrationHistory::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("event-sourced field"), "{error}");
     }
 
     #[test]
