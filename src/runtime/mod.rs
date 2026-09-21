@@ -1631,14 +1631,21 @@ impl Runtime {
                         }
                     }
                     let seq = self.next_sequence(actor_id);
-                    let _ = self.persistence.append_workflow_event(
+                    if let Err(error) = workflow::commit_workflow_event(
+                        self,
                         actor_id,
                         WorkflowEvent::StepCompleted {
                             sequence: seq,
                             step_name,
                         },
-                    );
-                    self.checkpoint_actor(actor_id);
+                    ) {
+                        warn!(
+                            "nulang-persist: resumed workflow completion commit failed for actor {} at sequence {}: {}",
+                            actor_id,
+                            seq,
+                            error
+                        );
+                    }
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
