@@ -2683,6 +2683,76 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_time_only_decls_do_not_enter_hir() {
+        let span = Span::default();
+        let main = Decl::Function {
+            name: "__main".to_string(),
+            type_params: vec![],
+            type_param_constraints: vec![],
+            params: vec![],
+            default_values: vec![],
+            using_params: vec![],
+            ret_type: Some(Type::unit()),
+            error_type: None,
+            effect: None,
+            cap: None,
+            requires: vec![],
+            ensures: vec![],
+            body: Expr::Literal(Literal::Unit, span),
+            annotations: vec![],
+            public: true,
+            span,
+        };
+        let ast = ast::AstModule {
+            name: "test".to_string(),
+            decls: vec![
+                Decl::Signal {
+                    name: "count".to_string(),
+                    ty: Type::int(),
+                    init: Expr::Literal(Literal::Int(0), span),
+                    span,
+                },
+                Decl::Given {
+                    name: "request_id".to_string(),
+                    ty: Some(Type::string()),
+                    value: Expr::Literal(Literal::String("id".to_string()), span),
+                    span,
+                },
+                Decl::Database {
+                    name: "AppDb".to_string(),
+                    tables: vec![],
+                    span,
+                },
+                Decl::Module {
+                    name: "Nested".to_string(),
+                    exports: vec![],
+                    decls: vec![
+                        Decl::Database {
+                            name: "NestedDb".to_string(),
+                            tables: vec![],
+                            span,
+                        },
+                        main.clone(),
+                    ],
+                    span,
+                },
+                main,
+            ],
+        };
+
+        let hir = lower_module(&ast, &FxHashMap::default());
+        assert_eq!(hir.decls.len(), 2);
+        assert!(matches!(hir.decls[0], hir::Decl::Module { .. }));
+        assert!(matches!(hir.decls[1], hir::Decl::Function(_)));
+
+        let hir::Decl::Module { decls, .. } = &hir.decls[0] else {
+            unreachable!()
+        };
+        assert_eq!(decls.len(), 1);
+        assert!(matches!(decls[0], hir::Decl::Function(_)));
+    }
+
+    #[test]
     fn test_lower_if_is_expression_positioned() {
         // `let x = if c then 1 else 2 in x` must keep the if as an RValue so
         // statements after it stay in evaluation order.
