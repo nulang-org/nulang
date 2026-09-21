@@ -249,7 +249,9 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             }
         }
         Decl::Extern { library, funcs, .. } => {
-            out.push_str(&format!("{}extern \"{}\" {{\n", sp, library));
+            out.push_str(&format!("{}extern ", sp));
+            push_string_literal(out, library);
+            out.push_str(" {\n");
             for f in funcs {
                 out.push_str(&format!("{}    fn {}(", sp, f.name));
                 for (j, (pn, pt)) in f.params.iter().enumerate() {
@@ -636,7 +638,9 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
             out.push_str("f\"");
             for part in parts {
                 match part {
-                    Expr::Literal(Literal::String(s), _) => out.push_str(s),
+                    Expr::Literal(Literal::String(s), _) => {
+                        push_escaped_string_content(out, s)
+                    },
                     e => {
                         out.push_str("{");
                         fmt_expr(out, e, indent, had_unhandled);
@@ -649,7 +653,7 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
         Expr::Literal(lit, _) => match lit {
             Literal::Int(n) => out.push_str(&n.to_string()),
             Literal::Float(f) => out.push_str(&f.to_string()),
-            Literal::String(s) => out.push_str(&format!("\"{}\"", s)),
+            Literal::String(s) => push_string_literal(out, s),
             Literal::Bool(b) => out.push_str(&b.to_string()),
             Literal::Nil => out.push_str("nil"),
             Literal::Unit => out.push_str("unit"),
@@ -1050,7 +1054,8 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
                 out.push(']');
             }
             if let Some(reg) = register_as {
-                out.push_str(&format!(" as \"{}\"", reg));
+                out.push_str(" as ");
+                push_string_literal(out, reg);
             }
         }
         Expr::Handle { body, handlers, .. } => {
@@ -1152,9 +1157,9 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
             fmt_expr(out, body, indent, had_unhandled);
         }
         Expr::Panic(msg, _) => {
-            out.push_str("panic(\"");
-            out.push_str(msg);
-            out.push_str("\")");
+            out.push_str("panic(");
+            push_string_literal(out, msg);
+            out.push(')');
         }
     }
 }
@@ -1165,7 +1170,7 @@ fn fmt_pat(out: &mut String, pat: &Pattern) {
         Pattern::Var(name) => out.push_str(name),
         Pattern::Lit(lit) => match lit {
             Literal::Int(n) => out.push_str(&n.to_string()),
-            Literal::String(s) => out.push_str(&format!("\"{}\"", s)),
+            Literal::String(s) => push_string_literal(out, s),
             Literal::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
             _ => out.push_str("_"),
         },
@@ -1248,6 +1253,27 @@ fn op_sym(op: BinOp) -> &'static str {
     }
 }
 
+fn push_escaped_string_content(out: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+}
+
+fn push_string_literal(out: &mut String, value: &str) {
+    out.push('"');
+    push_escaped_string_content(out, value);
+    out.push('"');
+}
+
 fn fmt_type(ty: &Type) -> String {
     format!("{}", ty)
 }
@@ -1306,6 +1332,17 @@ mod tests {
     fn test_fmt_import() {
         let out = format_source("import Foo::Bar").expect("import formats");
         assert!(out.contains("import Foo::Bar"), "got: {out}");
+    }
+
+    #[test]
+    fn test_fmt_string_literals_escape_and_roundtrip() {
+        let src = r#"fn main() { "a\nb\tc\"d\\e" }"#;
+        let out = format_source(src).expect("escaped string formats");
+        assert!(
+            out.contains(r#""a\nb\tc\"d\\e""#),
+            "formatter must re-escape decoded string data: {out}"
+        );
+        assert_idempotent(src);
     }
 
     #[test]
