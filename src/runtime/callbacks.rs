@@ -2174,10 +2174,7 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             };
             // Ownership is established only by commit_receive_match after
             // the pattern+guard succeeds.
-            Some((
-                pos,
-                payload.to_vec(),
-            ))
+            Some((pos, payload.to_vec()))
         }
     }
 
