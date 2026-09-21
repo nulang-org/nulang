@@ -123,6 +123,11 @@ Conceptual initial shape:
     "version": "0.1.0",
     "digest": "blake3:..."
   },
+  "host_abi": {
+    "schema": "nulang.host-effects/v0alpha1",
+    "required_operations": [],
+    "requires_legacy_extension_dispatch": false
+  },
   "interfaces": [],
   "actors": [],
   "effects": [],
@@ -135,6 +140,25 @@ Conceptual initial shape:
 ```
 
 The exact JSON schema is implementation work following this RFC; the semantic requirements below are normative for the proposal.
+
+## Host effect ABI binding
+
+`host_abi` is enforcement-relevant deployment metadata, not an advisory
+extension. It binds the exact artifact to the compiler-owned host ABI version
+and the canonical host-operation identities present in the artifact.
+
+`required_operations` contains only canonical operation identities such as
+`nulang.host-effects/v0alpha1:nulang:storage/string#Write`; deployment systems
+must not reconstruct these identities from source spellings such as
+`Storage.write`.
+
+During the v0alpha1 migration, `requires_legacy_extension_dispatch` is true
+when the artifact still contains an unresolved custom/legacy generic host
+dispatch. A canonical-only deployment profile must reject such an artifact
+rather than silently interpreting the source-level operation name.
+
+The compiler derives this field from the same checked/lowered unit that emits
+the artifact. Post-build source re-analysis is not an acceptable substitute.
 
 ## Interfaces
 
