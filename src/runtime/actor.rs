@@ -194,7 +194,7 @@ pub struct Actor {
     pub event_sourced_sequences: HashMap<String, u64>,
     /// How many events between compaction snapshots for EventSourced fields (default 100).
     pub event_sourced_compaction_interval: u64,
-    pub persistent: bool,  // Whether this actor survives restarts
+    pub persistent: bool, // Whether this actor survives restarts
     /// Compiler-owned declaration that defines this actor's durable schema.
     /// None for native/legacy actors without bytecode schema metadata.
     pub schema_owner: Option<String>,
