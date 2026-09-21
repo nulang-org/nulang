@@ -123,6 +123,7 @@ pub use resp_cache::*;
 pub use scheduler::*;
 pub use supervisor::*;
 pub use timer::*;
+pub use workflow::WorkflowQueryError;
 
 use crate::types::{ExitReason, NuError, Span, VmSuspension};
 use crate::vm::Value;
@@ -1184,6 +1185,17 @@ impl Runtime {
         workflow::query_workflow(self, actor_id, name)
     }
 
+    /// Checked query execution. Unlike `query_workflow`, this preserves
+    /// lookup, purity, and execution failures for callers that must not cache
+    /// or publish an invalid result.
+    pub fn query_workflow_checked(
+        &mut self,
+        actor_id: u64,
+        name: &str,
+    ) -> Result<Value, WorkflowQueryError> {
+        workflow::query_workflow_checked(self, actor_id, name)
+    }
+
     /// Invoke a workflow query and return both its value and the exact
     /// actor-state dependencies observed while evaluating it.
     ///
@@ -1196,6 +1208,15 @@ impl Runtime {
         name: &str,
     ) -> Option<(Value, StateReadSet)> {
         workflow::query_workflow_with_dependencies(self, actor_id, name)
+    }
+
+    /// Checked dependency-tracking query execution for subscriptions.
+    pub fn query_workflow_with_dependencies_checked(
+        &mut self,
+        actor_id: u64,
+        name: &str,
+    ) -> Result<(Value, StateReadSet), WorkflowQueryError> {
+        workflow::query_workflow_with_dependencies_checked(self, actor_id, name)
     }
 
     /// Drain completed background LLM calls and resume the suspended actors
