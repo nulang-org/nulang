@@ -36,7 +36,6 @@ fn bench_event_replay(c: &mut Criterion) {
     });
 }
 
-
 fn bench_durable_change_tail_scan(c: &mut Criterion) {
     use nulang::runtime::{
         scan_durable_changes, DurableChangeCursor, DurableChangeLane, EventEntry, MemoryStore,
