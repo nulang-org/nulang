@@ -530,9 +530,10 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             mutable,
             ..
         } => {
-            out.push_str(&format!("{}let ", sp));
             if *mutable {
-                out.push_str("mut ");
+                out.push_str(&format!("{}var ", sp));
+            } else {
+                out.push_str(&format!("{}let ", sp));
             }
             out.push_str(name);
             if let Some(t) = type_ann {
@@ -652,9 +653,22 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
         Expr::Var(name, _) => out.push_str(name),
         Expr::SelfRef(_) => out.push_str("self"),
         Expr::Let {
-            name, value, body, ..
+            name,
+            ty,
+            value,
+            body,
+            mutable,
+            ..
         } => {
-            out.push_str(&format!("let {} = ", name));
+            if *mutable {
+                out.push_str(&format!("var {}", name));
+            } else {
+                out.push_str(&format!("let {}", name));
+            }
+            if let Some(ty) = ty {
+                out.push_str(&format!(": {}", fmt_type(ty)));
+            }
+            out.push_str(" = ");
             fmt_expr(out, value, indent, had_unhandled);
             out.push_str(" in\n");
             fmt_expr(out, body, indent, had_unhandled);
@@ -903,11 +917,21 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
             actor,
             behavior,
             args,
+            remote,
             ..
         } => {
-            out.push_str("send ");
-            fmt_expr(out, actor, indent, had_unhandled);
-            out.push_str(&format!(" {}(", behavior));
+            if *remote {
+                // The operator form has no explicit remote marker, so preserve
+                // distributed semantics with the keyword spelling.
+                out.push_str("send remote ");
+                fmt_expr(out, actor, indent, had_unhandled);
+                out.push_str(&format!(" {}(", behavior));
+            } else {
+                // Canonical local send: visually preserves the actor boundary
+                // while avoiding a second ordinary keyword-call spelling.
+                fmt_expr(out, actor, indent, had_unhandled);
+                out.push_str(&format!(" ! {}(", behavior));
+            }
             for (i, a) in args.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
@@ -920,9 +944,14 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
             actor,
             behavior,
             args,
+            remote,
+            timeout_ms,
             ..
         } => {
             out.push_str("ask ");
+            if *remote {
+                out.push_str("remote ");
+            }
             fmt_expr(out, actor, indent, had_unhandled);
             out.push_str(&format!(" {}(", behavior));
             for (i, a) in args.iter().enumerate() {
@@ -932,6 +961,9 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
                 fmt_expr(out, a, indent, had_unhandled);
             }
             out.push(')');
+            if let Some(ms) = timeout_ms {
+                out.push_str(&format!(" timeout {}", ms));
+            }
         }
         Expr::Spawn {
             actor_type,
@@ -1394,6 +1426,58 @@ fn main() {
         assert!(out.contains("spawn Greeter()"), "got: {out}");
         assert!(out.contains("receive {"), "got: {out}");
         assert!(out.contains("emit Event(1)"), "got: {out}");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_var_preserves_mutability_and_type_annotation() {
+        let src = r#"
+fn main() {
+    var count: Int = 0
+    count = count + 1
+    count
+}"#;
+        let out = format_source(src).expect("mutable binding formats");
+        assert!(out.contains("var count: Int = 0"), "got: {out}");
+        assert!(!out.contains("let count: Int = 0"), "mutability lost: {out}");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_send_uses_bang_locally_and_preserves_remote() {
+        let src = r#"
+actor Worker {
+    behavior ping(x: Int) { x }
+}
+fn main() {
+    let w = spawn Worker()
+    send w ping(1)
+    send remote w ping(2)
+}"#;
+        let out = format_source(src).expect("send formats");
+        assert!(out.contains("w ! ping(1)"), "local send not canonicalized: {out}");
+        assert!(
+            out.contains("send remote w ping(2)"),
+            "remote send semantics lost: {out}"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_ask_preserves_remote_and_timeout() {
+        let src = r#"
+actor Worker {
+    behavior get() { 1 }
+}
+fn main() {
+    let w = spawn Worker()
+    ask remote w get() timeout 2500
+}"#;
+        let out = format_source(src).expect("ask formats");
+        assert!(
+            out.contains("ask remote w get() timeout 2500"),
+            "remote ask transport metadata lost: {out}"
+        );
         assert_idempotent(src);
     }
 }
