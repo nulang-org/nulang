@@ -677,3 +677,359 @@ pub fn rtree_query_intersects[CRS, T](
         None => [],
     }
 }
+
+
+/// Return true when inner is fully contained by outer.
+pub fn bounds_contains_bounds[CRS](
+    outer: BoundingBox[CRS],
+    inner: BoundingBox[CRS]
+) -> Bool {
+    inner.min_x >= outer.min_x &&
+    inner.min_y >= outer.min_y &&
+    inner.max_x <= outer.max_x &&
+    inner.max_y <= outer.max_y
+}
+
+fn rtree_entry_center_x[CRS, T](entry: RTreeEntry[CRS, T]) -> Float {
+    (entry.bounds.min_x + entry.bounds.max_x) / 2.0
+}
+
+fn rtree_entry_center_y[CRS, T](entry: RTreeEntry[CRS, T]) -> Float {
+    (entry.bounds.min_y + entry.bounds.max_y) / 2.0
+}
+
+fn rtree_copy_entries[CRS, T](
+    entries: [RTreeEntry[CRS, T]]
+) -> [RTreeEntry[CRS, T]] {
+    var result: [RTreeEntry[CRS, T]] = [];
+    for entry in entries {
+        result = perform Array.push(result, entry)
+    };
+    result
+}
+
+fn rtree_sort_entries_by_x[CRS, T](
+    entries: [RTreeEntry[CRS, T]]
+) -> [RTreeEntry[CRS, T]] {
+    var result = rtree_copy_entries(entries);
+    var i = 1;
+    let n = perform Array.length(result);
+    while i < n {
+        let current = result[i];
+        let current_center = rtree_entry_center_x(current);
+        var j = i;
+        while j > 0 && rtree_entry_center_x(result[j - 1]) > current_center {
+            result[j] = result[j - 1];
+            j = j - 1
+        };
+        result[j] = current;
+        i = i + 1
+    };
+    result
+}
+
+fn rtree_sort_entries_by_y[CRS, T](
+    entries: [RTreeEntry[CRS, T]]
+) -> [RTreeEntry[CRS, T]] {
+    var result = rtree_copy_entries(entries);
+    var i = 1;
+    let n = perform Array.length(result);
+    while i < n {
+        let current = result[i];
+        let current_center = rtree_entry_center_y(current);
+        var j = i;
+        while j > 0 && rtree_entry_center_y(result[j - 1]) > current_center {
+            result[j] = result[j - 1];
+            j = j - 1
+        };
+        result[j] = current;
+        i = i + 1
+    };
+    result
+}
+
+fn rtree_ceil_div(value: Int, divisor: Int) -> Int {
+    (value + divisor - 1) / divisor
+}
+
+fn rtree_ceil_sqrt(value: Int) -> Int {
+    if value <= 1 then {
+        1
+    } else {
+        var root = 1;
+        while root * root < value {
+            root = root + 1
+        };
+        root
+    }
+}
+
+fn rtree_entry_slice[CRS, T](
+    entries: [RTreeEntry[CRS, T]],
+    start: Int,
+    end: Int
+) -> [RTreeEntry[CRS, T]] {
+    var result: [RTreeEntry[CRS, T]] = [];
+    var i = start;
+    while i < end {
+        result = perform Array.push(result, entries[i]);
+        i = i + 1
+    };
+    result
+}
+
+fn rtree_make_str_leaves[CRS, T](
+    entries: [RTreeEntry[CRS, T]],
+    fanout: Int
+) -> [RTreeNode[CRS, T]] {
+    let n = perform Array.length(entries);
+    let leaf_count = rtree_ceil_div(n, fanout);
+    let slice_count = rtree_ceil_sqrt(leaf_count);
+    let slice_size = rtree_ceil_div(n, slice_count);
+    let by_x = rtree_sort_entries_by_x(entries);
+
+    var leaves: [RTreeNode[CRS, T]] = [];
+    var slice_start = 0;
+    while slice_start < n {
+        let proposed_end = slice_start + slice_size;
+        let slice_end = if proposed_end < n then proposed_end else n;
+        let vertical = rtree_entry_slice(by_x, slice_start, slice_end);
+        let by_y = rtree_sort_entries_by_y(vertical);
+
+        var group_start = 0;
+        let slice_n = perform Array.length(by_y);
+        while group_start < slice_n {
+            let proposed_group_end = group_start + fanout;
+            let group_end =
+                if proposed_group_end < slice_n then proposed_group_end
+                else slice_n;
+            let group = rtree_entry_slice(by_y, group_start, group_end);
+            leaves = perform Array.push(leaves, rtree_make_leaf(group));
+            group_start = group_end
+        };
+
+        slice_start = slice_end
+    };
+    leaves
+}
+
+/// Build an immutable R-tree with Sort-Tile-Recursive style packing.
+///
+/// Entries are sorted by x-center, divided into vertical slices, sorted by
+/// y-center inside each slice, and grouped by fanout. Higher levels reuse the
+/// stable parent builder. This captures the dominant leaf-locality benefit
+/// while keeping the public RTree representation and query semantics unchanged.
+pub fn rtree_bulk_load_str[CRS, T](
+    entries: [RTreeEntry[CRS, T]],
+    crs: CRS,
+    fanout: Int
+) -> RTree[CRS, T] {
+    let effective_fanout = if fanout < 2 then 2 else fanout;
+    let n = perform Array.length(entries);
+    if n == 0 then {
+        let empty: RTree[CRS, T] = { root: None, crs: crs, size: 0, fanout: effective_fanout };
+        empty
+    } else {
+        let leaves = rtree_make_str_leaves(entries, effective_fanout);
+        let tree: RTree[CRS, T] = { root: Some(rtree_build_root(leaves, effective_fanout)), crs: crs, size: n, fanout: effective_fanout };
+        tree
+    }
+}
+
+fn rtree_query_point_node[CRS, T](
+    node: RTreeNode[CRS, T],
+    query: Point[CRS]
+) -> [T] {
+    match node {
+        RTreeLeaf((bounds, entries)) => {
+            var results: [T] = [];
+            if contains(bounds, query) then {
+                for entry in entries {
+                    if contains(entry.bounds, query) then {
+                        results = perform Array.push(results, entry.value)
+                    } else {}
+                }
+            } else {};
+            results
+        },
+        RTreeBranch((bounds, children)) => {
+            var results: [T] = [];
+            if contains(bounds, query) then {
+                for child in children {
+                    let child_results = rtree_query_point_node(child, query);
+                    for value in child_results {
+                        results = perform Array.push(results, value)
+                    }
+                }
+            } else {};
+            results
+        },
+    }
+}
+
+/// Return payloads whose indexed bounds contain point.
+pub fn rtree_query_point[CRS, T](
+    tree: RTree[CRS, T],
+    query: Point[CRS]
+) -> [T] {
+    match tree.root {
+        Some(root) => rtree_query_point_node(root, query),
+        None => [],
+    }
+}
+
+fn rtree_collect_node_values[CRS, T](
+    node: RTreeNode[CRS, T]
+) -> [T] {
+    match node {
+        RTreeLeaf((_, entries)) => {
+            var results: [T] = [];
+            for entry in entries {
+                results = perform Array.push(results, entry.value)
+            };
+            results
+        },
+        RTreeBranch((_, children)) => {
+            var results: [T] = [];
+            for child in children {
+                let child_values = rtree_collect_node_values(child);
+                for value in child_values {
+                    results = perform Array.push(results, value)
+                }
+            };
+            results
+        },
+    }
+}
+
+fn rtree_query_contained_node[CRS, T](
+    node: RTreeNode[CRS, T],
+    query: BoundingBox[CRS]
+) -> [T] {
+    let bounds = rtree_node_bounds(node);
+    if !intersects(bounds, query) then {
+        []
+    } else if bounds_contains_bounds(query, bounds) then {
+        rtree_collect_node_values(node)
+    } else {
+        match node {
+            RTreeLeaf((_, entries)) => {
+                var results: [T] = [];
+                for entry in entries {
+                    if bounds_contains_bounds(query, entry.bounds) then {
+                        results = perform Array.push(results, entry.value)
+                    } else {}
+                };
+                results
+            },
+            RTreeBranch((_, children)) => {
+                var results: [T] = [];
+                for child in children {
+                    let child_results = rtree_query_contained_node(child, query);
+                    for value in child_results {
+                        results = perform Array.push(results, value)
+                    }
+                };
+                results
+            },
+        }
+    }
+}
+
+/// Return payloads whose indexed bounds are fully contained by query.
+pub fn rtree_query_contained_by[CRS, T](
+    tree: RTree[CRS, T],
+    query: BoundingBox[CRS]
+) -> [T] {
+    match tree.root {
+        Some(root) => rtree_query_contained_node(root, query),
+        None => [],
+    }
+}
+
+/// Diagnostics from one R-tree intersection query.
+pub type RTreeQueryStats = {
+    nodes_tested: Int,
+    entries_tested: Int,
+    matches: Int
+}
+
+/// Intersection results paired with traversal diagnostics.
+pub type RTreeQueryResult[T] = {
+    values: [T],
+    stats: RTreeQueryStats
+}
+
+fn rtree_empty_query_stats() -> RTreeQueryStats {
+    let stats: RTreeQueryStats = { nodes_tested: 0, entries_tested: 0, matches: 0 };
+    stats
+}
+
+fn rtree_query_result[T](
+    values: [T],
+    nodes_tested: Int,
+    entries_tested: Int,
+    matches: Int
+) -> RTreeQueryResult[T] {
+    let stats: RTreeQueryStats = { nodes_tested: nodes_tested, entries_tested: entries_tested, matches: matches };
+    let result: RTreeQueryResult[T] = { values: values, stats: stats };
+    result
+}
+
+fn rtree_query_node_with_stats[CRS, T](
+    node: RTreeNode[CRS, T],
+    query: BoundingBox[CRS]
+) -> RTreeQueryResult[T] {
+    match node {
+        RTreeLeaf((bounds, entries)) => {
+            var values: [T] = [];
+            var entries_tested = 0;
+            var matches = 0;
+            if intersects(bounds, query) then {
+                for entry in entries {
+                    entries_tested = entries_tested + 1;
+                    if intersects(entry.bounds, query) then {
+                        values = perform Array.push(values, entry.value);
+                        matches = matches + 1
+                    } else {}
+                }
+            } else {};
+            rtree_query_result(values, 1, entries_tested, matches)
+        },
+        RTreeBranch((bounds, children)) => {
+            var values: [T] = [];
+            var nodes_tested = 1;
+            var entries_tested = 0;
+            var matches = 0;
+            if intersects(bounds, query) then {
+                for child in children {
+                    let child_result = rtree_query_node_with_stats(child, query);
+                    nodes_tested = nodes_tested + child_result.stats.nodes_tested;
+                    entries_tested = entries_tested + child_result.stats.entries_tested;
+                    matches = matches + child_result.stats.matches;
+                    for value in child_result.values {
+                        values = perform Array.push(values, value)
+                    }
+                }
+            } else {};
+            rtree_query_result(values, nodes_tested, entries_tested, matches)
+        },
+    }
+}
+
+/// Run an intersection query and return values plus traversal diagnostics.
+///
+/// The counters are intended for testing, tuning fanout/packing, and benchmark
+/// instrumentation. They do not alter query behavior.
+pub fn rtree_query_intersects_with_stats[CRS, T](
+    tree: RTree[CRS, T],
+    query: BoundingBox[CRS]
+) -> RTreeQueryResult[T] {
+    match tree.root {
+        Some(root) => rtree_query_node_with_stats(root, query),
+        None => {
+            let result: RTreeQueryResult[T] = { values: [], stats: rtree_empty_query_stats() };
+            result
+        },
+    }
+}
