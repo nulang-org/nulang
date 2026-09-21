@@ -259,17 +259,17 @@ mod tests {
         let plan = plan_entity_query(&actor(), &[QueryPredicate::eq("status")]).unwrap();
 
         assert_eq!(plan.access, LogicalAccessPath::EntityScan);
-        assert_eq!(
-            plan.residual_predicates,
-            vec![QueryPredicate::eq("status")]
-        );
+        assert_eq!(plan.residual_predicates, vec![QueryPredicate::eq("status")]);
     }
 
     #[test]
     fn range_filter_is_residual_in_phase_two_planner() {
         let plan = plan_entity_query(
             &actor(),
-            &[QueryPredicate::eq("company"), QueryPredicate::range("status")],
+            &[
+                QueryPredicate::eq("company"),
+                QueryPredicate::range("status"),
+            ],
         )
         .unwrap();
 
