@@ -365,6 +365,7 @@ mod tests {
                 ty: Some("UserId".to_string()),
                 capability: None,
                 request: None,
+                            body_schema: None,
             }],
             response_type: Some("User".to_string()),
             error_type: Some("UserError".to_string()),
