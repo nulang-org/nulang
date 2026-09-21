@@ -3554,6 +3554,12 @@ impl Runtime {
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn step_actor(&mut self, actor_id: u64) {
+        // Public/manual stepping commonly follows a direct scheduler dequeue.
+        // Claim that queued turn here as run_scheduler does internally so a
+        // partially drained mailbox can schedule exactly one follow-up turn.
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.scheduled = false;
+        }
         self.step_actor_impl(actor_id, true);
     }
 
