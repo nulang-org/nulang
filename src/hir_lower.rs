@@ -343,6 +343,27 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
                     })
                 })
                 .collect(),
+            migration_event_bodies: migrations
+                .iter()
+                .flat_map(|migration| {
+                    migration.event_migrations.iter().filter_map(move |(event, params, body)| {
+                        if event == "other" {
+                            return None;
+                        }
+                        Some(hir::MigrationEventBody {
+                            from_version: migration.from_version,
+                            to_version: migration.to_version,
+                            event: event.clone(),
+                            params: params
+                                .iter()
+                                .map(|name| (name.clone(), Type::unit()))
+                                .collect(),
+                            body: with_fresh_defer_stack(|| lower_body(body)),
+                            span: migration.span,
+                        })
+                    })
+                })
+                .collect(),
             is_workflow: false,
             is_organization: *is_organization,
             is_agent: false,
@@ -994,6 +1015,7 @@ fn desugar_agent(
         version: 1,
         migrations: Vec::new(),
         migration_state_bodies: Vec::new(),
+        migration_event_bodies: Vec::new(),
         is_workflow: false,
         is_organization: false,
         is_agent: true,
@@ -1165,6 +1187,7 @@ fn desugar_workflow(name: &str, items: &[ast::WorkflowItem], span: Span) -> hir:
         version: 1,
         migrations: Vec::new(),
         migration_state_bodies: Vec::new(),
+        migration_event_bodies: Vec::new(),
         is_workflow: true,
         is_organization: false,
         is_agent: false,
