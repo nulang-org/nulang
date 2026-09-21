@@ -21,6 +21,8 @@ pub(crate) fn spawn_actor_with_models(
     state_models: HashMap<String, StateModel>,
     persistent: bool,
     workflow: Option<&str>,
+    schema_owner: Option<&str>,
+    schema_version: u32,
 ) -> u64 {
     spawn_actor_with_id(
         rt,
@@ -29,6 +31,8 @@ pub(crate) fn spawn_actor_with_models(
         state_models,
         persistent,
         workflow,
+        schema_owner,
+        schema_version,
     )
 }
 
@@ -60,6 +64,8 @@ pub(crate) fn spawn_actor_with_id(
     state_models: HashMap<String, StateModel>,
     persistent: bool,
     workflow: Option<&str>,
+    schema_owner: Option<&str>,
+    schema_version: u32,
 ) -> u64 {
     let restart_snapshot = if persistent && workflow.is_none() {
         match preflight_persistent_snapshot(rt, id) {
@@ -77,7 +83,49 @@ pub(crate) fn spawn_actor_with_id(
         None
     };
 
+    if let Some((snapshot, _)) = restart_snapshot.as_ref() {
+        if !crate::runtime::persistence::durable_schema_compatible(
+            snapshot.schema_owner.as_deref(),
+            snapshot.schema_version,
+            schema_owner,
+            schema_version,
+        ) {
+            tracing::warn!(
+                actor_id = id,
+                persisted_schema_owner = ?snapshot.schema_owner,
+                current_schema_owner = ?schema_owner,
+                persisted_schema_version = snapshot.schema_version,
+                current_schema_version = schema_version,
+                "refusing to activate persistent actor with incompatible durable schema; migration execution is not implemented"
+            );
+            return id;
+        }
+    }
+
+    if persistent && workflow.is_none() {
+        if let Some(event) = rt.persistence.read_events(id).into_iter().find(|event| {
+            !crate::runtime::persistence::durable_schema_compatible(
+                event.schema_owner.as_deref(),
+                event.schema_version,
+                schema_owner,
+                schema_version,
+            )
+        }) {
+            tracing::warn!(
+                actor_id = id,
+                persisted_schema_owner = ?event.schema_owner,
+                current_schema_owner = ?schema_owner,
+                persisted_schema_version = event.schema_version,
+                current_schema_version = schema_version,
+                "refusing to replay incompatible event-sourced state; migration execution is not implemented"
+            );
+            return id;
+        }
+    }
+
     let mut actor = Actor::new(id, format!("actor_{}", id), 0);
+    actor.schema_owner = schema_owner.map(str::to_string);
+    actor.schema_version = schema_version;
     let state_fields = init();
     for (name, value) in state_fields {
         actor.set_state_field(name, value);
@@ -281,10 +329,27 @@ pub(crate) fn spawn_from_module(
             } else {
                 None
             },
+            Some(meta.name.as_str()),
+            meta.version,
         )
     } else {
-        spawn_actor_with_models(rt, Box::new(move || init), HashMap::new(), false, None)
+        spawn_actor_with_models(
+            rt,
+            Box::new(move || init),
+            HashMap::new(),
+            false,
+            None,
+            None,
+            1,
+        )
     };
+    if !rt.actors.contains_key(&id) {
+        tracing::warn!(
+            actor_id = id,
+            "spawn preflight rejected actor; refusing to return an unresolved actor reference"
+        );
+        return Value::nil();
+    }
     let offsets: Vec<usize> = bytecode_offsets_for_role(module, role);
     // compensation_offsets filtered to this actor's own behaviors so
     // step-local indices in run_saga_compensation match.
@@ -570,6 +635,8 @@ mod authority_tests {
             std::collections::HashMap::new(),
             true,
             None,
+            None,
+            1,
         );
 
         assert_eq!(returned, actor_id);
@@ -615,6 +682,8 @@ mod authority_tests {
             std::collections::HashMap::new(),
             true,
             None,
+            None,
+            1,
         );
 
         assert_eq!(returned, actor_id);
@@ -622,6 +691,98 @@ mod authority_tests {
         assert!(
             !rt.actors.contains_key(&actor_id),
             "invalid authority must not publish a runnable actor"
+        );
+    }
+
+    #[test]
+    fn incompatible_restart_schema_fails_before_init_or_publish() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let mut rt = Runtime::new();
+        let actor_id = 910_003;
+        rt.persistence
+            .save_snapshot(ActorSnapshot {
+                actor_id,
+                schema_owner: Some("Counter".to_string()),
+                schema_version: 1,
+                ..ActorSnapshot::default()
+            })
+            .unwrap();
+
+        let init_ran = Rc::new(Cell::new(false));
+        let init_flag = Rc::clone(&init_ran);
+        let returned = spawn_actor_with_id(
+            &mut rt,
+            actor_id,
+            Box::new(move || {
+                init_flag.set(true);
+                vec![]
+            }),
+            std::collections::HashMap::new(),
+            true,
+            None,
+            Some("Counter"),
+            2,
+        );
+
+        assert_eq!(returned, actor_id);
+        assert!(
+            !init_ran.get(),
+            "schema mismatch must abort before actor initialization"
+        );
+        assert!(
+            !rt.actors.contains_key(&actor_id),
+            "schema mismatch must not publish a runnable actor"
+        );
+    }
+
+    #[test]
+    fn incompatible_event_only_schema_fails_before_init_or_publish() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let mut rt = Runtime::new();
+        let actor_id = 910_004;
+        rt.persistence
+            .append_event(
+                actor_id,
+                crate::runtime::persistence::EventEntry {
+                    sequence: 1,
+                    schema_owner: None,
+                    schema_version: 1,
+                    field_name: "counter".to_string(),
+                    event_name: "Incremented".to_string(),
+                    args: vec![PersistedValue::Int(1)],
+                    value: PersistedValue::Int(1),
+                },
+            )
+            .unwrap();
+
+        let init_ran = Rc::new(Cell::new(false));
+        let init_flag = Rc::clone(&init_ran);
+        let returned = spawn_actor_with_id(
+            &mut rt,
+            actor_id,
+            Box::new(move || {
+                init_flag.set(true);
+                vec![]
+            }),
+            std::collections::HashMap::new(),
+            true,
+            None,
+            Some("Counter"),
+            2,
+        );
+
+        assert_eq!(returned, actor_id);
+        assert!(
+            !init_ran.get(),
+            "event-log schema mismatch must abort before actor initialization"
+        );
+        assert!(
+            !rt.actors.contains_key(&actor_id),
+            "incompatible event-only state must not publish a runnable actor"
         );
     }
 }

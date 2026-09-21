@@ -124,12 +124,46 @@ impl PersistedValue {
     }
 }
 
+fn default_schema_version() -> u32 {
+    1
+}
+
+/// Compare persisted durable schema metadata with the currently executing
+/// declaration. Owner-less metadata is accepted only as the legacy v1 shape;
+/// once a writer has emitted an owner, losing that identity is never treated
+/// as compatible.
+pub(crate) fn durable_schema_compatible(
+    persisted_owner: Option<&str>,
+    persisted_version: u32,
+    current_owner: Option<&str>,
+    current_version: u32,
+) -> bool {
+    if persisted_version != current_version {
+        return false;
+    }
+    match (persisted_owner, current_owner) {
+        (Some(persisted), Some(current)) => persisted == current,
+        (Some(_), None) => false,
+        (None, _) => persisted_version == 1,
+    }
+}
+
 /// A serializable snapshot of an actor's durable state.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+///
+/// RFC 0008 treats snapshots without explicit schema metadata as version 1.
+/// `schema_owner` identifies the compiler-owned actor/entity declaration
+/// whose schema produced the state. New snapshots always populate it for
+/// bytecode-backed actors; legacy/native snapshots may leave it absent.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ActorSnapshot {
     pub actor_id: u64,
     pub sequence: u64,
+    /// Compiler-owned durable schema identity at the declaration level.
+    pub schema_owner: Option<String>,
+    /// Durable schema version. Legacy snapshots deserialize as version 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub state: HashMap<String, PersistedValue>,
     /// For workflow actors, the name of the signal the current step is
     /// suspended waiting for, if any.  This is part of the snapshot so that
@@ -152,6 +186,22 @@ pub struct ActorSnapshot {
     pub authority_tokens: BTreeSet<String>,
 }
 
+impl Default for ActorSnapshot {
+    fn default() -> Self {
+        Self {
+            actor_id: 0,
+            sequence: 0,
+            schema_owner: None,
+            schema_version: 1,
+            state: HashMap::new(),
+            waiting_signal: None,
+            crdt_snapshot: None,
+            crdt_field_map: None,
+            authority_tokens: BTreeSet::new(),
+        }
+    }
+}
+
 /// A journal entry records a message delivered to an actor.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct JournalEntry {
@@ -166,6 +216,13 @@ pub struct JournalEntry {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EventEntry {
     pub sequence: u64,
+    /// Compiler-owned durable schema identity for this event entry.
+    #[serde(default)]
+    pub schema_owner: Option<String>,
+    /// Schema version under which the event was committed. Legacy event logs
+    /// deserialize as version 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     /// Name of the EventSourced field being mutated.
     pub field_name: String,
     /// Event name (e.g. "Incremented", "Custom").
@@ -860,6 +917,8 @@ impl LibsqlStore {
                 "CREATE TABLE IF NOT EXISTS snapshots (
                     actor_id INTEGER PRIMARY KEY,
                     sequence INTEGER NOT NULL,
+                    schema_owner TEXT,
+                    schema_version INTEGER NOT NULL DEFAULT 1,
                     state TEXT NOT NULL,
                     waiting_signal TEXT,
                     crdt_snapshot TEXT,
@@ -870,6 +929,17 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            // RFC 0008 durable schema identity. Existing rows predate explicit
+            // metadata and therefore remain version 1 with no owner.
+            let _ = conn
+                .execute("ALTER TABLE snapshots ADD COLUMN schema_owner TEXT", ())
+                .await;
+            let _ = conn
+                .execute(
+                    "ALTER TABLE snapshots ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1",
+                    (),
+                )
+                .await;
             // Migrate databases created before the waiting_signal column existed.
             let _ = conn
                 .execute("ALTER TABLE snapshots ADD COLUMN waiting_signal TEXT", ())
@@ -914,6 +984,8 @@ impl LibsqlStore {
                 "CREATE TABLE IF NOT EXISTS events (
                     actor_id INTEGER NOT NULL,
                     sequence INTEGER NOT NULL,
+                    schema_owner TEXT,
+                    schema_version INTEGER NOT NULL DEFAULT 1,
                     field_name TEXT NOT NULL,
                     event_name TEXT NOT NULL,
                     args TEXT NOT NULL,
@@ -924,6 +996,15 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let _ = conn
+                .execute("ALTER TABLE events ADD COLUMN schema_owner TEXT", ())
+                .await;
+            let _ = conn
+                .execute(
+                    "ALTER TABLE events ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1",
+                    (),
+                )
+                .await;
             Ok(())
         })
     }
@@ -1002,9 +1083,9 @@ impl PersistenceStore for LibsqlStore {
         let conn = self.conn();
         self.rt.block_on(async {
             conn.execute(
-                "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, authority_tokens=excluded.authority_tokens",
-                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), authority_json.as_str()],
+                "INSERT INTO snapshots (actor_id, sequence, schema_owner, schema_version, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, schema_owner=excluded.schema_owner, schema_version=excluded.schema_version, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, authority_tokens=excluded.authority_tokens",
+                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, snapshot.schema_owner.as_deref(), snapshot.schema_version as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), authority_json.as_str()],
             ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
         })
     }
@@ -1014,18 +1095,20 @@ impl PersistenceStore for LibsqlStore {
         self.rt.block_on(async {
             let mut rows = conn
                 .query(
-                    "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens FROM snapshots WHERE actor_id = ?1",
+                    "SELECT sequence, schema_owner, schema_version, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens FROM snapshots WHERE actor_id = ?1",
                     libsql::params![actor_id as i64],
                 )
                 .await
                 .ok()?;
             let row = rows.next().await.ok()??;
             let sequence: i64 = row.get(0).ok()?;
-            let state_json: String = row.get(1).ok()?;
-            let waiting_signal: Option<String> = row.get(2).ok()?;
-            let crdt_json: Option<String> = row.get(3).ok()?;
-            let crdt_field_map_json: Option<String> = row.get(4).ok()?;
-            let authority_json: Option<String> = row.get(5).ok()?;
+            let schema_owner: Option<String> = row.get(1).ok()?;
+            let schema_version: i64 = row.get(2).ok()?;
+            let state_json: String = row.get(3).ok()?;
+            let waiting_signal: Option<String> = row.get(4).ok()?;
+            let crdt_json: Option<String> = row.get(5).ok()?;
+            let crdt_field_map_json: Option<String> = row.get(6).ok()?;
+            let authority_json: Option<String> = row.get(7).ok()?;
             let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> = match crdt_json {
                 Some(j) => serde_json::from_str(&j).ok()?,
                 None => None,
@@ -1051,6 +1134,8 @@ impl PersistenceStore for LibsqlStore {
             Some(ActorSnapshot {
                 actor_id,
                 sequence: sequence as u64,
+                schema_owner,
+                schema_version: schema_version as u32,
                 state,
                 waiting_signal,
                 crdt_snapshot,
@@ -1178,8 +1263,8 @@ impl PersistenceStore for LibsqlStore {
             let value_json = serde_json::to_string(&entry.value)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             conn.execute(
-                "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                libsql::params![actor_id as i64, entry.sequence as i64, entry.field_name, entry.event_name, args_json, value_json],
+                "INSERT INTO events (actor_id, sequence, schema_owner, schema_version, field_name, event_name, args, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                libsql::params![actor_id as i64, entry.sequence as i64, entry.schema_owner.as_deref(), entry.schema_version as i64, entry.field_name, entry.event_name, args_json, value_json],
             ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
         })
     }
@@ -1189,7 +1274,7 @@ impl PersistenceStore for LibsqlStore {
         self.rt.block_on(async {
             let mut rows = match conn
                 .query(
-                    "SELECT sequence, field_name, event_name, args, value FROM events
+                    "SELECT sequence, schema_owner, schema_version, field_name, event_name, args, value FROM events
                  WHERE actor_id = ?1 ORDER BY sequence ASC",
                     libsql::params![actor_id as i64],
                 )
@@ -1206,15 +1291,23 @@ impl PersistenceStore for LibsqlStore {
                             Ok(v) => v,
                             Err(_) => continue,
                         };
-                        let field_name: String = match row.get(1) {
+                        let schema_owner: Option<String> = match row.get(1) {
                             Ok(v) => v,
                             Err(_) => continue,
                         };
-                        let event_name: String = match row.get(2) {
+                        let schema_version: i64 = match row.get(2) {
                             Ok(v) => v,
                             Err(_) => continue,
                         };
-                        let args_json: String = match row.get(3) {
+                        let field_name: String = match row.get(3) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        let event_name: String = match row.get(4) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        let args_json: String = match row.get(5) {
                             Ok(v) => v,
                             Err(_) => continue,
                         };
@@ -1222,7 +1315,7 @@ impl PersistenceStore for LibsqlStore {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
-                        let value_json: String = match row.get(4) {
+                        let value_json: String = match row.get(6) {
                             Ok(v) => v,
                             Err(_) => continue,
                         };
@@ -1232,6 +1325,8 @@ impl PersistenceStore for LibsqlStore {
                         };
                         entries.push(EventEntry {
                             sequence: seq as u64,
+                            schema_owner,
+                            schema_version: schema_version as u32,
                             field_name,
                             event_name,
                             args,
@@ -1609,12 +1704,24 @@ impl PostgresStore {
             "CREATE TABLE IF NOT EXISTS snapshots (
                 actor_id BIGINT PRIMARY KEY,
                 sequence BIGINT NOT NULL,
+                schema_owner TEXT,
+                schema_version BIGINT NOT NULL DEFAULT 1,
                 state TEXT NOT NULL,
                 waiting_signal TEXT,
                 crdt_snapshot TEXT,
                 crdt_field_map TEXT,
                 authority_tokens TEXT
             )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS schema_owner TEXT",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS schema_version BIGINT NOT NULL DEFAULT 1",
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1648,12 +1755,24 @@ impl PostgresStore {
             "CREATE TABLE IF NOT EXISTS events (
                 actor_id BIGINT NOT NULL,
                 sequence BIGINT NOT NULL,
+                schema_owner TEXT,
+                schema_version BIGINT NOT NULL DEFAULT 1,
                 field_name TEXT NOT NULL,
                 event_name TEXT NOT NULL,
                 args TEXT NOT NULL,
                 value TEXT NOT NULL DEFAULT '1',
                 PRIMARY KEY (actor_id, sequence)
             )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN IF NOT EXISTS schema_owner TEXT",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN IF NOT EXISTS schema_version BIGINT NOT NULL DEFAULT 1",
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1674,10 +1793,12 @@ impl PersistenceStore for PostgresStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "INSERT INTO snapshots (actor_id, sequence, schema_owner, schema_version, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT (actor_id) DO UPDATE SET
                sequence = EXCLUDED.sequence,
+               schema_owner = EXCLUDED.schema_owner,
+               schema_version = EXCLUDED.schema_version,
                state = EXCLUDED.state,
                waiting_signal = EXCLUDED.waiting_signal,
                crdt_snapshot = EXCLUDED.crdt_snapshot,
@@ -1686,6 +1807,8 @@ impl PersistenceStore for PostgresStore {
             &[
                 &(snapshot.actor_id as i64),
                 &(snapshot.sequence as i64),
+                &snapshot.schema_owner.as_deref(),
+                &(snapshot.schema_version as i64),
                 &state_json,
                 &snapshot.waiting_signal.as_deref(),
                 &crdt_json.as_str(),
@@ -1701,17 +1824,19 @@ impl PersistenceStore for PostgresStore {
         let mut conn = self.conn.lock().unwrap();
         let row = conn
             .query_one(
-                "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens
+                "SELECT sequence, schema_owner, schema_version, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens
                  FROM snapshots WHERE actor_id = $1",
                 &[&(actor_id as i64)],
             )
             .ok()?;
         let sequence: i64 = row.get(0);
-        let state_json: String = row.get(1);
-        let waiting_signal: Option<String> = row.get(2);
-        let crdt_json: Option<String> = row.get(3);
-        let crdt_field_map_json: Option<String> = row.get(4);
-        let authority_json: Option<String> = row.get(5);
+        let schema_owner: Option<String> = row.get(1);
+        let schema_version: i64 = row.get(2);
+        let state_json: String = row.get(3);
+        let waiting_signal: Option<String> = row.get(4);
+        let crdt_json: Option<String> = row.get(5);
+        let crdt_field_map_json: Option<String> = row.get(6);
+        let authority_json: Option<String> = row.get(7);
         let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> =
             crdt_json.and_then(|j| serde_json::from_str(&j).ok());
         let crdt_field_map: Option<HashMap<String, u64>> =
@@ -1733,6 +1858,8 @@ impl PersistenceStore for PostgresStore {
         Some(ActorSnapshot {
             actor_id,
             sequence: sequence as u64,
+            schema_owner,
+            schema_version: schema_version as u32,
             state,
             waiting_signal,
             crdt_snapshot,
@@ -1833,9 +1960,11 @@ impl PersistenceStore for PostgresStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            "INSERT INTO events (actor_id, sequence, schema_owner, schema_version, field_name, event_name, args, value)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (actor_id, sequence) DO UPDATE SET
+               schema_owner = EXCLUDED.schema_owner,
+               schema_version = EXCLUDED.schema_version,
                field_name = EXCLUDED.field_name,
                event_name = EXCLUDED.event_name,
                args = EXCLUDED.args,
@@ -1843,6 +1972,8 @@ impl PersistenceStore for PostgresStore {
             &[
                 &(actor_id as i64),
                 &(entry.sequence as i64),
+                &entry.schema_owner.as_deref(),
+                &(entry.schema_version as i64),
                 &entry.field_name,
                 &entry.event_name,
                 &args_json,
@@ -1859,7 +1990,7 @@ impl PersistenceStore for PostgresStore {
             Err(_) => return Vec::new(),
         };
         let rows = match conn.query(
-            "SELECT sequence, field_name, event_name, args, value FROM events
+            "SELECT sequence, schema_owner, schema_version, field_name, event_name, args, value FROM events
              WHERE actor_id = $1 ORDER BY sequence ASC",
             &[&(actor_id as i64)],
         ) {
@@ -1869,14 +2000,18 @@ impl PersistenceStore for PostgresStore {
         rows.iter()
             .filter_map(|row| {
                 let seq: i64 = row.get(0);
-                let field_name: String = row.get(1);
-                let event_name: String = row.get(2);
-                let args_json: String = row.get(3);
+                let schema_owner: Option<String> = row.get(1);
+                let schema_version: i64 = row.get(2);
+                let field_name: String = row.get(3);
+                let event_name: String = row.get(4);
+                let args_json: String = row.get(5);
                 let args: Vec<PersistedValue> = serde_json::from_str(&args_json).ok()?;
-                let value_json: String = row.get(4);
+                let value_json: String = row.get(6);
                 let value: PersistedValue = serde_json::from_str(&value_json).ok()?;
                 Some(EventEntry {
                     sequence: seq as u64,
+                    schema_owner,
+                    schema_version: schema_version as u32,
                     field_name,
                     event_name,
                     args,
@@ -2026,6 +2161,8 @@ mod json_file_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 3,
+                schema_owner: Some("Counter".to_string()),
+                schema_version: 3,
                 state,
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2037,6 +2174,8 @@ mod json_file_store_tests {
         let loaded = store.load_snapshot(1).unwrap();
         assert_eq!(loaded.actor_id, 1);
         assert_eq!(loaded.sequence, 3);
+        assert_eq!(loaded.schema_owner.as_deref(), Some("Counter"));
+        assert_eq!(loaded.schema_version, 3);
         assert_eq!(loaded.state.get("count"), Some(&PersistedValue::Int(42)));
 
         // The atomic (temp + rename) write must not leave its temp file behind.
@@ -2045,6 +2184,36 @@ mod json_file_store_tests {
             .with_file_name("snapshot.json.tmp")
             .exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_legacy_snapshot_json_defaults_to_schema_v1() {
+        let legacy = r#"{
+            "actor_id": 7,
+            "sequence": 2,
+            "state": {},
+            "waiting_signal": null,
+            "crdt_snapshot": null,
+            "crdt_field_map": null,
+            "authority_tokens": []
+        }"#;
+        let snapshot: ActorSnapshot = serde_json::from_str(legacy).unwrap();
+        assert_eq!(snapshot.schema_owner, None);
+        assert_eq!(snapshot.schema_version, 1);
+    }
+
+    #[test]
+    fn test_legacy_event_json_defaults_to_schema_v1() {
+        let legacy = r#"{
+            "sequence": 9,
+            "field_name": "count",
+            "event_name": "Incremented",
+            "args": [{"tag":"Int","value":1}],
+            "value": {"tag":"Int","value":2}
+        }"#;
+        let event: EventEntry = serde_json::from_str(legacy).unwrap();
+        assert_eq!(event.schema_owner, None);
+        assert_eq!(event.schema_version, 1);
     }
 
     #[test]
@@ -2088,6 +2257,8 @@ mod json_file_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 5,
+                schema_owner: None,
+                schema_version: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2117,6 +2288,8 @@ mod json_file_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 1,
+                schema_owner: None,
+                schema_version: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2153,6 +2326,8 @@ mod json_file_store_tests {
                 .save_snapshot(ActorSnapshot {
                     actor_id: 1,
                     sequence: 1,
+                    schema_owner: None,
+                    schema_version: 1,
                     state,
                     waiting_signal: None,
                     crdt_snapshot: None,
@@ -2192,6 +2367,8 @@ mod json_file_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 9,
+                schema_owner: None,
+                schema_version: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2313,6 +2490,8 @@ mod rocksdb_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 3,
+                schema_owner: None,
+                schema_version: 1,
                 state,
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2369,6 +2548,8 @@ mod rocksdb_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 5,
+                schema_owner: None,
+                schema_version: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2398,6 +2579,8 @@ mod rocksdb_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 1,
+                schema_owner: None,
+                schema_version: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2434,6 +2617,8 @@ mod rocksdb_store_tests {
                 .save_snapshot(ActorSnapshot {
                     actor_id: 1,
                     sequence: 1,
+                    schema_owner: None,
+                    schema_version: 1,
                     state,
                     waiting_signal: None,
                     crdt_snapshot: None,
@@ -2505,6 +2690,8 @@ mod postgres_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id,
                 sequence: 3,
+                schema_owner: None,
+                schema_version: 1,
                 state,
                 waiting_signal: Some("signal".to_string()),
                 crdt_snapshot: None,
@@ -2570,6 +2757,8 @@ mod postgres_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id,
                 sequence: 5,
+                schema_owner: None,
+                schema_version: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2603,6 +2792,8 @@ mod postgres_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id,
                 sequence: 1,
+                schema_owner: None,
+                schema_version: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2667,6 +2858,8 @@ mod postgres_store_tests {
                 actor_id,
                 EventEntry {
                     sequence: 2,
+                    schema_owner: None,
+                    schema_version: 1,
                     field_name: "counter".to_string(),
                     event_name: "Inc".to_string(),
                     args: vec![PersistedValue::Int(1)],

@@ -1934,11 +1934,46 @@ fn test_event_sourced_counter_replays_from_event_log() {
 }
 
 #[test]
+fn test_recover_actor_rejects_schema_version_mismatch() {
+    let mut rt = Runtime::new();
+    let actor_id = 919_001;
+
+    rt.persistence
+        .save_snapshot(ActorSnapshot {
+            actor_id,
+            sequence: 3,
+            schema_owner: Some("Counter".to_string()),
+            schema_version: 1,
+            ..ActorSnapshot::default()
+        })
+        .unwrap();
+
+    let mut module = CodeModule::new("schema-mismatch-recovery");
+    let mut meta = ActorMeta::new("Counter");
+    meta.persistent = true;
+    meta.version = 2;
+    module.actor_metadata.push(meta);
+    rt.register_recovery_module(actor_id, module, vec![], vec![]);
+
+    assert_eq!(
+        rt.recover_actor(actor_id),
+        None,
+        "recovery must fail closed until a v1 -> v2 migration executor exists"
+    );
+    assert!(
+        !rt.actors.contains_key(&actor_id),
+        "incompatible persisted state must never become observable"
+    );
+}
+
+#[test]
 fn test_memory_store_latest_sequence() {
     let mut store = MemoryStore::new();
     let snapshot = ActorSnapshot {
         actor_id: 1,
         sequence: 5,
+        schema_owner: None,
+        schema_version: 1,
         state: HashMap::new(),
         waiting_signal: None,
         crdt_snapshot: None,
@@ -1968,6 +2003,8 @@ fn test_libsql_store_save_load_snapshot() {
     let snapshot = ActorSnapshot {
         actor_id: 1,
         sequence: 3,
+        schema_owner: Some("Counter".to_string()),
+        schema_version: 3,
         state,
         waiting_signal: None,
         crdt_snapshot: None,
@@ -1979,7 +2016,35 @@ fn test_libsql_store_save_load_snapshot() {
     let loaded = store.load_snapshot(1).unwrap();
     assert_eq!(loaded.actor_id, 1);
     assert_eq!(loaded.sequence, 3);
+    assert_eq!(loaded.schema_owner.as_deref(), Some("Counter"));
+    assert_eq!(loaded.schema_version, 3);
     assert_eq!(loaded.state.get("count"), Some(&PersistedValue::Int(42)));
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn test_libsql_store_event_schema_roundtrip() {
+    let mut store = LibsqlStore::in_memory().unwrap();
+    store
+        .append_event(
+            1,
+            EventEntry {
+                sequence: 1,
+                schema_owner: Some("Counter".to_string()),
+                schema_version: 3,
+                field_name: "count".to_string(),
+                event_name: "Incremented".to_string(),
+                args: vec![PersistedValue::Int(1)],
+                value: PersistedValue::Int(2),
+            },
+        )
+        .unwrap();
+
+    let events = store.read_events(1);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].schema_owner.as_deref(), Some("Counter"));
+    assert_eq!(events[0].schema_version, 3);
+    assert_eq!(events[0].value, PersistedValue::Int(2));
 }
 
 #[cfg(feature = "sqlite")]
@@ -2022,6 +2087,8 @@ fn test_libsql_store_latest_sequence() {
         .save_snapshot(ActorSnapshot {
             actor_id: 1,
             sequence: 5,
+            schema_owner: None,
+            schema_version: 1,
             state: HashMap::new(),
             waiting_signal: None,
             crdt_snapshot: None,
@@ -2050,6 +2117,8 @@ fn test_libsql_store_clear() {
         .save_snapshot(ActorSnapshot {
             actor_id: 1,
             sequence: 1,
+            schema_owner: None,
+            schema_version: 1,
             state: HashMap::new(),
             waiting_signal: None,
             crdt_snapshot: None,
@@ -2086,6 +2155,8 @@ fn test_libsql_store_persists_to_disk() {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 1,
+                schema_owner: None,
+                schema_version: 1,
                 state,
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2126,6 +2197,8 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
         .save_snapshot(ActorSnapshot {
             actor_id: 1,
             sequence: 3,
+            schema_owner: None,
+            schema_version: 1,
             state: HashMap::new(),
             waiting_signal: None,
             crdt_snapshot: Some(vec![(7, 1, vec![1, 2, 3]), (8, 2, vec![])]),
@@ -2145,6 +2218,8 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
         .save_snapshot(ActorSnapshot {
             actor_id: 1,
             sequence: 4,
+            schema_owner: None,
+            schema_version: 1,
             state: HashMap::new(),
             waiting_signal: None,
             crdt_snapshot: None,
@@ -2188,6 +2263,8 @@ fn test_libsql_store_migrates_old_schema_crdt_column() {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 3,
+                schema_owner: None,
+                schema_version: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: Some(vec![(7, 1, vec![1, 2, 3])]),
@@ -4085,6 +4162,8 @@ fn test_actor_migration_between_two_nodes() {
         let snapshot = ActorSnapshot {
             actor_id,
             sequence: actor.sequence,
+            schema_owner: None,
+            schema_version: 1,
             state,
             waiting_signal: actor.waiting_signal.clone(),
             crdt_snapshot,

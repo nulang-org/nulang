@@ -194,7 +194,12 @@ pub struct Actor {
     pub event_sourced_sequences: HashMap<String, u64>,
     /// How many events between compaction snapshots for EventSourced fields (default 100).
     pub event_sourced_compaction_interval: u64,
-    pub persistent: bool,  // Whether this actor survives restarts
+    pub persistent: bool, // Whether this actor survives restarts
+    /// Compiler-owned declaration that defines this actor's durable schema.
+    /// None for native/legacy actors without bytecode schema metadata.
+    pub schema_owner: Option<String>,
+    /// Current durable schema version (RFC 0008). Legacy/native actors use 1.
+    pub schema_version: u32,
     pub is_workflow: bool, // True if generated from a workflow declaration
     pub behavior_table: Vec<BehaviorEntry>,
     /// AOT-compiled behavior targets, parallel to `behavior_table`. `Some`
@@ -346,6 +351,8 @@ impl Actor {
             event_sourced_sequences: HashMap::new(),
             event_sourced_compaction_interval: 100,
             persistent: false,
+            schema_owner: None,
+            schema_version: 1,
             is_workflow: false,
             behavior_table: Vec::new(),
             #[cfg(feature = "native-codegen")]
@@ -629,6 +636,8 @@ mod tests {
         assert_eq!(actor.name, "test");
         assert_eq!(actor.state, ActorState::Created);
         assert!(!actor.persistent);
+        assert_eq!(actor.schema_owner, None);
+        assert_eq!(actor.schema_version, 1);
         assert!(!actor.is_workflow);
         assert!(!actor.is_agent);
         assert_eq!(actor.max_reductions, 1000);

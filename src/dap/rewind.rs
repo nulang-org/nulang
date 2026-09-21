@@ -198,6 +198,8 @@ mod tests {
                     7,
                     EventEntry {
                         sequence: seq,
+                        schema_owner: None,
+                        schema_version: 1,
                         field_name: "count".to_string(),
                         event_name: "Incremented".to_string(),
                         args: vec![PersistedValue::Int(1)],
@@ -285,6 +287,8 @@ mod tests {
                 9,
                 EventEntry {
                     sequence: 1,
+                    schema_owner: None,
+                    schema_version: 1,
                     field_name: "seen".to_string(),
                     event_name: "Custom".to_string(),
                     args: vec![],

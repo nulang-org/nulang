@@ -767,7 +767,7 @@ impl Runtime {
 
     #[tracing::instrument(level = "trace", skip(self, init))]
     pub fn spawn_actor(&mut self, init: Box<dyn FnOnce() -> Vec<(String, Value)>>) -> u64 {
-        spawn::spawn_actor_with_models(self, init, HashMap::new(), false, None)
+        spawn::spawn_actor_with_models(self, init, HashMap::new(), false, None, None, 1)
     }
 
     /// Spawn an actor co-located on the same shard as `near_actor_id`.
@@ -798,7 +798,7 @@ impl Runtime {
         } else {
             fresh_actor_id()
         };
-        spawn::spawn_actor_with_id(self, id, init, HashMap::new(), false, None)
+        spawn::spawn_actor_with_id(self, id, init, HashMap::new(), false, None, None, 1)
     }
 
     pub fn spawn_persistent_actor(
@@ -806,7 +806,7 @@ impl Runtime {
         init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
         state_models: HashMap<String, StateModel>,
     ) -> u64 {
-        spawn::spawn_actor_with_models(self, init, state_models, true, None)
+        spawn::spawn_actor_with_models(self, init, state_models, true, None, None, 1)
     }
 
     /// Spawn a durable workflow actor.  Workflows are always persistent and
@@ -817,7 +817,7 @@ impl Runtime {
         init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
         state_models: HashMap<String, StateModel>,
     ) -> u64 {
-        spawn::spawn_actor_with_models(self, init, state_models, true, Some(name))
+        spawn::spawn_actor_with_models(self, init, state_models, true, Some(name), Some(name), 1)
     }
 
     /// Spawn an actor for `module`'s behavior `behavior_idx`, seeded with
@@ -3217,9 +3217,12 @@ impl Runtime {
                 .map(|((_, name), id)| (name.clone(), id.0))
                 .collect()
         });
+        let actor = self.actors.get(&actor_id)?;
         Some(ActorSnapshot {
             actor_id,
             sequence,
+            schema_owner: actor.schema_owner.clone(),
+            schema_version: actor.schema_version,
             state,
             waiting_signal,
             crdt_snapshot,
@@ -4996,6 +4999,40 @@ impl Runtime {
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
+        let recovery_module = self
+            .recovery_modules
+            .get(&actor_id)
+            .map(|(module, _, _)| module);
+        let (schema_owner, schema_version) =
+            match Self::validate_snapshot_schema(recovery_module, &snapshot) {
+                Ok(schema) => schema,
+                Err(error) => {
+                    warn!(
+                        "nulang-recover: refusing actor {} with incompatible durable schema: {}",
+                        actor_id, error
+                    );
+                    return None;
+                }
+            };
+        if let Some(event) = self
+            .persistence
+            .read_events(actor_id)
+            .into_iter()
+            .find(|event| {
+                !durable_schema_compatible(
+                    event.schema_owner.as_deref(),
+                    event.schema_version,
+                    schema_owner.as_deref(),
+                    schema_version,
+                )
+            })
+        {
+            warn!(
+                "nulang-recover: refusing actor {} because event sequence {} was committed under incompatible schema {:?}@v{}",
+                actor_id, event.sequence, event.schema_owner, event.schema_version
+            );
+            return None;
+        }
         let authority_manifest =
             match crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens) {
                 Ok(manifest) => manifest,
@@ -5021,6 +5058,8 @@ impl Runtime {
 
         let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
         actor.persistent = true;
+        actor.schema_owner = schema_owner;
+        actor.schema_version = schema_version;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
@@ -5280,15 +5319,82 @@ impl Runtime {
     /// Restores persistent flags, state models, durable fields, and default
     /// values.  Does NOT register the recovery module, restore CRDT state,
     /// insert into `self.actors`, or enqueue - callers do those.
+    fn validate_snapshot_schema(
+        module: Option<&crate::bytecode::CodeModule>,
+        snapshot: &ActorSnapshot,
+    ) -> Result<(Option<String>, u32), String> {
+        let Some(module) = module else {
+            if snapshot.schema_owner.is_some() || snapshot.schema_version != 1 {
+                return Err(format!(
+                    "snapshot declares schema {:?}@v{} but no recovery module is available",
+                    snapshot.schema_owner, snapshot.schema_version
+                ));
+            }
+            return Ok((None, 1));
+        };
+
+        let meta = if let Some(owner) = snapshot.schema_owner.as_deref() {
+            module
+                .actor_metadata
+                .iter()
+                .find(|meta| meta.name == owner)
+                .ok_or_else(|| {
+                    format!(
+                        "snapshot schema owner '{}' is absent from the recovery module",
+                        owner
+                    )
+                })?
+        } else {
+            let mut candidates = module.actor_metadata.iter().filter(|meta| meta.persistent);
+            let first = candidates.next();
+            match (first, candidates.next()) {
+                (Some(meta), None) => meta,
+                (None, _) => {
+                    if snapshot.schema_version == 1 {
+                        return Ok((None, 1));
+                    }
+                    return Err(format!(
+                        "legacy snapshot v{} has no compiler-owned schema metadata",
+                        snapshot.schema_version
+                    ));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(
+                        "legacy snapshot has no schema owner and the recovery module contains multiple persistent actors"
+                            .to_string(),
+                    );
+                }
+            }
+        };
+
+        if snapshot.schema_version != meta.version {
+            return Err(format!(
+                "persisted {}@v{} does not match current {}@v{}; migration execution is not implemented",
+                snapshot
+                    .schema_owner
+                    .as_deref()
+                    .unwrap_or(meta.name.as_str()),
+                snapshot.schema_version,
+                meta.name,
+                meta.version
+            ));
+        }
+
+        Ok((Some(meta.name.clone()), meta.version))
+    }
+
     fn restore_actor_from_snapshot(
         actor_id: u64,
         module: &crate::bytecode::CodeModule,
         snapshot: &ActorSnapshot,
         is_workflow: bool,
         is_agent: bool,
-    ) -> Result<Actor, crate::authority_runtime::RuntimeAuthorityError> {
+    ) -> Result<Actor, String> {
+        let (schema_owner, schema_version) =
+            Self::validate_snapshot_schema(Some(module), snapshot)?;
         let authority_manifest =
-            crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens)?;
+            crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens)
+                .map_err(|error| error.to_string())?;
         let offsets: Vec<usize> = crate::runtime::spawn::bytecode_offsets_for(module, is_workflow);
         let compensation_offsets: Vec<Option<usize>> = if is_workflow {
             module
@@ -5318,6 +5424,8 @@ impl Runtime {
 
         let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
         actor.persistent = true;
+        actor.schema_owner = schema_owner;
+        actor.schema_version = schema_version;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
@@ -5404,7 +5512,7 @@ impl Runtime {
             )
             .map_err(|err| NuError::RuntimeError {
                 msg: format!(
-                    "invalid authority snapshot for virtual actor {}: {}",
+                    "invalid durable snapshot for virtual actor {}: {}",
                     grain_id.actor_name(),
                     err
                 ),
@@ -5413,6 +5521,15 @@ impl Runtime {
         } else {
             let mut actor = Actor::new(stable_actor_id, grain_id.actor_name(), 0);
             actor.persistent = true;
+            if let Some(meta) = grain_type
+                .module
+                .actor_metadata
+                .iter()
+                .find(|meta| meta.name == grain_id.grain_type)
+            {
+                actor.schema_owner = Some(meta.name.clone());
+                actor.schema_version = meta.version;
+            }
             actor.bytecode_module = Some(grain_type.module.clone());
             actor.bytecode_offsets = grain_type.bytecode_offsets.clone();
             actor.compensation_offsets = grain_type.compensation_offsets.clone();
@@ -5528,7 +5645,7 @@ impl Runtime {
             Ok(actor) => actor,
             Err(err) => {
                 warn!(
-                    "nulang-migrate: invalid authority manifest for actor {}: {}",
+                    "nulang-migrate: invalid durable snapshot for actor {}: {}",
                     actor_id, err
                 );
                 return false;
