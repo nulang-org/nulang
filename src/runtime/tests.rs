@@ -1939,6 +1939,8 @@ fn test_memory_store_latest_sequence() {
     let snapshot = ActorSnapshot {
         actor_id: 1,
         sequence: 5,
+        schema_owner: None,
+        schema_version: 1,
         state: HashMap::new(),
         waiting_signal: None,
         crdt_snapshot: None,
@@ -1968,6 +1970,8 @@ fn test_libsql_store_save_load_snapshot() {
     let snapshot = ActorSnapshot {
         actor_id: 1,
         sequence: 3,
+        schema_owner: None,
+        schema_version: 1,
         state,
         waiting_signal: None,
         crdt_snapshot: None,
@@ -2022,6 +2026,8 @@ fn test_libsql_store_latest_sequence() {
         .save_snapshot(ActorSnapshot {
             actor_id: 1,
             sequence: 5,
+            schema_owner: None,
+            schema_version: 1,
             state: HashMap::new(),
             waiting_signal: None,
             crdt_snapshot: None,
@@ -2050,6 +2056,8 @@ fn test_libsql_store_clear() {
         .save_snapshot(ActorSnapshot {
             actor_id: 1,
             sequence: 1,
+            schema_owner: None,
+            schema_version: 1,
             state: HashMap::new(),
             waiting_signal: None,
             crdt_snapshot: None,
@@ -2086,6 +2094,8 @@ fn test_libsql_store_persists_to_disk() {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 1,
+                schema_owner: None,
+                schema_version: 1,
                 state,
                 waiting_signal: None,
                 crdt_snapshot: None,
@@ -2126,6 +2136,8 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
         .save_snapshot(ActorSnapshot {
             actor_id: 1,
             sequence: 3,
+            schema_owner: None,
+            schema_version: 1,
             state: HashMap::new(),
             waiting_signal: None,
             crdt_snapshot: Some(vec![(7, 1, vec![1, 2, 3]), (8, 2, vec![])]),
@@ -2145,6 +2157,8 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
         .save_snapshot(ActorSnapshot {
             actor_id: 1,
             sequence: 4,
+            schema_owner: None,
+            schema_version: 1,
             state: HashMap::new(),
             waiting_signal: None,
             crdt_snapshot: None,
@@ -2188,6 +2202,8 @@ fn test_libsql_store_migrates_old_schema_crdt_column() {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 3,
+                schema_owner: None,
+                schema_version: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: Some(vec![(7, 1, vec![1, 2, 3])]),
@@ -4085,6 +4101,8 @@ fn test_actor_migration_between_two_nodes() {
         let snapshot = ActorSnapshot {
             actor_id,
             sequence: actor.sequence,
+            schema_owner: None,
+            schema_version: 1,
             state,
             waiting_signal: actor.waiting_signal.clone(),
             crdt_snapshot,
