@@ -335,8 +335,11 @@ impl ActorHeap {
     pub fn new(total_size: usize) -> Self {
         assert!(total_size > 0, "ActorHeap size must be > 0");
 
-        let (base, actual_size) =
-            Self::acquire_bump_block(total_size).expect("ActorHeap backing allocation failed");
+        let (base, actual_size) = Self::acquire_bump_block(total_size).unwrap_or_else(|| {
+            let layout = std::alloc::Layout::from_size_align(total_size, ALIGN)
+                .expect("invalid ActorHeap layout");
+            std::alloc::handle_alloc_error(layout)
+        });
 
         ActorHeap {
             actor_id: 0,
