@@ -6,12 +6,20 @@ import stdlib::list
 fn main() {
     let add = fn(a, b) { a + b }
     let sub = fn(a, b) { a - b }
+    let show = fn(opt) {
+        match opt {
+            Some(x) => perform Int.to_string(x),
+            None => "None",
+        }
+    }
     perform IO.print("fold_sum=" + perform Int.to_string(fold(add, 0, [1, 2, 3, 4])))
     perform IO.print("fold_init10=" + perform Int.to_string(fold(add, 10, [1, 2, 3])))
     perform IO.print("fold_empty=" + perform Int.to_string(fold(add, 0, [])))
     perform IO.print("fold_sub=" + perform Int.to_string(fold(sub, 0, [5, 2])))
-    perform IO.print("max=" + perform Int.to_string(max_of([1, 5, 3, 9, 2])))
-    perform IO.print("max_neg=" + perform Int.to_string(max_of([-5, -1, -3])))
-    perform IO.print("min=" + perform Int.to_string(min_of([1, 5, 3, 0, 2])))
-    perform IO.print("min_neg=" + perform Int.to_string(min_of([-5, -1, -3])))
+    perform IO.print("max=" + show(max_of([1, 5, 3, 9, 2])))
+    perform IO.print("max_neg=" + show(max_of([-5, -1, -3])))
+    perform IO.print("min=" + show(min_of([1, 5, 3, 0, 2])))
+    perform IO.print("min_neg=" + show(min_of([-5, -1, -3])))
+    perform IO.print("max_empty=" + show(max_of([])))
+    perform IO.print("min_empty=" + show(min_of([])))
 }
