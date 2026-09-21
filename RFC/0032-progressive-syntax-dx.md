@@ -114,12 +114,17 @@ Phase 0 adopts the formatter as the executable canonical-source contract.
 
 ### Bindings
 
-Canonical:
+Canonical local bindings:
 
 ```nulang
 let immutable = 1
 var mutable = 0
 ```
+
+The current parser represents a module-level mutable declaration as
+`let var mutable = 0`; Phase 0 preserves that declaration spelling rather
+than converting it into an expression-position `var`. Unifying module and
+local mutable syntax is a later parser change, not a formatter rewrite.
 
 Do not emit Rust-style `let mut`.
 
