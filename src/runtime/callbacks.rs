@@ -3180,3 +3180,33 @@ mod host_authority_tests {
         );
     }
 }
+
+
+#[cfg(test)]
+mod query_purity_allowlist_tests {
+    use super::query_builtin_is_allowed;
+
+    #[test]
+    fn query_purity_allowlist_is_fail_closed() {
+        assert!(query_builtin_is_allowed("Int", Some("to_float")));
+        assert!(query_builtin_is_allowed("String", Some("length")));
+        assert!(query_builtin_is_allowed("Array", Some("set")));
+        assert!(query_builtin_is_allowed("Map", Some("get")));
+        assert!(query_builtin_is_allowed("Map", Some("size")));
+        assert!(query_builtin_is_allowed("StrBuilder", Some("to_string")));
+        assert!(query_builtin_is_allowed("Workflow", Some("query")));
+
+        assert!(!query_builtin_is_allowed("Map", Some("insert")));
+        assert!(!query_builtin_is_allowed("Map", Some("remove")));
+        assert!(!query_builtin_is_allowed("StrBuilder", Some("push")));
+        assert!(!query_builtin_is_allowed("StrBuilder", Some("append")));
+        assert!(!query_builtin_is_allowed("DB", Some("query")));
+        assert!(!query_builtin_is_allowed("FS", Some("read")));
+        assert!(!query_builtin_is_allowed("Http", Some("get")));
+        assert!(!query_builtin_is_allowed("Inference", Some("ask")));
+        assert!(!query_builtin_is_allowed("Timer", Some("sleep")));
+        assert!(!query_builtin_is_allowed("Actor", Some("send")));
+        assert!(!query_builtin_is_allowed("Crdt", Some("read")));
+        assert!(!query_builtin_is_allowed("Debug", Some("inspect")));
+    }
+}
