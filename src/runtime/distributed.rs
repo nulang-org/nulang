@@ -1263,6 +1263,13 @@ pub fn process_network_packets(
             Packet::Ack { packet_seq } => {
                 runtime.acked_packets.insert(packet_seq);
             }
+            Packet::ActorAdmission {
+                delivery_id,
+                status,
+            } => {
+                runtime.record_remote_admission(delivery_id, status);
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
             Packet::FetchBehaviorRequest { content_hash } => {
                 let mut nbc_bytes: Option<Vec<u8>> = None;
                 let mut behavior_name = String::new();
@@ -2248,6 +2255,7 @@ pub fn process_network_packets(
                     string_table,
                     object_table,
                     content_hash,
+                    delivery_id,
                 )) = resolver.parse_packet(incoming.packet)
                 {
                     // Record the wire sender (bare id → node) so the
@@ -2263,6 +2271,7 @@ pub fn process_network_packets(
                             msg.sender,
                         );
                     }
+                    let admission = delivery_id.map(|id| (incoming.from_node, id));
                     // Resolve the behavior name against the target actor's
                     // behavior table. Unknown names must never alias behavior 0.
                     // If the sender attached a content hash, keep fetch-on-demand
@@ -2276,7 +2285,14 @@ pub fn process_network_packets(
                                 "nulang-net: rejecting message to actor {}: unknown behavior '{}'",
                                 target_actor, behavior_name
                             );
-                            notify_delivery_failed(runtime, msg.sender, "unknown behavior");
+                            reject_remote_delivery(
+                                runtime,
+                                transport,
+                                cluster,
+                                msg.sender,
+                                admission,
+                                "unknown behavior",
+                            );
                             ack_packet(transport, cluster, incoming.from_node, incoming.seq);
                             continue;
                         }
@@ -2301,9 +2317,12 @@ pub fn process_network_packets(
                                 let Some(behavior_id) =
                                     runtime.behavior_id_for(target_actor, &behavior_name)
                                 else {
-                                    notify_delivery_failed(
+                                    reject_remote_delivery(
                                         runtime,
+                                        transport,
+                                        cluster,
                                         msg.sender,
+                                        admission,
                                         "unknown behavior after hot reload",
                                     );
                                     ack_packet(
@@ -2337,13 +2356,14 @@ pub fn process_network_packets(
                                     .pending_fetched_messages
                                     .entry(sender_hash)
                                     .or_default()
-                                    .push((
+                                    .push(PendingFetchedMessage {
                                         target_actor,
-                                        behavior_name.clone(),
-                                        msg.clone(),
-                                        string_table.clone(),
-                                        object_table.clone(),
-                                    ));
+                                        behavior_name: behavior_name.clone(),
+                                        msg: msg.clone(),
+                                        string_table: string_table.clone(),
+                                        object_table: object_table.clone(),
+                                        admission,
+                                    });
                                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
                                 continue;
                             }
@@ -2364,11 +2384,15 @@ pub fn process_network_packets(
                             "nulang-net: dropping message to actor {}: string payload cannot be interned (target actor missing or has no module pool)",
                             target_actor
                         );
-                        notify_delivery_failed(
+                        reject_remote_delivery(
                             runtime,
+                            transport,
+                            cluster,
                             msg.sender,
+                            admission,
                             "string intern failed on receiver",
                         );
+                        ack_packet(transport, cluster, incoming.from_node, incoming.seq);
                         continue;
                     }
                     if !intern_wire_objects(runtime, &mut payload_vec, &object_table) {
@@ -2376,37 +2400,51 @@ pub fn process_network_packets(
                             "nulang-net: dropping message to actor {}: object payload cannot be interned (object table mismatch)",
                             target_actor
                         );
-                        notify_delivery_failed(
+                        reject_remote_delivery(
                             runtime,
+                            transport,
+                            cluster,
                             msg.sender,
+                            admission,
                             "object intern failed on receiver",
                         );
+                        ack_packet(transport, cluster, incoming.from_node, incoming.seq);
                         continue;
                     }
                     msg.payload = Arc::new(payload_vec);
-                    if runtime.actors.contains_key(&target_actor) {
-                        let admission = {
+                    let status = if runtime.actors.contains_key(&target_actor) {
+                        let pushed = {
                             let actor = runtime.actors.get_mut(&target_actor).unwrap();
                             actor.mailbox.push(msg)
                         };
-                        match admission {
-                            Ok(()) => runtime.scheduler.enqueue(target_actor),
+                        match pushed {
+                            Ok(()) => {
+                                runtime.scheduler.enqueue(target_actor);
+                                ActorAdmissionStatus::Accepted
+                            }
                             Err(rejected) => {
                                 warn!(
                                     "nulang-net: backpressure delivering remote message to actor {}: mailbox full",
                                     target_actor
                                 );
                                 runtime.route_to_dlq(&rejected, "mailbox full");
+                                ActorAdmissionStatus::Backpressured
                             }
                         }
                     } else {
                         notify_delivery_failed(runtime, msg.sender, "target actor not found");
-                    }
+                        ActorAdmissionStatus::Rejected
+                    };
+                    send_actor_admission(
+                        transport,
+                        cluster,
+                        incoming.from_node,
+                        delivery_id,
+                        status,
+                    );
                 }
-                // This ACK confirms transport-level processing only. A future
-                // application admission ACK/NACK must report Accepted vs
-                // Backpressured/Rejected to the sender without changing this
-                // reliability signal.
+                // Transport processing remains a separate signal from the
+                // ActorAdmission response above.
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
         }
