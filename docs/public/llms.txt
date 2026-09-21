@@ -32,12 +32,15 @@ Nulang is a systems language with static types, algebraic effects, capability ch
 - **Experimental surfaces:** WasmFX, Fabric, RESP cache server, typed protocol hardening, multi-node distribution, and other items marked Experimental in the changelog.
 - **CRDT caveat:** Rust/runtime CRDT types exist, but `.nula` `state crdt` fields are not yet fully wired and currently behave as durable state.
 
-## Quick Install
+## Quick Start
+- Zero-install: https://nulang.org/playground/
+- Native runtime: download a checksummed archive from https://github.com/nulang-org/nulang/releases
+- Release matrix: Linux x86_64/aarch64, macOS aarch64, Windows x86_64
+- Source/contributor build: Rust 1.95.0, then `cargo build --release`
+
 ```bash
-git clone https://github.com/nulang-org/nulang.git
-cd nulang
-cargo build --release
-cargo run -- --repl
+nulang --version
+nulang --repl
 ```
 
 ## Quick Example
@@ -63,7 +66,7 @@ send client run(counter)
 ```
 
 ## Documentation
-- [Installation](https://nulang.org/getting-started/installation/): Build from source, prerequisites, feature flags.
+- [Installation](https://nulang.org/getting-started/installation/): Browser playground, release binaries, source prerequisites, feature flags.
 - [Quick Start](https://nulang.org/getting-started/quick-start/): Hello World, actors, algebraic effects.
 - [Syntax Basics](https://nulang.org/language/syntax/): Functions, bindings, control flow, records, variants.
 - [Type System](https://nulang.org/language/types/): HM inference, row polymorphism, reference capabilities, ADTs.
