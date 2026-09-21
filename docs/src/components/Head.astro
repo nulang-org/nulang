@@ -102,28 +102,8 @@ const pageDescription =
 ---
 {headEntries.map(({ tag: Tag, attrs, content }: any) => <Tag {...attrs} set:html={content} />)}
 {!ogTypeSeen && <meta property="og:type" content={ogType} />}
-<meta property="og:image:alt" content="Nulang — distributed actor-based programming language" />
+<meta property="og:image:alt" content="Nulang — actor-based programming language for resilient software" />
 <meta name="twitter:title" content={pageTitle} />
 <meta name="twitter:description" content={pageDescription} />
 {is404 && <meta name="robots" content="noindex, nofollow" />}
 {!is404 && <script type="application/ld+json" set:html={jsonld} />}
-<link rel="preconnect" href="https://fonts.googleapis.com" />
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link
-  rel="preload"
-  href="https://fonts.gstatic.com/s/inter/v20/UcC73FwrK3iLTeHuS_nVMrMxCp50SjIa1ZL7.woff2"
-  as="font"
-  type="font/woff2"
-  crossorigin
-/>
-<link
-  rel="preload"
-  href="https://fonts.gstatic.com/s/jetbrainsmono/v24/tDbv2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKwBNntkaToggR7BYRbKPxDcwg.woff2"
-  as="font"
-  type="font/woff2"
-  crossorigin
-/>
-<link
-  href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
-  rel="stylesheet"
-/>
