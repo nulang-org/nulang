@@ -25,6 +25,7 @@ use crate::runtime::heap::{ActorHeap, TypeTag as HeapTypeTag};
 #[cfg(feature = "ai-runtime")]
 use nulang_ai::{LlmMessage, LlmRequest};
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -1409,6 +1410,9 @@ pub(crate) struct BytecodeRuntimeCallbacks {
     runtime: *mut Runtime,
     actor_id: u64,
     query_guard: Option<QueryPurityGuard>,
+    /// Heap allocations created by this query invocation. Direct VM stores
+    /// may mutate these temporaries, but not pre-existing actor-state objects.
+    query_allocations: Option<HashSet<usize>>,
 }
 
 // SAFETY: `runtime` is a transient borrow of the executing `Runtime` that
@@ -1429,6 +1433,7 @@ impl BytecodeRuntimeCallbacks {
             runtime,
             actor_id,
             query_guard: None,
+            query_allocations: None,
         }
     }
 
@@ -1441,6 +1446,7 @@ impl BytecodeRuntimeCallbacks {
             runtime,
             actor_id,
             query_guard: Some(guard),
+            query_allocations: Some(HashSet::new()),
         }
     }
 
@@ -1463,6 +1469,30 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         Some(self.actor_id)
     }
 
+    fn authorize_vm_side_effect(
+        &mut self,
+        operation: &str,
+        target: Option<*mut u8>,
+    ) -> bool {
+        let Some(guard) = &self.query_guard else {
+            return true;
+        };
+
+        if let Some(ptr) = target {
+            let query_owned = self
+                .query_allocations
+                .as_ref()
+                .map(|allocations| allocations.contains(&(ptr as usize)))
+                .unwrap_or(false);
+            if query_owned {
+                return true;
+            }
+        }
+
+        guard.record(operation.to_string());
+        false
+    }
+
     fn authorize_ffi(&mut self, library: &str, symbol: &str) -> bool {
         if self.block_query_operation(format!("FFI.call({library}::{symbol})")) {
             return false;
@@ -1473,13 +1503,17 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
     }
 
     fn alloc(&mut self, size: usize, type_tag: crate::runtime::heap::TypeTag) -> Option<*mut u8> {
-        unsafe {
+        let ptr = unsafe {
             (*self.runtime)
                 .actors
                 .get_mut(&self.actor_id)?
                 .heap
-                .alloc(size, type_tag)
+                .alloc(size, type_tag)?
+        };
+        if let Some(allocations) = self.query_allocations.as_mut() {
+            allocations.insert(ptr as usize);
         }
+        Some(ptr)
     }
 
     fn alloc_arena(
@@ -1487,13 +1521,17 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         size: usize,
         type_tag: crate::runtime::heap::TypeTag,
     ) -> Option<*mut u8> {
-        unsafe {
+        let ptr = unsafe {
             (*self.runtime)
                 .actors
                 .get_mut(&self.actor_id)?
                 .iso_arena
-                .alloc(size, type_tag)
+                .alloc(size, type_tag)?
+        };
+        if let Some(allocations) = self.query_allocations.as_mut() {
+            allocations.insert(ptr as usize);
         }
+        Some(ptr)
     }
 
     fn reset_arena(&mut self) {
