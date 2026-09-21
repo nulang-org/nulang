@@ -2363,18 +2363,39 @@ fn parse_frontend(
     Ok((ast, base_dir))
 }
 
-fn compile_with_new_pipeline(
+fn compile_identified_with_new_pipeline(
     ast: &nulang::ast::AstModule,
     name: &str,
     type_checker: &nulang::typechecker::TypeChecker,
-) -> NuResult<nulang::bytecode::CodeModule> {
+    source_bytes: Option<&[u8]>,
+) -> NuResult<nulang::compiler_identity::IdentifiedBytecodeArtifact> {
     // Anything this pipeline can't yet lower faithfully (see hir_lower.rs
     // and mir_lower.rs module docs) returns an honest NotYetImplemented
     // error, which the caller turns into a loud fallback to the stable
     // compiler.
     let hir = nulang::hir_lower::lower_module(ast, &type_checker.inferred_decl_types);
     let mut mir = nulang::mir_lower::lower_module(&hir)?;
-    nulang::compiler_identity::compile_typed_bytecode(&hir, &mut mir, [], name)
+    nulang::compiler_identity::compile_identified_bytecode(
+        source_bytes,
+        &hir,
+        &mut mir,
+        [],
+        name,
+        nulang::compiler_identity::BYTECODE_ARTIFACT_COMPILER_VERSION,
+        nulang::compiler_identity::BYTECODE_ARTIFACT_TARGET,
+        nulang::compiler_identity::BYTECODE_ARTIFACT_ABI,
+        nulang::compiler_identity::BYTECODE_ARTIFACT_BACKEND,
+        nulang::compiler_identity::bytecode_artifact_flags(),
+    )
+}
+
+fn compile_with_new_pipeline(
+    ast: &nulang::ast::AstModule,
+    name: &str,
+    type_checker: &nulang::typechecker::TypeChecker,
+) -> NuResult<nulang::bytecode::CodeModule> {
+    compile_identified_with_new_pipeline(ast, name, type_checker, None)
+        .map(|artifact| artifact.module)
 }
 /// Compile a source string to a `.nbc` artifact and write it to `out_path`.
 ///
@@ -2407,25 +2428,8 @@ fn compile_source_to_nbc(
             span: Span::default(),
         })?;
     }
-    let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
-    let mut mir = nulang::mir_lower::lower_module(&hir)?;
-    let compiler_version = concat!("nulangc-", env!("CARGO_PKG_VERSION"));
-    let bytecode_flag = format!(
-        "bytecode-format={}",
-        nulang::format::constants::BYTECODE_VERSION
-    );
-    let artifact = nulang::compiler_identity::compile_identified_bytecode(
-        Some(source.as_bytes()),
-        &hir,
-        &mut mir,
-        [],
-        "main",
-        compiler_version,
-        "portable",
-        "nulang-abi-v1",
-        "bytecode",
-        [bytecode_flag],
-    )?;
+    let artifact =
+        compile_identified_with_new_pipeline(&ast, "main", &type_checker, Some(source.as_bytes()))?;
     let source_hash = blake3::hash(source.as_bytes());
     let bytes = artifact
         .module
