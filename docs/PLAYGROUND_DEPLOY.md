@@ -1,113 +1,87 @@
 # Deploying the Nulang Playground to nulang.org/playground
 
-The browser playground (`playground/web/`) is a **static bundle**: four
-files, no backend. Anything that can serve static files with the right MIME
-types can host it.
+The browser playground is a static bundle: HTML, CSS, JavaScript, and a WASM
+build of the real compiler frontend + CoreVM. No application server is
+required.
 
-## 1. Build the bundle
+## Production deployment
+
+Production deployment is automated by
+`.github/workflows/docs-sync.yml` whenever compiler, docs, or playground
+sources change on `main`.
+
+The workflow:
+
+1. Installs Rust 1.95.0 with the `wasm32-unknown-unknown` target.
+2. Runs `playground/web/build.sh`.
+3. Runs `docs/scripts/sync-playground.mjs`, which copies the browser bundle to
+   `docs/public/playground/`.
+4. Builds the Astro documentation site as a validation gate.
+5. Commits the generated `docs/public/playground/` bundle back to `main`.
+6. Cloudflare Pages deploys the resulting site, including
+   `/playground/index.html` and `/playground/nulang_playground.wasm`.
+
+The generated WASM is intentionally not maintained by hand. The workflow
+refreshes it from compiler sources so the hosted playground cannot silently
+drift from the repository implementation.
+
+## Local browser-playground build
 
 ```bash
-rustup target add wasm32-unknown-unknown   # one-time
+rustup target add wasm32-unknown-unknown --toolchain 1.95.0
 playground/web/build.sh
+
+cd playground/web
+python3 -m http.server 8080
+# open http://localhost:8080
 ```
 
-This compiles `crates/nulang-playground` for `wasm32-unknown-unknown` and
-copies the artifact into `playground/web/`:
+The build produces:
 
-```
+```text
 playground/web/
-├── index.html               # editor UI
-├── playground.js            # wasm loader + run driver (no frameworks)
+├── index.html
+├── playground.js
 ├── style.css
-└── nulang_playground.wasm   # build artifact (~1.2 MB, git-ignored)
+└── nulang_playground.wasm
 ```
 
-Sanity check locally:
+The bundle uses relative asset paths, so the same files work at
+`/playground/` or at a local server root.
+
+## Docs-only builds
+
+`pnpm run build` inside `docs/` runs `docs/scripts/sync-playground.mjs`
+before Astro. The script always refreshes the HTML/CSS/JS shell from
+`playground/web/`.
+
+If `playground/web/nulang_playground.wasm` exists, it refreshes the public
+WASM too. If Rust/WASM tooling is unavailable (for example a lightweight local
+or Cloudflare docs build), it preserves the already-generated
+`docs/public/playground/nulang_playground.wasm`. The authoritative rebuild
+happens in Docs Sync on `main`.
+
+## Verification after deployment
 
 ```bash
-cd playground/web && python3 -m http.server 8080
-# open http://localhost:8080, press Run
+curl -sI https://nulang.org/playground/
+curl -sI https://nulang.org/playground/nulang_playground.wasm
 ```
 
-## 2. Serve it at nulang.org/playground
+Expected behavior:
 
-The bundle uses **relative paths only**, so it works under any sub-path.
-Copy the four files to whatever directory the nulang.org web server maps to
-`/playground/`, e.g.:
+- both requests return `200`;
+- the WASM asset is served as `application/wasm`;
+- the playground status changes to **compiler ready**;
+- running the default example prints:
 
-```bash
-rsync -av playground/web/ webroot/playground/
+```text
+Hello, Nulang!
+Hello, World!
+The answer is 42
 ```
 
-### Required response headers / MIME types
-
-| File                     | Content-Type               | Notes                          |
-|--------------------------|----------------------------|--------------------------------|
-| `*.wasm`                 | `application/wasm`         | **required** for fast compile  |
-| `*.js`                   | `text/javascript`          |                                |
-| everything               | `Cache-Control` short-ish  | wasm is content-stable per build |
-
-`playground.js` uses `fetch()` + `WebAssembly.instantiate()` (not
-`instantiateStreaming`), so a wrong wasm MIME type degrades to a warning,
-not a failure — but set `application/wasm` anyway.
-
-**nginx** (recent versions already map `.wasm` → `application/wasm`):
-
-```nginx
-location /playground/ {
-    alias /var/www/nulang.org/playground/;
-    types { application/wasm wasm; }   # only if your mime.types lacks it
-    add_header Cache-Control "public, max-age=300";
-}
-```
-
-**Caddy**: nothing to do; Caddy serves `application/wasm` out of the box.
-
-### Static-hosting alternatives (no server access needed)
-
-- **GitHub Pages**: commit the bundle to a `gh-pages` branch (the `.wasm`
-  must be force-added since it is git-ignored in `main`: `git add -f`), or
-  publish from a release artifact via CI.
-- **Cloudflare Pages / Netlify / Vercel**: point the site at a build that
-  runs `playground/web/build.sh` (Rust toolchain available in all three) and
-  publish `playground/web/` as the output directory, or upload the four
-  files directly.
-- **S3 + CloudFront**: upload with
-  `aws s3 cp playground/web/ s3://bucket/playground/ --recursive` and set
-  `--content-type application/wasm` on the `.wasm` object.
-
-### CI sketch (GitHub Actions)
-
-```yaml
-- uses: dtolnay/rust-toolchain@stable
-  with:
-    targets: wasm32-unknown-unknown
-- run: playground/web/build.sh
-- uses: actions/upload-artifact@v4
-  with:
-    name: playground
-    path: playground/web/
-# then publish `playground/web/` with your pages/deploy step of choice
-```
-
-## 3. Verify after deploy
-
-1. `curl -sI https://nulang.org/playground/nulang_playground.wasm` →
-   `200` and `content-type: application/wasm`.
-2. Open `https://nulang.org/playground/` — the status line should read
-   **"compiler ready"**.
-3. Press **Run** on the default example — output should be:
-   ```
-   Hello, Nulang!
-   Hello, World!
-   The answer is 42
-   ```
-
-## Notes
-
-- The wasm is the real compiler front-end + CoreVM (`src/core_vm`), built
-  from the same sources as the native binary. Language support == the
-  `core-vm` backend: frozen Core subset, `IO.print`, closures, recursion.
-  Actors, networking, FFI, JIT are native-only by design.
-- The old server-side playground (`playground/server.py`) remains available
-  for features that need the full native runtime.
+The browser playground intentionally targets the CoreVM subset. Actors,
+networking, FFI, and JIT execution remain native-runtime features. The older
+server-side playground (`playground/server.py`) is still useful when testing
+those broader capabilities locally.
