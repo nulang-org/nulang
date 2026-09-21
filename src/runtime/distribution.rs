@@ -16,6 +16,10 @@ use tracing::warn;
 /// forward `RemoteActorCache` (10k, TTL-bounded) still covers explicit
 /// `ActorAddress::remote` sends; the reverse index is best-effort on top.
 const REMOTE_REFS_MAX: usize = 10_000;
+/// Bound messages accumulated while a remote spawn request is unresolved.
+/// These are actor-data admission queues, not durable mailboxes.
+const PENDING_SPAWN_MESSAGES_PER_REQUEST_MAX: usize = 256;
+const PENDING_SPAWN_MESSAGES_TOTAL_MAX: usize = 4_096;
 
 /// A message sent to a spawn@node placeholder before its SpawnResponse
 /// arrived. The payload is ALREADY in wire form — string ids rewritten to
@@ -42,6 +46,22 @@ pub(crate) fn queue_spawn_message(
     behavior: &str,
     args: &[Value],
 ) -> crate::runtime::MessageAdmission {
+    let request_depth = rt
+        .pending_spawn_messages
+        .get(&request_id)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let total_depth: usize = rt.pending_spawn_messages.values().map(Vec::len).sum();
+    if request_depth >= PENDING_SPAWN_MESSAGES_PER_REQUEST_MAX
+        || total_depth >= PENDING_SPAWN_MESSAGES_TOTAL_MAX
+    {
+        warn!(
+            "nulang-net: backpressure queueing message to unresolved spawn placeholder {} (request_depth={}, total_depth={})",
+            request_id, request_depth, total_depth
+        );
+        return crate::runtime::MessageAdmission::Backpressured;
+    }
+
     let (payload, string_table) = match distributed::resolve_wire_strings(rt, args) {
         Some(resolved) => resolved,
         None => {
@@ -527,6 +547,30 @@ pub(crate) fn handle_node_failed(rt: &mut Runtime, node: NodeId) {
     // (1) Invalidate cached remote actors on the failed node.
     if let Some(resolver) = rt.distributed.resolver.as_mut() {
         resolver.invalidate_node(node);
+    }
+
+    // Pending spawn placeholders have no usable remote actor id until the
+    // response arrives. Once the hosting node is failed, stop retaining their
+    // pre-spawn message queues and publish a failed spawn result.
+    let failed_placeholders: Vec<u64> = rt
+        .spawn_placeholders
+        .iter()
+        .copied()
+        .filter(|request_id| rt.remote_refs.get(request_id) == Some(&node))
+        .collect();
+    for request_id in failed_placeholders {
+        rt.spawn_placeholders.remove(&request_id);
+        rt.remote_refs.remove(&request_id);
+        rt.pending_spawn_responses.insert(request_id, None);
+        if let Some(messages) = rt.pending_spawn_messages.remove(&request_id) {
+            for message in messages {
+                crate::runtime::distributed::notify_delivery_failed(
+                    rt,
+                    message.sender,
+                    "target node left cluster",
+                );
+            }
+        }
     }
 
     // (2) DOWN-with-noconnection to local watchers of actors on the node.
