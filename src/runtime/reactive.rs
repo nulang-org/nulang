@@ -13,6 +13,17 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
+/// Runtime-local identity of one actor-state field value.
+///
+/// `incarnation` changes whenever an Actor instance is reconstructed, while
+/// `revision` changes on each write to the field. Together they prevent a
+/// read set from becoming accidentally current again after actor replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateVersion {
+    pub incarnation: u64,
+    pub revision: u64,
+}
+
 /// The state fields observed while evaluating one query.
 ///
 /// Keys are `(actor_id, field_name)`; values are the field revision observed
@@ -22,61 +33,76 @@ use std::collections::BTreeMap;
 /// dependency primitive conservative until purity is enforced statically.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StateReadSet {
-    dependencies: BTreeMap<(u64, String), u64>,
+    dependencies: BTreeMap<u64, BTreeMap<String, StateVersion>>,
 }
 
 impl StateReadSet {
     /// Number of distinct actor-field dependencies.
     pub fn len(&self) -> usize {
-        self.dependencies.len()
+        self.dependencies.values().map(BTreeMap::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.dependencies.is_empty()
+        self.dependencies.values().all(BTreeMap::is_empty)
     }
 
-    /// Revision observed for one actor-state field.
-    pub fn revision(&self, actor_id: u64, field: &str) -> Option<u64> {
+    /// Version observed for one actor-state field.
+    pub fn version(&self, actor_id: u64, field: &str) -> Option<StateVersion> {
         self.dependencies
-            .get(&(actor_id, field.to_string()))
+            .get(&actor_id)
+            .and_then(|fields| fields.get(field))
             .copied()
     }
 
-    /// Iterate dependencies in deterministic actor/field order.
-    pub fn iter(&self) -> impl Iterator<Item = (u64, &str, u64)> + '_ {
-        self.dependencies
-            .iter()
-            .map(|((actor_id, field), revision)| (*actor_id, field.as_str(), *revision))
+    /// Field revision observed for one actor-state field.
+    pub fn revision(&self, actor_id: u64, field: &str) -> Option<u64> {
+        self.version(actor_id, field).map(|version| version.revision)
     }
 
-    /// True when a changed field revision invalidates this read set.
+    /// Iterate dependencies in deterministic actor/field order.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &str, StateVersion)> + '_ {
+        self.dependencies.iter().flat_map(|(actor_id, fields)| {
+            fields
+                .iter()
+                .map(move |(field, version)| (*actor_id, field.as_str(), *version))
+        })
+    }
+
+    /// True when a changed field version invalidates this read set.
     ///
     /// Writes to fields that were not read do not invalidate the query.
-    pub fn is_invalidated_by(&self, actor_id: u64, field: &str, revision: u64) -> bool {
-        self.revision(actor_id, field)
-            .map(|observed| observed != revision)
+    pub fn is_invalidated_by(
+        &self,
+        actor_id: u64,
+        field: &str,
+        version: StateVersion,
+    ) -> bool {
+        self.version(actor_id, field)
+            .map(|observed| observed != version)
             .unwrap_or(false)
     }
 
-    /// Check every dependency against a revision lookup.
+    /// Check every dependency against a version lookup.
     ///
     /// Missing actors/fields are stale: disappearance is itself a dependency
     /// change and must not leave a cached query result looking current.
-    pub fn is_current_with<F>(&self, mut revision_for: F) -> bool
+    pub fn is_current_with<F>(&self, mut version_for: F) -> bool
     where
-        F: FnMut(u64, &str) -> Option<u64>,
+        F: FnMut(u64, &str) -> Option<StateVersion>,
     {
         self.iter().all(|(actor_id, field, observed)| {
-            revision_for(actor_id, field)
+            version_for(actor_id, field)
                 .map(|current| current == observed)
                 .unwrap_or(false)
         })
     }
 
-    pub(crate) fn record(&mut self, actor_id: u64, field: &str, revision: u64) {
+    pub(crate) fn record(&mut self, actor_id: u64, field: &str, version: StateVersion) {
         self.dependencies
-            .entry((actor_id, field.to_string()))
-            .or_insert(revision);
+            .entry(actor_id)
+            .or_default()
+            .entry(field.to_string())
+            .or_insert(version);
     }
 }
 
@@ -100,9 +126,9 @@ impl ReactiveReadTracker {
     /// Recording in all scopes is what makes nested queries transparent to an
     /// outer subscription: if A queries B and B reads `B.status`, A's read set
     /// also contains that dependency.
-    pub(crate) fn record(&self, actor_id: u64, field: &str, revision: u64) {
+    pub(crate) fn record(&self, actor_id: u64, field: &str, version: StateVersion) {
         for scope in self.scopes.borrow_mut().iter_mut() {
-            scope.record(actor_id, field, revision);
+            scope.record(actor_id, field, version);
         }
     }
 
@@ -124,9 +150,30 @@ mod tests {
     fn records_distinct_fields_and_keeps_first_observed_revision() {
         let tracker = ReactiveReadTracker::default();
         tracker.begin();
-        tracker.record(7, "name", 3);
-        tracker.record(7, "name", 4);
-        tracker.record(7, "status", 9);
+        tracker.record(
+            7,
+            "name",
+            StateVersion {
+                incarnation: 2,
+                revision: 3,
+            },
+        );
+        tracker.record(
+            7,
+            "name",
+            StateVersion {
+                incarnation: 2,
+                revision: 4,
+            },
+        );
+        tracker.record(
+            7,
+            "status",
+            StateVersion {
+                incarnation: 2,
+                revision: 9,
+            },
+        );
 
         let reads = tracker.finish().unwrap();
         assert_eq!(reads.len(), 2);
@@ -138,13 +185,34 @@ mod tests {
     fn nested_reads_are_inherited_by_outer_scope() {
         let tracker = ReactiveReadTracker::default();
         tracker.begin();
-        tracker.record(1, "local", 1);
+        tracker.record(
+            1,
+            "local",
+            StateVersion {
+                incarnation: 10,
+                revision: 1,
+            },
+        );
 
         tracker.begin();
-        tracker.record(2, "remote", 5);
+        tracker.record(
+            2,
+            "remote",
+            StateVersion {
+                incarnation: 20,
+                revision: 5,
+            },
+        );
         let inner = tracker.finish().unwrap();
 
-        tracker.record(1, "after", 2);
+        tracker.record(
+            1,
+            "after",
+            StateVersion {
+                incarnation: 10,
+                revision: 2,
+            },
+        );
         let outer = tracker.finish().unwrap();
 
         assert_eq!(tracker.depth(), 0);
@@ -159,14 +227,40 @@ mod tests {
     #[test]
     fn invalidation_is_field_precise() {
         let mut reads = StateReadSet::default();
-        reads.record(9, "title", 4);
+        let observed = StateVersion {
+            incarnation: 4,
+            revision: 4,
+        };
+        reads.record(9, "title", observed);
 
-        assert!(!reads.is_invalidated_by(9, "other", 99));
-        assert!(!reads.is_invalidated_by(9, "title", 4));
-        assert!(reads.is_invalidated_by(9, "title", 5));
+        assert!(!reads.is_invalidated_by(
+            9,
+            "other",
+            StateVersion {
+                incarnation: 4,
+                revision: 99,
+            },
+        ));
+        assert!(!reads.is_invalidated_by(9, "title", observed));
+        assert!(reads.is_invalidated_by(
+            9,
+            "title",
+            StateVersion {
+                incarnation: 4,
+                revision: 5,
+            },
+        ));
+        assert!(reads.is_invalidated_by(
+            9,
+            "title",
+            StateVersion {
+                incarnation: 5,
+                revision: 4,
+            },
+        ));
 
         assert!(reads.is_current_with(|actor_id, field| {
-            (actor_id == 9 && field == "title").then_some(4)
+            (actor_id == 9 && field == "title").then_some(observed)
         }));
         assert!(!reads.is_current_with(|_, _| None));
     }
