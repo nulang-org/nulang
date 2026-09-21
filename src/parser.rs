@@ -8,7 +8,7 @@ use crate::authority::AuthorityGrant;
 use crate::lexer::{Token, TokenKind};
 use crate::types::{
     Capability, Effect, EffectRow, NuError, NuResult, NuWarning, PrimitiveType, Region, Span, Type,
-    TypeVar, ACTOR_REF_TYPE_NAME,
+    TypeVar, ACTOR_REF_TYPE_NAME, SECRET_TYPE_NAME,
 };
 use rustc_hash::FxHashMap;
 use std::sync::OnceLock;
@@ -5454,6 +5454,20 @@ impl Parser {
                     Vec::new()
                 };
 
+                if name == SECRET_TYPE_NAME {
+                    if args.len() != 1 {
+                        return Err(NuError::parse_error(
+                            format!(
+                                "Secret expects exactly one protected type argument, got {}",
+                                args.len()
+                            ),
+                            name_span,
+                        ));
+                    }
+                    let inner = args.into_iter().next().expect("length checked above");
+                    return Ok(Type::secret(inner));
+                }
+
                 if name == ACTOR_REF_TYPE_NAME {
                     if args.len() != 1 {
                         return Err(NuError::parse_error(
@@ -7010,6 +7024,32 @@ mod tests {
                 assert_eq!(params[0].ty, Some(Type::Primitive(PrimitiveType::Nil)));
             }
             _ => panic!("Expected function declaration"),
+        }
+    }
+
+    #[test]
+    fn test_parse_secret_type_annotation() {
+        let ast = parse("fn use_secret(s: Secret[String]) s").unwrap();
+        match &ast.decls[0] {
+            Decl::Function { params, .. } => {
+                let ty = params[0].ty.as_ref().expect("secret annotation");
+                assert_eq!(ty.secret_inner(), Some(&Type::string()));
+                assert!(ty.contains_secret());
+            }
+            _ => panic!("Expected function declaration"),
+        }
+    }
+
+    #[test]
+    fn test_parse_secret_type_requires_exactly_one_argument() {
+        for source in ["fn f(x: Secret) x", "fn f(x: Secret[Int, String]) x"] {
+            let result = parse(source);
+            match result {
+                Err(NuError::ParseError { msg, .. }) => {
+                    assert!(msg.contains("Secret expects exactly one"), "unexpected message: {msg}");
+                }
+                other => panic!("expected Secret arity error, got {other:?}"),
+            }
         }
     }
 
