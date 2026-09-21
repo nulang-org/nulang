@@ -1108,6 +1108,34 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            // v2 permits one event-sourced mutation per field at the same actor
+            // sequence. The legacy table keyed only by (actor_id, sequence),
+            // which silently made multi-field event sourcing backend-dependent.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS events_v2 (
+                    actor_id INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    field_name TEXT NOT NULL,
+                    event_name TEXT NOT NULL,
+                    args TEXT NOT NULL,
+                    value TEXT NOT NULL DEFAULT '1',
+                    PRIMARY KEY (actor_id, sequence, ordinal),
+                    UNIQUE (actor_id, sequence, field_name)
+                )",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "INSERT OR IGNORE INTO events_v2
+                    (actor_id, sequence, ordinal, field_name, event_name, args, value)
+                 SELECT actor_id, sequence, 0, field_name, event_name, args, value
+                 FROM events",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             Ok(())
         })
     }
@@ -1305,6 +1333,58 @@ impl PersistenceStore for LibsqlStore {
         })
     }
 
+    fn scan_journal_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<JournalEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = match conn
+                .query(
+                    "SELECT sequence, behavior_id, payload FROM journal
+                     WHERE actor_id = ?1 AND sequence >= ?2
+                     ORDER BY sequence ASC LIMIT ?3",
+                    libsql::params![actor_id as i64, start_sequence as i64, limit],
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                Err(_) => return Vec::new(),
+            };
+            let mut entries = Vec::new();
+            while let Ok(Some(row)) = rows.next().await {
+                let seq: i64 = match row.get(0) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let behavior_id: i64 = match row.get(1) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let payload_json: String = match row.get(2) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let payload = match serde_json::from_str(&payload_json) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                entries.push(JournalEntry {
+                    sequence: seq as u64,
+                    behavior_id: behavior_id as u16,
+                    payload,
+                });
+            }
+            entries
+        })
+    }
+
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
         let event_json = serde_json::to_string(&event)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1354,6 +1434,44 @@ impl PersistenceStore for LibsqlStore {
         })
     }
 
+    fn scan_workflow_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<WorkflowEvent> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = match conn
+                .query(
+                    "SELECT event FROM workflow_events
+                     WHERE actor_id = ?1 AND sequence >= ?2
+                     ORDER BY sequence ASC LIMIT ?3",
+                    libsql::params![actor_id as i64, start_sequence as i64, limit],
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                Err(_) => return Vec::new(),
+            };
+            let mut events = Vec::new();
+            while let Ok(Some(row)) = rows.next().await {
+                let event_json: String = match row.get(0) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                if let Ok(event) = serde_json::from_str(&event_json) {
+                    events.push(event);
+                }
+            }
+            events
+        })
+    }
+
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
         let args_json = serde_json::to_string(&entry.args)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1362,7 +1480,14 @@ impl PersistenceStore for LibsqlStore {
             let value_json = serde_json::to_string(&entry.value)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             conn.execute(
-                "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO events_v2
+                    (actor_id, sequence, ordinal, field_name, event_name, args, value)
+                 SELECT ?1, ?2, COALESCE(MAX(ordinal) + 1, 0), ?3, ?4, ?5, ?6
+                 FROM events_v2 WHERE actor_id = ?1 AND sequence = ?2
+                 ON CONFLICT(actor_id, sequence, field_name) DO UPDATE SET
+                    event_name = excluded.event_name,
+                    args = excluded.args,
+                    value = excluded.value",
                 libsql::params![actor_id as i64, entry.sequence as i64, entry.field_name, entry.event_name, args_json, value_json],
             ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
         })
@@ -1373,8 +1498,8 @@ impl PersistenceStore for LibsqlStore {
         self.rt.block_on(async {
             let mut rows = match conn
                 .query(
-                    "SELECT sequence, field_name, event_name, args, value FROM events
-                 WHERE actor_id = ?1 ORDER BY sequence ASC",
+                    "SELECT sequence, field_name, event_name, args, value FROM events_v2
+                 WHERE actor_id = ?1 ORDER BY sequence ASC, ordinal ASC",
                     libsql::params![actor_id as i64],
                 )
                 .await
@@ -1430,6 +1555,72 @@ impl PersistenceStore for LibsqlStore {
         })
     }
 
+    fn scan_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<EventEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = match conn
+                .query(
+                    "SELECT sequence, field_name, event_name, args, value FROM events_v2
+                     WHERE actor_id = ?1 AND sequence >= ?2
+                     ORDER BY sequence ASC, ordinal ASC LIMIT ?3",
+                    libsql::params![actor_id as i64, start_sequence as i64, limit],
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                Err(_) => return Vec::new(),
+            };
+            let mut entries = Vec::new();
+            while let Ok(Some(row)) = rows.next().await {
+                let sequence: i64 = match row.get(0) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let field_name: String = match row.get(1) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let event_name: String = match row.get(2) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let args_json: String = match row.get(3) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let value_json: String = match row.get(4) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let args = match serde_json::from_str(&args_json) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let value = match serde_json::from_str(&value_json) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                entries.push(EventEntry {
+                    sequence: sequence as u64,
+                    field_name,
+                    event_name,
+                    args,
+                    value,
+                });
+            }
+            entries
+        })
+    }
+
     fn latest_sequence(&self, actor_id: u64) -> u64 {
         let conn = self.conn();
         self.rt.block_on(async {
@@ -1459,7 +1650,7 @@ impl PersistenceStore for LibsqlStore {
             }.await;
             let event_seq: Option<i64> = async {
                 let mut rows = conn.query(
-                    "SELECT sequence FROM events WHERE actor_id = ?1 ORDER BY sequence DESC LIMIT 1",
+                    "SELECT sequence FROM events_v2 WHERE actor_id = ?1 ORDER BY sequence DESC LIMIT 1",
                     libsql::params![actor_id as i64],
                 ).await.ok()?;
                 let row = rows.next().await.ok()??;
@@ -1498,6 +1689,13 @@ impl PersistenceStore for LibsqlStore {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             conn.execute(
                 "DELETE FROM events WHERE actor_id = ?1",
+                libsql::params![actor_id as i64],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "DELETE FROM events_v2 WHERE actor_id = ?1",
                 libsql::params![actor_id as i64],
             )
             .await
