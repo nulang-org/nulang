@@ -2,9 +2,9 @@
 // Language version: 2.0.0-alpha
 //
 // Polymorphic functions (map, filter, reverse, take, drop, range, length,
-// contains, any, all) work with any element type. Functions with explicit
-// [Int] annotations (sum, index_of, find, fold, max_of, min_of, sort, append,
-// zip, enumerate, uniq) are Int-only for now.
+// contains, index_of, find, any, all) work with any element type. Functions with explicit
+// [Int] annotations (sum, fold, max_of, min_of, sort, append, zip, enumerate,
+// uniq) are Int-only for now.
 //
 // Built on `perform Array.push` / `perform Array.new` / `perform Array.length`
 // primitives (added 2026-07-30).
@@ -34,14 +34,14 @@ pub fn contains(x, xs) -> Bool {
     false
 }
 
-/// First index of x in xs, or -1 if not found.
-pub fn index_of(x, xs) -> Int {
+/// First index of x in xs, or None if not found.
+pub fn index_of(x, xs) -> Option[Int] {
     var i = 0;
     for elem in xs {
-        if elem == x then { return i } else {};
+        if elem == x then { return Some(i) } else {};
         i = i + 1
     };
-    -1
+    None
 }
 
 /// True if any element satisfies the predicate.
@@ -60,12 +60,12 @@ pub fn all(pred, xs) -> Bool {
     true
 }
 
-/// First element satisfying pred, or -1 if none match.
+/// First element satisfying pred, or None if none match.
 pub fn find(pred, xs) {
     for x in xs {
-        if pred(x) then { return x } else {}
+        if pred(x) then { return Some(x) } else {}
     };
-    -1
+    None
 }
 
 /// Left fold: fold(f, init, [a, b, c]) = f(f(f(init, a), b), c).
@@ -77,8 +77,8 @@ pub fn fold(f, init: Int, xs: [Int]) -> Int {
     acc
 }
 
-/// Maximum element. Crashes (negative return) for empty array.
-pub fn max_of(xs: [Int]) -> Int {
+/// Maximum element, or None for an empty array.
+pub fn max_of(xs: [Int]) -> Option[Int] {
     var first = true;
     var best = 0;
     for x in xs {
@@ -86,11 +86,11 @@ pub fn max_of(xs: [Int]) -> Int {
             if x > best then { best = x } else {}
         }
     };
-    best
+    if first then None else Some(best)
 }
 
-/// Minimum element. Crashes (negative return) for empty array.
-pub fn min_of(xs: [Int]) -> Int {
+/// Minimum element, or None for an empty array.
+pub fn min_of(xs: [Int]) -> Option[Int] {
     var first = true;
     var best = 0;
     for x in xs {
@@ -98,7 +98,7 @@ pub fn min_of(xs: [Int]) -> Int {
             if x < best then { best = x } else {}
         }
     };
-    best
+    if first then None else Some(best)
 }
 
 // ---------------------------------------------------------------------------
@@ -211,8 +211,7 @@ pub fn sort_by(cmp, xs) {
     }
 }
 
-/// Minimum element according to comparator cmp(a, b) returning true if a is "less than" b.
-/// Returns 0 for empty array (matching max_of/min_of convention).
+/// Minimum element according to comparator cmp(a, b), or None for an empty array.
 pub fn min_by(cmp, xs) {
     var first = true;
     var best = 0;
@@ -221,11 +220,10 @@ pub fn min_by(cmp, xs) {
             if cmp(x, best) then { best = x } else {}
         }
     };
-    best
+    if first then None else Some(best)
 }
 
-/// Maximum element according to comparator cmp(a, b) returning true if a is "less than" b.
-/// Returns 0 for empty array (matching max_of/min_of convention).
+/// Maximum element according to comparator cmp(a, b), or None for an empty array.
 pub fn max_by(cmp, xs) {
     var first = true;
     var best = 0;
@@ -234,7 +232,7 @@ pub fn max_by(cmp, xs) {
             if cmp(best, x) then { best = x } else {}
         }
     };
-    best
+    if first then None else Some(best)
 }
 
 /// Concatenate two arrays into a new array.  Original arrays unchanged.
