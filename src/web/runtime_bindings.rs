@@ -406,6 +406,7 @@ mod tests {
             handler_param: name.to_string(),
             handler_index: index,
             ty: ty.map(str::to_string),
+            codec: None,
         }
     }
 
