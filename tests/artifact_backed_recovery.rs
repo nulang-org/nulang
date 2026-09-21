@@ -36,11 +36,7 @@ fn semantic(label: &[u8]) -> SemanticId {
 
 fn retained_mixed_module(
     store: &FileArtifactStore,
-) -> (
-    ArtifactIdentityManifest,
-    SemanticId,
-    SemanticId,
-) {
+) -> (ArtifactIdentityManifest, SemanticId, SemanticId) {
     let program_id = semantic(b"mixed-program");
     let workflow_id = semantic(b"workflow-definition");
     let counter_id = semantic(b"counter-definition");
@@ -112,11 +108,7 @@ fn historical_artifact_recovery_selects_exact_definition_metadata() {
 
     assert_eq!(
         runtime
-            .recover_actor_from_artifact_store(
-                actor_id,
-                &store,
-                RecoveryIdentityPolicy::Strict,
-            )
+            .recover_actor_from_artifact_store(actor_id, &store, RecoveryIdentityPolicy::Strict,)
             .unwrap(),
         actor_id
     );
@@ -163,7 +155,9 @@ fn historical_artifact_recovery_requires_runtime_sidecar() {
     module.artifact_id = Some(identity.artifact_id());
     module.actor_metadata.push(ActorMeta::new("Counter"));
     module.actor_semantic_ids.push(definition_id);
-    store.retain(&identity, &module.to_nbc(None).unwrap()).unwrap();
+    store
+        .retain(&identity, &module.to_nbc(None).unwrap())
+        .unwrap();
 
     let actor_id = 420_002;
     let mut runtime = Runtime::new();
