@@ -194,7 +194,9 @@ pub struct Actor {
     pub event_sourced_sequences: HashMap<String, u64>,
     /// How many events between compaction snapshots for EventSourced fields (default 100).
     pub event_sourced_compaction_interval: u64,
-    pub persistent: bool,  // Whether this actor survives restarts
+    pub persistent: bool, // Whether this actor survives restarts
+    /// Declared durable entity schema version. Native/legacy actors default to v1.
+    pub schema_version: u32,
     pub is_workflow: bool, // True if generated from a workflow declaration
     pub behavior_table: Vec<BehaviorEntry>,
     /// AOT-compiled behavior targets, parallel to `behavior_table`. `Some`
@@ -346,6 +348,7 @@ impl Actor {
             event_sourced_sequences: HashMap::new(),
             event_sourced_compaction_interval: 100,
             persistent: false,
+            schema_version: crate::persistence_schema::LEGACY_SCHEMA_VERSION,
             is_workflow: false,
             behavior_table: Vec::new(),
             #[cfg(feature = "native-codegen")]
