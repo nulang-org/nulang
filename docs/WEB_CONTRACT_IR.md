@@ -268,11 +268,28 @@ The first explicit response-body contracts are now:
 
 `Json[T]` is currently an already-serialized string marker, not an implicit serializer. This keeps transport semantics explicit while serialization/value codecs evolve independently. The same response contract is lowered into runtime route plans and Deployment IR and is reused by OpenAPI.
 
+## Request body algebra and codecs
+
+Whole-body request bindings can now opt into explicit wire semantics through their declared type:
+
+```nulang
+fn create_user(payload: Json[CreateUser] from body) -> Json[User] {
+    // payload is still serialized JSON text in this phase.
+}
+```
+
+For `Json[T] from body` the compiler emits a JSON body codec in binding IR. The HTTP runtime requires `Content-Type: application/json` (parameters such as `charset=utf-8` are allowed), validates JSON syntax, and validates the JSON shape for primitive payload markers such as `Json[Int]` or `Json[String]`. Domain payload types retain `T` as schema metadata but remain serialized text until first-class value codecs are available.
+
+Malformed JSON is a `400 application/problem+json` request error. A missing or incompatible media type is `415 application/problem+json`. Raw `String from body` bindings preserve the previous behavior and do not invent a media type or codec.
+
+The same binding codec metadata is serialized into Deployment IR and drives OpenAPI `requestBody`, runtime validation, and future Nulang Cloud admission. Typed JSON whole-body bindings cannot be mixed with URL-encoded form bindings because those require mutually exclusive request media types.
+
 ## Remaining implementation priorities
 
-1. Extend the request/response algebra with bytes, streams, typed request bodies/media, and first-class serialization codecs.
-2. Add richer request decoders for optional/default values, repeated query parameters/collections, binary bodies, transparent aliases, and opaque/domain types.
-3. Execute requests under lightweight supervised request actors with structured cancellation/backpressure.
-4. Replace ambient request-context dependency injection with effect handlers once compatibility coverage is sufficient.
-5. Introduce authorization/resource capabilities separately from Nulang reference capabilities, including attenuation and capability-parameterized effects.
-6. Unify HTTP, SSE, and WebSocket entry points over the same actor/effect/capability execution model.
+1. Add first-class value serialization/deserialization codecs so `Json[T]` can decode/encode records, variants, arrays, optionals, and domain types without hand-written parsing.
+2. Extend the request/response algebra with bytes and streaming bodies.
+3. Add richer request decoders for optional/default values, repeated query parameters/collections, transparent aliases, and opaque/domain types.
+4. Execute requests under lightweight supervised request actors with structured cancellation/backpressure.
+5. Replace ambient request-context dependency injection with effect handlers once compatibility coverage is sufficient.
+6. Introduce authorization/resource capabilities separately from Nulang reference capabilities, including attenuation and capability-parameterized effects.
+7. Unify HTTP, SSE, and WebSocket entry points over the same actor/effect/capability execution model.

@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod bindings;
+pub mod codec;
 pub mod budget;
 pub mod contracts;
 pub mod dispatch;

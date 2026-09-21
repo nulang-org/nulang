@@ -98,7 +98,7 @@ fn operation_for(route: &RouteContract) -> Value {
     if !parameters.is_empty() {
         operation.insert("parameters".to_string(), Value::Array(parameters));
     }
-    if let Some(request_body) = form_request_body(&binding_compilation.bindings) {
+    if let Some(request_body) = request_body(&binding_compilation.bindings) {
         operation.insert("requestBody".to_string(), request_body);
     }
     operation.insert("responses".to_string(), Value::Object(responses));
@@ -200,6 +200,34 @@ fn binding_parameter(binding: &RouteBindingContract) -> Option<Value> {
     }))
 }
 
+/// Generate a real OpenAPI request body from compiler-owned binding semantics.
+///
+/// Explicit whole-body codecs take precedence. URL-encoded form bindings remain
+/// supported when no typed whole-body contract is present.
+fn request_body(bindings: &[RouteBindingContract]) -> Option<Value> {
+    if let Some(binding) = bindings.iter().find(|binding| {
+        binding.source == RouteBindingSource::Body && binding.codec.is_some()
+    }) {
+        let codec = binding.codec.as_ref()?;
+        let schema = json_payload_schema(codec.payload_type.as_deref());
+        let mut content = Map::new();
+        content.insert(
+            codec.media_type.clone(),
+            json!({
+                "schema": schema,
+                "x-nulang-codec": codec.codec.as_str(),
+                "x-nulang-handler-param": binding.handler_param,
+            }),
+        );
+        return Some(json!({
+            "required": true,
+            "content": Value::Object(content),
+        }));
+    }
+
+    form_request_body(bindings)
+}
+
 /// Generate a real OpenAPI request body for `from form(...)` bindings.
 ///
 /// The HTTP runtime only populates form bindings for
@@ -245,13 +273,20 @@ fn form_request_body(bindings: &[RouteBindingContract]) -> Option<Value> {
 }
 
 fn binding_extension(binding: &RouteBindingContract) -> Value {
-    json!({
+    let mut extension = json!({
         "source": binding_source_name(binding.source),
         "source_name": binding.source_name,
         "handler_param": binding.handler_param,
         "handler_index": binding.handler_index,
         "type": binding.ty,
-    })
+    });
+    if let (Value::Object(fields), Some(codec)) = (&mut extension, &binding.codec) {
+        fields.insert(
+            "codec".to_string(),
+            serde_json::to_value(codec).unwrap_or(Value::Null),
+        );
+    }
+    extension
 }
 
 fn binding_source_name(source: RouteBindingSource) -> &'static str {
@@ -346,6 +381,7 @@ mod tests {
             handler_param: format!("handler_{name}"),
             handler_index: 0,
             ty: Some(ty.to_string()),
+            codec: None,
         }
     }
 
@@ -414,7 +450,7 @@ mod tests {
             binding(RouteBindingSource::Form, "title", "String"),
             binding(RouteBindingSource::Form, "count", "Int"),
         ];
-        let body = form_request_body(&bindings).unwrap();
+        let body = request_body(&bindings).unwrap();
 
         let schema = &body["content"]["application/x-www-form-urlencoded"]["schema"];
         assert_eq!(body["required"], true);
@@ -428,7 +464,20 @@ mod tests {
     #[test]
     fn raw_body_does_not_invent_an_openapi_media_type() {
         let body = binding(RouteBindingSource::Body, "body", "Payload");
-        assert!(form_request_body(&[body]).is_none());
+        assert!(request_body(&[body]).is_none());
+    }
+
+    #[test]
+    fn typed_json_body_emits_openapi_media_and_payload_schema() {
+        let mut body = binding(RouteBindingSource::Body, "body", "Json[CreateUser]");
+        body.codec = crate::web::codec::body_codec_for_type(body.ty.as_deref());
+        let request = request_body(&[body]).unwrap();
+
+        assert_eq!(request["required"], true);
+        let media = &request["content"]["application/json"];
+        assert_eq!(media["schema"]["x-nulang-type"], "CreateUser");
+        assert_eq!(media["x-nulang-codec"], "json");
+        assert_eq!(media["x-nulang-handler-param"], "handler_body");
     }
 
     #[test]

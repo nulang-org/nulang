@@ -68,6 +68,7 @@ mod tests {
             handler_param: "limit".to_string(),
             handler_index: 0,
             ty: Some("Int".to_string()),
+            codec: None,
         };
         let error = bind_request_arguments(&[binding], 1, &values).unwrap_err();
         assert_eq!(error.kind, RequestDecodeErrorKind::InvalidType);
@@ -96,6 +97,7 @@ mod tests {
             handler_param: None,
             handler_index: Some(1),
             expected_type: None,
+            expected_media_type: None,
             message: "handler parameter slot 1 has no request binding".to_string(),
         };
 
