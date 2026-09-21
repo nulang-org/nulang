@@ -252,6 +252,9 @@ impl BehaviorManifest {
         let effects = collect_checked_effects(effect_checker, decls)?;
         let effect_decls: Vec<EffectDecl> = effects.iter().map(classify_effect).collect();
         let authority = authority_requirements(&effects);
+        let mut host_abi = input.host_abi;
+        host_abi.required_operations.sort();
+        host_abi.required_operations.dedup();
 
         Ok(Self {
             schema: BEHAVIOR_MANIFEST_SCHEMA.to_string(),
@@ -269,7 +272,7 @@ impl BehaviorManifest {
                 version: input.compiler_version.to_string(),
                 digest: digest(input.compiler_bytes),
             },
-            host_abi: input.host_abi,
+            host_abi,
             // Phase 0 intentionally emits no speculative contracts. These
             // arrays become non-empty only when their compiler source of truth
             // is authoritative and covered by conformance tests.
