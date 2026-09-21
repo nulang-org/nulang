@@ -3,7 +3,7 @@
 </p>
 <h1 align="center">Nulang</h1>
 <p align="center">
-  An actor-based language with algebraic effects, capability-based types, and durable/distributed actors for building resilient software.
+  An actor-based language with algebraic effects, capability-based types, durable actors, and experimental distribution for building resilient software.
 </p>
 <p align="center">
   <a href="https://nulang.org">Website</a> •
@@ -31,7 +31,7 @@ and row-polymorphic algebraic effects. The compiler pipeline (AST → HIR → MI
 targets a register-based bytecode VM with a Cranelift JIT, an ahead-of-time
 native backend, and an optional WASM backend. The runtime is a multi-threaded
 work-stealing executor with supervision trees, ORCA garbage collection,
-location-transparent distribution, and durable persistence.
+durable persistence, plus experimental location-transparent distribution.
 
 ---
 
