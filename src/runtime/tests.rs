@@ -5524,6 +5524,7 @@ fn test_message_retry_after_bytecode_fetch() {
         sender_node: node_b,
         priority: crate::runtime::mailbox::MessagePriority::Normal,
         trace_id: None,
+        delivery_id: None,
     };
     rt_b.distributed
         .transport
