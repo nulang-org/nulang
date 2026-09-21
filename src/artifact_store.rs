@@ -52,8 +52,17 @@ pub trait ArtifactStore: Send + Sync {
     ) -> Result<ArtifactId, ArtifactStoreError>;
 
     /// Load an exact artifact by canonical ArtifactId.
-    fn load(&self, artifact_id: ArtifactId)
-        -> Result<Option<RetainedArtifact>, ArtifactStoreError>;
+    fn load(
+        &self,
+        artifact_id: ArtifactId,
+    ) -> Result<Option<RetainedArtifact>, ArtifactStoreError>;
+
+    /// Require an exact historical artifact. Missing retention is a
+    /// machine-readable error rather than an invitation to run current code.
+    fn require(&self, artifact_id: ArtifactId) -> Result<RetainedArtifact, ArtifactStoreError> {
+        self.load(artifact_id)?
+            .ok_or(ArtifactStoreError::MissingArtifact { artifact_id })
+    }
 }
 
 /// Local content-addressed artifact cache.
@@ -82,11 +91,6 @@ impl LocalArtifactStore {
 
     fn artifact_dir(&self, artifact_id: ArtifactId) -> PathBuf {
         self.root.join(artifact_id.to_string())
-    }
-
-    fn load_required(&self, artifact_id: ArtifactId) -> Result<RetainedArtifact, ArtifactStoreError> {
-        self.load(artifact_id)?
-            .ok_or(ArtifactStoreError::MissingArtifact { artifact_id })
     }
 
     fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), ArtifactStoreError> {
@@ -162,7 +166,7 @@ impl ArtifactStore for LocalArtifactStore {
         fs::create_dir_all(&self.root).map_err(ArtifactStoreError::from)?;
         let target = self.artifact_dir(artifact_id);
         if target.exists() {
-            let existing = self.load_required(artifact_id)?;
+            let existing = self.require(artifact_id)?;
             if existing.nbc_bytes == nbc_bytes
                 && existing.manifest == *manifest
                 && existing.module.actor_semantic_ids == module.actor_semantic_ids
@@ -197,7 +201,7 @@ impl ArtifactStore for LocalArtifactStore {
             // A concurrent writer may have won the race. Accept only if it
             // retained byte-for-byte equivalent content.
             if target.exists() {
-                let existing = self.load_required(artifact_id)?;
+                let existing = self.require(artifact_id)?;
                 if existing.nbc_bytes == nbc_bytes
                     && existing.manifest == *manifest
                     && existing.module.actor_semantic_ids == module.actor_semantic_ids
@@ -497,6 +501,27 @@ mod tests {
             std::iter::empty::<&str>(),
         );
         assert!(store.load(missing).unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn require_missing_artifact_returns_machine_readable_error() {
+        let root = temp_root("require-missing");
+        let _ = fs::remove_dir_all(&root);
+        let store = LocalArtifactStore::new(&root);
+        let missing = ArtifactId::from_semantic(
+            SemanticId::from_canonical_bytes(b"required-missing", []),
+            "compiler",
+            "target",
+            "abi",
+            "backend",
+            std::iter::empty::<&str>(),
+        );
+
+        assert!(matches!(
+            store.require(missing),
+            Err(ArtifactStoreError::MissingArtifact { artifact_id }) if artifact_id == missing
+        ));
         let _ = fs::remove_dir_all(root);
     }
 
