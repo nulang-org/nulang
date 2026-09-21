@@ -2244,6 +2244,89 @@ fn test_recover_actor_executes_current_schema_apply_replay_instead_of_stored_val
 }
 
 #[test]
+fn test_recover_actor_migrates_snapshot_and_historical_events_without_rewriting_journal() {
+    let module = compile_state_migration_module(
+        r#"
+        entity Counter {
+            version: 2
+            state durable bonus: Int = 0
+            state event_sourced count: Int = 0
+            events
+                | Incremented(by: Int)
+            apply
+                | Incremented(by) => { self.count = self.count + by }
+
+            behavior inc(by: Int) {
+                emit Incremented(by)
+            }
+
+            migration from 1 to 2 {
+                state => { self.bonus = self.bonus + 5 }
+                events {
+                    | Added(by) => emit Incremented(by)
+                    | other => other
+                }
+            }
+        }
+        "#,
+    );
+    let actor_id = 919_021;
+    let mut snapshot = ActorSnapshot {
+        actor_id,
+        sequence: 1,
+        schema_owner: Some("Counter".to_string()),
+        schema_version: 1,
+        ..ActorSnapshot::default()
+    };
+    snapshot
+        .state
+        .insert("bonus".to_string(), PersistedValue::Int(10));
+
+    let historical = EventEntry {
+        sequence: 1,
+        schema_owner: Some("Counter".to_string()),
+        schema_version: 1,
+        field_name: "legacy_count".to_string(),
+        event_name: "Added".to_string(),
+        args: vec![PersistedValue::Int(3)],
+        value: PersistedValue::Int(777),
+    };
+
+    let mut rt = Runtime::new();
+    rt.persistence.save_snapshot(snapshot).unwrap();
+    rt.persistence
+        .append_event(actor_id, historical.clone())
+        .unwrap();
+    rt.register_recovery_module(actor_id, module, vec![], vec![]);
+
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+
+    let actor = rt.actors.get(&actor_id).expect("recovered actor");
+    assert_eq!(actor.schema_version, 2);
+    assert_eq!(
+        actor.get_state_field("bonus").and_then(|value| value.as_int()),
+        Some(15),
+        "snapshot state migration must commit before publication"
+    );
+    assert_eq!(
+        actor.get_state_field("count").and_then(|value| value.as_int()),
+        Some(4),
+        "historical Added(3) must migrate to current Incremented(3), then apply + runtime increment"
+    );
+
+    let committed = rt.persistence.load_snapshot(actor_id).expect("committed snapshot");
+    assert_eq!(committed.schema_version, 2);
+    assert_eq!(committed.state.get("bonus"), Some(&PersistedValue::Int(15)));
+
+    let journal = rt.persistence.read_events(actor_id);
+    assert_eq!(
+        journal,
+        vec![historical],
+        "RFC 0008 migration must never rewrite historical event rows"
+    );
+}
+
+#[test]
 fn test_recover_actor_executes_and_commits_state_migration_before_publication() {
     let module = compile_state_migration_module(
         r#"
