@@ -450,6 +450,11 @@ pub struct Runtime {
     /// Kept separate from the module tuple so whole-program artifact identity
     /// cannot accidentally become the durable actor compatibility key.
     pub(crate) recovery_definition_semantic_ids: HashMap<u64, crate::content_identity::SemanticId>,
+    /// Exact actor-metadata index selected for each recovery module when
+    /// definition identity resolves unambiguously. This prevents mixed
+    /// actor/workflow modules from restoring another definition's role,
+    /// defaults, or state-model metadata.
+    pub(crate) recovery_definition_indices: HashMap<u64, usize>,
     /// Content-addressed bytecode cache for fetch-on-demand.
     /// When a node receives a message for an unknown content hash, it can
     /// request the bytecode from the sender and cache it here keyed by hash.
@@ -643,6 +648,7 @@ impl Runtime {
             idle_callback: None,
             recovery_modules: HashMap::new(),
             recovery_definition_semantic_ids: HashMap::new(),
+            recovery_definition_indices: HashMap::new(),
             #[cfg(feature = "ai-runtime")]
             ai: AiRuntimeRegistry::new(),
             #[cfg(feature = "ai-runtime")]
