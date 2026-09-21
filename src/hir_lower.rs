@@ -74,12 +74,7 @@ pub fn lower_module(
         *cell.borrow_mut() = Some(inferred_decl_types.clone());
     });
 
-    for decl in &ast.decls {
-        if matches!(decl, Decl::NamedHandler { .. } | Decl::Class { .. }) {
-            continue;
-        }
-        module.decls.push(lower_decl(decl, &tools));
-    }
+    module.decls = lower_decls(&ast.decls, &tools);
 
     CURRENT_CLASS_TABLES.with(|cell| {
         *cell.borrow_mut() = None;
@@ -95,6 +90,20 @@ pub fn lower_module(
 /// (including nested modules), mirroring the stable compiler's
 /// `collect_functions` so `agent` declarations can resolve `tools: [...]`
 /// names regardless of source order.
+fn lower_decls(decls: &[Decl], tools: &[ToolSchema]) -> Vec<hir::Decl> {
+    decls
+        .iter()
+        .filter_map(|decl| match decl {
+            Decl::NamedHandler { .. }
+            | Decl::Class { .. }
+            | Decl::Signal { .. }
+            | Decl::Given { .. }
+            | Decl::Database { .. } => None,
+            _ => Some(lower_decl(decl, tools)),
+        })
+        .collect()
+}
+
 fn collect_tool_schemas(decls: &[Decl]) -> Vec<ToolSchema> {
     let mut tools = Vec::new();
     collect_tool_schemas_into(decls, &mut tools);
@@ -409,7 +418,7 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
         } => hir::Decl::Module {
             name: name.clone(),
             exports: exports.clone(),
-            decls: decls.iter().map(|d| lower_decl(d, tools)).collect(),
+            decls: lower_decls(decls, tools),
             span: *span,
         },
         Decl::Import { path, items, span } => hir::Decl::Import {
@@ -431,13 +440,7 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
             }
         }
         Decl::Signal { .. } => {
-            // Signals are compile-time metadata for the reactivity pass and are
-            // inlined at use sites in `lower_expr`. They produce no HIR decl.
-            return hir::Decl::Import {
-                path: String::new(),
-                items: Vec::new(),
-                span: Span::default(),
-            };
+            unreachable!("Signal should be filtered by lower_decls")
         }
         Decl::Workflow {
             name, items, span, ..
@@ -541,35 +544,11 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
             // lower_decl; this arm exists only for exhaustiveness.
             unreachable!("NamedHandler should be filtered by lower_module")
         }
-        Decl::Database { name, tables, span } => hir::Decl::Database {
-            name: name.clone(),
-            tables: tables
-                .iter()
-                .map(|table| ast::DatabaseTable {
-                    name: table.name.clone(),
-                    columns: table
-                        .columns
-                        .iter()
-                        .map(|column| ast::DatabaseColumn {
-                            name: column.name.clone(),
-                            col_type: lower_runtime_type(&column.col_type),
-                            modifiers: column.modifiers.clone(),
-                            span: column.span,
-                        })
-                        .collect(),
-                    span: table.span,
-                })
-                .collect(),
-            span: *span,
-        },
-        Decl::Given { span, .. } => {
-            // Given declarations are resolved to call-site arguments
-            // during typechecking and do not produce HIR nodes.
-            hir::Decl::Constant {
-                name: "_unused_given".to_string(),
-                body: hir::Body::new(),
-                span: *span,
-            }
+        Decl::Database { .. } => {
+            unreachable!("Database should be filtered by lower_decls")
+        }
+        Decl::Given { .. } => {
+            unreachable!("Given should be filtered by lower_decls")
         }
     }
 }
