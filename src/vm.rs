@@ -7236,6 +7236,22 @@ mod vm_tests {
         );
     }
 
+    #[test]
+    fn sandboxed_standalone_callbacks_deny_process_execution() {
+        let mut callbacks = StandaloneVmCallbacks::new();
+        callbacks.deny_ambient_host_effects = true;
+        let constants = vec![Constant::String("printf should-not-run".to_string())];
+        let result = callbacks
+            .perform_builtin_effect(
+                "Process",
+                Some("run"),
+                &constants,
+                &[Value::string(0)],
+            )
+            .expect("sandboxed Process.run should be handled as denied");
+        assert!(result.is_nil());
+    }
+
     /// Test 21: Gossip records intent and returns unit.
     #[test]
     fn test_gossip_records_intent_and_returns_unit() {
