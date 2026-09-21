@@ -1084,7 +1084,7 @@ fn print_help() {
     println!("       nulang --dap");
     println!("       nulang new <path> [--template <name>]");
     println!("       nulang dev [--port <port>]");
-    println!("       nulang build");
+    println!("       nulang build [--target bytecode|wasm|cwasm]");
     println!("       nulang test [--filter <pattern>]");
     println!("       nulang run [--watch]");
     println!("       nulang fmt [--check] [<file>]");
@@ -1136,7 +1136,7 @@ fn print_help() {
     );
     println!("  new <path>       Scaffold a package (shortcut for 'nula new')");
     println!("  dev              Start package dev server (shortcut for 'nula dev')");
-    println!("  build            Build the current package (shortcut for 'nula build')");
+    println!("  build            Build package artifact; --target wasm emits portable WASM");
     println!("  test             Test the current package (shortcut for 'nula test')");
     println!("  run              Run the current package (shortcut for 'nula run')");
     println!(
