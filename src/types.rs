@@ -802,12 +802,78 @@ pub const RECORD_ROW_TAIL_FIELD: &str = "..";
 /// protocol against the required `ActorRef` protocol.
 pub const ACTOR_REF_TYPE_NAME: &str = "ActorRef";
 
+/// Reserved nominal constructor for secret-bearing values.
+///
+/// `Secret[T]` is a compile-time confidentiality wrapper. It is deliberately
+/// independent from reference capabilities such as `lineariso`: confidentiality
+/// and ownership/aliasing are orthogonal properties.
+pub const SECRET_TYPE_NAME: &str = "Secret";
+
 /// Reserved nominal marker used when a behavior parameter/return type was not
 /// explicitly declared. Protocol identity generation must reject this marker:
 /// it is a compatibility fallback for local typechecking, not a stable schema.
 pub const UNSPECIFIED_ACTOR_PROTOCOL_TYPE_NAME: &str = "__UnspecifiedActorProtocolType";
 
 impl Type {
+    /// Construct an opaque secret-bearing value type `Secret[T]`.
+    ///
+    /// The wrapper is semantic/type-level metadata; it does not imply linear
+    /// ownership and it does not expose the inner value through ordinary
+    /// unification with `T`.
+    pub fn secret(inner: Type) -> Type {
+        Type::App {
+            constructor: Box::new(Type::Nominal {
+                name: SECRET_TYPE_NAME.to_string(),
+                underlying: Box::new(Type::unit()),
+            }),
+            args: vec![inner],
+        }
+    }
+
+    /// Return the protected inner type for `Secret[T]`.
+    pub fn secret_inner(&self) -> Option<&Type> {
+        match self {
+            Type::App { constructor, args } if args.len() == 1 => match constructor.as_ref() {
+                Type::Nominal { name, .. } if name == SECRET_TYPE_NAME => args.first(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// True when this value is or transitively contains secret-bearing data.
+    ///
+    /// This is used at confidentiality boundaries (effects, actor messages,
+    /// durable events) so wrapping a secret in a tuple/record/container cannot
+    /// bypass the sink check.
+    pub fn contains_secret(&self) -> bool {
+        if self.secret_inner().is_some() {
+            return true;
+        }
+
+        match self {
+            Type::Tuple(items) => items.iter().any(Type::contains_secret),
+            Type::Record(fields) => fields.iter().any(|(_, ty)| ty.contains_secret()),
+            Type::Variant(variants) => variants
+                .iter()
+                .any(|(_, payload)| payload.as_ref().is_some_and(Type::contains_secret)),
+            Type::Array(inner) => inner.contains_secret(),
+            Type::Function { param, ret, .. } => {
+                param.contains_secret() || ret.contains_secret()
+            }
+            Type::Actor { state, behavior } => {
+                state.contains_secret() || behavior.contains_secret()
+            }
+            Type::App { constructor, args } => {
+                constructor.contains_secret() || args.iter().any(Type::contains_secret)
+            }
+            Type::Reference { inner, .. } => inner.contains_secret(),
+            Type::Scheme { body, .. } => body.contains_secret(),
+            Type::Nominal { underlying, .. } => underlying.contains_secret(),
+            Type::Var(_) | Type::Primitive(_) | Type::Skolem(_) => false,
+        }
+    }
+
     /// Construct the compile-time-only structural actor-reference type
     /// `ActorRef[P]`. `P` is expected to be a record whose fields map
     /// behavior names to function signatures.
