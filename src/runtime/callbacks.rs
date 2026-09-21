@@ -2393,9 +2393,15 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                         return;
                     }
                 };
+                // NBC v1 does not carry the compiler semantic-identity
+                // sidecar. Until migration transports a verifiable artifact
+                // manifest, cross-node migration remains explicitly legacy /
+                // unverified rather than copying an identity string that the
+                // receiver cannot prove belongs to the transported bytecode.
                 let snapshot = crate::runtime::persistence::ActorSnapshot {
                     actor_id,
                     sequence: actor.sequence,
+                    semantic_id: None,
                     state,
                     waiting_signal: actor.waiting_signal.clone(),
                     crdt_snapshot,

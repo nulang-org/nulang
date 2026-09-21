@@ -10,6 +10,7 @@ fn bench_memory_store(c: &mut Criterion) {
             let snapshot = ActorSnapshot {
                 actor_id: 1,
                 sequence: 0,
+                semantic_id: None,
                 state: std::collections::HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,

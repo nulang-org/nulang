@@ -10,7 +10,9 @@ use crate::content_identity::{SemanticId, SourceId};
 use crate::hir;
 use crate::mir;
 use crate::semantic_identity::SemanticIdentityError;
-use crate::semantic_schema::semantic_id_for_typed_program;
+use crate::semantic_schema::{
+    actor_definition_semantic_ids_for_typed_program, semantic_id_for_typed_program,
+};
 
 /// Derive a complete artifact identity manifest from one typed/lowered program.
 ///
@@ -49,6 +51,43 @@ where
         backend,
         flags,
     ))
+}
+
+/// Compile one typed HIR/MIR program to bytecode and attach its proven
+/// backend-independent semantic identity as an in-memory sidecar.
+///
+/// Low-level `mir_codegen::compile_mir` intentionally remains available for
+/// tests/fuzzers/backend work and produces an unproven `CodeModule` with no
+/// semantic identity. Durable/runtime entry points should use this function
+/// when typed HIR is available.
+pub fn compile_typed_bytecode<D>(
+    hir: &hir::Module,
+    mir: &mut mir::Module,
+    dependency_semantic_ids: D,
+    name: &str,
+) -> crate::types::NuResult<crate::bytecode::CodeModule>
+where
+    D: IntoIterator<Item = SemanticId>,
+{
+    let dependencies: Vec<_> = dependency_semantic_ids.into_iter().collect();
+    let semantic_id = semantic_id_for_typed_program(hir, mir, dependencies.iter().copied())
+        .map_err(|error| crate::types::NuError::VMError {
+            msg: format!("cannot derive canonical semantic identity: {error}"),
+            span: crate::types::Span::default(),
+        })?;
+    let actor_semantic_ids =
+        actor_definition_semantic_ids_for_typed_program(hir, mir, dependencies.iter().copied())
+            .map_err(|error| crate::types::NuError::VMError {
+                msg: format!("cannot derive actor semantic identities: {error}"),
+                span: crate::types::Span::default(),
+            })?;
+    let mut module = crate::mir_codegen::compile_mir(mir, name)?;
+    module.semantic_id = Some(semantic_id);
+    module.actor_semantic_ids = actor_semantic_ids
+        .into_iter()
+        .map(|(_, semantic_id)| semantic_id)
+        .collect();
+    Ok(module)
 }
 
 #[cfg(test)]
@@ -96,6 +135,20 @@ mod tests {
         assert_ne!(first.source_id(), reformatted.source_id());
         assert_eq!(first.semantic_id(), reformatted.semantic_id());
         assert_eq!(first.artifact_id(), reformatted.artifact_id());
+    }
+
+    #[test]
+    fn typed_bytecode_carries_semantic_identity_but_raw_codegen_does_not() {
+        let (hir, mut typed_mir) = empty_program();
+        let mut raw_mir = typed_mir.clone();
+
+        let typed = compile_typed_bytecode(&hir, &mut typed_mir, [], "typed").unwrap();
+        let raw = crate::mir_codegen::compile_mir(&mut raw_mir, "raw").unwrap();
+
+        assert!(typed.semantic_id.is_some());
+        assert!(raw.semantic_id.is_none());
+        assert!(typed.actor_semantic_ids.is_empty());
+        assert!(raw.actor_semantic_ids.is_empty());
     }
 
     #[test]

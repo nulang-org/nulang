@@ -10,8 +10,8 @@ use crate::primitives::ActorRole;
 use crate::runtime::actor::{Actor, ActorBackend, BehaviorEntry};
 use crate::runtime::persistence::{ActorSnapshot, PersistedValue, StateModel, WorkflowEvent};
 use crate::runtime::timer_fired_handler;
-use crate::runtime::Runtime;
 use crate::runtime::{bytecode_step_placeholder, fresh_actor_id, map_ast_state_model};
+use crate::runtime::{RecoveryIdentityPolicy, Runtime};
 use crate::vm::Value;
 
 /// Core spawn logic shared by all spawn entry points.
@@ -21,6 +21,7 @@ pub(crate) fn spawn_actor_with_models(
     state_models: HashMap<String, StateModel>,
     persistent: bool,
     workflow: Option<&str>,
+    definition_semantic_id: Option<crate::content_identity::SemanticId>,
 ) -> u64 {
     spawn_actor_with_id(
         rt,
@@ -29,6 +30,7 @@ pub(crate) fn spawn_actor_with_models(
         state_models,
         persistent,
         workflow,
+        definition_semantic_id,
     )
 }
 
@@ -60,6 +62,7 @@ pub(crate) fn spawn_actor_with_id(
     state_models: HashMap<String, StateModel>,
     persistent: bool,
     workflow: Option<&str>,
+    definition_semantic_id: Option<crate::content_identity::SemanticId>,
 ) -> u64 {
     let restart_snapshot = if persistent && workflow.is_none() {
         match preflight_persistent_snapshot(rt, id) {
@@ -77,7 +80,28 @@ pub(crate) fn spawn_actor_with_id(
         None
     };
 
+    let verified_definition_semantic_id = match restart_snapshot.as_ref() {
+        Some((snapshot, _)) => match Runtime::verify_snapshot_definition_semantic_identity(
+            id,
+            snapshot,
+            definition_semantic_id,
+            RecoveryIdentityPolicy::LegacyCompatible,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::warn!(
+                    actor_id = id,
+                    %error,
+                    "refusing to activate persistent actor with incompatible definition identity"
+                );
+                return id;
+            }
+        },
+        None => definition_semantic_id,
+    };
+
     let mut actor = Actor::new(id, format!("actor_{}", id), 0);
+    actor.definition_semantic_id = verified_definition_semantic_id;
     let state_fields = init();
     for (name, value) in state_fields {
         actor.set_state_field(name, value);
@@ -256,6 +280,7 @@ pub(crate) fn spawn_from_module(
         },
         None => ActorRole::Plain,
     };
+    let definition_semantic_id = module.actor_semantic_id_for_behavior(behavior_idx);
 
     let id = if let Some(meta) = meta {
         let state_models: HashMap<String, StateModel> = meta
@@ -281,9 +306,17 @@ pub(crate) fn spawn_from_module(
             } else {
                 None
             },
+            definition_semantic_id,
         )
     } else {
-        spawn_actor_with_models(rt, Box::new(move || init), HashMap::new(), false, None)
+        spawn_actor_with_models(
+            rt,
+            Box::new(move || init),
+            HashMap::new(),
+            false,
+            None,
+            definition_semantic_id,
+        )
     };
     let offsets: Vec<usize> = bytecode_offsets_for_role(module, role);
     // compensation_offsets filtered to this actor's own behaviors so
@@ -301,6 +334,7 @@ pub(crate) fn spawn_from_module(
             .collect()
     };
     if let Some(actor) = rt.actors.get_mut(&id) {
+        actor.definition_semantic_id = definition_semantic_id;
         actor.bytecode_module = Some(module.clone());
         actor.bytecode_offsets = offsets.clone();
         actor.compensation_offsets = compensation_offsets.clone();
@@ -374,7 +408,14 @@ pub(crate) fn spawn_from_module(
     if matches!(role, ActorRole::Workflow) {
         layout_workflow_behavior_table(rt, id);
     }
-    register_recovery_module(rt, id, module.clone(), offsets, compensation_offsets);
+    register_recovery_module(
+        rt,
+        id,
+        module.clone(),
+        offsets,
+        compensation_offsets,
+        definition_semantic_id,
+    );
     Value::actor_ref(id)
 }
 
@@ -444,9 +485,18 @@ pub(crate) fn register_recovery_module(
     module: crate::bytecode::CodeModule,
     offsets: Vec<usize>,
     compensation_offsets: Vec<Option<usize>>,
+    definition_semantic_id: Option<crate::content_identity::SemanticId>,
 ) {
     rt.recovery_modules
         .insert(actor_id, (module, offsets, compensation_offsets));
+    match definition_semantic_id {
+        Some(id) => {
+            rt.recovery_definition_semantic_ids.insert(actor_id, id);
+        }
+        None => {
+            rt.recovery_definition_semantic_ids.remove(&actor_id);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -570,6 +620,7 @@ mod authority_tests {
             std::collections::HashMap::new(),
             true,
             None,
+            None,
         );
 
         assert_eq!(returned, actor_id);
@@ -614,6 +665,7 @@ mod authority_tests {
             }),
             std::collections::HashMap::new(),
             true,
+            None,
             None,
         );
 

@@ -300,6 +300,16 @@ pub(crate) enum MessageAdmission {
     Rejected,
 }
 
+/// Policy for histories created before strong semantic identity was persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryIdentityPolicy {
+    /// Reject any snapshot that cannot prove which semantics produced it.
+    Strict,
+    /// Permit legacy snapshots that lack semantic identity, while still
+    /// rejecting malformed identities and all identified-code mismatches.
+    LegacyCompatible,
+}
+
 pub struct Runtime {
     pub actors: HashMap<u64, Actor>,
     pub supervisors: HashMap<u64, Supervisor>,
@@ -436,6 +446,10 @@ pub struct Runtime {
     // compensation_offsets).
     pub(crate) recovery_modules:
         HashMap<u64, (crate::bytecode::CodeModule, Vec<usize>, Vec<Option<usize>>)>,
+    /// Definition-scoped semantic identity paired with each recovery module.
+    /// Kept separate from the module tuple so whole-program artifact identity
+    /// cannot accidentally become the durable actor compatibility key.
+    pub(crate) recovery_definition_semantic_ids: HashMap<u64, crate::content_identity::SemanticId>,
     /// Content-addressed bytecode cache for fetch-on-demand.
     /// When a node receives a message for an unknown content hash, it can
     /// request the bytecode from the sender and cache it here keyed by hash.
@@ -628,6 +642,7 @@ impl Runtime {
             draining_receive_wakes: false,
             idle_callback: None,
             recovery_modules: HashMap::new(),
+            recovery_definition_semantic_ids: HashMap::new(),
             #[cfg(feature = "ai-runtime")]
             ai: AiRuntimeRegistry::new(),
             #[cfg(feature = "ai-runtime")]
@@ -767,7 +782,7 @@ impl Runtime {
 
     #[tracing::instrument(level = "trace", skip(self, init))]
     pub fn spawn_actor(&mut self, init: Box<dyn FnOnce() -> Vec<(String, Value)>>) -> u64 {
-        spawn::spawn_actor_with_models(self, init, HashMap::new(), false, None)
+        spawn::spawn_actor_with_models(self, init, HashMap::new(), false, None, None)
     }
 
     /// Spawn an actor co-located on the same shard as `near_actor_id`.
@@ -798,7 +813,7 @@ impl Runtime {
         } else {
             fresh_actor_id()
         };
-        spawn::spawn_actor_with_id(self, id, init, HashMap::new(), false, None)
+        spawn::spawn_actor_with_id(self, id, init, HashMap::new(), false, None, None)
     }
 
     pub fn spawn_persistent_actor(
@@ -806,7 +821,7 @@ impl Runtime {
         init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
         state_models: HashMap<String, StateModel>,
     ) -> u64 {
-        spawn::spawn_actor_with_models(self, init, state_models, true, None)
+        spawn::spawn_actor_with_models(self, init, state_models, true, None, None)
     }
 
     /// Spawn a durable workflow actor.  Workflows are always persistent and
@@ -817,7 +832,7 @@ impl Runtime {
         init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
         state_models: HashMap<String, StateModel>,
     ) -> u64 {
-        spawn::spawn_actor_with_models(self, init, state_models, true, Some(name))
+        spawn::spawn_actor_with_models(self, init, state_models, true, Some(name), None)
     }
 
     /// Spawn an actor for `module`'s behavior `behavior_idx`, seeded with
@@ -846,7 +861,41 @@ impl Runtime {
         offsets: Vec<usize>,
         compensation_offsets: Vec<Option<usize>>,
     ) {
-        spawn::register_recovery_module(self, actor_id, module, offsets, compensation_offsets)
+        // Compatibility path for callers that do not carry an actor name.
+        // A single definition sidecar is unambiguous; multi-actor modules
+        // require register_recovery_module_for_definition instead.
+        let definition_semantic_id = match module.actor_semantic_ids.as_slice() {
+            [id] => Some(*id),
+            _ => None,
+        };
+        spawn::register_recovery_module(
+            self,
+            actor_id,
+            module,
+            offsets,
+            compensation_offsets,
+            definition_semantic_id,
+        )
+    }
+
+    /// Register recovery metadata for one known actor definition.
+    pub fn register_recovery_module_for_definition(
+        &mut self,
+        actor_id: u64,
+        actor_name: &str,
+        module: crate::bytecode::CodeModule,
+        offsets: Vec<usize>,
+        compensation_offsets: Vec<Option<usize>>,
+    ) {
+        let definition_semantic_id = module.actor_semantic_id(actor_name);
+        spawn::register_recovery_module(
+            self,
+            actor_id,
+            module,
+            offsets,
+            compensation_offsets,
+            definition_semantic_id,
+        )
     }
 
     /// Register all `virtual entity` types declared in `module` with the
@@ -3217,9 +3266,15 @@ impl Runtime {
                 .map(|((_, name), id)| (name.clone(), id.0))
                 .collect()
         });
+        let semantic_id = self
+            .actors
+            .get(&actor_id)
+            .and_then(|actor| actor.definition_semantic_id)
+            .map(|id| id.to_string());
         Some(ActorSnapshot {
             actor_id,
             sequence,
+            semantic_id,
             state,
             waiting_signal,
             crdt_snapshot,
@@ -4989,13 +5044,89 @@ impl Runtime {
             .unwrap_or(false)
     }
 
+    /// Verify the definition-scoped semantic provenance of one snapshot.
+    ///
+    /// Identified histories always require an exact definition identity match.
+    /// LegacyCompatible permits a pre-identity snapshot to load, but returns
+    /// None so the live actor remains explicitly unverified until an explicit
+    /// migration establishes provenance.
+    pub(crate) fn verify_snapshot_definition_semantic_identity(
+        actor_id: u64,
+        snapshot: &ActorSnapshot,
+        current: Option<crate::content_identity::SemanticId>,
+        identity_policy: RecoveryIdentityPolicy,
+    ) -> Result<Option<crate::content_identity::SemanticId>, String> {
+        match snapshot.semantic_id.as_deref() {
+            Some(persisted) => {
+                let persisted = persisted
+                    .parse::<crate::content_identity::SemanticId>()
+                    .map_err(|error| {
+                        format!(
+                            "actor {actor_id} has malformed definition semantic identity: {error}"
+                        )
+                    })?;
+                match current {
+                    Some(current) if current == persisted => Ok(Some(current)),
+                    Some(current) => Err(format!(
+                        "actor {actor_id} persisted definition semantic identity {persisted} does not match recovery definition {current}"
+                    )),
+                    None => Err(format!(
+                        "actor {actor_id} persisted definition semantic identity {persisted} has no identified recovery definition"
+                    )),
+                }
+            }
+            None if identity_policy == RecoveryIdentityPolicy::Strict => Err(format!(
+                "actor {actor_id} legacy snapshot has no definition semantic identity"
+            )),
+            None => Ok(None),
+        }
+    }
+
     /// Recover a persistent actor from the latest snapshot and replay the journal.
     ///
     /// For workflow actors the durable workflow event journal is replayed
     /// instead of the message journal, restoring the current step index and
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
+        self.recover_actor_with_identity_policy(actor_id, RecoveryIdentityPolicy::LegacyCompatible)
+    }
+
+    /// Recover a persistent actor under an explicit semantic-identity policy.
+    ///
+    /// Any snapshot that already carries strong semantic identity is always
+    /// fail-closed: recovery code must carry the same compiler-derived ID.
+    /// `LegacyCompatible` exists only for pre-identity histories and never
+    /// upgrades them to verified provenance.
+    pub fn recover_actor_with_identity_policy(
+        &mut self,
+        actor_id: u64,
+        identity_policy: RecoveryIdentityPolicy,
+    ) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
+
+        let recovery_definition_semantic_id = self
+            .recovery_definition_semantic_ids
+            .get(&actor_id)
+            .copied();
+        let verified_definition_semantic_id =
+            match Self::verify_snapshot_definition_semantic_identity(
+                actor_id,
+                &snapshot,
+                recovery_definition_semantic_id,
+                identity_policy,
+            ) {
+                Ok(id) => id,
+                Err(error) => {
+                    warn!("nulang-recover: refusing {error}");
+                    return None;
+                }
+            };
+        if verified_definition_semantic_id.is_none() {
+            warn!(
+                "nulang-recover: actor {} uses legacy snapshot without verified definition provenance",
+                actor_id
+            );
+        }
         let authority_manifest =
             match crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens) {
                 Ok(manifest) => manifest,
@@ -5020,6 +5151,7 @@ impl Runtime {
             .unwrap_or(false);
 
         let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
+        actor.definition_semantic_id = verified_definition_semantic_id;
         actor.persistent = true;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
@@ -5385,16 +5517,35 @@ impl Runtime {
         let stable_actor_id = grain_actor_id(&grain_id);
 
         // Register the recovery module so checkpoint/replay know the bytecode.
-        self.register_recovery_module(
+        self.register_recovery_module_for_definition(
             stable_actor_id,
+            &grain_id.grain_type,
             grain_type.module.clone(),
             grain_type.bytecode_offsets.clone(),
             grain_type.compensation_offsets.clone(),
         );
 
         let snapshot = self.persistence.load_snapshot(stable_actor_id);
+        let verified_definition_semantic_id = if let Some(ref snap) = snapshot {
+            Self::verify_snapshot_definition_semantic_identity(
+                stable_actor_id,
+                snap,
+                grain_type.module.actor_semantic_id(&grain_id.grain_type),
+                RecoveryIdentityPolicy::LegacyCompatible,
+            )
+            .map_err(|error| NuError::RuntimeError {
+                msg: format!(
+                    "cannot hydrate virtual actor {}: {}",
+                    grain_id.actor_name(),
+                    error
+                ),
+                span: Span::new(0, 0),
+            })?
+        } else {
+            grain_type.module.actor_semantic_id(&grain_id.grain_type)
+        };
 
-        let actor = if let Some(ref snap) = snapshot {
+        let mut actor = if let Some(ref snap) = snapshot {
             Self::restore_actor_from_snapshot(
                 stable_actor_id,
                 &grain_type.module,
@@ -5436,6 +5587,8 @@ impl Runtime {
             }
             actor
         };
+
+        actor.definition_semantic_id = verified_definition_semantic_id;
 
         // Track the grain identity.
         self.actors.insert(stable_actor_id, actor);
@@ -5514,6 +5667,18 @@ impl Runtime {
                 return false;
             }
         };
+
+        // Frozen NBC v1 does not embed the semantic sidecar, so an identified
+        // snapshot arriving through this legacy transport cannot be verified
+        // against the received bytecode. Reject it rather than trusting the
+        // snapshot to self-certify the code that should execute its state.
+        if snapshot.semantic_id.is_some() {
+            tracing::warn!(
+                "nulang-migrate: refusing identified snapshot for actor {} over legacy NBC v1 transport",
+                actor_id
+            );
+            return false;
+        }
 
         let is_workflow = module.actor_metadata.iter().any(|m| m.is_workflow);
         let is_agent = module.actor_metadata.iter().any(|m| m.is_agent);
@@ -6213,6 +6378,7 @@ impl Runtime {
                 .iter()
                 .map(|entry| (entry.name.clone(), entry.handler_fn))
                 .collect(),
+            definition_semantic_id: actor.definition_semantic_id,
             bytecode_module: actor.bytecode_module.clone(),
             bytecode_offsets: actor.bytecode_offsets.clone(),
             compensation_offsets: actor.compensation_offsets.clone(),
@@ -6652,7 +6818,14 @@ impl Runtime {
         if shadow == home {
             return;
         }
-        let Ok(snapshot_json) = serde_json::to_vec(snapshot) else {
+        // Shadow replication still transports frozen NBC v1, which cannot
+        // prove the in-memory semantic-identity sidecar on the receiving node.
+        // Preserve the strongly identified local snapshot, but send an
+        // explicitly legacy/unverified replica until the transport carries a
+        // verifiable artifact manifest.
+        let mut replicated_snapshot = snapshot.clone();
+        replicated_snapshot.semantic_id = None;
+        let Ok(snapshot_json) = serde_json::to_vec(&replicated_snapshot) else {
             return;
         };
         let module = match self

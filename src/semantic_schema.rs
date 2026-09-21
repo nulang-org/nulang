@@ -230,11 +230,7 @@ where
     }
 
     let mut identities = Vec::with_capacity(schemas.len());
-    for (actor_index, (actor, schema)) in mir
-        .actor_metadata
-        .iter()
-        .zip(schemas.iter())
-        .enumerate()
+    for (actor_index, (actor, schema)) in mir.actor_metadata.iter().zip(schemas.iter()).enumerate()
     {
         let schema_short_name = schema
             .actor_name
@@ -692,10 +688,9 @@ mod tests {
         let int_id = semantic_id_for_actor_definition(&module, "Counter", &int_schema, [])
             .unwrap()
             .unwrap();
-        let string_id =
-            semantic_id_for_actor_definition(&module, "Counter", &string_schema, [])
-                .unwrap()
-                .unwrap();
+        let string_id = semantic_id_for_actor_definition(&module, "Counter", &string_schema, [])
+            .unwrap()
+            .unwrap();
 
         assert_ne!(int_id, string_id);
     }
@@ -796,11 +791,7 @@ mod tests {
                 hir::Decl::Module {
                     name: "Inventory".to_string(),
                     exports: Vec::new(),
-                    decls: vec![hir::Decl::Actor(actor_def(
-                        "Counter",
-                        "other",
-                        field_ty,
-                    ))],
+                    decls: vec![hir::Decl::Actor(actor_def("Counter", "other", field_ty))],
                     span: Span::default(),
                 },
             ],
