@@ -311,6 +311,14 @@ impl WasmBackend {
             for block in &func.blocks {
                 for stmt in &block.stmts {
                     if let Stmt::Assign { op, .. } = stmt {
+                        if matches!(op, RValue::Panic(..)) {
+                            return Err(crate::types::NuError::VMError {
+                                msg: "WASM backend restricted profile: runtime panic is not supported yet; use the bytecode backend"
+                                    .into(),
+                                span: crate::types::Span::default(),
+                            });
+                        }
+
                         if let RValue::Call {
                             func: FuncRef::Local(_),
                             ..
