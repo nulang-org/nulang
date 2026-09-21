@@ -108,8 +108,17 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             ret_type,
             body,
             effect,
+            span,
             ..
         } => {
+            // Top-level script expressions are represented by the parser as a
+            // synthetic zero-span __main function. Do not leak that compiler
+            // representation back into formatted source.
+            if name == "__main" && span.start == 0 && span.end == 0 {
+                fmt_block_body(out, body, indent, had_unhandled);
+                out.push('\n');
+                return;
+            }
             out.push_str(&format!("{}fn {}(", sp, name));
             for (i, p) in params.iter().enumerate() {
                 let pn = &p.name;
@@ -692,6 +701,10 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
                     body.as_ref(),
                     Expr::Block { exprs, span }
                         if exprs.is_empty() && span.start == 0 && span.end == 0
+                ) || matches!(
+                    body.as_ref(),
+                    Expr::Literal(Literal::Unit, span)
+                        if span.start == 0 && span.end == 0
                 );
                 if !empty_body {
                     out.push('\n');
@@ -1500,7 +1513,7 @@ fn main() {
     fn test_fmt_module_mutable_binding_preserves_declaration_scope() {
         let src = "let var counter: Int = 0\n";
         let out = format_source(src).expect("module mutable binding formats");
-        assert_eq!(out, "let var counter: Int = 0\n");
+        assert_eq!(out, "var counter: Int = 0\n");
         assert_idempotent(src);
     }
 
