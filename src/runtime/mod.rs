@@ -313,10 +313,20 @@ pub enum RecoveryIdentityPolicy {
 /// Machine-readable strong-identity failures that occur before durable replay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryIdentityError {
-    SnapshotMissing { actor_id: u64 },
-    InvalidArtifactId { actor_id: u64, value: String },
-    InvalidSemanticId { actor_id: u64, value: String },
-    IncompleteIdentity { actor_id: u64 },
+    SnapshotMissing {
+        actor_id: u64,
+    },
+    InvalidArtifactId {
+        actor_id: u64,
+        value: String,
+    },
+    InvalidSemanticId {
+        actor_id: u64,
+        value: String,
+    },
+    IncompleteIdentity {
+        actor_id: u64,
+    },
     RetentionUnsupported {
         actor_id: u64,
         artifact_id: crate::content_identity::ArtifactId,
@@ -335,7 +345,9 @@ pub enum RecoveryIdentityError {
         expected: crate::content_identity::SemanticId,
         actual: crate::content_identity::SemanticId,
     },
-    RecoveryFailed { actor_id: u64 },
+    RecoveryFailed {
+        actor_id: u64,
+    },
 }
 
 impl std::fmt::Display for RecoveryIdentityError {
@@ -5102,12 +5114,12 @@ impl Runtime {
         let Some(raw_artifact_id) = snapshot.artifact_id.as_deref() else {
             return Ok(());
         };
-        let artifact_id = raw_artifact_id.parse::<crate::content_identity::ArtifactId>().map_err(
-            |_| RecoveryIdentityError::InvalidArtifactId {
+        let artifact_id = raw_artifact_id
+            .parse::<crate::content_identity::ArtifactId>()
+            .map_err(|_| RecoveryIdentityError::InvalidArtifactId {
                 actor_id,
                 value: raw_artifact_id.to_string(),
-            },
-        )?;
+            })?;
         let raw_semantic_id = snapshot
             .semantic_id
             .as_deref()
@@ -5168,13 +5180,14 @@ impl Runtime {
                 message: error.to_string(),
             }
         })?;
-        let actual_semantic = module.semantic_id.ok_or_else(|| {
-            RecoveryIdentityError::CorruptHistoricalArtifact {
-                actor_id,
-                artifact_id,
-                message: "restored historical artifact has no SemanticId".to_string(),
-            }
-        })?;
+        let actual_semantic =
+            module
+                .semantic_id
+                .ok_or_else(|| RecoveryIdentityError::CorruptHistoricalArtifact {
+                    actor_id,
+                    artifact_id,
+                    message: "restored historical artifact has no SemanticId".to_string(),
+                })?;
         if actual_semantic != expected_semantic {
             return Err(RecoveryIdentityError::HistoricalSemanticMismatch {
                 actor_id,
