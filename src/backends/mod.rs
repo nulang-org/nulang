@@ -176,6 +176,20 @@ fn validate_default_wasm_semantics(module: &MirModule) -> NuResult<()> {
             }
 
             for stmt in &block.stmts {
+                if matches!(
+                    stmt,
+                    crate::mir::Stmt::Assign {
+                        op: crate::mir::RValue::Panic(..),
+                        ..
+                    }
+                ) {
+                    return Err(crate::types::NuError::VMError {
+                        msg: "WASM backend restricted profile: runtime panic is not supported yet; use the bytecode backend"
+                            .into(),
+                        span: crate::types::Span::default(),
+                    });
+                }
+
                 let unsupported = matches!(
                     stmt,
                     crate::mir::Stmt::EnterHandle { .. } | crate::mir::Stmt::PopHandler
