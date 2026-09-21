@@ -1076,6 +1076,11 @@ pub struct TypeChecker {
     pub collect_errors: bool,
     /// Errors collected when `collect_errors` is set (empty otherwise).
     pub collected_errors: Vec<crate::types::NuError>,
+    /// Non-fatal semantic diagnostics collected during type inference.
+    ///
+    /// Pattern-coverage diagnostics live here rather than in the parser so
+    /// they are based on the fully inferred scrutinee type.
+    pub warnings: Vec<NuWarning>,
 }
 
 /// Pre-computed class and instance tables extracted from an AST module.
@@ -1157,7 +1162,14 @@ impl TypeChecker {
             rigid_vars: FxHashSet::default(),
             collect_errors: false,
             collected_errors: Vec::new(),
+            warnings: Vec::new(),
         }
+    }
+
+    /// Consume and return non-fatal semantic warnings collected by the last
+    /// type-checking operation.
+    pub fn take_warnings(&mut self) -> Vec<NuWarning> {
+        std::mem::take(&mut self.warnings)
     }
 
     /// Type-check an entire module, returning the type of the last declaration.
@@ -3393,6 +3405,23 @@ impl TypeChecker {
             )?;
             final_subst = compose_subst(&s, &final_subst);
         }
+
+        // Coverage is a semantic diagnostic, not a validity rule in Nulang
+        // 1.x: RFC 0002 freezes existing Core `match` program validity. Run
+        // the conservative finite-domain analysis only after all ordinary
+        // pattern/guard/arm type inference has succeeded, using the fully
+        // substituted scrutinee type as the source of truth.
+        let coverage_ty = apply_subst(&scrut_ty, &final_subst);
+        let coverage_arms: Vec<(Pattern, bool)> = arms
+            .iter()
+            .map(|(pattern, guard, _)| (pattern.clone(), guard.is_some()))
+            .collect();
+        self.warnings
+            .extend(crate::pattern_coverage::warnings_for_match(
+                &coverage_ty,
+                &coverage_arms,
+                span,
+            ));
 
         Ok((final_subst.clone(), apply_subst(&first_arm, &final_subst)))
     }
