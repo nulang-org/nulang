@@ -729,4 +729,54 @@ mod authority_tests {
             "schema mismatch must not publish a runnable actor"
         );
     }
+
+    #[test]
+    fn incompatible_event_only_schema_fails_before_init_or_publish() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let mut rt = Runtime::new();
+        let actor_id = 910_004;
+        rt.persistence
+            .append_event(
+                actor_id,
+                crate::runtime::persistence::EventEntry {
+                    sequence: 1,
+                    schema_owner: None,
+                    schema_version: 1,
+                    field_name: "counter".to_string(),
+                    event_name: "Incremented".to_string(),
+                    args: vec![PersistedValue::Int(1)],
+                    value: PersistedValue::Int(1),
+                },
+            )
+            .unwrap();
+
+        let init_ran = Rc::new(Cell::new(false));
+        let init_flag = Rc::clone(&init_ran);
+        let returned = spawn_actor_with_id(
+            &mut rt,
+            actor_id,
+            Box::new(move || {
+                init_flag.set(true);
+                vec![]
+            }),
+            std::collections::HashMap::new(),
+            true,
+            None,
+            Some("Counter"),
+            2,
+        );
+
+        assert_eq!(returned, actor_id);
+        assert!(
+            !init_ran.get(),
+            "event-log schema mismatch must abort before actor initialization"
+        );
+        assert!(
+            !rt.actors.contains_key(&actor_id),
+            "incompatible event-only state must not publish a runnable actor"
+        );
+    }
+
 }
