@@ -1,6 +1,6 @@
 // Nulang standard library — JSON encoding and decoding.
 // Package: `json` (official seed package, registry tier: Experimental).
-// Standalone port of `src/stdlib/json.nula` — proves stdlib extraction works.
+// Standalone port of `src/stdlib/json.nula` — generated from the stdlib source.
 // Consume with: `import lib` (or via `nula add json`).
 // NOTE: JsonNumber stores a Float. String.to_float and Float.to_string
 // primitives are now available in the VM, enabling numeric conversion
@@ -402,3 +402,4 @@ pub fn get_bool(obj: JsonValue, key: String, default: Bool) -> Bool {
         _ => default,
     }
 }
+
