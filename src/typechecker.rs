@@ -1982,10 +1982,10 @@ impl TypeChecker {
             // Perform effect
             Expr::Perform {
                 effect,
-                op: _,
+                op,
                 args,
                 span,
-            } => self.infer_perform(ctx, effect, args, *span),
+            } => self.infer_perform(ctx, effect, op, args, *span),
             // Emit event — check against entity's declared events if in an entity context
             Expr::Emit { event, args, span } => {
                 // Validate against entity event declarations if available
@@ -2039,8 +2039,14 @@ impl TypeChecker {
                 let mut subst = Vec::new();
                 for arg in args {
                     let ctx_sub = apply_subst_to_ctx(ctx, &subst);
-                    let (s, _ty) = self.infer_expr(&ctx_sub, arg)?;
+                    let (s, arg_ty) = self.infer_expr(&ctx_sub, arg)?;
                     subst = compose_subst(&s, &subst);
+                    let resolved = apply_subst(&arg_ty, &subst);
+                    Self::reject_secret_boundary(
+                        &resolved,
+                        "a durable event boundary",
+                        arg.span(),
+                    )?;
                 }
                 Ok((subst, Type::unit()))
             }
@@ -3719,6 +3725,26 @@ impl TypeChecker {
         }
     }
 
+    /// Reject secret-bearing data at a confidentiality boundary.
+    ///
+    /// Secret-aware operations are handled explicitly by their own namespace;
+    /// generic effects/messages/events must never receive a `Secret[T]`, even
+    /// when it is nested inside another value.
+    fn reject_secret_boundary(ty: &Type, boundary: &str, span: Span) -> NuResult<()> {
+        if ty.contains_secret() {
+            return Err(NuError::TypeError {
+                msg: format!(
+                    "secret-bearing value cannot cross {boundary}; use a Secret.* operation that explicitly accepts protected data"
+                ),
+                span,
+                expected_type: Some("non-secret value".to_string()),
+                found_type: Some(format!("{ty}")),
+                similar_names: None,
+            });
+        }
+        Ok(())
+    }
+
     /// Infer send expression.
     fn infer_send(
         &mut self,
@@ -3747,8 +3773,10 @@ impl TypeChecker {
         let mut subst = compose_subst(&s2, &s1);
         for arg in args {
             let ctx_sub = apply_subst_to_ctx(ctx, &subst);
-            let (s_arg, _arg_ty) = self.infer_expr(&ctx_sub, arg)?;
+            let (s_arg, arg_ty) = self.infer_expr(&ctx_sub, arg)?;
             subst = compose_subst(&s_arg, &subst);
+            let resolved = apply_subst(&arg_ty, &subst);
+            Self::reject_secret_boundary(&resolved, "an actor message boundary", arg.span())?;
         }
         Ok((subst, Type::unit()))
     }
@@ -3777,8 +3805,10 @@ impl TypeChecker {
         let mut subst = compose_subst(&s2, &s1);
         for arg in args {
             let ctx_sub = apply_subst_to_ctx(ctx, &subst);
-            let (s_arg, _arg_ty) = self.infer_expr(&ctx_sub, arg)?;
+            let (s_arg, arg_ty) = self.infer_expr(&ctx_sub, arg)?;
             subst = compose_subst(&s_arg, &subst);
+            let resolved = apply_subst(&arg_ty, &subst);
+            Self::reject_secret_boundary(&resolved, "an actor message boundary", arg.span())?;
         }
 
         // Opaque/dynamic asks retain the existing unconstrained result.
@@ -3789,19 +3819,52 @@ impl TypeChecker {
     fn infer_perform(
         &mut self,
         ctx: &TypeContext,
-        _effect: &str,
+        effect: &str,
+        op: &str,
         args: &[Expr],
-        _span: Span,
+        span: Span,
     ) -> NuResult<(Substitution, Type)> {
         let mut subst = vec![];
+        let mut arg_types = Vec::with_capacity(args.len());
         for arg in args {
             let ctx_sub = apply_subst_to_ctx(ctx, &subst);
-            let (s, _ty) = self.infer_expr(&ctx_sub, arg)?;
+            let (s, ty) = self.infer_expr(&ctx_sub, arg)?;
             subst = compose_subst(&s, &subst);
+            arg_types.push(apply_subst(&ty, &subst));
         }
-        // Perform returns a fresh type variable
-        let ret_var = Type::Var(TypeVar::fresh());
-        Ok((subst, ret_var))
+
+        // Secret reads produce an opaque confidentiality wrapper rather than a
+        // plain String. A future runtime broker can replace raw material with
+        // handles without changing this source-level contract.
+        if effect == "Secret" && matches!(op, "read" | "get") {
+            if arg_types.len() != 1 {
+                return Err(NuError::TypeError {
+                    msg: format!("Secret.{op} expects exactly one secret name argument"),
+                    span,
+                    expected_type: Some("1 argument".to_string()),
+                    found_type: Some(format!("{} arguments", arg_types.len())),
+                    similar_names: None,
+                });
+            }
+            let s_name = mgu(&arg_types[0], &Type::string(), args[0].span())?;
+            subst = compose_subst(&s_name, &subst);
+            return Ok((subst, Type::secret(Type::string())));
+        }
+
+        // Only the Secret namespace may accept protected values. This blocks
+        // accidental leakage through logging, HTTP/FS/DB/Python/FFI effects
+        // and future generic effect namespaces by default.
+        if effect != "Secret" {
+            for (arg, ty) in args.iter().zip(arg_types.iter()) {
+                Self::reject_secret_boundary(
+                    ty,
+                    &format!("the {effect}.{op} effect boundary"),
+                    arg.span(),
+                )?;
+            }
+        }
+
+        Ok((subst, Type::Var(TypeVar::fresh())))
     }
 
     /// Infer handle expression.
@@ -5372,6 +5435,55 @@ mod tests {
             }
             other => panic!("Expected TypeError, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_secret_value_cannot_cross_generic_effect_boundary() {
+        let result = check_src("fn leak(s: Secret[String]) { perform IO.print(s) }");
+        let err = result.expect_err("printing a Secret must fail");
+        assert!(
+            err.to_string().contains("secret-bearing value"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_secret_get_is_typed_as_protected_value() {
+        let result =
+            check_src("let s = perform Secret.get(\"API_KEY\") in perform IO.print(s)");
+        let err = result.expect_err("Secret.get result must not be printable");
+        assert!(
+            err.to_string().contains("secret-bearing value"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_nested_secret_cannot_bypass_effect_boundary() {
+        let result =
+            check_src("fn leak(s: Secret[String]) { perform IO.print((\"prefix\", s)) }");
+        assert!(result.is_err(), "nested Secret must remain protected");
+    }
+
+    #[test]
+    fn test_secret_values_can_flow_through_pure_code() {
+        let result = check_src("fn keep(s: Secret[String]) -> Secret[String] { s }");
+        assert!(
+            result.is_ok(),
+            "pure Secret flow should remain legal: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_secret_namespace_may_accept_secret_values() {
+        let result =
+            check_src("fn consume(s: Secret[String]) { perform Secret.consume(s) }");
+        assert!(
+            result.is_ok(),
+            "Secret-aware effects may receive protected values: {:?}",
+            result.err()
+        );
     }
 
     // -----------------------------------------------------------------------
