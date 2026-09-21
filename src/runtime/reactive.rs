@@ -148,6 +148,31 @@ impl StateReadSet {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SubscriptionId(pub u64);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReactiveSubscriptionError {
+    NotFound(SubscriptionId),
+    Query(super::workflow::WorkflowQueryError),
+}
+
+impl std::fmt::Display for ReactiveSubscriptionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReactiveSubscriptionError::NotFound(id) => {
+                write!(f, "reactive subscription {} not found", id.0)
+            }
+            ReactiveSubscriptionError::Query(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ReactiveSubscriptionError {}
+
+impl From<super::workflow::WorkflowQueryError> for ReactiveSubscriptionError {
+    fn from(value: super::workflow::WorkflowQueryError) -> Self {
+        Self::Query(value)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ReactiveSubscription {
     pub actor_id: u64,
