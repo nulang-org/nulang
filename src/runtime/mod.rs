@@ -5014,10 +5014,7 @@ impl Runtime {
                 .iter()
                 .any(|entry| entry.sequence > snapshot.sequence),
             has_event_history: !self.persistence.read_events(actor_id).is_empty(),
-            has_workflow_history: !self
-                .persistence
-                .read_workflow_events(actor_id)
-                .is_empty(),
+            has_workflow_history: !self.persistence.read_workflow_events(actor_id).is_empty(),
         };
 
         let Some(upgraded) = migration::migrate_snapshot_state(module, &snapshot, history)? else {
@@ -5475,18 +5472,20 @@ impl Runtime {
                     meta.version
                 )
             })?;
-            let plan = manifest.plan_from(snapshot.schema_version).map_err(|error| {
-                format!(
-                    "persisted {}@v{} cannot be migrated to {}@v{}: {error}",
-                    snapshot
-                        .schema_owner
-                        .as_deref()
-                        .unwrap_or(meta.name.as_str()),
-                    snapshot.schema_version,
-                    meta.name,
-                    meta.version
-                )
-            })?;
+            let plan = manifest
+                .plan_from(snapshot.schema_version)
+                .map_err(|error| {
+                    format!(
+                        "persisted {}@v{} cannot be migrated to {}@v{}: {error}",
+                        snapshot
+                            .schema_owner
+                            .as_deref()
+                            .unwrap_or(meta.name.as_str()),
+                        snapshot.schema_version,
+                        meta.name,
+                        meta.version
+                    )
+                })?;
             if let Some(step) = plan
                 .iter()
                 .find(|step| step.has_state_transform && step.state_function_index.is_none())
@@ -5643,19 +5642,15 @@ impl Runtime {
 
         let snapshot = match self.persistence.load_snapshot(stable_actor_id) {
             Some(snapshot) => Some(
-                self.prepare_snapshot_for_module(
-                    stable_actor_id,
-                    &grain_type.module,
-                    snapshot,
-                )
-                .map_err(|err| NuError::RuntimeError {
-                    msg: format!(
-                        "failed to prepare durable snapshot for virtual actor {}: {}",
-                        grain_id.actor_name(),
-                        err
-                    ),
-                    span: Span::new(0, 0),
-                })?,
+                self.prepare_snapshot_for_module(stable_actor_id, &grain_type.module, snapshot)
+                    .map_err(|err| NuError::RuntimeError {
+                        msg: format!(
+                            "failed to prepare durable snapshot for virtual actor {}: {}",
+                            grain_id.actor_name(),
+                            err
+                        ),
+                        span: Span::new(0, 0),
+                    })?,
             ),
             None => None,
         };
