@@ -579,7 +579,9 @@ pub struct ActorMeta {
     /// Entity schema version (RFC 0008).  Defaults to 1.
     #[serde(default = "default_version")]
     pub version: u32,
-    /// Serialized migration contracts (JSON `Vec<MigrationDecl>`).  RFC 0008.
+    /// Canonical RFC 0008 migration topology (`MigrationManifest` JSON).
+    /// Empty only for legacy artifacts; current compiler output emits an
+    /// explicit manifest even for schema version 1.
     #[serde(default)]
     pub migrations: String,
 }
