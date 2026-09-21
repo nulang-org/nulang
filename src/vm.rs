@@ -117,6 +117,14 @@ pub enum SignalWaitResult {
 
 /// Result of a generic async effect operation from the `PerformAsync` opcode.
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinEffectId {
+    IntToFloat,
+    FloatSqrt,
+    StringLength,
+    ArrayLength,
+}
+
 pub enum PerformAsyncResult {
     /// The effect completed synchronously; `Some(content)` is the string
     /// result (interned into the module's constant pool by the VM), `None`
@@ -292,6 +300,22 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
         regs: &[Value],
     ) -> Option<Value> {
         self.perform_builtin_effect(effect_name, op_name, &module.constants, regs)
+    }
+
+    /// Dispatch a module-load-classified pure builtin. Runtime-backed
+    /// callbacks keep their existing policy/authority path by default;
+    /// callback implementations may override this for allocation-free enum
+    /// dispatch when the operation is semantically self-contained.
+    fn perform_builtin_id_in_module(
+        &mut self,
+        builtin: BuiltinEffectId,
+        effect_name: &str,
+        op_name: Option<&str>,
+        module: &CodeModule,
+        regs: &[Value],
+    ) -> Option<Value> {
+        let _ = builtin;
+        self.perform_builtin_effect_in_module(effect_name, op_name, module, regs)
     }
 
     /// Check whether a workflow signal has been received.
@@ -992,6 +1016,49 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
     }
 
     fn send_message(&mut self, _target: Value, _behavior_id: u16, _args: &[Value]) {}
+
+    fn perform_builtin_id_in_module(
+        &mut self,
+        builtin: BuiltinEffectId,
+        _effect_name: &str,
+        _op_name: Option<&str>,
+        module: &CodeModule,
+        regs: &[Value],
+    ) -> Option<Value> {
+        match builtin {
+            BuiltinEffectId::IntToFloat => {
+                let n = regs.first().and_then(|v| v.as_int()).unwrap_or(0);
+                Some(Value::float(n as f64))
+            }
+            BuiltinEffectId::FloatSqrt => {
+                let x = regs.first().and_then(|v| v.as_float()).unwrap_or(0.0);
+                if x < 0.0 {
+                    Some(Value::nil())
+                } else {
+                    Some(Value::float(f64::sqrt(x)))
+                }
+            }
+            BuiltinEffectId::StringLength => {
+                let s = resolve_value_string(
+                    &module.constants,
+                    *regs.first().unwrap_or(&Value::nil()),
+                );
+                Some(Value::int(s.len() as i64))
+            }
+            BuiltinEffectId::ArrayLength => {
+                let arr_ptr = regs
+                    .first()
+                    .and_then(|v| v.as_ptr())
+                    .unwrap_or(std::ptr::null_mut());
+                let len = if arr_ptr.is_null() {
+                    0
+                } else {
+                    self.array_len(arr_ptr).unwrap_or(0) as i64
+                };
+                Some(Value::int(len))
+            }
+        }
+    }
 
     /// Built-in effects for actor-free scripts: `IO.print` writes the
     /// first staged argument to stdout, `IO.read` reads one stdin line
@@ -2435,13 +2502,22 @@ pub struct SuspendedVmState {
 struct CachedPerformName {
     qualified: std::sync::Arc<str>,
     dot: Option<usize>,
+    builtin: Option<BuiltinEffectId>,
 }
 
 impl CachedPerformName {
     fn new(name: &str) -> Self {
+        let builtin = match name {
+            "Int.to_float" => Some(BuiltinEffectId::IntToFloat),
+            "Float.sqrt" => Some(BuiltinEffectId::FloatSqrt),
+            "String.length" => Some(BuiltinEffectId::StringLength),
+            "Array.length" => Some(BuiltinEffectId::ArrayLength),
+            _ => None,
+        };
         Self {
             qualified: std::sync::Arc::from(name),
             dot: name.find('.'),
+            builtin,
         }
     }
 
@@ -3949,12 +4025,21 @@ impl VM {
         // actor bytecode (no user handler, empty handler_stack).
         if self.handler_stack.is_empty() {
             let result = match self.modules.get(module_idx) {
-                Some(module) => self.actor_callbacks.perform_builtin_effect_in_module(
-                    effect_name,
-                    op_name,
-                    module,
-                    &self.frames[frame_idx].regs,
-                ),
+                Some(module) => match cached_name.as_ref().and_then(|cached| cached.builtin) {
+                    Some(builtin) => self.actor_callbacks.perform_builtin_id_in_module(
+                        builtin,
+                        effect_name,
+                        op_name,
+                        module,
+                        &self.frames[frame_idx].regs,
+                    ),
+                    None => self.actor_callbacks.perform_builtin_effect_in_module(
+                        effect_name,
+                        op_name,
+                        module,
+                        &self.frames[frame_idx].regs,
+                    ),
+                },
                 None => self.actor_callbacks.perform_builtin_effect(
                     effect_name,
                     op_name,
@@ -4030,12 +4115,21 @@ impl VM {
             // are in r0..rn; string-id args resolve against the
             // performing module's constant pool.
             let result = match self.modules.get(module_idx) {
-                Some(module) => self.actor_callbacks.perform_builtin_effect_in_module(
-                    effect_name,
-                    op_name,
-                    module,
-                    &self.frames[frame_idx].regs,
-                ),
+                Some(module) => match cached_name.as_ref().and_then(|cached| cached.builtin) {
+                    Some(builtin) => self.actor_callbacks.perform_builtin_id_in_module(
+                        builtin,
+                        effect_name,
+                        op_name,
+                        module,
+                        &self.frames[frame_idx].regs,
+                    ),
+                    None => self.actor_callbacks.perform_builtin_effect_in_module(
+                        effect_name,
+                        op_name,
+                        module,
+                        &self.frames[frame_idx].regs,
+                    ),
+                },
                 None => self.actor_callbacks.perform_builtin_effect(
                     effect_name,
                     op_name,
