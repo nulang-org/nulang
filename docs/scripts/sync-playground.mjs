@@ -21,10 +21,20 @@ const targetWasm = path.join(targetDir, wasm);
 try {
   await access(sourceWasm);
   await copyFile(sourceWasm, targetWasm);
-  console.log('Synced browser playground, including WASM compiler.');
+  console.log('Synced browser playground, including freshly built WASM compiler.');
 } catch {
-  // Local/Cloudflare docs builds do not necessarily have a Rust toolchain.
-  // Preserve an already-generated public WASM artifact when present; the
-  // Docs Sync workflow builds and refreshes it on main.
-  console.log('Synced playground shell; WASM artifact was not rebuilt in this environment.');
+  try {
+    await access(targetWasm);
+    console.log('Synced playground shell; preserving the generated public WASM compiler.');
+  } catch {
+    if (process.env.CF_PAGES === '1') {
+      throw new Error(
+        'Refusing a Cloudflare Pages build without docs/public/playground/nulang_playground.wasm. ' +
+        'Docs Sync must generate and commit the compiler artifact first.'
+      );
+    }
+    console.log(
+      'Synced playground shell without WASM. Build playground/web first for a runnable local playground.'
+    );
+  }
 }
