@@ -44,6 +44,132 @@ fn apply_handler_function_name(actor_name: &str, event: &str) -> String {
     format!("{actor_name}.$apply_{event}")
 }
 
+
+/// Conservative proof that an apply handler can be re-run as a deterministic
+/// event projection without observing non-event-sourced actor state or
+/// invoking actor/effect surfaces that the isolated replay VM must deny.
+///
+/// This is intentionally a capability fact, not a source validity rule:
+/// handlers outside this subset retain today's live semantics and stored-value
+/// recovery, but RFC 0008 event replay will fail closed rather than re-run them.
+fn apply_handler_replay_safe(
+    expr: &crate::ast::Expr,
+    event_sourced_fields: &HashSet<String>,
+) -> bool {
+    use crate::ast::Expr;
+
+    match expr {
+        Expr::Literal(..) | Expr::Var(..) | Expr::Panic(..) => true,
+        Expr::SelfRef(_) => false,
+        Expr::FString(parts, _)
+        | Expr::Tuple(parts, _)
+        | Expr::Array(parts, _) => parts
+            .iter()
+            .all(|part| apply_handler_replay_safe(part, event_sourced_fields)),
+        Expr::Record(fields, _) => fields
+            .iter()
+            .all(|(_, value)| apply_handler_replay_safe(value, event_sourced_fields)),
+        Expr::FieldAccess { expr, field, .. } => match expr.as_ref() {
+            Expr::SelfRef(_) => event_sourced_fields.contains(field),
+            other => apply_handler_replay_safe(other, event_sourced_fields),
+        },
+        Expr::RecordUpdate { base, fields, .. } => {
+            apply_handler_replay_safe(base, event_sourced_fields)
+                && fields
+                    .iter()
+                    .all(|(_, value)| apply_handler_replay_safe(value, event_sourced_fields))
+        }
+        Expr::Index { arr, idx, .. }
+        | Expr::Binary {
+            left: arr,
+            right: idx,
+            ..
+        } => {
+            apply_handler_replay_safe(arr, event_sourced_fields)
+                && apply_handler_replay_safe(idx, event_sourced_fields)
+        }
+        Expr::Unary { expr, .. }
+        | Expr::CapAnnotate { expr, .. }
+        | Expr::TypeAnnotate { expr, .. }
+        | Expr::Consume { expr, .. }
+        | Expr::Defer { expr, .. } => apply_handler_replay_safe(expr, event_sourced_fields),
+        Expr::Lambda { body, .. } => apply_handler_replay_safe(body, event_sourced_fields),
+        Expr::Let { value, body, .. } | Expr::LetRec { value, body, .. } => {
+            apply_handler_replay_safe(value, event_sourced_fields)
+                && apply_handler_replay_safe(body, event_sourced_fields)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            apply_handler_replay_safe(cond, event_sourced_fields)
+                && apply_handler_replay_safe(then_branch, event_sourced_fields)
+                && else_branch.as_ref().map_or(true, |branch| {
+                    apply_handler_replay_safe(branch, event_sourced_fields)
+                })
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            apply_handler_replay_safe(scrutinee, event_sourced_fields)
+                && arms.iter().all(|(_, guard, body)| {
+                    guard.as_ref().map_or(true, |guard| {
+                        apply_handler_replay_safe(guard, event_sourced_fields)
+                    }) && apply_handler_replay_safe(body, event_sourced_fields)
+                })
+        }
+        Expr::Block { exprs, .. } | Expr::Par { exprs, .. } => exprs
+            .iter()
+            .all(|expr| apply_handler_replay_safe(expr, event_sourced_fields)),
+        Expr::Assign { target, value, .. } => {
+            let target_safe = match target.as_ref() {
+                Expr::FieldAccess { expr, field, .. }
+                    if matches!(expr.as_ref(), Expr::SelfRef(_)) =>
+                {
+                    event_sourced_fields.contains(field)
+                }
+                other => apply_handler_replay_safe(other, event_sourced_fields),
+            };
+            target_safe && apply_handler_replay_safe(value, event_sourced_fields)
+        }
+        Expr::Pipe { left, right, .. } => {
+            apply_handler_replay_safe(left, event_sourced_fields)
+                && apply_handler_replay_safe(right, event_sourced_fields)
+        }
+        Expr::For { iterable, body, .. } => {
+            apply_handler_replay_safe(iterable, event_sourced_fields)
+                && apply_handler_replay_safe(body, event_sourced_fields)
+        }
+        Expr::While { cond, body, .. } => {
+            apply_handler_replay_safe(cond, event_sourced_fields)
+                && apply_handler_replay_safe(body, event_sourced_fields)
+        }
+        Expr::Return(value, _) | Expr::Break(value, _) => value
+            .as_ref()
+            .map_or(true, |value| apply_handler_replay_safe(value, event_sourced_fields)),
+        Expr::Recover { body, .. }
+        | Expr::Hide { body, .. }
+        | Expr::Seal { body, .. } => apply_handler_replay_safe(body, event_sourced_fields),
+
+        // Conservative v1 replay subset. Function calls and all actor/effect
+        // surfaces are excluded until their transitive purity/capability
+        // contracts are represented in replay metadata.
+        Expr::App { .. }
+        | Expr::Spawn { .. }
+        | Expr::Send { .. }
+        | Expr::Ask { .. }
+        | Expr::Receive { .. }
+        | Expr::Emit { .. }
+        | Expr::Perform { .. }
+        | Expr::GrainRef { .. }
+        | Expr::Resume { .. }
+        | Expr::Handle { .. }
+        | Expr::Migrate { .. } => false,
+    }
+}
+
 pub fn lower_module(hir: &hir::Module) -> NuResult<mir::Module> {
     let mut ctx = ModuleCtx::new(&hir.name);
 
@@ -228,6 +354,14 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                 span: a.span,
             })?;
 
+            let event_sourced_fields: HashSet<String> = a
+                .state_fields
+                .iter()
+                .filter(|(_, model, _, _)| {
+                    matches!(model, crate::ast::StateModel::EventSourced)
+                })
+                .map(|(name, _, _, _)| name.clone())
+                .collect();
             let apply_handlers = a
                 .apply_handler_bodies
                 .iter()
@@ -240,10 +374,22 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                         })
                         .map(|(_, _, idx)| *idx)
                         .expect("apply handler function slot reserved in pass 1");
+                    let replay_safe = a
+                        .apply_handlers
+                        .iter()
+                        .find(|source| source.event == handler.event)
+                        .map(|source| {
+                            apply_handler_replay_safe(
+                                &source.body,
+                                &event_sourced_fields,
+                            )
+                        })
+                        .unwrap_or(false);
                     crate::bytecode::ApplyHandlerMeta {
                         event: handler.event.clone(),
                         param_count: handler.params.len(),
                         function_index,
+                        replay_safe,
                     }
                 })
                 .collect();
