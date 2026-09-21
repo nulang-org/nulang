@@ -2360,6 +2360,49 @@ fn test_memory_store_latest_sequence() {
 
 #[cfg(feature = "sqlite")]
 #[test]
+fn test_libsql_snapshot_cas_is_atomic_and_revision_fenced() {
+    let mut store = LibsqlStore::in_memory().unwrap();
+    let mut original = ActorSnapshot {
+        actor_id: 920_002,
+        sequence: 11,
+        schema_owner: Some("Counter".to_string()),
+        schema_version: 1,
+        ..ActorSnapshot::default()
+    };
+    original
+        .state
+        .insert("count".to_string(), PersistedValue::Int(4));
+    store.save_snapshot(original.clone()).unwrap();
+    let expected = SnapshotRevision::from_snapshot(&original);
+
+    let mut replacement = original.clone();
+    replacement.schema_version = 2;
+    replacement
+        .state
+        .insert("count".to_string(), PersistedValue::Int(5));
+    assert_eq!(
+        store
+            .compare_and_swap_snapshot(&expected, replacement.clone())
+            .unwrap(),
+        SnapshotCasResult::Committed
+    );
+
+    let mut stale = replacement.clone();
+    stale.schema_version = 3;
+    assert_eq!(
+        store.compare_and_swap_snapshot(&expected, stale).unwrap(),
+        SnapshotCasResult::Conflict
+    );
+    let committed = store.load_snapshot(original.actor_id).unwrap();
+    assert_eq!(committed.schema_version, 2);
+    assert_eq!(
+        committed.state.get("count"),
+        Some(&PersistedValue::Int(5))
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
 fn test_libsql_store_save_load_snapshot() {
     let mut store = LibsqlStore::in_memory().unwrap();
     let mut state = HashMap::new();
