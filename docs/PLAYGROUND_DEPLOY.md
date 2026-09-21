@@ -19,7 +19,10 @@ The workflow:
 4. Builds the Astro documentation site as a validation gate.
 5. Opens or updates the protected-branch PR `automation/docs-sync` containing
    generated standard-library/API docs and `docs/public/playground/`.
-6. That generated-assets PR runs the repository's normal required checks.
+6. That generated-assets PR runs the repository's normal required checks. With
+   the default `GITHUB_TOKEN`, GitHub places those workflow runs behind a
+   maintainer approval gate. Setting the optional `DOCS_SYNC_TOKEN` to a PAT
+   or GitHub App token allows the checks to start automatically.
 7. After the generated-assets PR is merged to `main`, Cloudflare Pages deploys
    the reviewed revision, including `/playground/index.html` and
    `/playground/nulang_playground.wasm`.
@@ -68,7 +71,8 @@ If `playground/web/nulang_playground.wasm` exists, it refreshes the public
 WASM too. Otherwise it preserves an already-generated
 `docs/public/playground/nulang_playground.wasm`. Lightweight local and preview
 builds may continue without that artifact, but the production Cloudflare Pages
-build on `main` refuses to deploy when it is missing. The authoritative rebuild happens in Docs Sync on `main`, and its generated
+build on `main` refuses to deploy when it is missing. The authoritative
+rebuild happens in Docs Sync on `main`, and its generated
 outputs are proposed through `automation/docs-sync` rather than pushed
 directly to the protected branch.
 
