@@ -57,7 +57,7 @@ use super::fabric_stream_epoch::{
 };
 use super::mailbox::{Message, MessagePriority};
 use super::network::{NetworkTransport, Packet};
-use super::{ClusterState, NodeId, NodeStatus};
+use super::{ActorAdmissionStatus, ClusterState, NodeId, NodeStatus};
 use crate::runtime::Runtime;
 use crate::types::ExitReason;
 use crate::vm::Value;
@@ -77,6 +77,16 @@ impl From<DistributedMessage> for Message {
     fn from(dm: DistributedMessage) -> Self {
         dm.0
     }
+}
+
+/// Remote actor message deferred while behavior bytecode is fetched.
+pub(crate) struct PendingFetchedMessage {
+    pub target_actor: u64,
+    pub behavior_name: String,
+    pub msg: Message,
+    pub string_table: Vec<String>,
+    pub object_table: Vec<(u64, Vec<u8>)>,
+    pub admission: Option<(NodeId, u64)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,6 +1012,32 @@ fn try_lookup_content_hash(runtime: &Runtime, behavior_name: &str) -> Option<[u8
 /// [`Packet::SpawnResponse`] (hence the mutable transport).
 ///
 /// Send a transport-level acknowledgement for a successfully processed packet.
+fn send_actor_admission(
+    transport: &mut dyn NetworkTransport,
+    cluster: &ClusterState,
+    to_node: NodeId,
+    delivery_id: Option<u64>,
+    status: ActorAdmissionStatus,
+) {
+    let Some(delivery_id) = delivery_id else {
+        return;
+    };
+    let addr = cluster
+        .get_node(to_node)
+        .map(|node| node.address)
+        .or_else(|| transport.connection_addr(to_node));
+    if let Some(addr) = addr {
+        transport.send(
+            to_node,
+            addr,
+            Packet::ActorAdmission {
+                delivery_id,
+                status,
+            },
+        );
+    }
+}
+
 fn ack_packet(
     transport: &mut dyn NetworkTransport,
     cluster: &ClusterState,
