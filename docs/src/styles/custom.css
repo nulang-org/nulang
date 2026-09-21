@@ -824,14 +824,12 @@ html[data-theme="light"] starlight-theme-select label::before {
   opacity: 0.12;
 }
 
-[data-theme="dark"] .feature-card,
-[data-theme="dark"] .learn-card {
+[data-theme="dark"] .feature-card {
   background: var(--nu-surface);
   border-color: var(--nu-border);
 }
 
-[data-theme="dark"] .feature-card:hover,
-[data-theme="dark"] .learn-card:hover {
+[data-theme="dark"] .feature-card:hover {
   border-color: rgba(249, 115, 22, 0.4);
   box-shadow: 0 18px 40px rgba(0, 0, 0, 0.25);
 }
@@ -918,59 +916,6 @@ html[data-theme="light"] starlight-theme-select label::before {
   height: 1.25rem;
   color: var(--nu-accent-high);
   margin-top: 0.125rem;
-}
-
-/* ── Learn & contribute grid ── */
-.learn-grid {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 1rem;
-  margin: 2rem 0 3rem;
-}
-
-@media (min-width: 40rem) {
-  .learn-grid {
-    grid-template-columns: repeat(2, 1fr);
-  }
-}
-
-.learn-card {
-  display: block;
-  padding: 1.25rem 1.5rem;
-  border-radius: 0.875rem;
-  border: 1px solid var(--nu-border);
-  background: var(--nu-surface);
-  text-decoration: none;
-  transition: border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
-}
-
-.learn-card:hover {
-  border-color: rgba(243, 128, 32, 0.4);
-  transform: translateY(-2px);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
-}
-
-.learn-card h3 {
-  margin: 0 0 0.375rem;
-  font-size: 1rem;
-  font-weight: 600;
-  color: var(--nu-text);
-}
-
-.learn-card p {
-  margin: 0;
-  font-size: 0.875rem;
-  line-height: 1.6;
-  color: var(--nu-text-secondary);
-}
-
-.learn-card-accent {
-  border-color: rgba(243, 128, 32, 0.35);
-  background: linear-gradient(180deg, rgba(243, 128, 32, 0.06), var(--nu-surface));
-}
-
-.learn-card-accent:hover {
-  border-color: var(--nu-blue);
 }
 
 /* ── Mobile navigation ── */
