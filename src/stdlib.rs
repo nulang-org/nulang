@@ -15,7 +15,7 @@
 //! | `std.math` | `math.nula` | Math functions: `abs`, `min`, `max`, `clamp`, `pow`, `factorial`, `gcd`, `sqrt`. |
 //! | `std.list` | `list.nula` | Functional list combinators: `map`, `filter`, `fold`, `append`, `reverse`, `sort`, etc. |
 //! | `std.string` | `string.nula` | String operations: `trim`, `split`, `join`, `replace`, `to_upper`, `to_lower`, etc. |
-//! | `std.map` | `map.nula` | Int→Int key-value map via sorted arrays: `insert`, `get`, `remove`, `contains`. |
+//! | `std.map` | `map.nula` | Generic key-value map via record arrays: `insert`, Option-returning `get`, `remove`, `contains`. |
 //! | `std.set` | `set.nula` | Int set via sorted arrays: `insert`, `contains`, `remove`. |
 //! | `std.result` | `result.nula` | Extra Result combinators: `unwrap`, `map`, `is_ok`, `is_err`. |
 //! | `std.option` | `option.nula` | Extra Option combinators: `unwrap`, `map`, `is_some`, `is_none`. |
