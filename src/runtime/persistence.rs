@@ -124,12 +124,26 @@ impl PersistedValue {
     }
 }
 
+fn default_schema_version() -> u32 {
+    1
+}
+
 /// A serializable snapshot of an actor's durable state.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+///
+/// RFC 0008 treats snapshots without explicit schema metadata as version 1.
+/// `schema_owner` identifies the compiler-owned actor/entity declaration
+/// whose schema produced the state. New snapshots always populate it for
+/// bytecode-backed actors; legacy/native snapshots may leave it absent.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ActorSnapshot {
     pub actor_id: u64,
     pub sequence: u64,
+    /// Compiler-owned durable schema identity at the declaration level.
+    pub schema_owner: Option<String>,
+    /// Durable schema version. Legacy snapshots deserialize as version 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub state: HashMap<String, PersistedValue>,
     /// For workflow actors, the name of the signal the current step is
     /// suspended waiting for, if any.  This is part of the snapshot so that
@@ -150,6 +164,22 @@ pub struct ActorSnapshot {
     /// typed manifest before any recovered actor becomes observable.
     #[serde(default)]
     pub authority_tokens: BTreeSet<String>,
+}
+
+impl Default for ActorSnapshot {
+    fn default() -> Self {
+        Self {
+            actor_id: 0,
+            sequence: 0,
+            schema_owner: None,
+            schema_version: 1,
+            state: HashMap::new(),
+            waiting_signal: None,
+            crdt_snapshot: None,
+            crdt_field_map: None,
+            authority_tokens: BTreeSet::new(),
+        }
+    }
 }
 
 /// A journal entry records a message delivered to an actor.
