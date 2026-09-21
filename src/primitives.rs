@@ -11,10 +11,11 @@
 //! `is_workflow`, `is_organization`, and `virtual_`. [`ActorRole`] remains
 //! as a compatibility view for persisted formats while those flags are phased out.
 
-/// The seven semantic primitives that make up the Nulang execution model.
+/// The five semantic primitives that make up the Nulang execution model.
 ///
-/// Higher-level features should lower to compositions of these primitives
-/// instead of introducing additional runtime species.
+/// Supervision is composed from actors, lifecycle relationships, and messages;
+/// time is expressed through effects. Higher-level features should lower to
+/// compositions of these primitives instead of introducing runtime species.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimePrimitive {
     Actor,
@@ -22,8 +23,6 @@ pub enum RuntimePrimitive {
     Message,
     Effect,
     Capability,
-    Supervisor,
-    Time,
 }
 
 pub use crate::actor_semantics::{
@@ -186,8 +185,7 @@ impl crate::runtime::Actor {
     }
 }
 
-/// Runtime operations implemented by the single [`RuntimePrimitive::Time`]
-/// primitive.
+/// Runtime operations implemented behind the `Time` effect family.
 ///
 /// The timer wheel has multiple internal wake-message variants for efficiency,
 /// but those variants are implementation detail. Language features such as
