@@ -1268,10 +1268,7 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         // Ownership is established only after pattern+guard commit. Until
         // then the message remains logically queued and its in-flight ORCA
         // reference keeps the payload alive.
-        Some((
-            pos,
-            payload.to_vec(),
-        ))
+        Some((pos, payload.to_vec()))
     }
 
     fn commit_receive_match(&mut self) {
