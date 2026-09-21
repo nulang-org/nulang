@@ -53,7 +53,10 @@ two major versions.*
   provenance without a post-build semantic reparse. Manifests now carry the
   required `nulang.host-effects/v0alpha1` canonical operation identities and
   explicitly flag unresolved legacy/custom dispatch so canonical-only
-  deployment can fail closed.
+  deployment can fail closed. Canonical `nula build-wasm` now uses this
+  integrated path directly, forwards package capabilities as compiler input,
+  and writes the bound `.wasm`, `.cwasm`, and `.behavior.json` artifacts
+  together.
 
 ### Compiler-owned host effect ABI — 2026-09-20
 - **Built-in host effects now lower through a versioned compiler-owned contract**
