@@ -306,15 +306,25 @@ If JSON canonicalization proves awkward, a later schema version may use determin
 
 ## Compiler commands
 
-Proposed experimental CLI surface:
+Current experimental package-build surface:
 
 ```bash
-nulang --check src/main.nula --emit-behavior-manifest /tmp/app.behavior.json
-nulang nula build-wasm --emit-behavior-manifest
-nulang inspect-behavior .nula/dist/app.behavior.json
+nulang nula build-wasm
 ```
 
-Exact CLI spelling is non-normative until implementation review.
+With the `wasm-backend` feature enabled, this command resolves the package,
+checks and lowers one compilation unit, and writes:
+
+```text
+.nula/dist/<package>.wasm
+.nula/dist/<package>.cwasm
+.nula/dist/<package>.behavior.json
+```
+
+The Wasm bytes and Behavior Manifest are produced in the same compiler process
+from the same checked/import-resolved unit. The AOT artifact is then derived
+from those exact Wasm bytes. Standalone inspection/admission CLI spelling
+remains non-normative until implementation review.
 
 ## Admission model
 
