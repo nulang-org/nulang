@@ -2,8 +2,10 @@
 //!
 //! Source/HIR retains executable migration bodies, while the bytecode artifact
 //! boundary needs a stable representation that is independent of compiler AST
-//! layout. This module records only validated migration topology and event-arm
-//! metadata. Executable migration code is deliberately a separate follow-up.
+//! layout. This module records validated migration topology and event-arm
+//! metadata plus optional artifact-local bindings to compiler-generated private
+//! state-transform functions. The executable bytecode lives in the ordinary
+//! function table; runtime execution/commit remains a separate follow-up.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
