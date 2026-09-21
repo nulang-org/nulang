@@ -1803,6 +1803,7 @@ fn system_packet(behavior: &str, sender_node: NodeId, bytes: Vec<u8>) -> Packet 
         sender_node,
         priority: MessagePriority::System,
         trace_id: None,
+        delivery_id: None,
     }
 }
 

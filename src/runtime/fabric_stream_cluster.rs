@@ -1495,6 +1495,7 @@ impl Runtime {
                 sender_node: local,
                 priority: MessagePriority::System,
                 trace_id: None,
+                delivery_id: None,
             };
             transport.send(node, address, packet);
             report.dispatched += 1;
@@ -1566,6 +1567,7 @@ impl Runtime {
                 sender_node: local,
                 priority: MessagePriority::System,
                 trace_id: None,
+                delivery_id: None,
             },
         );
         Ok(true)
@@ -1644,6 +1646,7 @@ impl Runtime {
                 sender_node: local,
                 priority: MessagePriority::System,
                 trace_id: None,
+                delivery_id: None,
             },
         );
         Ok(true)

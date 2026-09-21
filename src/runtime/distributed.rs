@@ -57,7 +57,7 @@ use super::fabric_stream_epoch::{
 };
 use super::mailbox::{Message, MessagePriority};
 use super::network::{NetworkTransport, Packet};
-use super::{ClusterState, NodeId, NodeStatus};
+use super::{ActorAdmissionStatus, ClusterState, NodeId, NodeStatus};
 use crate::runtime::Runtime;
 use crate::types::ExitReason;
 use crate::vm::Value;
@@ -77,6 +77,16 @@ impl From<DistributedMessage> for Message {
     fn from(dm: DistributedMessage) -> Self {
         dm.0
     }
+}
+
+/// Remote actor message deferred while behavior bytecode is fetched.
+pub(crate) struct PendingFetchedMessage {
+    pub target_actor: u64,
+    pub behavior_name: String,
+    pub msg: Message,
+    pub string_table: Vec<String>,
+    pub object_table: Vec<(u64, Vec<u8>)>,
+    pub admission: Option<(NodeId, u64)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +513,7 @@ impl AddressResolver {
         object_table: Vec<(u64, Vec<u8>)>,
         content_hash: Option<[u8; 32]>,
         trace_id: Option<String>,
+        delivery_id: Option<u64>,
     ) -> Packet {
         Packet::ActorMessage {
             target_actor,
@@ -515,6 +526,7 @@ impl AddressResolver {
             sender_node: NodeId(self.local_node.0),
             priority,
             trace_id,
+            delivery_id,
         }
     }
     /// Parse a received network packet into a message for local delivery.
@@ -542,6 +554,7 @@ impl AddressResolver {
         Vec<String>,
         Vec<(u64, Vec<u8>)>,
         Option<[u8; 32]>,
+        Option<u64>,
     )> {
         match packet {
             Packet::ActorMessage {
@@ -555,6 +568,7 @@ impl AddressResolver {
                 sender_node,
                 priority,
                 trace_id,
+                delivery_id,
             } => {
                 // Record the sender in our cache so we can reply.
                 let sender_cluster_node = NodeId(sender_node.0);
@@ -574,6 +588,7 @@ impl AddressResolver {
                     string_table,
                     object_table,
                     content_hash,
+                    delivery_id,
                 ))
             }
             // Non-actor-message packets are not parsed here.
@@ -782,19 +797,45 @@ pub fn send_distributed(
     behavior: &str,
     args: &[Value],
 ) {
+    let _ = send_distributed_inner(
+        runtime, transport, cluster, resolver, target, behavior, args, false,
+    );
+}
+
+/// Send a distributed message and request a terminal destination admission
+/// response. Returns a sender-local delivery id only when the message was
+/// actually handed to the remote transport.
+pub fn send_distributed_tracked(
+    runtime: &mut Runtime,
+    transport: &mut dyn NetworkTransport,
+    cluster: &ClusterState,
+    resolver: &mut AddressResolver,
+    target: ActorAddress,
+    behavior: &str,
+    args: &[Value],
+) -> Option<u64> {
+    send_distributed_inner(
+        runtime, transport, cluster, resolver, target, behavior, args, true,
+    )
+}
+
+fn send_distributed_inner(
+    runtime: &mut Runtime,
+    transport: &mut dyn NetworkTransport,
+    cluster: &ClusterState,
+    resolver: &mut AddressResolver,
+    target: ActorAddress,
+    behavior: &str,
+    args: &[Value],
+    tracked: bool,
+) -> Option<u64> {
     match resolver.resolve(cluster, target) {
         ResolveResult::Local { actor_id } => {
             runtime.send_message(actor_id, behavior, args);
+            None
         }
         ResolveResult::Remote { node_id, actor_id } => {
-            // Remember the bare id → node mapping so a LATER bare actor-ref
-            // Value (no node id) can route here too (RFC-0007).
             crate::runtime::distribution::record_remote_ref(runtime, node_id, actor_id);
-            // String payloads must cross the wire by CONTENT: a bare string
-            // id indexes the sender's module constant pool and means nothing
-            // (or the wrong thing) on the receiving node. Resolve each
-            // string arg against the sender's pool and carry the contents
-            // in the packet's string table.
             let (payload, string_table) = match resolve_wire_strings(runtime, args) {
                 Some(resolved) => resolved,
                 None => {
@@ -804,11 +845,9 @@ pub fn send_distributed(
                     );
                     let sender = runtime.current_actor.unwrap_or(0);
                     notify_delivery_failed(runtime, sender, "string payload unresolvable");
-                    return;
+                    return None;
                 }
             };
-            // Object-store refs must cross the wire with their byte payloads:
-            // object ids are local to each node's store.
             let (payload, object_table) = match resolve_wire_objects(runtime, &payload) {
                 Some(resolved) => resolved,
                 None => {
@@ -818,18 +857,35 @@ pub fn send_distributed(
                     );
                     let sender = runtime.current_actor.unwrap_or(0);
                     notify_delivery_failed(runtime, sender, "object ref unresolvable");
-                    return;
+                    return None;
                 }
             };
-            // Remote sends carry the behavior name and an optional content
-            // hash; the receiving node resolves the name and MAY verify the
-            // hash against its own behavior table on delivery.
+            let Some(node_info) = cluster.get_node(node_id) else {
+                warn!(
+                    "nulang-net: dropping message to actor {} on node {:?}: node missing from cluster membership",
+                    actor_id, node_id
+                );
+                let sender = runtime.current_actor.unwrap_or(0);
+                notify_delivery_failed(runtime, sender, "target node left cluster");
+                return None;
+            };
+
             let content_hash = try_lookup_content_hash(runtime, behavior);
-            // Carry the current handler's trace span across the wire so the
-            // remote side continues the same causal chain. The current span
-            // (not a synthetic child) crosses because `traceparent` has no
-            // parent field — the receiver creates its own child span.
             let trace_id = runtime.current_trace.as_ref().map(|t| t.to_traceparent());
+            let delivery_id = if tracked {
+                match runtime.begin_remote_delivery(node_id) {
+                    Some(delivery_id) => Some(delivery_id),
+                    None => {
+                        warn!(
+                            "nulang-net: refusing tracked send to actor {} on node {:?}: pending admission table is full",
+                            actor_id, node_id
+                        );
+                        return None;
+                    }
+                }
+            } else {
+                None
+            };
             let packet = resolver.build_packet(
                 actor_id,
                 behavior,
@@ -840,27 +896,18 @@ pub fn send_distributed(
                 object_table,
                 content_hash,
                 trace_id,
+                delivery_id,
             );
 
-            if let Some(node_info) = cluster.get_node(node_id) {
-                let net_node_id = NodeId(node_id.0);
-                transport.send(net_node_id, node_info.address, packet);
-            } else {
-                // The node resolved as remote but is no longer in the
-                // membership table (it left between resolve and send). Log
-                // the drop rather than losing the message silently.
-                warn!(
-                    "nulang-net: dropping message to actor {} on node {:?}: node missing from cluster membership",
-                    actor_id, node_id
-                );
-                let sender = runtime.current_actor.unwrap_or(0);
-                notify_delivery_failed(runtime, sender, "target node left cluster");
-            }
+            let net_node_id = NodeId(node_id.0);
+            transport.send(net_node_id, node_info.address, packet);
+            delivery_id
         }
         ResolveResult::Unresolvable { reason } => {
             warn!("nulang-net: dropping message to {:?}: {}", target, reason);
             let sender = runtime.current_actor.unwrap_or(0);
             notify_delivery_failed(runtime, sender, &reason);
+            None
         }
     }
 }
@@ -978,6 +1025,52 @@ fn try_lookup_content_hash(runtime: &Runtime, behavior_name: &str) -> Option<[u8
 /// [`Packet::SpawnResponse`] (hence the mutable transport).
 ///
 /// Send a transport-level acknowledgement for a successfully processed packet.
+fn send_actor_admission(
+    transport: &mut dyn NetworkTransport,
+    cluster: &ClusterState,
+    to_node: NodeId,
+    delivery_id: Option<u64>,
+    status: ActorAdmissionStatus,
+) {
+    let Some(delivery_id) = delivery_id else {
+        return;
+    };
+    let addr = cluster
+        .get_node(to_node)
+        .map(|node| node.address)
+        .or_else(|| transport.connection_addr(to_node));
+    if let Some(addr) = addr {
+        transport.send(
+            to_node,
+            addr,
+            Packet::ActorAdmission {
+                delivery_id,
+                status,
+            },
+        );
+    }
+}
+
+fn reject_remote_delivery(
+    runtime: &mut Runtime,
+    transport: &mut dyn NetworkTransport,
+    cluster: &ClusterState,
+    sender: u64,
+    admission: Option<(NodeId, u64)>,
+    reason: &str,
+) {
+    notify_delivery_failed(runtime, sender, reason);
+    if let Some((node, delivery_id)) = admission {
+        send_actor_admission(
+            transport,
+            cluster,
+            node,
+            Some(delivery_id),
+            ActorAdmissionStatus::Rejected,
+        );
+    }
+}
+
 fn ack_packet(
     transport: &mut dyn NetworkTransport,
     cluster: &ClusterState,
@@ -1129,6 +1222,7 @@ pub fn process_network_packets(
                                 m.object_table,
                                 content_hash,
                                 m.trace_id,
+                                None,
                             );
                             let reply_addr = cluster
                                 .get_node(from)
@@ -1181,6 +1275,18 @@ pub fn process_network_packets(
             }
             Packet::Ack { packet_seq } => {
                 runtime.acked_packets.insert(packet_seq);
+            }
+            Packet::ActorAdmission {
+                delivery_id,
+                status,
+            } => {
+                if !runtime.record_remote_admission(incoming.from_node, delivery_id, status) {
+                    warn!(
+                        "nulang-net: ignoring actor admission {} from unexpected node {:?}",
+                        delivery_id, incoming.from_node
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
             Packet::FetchBehaviorRequest { content_hash } => {
                 let mut nbc_bytes: Option<Vec<u8>> = None;
@@ -1243,24 +1349,21 @@ pub fn process_network_packets(
                     match crate::bytecode::CodeModule::from_nbc(&bytes) {
                         Ok(artifact) => {
                             runtime.behavior_cache.insert(content_hash, artifact.module);
-                            // Retry any messages that were waiting for this bytecode
                             let pending = runtime.pending_fetched_messages.remove(&content_hash);
                             if let Some(messages) = pending {
-                                for (
-                                    target_actor,
-                                    behavior_name,
-                                    mut msg,
-                                    string_table,
-                                    object_table,
-                                ) in messages
-                                {
-                                    // Hot-reload the newly cached module into the target actor
+                                for mut pending in messages {
+                                    let admission = pending.admission;
+                                    let sender = pending.msg.sender;
+
                                     let cached = match runtime.behavior_cache.get(&content_hash) {
-                                        Some(c) => c.clone(),
+                                        Some(cached) => cached.clone(),
                                         None => {
-                                            notify_delivery_failed(
+                                            reject_remote_delivery(
                                                 runtime,
-                                                msg.sender,
+                                                transport,
+                                                cluster,
+                                                sender,
+                                                admission,
                                                 "bytecode fetch succeeded but cache miss on retry",
                                             );
                                             continue;
@@ -1268,50 +1371,57 @@ pub fn process_network_packets(
                                     };
                                     hot_reload_behavior(
                                         runtime,
-                                        target_actor,
+                                        pending.target_actor,
                                         &cached,
-                                        &behavior_name,
+                                        &pending.behavior_name,
                                     );
-                                    // Resolve behavior id against the updated module.
-                                    // A successful fetch that still lacks the requested
-                                    // name is a failed delivery, never permission to run
-                                    // behavior 0.
-                                    let Some(behavior_id) =
-                                        runtime.behavior_id_for(target_actor, &behavior_name)
+                                    let Some(behavior_id) = runtime
+                                        .behavior_id_for(
+                                            pending.target_actor,
+                                            &pending.behavior_name,
+                                        )
                                     else {
-                                        notify_delivery_failed(
+                                        reject_remote_delivery(
                                             runtime,
-                                            msg.sender,
+                                            transport,
+                                            cluster,
+                                            sender,
+                                            admission,
                                             "unknown behavior after fetch",
                                         );
                                         continue;
                                     };
-                                    msg.behavior_id = behavior_id;
-                                    // Verify the hash now matches
+                                    pending.msg.behavior_id = behavior_id;
                                     if !verify_behavior_hash(
                                         runtime,
-                                        target_actor,
-                                        msg.behavior_id,
+                                        pending.target_actor,
+                                        pending.msg.behavior_id,
                                         &content_hash,
                                     ) {
-                                        notify_delivery_failed(
+                                        reject_remote_delivery(
                                             runtime,
-                                            msg.sender,
+                                            transport,
+                                            cluster,
+                                            sender,
+                                            admission,
                                             "behavior content hash still mismatched after fetch",
                                         );
                                         continue;
                                     }
-                                    // Intern string and object payloads, then deliver
-                                    let mut payload_vec = (*msg.payload).clone();
+
+                                    let mut payload_vec = (*pending.msg.payload).clone();
                                     if !intern_wire_strings(
                                         runtime,
-                                        target_actor,
+                                        pending.target_actor,
                                         &mut payload_vec,
-                                        &string_table,
+                                        &pending.string_table,
                                     ) {
-                                        notify_delivery_failed(
+                                        reject_remote_delivery(
                                             runtime,
-                                            msg.sender,
+                                            transport,
+                                            cluster,
+                                            sender,
+                                            admission,
                                             "string intern failed on retry",
                                         );
                                         continue;
@@ -1319,24 +1429,62 @@ pub fn process_network_packets(
                                     if !intern_wire_objects(
                                         runtime,
                                         &mut payload_vec,
-                                        &object_table,
+                                        &pending.object_table,
                                     ) {
-                                        notify_delivery_failed(
+                                        reject_remote_delivery(
                                             runtime,
-                                            msg.sender,
+                                            transport,
+                                            cluster,
+                                            sender,
+                                            admission,
                                             "object intern failed on retry",
                                         );
                                         continue;
                                     }
-                                    msg.payload = Arc::new(payload_vec);
-                                    if let Some(actor) = runtime.actors.get_mut(&target_actor) {
-                                        let _ = actor.mailbox.push(msg);
-                                        runtime.scheduler.enqueue(target_actor);
+                                    pending.msg.payload = Arc::new(payload_vec);
+
+                                    let status = if runtime
+                                        .actors
+                                        .contains_key(&pending.target_actor)
+                                    {
+                                        let pushed = {
+                                            let actor = runtime
+                                                .actors
+                                                .get_mut(&pending.target_actor)
+                                                .unwrap();
+                                            actor.mailbox.push(pending.msg)
+                                        };
+                                        match pushed {
+                                            Ok(()) => {
+                                                runtime
+                                                    .scheduler
+                                                    .enqueue(pending.target_actor);
+                                                ActorAdmissionStatus::Accepted
+                                            }
+                                            Err(rejected) => {
+                                                runtime.route_to_dlq(
+                                                    &rejected,
+                                                    "mailbox full",
+                                                );
+                                                ActorAdmissionStatus::Backpressured
+                                            }
+                                        }
                                     } else {
                                         notify_delivery_failed(
                                             runtime,
-                                            msg.sender,
+                                            sender,
                                             "target actor not found on retry",
+                                        );
+                                        ActorAdmissionStatus::Rejected
+                                    };
+
+                                    if let Some((node, delivery_id)) = admission {
+                                        send_actor_admission(
+                                            transport,
+                                            cluster,
+                                            node,
+                                            Some(delivery_id),
+                                            status,
                                         );
                                     }
                                 }
@@ -1347,25 +1495,45 @@ pub fn process_network_packets(
                                 "nulang-net: failed to deserialize fetched bytecode for '{}': {}",
                                 behavior_name, e
                             );
-                            // Drop pending messages for this hash on deserialize failure
                             let pending = runtime.pending_fetched_messages.remove(&content_hash);
                             if let Some(messages) = pending {
-                                for (_, _, msg, _, _) in messages {
+                                for pending in messages {
                                     notify_delivery_failed(
                                         runtime,
-                                        msg.sender,
+                                        pending.msg.sender,
                                         "bytecode fetch failed: deserialization error",
                                     );
+                                    if let Some((node, delivery_id)) = pending.admission {
+                                        send_actor_admission(
+                                            transport,
+                                            cluster,
+                                            node,
+                                            Some(delivery_id),
+                                            ActorAdmissionStatus::Rejected,
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
                 } else {
-                    // Sender didn't have the requested bytecode; drain and notify
                     let pending = runtime.pending_fetched_messages.remove(&content_hash);
                     if let Some(messages) = pending {
-                        for (_, _, msg, _, _) in messages {
-                            notify_delivery_failed(runtime, msg.sender, "bytecode fetch failed: sender does not have the requested behavior");
+                        for pending in messages {
+                            notify_delivery_failed(
+                                runtime,
+                                pending.msg.sender,
+                                "bytecode fetch failed: sender does not have the requested behavior",
+                            );
+                            if let Some((node, delivery_id)) = pending.admission {
+                                send_actor_admission(
+                                    transport,
+                                    cluster,
+                                    node,
+                                    Some(delivery_id),
+                                    ActorAdmissionStatus::Rejected,
+                                );
+                            }
                         }
                     }
                 }
@@ -1649,6 +1817,7 @@ pub fn process_network_packets(
                                                 sender_node: outcome.placement.leader,
                                                 priority: MessagePriority::System,
                                                 trace_id: None,
+                                                delivery_id: None,
                                             },
                                         );
                                     }
@@ -2039,6 +2208,7 @@ pub fn process_network_packets(
                                                 sender_node: local,
                                                 priority: MessagePriority::System,
                                                 trace_id: None,
+                                                delivery_id: None,
                                             },
                                         );
                                     }
@@ -2103,6 +2273,7 @@ pub fn process_network_packets(
                     string_table,
                     object_table,
                     content_hash,
+                    delivery_id,
                 )) = resolver.parse_packet(incoming.packet)
                 {
                     // Record the wire sender (bare id → node) so the
@@ -2118,6 +2289,7 @@ pub fn process_network_packets(
                             msg.sender,
                         );
                     }
+                    let admission = delivery_id.map(|id| (incoming.from_node, id));
                     // Resolve the behavior name against the target actor's
                     // behavior table. Unknown names must never alias behavior 0.
                     // If the sender attached a content hash, keep fetch-on-demand
@@ -2131,7 +2303,14 @@ pub fn process_network_packets(
                                 "nulang-net: rejecting message to actor {}: unknown behavior '{}'",
                                 target_actor, behavior_name
                             );
-                            notify_delivery_failed(runtime, msg.sender, "unknown behavior");
+                            reject_remote_delivery(
+                                runtime,
+                                transport,
+                                cluster,
+                                msg.sender,
+                                admission,
+                                "unknown behavior",
+                            );
                             ack_packet(transport, cluster, incoming.from_node, incoming.seq);
                             continue;
                         }
@@ -2156,9 +2335,12 @@ pub fn process_network_packets(
                                 let Some(behavior_id) =
                                     runtime.behavior_id_for(target_actor, &behavior_name)
                                 else {
-                                    notify_delivery_failed(
+                                    reject_remote_delivery(
                                         runtime,
+                                        transport,
+                                        cluster,
                                         msg.sender,
+                                        admission,
                                         "unknown behavior after hot reload",
                                     );
                                     ack_packet(
@@ -2192,13 +2374,14 @@ pub fn process_network_packets(
                                     .pending_fetched_messages
                                     .entry(sender_hash)
                                     .or_default()
-                                    .push((
+                                    .push(PendingFetchedMessage {
                                         target_actor,
-                                        behavior_name.clone(),
-                                        msg.clone(),
-                                        string_table.clone(),
-                                        object_table.clone(),
-                                    ));
+                                        behavior_name: behavior_name.clone(),
+                                        msg: msg.clone(),
+                                        string_table: string_table.clone(),
+                                        object_table: object_table.clone(),
+                                        admission,
+                                    });
                                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
                                 continue;
                             }
@@ -2219,11 +2402,15 @@ pub fn process_network_packets(
                             "nulang-net: dropping message to actor {}: string payload cannot be interned (target actor missing or has no module pool)",
                             target_actor
                         );
-                        notify_delivery_failed(
+                        reject_remote_delivery(
                             runtime,
+                            transport,
+                            cluster,
                             msg.sender,
+                            admission,
                             "string intern failed on receiver",
                         );
+                        ack_packet(transport, cluster, incoming.from_node, incoming.seq);
                         continue;
                     }
                     if !intern_wire_objects(runtime, &mut payload_vec, &object_table) {
@@ -2231,37 +2418,52 @@ pub fn process_network_packets(
                             "nulang-net: dropping message to actor {}: object payload cannot be interned (object table mismatch)",
                             target_actor
                         );
-                        notify_delivery_failed(
+                        reject_remote_delivery(
                             runtime,
+                            transport,
+                            cluster,
                             msg.sender,
+                            admission,
                             "object intern failed on receiver",
                         );
+                        ack_packet(transport, cluster, incoming.from_node, incoming.seq);
                         continue;
                     }
                     msg.payload = Arc::new(payload_vec);
-                    if runtime.actors.contains_key(&target_actor) {
-                        let admission = {
+                    let sender = msg.sender;
+                    let status = if runtime.actors.contains_key(&target_actor) {
+                        let pushed = {
                             let actor = runtime.actors.get_mut(&target_actor).unwrap();
                             actor.mailbox.push(msg)
                         };
-                        match admission {
-                            Ok(()) => runtime.scheduler.enqueue(target_actor),
+                        match pushed {
+                            Ok(()) => {
+                                runtime.scheduler.enqueue(target_actor);
+                                ActorAdmissionStatus::Accepted
+                            }
                             Err(rejected) => {
                                 warn!(
                                     "nulang-net: backpressure delivering remote message to actor {}: mailbox full",
                                     target_actor
                                 );
                                 runtime.route_to_dlq(&rejected, "mailbox full");
+                                ActorAdmissionStatus::Backpressured
                             }
                         }
                     } else {
-                        notify_delivery_failed(runtime, msg.sender, "target actor not found");
-                    }
+                        notify_delivery_failed(runtime, sender, "target actor not found");
+                        ActorAdmissionStatus::Rejected
+                    };
+                    send_actor_admission(
+                        transport,
+                        cluster,
+                        incoming.from_node,
+                        delivery_id,
+                        status,
+                    );
                 }
-                // This ACK confirms transport-level processing only. A future
-                // application admission ACK/NACK must report Accepted vs
-                // Backpressured/Rejected to the sender without changing this
-                // reliability signal.
+                // Transport processing remains a separate signal from the
+                // ActorAdmission response above.
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
         }
@@ -2888,6 +3090,7 @@ mod tests {
             vec![], // object_table
             None,   // content_hash
             Some(trace.to_string()),
+            Some(77),
         );
         match packet {
             Packet::ActorMessage {
@@ -2900,17 +3103,20 @@ mod tests {
                 sender_node,
                 priority,
                 trace_id,
+                delivery_id,
                 ..
             } => {
                 assert_eq!(target_actor, 42);
                 assert_eq!(behavior_name, "handle_msg");
                 assert_eq!(content_hash, None);
+        assert_eq!(delivery_id, None);
                 assert_eq!(sender_actor, 100);
                 assert_eq!(sender_node.0, local_node.0); // Same underlying u64
                 assert_eq!(priority, MessagePriority::Normal);
                 assert_eq!(payload.len(), 2);
                 assert_eq!(string_table, vec!["hello".to_string()]);
                 assert_eq!(trace_id.as_deref(), Some(trace));
+                assert_eq!(delivery_id, Some(77));
             }
             other => panic!("expected ActorMessage packet, got {:?}", other),
         }
@@ -2935,12 +3141,20 @@ mod tests {
             sender_node: NodeId(9),
             priority: MessagePriority::System,
             trace_id: None,
+            delivery_id: None,
         };
         let result = resolver.parse_packet(packet);
         assert!(result.is_some());
 
-        let (target, behavior_name, msg, string_table, _object_table, content_hash) =
-            result.unwrap();
+        let (
+            target,
+            behavior_name,
+            msg,
+            string_table,
+            _object_table,
+            content_hash,
+            delivery_id,
+        ) = result.unwrap();
         assert_eq!(target, 77);
         assert_eq!(behavior_name, "inc");
         assert_eq!(content_hash, None);
@@ -3302,6 +3516,126 @@ mod tests {
                 .and_then(|value| value.as_int()),
             Some(1),
             "only the admitted remote message may execute"
+        );
+
+        transport_a.shutdown();
+        transport_b.shutdown();
+    }
+
+    #[test]
+    fn test_tracked_remote_send_reports_terminal_admission() {
+        use crate::runtime::network::DeterministicNetworkTransport;
+        use crate::runtime::{Mailbox, NetworkTransport};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let addr_a = addr(31_101);
+        let addr_b = addr(31_102);
+        let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+
+        let mut transport_a =
+            DeterministicNetworkTransport::bind_with_bus(addr_a, bus.clone()).unwrap();
+        let mut transport_b =
+            DeterministicNetworkTransport::bind_with_bus(addr_b, bus).unwrap();
+        let node_a = transport_a.node_id();
+        let node_b = transport_b.node_id();
+        transport_a.register_on_bus();
+        transport_b.register_on_bus();
+        transport_a.connect(node_b, addr_b).unwrap();
+        transport_b.connect(node_a, addr_a).unwrap();
+
+        let mut cluster_a = ClusterState::new(node_a, addr_a);
+        cluster_a.handle_heartbeat(node_b, addr_b);
+        let mut cluster_b = ClusterState::new(node_b, addr_b);
+        cluster_b.handle_heartbeat(node_a, addr_a);
+        let mut resolver_a = AddressResolver::new(node_a);
+        let mut resolver_b = AddressResolver::new(node_b);
+        let mut runtime_a = Runtime::new();
+        let mut runtime_b = Runtime::new();
+
+        let actor_b =
+            runtime_b.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+        {
+            let actor = runtime_b.actors.get_mut(&actor_b).unwrap();
+            actor.mailbox = Mailbox::new(1);
+            actor.register_behavior("inc", |actor, _args| {
+                let count = actor
+                    .get_state_field("count")
+                    .and_then(|value| value.as_int())
+                    .unwrap_or(0);
+                actor.set_state_field("count", Value::int(count + 1));
+            });
+        }
+
+        let target = ActorAddress::remote(node_b, actor_b);
+        let accepted = send_distributed_tracked(
+            &mut runtime_a,
+            &mut transport_a,
+            &cluster_a,
+            &mut resolver_a,
+            target,
+            "inc",
+            &[],
+        )
+        .expect("remote send should return a delivery id");
+        let backpressured = send_distributed_tracked(
+            &mut runtime_a,
+            &mut transport_a,
+            &cluster_a,
+            &mut resolver_a,
+            target,
+            "inc",
+            &[],
+        )
+        .expect("second remote send should return a delivery id");
+        let rejected = send_distributed_tracked(
+            &mut runtime_a,
+            &mut transport_a,
+            &cluster_a,
+            &mut resolver_a,
+            target,
+            "missing_behavior",
+            &[],
+        )
+        .expect("rejected remote send was still handed to the destination");
+
+        process_network_packets(
+            &mut runtime_b,
+            &mut transport_b,
+            &mut cluster_b,
+            &mut resolver_b,
+        );
+        process_network_packets(
+            &mut runtime_a,
+            &mut transport_a,
+            &mut cluster_a,
+            &mut resolver_a,
+        );
+
+        assert_eq!(
+            runtime_a.take_remote_admission(accepted),
+            Some(ActorAdmissionStatus::Accepted)
+        );
+        assert_eq!(
+            runtime_a.take_remote_admission(backpressured),
+            Some(ActorAdmissionStatus::Backpressured)
+        );
+        assert_eq!(
+            runtime_a.take_remote_admission(rejected),
+            Some(ActorAdmissionStatus::Rejected)
+        );
+        assert_eq!(runtime_b.actors.get(&actor_b).unwrap().mailbox.len(), 1);
+        assert_eq!(runtime_b.dlq_depth(), 1);
+
+        runtime_b.run_scheduler();
+        assert_eq!(
+            runtime_b
+                .actors
+                .get(&actor_b)
+                .unwrap()
+                .get_state_field("count")
+                .and_then(|value| value.as_int()),
+            Some(1)
         );
 
         transport_a.shutdown();

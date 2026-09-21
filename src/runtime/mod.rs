@@ -144,6 +144,9 @@ pub fn fresh_actor_id() -> u64 {
 /// `ACTOR_ID_COUNTER`'s start value of 1, so it can never collide with a
 /// real `fresh_actor_id()` result.
 const MAIN_HEAP_ACTOR_ID: u64 = 0;
+/// Bound outstanding tracked remote sends so a partition cannot grow
+/// correlation state without limit.
+const MAX_PENDING_REMOTE_ADMISSIONS: usize = 65_536;
 
 /// Maximum number of membership entries carried by a single gossip packet.
 const GOSSIP_PAYLOAD_MAX_ENTRIES: usize = 256;
@@ -302,6 +305,13 @@ pub enum MessageAdmission {
     Rejected,
 }
 
+/// Terminal admission reported by a remote node for a tracked actor message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteMessageAdmission {
+    pub delivery_id: u64,
+    pub status: ActorAdmissionStatus,
+}
+
 impl MessageAdmission {
     /// True only when this process admitted the message to a local mailbox or
     /// cross-shard delivery queue.
@@ -354,6 +364,12 @@ pub struct Runtime {
     pub cluster_config: ClusterConfig,
     // Acknowledged packet sequence numbers (transport-level reliability).
     pub acked_packets: HashSet<u64>,
+    /// Monotonic sender-local correlation id for tracked cross-node messages.
+    next_remote_delivery_id: u64,
+    /// Destination node expected to answer each outstanding tracked send.
+    pending_remote_admissions: HashMap<u64, NodeId>,
+    /// Terminal destination admission results received from remote nodes.
+    remote_message_admissions: HashMap<u64, ActorAdmissionStatus>,
 
     // Cross-node supervision (RFC 0012)
     pub remote_links: supervision::RemoteLinkRegistry,
@@ -464,7 +480,7 @@ pub struct Runtime {
     /// Keyed by content hash; drained when the matching FetchBehaviorResponse
     /// arrives and the module is cached.
     pub(crate) pending_fetched_messages:
-        HashMap<[u8; 32], Vec<(u64, String, Message, Vec<String>, Vec<(u64, Vec<u8>)>)>>,
+        HashMap<[u8; 32], Vec<distributed::PendingFetchedMessage>>,
     // Pipelines and debates (v0.9 AI Runtime) - extracted into a registry so
     // the god-object shrinks and the subsystems can evolve independently.
     #[cfg(feature = "ai-runtime")]
@@ -615,6 +631,9 @@ impl Runtime {
             distributed: DistributedContext::new(),
             cluster_config: ClusterConfig::default(),
             acked_packets: HashSet::new(),
+            next_remote_delivery_id: 1,
+            pending_remote_admissions: HashMap::new(),
+            remote_message_admissions: HashMap::new(),
             remote_links: supervision::RemoteLinkRegistry::new(),
             remote_monitors: supervision::RemoteMonitorRegistry::new(),
             migrated_actors: HashMap::new(),
@@ -6540,8 +6559,84 @@ impl Runtime {
         distribution::drain_acked(self)
     }
 
+    /// Send a distributed actor message and request a destination admission
+    /// result. Returns a sender-local delivery id only for a cross-node send.
+    ///
+    /// The returned id is independent of the NUL0 packet sequence number:
+    /// transport ACKs prove packet processing, while remote admission proves
+    /// destination mailbox acceptance/backpressure/rejection.
+    pub fn send_distributed_tracked(
+        &mut self,
+        target: ActorAddress,
+        behavior: &str,
+        args: &[Value],
+    ) -> Option<u64> {
+        distribution::send_distributed_tracked(self, target, behavior, args)
+    }
+
     pub fn send_distributed(&mut self, target: ActorAddress, behavior: &str, args: &[Value]) {
         distribution::send_distributed(self, target, behavior, args)
+    }
+
+    /// Remove one terminal remote admission result by delivery id.
+    pub fn take_remote_admission(&mut self, delivery_id: u64) -> Option<ActorAdmissionStatus> {
+        self.remote_message_admissions.remove(&delivery_id)
+    }
+
+    /// Drain terminal remote admission results in delivery-id order.
+    pub fn drain_remote_admissions(&mut self) -> Vec<RemoteMessageAdmission> {
+        let mut admissions: Vec<_> = std::mem::take(&mut self.remote_message_admissions)
+            .into_iter()
+            .map(|(delivery_id, status)| RemoteMessageAdmission {
+                delivery_id,
+                status,
+            })
+            .collect();
+        admissions.sort_by_key(|entry| entry.delivery_id);
+        admissions
+    }
+
+    pub(crate) fn begin_remote_delivery(&mut self, node_id: NodeId) -> Option<u64> {
+        if self.pending_remote_admissions.len() >= MAX_PENDING_REMOTE_ADMISSIONS {
+            return None;
+        }
+
+        // Skip ids that are still pending or have an unread terminal result.
+        for _ in 0..=MAX_PENDING_REMOTE_ADMISSIONS {
+            let delivery_id = self.next_remote_delivery_id.max(1);
+            self.next_remote_delivery_id = delivery_id.wrapping_add(1).max(1);
+            if !self.pending_remote_admissions.contains_key(&delivery_id)
+                && !self.remote_message_admissions.contains_key(&delivery_id)
+            {
+                self.pending_remote_admissions.insert(delivery_id, node_id);
+                return Some(delivery_id);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn record_remote_admission(
+        &mut self,
+        from_node: NodeId,
+        delivery_id: u64,
+        status: ActorAdmissionStatus,
+    ) -> bool {
+        if self.pending_remote_admissions.get(&delivery_id) != Some(&from_node) {
+            return false;
+        }
+        self.pending_remote_admissions.remove(&delivery_id);
+        self.remote_message_admissions.insert(delivery_id, status);
+        true
+    }
+
+    /// Abandon an outstanding tracked delivery after an application timeout.
+    /// Returns true when the delivery id was still pending.
+    pub fn abandon_remote_admission(&mut self, delivery_id: u64) -> bool {
+        self.pending_remote_admissions.remove(&delivery_id).is_some()
+    }
+
+    pub fn pending_remote_admission_count(&self) -> usize {
+        self.pending_remote_admissions.len()
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
