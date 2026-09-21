@@ -1,0 +1,51 @@
+// stdlib::json — strict Option-based field access preserves absence, null,
+// and wrong-type distinctions needed by generated codecs.
+import stdlib::json
+
+fn main() {
+    let obj = parse("{\"name\":\"Alice\",\"age\":30,\"active\":true,\"note\":null}")
+
+    let show_string = fn(opt) {
+        match opt {
+            Some(value) => value,
+            None => "None",
+        }
+    }
+    let show_number = fn(opt) {
+        match opt {
+            Some(value) => perform Float.to_string(value),
+            None => "None",
+        }
+    }
+    let show_bool = fn(opt) {
+        match opt {
+            Some(value) => if value then "true" else "false",
+            None => "None",
+        }
+    }
+
+    perform IO.print("name=" + show_string(get_string_opt(obj, "name")))
+    perform IO.print("missing=" + show_string(get_string_opt(obj, "missing")))
+    perform IO.print("wrongtype=" + show_string(get_string_opt(obj, "age")))
+    perform IO.print("age=" + show_number(get_number_opt(obj, "age")))
+    perform IO.print("active=" + show_bool(get_bool_opt(obj, "active")))
+
+    let null_state = match get(obj, "note") {
+        Some(JsonNull) => "null",
+        Some(_) => "other",
+        None => "missing",
+    }
+    perform IO.print("null=" + null_state)
+
+    let non_object = match get(JsonString("x"), "name") {
+        None => "None",
+        Some(_) => "Some",
+    }
+    perform IO.print("nonobject=" + non_object)
+
+    let projected = match as_string(JsonString("ok")) {
+        Some(value) => value,
+        None => "None",
+    }
+    perform IO.print("as_string=" + projected)
+}
