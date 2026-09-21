@@ -265,10 +265,7 @@ impl MigrationManifest {
             let contract = by_from
                 .get(&from)
                 .copied()
-                .ok_or(MigrationManifestError::MissingTransition {
-                    from,
-                    to: from + 1,
-                })?;
+                .ok_or(MigrationManifestError::MissingTransition { from, to: from + 1 })?;
             plan.push(contract);
         }
         Ok(plan)
