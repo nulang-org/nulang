@@ -51,8 +51,14 @@ pub fn resolve_imports(
         let resolved_canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
 
         // If the file has already been fully resolved in this compilation,
-        // reuse its cached declarations.
+        // reuse its cached public declarations. Apply any selective import
+        // at the call site so a prior selective import cannot poison the cache.
         if let Some(cached) = IMPORT_CACHE.with(|c| c.borrow().get(&resolved_canonical).cloned()) {
+            let cached = if items.is_empty() {
+                cached
+            } else {
+                filter_requested_cached_decls(cached, items, import_path)?
+            };
             merge_imported_decls(module, cached, import_path, true)?;
             continue;
         }
@@ -85,16 +91,17 @@ pub fn resolve_imports(
 
         resolve_imports(&mut imported, &resolved_canonical, stack)?;
 
+        // Cache the complete public surface, never the call site's selective
+        // subset. This keeps repeated imports order-independent.
+        let resolved_decls = imported.decls;
+        let public_decls = filter_public_decls(resolved_decls.clone());
         let imported_decls = if items.is_empty() {
-            imported.decls
+            public_decls.clone()
         } else {
-            filter_decls(imported.decls, items)
+            filter_requested_public_decls(resolved_decls, items, import_path)?
         };
 
-        IMPORT_CACHE.with(|c| {
-            c.borrow_mut()
-                .insert(resolved_canonical, imported_decls.clone())
-        });
+        IMPORT_CACHE.with(|c| c.borrow_mut().insert(resolved_canonical, public_decls));
         merge_imported_decls(module, imported_decls, import_path, false)?;
     }
     module.decls.retain(|d| !matches!(d, Decl::Import { .. }));
@@ -287,6 +294,87 @@ fn filter_decls(decls: Vec<Decl>, items: &[String]) -> Vec<Decl> {
         .collect()
 }
 
+fn decl_is_public(decl: &Decl) -> bool {
+    match decl {
+        Decl::Function { public, .. }
+        | Decl::TypeAlias { public, .. }
+        | Decl::RecordType { public, .. }
+        | Decl::VariantType { public, .. } => *public,
+        _ => true,
+    }
+}
+
+fn filter_public_decls(decls: Vec<Decl>) -> Vec<Decl> {
+    decls.into_iter().filter(decl_is_public).collect()
+}
+
+fn filter_requested_public_decls(
+    decls: Vec<Decl>,
+    items: &[String],
+    import_path: &str,
+) -> NuResult<Vec<Decl>> {
+    let requested: HashSet<&str> = items.iter().map(String::as_str).collect();
+    let mut found = HashSet::new();
+    let mut private = HashSet::new();
+    let mut out = Vec::new();
+
+    for decl in decls {
+        let Some(name) = decl_name(&decl) else {
+            continue;
+        };
+        if !requested.contains(name) {
+            continue;
+        }
+        if decl_is_public(&decl) {
+            found.insert(name.to_string());
+            out.push(decl);
+        } else {
+            private.insert(name.to_string());
+        }
+    }
+
+    for item in items {
+        if private.contains(item) {
+            return Err(NuError::RuntimeError {
+                msg: format!(
+                    "cannot import private declaration '{}' from '{}'; mark it pub to export it",
+                    item, import_path
+                ),
+                span: Span::default(),
+            });
+        }
+        if !found.contains(item) {
+            return Err(NuError::RuntimeError {
+                msg: format!(
+                    "import '{}' does not export a declaration named '{}'",
+                    import_path, item
+                ),
+                span: Span::default(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn filter_requested_cached_decls(
+    decls: Vec<Decl>,
+    items: &[String],
+    import_path: &str,
+) -> NuResult<Vec<Decl>> {
+    let filtered = filter_decls(decls, items);
+    let found: HashSet<&str> = filtered.iter().filter_map(decl_name).collect();
+    if let Some(missing) = items.iter().find(|item| !found.contains(item.as_str())) {
+        return Err(NuError::RuntimeError {
+            msg: format!(
+                "import '{}' does not export a public declaration named '{}'",
+                import_path, missing
+            ),
+            span: Span::default(),
+        });
+    }
+    Ok(filtered)
+}
+
 /// Resolve an `@nulang/<module>` import path using the `NULANG_MODULE_PATH`
 /// environment variable. Entries are semicolon-separated `name=src_dir` pairs.
 /// The package source directory is expected to contain the module's `.nula`
@@ -374,6 +462,28 @@ mod tests {
         let r = filter_decls(vec![fn_decl("a"), fn_decl("b")], &["a".into()]);
         assert_eq!(r.len(), 1);
         assert_eq!(decl_name(&r[0]), Some("a"));
+    }
+
+    #[test]
+    fn test_filter_public_decls_hides_private_functions() {
+        let mut public = fn_decl("public_fn");
+        if let Decl::Function {
+            public: is_public, ..
+        } = &mut public
+        {
+            *is_public = true;
+        }
+        let filtered = filter_public_decls(vec![fn_decl("private_fn"), public]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(decl_name(&filtered[0]), Some("public_fn"));
+    }
+
+    #[test]
+    fn test_requested_private_decl_is_rejected() {
+        let err =
+            filter_requested_public_decls(vec![fn_decl("hidden")], &["hidden".into()], "helpers")
+                .unwrap_err();
+        assert!(format!("{}", err).contains("private declaration 'hidden'"));
     }
 
     #[test]
