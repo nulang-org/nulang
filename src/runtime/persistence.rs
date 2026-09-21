@@ -130,6 +130,11 @@ impl PersistedValue {
 pub struct ActorSnapshot {
     pub actor_id: u64,
     pub sequence: u64,
+    /// Canonical compiler-derived semantic identity of the executable that
+    /// produced this durable state. Legacy snapshots omit it and remain
+    /// explicitly unverified; a present identity must match recovery code.
+    #[serde(default)]
+    pub semantic_id: Option<String>,
     pub state: HashMap<String, PersistedValue>,
     /// For workflow actors, the name of the signal the current step is
     /// suspended waiting for, if any.  This is part of the snapshot so that
