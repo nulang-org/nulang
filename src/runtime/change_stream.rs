@@ -80,71 +80,136 @@ impl DurableChange {
     }
 }
 
-/// Read an actor's durable history as one deterministic stream.
+/// Read a bounded batch of an actor's durable history.
 ///
-/// The current implementation is an adapter over the three existing append-
-/// only logs. That keeps the API independent of Memory/JSON/libSQL storage and
-/// lets higher layers adopt the unified model before a future storage-native
-/// global commit log lands.
+/// Each persistence backend receives an inclusive per-lane starting sequence
+/// and may satisfy the range scan without materializing the actor's complete
+/// history. The composite cursor is filtered after the lane scans so records
+/// from later lanes at the same actor sequence are preserved.
 ///
-/// `after` is exclusive. Pass the last observed cursor to resume without
-/// duplicates or gaps.
-pub fn read_durable_changes(
+/// after is exclusive. limit bounds the returned batch; zero performs no
+/// storage reads.
+pub fn scan_durable_changes(
     store: &dyn PersistenceStore,
     actor_id: u64,
     after: Option<DurableChangeCursor>,
-) -> Vec<DurableChange> {
-    let mut changes = Vec::new();
+    limit: usize,
+) -> std::io::Result<Vec<DurableChange>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
 
-    for (ordinal, entry) in store.read_journal(actor_id).into_iter().enumerate() {
+    let lane_window = |lane: DurableChangeLane| -> (u64, usize) {
+        match after {
+            None => (0, limit),
+            Some(cursor) if lane < cursor.lane => {
+                (cursor.sequence.saturating_add(1), limit)
+            }
+            Some(cursor) if lane == cursor.lane => (
+                cursor.sequence,
+                limit.saturating_add(cursor.ordinal.saturating_add(1) as usize),
+            ),
+            Some(cursor) => (cursor.sequence, limit),
+        }
+    };
+
+    let (journal_start, journal_limit) = lane_window(DurableChangeLane::Journal);
+    let (event_start, event_limit) = lane_window(DurableChangeLane::Event);
+    let (workflow_start, workflow_limit) = lane_window(DurableChangeLane::Workflow);
+
+    let journals = store.scan_journal_from(actor_id, journal_start, journal_limit);
+    let events = store.scan_events_from(actor_id, event_start, event_limit);
+    let workflows =
+        store.scan_workflow_events_from(actor_id, workflow_start, workflow_limit);
+
+    let mut changes = Vec::with_capacity(
+        journals
+            .len()
+            .saturating_add(events.len())
+            .saturating_add(workflows.len()),
+    );
+
+    let mut previous_sequence = None;
+    let mut ordinal = 0u64;
+    for entry in journals {
+        if previous_sequence == Some(entry.sequence) {
+            ordinal += 1;
+        } else {
+            previous_sequence = Some(entry.sequence);
+            ordinal = 0;
+        }
         changes.push(DurableChange {
             actor_id,
             cursor: DurableChangeCursor {
                 sequence: entry.sequence,
                 lane: DurableChangeLane::Journal,
-                ordinal: ordinal as u64,
+                ordinal,
             },
             record: DurableChangeRecord::Journal(entry),
         });
     }
 
-    for (ordinal, entry) in store.read_events(actor_id).into_iter().enumerate() {
+    previous_sequence = None;
+    ordinal = 0;
+    for entry in events {
+        if previous_sequence == Some(entry.sequence) {
+            ordinal += 1;
+        } else {
+            previous_sequence = Some(entry.sequence);
+            ordinal = 0;
+        }
         changes.push(DurableChange {
             actor_id,
             cursor: DurableChangeCursor {
                 sequence: entry.sequence,
                 lane: DurableChangeLane::Event,
-                ordinal: ordinal as u64,
+                ordinal,
             },
             record: DurableChangeRecord::Event(entry),
         });
     }
 
-    for (ordinal, entry) in store
-        .read_workflow_events(actor_id)
-        .into_iter()
-        .enumerate()
-    {
+    previous_sequence = None;
+    ordinal = 0;
+    for entry in workflows {
+        let sequence = entry.sequence();
+        if previous_sequence == Some(sequence) {
+            ordinal += 1;
+        } else {
+            previous_sequence = Some(sequence);
+            ordinal = 0;
+        }
         changes.push(DurableChange {
             actor_id,
             cursor: DurableChangeCursor {
-                sequence: entry.sequence(),
+                sequence,
                 lane: DurableChangeLane::Workflow,
-                ordinal: ordinal as u64,
+                ordinal,
             },
             record: DurableChangeRecord::Workflow(entry),
         });
     }
 
     changes.sort_by_key(|change| change.cursor);
-
     if let Some(cursor) = after {
         changes.retain(|change| change.cursor > cursor);
     }
-
-    changes
+    changes.truncate(limit);
+    Ok(changes)
 }
 
+/// Read all currently available durable history.
+///
+/// This compatibility helper is intentionally unbounded. New streaming,
+/// projection, CDC, and analytical consumers should prefer scan_durable_changes
+/// and persist the returned cursor.
+pub fn read_durable_changes(
+    store: &dyn PersistenceStore,
+    actor_id: u64,
+    after: Option<DurableChangeCursor>,
+) -> Vec<DurableChange> {
+    scan_durable_changes(store, actor_id, after, usize::MAX).unwrap_or_default()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +307,75 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn bounded_scan_resumes_inside_same_sequence_event_batch() {
+        let mut store = MemoryStore::new();
+
+        for (field_name, value) in [("a", 1), ("b", 2), ("c", 3)] {
+            store
+                .append_event(
+                    21,
+                    EventEntry {
+                        sequence: 8,
+                        field_name: field_name.into(),
+                        event_name: "Updated".into(),
+                        args: vec![],
+                        value: PersistedValue::Int(value),
+                    },
+                )
+                .unwrap();
+        }
+
+        let first = scan_durable_changes(&store, 21, None, 2).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].cursor.ordinal, 0);
+        assert_eq!(first[1].cursor.ordinal, 1);
+
+        let second =
+            scan_durable_changes(&store, 21, Some(first[1].cursor), 2).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].cursor.sequence, 8);
+        assert_eq!(second[0].cursor.ordinal, 2);
+        match &second[0].record {
+            DurableChangeRecord::Event(event) => assert_eq!(event.field_name, "c"),
+            other => panic!("expected event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bounded_scan_preserves_later_lane_at_same_sequence() {
+        let mut store = MemoryStore::new();
+        store
+            .append_journal(
+                22,
+                JournalEntry {
+                    sequence: 5,
+                    behavior_id: 7,
+                    payload: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                22,
+                EventEntry {
+                    sequence: 5,
+                    field_name: "count".into(),
+                    event_name: "Incremented".into(),
+                    args: vec![],
+                    value: PersistedValue::Int(1),
+                },
+            )
+            .unwrap();
+
+        let first = scan_durable_changes(&store, 22, None, 1).unwrap();
+        assert!(matches!(first[0].record, DurableChangeRecord::Journal(_)));
+
+        let second =
+            scan_durable_changes(&store, 22, Some(first[0].cursor), 1).unwrap();
+        assert!(matches!(second[0].record, DurableChangeRecord::Event(_)));
+        assert_eq!(second[0].cursor.sequence, 5);
+    }
     #[test]
     fn durable_change_json_uses_stable_wire_names() {
         let change = DurableChange {
