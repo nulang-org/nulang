@@ -1,0 +1,351 @@
+---
+const stages = [
+  {
+    label: 'Language core',
+    status: 'Stable',
+    title: 'Types + effects',
+    detail: 'HM inference, rows, variants, capabilities, algebraic effects',
+    tone: 'stable',
+  },
+  {
+    label: 'Actor surface',
+    status: 'Stable',
+    title: 'Actors + supervision',
+    detail: 'spawn · send · ask · link · monitor · supervisors',
+    tone: 'stable',
+  },
+  {
+    label: 'Runtime state',
+    status: 'Alpha',
+    title: 'Durable actors',
+    detail: 'snapshots · journals · restart hydration · pluggable stores',
+    tone: 'alpha',
+  },
+];
+---
+
+<section class="architecture" aria-labelledby="architecture-title">
+  <div class="architecture-copy">
+    <span class="architecture-kicker">Runtime model</span>
+    <h2 id="architecture-title">One model from source code to recovery.</h2>
+    <p>
+      Nulang keeps the resilient-systems primitives close together: typed effects
+      describe what code may do, actors isolate state and failure, supervisors
+      coordinate recovery, and persistent actors can hydrate durable state after restart.
+    </p>
+    <a href="/actors/overview/" class="architecture-link">
+      Explore the actor runtime
+      <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
+      </svg>
+    </a>
+  </div>
+
+  <div class="architecture-map" aria-label="Nulang runtime architecture">
+    <div class="core-flow">
+      {stages.map((stage, index) => (
+        <div class:list={['architecture-node', stage.tone]}>
+          <div class="node-meta">
+            <span>{stage.label}</span>
+            <span class="node-status">{stage.status}</span>
+          </div>
+          <strong>{stage.title}</strong>
+          <p>{stage.detail}</p>
+          {index < stages.length - 1 && (
+            <span class="flow-connector" aria-hidden="true">
+              <span class="flow-dot"></span>
+            </span>
+          )}
+        </div>
+      ))}
+    </div>
+
+    <div class="recovery-loop" aria-label="Failure recovery loop">
+      <div class="recovery-event">
+        <span class="event-dot" aria-hidden="true"></span>
+        failure
+      </div>
+      <div class="recovery-line" aria-hidden="true"></div>
+      <div class="recovery-action">
+        supervisor restart
+        <span aria-hidden="true">→</span>
+        hydrate durable state
+      </div>
+    </div>
+
+    <div class="experimental-lane">
+      <div class="lane-label">
+        <span>Optional boundaries</span>
+        <span class="experimental-badge">Experimental</span>
+      </div>
+      <div class="experimental-items">
+        <div>
+          <strong>Multi-node distribution</strong>
+          <span>TCP send/ask · gossip membership</span>
+        </div>
+        <div>
+          <strong>AI runtime</strong>
+          <span>providers · pipelines · supervisor teams</span>
+        </div>
+        <div>
+          <strong>Alternate backends</strong>
+          <span>WASM · native AOT</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .architecture {
+    display: grid;
+    grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+    gap: clamp(2rem, 5vw, 5rem);
+    align-items: center;
+  }
+
+  .architecture-copy {
+    max-width: 34rem;
+  }
+
+  .architecture-kicker {
+    color: var(--nu-blue);
+    font-size: 0.75rem;
+    font-weight: 750;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .architecture-copy h2 {
+    margin: 0.7rem 0 1rem;
+    color: var(--nu-text);
+    font-size: clamp(2rem, 4vw, 3.25rem);
+    line-height: 1.06;
+    letter-spacing: -0.04em;
+  }
+
+  .architecture-copy p {
+    margin: 0;
+    color: var(--nu-text-secondary);
+    font-size: 1rem;
+    line-height: 1.75;
+  }
+
+  .architecture-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 1.5rem;
+    color: var(--nu-blue);
+    font-weight: 700;
+    text-decoration: none;
+  }
+
+  .architecture-link svg {
+    width: 1rem;
+    height: 1rem;
+    transition: transform 0.18s ease;
+  }
+
+  .architecture-link:hover svg {
+    transform: translateX(3px);
+  }
+
+  .architecture-map {
+    position: relative;
+    overflow: hidden;
+    padding: 1rem;
+    border: 1px solid var(--nu-border);
+    border-radius: 1.25rem;
+    background:
+      radial-gradient(circle at 15% 0%, color-mix(in srgb, var(--nu-blue) 11%, transparent), transparent 40%),
+      var(--nu-surface);
+  }
+
+  .core-flow {
+    display: grid;
+    gap: 0.75rem;
+  }
+
+  .architecture-node {
+    position: relative;
+    padding: 1rem 1.1rem;
+    border: 1px solid var(--nu-border);
+    border-radius: 0.9rem;
+    background: color-mix(in srgb, var(--nu-surface) 92%, var(--nu-bg));
+  }
+
+  .architecture-node.stable {
+    border-left: 3px solid var(--nu-blue);
+  }
+
+  .architecture-node.alpha {
+    border-left: 3px solid var(--nu-accent-high);
+  }
+
+  .node-meta,
+  .lane-label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+
+  .node-meta > span:first-child,
+  .lane-label > span:first-child {
+    color: var(--nu-text-tertiary);
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+  }
+
+  .node-status,
+  .experimental-badge {
+    padding: 0.2rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.66rem;
+    font-weight: 700;
+  }
+
+  .node-status {
+    background: color-mix(in srgb, var(--nu-blue) 9%, transparent);
+    color: var(--nu-blue);
+  }
+
+  .alpha .node-status {
+    background: color-mix(in srgb, var(--nu-accent-high) 10%, transparent);
+    color: var(--nu-accent-high);
+  }
+
+  .architecture-node strong {
+    display: block;
+    margin-top: 0.45rem;
+    color: var(--nu-text);
+    font-size: 1rem;
+  }
+
+  .architecture-node p {
+    margin: 0.25rem 0 0;
+    color: var(--nu-text-secondary);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.72rem;
+    line-height: 1.5;
+  }
+
+  .flow-connector {
+    position: absolute;
+    left: 2rem;
+    bottom: -0.78rem;
+    z-index: 2;
+    width: 1px;
+    height: 0.8rem;
+    background: var(--nu-blue);
+  }
+
+  .flow-dot {
+    position: absolute;
+    left: -2px;
+    bottom: -1px;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--nu-blue);
+  }
+
+  .recovery-loop {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 0.65rem;
+    margin: 1rem 0;
+    padding: 0 0.25rem;
+    color: var(--nu-text-secondary);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.7rem;
+  }
+
+  .recovery-event,
+  .recovery-action {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .event-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: var(--nu-accent-high);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--nu-accent-high) 10%, transparent);
+  }
+
+  .recovery-line {
+    height: 1px;
+    background: linear-gradient(90deg, var(--nu-accent-high), var(--nu-blue));
+  }
+
+  .experimental-lane {
+    padding: 1rem 1.1rem;
+    border: 1px dashed color-mix(in srgb, var(--nu-text-tertiary) 55%, var(--nu-border));
+    border-radius: 0.9rem;
+    background: color-mix(in srgb, var(--nu-bg) 72%, transparent);
+  }
+
+  .experimental-badge {
+    background: color-mix(in srgb, var(--nu-accent-high) 10%, transparent);
+    color: var(--nu-accent-high);
+  }
+
+  .experimental-items {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.75rem;
+    margin-top: 0.8rem;
+  }
+
+  .experimental-items div {
+    min-width: 0;
+  }
+
+  .experimental-items strong,
+  .experimental-items span {
+    display: block;
+  }
+
+  .experimental-items strong {
+    color: var(--nu-text);
+    font-size: 0.78rem;
+  }
+
+  .experimental-items span {
+    margin-top: 0.2rem;
+    color: var(--nu-text-tertiary);
+    font-size: 0.68rem;
+    line-height: 1.45;
+  }
+
+  @media (max-width: 58rem) {
+    .architecture {
+      grid-template-columns: 1fr;
+    }
+
+    .architecture-copy {
+      max-width: 44rem;
+    }
+  }
+
+  @media (max-width: 38rem) {
+    .experimental-items {
+      grid-template-columns: 1fr;
+    }
+
+    .recovery-loop {
+      grid-template-columns: 1fr;
+    }
+
+    .recovery-line {
+      display: none;
+    }
+  }
+</style>
