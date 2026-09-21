@@ -26,7 +26,6 @@ use crate::runtime::heap::{ActorHeap, TypeTag as HeapTypeTag};
 use nulang_ai::{LlmMessage, LlmRequest};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
 
 /// Spawn using authority metadata attached to the exact executing bytecode PC.
 /// Any malformed metadata or parent escalation fails closed before a child is
