@@ -28,10 +28,13 @@ Nulang is an actor-based programming language with algebraic effects and
 capability-based types. It fuses Erlang-style fault-tolerant actors with a
 Hindley-Milner type system, reference capabilities (`iso`/`trn`/`ref`/`val`/`box`/`tag`/`lineariso`),
 and row-polymorphic algebraic effects. The compiler pipeline (AST → HIR → MIR)
-targets a register-based bytecode VM with a Cranelift JIT, an ahead-of-time
-native backend, and an optional WASM backend. The runtime is a multi-threaded
-work-stealing executor with supervision trees, ORCA garbage collection,
-location-transparent distribution, and durable persistence.
+uses the register-based bytecode VM as the semantic reference implementation.
+Hot regions can tier into a Cranelift JIT; WASM is the canonical portable/cloud
+execution target; and native AOT remains a secondary backend until full semantic
+parity is demonstrated. An experimental WasmFX backend explores stack-switching
+for suspending effects. The runtime is a multi-threaded work-stealing executor
+with supervision trees, ORCA garbage collection, location-transparent
+distribution, and durable persistence.
 
 ---
 
@@ -102,6 +105,7 @@ perform IO.print("Hello, " + name + "!")
 - **Capability-based types** — `iso`, `trn`, `ref`, `val`, `box`, `tag`, and `lineariso` guarantee memory safety and data-race freedom. Checked at compile time; erased at runtime.
 - **Hindley-Milner type inference** — full Algorithm W with row-polymorphic records, variant types, and algebraic effect rows.
 - **Actors** — `spawn`, `send`/`!`, `ask`, selective `receive` with `after` timeout, links, monitors, supervision trees, process groups, and actor priority scheduling.
+- **Typed actor protocols** — structural `ActorRef[P]` contracts can restrict public actor APIs to required behaviors. Compiler-derived protocol fingerprints, a trusted schema registry, directional compatibility checks, and pre-mailbox admission are implemented as *Experimental* protocol hardening.
 - **Entities & workflows** — `entity` declarations (durable-first, event-sourced by default). `workflow` declarations with steps, timers, signals, and saga compensation that survive restarts.
 - **`let` and `var`** — immutable and mutable bindings. Records with `{ field: value }` syntax and `{ base .. field = new_val }` update syntax. Pattern matching with guards, alias patterns, and recursive sub-patterns. `**` exponentiation. Multi-line `"""..."""` strings with `\u{...}` unicode escapes. Pipe operator `|>`.
 - **Error handling** — `catch expr fallback` (prefix or postfix), `fail Error(...)` for structured short-circuit return, `T ! E` return types, `?` unwrap.
@@ -112,8 +116,10 @@ perform IO.print("Hello, " + name + "!")
 - **REPL** — `nulang --repl` with `:help <topic>`, `:type <expr>`, `:load <file>`, tab completion, and automatic multi-line input.
 - **AI runtime** — `agent` declarations, LLM providers (OpenAI, Ollama), episodic/semantic/procedural memory, pipelines, debates, and supervisor teams. Gated behind the `ai-runtime` feature flag. *Experimental.*
 - **Distribution** — location-transparent `send`/`ask` over TCP (NUL0 wire protocol) and gossip membership. *Experimental.* The 8 CRDT types (`GCounter`, `ORSet`, …) are implemented and tested at the Rust embedder level only — `.nula`-level `state crdt` fields are not yet wired to them and behave as `durable` (see SPEC2 §9.10).
-- **WASM backend** — MIR→WASM compilation via `--backend wasm|wasm-run|wasm-aot`, Wasmtime host runtime with guard pages and SIMD. Gated behind the `wasm-backend` feature flag. *Experimental.*
-- **AOT native backend** — `--backend native` compiles pure-functional programs (no effects, actors, or FFI) to native code via Cranelift; other constructs fail with a specific "not yet supported in the native backend" error naming the construct. Use the default `bytecode` backend for full-language programs. *Experimental.*
+- **Fabric** — an *Experimental* messaging/stream substrate layered on the actor transport, with topic routing, consumer groups, durable replicated streams, quorum commit, epoch fencing, bounded repair/retry, and confirmed-removal failover. See [`docs/FABRIC.md`](docs/FABRIC.md).
+- **RESP-compatible cache kernel** — an *Experimental* Redis-compatible cache path with packed shard-local storage, Redis Cluster slot routing/`MOVED`, ordered pipelining, and an optional dedicated Mio reactor via the `cache-server` feature. See [`docs/RESP_CACHE_ARCHITECTURE.md`](docs/RESP_CACHE_ARCHITECTURE.md).
+- **WASM backend** — MIR→WASM compilation via `--backend wasm|wasm-run|wasm-aot`, with Wasmtime hosting and SIMD support. This is the canonical portable/cloud execution target, but the current plain-WASM profile still supports fewer language/runtime semantics than bytecode. The separate `wasmfx-backend` feature is an *Experimental* stack-switching path for suspending effects.
+- **Secondary native AOT backend** — `--backend native` compiles a restricted subset through Cranelift. It remains useful for differential testing and supported pure/native workloads, but it is not the semantic reference and must not be assumed to have full parity with bytecode. *Experimental.*
 
 ---
 
@@ -129,6 +135,9 @@ perform IO.print("Hello, " + name + "!")
 | [`CHANGELOG.md`](CHANGELOG.md) | Changelog organized by stability tier (Frozen / Stable / Experimental) |
 | [`GOVERNANCE.md`](GOVERNANCE.md) | Stability tiers, RFC process, and language versioning |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Implementation architecture and module map |
+| [`docs/SEMANTIC_STABILIZATION_CONTRACT.md`](docs/SEMANTIC_STABILIZATION_CONTRACT.md) | Current semantic-source-of-truth, backend, durability, and production-validation contract |
+| [`docs/FABRIC.md`](docs/FABRIC.md) | Experimental distributed messaging and durable stream substrate |
+| [`docs/RESP_CACHE_ARCHITECTURE.md`](docs/RESP_CACHE_ARCHITECTURE.md) | Experimental RESP-compatible cache architecture and cluster-routing invariants |
 | [`editors/vscode/`](editors/vscode/) | VS Code extension (syntax highlighting, language essentials, snippets) — build a `.vsix` or install manually |
 | [`RFC/`](RFC/) | RFC proposals (format stability, frozen core, deprecation cycles, roadmap) |
 
@@ -177,7 +186,7 @@ Nulang is **alpha software**. The language version is `1.0.0-frozen`
 |------|-------|
 | **Frozen** | Never breaks — `.nbc` bytecode format, NUL0 wire protocol, value layout, Nulang Core, and the `IO`/`Spawn`/`Send`/`Receive` built-in effects. |
 | **Stable** | HM type system, effect rows, capability lattice, actor surface. Breaking changes require an RFC and a deprecation cycle. |
-| **Experimental** | Everything else — feature flags (`wasm-backend`, `python`, `sqlite`, `lsp`, `ai-runtime`), distribution (multi-node `send`/`ask`, CRDTs — Rust-level only so far), and items marked Experimental in [`CHANGELOG.md`](CHANGELOG.md). |
+| **Experimental** | Everything else — including `wasm-backend`/`wasmfx-backend`, `cache-server`, the AI runtime, Fabric, typed actor-protocol hardening, multi-node distribution, CRDTs (Rust-level only so far), optional persistence backends, and other items marked Experimental in [`CHANGELOG.md`](CHANGELOG.md). |
 
 > **Pre-1.0 disclaimer:** Nulang does not have external users yet. The tier
 > guarantees above are the maintainer's stated policy and intent, but **expect

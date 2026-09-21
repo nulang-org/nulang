@@ -12,6 +12,8 @@ use super::cache_dispatch::{
     CacheReplyError,
 };
 
+const DEFAULT_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachePipelineError {
     Dispatch(CacheDispatchError),
@@ -58,6 +60,8 @@ enum PendingResponse {
 /// request.
 pub struct CacheResponsePipeline {
     max_pending: usize,
+    max_pending_bytes: usize,
+    pending_bytes: usize,
     next_request_id: u64,
     pending: VecDeque<PendingResponse>,
     remote_ready: HashMap<u64, Vec<u8>>,
@@ -66,9 +70,19 @@ pub struct CacheResponsePipeline {
 
 impl CacheResponsePipeline {
     pub fn new(max_pending: usize) -> Self {
+        Self::with_limits(max_pending, DEFAULT_MAX_PENDING_BYTES)
+    }
+
+    pub fn with_limits(max_pending: usize, max_pending_bytes: usize) -> Self {
         assert!(max_pending > 0, "cache pipeline capacity must be non-zero");
+        assert!(
+            max_pending_bytes > 0,
+            "cache pipeline byte capacity must be non-zero"
+        );
         Self {
             max_pending,
+            max_pending_bytes,
+            pending_bytes: 0,
             next_request_id: 1,
             pending: VecDeque::new(),
             remote_ready: HashMap::new(),
@@ -78,6 +92,10 @@ impl CacheResponsePipeline {
 
     pub fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+
+    pub fn pending_bytes(&self) -> usize {
+        self.pending_bytes
     }
 
     pub fn is_empty(&self) -> bool {
@@ -96,7 +114,10 @@ impl CacheResponsePipeline {
         now_ms: u64,
         socket_out: &mut Vec<u8>,
     ) -> Result<Option<CachePipelineSubmit>, CachePipelineError> {
-        if self.pending.len() >= self.max_pending {
+        self.collect_ready_local()?;
+        self.drain_ready(socket_out)?;
+
+        if self.pending.len() >= self.max_pending || self.pending_bytes >= self.max_pending_bytes {
             return Err(CachePipelineError::PipelineFull);
         }
 
@@ -113,6 +134,8 @@ impl CacheResponsePipeline {
                 if self.pending.is_empty() {
                     socket_out.extend_from_slice(&self.direct_scratch);
                 } else {
+                    self.pending_bytes =
+                        self.pending_bytes.saturating_add(self.direct_scratch.len());
                     self.pending
                         .push_back(PendingResponse::Ready(self.direct_scratch.clone()));
                 }
@@ -150,6 +173,25 @@ impl CacheResponsePipeline {
         Ok(Some(submit))
     }
 
+    /// Collect completed cross-shard replies even when they are not yet at
+    /// the front of the ordered pipeline. Their owned response bytes must
+    /// participate in the same per-connection high-water accounting as direct
+    /// and remote responses.
+    fn collect_ready_local(&mut self) -> Result<(), CachePipelineError> {
+        for pending in &mut self.pending {
+            let ready = match pending {
+                PendingResponse::Local(reply) => reply.try_recv()?,
+                _ => None,
+            };
+
+            if let Some(bytes) = ready {
+                self.pending_bytes = self.pending_bytes.saturating_add(bytes.len());
+                *pending = PendingResponse::Ready(bytes);
+            }
+        }
+        Ok(())
+    }
+
     /// Record a remote response. It is held until every earlier request has
     /// completed, preserving RESP pipeline order.
     pub fn complete_remote(
@@ -157,6 +199,8 @@ impl CacheResponsePipeline {
         request_id: u64,
         response: Vec<u8>,
     ) -> Result<(), CachePipelineError> {
+        self.collect_ready_local()?;
+
         let known = self
             .pending
             .iter()
@@ -164,6 +208,27 @@ impl CacheResponsePipeline {
         if !known {
             return Err(CachePipelineError::UnknownRemoteRequest(request_id));
         }
+        let is_front = matches!(
+            self.pending.front(),
+            Some(PendingResponse::Remote(id)) if *id == request_id
+        );
+
+        let previous_len = self
+            .remote_ready
+            .get(&request_id)
+            .map(|previous| previous.len())
+            .unwrap_or(0);
+        let retained_without_previous = self.pending_bytes.saturating_sub(previous_len);
+
+        // Treat the byte limit as a high-water mark. A single response that
+        // crosses the mark is retained so an already-executed request does not
+        // lose its reply, but no additional response is accepted until draining
+        // brings retained bytes back below the limit.
+        if previous_len == 0 && retained_without_previous >= self.max_pending_bytes && !is_front {
+            return Err(CachePipelineError::PipelineFull);
+        }
+
+        self.pending_bytes = retained_without_previous.saturating_add(response.len());
         self.remote_ready.insert(request_id, response);
         Ok(())
     }
@@ -181,7 +246,10 @@ impl CacheResponsePipeline {
                 },
                 Some(PendingResponse::Remote(request_id)) => {
                     match self.remote_ready.remove(request_id) {
-                        Some(bytes) => FrontAction::Completed(bytes),
+                        Some(bytes) => {
+                            self.pending_bytes = self.pending_bytes.saturating_sub(bytes.len());
+                            FrontAction::Completed(bytes)
+                        }
                         None => FrontAction::Pending,
                     }
                 }
@@ -193,6 +261,7 @@ impl CacheResponsePipeline {
                     let Some(PendingResponse::Ready(bytes)) = self.pending.pop_front() else {
                         unreachable!("front response changed while draining")
                     };
+                    self.pending_bytes = self.pending_bytes.saturating_sub(bytes.len());
                     bytes
                 }
                 FrontAction::Completed(bytes) => {
@@ -244,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_responses_flush_immediately() {
+    fn test_direct_responses_flush_immediately() {
         let placement = CacheSlotMap::new_local(1, 1).unwrap();
         let (channels, _inboxes) = CacheDispatchChannels::new(1, 8).unwrap();
         let dispatcher = CacheDispatcher::new(1, 0, placement, channels).unwrap();
@@ -265,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn later_direct_response_waits_for_earlier_cross_shard_reply() {
+    fn test_later_direct_response_waits_for_earlier_cross_shard_reply() {
         let placement = CacheSlotMap::new_local(1, 2).unwrap();
         let remote_local_key = key_for_shard(&placement, 1);
         let (channels, mut inboxes) = CacheDispatchChannels::new(2, 8).unwrap();
@@ -297,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_response_orders_before_later_direct_response() {
+    fn test_remote_response_orders_before_later_direct_response() {
         let mut placement = CacheSlotMap::new_local(1, 1).unwrap();
         let key = b"remote-pipeline-key";
         let slot = redis_slot(key);
@@ -344,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_limit_applies_backpressure_before_consuming_next_request() {
+    fn test_pending_limit_applies_backpressure_before_consuming_next_request() {
         let placement = CacheSlotMap::new_local(1, 2).unwrap();
         let key = key_for_shard(&placement, 1);
         let (channels, _inboxes) = CacheDispatchChannels::new(2, 8).unwrap();
@@ -368,7 +437,172 @@ mod tests {
     }
 
     #[test]
-    fn unknown_remote_completion_is_rejected() {
+    fn test_pending_byte_high_water_applies_backpressure() {
+        let mut placement = CacheSlotMap::new_local(1, 1).unwrap();
+        let key = b"remote-byte-budget";
+        let slot = redis_slot(key);
+        placement
+            .apply_epoch(
+                1,
+                &[CacheSlotRange {
+                    start: slot,
+                    end: slot,
+                    owner: CacheShardOwner {
+                        node_id: 9,
+                        shard: 0,
+                    },
+                }],
+            )
+            .unwrap();
+
+        let (channels, _inboxes) = CacheDispatchChannels::new(1, 8).unwrap();
+        let dispatcher = CacheDispatcher::new(1, 0, placement, channels).unwrap();
+        let mut pipeline = CacheResponsePipeline::with_limits(16, 8);
+        let mut store = CacheStore::new();
+        let mut socket_out = Vec::new();
+
+        let get = frame(&[b"GET", key]);
+        pipeline
+            .submit_frame(&dispatcher, &mut store, &get, 0, &mut socket_out)
+            .unwrap()
+            .unwrap();
+
+        let ping = frame(&[b"PING", b"0123456789abcdef"]);
+        pipeline
+            .submit_frame(&dispatcher, &mut store, &ping, 0, &mut socket_out)
+            .unwrap()
+            .unwrap();
+
+        assert!(pipeline.pending_bytes() >= 8);
+
+        let next = frame(&[b"PING"]);
+        assert_eq!(
+            pipeline.submit_frame(&dispatcher, &mut store, &next, 0, &mut socket_out),
+            Err(CachePipelineError::PipelineFull)
+        );
+    }
+
+    #[test]
+    fn test_completed_local_reply_counts_toward_byte_limit_and_front_remote_unblocks() {
+        let mut placement = CacheSlotMap::new_local(1, 2).unwrap();
+        let local_key = key_for_shard(&placement, 1);
+        let remote_key = b"remote-front-key";
+        let remote_slot = redis_slot(remote_key);
+        placement
+            .apply_epoch(
+                1,
+                &[CacheSlotRange {
+                    start: remote_slot,
+                    end: remote_slot,
+                    owner: CacheShardOwner {
+                        node_id: 9,
+                        shard: 0,
+                    },
+                }],
+            )
+            .unwrap();
+
+        let (channels, mut inboxes) = CacheDispatchChannels::new(2, 8).unwrap();
+        let dispatcher = CacheDispatcher::new(1, 0, placement, channels).unwrap();
+        let mut pipeline = CacheResponsePipeline::with_limits(16, 8);
+        let mut ingress_store = CacheStore::new();
+        let mut owner_store = CacheStore::new();
+        owner_store.set_bytes(&local_key, b"0123456789abcdef", None, 0);
+        let mut socket_out = Vec::new();
+
+        let remote_get = frame(&[b"GET", remote_key]);
+        let remote = pipeline
+            .submit_frame(
+                &dispatcher,
+                &mut ingress_store,
+                &remote_get,
+                0,
+                &mut socket_out,
+            )
+            .unwrap()
+            .unwrap()
+            .remote
+            .expect("remote handoff");
+
+        let local_get = frame(&[b"GET", &local_key]);
+        pipeline
+            .submit_frame(
+                &dispatcher,
+                &mut ingress_store,
+                &local_get,
+                0,
+                &mut socket_out,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(inboxes[1].try_process_one(&mut owner_store));
+
+        // The completed local reply sits behind the unresolved remote front.
+        // A new submission first collects/account its bytes, then applies
+        // backpressure without consuming the new request.
+        let ping = frame(&[b"PING"]);
+        assert_eq!(
+            pipeline.submit_frame(&dispatcher, &mut ingress_store, &ping, 0, &mut socket_out,),
+            Err(CachePipelineError::PipelineFull)
+        );
+        assert!(pipeline.pending_bytes() >= 8);
+
+        // Even above the high-water mark, the front response must be accepted:
+        // rejecting it would deadlock the ordered pipeline because the later
+        // local response cannot drain first.
+        pipeline
+            .complete_remote(remote.request_id, b"$-1\r\n".to_vec())
+            .unwrap();
+        assert_eq!(pipeline.drain_ready(&mut socket_out).unwrap(), 2);
+        assert_eq!(pipeline.pending_bytes(), 0);
+        assert!(pipeline.is_empty());
+    }
+
+    #[test]
+    fn test_remote_ready_bytes_are_released_when_drained() {
+        let mut placement = CacheSlotMap::new_local(1, 1).unwrap();
+        let key = b"remote-drain-key";
+        let slot = redis_slot(key);
+        placement
+            .apply_epoch(
+                1,
+                &[CacheSlotRange {
+                    start: slot,
+                    end: slot,
+                    owner: CacheShardOwner {
+                        node_id: 9,
+                        shard: 0,
+                    },
+                }],
+            )
+            .unwrap();
+
+        let (channels, _inboxes) = CacheDispatchChannels::new(1, 8).unwrap();
+        let dispatcher = CacheDispatcher::new(1, 0, placement, channels).unwrap();
+        let mut pipeline = CacheResponsePipeline::with_limits(16, 64);
+        let mut store = CacheStore::new();
+        let mut socket_out = Vec::new();
+
+        let get = frame(&[b"GET", key]);
+        let remote = pipeline
+            .submit_frame(&dispatcher, &mut store, &get, 0, &mut socket_out)
+            .unwrap()
+            .unwrap()
+            .remote
+            .expect("remote handoff");
+
+        pipeline
+            .complete_remote(remote.request_id, b"$5\r\nvalue\r\n".to_vec())
+            .unwrap();
+        assert!(pipeline.pending_bytes() > 0);
+
+        assert_eq!(pipeline.drain_ready(&mut socket_out).unwrap(), 1);
+        assert_eq!(pipeline.pending_bytes(), 0);
+        assert!(pipeline.is_empty());
+    }
+
+    #[test]
+    fn test_unknown_remote_completion_is_rejected() {
         let mut pipeline = CacheResponsePipeline::new(4);
         assert_eq!(
             pipeline.complete_remote(99, b"+OK\r\n".to_vec()),

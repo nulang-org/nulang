@@ -504,10 +504,42 @@ impl AddressResolver {
         content_hash: Option<[u8; 32]>,
         trace_id: Option<String>,
     ) -> Packet {
+        self.build_packet_with_required_protocol(
+            target_actor,
+            behavior_name,
+            payload,
+            sender_actor,
+            priority,
+            string_table,
+            object_table,
+            content_hash,
+            trace_id,
+            None,
+        )
+    }
+
+    /// Build a remote actor message carrying the protocol contract required by
+    /// the sender/client. Existing callers keep using `build_packet`, which
+    /// emits the historical NUL0-v1 payload with no protocol tail.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_packet_with_required_protocol(
+        &self,
+        target_actor: u64,
+        behavior_name: &str,
+        payload: Vec<Value>,
+        sender_actor: u64,
+        priority: MessagePriority,
+        string_table: Vec<String>,
+        object_table: Vec<(u64, Vec<u8>)>,
+        content_hash: Option<[u8; 32]>,
+        trace_id: Option<String>,
+        required_protocol_id: Option<crate::protocol::ProtocolId>,
+    ) -> Packet {
         Packet::ActorMessage {
             target_actor,
             behavior_name: behavior_name.to_string(),
             content_hash,
+            required_protocol_id,
             payload,
             string_table,
             object_table,
@@ -517,9 +549,11 @@ impl AddressResolver {
             trace_id,
         }
     }
+
     /// Parse a received network packet into a message for local delivery.
     ///
-    /// Returns `Some((target_actor_id, behavior_name, message, string_table, content_hash))`
+    /// Returns the local target, behavior/message payload tables, optional
+    /// behavior content hash, and optional sender-required protocol identity.
     /// if the packet is an actor message that should be delivered locally.
     /// The message's `behavior_id` is left as `0` — the caller must resolve
     /// `behavior_name` against the target actor's behavior table before
@@ -542,12 +576,14 @@ impl AddressResolver {
         Vec<String>,
         Vec<(u64, Vec<u8>)>,
         Option<[u8; 32]>,
+        Option<crate::protocol::ProtocolId>,
     )> {
         match packet {
             Packet::ActorMessage {
                 target_actor,
                 behavior_name,
                 content_hash,
+                required_protocol_id,
                 payload,
                 string_table,
                 object_table,
@@ -574,6 +610,7 @@ impl AddressResolver {
                     string_table,
                     object_table,
                     content_hash,
+                    required_protocol_id,
                 ))
             }
             // Non-actor-message packets are not parsed here.
@@ -946,6 +983,21 @@ fn verify_behavior_hash(
     }
 }
 
+/* Resolve a behavior name only when the currently installed implementation
+ * satisfies the sender's content-hash contract.  Hot reload/fetch paths must
+ * use this helper instead of resolving the name and trusting the cache key:
+ * a cached module can be malformed or stale and may not actually contain the
+ * requested implementation hash. */
+fn resolve_verified_behavior(
+    runtime: &Runtime,
+    target_actor: u64,
+    behavior_name: &str,
+    sender_hash: &[u8; 32],
+) -> Option<u16> {
+    let behavior_id = runtime.behavior_id_for(target_actor, behavior_name)?;
+    verify_behavior_hash(runtime, target_actor, behavior_id, sender_hash).then_some(behavior_id)
+}
+
 /// Try to look up the content hash for a behavior name in the current
 /// actor's bytecode module. Returns `None` if no current actor context,
 /// no bytecode module, or the behavior has no content hash.
@@ -1272,24 +1324,24 @@ pub fn process_network_packets(
                                         &cached,
                                         &behavior_name,
                                     );
-                                    // Resolve behavior_id against the updated module
-                                    msg.behavior_id = runtime
-                                        .behavior_id_for(target_actor, &behavior_name)
-                                        .unwrap_or(0);
-                                    // Verify the hash now matches
-                                    if !verify_behavior_hash(
+                                    // Resolve and verify against the requested hash.
+                                    // A successful fetch that lacks the requested name OR
+                                    // installs a stale/malformed implementation is a failed
+                                    // delivery, never permission to run behavior 0.
+                                    let Some(behavior_id) = resolve_verified_behavior(
                                         runtime,
                                         target_actor,
-                                        msg.behavior_id,
+                                        &behavior_name,
                                         &content_hash,
-                                    ) {
+                                    ) else {
                                         notify_delivery_failed(
                                             runtime,
                                             msg.sender,
-                                            "behavior content hash still mismatched after fetch",
+                                            "behavior missing or content hash mismatched after fetch",
                                         );
                                         continue;
-                                    }
+                                    };
+                                    msg.behavior_id = behavior_id;
                                     // Intern string and object payloads, then deliver
                                     let mut payload_vec = (*msg.payload).clone();
                                     if !intern_wire_strings(
@@ -1539,6 +1591,7 @@ pub fn process_network_packets(
                                 target_actor: 0,
                                 behavior_name: FABRIC_STREAM_REPLICA_ACK_BEHAVIOR.to_string(),
                                 content_hash: None,
+                                required_protocol_id: None,
                                 payload: Vec::new(),
                                 string_table: Vec::new(),
                                 object_table: vec![(0, bytes)],
@@ -1631,6 +1684,7 @@ pub fn process_network_packets(
                                                 behavior_name:
                                                     FABRIC_STREAM_COMMIT_BEHAVIOR.to_string(),
                                                 content_hash: None,
+                                                required_protocol_id: None,
                                                 payload: Vec::new(),
                                                 string_table: Vec::new(),
                                                 object_table: vec![(0, update_bytes)],
@@ -1751,6 +1805,7 @@ pub fn process_network_packets(
                                         behavior_name:
                                             FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR.to_string(),
                                         content_hash: None,
+                                        required_protocol_id: None,
                                         payload: Vec::new(),
                                         string_table: Vec::new(),
                                         object_table: vec![(0, response_bytes)],
@@ -1824,6 +1879,7 @@ pub fn process_network_packets(
                                         behavior_name:
                                             FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR.to_string(),
                                         content_hash: None,
+                                        required_protocol_id: None,
                                         payload: Vec::new(),
                                         string_table: Vec::new(),
                                         object_table: vec![(0, response_bytes)],
@@ -1938,6 +1994,7 @@ pub fn process_network_packets(
                                         behavior_name:
                                             FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR.to_string(),
                                         content_hash: None,
+                                        required_protocol_id: None,
                                         payload: Vec::new(),
                                         string_table: Vec::new(),
                                         object_table: vec![(0, response_bytes)],
@@ -2018,6 +2075,7 @@ pub fn process_network_packets(
                                                     FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR
                                                         .to_string(),
                                                 content_hash: None,
+                                                required_protocol_id: None,
                                                 payload: Vec::new(),
                                                 string_table: Vec::new(),
                                                 object_table: vec![(
@@ -2092,6 +2150,7 @@ pub fn process_network_packets(
                     string_table,
                     object_table,
                     content_hash,
+                    _required_protocol_id,
                 )) = resolver.parse_packet(incoming.packet)
                 {
                     // Record the wire sender (bare id → node) so the
@@ -2108,13 +2167,23 @@ pub fn process_network_packets(
                         );
                     }
                     // Resolve the behavior name against the target actor's
-                    // behavior table — the same rule local sends use
-                    // (`Runtime::send_message`). An unknown name falls back
-                    // to behavior 0, mirroring `send_message`'s
-                    // `unwrap_or(0)`.
-                    msg.behavior_id = runtime
-                        .behavior_id_for(target_actor, &behavior_name)
-                        .unwrap_or(0);
+                    // behavior table. Unknown names must never alias behavior 0.
+                    // If the sender attached a content hash, keep fetch-on-demand
+                    // viable with an invalid sentinel until the hash path loads the
+                    // missing implementation; the sentinel is never delivered.
+                    match runtime.behavior_id_for(target_actor, &behavior_name) {
+                        Some(behavior_id) => msg.behavior_id = behavior_id,
+                        None if content_hash.is_some() => msg.behavior_id = u16::MAX,
+                        None => {
+                            warn!(
+                                "nulang-net: rejecting message to actor {}: unknown behavior '{}'",
+                                target_actor, behavior_name
+                            );
+                            notify_delivery_failed(runtime, msg.sender, "unknown behavior");
+                            ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+                            continue;
+                        }
+                    }
                     // If the sender attached a content hash, verify it
                     // against the local behavior table.
                     if let Some(sender_hash) = content_hash {
@@ -2129,10 +2198,29 @@ pub fn process_network_packets(
                             if let Some(cached) = cached_module {
                                 // Hot-reload: install the cached module
                                 hot_reload_behavior(runtime, target_actor, &cached, &behavior_name);
-                                // Retry resolution after hot-reload
-                                msg.behavior_id = runtime
-                                    .behavior_id_for(target_actor, &behavior_name)
-                                    .unwrap_or(0);
+                                // Re-resolve AND re-verify after hot reload.  The
+                                // cache key alone is not evidence that the installed
+                                // module actually contains the requested implementation.
+                                let Some(behavior_id) = resolve_verified_behavior(
+                                    runtime,
+                                    target_actor,
+                                    &behavior_name,
+                                    &sender_hash,
+                                ) else {
+                                    notify_delivery_failed(
+                                        runtime,
+                                        msg.sender,
+                                        "behavior missing or content hash mismatched after hot reload",
+                                    );
+                                    ack_packet(
+                                        transport,
+                                        cluster,
+                                        incoming.from_node,
+                                        incoming.seq,
+                                    );
+                                    continue;
+                                };
+                                msg.behavior_id = behavior_id;
                             } else {
                                 // Request the bytecode from the sender
                                 warn!(
@@ -2559,6 +2647,62 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+    #[test]
+    fn test_resolve_verified_behavior_rejects_mismatched_hot_reload_hash() {
+        use crate::bytecode::{BehaviorTableEntry, CodeModule};
+
+        let mut runtime = Runtime::new();
+        let actor_id = runtime.spawn_actor(Box::new(Vec::new));
+
+        let module_with_hash = |hash: [u8; 32]| {
+            let mut module = CodeModule::new("hash-verification");
+            module.behaviors.push(BehaviorTableEntry {
+                name: "store".to_string(),
+                param_count: 0,
+                code_offset: 0,
+                local_count: 0,
+                effect_mask: 0,
+                compensate_offset: None,
+                content_hash: Some(hash),
+                source_location: None,
+                parallel_branches: None,
+            });
+            module
+        };
+
+        {
+            let actor = runtime.actors.get_mut(&actor_id).unwrap();
+            actor.bytecode_module = Some(module_with_hash([0xAA; 32]));
+            actor.bytecode_offsets = vec![0];
+        }
+
+        let requested_hash = [0xCC; 32];
+        hot_reload_behavior(
+            &mut runtime,
+            actor_id,
+            &module_with_hash([0xBB; 32]),
+            "store",
+        );
+
+        assert_eq!(
+            resolve_verified_behavior(&runtime, actor_id, "store", &requested_hash),
+            None,
+            "a cached module must not be trusted merely because it was stored under the requested hash"
+        );
+
+        hot_reload_behavior(
+            &mut runtime,
+            actor_id,
+            &module_with_hash(requested_hash),
+            "store",
+        );
+        assert_eq!(
+            resolve_verified_behavior(&runtime, actor_id, "store", &requested_hash),
+            Some(0),
+            "matching reloaded behavior should remain deliverable"
+        );
+    }
+
     /// Helper: create a loopback address on a given port.
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
@@ -2841,6 +2985,7 @@ mod tests {
                 target_actor,
                 behavior_name,
                 content_hash,
+                required_protocol_id,
                 payload,
                 string_table,
                 sender_actor,
@@ -2852,6 +2997,7 @@ mod tests {
                 assert_eq!(target_actor, 42);
                 assert_eq!(behavior_name, "handle_msg");
                 assert_eq!(content_hash, None);
+                assert_eq!(required_protocol_id, None);
                 assert_eq!(sender_actor, 100);
                 assert_eq!(sender_node.0, local_node.0); // Same underlying u64
                 assert_eq!(priority, MessagePriority::Normal);
@@ -2859,6 +3005,35 @@ mod tests {
                 assert_eq!(string_table, vec!["hello".to_string()]);
                 assert_eq!(trace_id.as_deref(), Some(trace));
             }
+            other => panic!("expected ActorMessage packet, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_packet_with_required_protocol_preserves_typed_contract() {
+        let local_addr = addr(9000);
+        let local_node = NodeId::new(&local_addr);
+        let resolver = AddressResolver::new(local_node);
+        let required = crate::protocol::ProtocolId::from_bytes([0x5A; 32]);
+
+        let packet = resolver.build_packet_with_required_protocol(
+            42,
+            "handle_msg",
+            vec![Value::int(1)],
+            100,
+            MessagePriority::Normal,
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(required),
+        );
+
+        match packet {
+            Packet::ActorMessage {
+                required_protocol_id,
+                ..
+            } => assert_eq!(required_protocol_id, Some(required)),
             other => panic!("expected ActorMessage packet, got {:?}", other),
         }
     }
@@ -2875,6 +3050,7 @@ mod tests {
             target_actor: 77,
             behavior_name: "inc".to_string(),
             content_hash: None,
+            required_protocol_id: None,
             payload: vec![Value::int(123)],
             string_table: vec![],
             object_table: vec![],
@@ -2886,11 +3062,19 @@ mod tests {
         let result = resolver.parse_packet(packet);
         assert!(result.is_some());
 
-        let (target, behavior_name, msg, string_table, _object_table, content_hash) =
-            result.unwrap();
+        let (
+            target,
+            behavior_name,
+            msg,
+            string_table,
+            _object_table,
+            content_hash,
+            required_protocol_id,
+        ) = result.unwrap();
         assert_eq!(target, 77);
         assert_eq!(behavior_name, "inc");
         assert_eq!(content_hash, None);
+        assert_eq!(required_protocol_id, None);
         // behavior_id is resolved at delivery, not parse time.
         assert_eq!(msg.behavior_id, 0);
         assert_eq!(msg.sender, 88);
@@ -3126,8 +3310,8 @@ mod tests {
             "remote send must dispatch the named behavior \"inc\""
         );
 
-        // Unknown behavior name: falls back to behavior 0, mirroring
-        // `Runtime::send_message`'s `unwrap_or(0)` for local sends.
+        // Unknown behavior name: reject it without enqueueing or executing
+        // any target handler.
         send_distributed(
             &mut runtime_a,
             &mut transport_a,
@@ -3152,8 +3336,8 @@ mod tests {
             .and_then(|v| v.as_int())
             .unwrap();
         assert_eq!(
-            count, 4,
-            "unknown behavior name must fall back to behavior 0 (\"dec\")"
+            count, 5,
+            "unknown behavior name must leave target state unchanged"
         );
 
         transport_a.shutdown();

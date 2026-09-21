@@ -42,8 +42,45 @@ version + migration.*
 
 ## Stable tier
 
+### Typed process host authority — 2026-09-20
+- **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
+
+
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
+
+### Actor protocol rolling-upgrade compatibility — 2026-09-20
+- **Directional structural compatibility** (Experimental, `src/protocol.rs`).
+  A receiver may serve an older required protocol when it preserves every
+  required compiler-owned behavior contract exactly; additive receiver
+  behaviors are allowed. Parameter, return, effect, or capability changes are
+  incompatible. V1 deliberately avoids implicit variance/default-field rules.
+
+### Actor protocol schema registry — 2026-09-20
+- **Trusted canonical schema registry** (Experimental, `src/protocol.rs`).
+  `ProtocolRegistry` maps `ProtocolId` values to compiler-derived schemas so
+  different digests can be compared using directional rolling-upgrade rules.
+  Exact digest equality needs no lookup; different/unknown digests fail closed.
+  Structurally identical source renames register idempotently because display
+  names are intentionally excluded from protocol identity.
+
+### Actor protocol pre-mailbox admission — 2026-09-20
+- **Fail-closed protocol admission policy** (Experimental, `src/protocol.rs`).
+  `admit_protocol` is a side-effect-free decision point intended to run before
+  mailbox publication. `StrictCompatible` is the default: exact ids pass
+  directly, proven additive receiver upgrades pass through the trusted schema
+  registry, and incompatible/unknown/missing typed identities are rejected.
+  `LegacyCompatible` is explicit migration mode and relaxes only a missing
+  incoming required protocol identity; typed mismatches remain fail-closed.
+
+### NUL0 required actor-protocol identity tail — 2026-09-20
+- **Additive typed delivery metadata** (Experimental, `src/runtime/network.rs`,
+  `src/runtime/distributed.rs`). Actor messages may carry the sender/client's
+  required `ProtocolId` in a self-identifying `PRT0` trailing extension.
+  Existing untyped send paths emit the historical NUL0-v1 payload unchanged;
+  current readers accept messages without the tail and ignore unrelated future
+  trailing extensions. The receiver's installed protocol remains local runtime
+  metadata and is deliberately not trusted from the wire.
 
 ### Typed actor protocol checking — 2026-09-20
 - **Static protocol validation for known actor references** (Experimental,
@@ -73,6 +110,14 @@ two major versions.*
   include parameter packs, return types, effects, and capabilities; unresolved
   or open contracts fail closed. Protocol type hashes now use the canonical
   content encoding rather than information-erasing NTIR.
+
+### Actor dispatch soundness — 2026-09-20
+- **Fail-closed behavior-name resolution** (Stable runtime correction). Local,
+  cross-shard, and remote actor sends no longer map an unknown behavior name to
+  behavior id 0. Name resolution remains on the owning runtime/shard, fetched
+  or hot-reloaded code must still declare the requested behavior, invalid
+  synchronous numeric asks fail explicitly, and a genuinely declared behavior
+  id 0 remains valid.
 
 ### RESP-compatible cache kernel — 2026-09-19
 - **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
@@ -105,6 +150,11 @@ two major versions.*
   per-connection sequencer and emitted only as the longest contiguous completed
   prefix. Direct responses stay immediate when no earlier async request is
   pending; pipeline saturation is explicit backpressure.
+- **RESP pipeline retained-byte high-water mark** (Experimental,
+  `src/runtime/cache_pipeline.rs`). Deferred direct and completed local/remote
+  responses now contribute to a per-connection byte budget in addition to the
+  pending-entry limit. Crossing the byte high-water mark backpressures further
+  submissions/completions until ordered draining releases retained bytes.
 - **Redis Cluster MOVED redirect mode** (Experimental,
   `src/runtime/cache_cluster.rs`, `src/runtime/cache_dispatch.rs`). Physical
   cache owners can advertise preformatted RESP endpoints. Redirect mode sends
