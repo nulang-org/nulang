@@ -1633,6 +1633,7 @@ impl TypeChecker {
             Decl::EffectDecl { .. } => Ok((vec![], Type::unit())),
             Decl::Actor {
                 name,
+                persistent,
                 state_fields,
                 behaviors,
                 events,
@@ -1642,6 +1643,7 @@ impl TypeChecker {
             } => self.infer_actor_decl(
                 ctx,
                 name,
+                *persistent,
                 state_fields,
                 behaviors,
                 events,
@@ -1986,9 +1988,10 @@ impl TypeChecker {
                 args,
                 span,
             } => self.infer_perform(ctx, effect, args, *span),
-            // Emit event — check against entity's declared events if in an entity context
+            // Emit event — validate name, arity, payload types, then infer args.
             Expr::Emit { event, args, span } => {
-                // Validate against entity event declarations if available
+                let mut subst = Vec::new();
+
                 if let Some(ref entity_events) = ctx.entity_events {
                     let declared = entity_events.iter().find(|(name, _)| name == event);
                     match declared {
@@ -2015,12 +2018,12 @@ impl TypeChecker {
                                 },
                             });
                         }
-                        Some(params) => {
-                            if args.len() != params.1.len() {
+                        Some((_event_name, params)) => {
+                            if args.len() != params.len() {
                                 let plural =
                                     |n: usize| if n == 1 { "argument" } else { "arguments" };
                                 let expected_desc =
-                                    format!("{} {}", params.1.len(), plural(params.1.len()));
+                                    format!("{} {}", params.len(), plural(params.len()));
                                 let found_desc = format!("{} {}", args.len(), plural(args.len()));
                                 return Err(NuError::TypeError {
                                     msg: format!(
@@ -2033,15 +2036,37 @@ impl TypeChecker {
                                     similar_names: None,
                                 });
                             }
+
+                            for (arg, (param_name, param_ty)) in args.iter().zip(params.iter()) {
+                                let ctx_sub = apply_subst_to_ctx(ctx, &subst);
+                                let (s_arg, arg_ty) = self.infer_expr(&ctx_sub, arg)?;
+                                subst = compose_subst(&s_arg, &subst);
+                                let resolved_arg = apply_subst(&arg_ty, &subst);
+                                let resolved_expected = apply_subst(param_ty, &subst);
+                                let s_match =
+                                    mgu_assignable(&resolved_arg, &resolved_expected, arg.span())
+                                        .map_err(|_| NuError::TypeError {
+                                        msg: format!(
+                                            "Event '{}' parameter '{}' expects {}, got {}",
+                                            event, param_name, resolved_expected, resolved_arg
+                                        ),
+                                        span: arg.span(),
+                                        expected_type: Some(format!("{}", resolved_expected)),
+                                        found_type: Some(format!("{}", resolved_arg)),
+                                        similar_names: None,
+                                    })?;
+                                subst = compose_subst(&s_match, &subst);
+                            }
                         }
                     }
+                } else {
+                    for arg in args {
+                        let ctx_sub = apply_subst_to_ctx(ctx, &subst);
+                        let (s_arg, _ty) = self.infer_expr(&ctx_sub, arg)?;
+                        subst = compose_subst(&s_arg, &subst);
+                    }
                 }
-                let mut subst = Vec::new();
-                for arg in args {
-                    let ctx_sub = apply_subst_to_ctx(ctx, &subst);
-                    let (s, _ty) = self.infer_expr(&ctx_sub, arg)?;
-                    subst = compose_subst(&s, &subst);
-                }
+
                 Ok((subst, Type::unit()))
             }
 
@@ -3596,6 +3621,7 @@ impl TypeChecker {
         &mut self,
         ctx: &TypeContext,
         name: &str,
+        persistent: bool,
         state_fields: &[(String, crate::ast::StateModel, Type, Expr)],
         behaviors: &[Behavior],
         events: &[crate::ast::EventDecl],
@@ -3624,6 +3650,20 @@ impl TypeChecker {
                 declared_ty.clone()
             };
 
+            if matches!(
+                *model,
+                crate::ast::StateModel::Durable | crate::ast::StateModel::EventSourced
+            ) {
+                self.validate_durable_value_type(
+                    &effective_ty,
+                    default_expr.span(),
+                    &format!(
+                        "persistent state field '{}' on actor '{}'",
+                        field_name, name
+                    ),
+                )?;
+            }
+
             if let crate::ast::StateModel::Crdt(crdt_type) = model {
                 let expected_ty = match crdt_type {
                     crate::ast::CrdtType::LWWRegister => Type::string(),
@@ -3641,6 +3681,21 @@ impl TypeChecker {
                         default_expr.span(),
                     ));
                 }
+            }
+        }
+
+        // Event payloads are durable journal schema. Reject declarations that
+        // name a source type the runtime cannot encode losslessly.
+        for event in events {
+            for (param_name, param_ty) in &event.params {
+                self.validate_durable_value_type(
+                    param_ty,
+                    event.span,
+                    &format!(
+                        "parameter '{}' of durable event '{}' on actor '{}'",
+                        param_name, event.name, name
+                    ),
+                )?;
             }
         }
 
@@ -3669,7 +3724,20 @@ impl TypeChecker {
                     .collect();
                 behavior_ctx.set_entity_events(ctx_events);
             }
-            let (_s, _body_ty) = self.infer_expr(&behavior_ctx, &behavior.body)?;
+            let (body_subst, _body_ty) = self.infer_expr(&behavior_ctx, &behavior.body)?;
+            if persistent {
+                for (param, param_ty) in behavior.params.iter().zip(param_types.iter()) {
+                    let resolved_ty = apply_subst(param_ty, &body_subst);
+                    self.validate_durable_value_type(
+                        &resolved_ty,
+                        behavior.span,
+                        &format!(
+                            "parameter '{}' of behavior '{}' on persistent actor '{}'",
+                            param.name, behavior.name, name
+                        ),
+                    )?;
+                }
+            }
         }
 
         // Typecheck migration contracts: state_body and event_migration handlers
@@ -3895,6 +3963,27 @@ impl TypeChecker {
     // -----------------------------------------------------------------------
     // Generalization with tracked context vars
     // -----------------------------------------------------------------------
+
+    /// Require a source type to have an explicit runtime durable codec.
+    ///
+    /// This is intentionally a proof obligation, not a best-effort
+    /// serializability guess. It must stay aligned with PersistedValue.
+    fn validate_durable_value_type(&self, ty: &Type, span: Span, surface: &str) -> NuResult<()> {
+        if ty.has_stable_durable_codec() {
+            return Ok(());
+        }
+
+        Err(NuError::TypeError {
+            msg: format!(
+                "{} has type {}, which has no stable durable codec; currently supported durable values are Int, Float, Bool, String, Nil, Unit, nominal wrappers of those types, and actor references",
+                surface, ty
+            ),
+            span,
+            expected_type: Some("type with a stable durable codec".to_string()),
+            found_type: Some(format!("{}", ty)),
+            similar_names: None,
+        })
+    }
 
     /// Validate that a type is usable as an FFI parameter/return type in the MVP.
     /// Only primitive Int, Float, Bool, String, and Unit are supported.
@@ -5390,6 +5479,133 @@ mod tests {
     }
 
     #[test]
+    fn test_durable_state_accepts_runtime_codec_scalar() {
+        let result = check_src(
+            r#"
+            persistent actor Counter {
+                state durable count: Int = 0
+                behavior get() { self.count }
+            }
+            "#,
+        );
+        assert!(
+            result.is_ok(),
+            "expected durable Int state to check: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_durable_state_rejects_heap_aggregate_without_codec() {
+        let result = check_src(
+            r#"
+            persistent actor Counter {
+                state durable history: [Int] = [1, 2]
+                behavior get() { unit }
+            }
+            "#,
+        );
+        let error = result.expect_err("durable Array state must fail closed");
+        let text = format!("{}", error);
+        assert!(text.contains("persistent state field 'history'"), "{text}");
+        assert!(text.contains("no stable durable codec"), "{text}");
+    }
+
+    #[test]
+    fn test_event_sourced_state_rejects_heap_aggregate_without_codec() {
+        let result = check_src(
+            r#"
+            entity Counter {
+                state history: [Int] = [1, 2]
+                behavior get() { unit }
+            }
+            "#,
+        );
+        let error = result.expect_err("event-sourced Array state must fail closed");
+        assert!(format!("{}", error).contains("no stable durable codec"));
+    }
+
+    #[test]
+    fn test_local_state_keeps_rich_in_memory_types() {
+        let result = check_src(
+            r#"
+            persistent actor Cache {
+                state local items: [Int] = [1, 2]
+                behavior get() { unit }
+            }
+            "#,
+        );
+        assert!(
+            result.is_ok(),
+            "local state must remain unrestricted: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_persistent_behavior_accepts_journalable_payload_type() {
+        let result = check_src(
+            r#"
+            persistent actor Counter {
+                behavior add(by: Int) { by + 1 }
+            }
+            "#,
+        );
+        assert!(
+            result.is_ok(),
+            "persistent Int payload should check: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_persistent_behavior_rejects_unjournalable_payload_type() {
+        let result = check_src(
+            r#"
+            persistent actor Counter {
+                behavior replace(values: [Int]) { unit }
+            }
+            "#,
+        );
+        let error = result.expect_err("persistent Array payload must fail closed");
+        let text = format!("{}", error);
+        assert!(
+            text.contains("parameter 'values' of behavior 'replace'"),
+            "{text}"
+        );
+        assert!(text.contains("no stable durable codec"), "{text}");
+    }
+
+    #[test]
+    fn test_nonpersistent_behavior_keeps_rich_payload_types() {
+        let result = check_src(
+            r#"
+            actor Worker {
+                behavior replace(values: [Int]) { unit }
+            }
+            "#,
+        );
+        assert!(
+            result.is_ok(),
+            "ephemeral actor messages must remain unrestricted: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_persistent_unresolved_payload_type_fails_closed() {
+        let result = check_src(
+            r#"
+            persistent actor Sink {
+                behavior put(value) { unit }
+            }
+            "#,
+        );
+        let error = result.expect_err("unproven persistent payload type must fail closed");
+        assert!(format!("{}", error).contains("no stable durable codec"));
+    }
+
+    #[test]
     fn test_apply_subst_to_ctx_updates_bindings() {
         let v = TypeVar(9001);
         let ctx = ctx_with("x", Type::Var(v));
@@ -5798,6 +6014,64 @@ mod tests {
             "#,
         );
         assert!(result.is_ok(), "known event must pass: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_durable_event_schema_rejects_unencodable_payload_type() {
+        let result = check_src(
+            r#"
+            entity E {
+                state x: Int = 0
+                events
+                    | Replaced(values: [Int])
+                behavior go() { unit }
+            }
+            "#,
+        );
+        let error = result.expect_err("durable event Array payload must fail closed");
+        let text = format!("{}", error);
+        assert!(text.contains("durable event 'Replaced'"), "{text}");
+        assert!(text.contains("no stable durable codec"), "{text}");
+    }
+
+    #[test]
+    fn test_emit_event_rejects_wrong_payload_type() {
+        let result = check_src(
+            r#"
+            entity E {
+                state x: Int = 0
+                events
+                    | Incremented(by: Int)
+                behavior go() { emit Incremented("oops") }
+            }
+            "#,
+        );
+        let error = result.expect_err("event payload type mismatch must be rejected");
+        let text = format!("{}", error);
+        assert!(
+            text.contains("Event 'Incremented' parameter 'by' expects Int"),
+            "{text}"
+        );
+        assert!(text.contains("String"), "{text}");
+    }
+
+    #[test]
+    fn test_emit_event_accepts_matching_payload_type() {
+        let result = check_src(
+            r#"
+            entity E {
+                state x: Int = 0
+                events
+                    | Incremented(by: Int)
+                behavior go() { emit Incremented(1) }
+            }
+            "#,
+        );
+        assert!(
+            result.is_ok(),
+            "matching event payload must typecheck: {:?}",
+            result.err()
+        );
     }
 
     #[test]
