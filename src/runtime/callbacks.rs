@@ -1820,6 +1820,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             if effect_name == "Realtime" {
                 return perform_realtime_builtin(self, op_name, constants, regs);
             }
+            if effect_name == "ArrayBuilder" {
+                return crate::vm::arraybuilder_op(self, op_name.unwrap_or(""), regs);
+            }
             if effect_name == "StrBuilder" {
                 return crate::vm::strbuilder_op(self, constants, op_name.unwrap_or(""), regs);
             }
