@@ -14,7 +14,7 @@ use super::persistence::{EventEntry, JournalEntry, PersistenceStore, WorkflowEve
 /// records share the same actor sequence, message delivery is observed first,
 /// followed by state events and then workflow events.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[repr(u8)]
 #[serde(rename_all = "snake_case")]
