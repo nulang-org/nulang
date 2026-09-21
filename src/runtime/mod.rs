@@ -117,7 +117,9 @@ pub use object_store::*;
 pub use orca_cycle::*;
 pub use persistence::*;
 pub use process_groups::*;
-pub use reactive::{StateReadSet, StateVersion};
+pub use reactive::{
+    ActorTurnVersion, ReactiveSubscriptionError, StateReadSet, StateVersion, SubscriptionId,
+};
 pub use registry::*;
 pub use resp_cache::*;
 pub use scheduler::*;
@@ -320,6 +322,8 @@ pub struct Runtime {
     /// runtime-local and ephemeral; durable subscription identity belongs in
     /// the higher-level subscription layer.
     reactive_reads: reactive::ReactiveReadTracker,
+    /// In-process workflow-query subscriptions and reverse dependency indexes.
+    reactive_subscriptions: reactive::ReactiveSubscriptionRegistry,
     // Fallback heap/GC for allocation performed OUTSIDE any actor's
     // behavior (e.g. `main()`'s own top-level bytecode: string
     // concatenation, `Int.to_string`, and similar). See
@@ -591,6 +595,7 @@ impl Runtime {
             current_actor: None,
             current_trace: None,
             reactive_reads: reactive::ReactiveReadTracker::default(),
+            reactive_subscriptions: reactive::ReactiveSubscriptionRegistry::default(),
             main_heap: {
                 let mut heap = ActorHeap::new(64 * 1024);
                 heap.set_actor_id(MAIN_HEAP_ACTOR_ID);
@@ -687,26 +692,128 @@ impl Runtime {
             return;
         }
         if let Some(actor) = self.actors.get(&actor_id) {
+            let incarnation = actor.state_incarnation();
             self.reactive_reads.record(
                 actor_id,
                 field,
                 StateVersion {
-                    incarnation: actor.state_incarnation(),
+                    incarnation,
                     revision: actor.state_revision(field),
                 },
             );
+            // Pointer-backed state may contain mutable heap objects whose
+            // contents can change in-place without a StateSet. Depend on the
+            // actor turn as a conservative invalidation fence.
+            if actor
+                .get_state_field(field)
+                .and_then(|value| value.as_ptr())
+                .is_some()
+            {
+                self.reactive_reads.record_pointer_turn(
+                    actor_id,
+                    ActorTurnVersion {
+                        incarnation,
+                        turn_revision: actor.reactive_turn_revision(),
+                    },
+                );
+            }
         }
     }
 
     /// Check whether every field observed by a prior query still has the same
     /// revision. Missing actors are stale.
     pub fn state_read_set_is_current(&self, reads: &StateReadSet) -> bool {
-        reads.is_current_with(|actor_id, field| {
-            self.actors.get(&actor_id).map(|actor| StateVersion {
-                incarnation: actor.state_incarnation(),
-                revision: actor.state_revision(field),
+        reads.is_current_with(
+            |actor_id, field| {
+                self.actors.get(&actor_id).map(|actor| StateVersion {
+                    incarnation: actor.state_incarnation(),
+                    revision: actor.state_revision(field),
+                })
+            },
+            |actor_id| {
+                self.actors.get(&actor_id).map(|actor| ActorTurnVersion {
+                    incarnation: actor.state_incarnation(),
+                    turn_revision: actor.reactive_turn_revision(),
+                })
+            },
+        )
+    }
+
+    /// Register a reactive subscription to a pure workflow query.
+    ///
+    /// The query executes immediately. The returned value is the initial
+    /// result; the runtime retains only the dependency metadata, never the VM
+    /// value itself, so actor-heap pointer ownership remains explicit.
+    pub fn subscribe_workflow_query(
+        &mut self,
+        actor_id: u64,
+        name: &str,
+    ) -> Result<(SubscriptionId, Value), ReactiveSubscriptionError> {
+        let (value, reads) =
+            self.query_workflow_with_dependencies_checked(actor_id, name)?;
+        let id = self
+            .reactive_subscriptions
+            .register(actor_id, name.to_string(), reads);
+        Ok((id, value))
+    }
+
+    /// Remove a reactive workflow-query subscription.
+    pub fn unsubscribe_workflow_query(&mut self, id: SubscriptionId) -> bool {
+        self.reactive_subscriptions.remove(id)
+    }
+
+    /// Re-evaluate an invalidated subscription and replace its dependency set.
+    ///
+    /// The refreshed result is returned directly rather than being retained in
+    /// the runtime, avoiding long-lived ownership of actor-heap pointers.
+    pub fn refresh_workflow_query_subscription(
+        &mut self,
+        id: SubscriptionId,
+    ) -> Result<Value, ReactiveSubscriptionError> {
+        let (actor_id, query_name) = self
+            .reactive_subscriptions
+            .get(id)
+            .map(|subscription| (subscription.actor_id, subscription.query_name.clone()))
+            .ok_or(ReactiveSubscriptionError::NotFound(id))?;
+
+        let (value, reads) =
+            self.query_workflow_with_dependencies_checked(actor_id, &query_name)?;
+        let replaced = self.reactive_subscriptions.replace_reads(id, reads);
+        debug_assert!(replaced, "subscription disappeared during synchronous refresh");
+        Ok(value)
+    }
+
+    /// Drain subscriptions invalidated by state changes since the previous
+    /// drain. State writes are batched here rather than rerunning queries from
+    /// `set_state_field`, so a behavior can make several updates atomically
+    /// from the reactive layer's perspective.
+    pub fn drain_workflow_query_invalidations(&mut self) -> Vec<SubscriptionId> {
+        let mut candidates = std::collections::BTreeSet::new();
+
+        for (actor_id, actor) in self.actors.iter_mut() {
+            let (dirty_fields, turn_changed) = actor.take_reactive_changes();
+            if dirty_fields.is_empty() && !turn_changed {
+                continue;
+            }
+            candidates.extend(self.reactive_subscriptions.candidates(
+                *actor_id,
+                dirty_fields,
+                turn_changed,
+            ));
+        }
+
+        candidates
+            .into_iter()
+            .filter(|id| {
+                let reads = self
+                    .reactive_subscriptions
+                    .get(*id)
+                    .map(|subscription| subscription.reads.clone());
+                reads
+                    .map(|reads| !self.state_read_set_is_current(&reads))
+                    .unwrap_or(false)
             })
-        })
+            .collect()
     }
 
     /// Compute the BLAKE3 hash of `data` using the configured [`CryptoProvider`].
@@ -3661,8 +3768,12 @@ impl Runtime {
             }
         };
         let should_requeue = if let Some(msg) = msg_opt {
-            // Message delivery counts as activity for dehydration.
+            // A real actor message starts one reactive turn. Pointer-backed
+            // query dependencies use this coarser token so any in-place heap
+            // mutation during the turn invalidates only after the turn began,
+            // rather than on every intermediate field write.
             if let Some(actor) = self.actors.get_mut(&actor_id) {
+                actor.begin_reactive_turn();
                 actor.idle_ms = 0;
             }
             let behavior_idx = msg.behavior_id as usize;
