@@ -82,6 +82,40 @@ impl fmt::Display for LogicalActorCommitError {
 
 impl std::error::Error for LogicalActorCommitError {}
 
+
+/// Common fenced durable-state boundary for logical actors.
+///
+/// Implementations must authorize every write using the full logical identity,
+/// owner node, and authoritative activation epoch. The authorization check and
+/// durable mutation must be one atomic storage operation in persistent
+/// backends; checking authority in process memory before a separate write is
+/// not sufficient fencing.
+pub trait LogicalActorPersistenceStore: Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn save_logical_snapshot(
+        &mut self,
+        stamp: &LogicalActorCommitStamp,
+        snapshot: ActorSnapshot,
+    ) -> Result<(), Self::Error>;
+
+    fn load_logical_snapshot(
+        &self,
+        grain_id: &GrainId,
+    ) -> Result<Option<ActorSnapshot>, Self::Error>;
+
+    fn append_logical_journal(
+        &mut self,
+        stamp: &LogicalActorCommitStamp,
+        entry: JournalEntry,
+    ) -> Result<(), Self::Error>;
+
+    fn read_logical_journal(
+        &self,
+        grain_id: &GrainId,
+    ) -> Result<Vec<JournalEntry>, Self::Error>;
+}
+
 /// In-memory reference implementation of logical-identity keyed durable state.
 ///
 /// Production backends should preserve the same authorization rules while
@@ -183,6 +217,40 @@ impl FencedLogicalActorStore {
             epoch: stamp.epoch,
             current: self.ownership.record_for(&stamp.grain_id),
         })
+    }
+}
+
+impl LogicalActorPersistenceStore for FencedLogicalActorStore {
+    type Error = LogicalActorCommitError;
+
+    fn save_logical_snapshot(
+        &mut self,
+        stamp: &LogicalActorCommitStamp,
+        snapshot: ActorSnapshot,
+    ) -> Result<(), Self::Error> {
+        self.save_snapshot(stamp, snapshot)
+    }
+
+    fn load_logical_snapshot(
+        &self,
+        grain_id: &GrainId,
+    ) -> Result<Option<ActorSnapshot>, Self::Error> {
+        Ok(self.load_snapshot(grain_id))
+    }
+
+    fn append_logical_journal(
+        &mut self,
+        stamp: &LogicalActorCommitStamp,
+        entry: JournalEntry,
+    ) -> Result<(), Self::Error> {
+        self.append_journal(stamp, entry)
+    }
+
+    fn read_logical_journal(
+        &self,
+        grain_id: &GrainId,
+    ) -> Result<Vec<JournalEntry>, Self::Error> {
+        Ok(self.read_journal(grain_id))
     }
 }
 
