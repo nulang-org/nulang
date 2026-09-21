@@ -15,6 +15,24 @@ use crate::semantic_schema::{
     actor_definition_semantic_ids_for_typed_program, semantic_id_for_typed_program,
 };
 
+/// Canonical code-generation identity inputs for portable NBC bytecode.
+///
+/// These constants are part of the ArtifactId contract for the standard Nulang
+/// bytecode compiler. Changing one intentionally creates a new ArtifactId even
+/// when program semantics are unchanged.
+pub const BYTECODE_ARTIFACT_COMPILER_VERSION: &str =
+    concat!("nulangc-", env!("CARGO_PKG_VERSION"));
+pub const BYTECODE_ARTIFACT_TARGET: &str = "portable";
+pub const BYTECODE_ARTIFACT_ABI: &str = "nulang-abi-v1";
+pub const BYTECODE_ARTIFACT_BACKEND: &str = "bytecode";
+
+pub fn bytecode_artifact_flags() -> [String; 1] {
+    [format!(
+        "bytecode-format={}",
+        crate::format::constants::BYTECODE_VERSION
+    )]
+}
+
 /// Derive a complete artifact identity manifest from one typed/lowered program.
 ///
 /// - `source_bytes` are optional exact input bytes used only for [`SourceId`].
