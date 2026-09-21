@@ -1570,6 +1570,14 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Canonical stdlib module manifest — 2026-09-21
+- **Stdlib module metadata is now generated from one manifest.** `spec/stdlib/v0alpha1.json` owns module names, imports, source paths, stability tiers, descriptions, and declared official package mirrors. `scripts/generate_stdlib.py` materializes Rust descriptors and the docs module index from that file.
+- **Official package mirrors fail closed on drift.** The `json` seed package is generated from `src/stdlib/json.nula` with only its package-specific import preamble substituted; `scripts/verify_implementation.py` runs the generator in `--check` mode so stale package copies or generated metadata fail CI.
+- **Built-in effects remain executable registry data.** `src/stdlib.rs` still owns the compiler/runtime built-in operation registry used by effect docs; module metadata is no longer duplicated in its comments. This intentionally separates executable effect semantics from higher-level Nulang-authored module metadata while exposing both through `nulang::stdlib`.
+
+
+## Experimental tier
+
 ### Standard-library Option lookup contracts — 2026-09-21
 - **Collection absence is explicit.** Experimental `stdlib::map.get`, `stdlib::list.index_of`, and `stdlib::list.find` now return `Option` instead of sentinel `-1` values. `max_of`, `min_of`, `min_by`, and `max_by` now return `None` for empty inputs. Conformance fixtures and stdlib tests pin the new contracts. This is source-breaking for Experimental stdlib callers that compared missing results with integer sentinels.
 

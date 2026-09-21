@@ -77,6 +77,25 @@ def check_warnings():
         and check_warnings_for(["--all-features"], "(--all-features)")
     )
 
+def check_stdlib_manifest():
+    """Fail when canonical stdlib metadata or generated mirrors drift."""
+    print("Checking canonical stdlib manifest and generated artifacts...")
+    res = subprocess.run(
+        [sys.executable, "scripts/generate_stdlib.py", "--check"],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        print("Error: stdlib manifest validation failed.")
+        if res.stdout:
+            print(res.stdout)
+        if res.stderr:
+            print(res.stderr)
+        return False
+    print(res.stdout.strip())
+    return True
+
+
 def verify_files():
     # 1. (compiler.rs has been removed; MIR pipeline is now exclusive.)
     # 2. Check vm.rs for Frame caller and leaked SConcat
@@ -180,6 +199,9 @@ def verify_files():
             intra_node_wired = True
     if not intra_node_wired:
         print("Error: Cycle detector intra-node restriction is not wired in Runtime.")
+        return False
+
+    if not check_stdlib_manifest():
         return False
 
     print("Success: All files passed implementation checks!")
