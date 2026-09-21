@@ -2203,6 +2203,20 @@ mod json_file_store_tests {
     }
 
     #[test]
+    fn test_legacy_event_json_defaults_to_schema_v1() {
+        let legacy = r#"{
+            "sequence": 9,
+            "field_name": "count",
+            "event_name": "Incremented",
+            "args": [{"tag":"Int","value":1}],
+            "value": {"tag":"Int","value":2}
+        }"#;
+        let event: EventEntry = serde_json::from_str(legacy).unwrap();
+        assert_eq!(event.schema_owner, None);
+        assert_eq!(event.schema_version, 1);
+    }
+
+    #[test]
     fn test_json_file_store_append_read_journal() {
         let dir = fresh_dir("journal");
         let mut store = JsonFileStore::new(&dir).unwrap();
