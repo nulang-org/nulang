@@ -569,6 +569,15 @@ fn main() {
         opts.ffi_sandbox = true;
     }
 
+    if opts.sandboxed && opts.repl {
+        eprintln!("Error: --sandboxed REPL execution is not yet supported; run a source file, --eval, or .nbc artifact instead");
+        std::process::exit(1);
+    }
+    if opts.sandboxed && opts.dap {
+        eprintln!("Error: --sandboxed DAP execution is not yet supported; run the program directly with --sandboxed");
+        std::process::exit(1);
+    }
+
     // Resolve color mode once after all args are parsed.
     let use_color = color_enabled(&opts);
     // Wave D4: --iso-arena enables the VM's per-activation arena path for
