@@ -7264,3 +7264,59 @@ fn p0_cross_shard_named_send_resolves_only_on_owner() {
         "unknown cross-shard behavior must not execute behavior zero"
     );
 }
+
+
+#[test]
+fn perf_scheduler_coalesces_repeated_actor_wakeups() {
+    fn increment(actor: &mut Actor, _args: &[Value]) {
+        let count = actor
+            .get_state_field("count")
+            .and_then(|v| v.as_int())
+            .unwrap_or(0);
+        actor.set_state_field("count", Value::int(count + 1));
+    }
+
+    let mut rt = Runtime::new();
+    let actor_id =
+        rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("inc", increment);
+
+    // Drain the spawn-time scheduler entry so the measurement below contains
+    // only wakeups created by the message flood.
+    rt.run_scheduler();
+    let before = rt.scheduler_stats().total_tasks_processed;
+
+    for _ in 0..1_000 {
+        rt.send_message_by_id(actor_id, 0, &[]);
+    }
+
+    assert!(
+        rt.actors.get(&actor_id).unwrap().scheduled,
+        "a flood should leave exactly one outstanding actor wakeup"
+    );
+
+    rt.run_scheduler();
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(
+        actor.get_state_field("count").and_then(|v| v.as_int()),
+        Some(1_000)
+    );
+    assert!(!actor.scheduled, "drained actors must not remain scheduled");
+
+    let dequeues = rt.scheduler_stats().total_tasks_processed - before;
+    assert!(
+        dequeues <= 64,
+        "1,000 queued messages should be micro-batched into <=64 scheduler turns, got {dequeues}"
+    );
+}
+
+#[test]
+fn perf_disabled_flight_recorder_is_a_noop() {
+    let mut recorder = super::actor::FlightRecorder::new(0);
+    recorder.record(7, 3, &[Value::int(42), Value::bool(true)]);
+    assert!(recorder.is_empty());
+}
