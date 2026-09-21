@@ -210,27 +210,43 @@ pub(crate) fn send_distributed(
     behavior: &str,
     args: &[Value],
 ) {
+    let _ = send_distributed_impl(rt, target, behavior, args, false);
+}
+
+pub(crate) fn send_distributed_tracked(
+    rt: &mut Runtime,
+    target: ActorAddress,
+    behavior: &str,
+    args: &[Value],
+) -> Option<u64> {
+    send_distributed_impl(rt, target, behavior, args, true)
+}
+
+fn send_distributed_impl(
+    rt: &mut Runtime,
+    target: ActorAddress,
+    behavior: &str,
+    args: &[Value],
+    tracked: bool,
+) -> Option<u64> {
     if !rt.distributed.enabled {
         let actor_id = match target {
             ActorAddress::Local { actor_id } => actor_id,
             ActorAddress::Remote { actor_id, .. } => actor_id,
         };
         rt.send_message(actor_id, behavior, args);
-        return;
+        return None;
     }
     if let ActorAddress::Local { actor_id } = target {
         rt.send_message(actor_id, behavior, args);
-        return;
+        return None;
     }
-    let mut transport = match rt.distributed.transport.take() {
-        Some(t) => t,
-        None => return,
-    };
+    let mut transport = rt.distributed.transport.take()?;
     let cluster = match rt.distributed.cluster.take() {
         Some(c) => c,
         None => {
             rt.distributed.transport = Some(transport);
-            return;
+            return None;
         }
     };
     let mut resolver = match rt.distributed.resolver.take() {
@@ -238,21 +254,35 @@ pub(crate) fn send_distributed(
         None => {
             rt.distributed.transport = Some(transport);
             rt.distributed.cluster = Some(cluster);
-            return;
+            return None;
         }
     };
-    distributed::send_distributed(
-        rt,
-        &mut transport,
-        &cluster,
-        &mut resolver,
-        target,
-        behavior,
-        args,
-    );
+    let delivery_id = if tracked {
+        distributed::send_distributed_tracked(
+            rt,
+            &mut transport,
+            &cluster,
+            &mut resolver,
+            target,
+            behavior,
+            args,
+        )
+    } else {
+        distributed::send_distributed(
+            rt,
+            &mut transport,
+            &cluster,
+            &mut resolver,
+            target,
+            behavior,
+            args,
+        );
+        None
+    };
     rt.distributed.transport = Some(transport);
     rt.distributed.cluster = Some(cluster);
     rt.distributed.resolver = Some(resolver);
+    delivery_id
 }
 
 /// Process incoming network packets and cluster actions.
