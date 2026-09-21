@@ -3,7 +3,6 @@
 //! Parses a `.nula` file and pretty-prints it with canonical formatting.
 
 use crate::ast::{BinOp, Decl, Expr, Literal, Pattern};
-use crate::authority::AuthorityGrant;
 use crate::types::Type;
 use std::path::Path;
 
@@ -975,15 +974,7 @@ fn fmt_expr(out: &mut String, expr: &Expr, indent: usize, had_unhandled: &mut bo
                     if i > 0 {
                         out.push_str(", ");
                     }
-                    match cap.parse::<AuthorityGrant>() {
-                        Ok(grant) => out.push_str(&grant.to_source_syntax()),
-                        Err(_) => {
-                            // Parsed source should never carry malformed authority
-                            // metadata. Refuse to format rather than emit source that
-                            // silently changes or drops authority.
-                            *had_unhandled = true;
-                        }
-                    }
+                    out.push_str(&cap.to_source_syntax());
                 }
                 out.push(']');
             }

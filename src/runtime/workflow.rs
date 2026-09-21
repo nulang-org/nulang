@@ -61,17 +61,7 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
             state.insert(name.clone(), persisted);
         }
     }
-    let authority_tokens = match actor.authority_manifest() {
-        Ok(manifest) => manifest.canonical_token_set(),
-        Err(err) => {
-            tracing::warn!(
-                "nulang-persist: refusing to checkpoint actor {} with invalid authority: {}",
-                actor_id,
-                err
-            );
-            return;
-        }
-    };
+    let authority_tokens = actor.authority_manifest().canonical_token_set();
     // Snapshot the global CRDT state alongside durable actor fields.
     let crdt_snapshot = rt.crdt_manager.as_ref().map(|m| {
         m.snapshot()

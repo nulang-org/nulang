@@ -6,10 +6,10 @@
 //! access. Keeping the two concepts distinct avoids overloading the word
 //! "capability" in compiler and runtime code.
 //!
-//! The current spawn pipeline still carries canonical authority tokens as
-//! strings. `AuthorityGrant` is the migration target and provides a strict
-//! parser/formatter so existing tokens can cross that boundary without making
-//! security-sensitive runtime decisions on ad-hoc string matching.
+//! The semantic spawn pipeline carries `AuthorityGrant` structurally through
+//! AST/HIR/MIR. Canonical strings remain only at stable artifact, persistence,
+//! and runtime-compatibility boundaries, where strict parsing prevents
+//! security-sensitive decisions from depending on ad-hoc string matching.
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -136,9 +136,8 @@ impl AuthorityManifest {
         }
     }
 
-    /// Compatibility bridge for existing bytecode/persistence/runtime token
-    /// sets. Invalid persisted authority fails closed instead of being kept as
-    /// an opaque string that a host function could accidentally authorize.
+    /// Compatibility bridge for encoded bytecode, persistence, and wire token
+    /// sets. Invalid external authority fails closed before it becomes actor state.
     pub fn from_tokens<'a>(
         tokens: impl IntoIterator<Item = &'a str>,
     ) -> Result<Self, AuthorityParseError> {
@@ -149,8 +148,7 @@ impl AuthorityManifest {
         Ok(Self { grants })
     }
 
-    /// Convenience bridge for the runtime's current `BTreeSet<String>` actor
-    /// field while it migrates to `AuthorityManifest` directly.
+    /// Convenience bridge for legacy persistence/wire token sets.
     pub fn from_token_set(tokens: &BTreeSet<String>) -> Result<Self, AuthorityParseError> {
         Self::from_tokens(tokens.iter().map(String::as_str))
     }
@@ -206,8 +204,8 @@ impl AuthorityManifest {
         self.grants.iter()
     }
 
-    /// Stable tokens for bytecode metadata, persistence, hashing, and the
-    /// existing runtime bridge while those layers migrate to typed grants.
+    /// Stable tokens for bytecode metadata, persistence, hashing, and wire
+    /// compatibility boundaries.
     ///
     /// Serialization order is lexical by canonical token, not enum variant
     /// declaration order. This prevents an internal enum reordering from
@@ -218,8 +216,7 @@ impl AuthorityManifest {
         tokens
     }
 
-    /// Canonical compatibility representation for the runtime's current actor
-    /// field. New semantic code should prefer `AuthorityManifest` directly.
+    /// Canonical compatibility representation for persistence and wire formats.
     pub fn canonical_token_set(&self) -> BTreeSet<String> {
         self.canonical_tokens().into_iter().collect()
     }
@@ -443,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn current_runtime_token_set_converts_fail_closed() {
+    fn persistence_token_set_converts_fail_closed() {
         let tokens = BTreeSet::from(["Net::TcpOut(api.stripe.com:443)".to_string()]);
         let manifest = AuthorityManifest::from_token_set(&tokens).unwrap();
         assert!(manifest.allows_tcp_out("api.stripe.com", 443));
