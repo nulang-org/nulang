@@ -6110,6 +6110,8 @@ match { a: 2, b: 9 } with {
     fn test_flight_recorder_records_messages() {
         let mut rt = Runtime::new();
         let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+        rt.actors.get_mut(&actor_id).unwrap().flight_recorder =
+            crate::runtime::actor::FlightRecorder::new(1000);
 
         // Send three messages
         rt.send_message_by_id(actor_id, 1, &[Value::int(10)]);
@@ -6132,7 +6134,9 @@ match { a: 2, b: 9 } with {
     fn test_flight_recorder_ring_buffer_wraps() {
         let mut rt = Runtime::new();
         let actor_id = rt.spawn_actor(Box::new(|| vec![]));
-        // Flight recorder defaults to 1000 entries. Send 3 and check.
+        rt.actors.get_mut(&actor_id).unwrap().flight_recorder =
+            crate::runtime::actor::FlightRecorder::new(1000);
+        // Opt in to recording, send 3, and check.
         for i in 0..3 {
             rt.send_message_by_id(actor_id, (i % 10) as u16, &[Value::int(i)]);
         }
