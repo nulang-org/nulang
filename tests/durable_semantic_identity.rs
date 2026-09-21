@@ -165,6 +165,34 @@ fn legacy_compatible_recovery_does_not_upgrade_provenance() {
 }
 
 #[test]
+fn malformed_artifact_identity_fails_closed_before_recovery() {
+    let actor_id = 410_008;
+    let definition_id = semantic(b"definition");
+    let mut runtime = Runtime::new();
+    runtime
+        .persistence
+        .save_snapshot(ActorSnapshot {
+            actor_id,
+            semantic_id: Some(definition_id.to_string()),
+            artifact_id: Some("not-an-artifact-id".to_string()),
+            ..ActorSnapshot::default()
+        })
+        .unwrap();
+    runtime.register_recovery_module(
+        actor_id,
+        module_with_definition_identity("Counter", Some(definition_id)),
+        vec![],
+        vec![],
+    );
+
+    assert_eq!(
+        runtime.recover_actor_with_identity_policy(actor_id, RecoveryIdentityPolicy::Strict),
+        None
+    );
+    assert!(!runtime.actors.contains_key(&actor_id));
+}
+
+#[test]
 fn legacy_nbc_transport_rejects_self_asserted_semantic_identity() {
     let actor_id = 410_007;
     let id = semantic(b"transported");
