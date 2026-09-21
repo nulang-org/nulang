@@ -4,7 +4,7 @@
 //! snapshot of durable actor state and an append-only journal of messages.
 //! On recovery the runtime loads the latest snapshot and replays the journal.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -1088,6 +1088,37 @@ impl LibsqlStore {
                     (),
                 )
                 .await;
+            // v2 event identity includes field_name. A single domain emit can
+            // project into multiple event_sourced fields at the same durable
+            // sequence; the legacy (actor_id, sequence) key could retain only
+            // one of those projections.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS events_v2 (
+                    actor_id INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    schema_owner TEXT,
+                    schema_version INTEGER NOT NULL DEFAULT 1,
+                    field_name TEXT NOT NULL,
+                    event_name TEXT NOT NULL,
+                    args TEXT NOT NULL,
+                    value TEXT NOT NULL DEFAULT '1',
+                    PRIMARY KEY (actor_id, sequence, field_name)
+                )",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            // Idempotently preserve every row that an older runtime managed
+            // to commit. New writes go only to events_v2.
+            conn.execute(
+                "INSERT OR IGNORE INTO events_v2
+                    (actor_id, sequence, schema_owner, schema_version, field_name, event_name, args, value)
+                 SELECT actor_id, sequence, schema_owner, schema_version, field_name, event_name, args, value
+                 FROM events",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             Ok(())
         })
     }
@@ -1397,7 +1428,13 @@ impl PersistenceStore for LibsqlStore {
             let value_json = serde_json::to_string(&entry.value)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             conn.execute(
-                "INSERT INTO events (actor_id, sequence, schema_owner, schema_version, field_name, event_name, args, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO events_v2 (actor_id, sequence, schema_owner, schema_version, field_name, event_name, args, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(actor_id, sequence, field_name) DO UPDATE SET
+                    schema_owner=excluded.schema_owner,
+                    schema_version=excluded.schema_version,
+                    event_name=excluded.event_name,
+                    args=excluded.args,
+                    value=excluded.value",
                 libsql::params![actor_id as i64, entry.sequence as i64, entry.schema_owner.as_deref(), entry.schema_version as i64, entry.field_name, entry.event_name, args_json, value_json],
             ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
         })
@@ -1408,8 +1445,8 @@ impl PersistenceStore for LibsqlStore {
         self.rt.block_on(async {
             let mut rows = match conn
                 .query(
-                    "SELECT sequence, schema_owner, schema_version, field_name, event_name, args, value FROM events
-                 WHERE actor_id = ?1 ORDER BY sequence ASC",
+                    "SELECT sequence, schema_owner, schema_version, field_name, event_name, args, value FROM events_v2
+                 WHERE actor_id = ?1 ORDER BY sequence ASC, field_name ASC",
                     libsql::params![actor_id as i64],
                 )
                 .await
@@ -1504,7 +1541,7 @@ impl PersistenceStore for LibsqlStore {
             }.await;
             let event_seq: Option<i64> = async {
                 let mut rows = conn.query(
-                    "SELECT sequence FROM events WHERE actor_id = ?1 ORDER BY sequence DESC LIMIT 1",
+                    "SELECT sequence FROM events_v2 WHERE actor_id = ?1 ORDER BY sequence DESC LIMIT 1",
                     libsql::params![actor_id as i64],
                 ).await.ok()?;
                 let row = rows.next().await.ok()??;
@@ -1599,6 +1636,14 @@ impl RocksDbStore {
         let mut key = [0u8; 16];
         key[..8].copy_from_slice(&actor_id.to_be_bytes());
         key[8..].copy_from_slice(&sequence.to_be_bytes());
+        key
+    }
+
+    fn event_key(actor_id: u64, sequence: u64, field_name: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(16 + field_name.len());
+        key.extend_from_slice(&actor_id.to_be_bytes());
+        key.extend_from_slice(&sequence.to_be_bytes());
+        key.extend_from_slice(field_name.as_bytes());
         key
     }
 
@@ -1750,7 +1795,7 @@ impl PersistenceStore for RocksDbStore {
         self.db
             .put_cf(
                 cf,
-                Self::actor_seq_key(actor_id, entry.sequence),
+                Self::event_key(actor_id, entry.sequence, &entry.field_name),
                 json.as_bytes(),
             )
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1764,7 +1809,12 @@ impl PersistenceStore for RocksDbStore {
             Ok(cf) => cf,
             Err(_) => return Vec::new(),
         };
-        let mut entries = Vec::new();
+        // Legacy keys are actor||sequence (16 bytes). New keys append the
+        // field name, allowing multiple field projections at one sequence.
+        // If both encodings exist for the same logical row, iteration visits
+        // the shorter legacy key first and the v2 key later; BTreeMap
+        // replacement therefore prefers the v2 value.
+        let mut entries: BTreeMap<(u64, String), EventEntry> = BTreeMap::new();
         let start = Self::actor_seq_key(actor_id, 0);
         let mut iter = self.db.iterator_cf(
             cf,
@@ -1775,10 +1825,10 @@ impl PersistenceStore for RocksDbStore {
                 break;
             }
             if let Ok(entry) = serde_json::from_slice::<EventEntry>(&value) {
-                entries.push(entry);
+                entries.insert((entry.sequence, entry.field_name.clone()), entry);
             }
         }
-        entries
+        entries.into_values().collect()
     }
 
     fn latest_sequence(&self, actor_id: u64) -> u64 {
@@ -1943,6 +1993,30 @@ impl PostgresStore {
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         conn.execute(
             "ALTER TABLE events ADD COLUMN IF NOT EXISTS schema_version BIGINT NOT NULL DEFAULT 1",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS events_v2 (
+                actor_id BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                schema_owner TEXT,
+                schema_version BIGINT NOT NULL DEFAULT 1,
+                field_name TEXT NOT NULL,
+                event_name TEXT NOT NULL,
+                args TEXT NOT NULL,
+                value TEXT NOT NULL DEFAULT '1',
+                PRIMARY KEY (actor_id, sequence, field_name)
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "INSERT INTO events_v2
+                (actor_id, sequence, schema_owner, schema_version, field_name, event_name, args, value)
+             SELECT actor_id, sequence, schema_owner, schema_version, field_name, event_name, args, value
+             FROM events
+             ON CONFLICT (actor_id, sequence, field_name) DO NOTHING",
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -2178,12 +2252,11 @@ impl PersistenceStore for PostgresStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO events (actor_id, sequence, schema_owner, schema_version, field_name, event_name, args, value)
+            "INSERT INTO events_v2 (actor_id, sequence, schema_owner, schema_version, field_name, event_name, args, value)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             ON CONFLICT (actor_id, sequence) DO UPDATE SET
+             ON CONFLICT (actor_id, sequence, field_name) DO UPDATE SET
                schema_owner = EXCLUDED.schema_owner,
                schema_version = EXCLUDED.schema_version,
-               field_name = EXCLUDED.field_name,
                event_name = EXCLUDED.event_name,
                args = EXCLUDED.args,
                value = EXCLUDED.value",
@@ -2208,8 +2281,8 @@ impl PersistenceStore for PostgresStore {
             Err(_) => return Vec::new(),
         };
         let rows = match conn.query(
-            "SELECT sequence, schema_owner, schema_version, field_name, event_name, args, value FROM events
-             WHERE actor_id = $1 ORDER BY sequence ASC",
+            "SELECT sequence, schema_owner, schema_version, field_name, event_name, args, value FROM events_v2
+             WHERE actor_id = $1 ORDER BY sequence ASC, field_name ASC",
             &[&(actor_id as i64)],
         ) {
             Ok(r) => r,
@@ -2270,7 +2343,7 @@ impl PersistenceStore for PostgresStore {
             .map(|row| row.get(0));
         let event_seq: Option<i64> = conn
             .query_opt(
-                "SELECT sequence FROM events WHERE actor_id = $1 ORDER BY sequence DESC LIMIT 1",
+                "SELECT sequence FROM events_v2 WHERE actor_id = $1 ORDER BY sequence DESC LIMIT 1",
                 &[&(actor_id as i64)],
             )
             .ok()
@@ -2285,7 +2358,7 @@ impl PersistenceStore for PostgresStore {
 
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        for table in ["snapshots", "journal", "workflow_events", "events"] {
+        for table in ["snapshots", "journal", "workflow_events", "events", "events_v2"] {
             conn.execute(
                 &format!("DELETE FROM {} WHERE actor_id = $1", table),
                 &[&(actor_id as i64)],
