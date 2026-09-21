@@ -303,20 +303,20 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
         self.perform_builtin_effect(effect_name, op_name, &module.constants, regs)
     }
 
-    /// Dispatch a module-load-classified pure builtin. Runtime-backed
-    /// callbacks keep their existing policy/authority path by default;
-    /// callback implementations may override this for allocation-free enum
-    /// dispatch when the operation is semantically self-contained.
+    /// Fast hook for a module-load-classified pure builtin.
+    ///
+    /// Returning `None` declines specialization and preserves the ordinary
+    /// name-based callback path. Runtime-backed callbacks intentionally use
+    /// that default so policy, authority, and test interception remain in the
+    /// existing module-aware dispatch boundary.
     fn perform_builtin_id_in_module(
         &mut self,
         builtin: BuiltinEffectId,
-        effect_name: &str,
-        op_name: Option<&str>,
         module: &CodeModule,
         regs: &[Value],
     ) -> Option<Value> {
-        let _ = builtin;
-        self.perform_builtin_effect_in_module(effect_name, op_name, module, regs)
+        let _ = (builtin, module, regs);
+        None
     }
 
     /// Check whether a workflow signal has been received.
@@ -1021,8 +1021,6 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
     fn perform_builtin_id_in_module(
         &mut self,
         builtin: BuiltinEffectId,
-        _effect_name: &str,
-        _op_name: Option<&str>,
         module: &CodeModule,
         regs: &[Value],
     ) -> Option<Value> {
@@ -3919,6 +3917,32 @@ impl VM {
         let eff_name_idx = instr.imm16() as usize;
         let dst_reg = instr.op3;
 
+        // Handler-free pure builtins can bypass qualified-name resolution
+        // entirely. The cached ID is Copy, so this avoids even the Arc<str>
+        // refcount traffic of the Stage-1 parsed-name path. Runtime-backed
+        // callbacks decline this hook and continue through the ordinary
+        // module-aware policy/authority dispatch below.
+        if self.handler_stack.is_empty() {
+            let cached_builtin = self
+                .perform_name_cache
+                .get(module_idx)
+                .and_then(|module_cache| module_cache.get(eff_name_idx))
+                .and_then(|cached| cached.as_ref())
+                .and_then(|cached| cached.builtin);
+            if let (Some(builtin), Some(module)) =
+                (cached_builtin, self.modules.get(module_idx))
+            {
+                if let Some(result) = self.actor_callbacks.perform_builtin_id_in_module(
+                    builtin,
+                    module,
+                    &self.frames[frame_idx].regs,
+                ) {
+                    self.frames[frame_idx].regs[dst_reg as usize] = result;
+                    return Ok(());
+                }
+            }
+        }
+
         // The MIR pipeline encodes the performed operation as "Effect.op"
         // (e.g. "IO.print"). Resolve that stable identity from the module-load
         // cache so hot Perform sites do not clone/split/allocate owned Strings
@@ -4026,21 +4050,12 @@ impl VM {
         // actor bytecode (no user handler, empty handler_stack).
         if self.handler_stack.is_empty() {
             let result = match self.modules.get(module_idx) {
-                Some(module) => match cached_name.as_ref().and_then(|cached| cached.builtin) {
-                    Some(builtin) => self.actor_callbacks.perform_builtin_id_in_module(
-                        builtin,
-                        effect_name,
-                        op_name,
-                        module,
-                        &self.frames[frame_idx].regs,
-                    ),
-                    None => self.actor_callbacks.perform_builtin_effect_in_module(
-                        effect_name,
-                        op_name,
-                        module,
-                        &self.frames[frame_idx].regs,
-                    ),
-                },
+                Some(module) => self.actor_callbacks.perform_builtin_effect_in_module(
+                    effect_name,
+                    op_name,
+                    module,
+                    &self.frames[frame_idx].regs,
+                ),
                 None => self.actor_callbacks.perform_builtin_effect(
                     effect_name,
                     op_name,
@@ -4116,21 +4131,12 @@ impl VM {
             // are in r0..rn; string-id args resolve against the
             // performing module's constant pool.
             let result = match self.modules.get(module_idx) {
-                Some(module) => match cached_name.as_ref().and_then(|cached| cached.builtin) {
-                    Some(builtin) => self.actor_callbacks.perform_builtin_id_in_module(
-                        builtin,
-                        effect_name,
-                        op_name,
-                        module,
-                        &self.frames[frame_idx].regs,
-                    ),
-                    None => self.actor_callbacks.perform_builtin_effect_in_module(
-                        effect_name,
-                        op_name,
-                        module,
-                        &self.frames[frame_idx].regs,
-                    ),
-                },
+                Some(module) => self.actor_callbacks.perform_builtin_effect_in_module(
+                    effect_name,
+                    op_name,
+                    module,
+                    &self.frames[frame_idx].regs,
+                ),
                 None => self.actor_callbacks.perform_builtin_effect(
                     effect_name,
                     op_name,
