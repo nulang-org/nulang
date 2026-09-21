@@ -33,6 +33,8 @@ mod fabric_stream_epoch;
 mod grain;
 mod logical_actor_directory;
 mod logical_actor_persistence;
+#[cfg(feature = "sqlite")]
+mod logical_actor_libsql;
 mod network;
 mod object_store;
 mod orca_cycle;
@@ -108,6 +110,8 @@ pub use gc::{ForeignRefOp, GcStats, OrcaCoordinator, OrcaGc, OrcaHeap};
 pub use grain::*;
 pub use logical_actor_directory::*;
 pub use logical_actor_persistence::*;
+#[cfg(feature = "sqlite")]
+pub use logical_actor_libsql::*;
 pub use heap::*;
 pub use http_server::{render_route_handler, HttpMethod, HttpServerState, WebDevServer, WebRoute};
 pub use mailbox::*;
