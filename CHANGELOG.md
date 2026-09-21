@@ -1557,6 +1557,9 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### ORCA deferred reclamation scan reduction — 2026-09-21
+- **Deferred ORCA reclamation avoids redundant linear scans.** Foreign-ref reclamation no longer searches the deferred list twice, and `process_deferred` skips the self-removal lookup after it already `swap_remove`s the current header. Recursive child cleanup keeps the defensive removal path.
+
 ### Standard-library Option lookup contracts — 2026-09-21
 - **Collection absence is explicit.** Experimental `stdlib::map.get`, `stdlib::list.index_of`, and `stdlib::list.find` now return `Option` instead of sentinel `-1` values. `max_of`, `min_of`, `min_by`, and `max_by` now return `None` for empty inputs. Conformance fixtures and stdlib tests pin the new contracts. This is source-breaking for Experimental stdlib callers that compared missing results with integer sentinels.
 
