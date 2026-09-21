@@ -50,7 +50,8 @@ pub type Distance = {
 
 /// Construct a CRS-tagged point.
 pub fn point[CRS](x: Float, y: Float, crs: CRS) -> Point[CRS] {
-    { x: x, y: y, crs: crs }
+    let result: Point[CRS] = { x: x, y: y, crs: crs };
+    result
 }
 
 /// Construct a WGS84 point using longitude (x), latitude (y) axis order.
@@ -83,13 +84,14 @@ pub fn bounding_box[CRS](
     let max_x = if x1 <= x2 then x2 else x1;
     let min_y = if y1 <= y2 then y1 else y2;
     let max_y = if y1 <= y2 then y2 else y1;
-    {
+    let result: BoundingBox[CRS] = {
         min_x: min_x,
         min_y: min_y,
         max_x: max_x,
         max_y: max_y,
         crs: crs
-    }
+    };
+    result
 }
 
 /// Return true when a WGS84 point is inside legal lon/lat ranges.
@@ -132,13 +134,14 @@ pub fn expand[CRS](
     dx: Float,
     dy: Float
 ) -> BoundingBox[CRS] {
-    {
+    let result: BoundingBox[CRS] = {
         min_x: bounds.min_x - dx,
         min_y: bounds.min_y - dy,
         max_x: bounds.max_x + dx,
         max_y: bounds.max_y + dy,
         crs: bounds.crs
-    }
+    };
+    result
 }
 
 /// Return the squared Euclidean distance between points in the same CRS.
@@ -157,12 +160,14 @@ pub fn distance_2d[CRS](a: Point[CRS], b: Point[CRS]) -> Float {
 
 /// Construct a distance from meters.
 pub fn meters(value: Float) -> Distance {
-    { meters: value }
+    let result: Distance = { meters: value };
+    result
 }
 
 /// Construct a distance from kilometers.
 pub fn kilometers(value: Float) -> Distance {
-    { meters: value * 1000.0 }
+    let result: Distance = { meters: value * 1000.0 };
+    result
 }
 
 /// Read a distance in kilometers.
