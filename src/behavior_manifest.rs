@@ -1052,6 +1052,24 @@ fn main() {
     }
 
     #[test]
+    fn compiler_host_effect_fixture_matches_checked_source() {
+        let manifest = emit(
+            r#"
+fn main() {
+    perform Comms.send("p", "sms", "from", "to", "body", "media", "key", "meta")
+}
+"#,
+        );
+
+        let actual = serde_json::to_value(manifest).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../spec/behavior/examples/compiler-host-effect.behavior.json"
+        ))
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn process_and_ffi_are_not_overclaimed_as_replayable() {
         let manifest = emit(
             r#"
