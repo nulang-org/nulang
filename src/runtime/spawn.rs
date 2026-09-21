@@ -84,12 +84,12 @@ pub(crate) fn spawn_actor_with_id(
     };
 
     if let Some((snapshot, _)) = restart_snapshot.as_ref() {
-        let owner_mismatch = snapshot
-            .schema_owner
-            .as_deref()
-            .zip(schema_owner)
-            .is_some_and(|(persisted, current)| persisted != current);
-        if snapshot.schema_version != schema_version || owner_mismatch {
+        if !crate::runtime::persistence::durable_schema_compatible(
+            snapshot.schema_owner.as_deref(),
+            snapshot.schema_version,
+            schema_owner,
+            schema_version,
+        ) {
             tracing::warn!(
                 actor_id = id,
                 persisted_schema_owner = ?snapshot.schema_owner,
@@ -97,6 +97,27 @@ pub(crate) fn spawn_actor_with_id(
                 persisted_schema_version = snapshot.schema_version,
                 current_schema_version = schema_version,
                 "refusing to activate persistent actor with incompatible durable schema; migration execution is not implemented"
+            );
+            return id;
+        }
+    }
+
+    if persistent && workflow.is_none() {
+        if let Some(event) = rt.persistence.read_events(id).into_iter().find(|event| {
+            !crate::runtime::persistence::durable_schema_compatible(
+                event.schema_owner.as_deref(),
+                event.schema_version,
+                schema_owner,
+                schema_version,
+            )
+        }) {
+            tracing::warn!(
+                actor_id = id,
+                persisted_schema_owner = ?event.schema_owner,
+                current_schema_owner = ?schema_owner,
+                persisted_schema_version = event.schema_version,
+                current_schema_version = schema_version,
+                "refusing to replay incompatible event-sourced state; migration execution is not implemented"
             );
             return id;
         }
