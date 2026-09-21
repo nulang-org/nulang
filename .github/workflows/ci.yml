@@ -329,6 +329,55 @@ jobs:
           fi
 
   # -----------------------------------------------------------------------
+  # Same-host Nulang vs BEAM evidence — informational, never a merge ranking.
+  # Runs only on the dedicated benchmark PR so normal changes do not pay for
+  # installing Erlang or compiling the matched release harness.
+  # -----------------------------------------------------------------------
+  beam-parity-evidence:
+    name: Same-host Nulang vs BEAM actor baseline
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'perf/beam-parity')
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies and Erlang
+        run: sudo apt-get update && sudo apt-get install -y python3-dev erlang-base
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build matched Nulang harness
+        run: |
+          CARGO_TARGET_DIR=/tmp/nulang-beam-target \
+            cargo build --release --example beam_parity
+
+      - name: Run matched 1k / 10k actor workloads
+        run: |
+          mkdir -p /tmp/beam-parity-results
+          /tmp/nulang-beam-target/release/examples/beam_parity 1000 10000 \
+            | tee /tmp/beam-parity-results/nulang.csv
+          escript benchmarks/beam/beam_parity.escript 1000 10000 \
+            | tee /tmp/beam-parity-results/beam.csv
+
+      - name: Render comparison
+        run: |
+          python3 scripts/compare_beam_parity.py \
+            --nulang /tmp/beam-parity-results/nulang.csv \
+            --beam /tmp/beam-parity-results/beam.csv \
+            | tee /tmp/beam-parity-results/summary.md
+          cat /tmp/beam-parity-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload same-host evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: beam-parity-${{ github.sha }}
+          path: /tmp/beam-parity-results
+          retention-days: 90
+
+  # -----------------------------------------------------------------------
   # Actor density A/B gate — runs only for actor-density PR branches.
   #
   # Builds the PR base and head into separate target directories, then runs
