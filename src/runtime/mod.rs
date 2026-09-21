@@ -1752,8 +1752,7 @@ impl Runtime {
         // `send_message_by_id`; see RFC-0007 note there).
         if !self.actors.contains_key(&target_id) {
             if let Some(node) = self.remote_refs.get(&target_id).copied() {
-                self.route_ref_send(target_id, node, behavior, args);
-                return MessageAdmission::Forwarded;
+                return self.route_ref_send(target_id, node, behavior, args);
             }
         }
 
@@ -1786,20 +1785,26 @@ impl Runtime {
     /// resolved via `remote_refs`): queue while the spawn placeholder is
     /// still pending, otherwise translate the placeholder to the real
     /// actor id (if applicable) and send over the wire.
-    fn route_ref_send(&mut self, target_id: u64, node: NodeId, behavior: &str, args: &[Value]) {
+    fn route_ref_send(
+        &mut self,
+        target_id: u64,
+        node: NodeId,
+        behavior: &str,
+        args: &[Value],
+    ) -> MessageAdmission {
         if self.spawn_placeholders.contains(&target_id)
             && !self.pending_spawn_responses.contains_key(&target_id)
         {
             // SpawnResponse still in flight: queue the pre-resolved wire
             // form; it flushes when the real actor id arrives.
-            distribution::queue_spawn_message(self, target_id, node, behavior, args);
+            distribution::queue_spawn_message(self, target_id, node, behavior, args)
         } else {
             let real_id = self
                 .spawn_translations
                 .get(&target_id)
                 .copied()
                 .unwrap_or(target_id);
-            self.send_distributed(ActorAddress::remote(node, real_id), behavior, args);
+            self.try_send_distributed(ActorAddress::remote(node, real_id), behavior, args)
         }
     }
 
@@ -2487,8 +2492,7 @@ impl Runtime {
                     );
                     return MessageAdmission::Rejected;
                 };
-                self.route_ref_send(target_id, node, &behavior_name, args);
-                return MessageAdmission::Forwarded;
+                return self.route_ref_send(target_id, node, &behavior_name, args);
             }
         }
         // Forwarding for migrated actors: if this actor has been relocated
@@ -2514,8 +2518,7 @@ impl Runtime {
                 return MessageAdmission::Rejected;
             };
             let target = ActorAddress::remote(target_node, target_id);
-            self.send_distributed(target, &behavior_name, args);
-            return MessageAdmission::Forwarded;
+            return self.try_send_distributed(target, &behavior_name, args);
         }
         // Cross-shard routing: if the target actor lives on another shard,
         // forward via the cross-shard channel. The receiving shard delivers it
@@ -6595,6 +6598,16 @@ impl Runtime {
         args: &[Value],
     ) -> TrackedSendAdmission {
         distribution::try_send_distributed_tracked(self, target, behavior, args)
+    }
+
+    /// Attempt distributed delivery without blocking on the transport queue.
+    pub fn try_send_distributed(
+        &mut self,
+        target: ActorAddress,
+        behavior: &str,
+        args: &[Value],
+    ) -> MessageAdmission {
+        distribution::try_send_distributed(self, target, behavior, args)
     }
 
     pub fn send_distributed(&mut self, target: ActorAddress, behavior: &str, args: &[Value]) {
