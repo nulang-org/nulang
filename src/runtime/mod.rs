@@ -5143,13 +5143,13 @@ impl Runtime {
         store: &crate::artifact_store::FileArtifactStore,
         identity_policy: RecoveryIdentityPolicy,
     ) -> Result<u64, NuError> {
-        let snapshot = self
-            .persistence
-            .load_snapshot(actor_id)
-            .ok_or_else(|| NuError::RuntimeError {
-                msg: format!("actor {actor_id} has no durable snapshot"),
-                span: Span::new(0, 0),
-            })?;
+        let snapshot =
+            self.persistence
+                .load_snapshot(actor_id)
+                .ok_or_else(|| NuError::RuntimeError {
+                    msg: format!("actor {actor_id} has no durable snapshot"),
+                    span: Span::new(0, 0),
+                })?;
 
         let artifact_id = snapshot
             .artifact_id
@@ -5181,14 +5181,15 @@ impl Runtime {
                 span: Span::new(0, 0),
             })?;
 
-        let module = store
-            .load_identified_module(artifact_id)
-            .map_err(|error| NuError::RuntimeError {
-                msg: format!(
+        let module =
+            store
+                .load_identified_module(artifact_id)
+                .map_err(|error| NuError::RuntimeError {
+                    msg: format!(
                     "cannot load retained executable {artifact_id} for actor {actor_id}: {error}"
                 ),
-                span: Span::new(0, 0),
-            })?;
+                    span: Span::new(0, 0),
+                })?;
 
         let mut matching_definitions = module
             .actor_semantic_ids
