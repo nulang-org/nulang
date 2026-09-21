@@ -587,7 +587,7 @@ mod tests {
         mb.push(make_msg(2, 200)).unwrap();
         mb.push(make_msg(3, 300)).unwrap();
         let found = mb.receive_match(&[2]);
-        assert_eq!(found, Some((0, Arc::new(vec![Value::int(42)]))));
+        assert_eq!(found, Some((0, MessagePayload::from_slice(&[Value::int(42)]))));
         mb.commit_receive_match();
         assert_eq!(mb.len(), 2);
         assert_eq!(mb.pop().unwrap().behavior_id, 1);
