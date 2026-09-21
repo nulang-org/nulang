@@ -114,7 +114,7 @@ pub use object_store::*;
 pub use orca_cycle::*;
 pub use persistence::*;
 pub use process_groups::*;
-pub use reactive::StateReadSet;
+pub use reactive::{StateReadSet, StateVersion};
 pub use registry::*;
 pub use resp_cache::*;
 pub use scheduler::*;
@@ -679,8 +679,14 @@ impl Runtime {
     /// empty-scope check inside the tracker.
     pub(crate) fn record_reactive_state_read(&self, actor_id: u64, field: &str) {
         if let Some(actor) = self.actors.get(&actor_id) {
-            self.reactive_reads
-                .record(actor_id, field, actor.state_revision(field));
+            self.reactive_reads.record(
+                actor_id,
+                field,
+                StateVersion {
+                    incarnation: actor.state_incarnation(),
+                    revision: actor.state_revision(field),
+                },
+            );
         }
     }
 
@@ -688,9 +694,10 @@ impl Runtime {
     /// revision. Missing actors are stale.
     pub fn state_read_set_is_current(&self, reads: &StateReadSet) -> bool {
         reads.is_current_with(|actor_id, field| {
-            self.actors
-                .get(&actor_id)
-                .map(|actor| actor.state_revision(field))
+            self.actors.get(&actor_id).map(|actor| StateVersion {
+                incarnation: actor.state_incarnation(),
+                revision: actor.state_revision(field),
+            })
         })
     }
 
