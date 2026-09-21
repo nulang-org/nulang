@@ -1,0 +1,1 @@
+{"exit_code":0,"stdout":"write=ok\nread=hello\nappend=ok\nread2=hello!\nmissing=error","stderr":""}
