@@ -165,7 +165,7 @@ pub fn serialize_continuation(
     let mut buf = Vec::new();
     write_header(&mut buf, module_hash, &ctx);
     write_string_table(&mut buf, &ctx);
-    write_objects(&mut buf, &ctx);
+    write_objects(&mut buf, &ctx)?;
     write_closures(&mut buf, &ctx);
     write_frames(&mut buf, &ctx)?;
     write_handlers(&mut buf, &ctx);
@@ -344,6 +344,12 @@ fn walk_value(
                     walk_value(ctx, *slot, vm, module_idx)?;
                 }
             }
+            TypeTag::ArrayBuilder => {
+                return Err(
+                    "live ArrayBuilder cannot cross a durable continuation boundary; materialize it with ArrayBuilder.to_array first"
+                        .to_string(),
+                );
+            }
             TypeTag::String | TypeTag::ActorRef | TypeTag::RemoteActor | TypeTag::Raw => {}
         }
     }
@@ -414,12 +420,18 @@ fn write_string_table(buf: &mut Vec<u8>, ctx: &SerializeCtx) {
     }
 }
 
-fn write_objects(buf: &mut Vec<u8>, ctx: &SerializeCtx) {
+fn write_objects(buf: &mut Vec<u8>, ctx: &SerializeCtx) -> Result<(), String> {
     for obj in &ctx.objects {
         buf.push(obj.type_tag as u8);
         buf.extend_from_slice(&obj.payload_size.to_be_bytes());
 
         match obj.type_tag {
+            TypeTag::ArrayBuilder => {
+                return Err(
+                    "durable continuation format v1 does not support ArrayBuilder objects"
+                        .to_string(),
+                );
+            }
             TypeTag::Array
             | TypeTag::Record
             | TypeTag::Tuple
@@ -436,6 +448,11 @@ fn write_objects(buf: &mut Vec<u8>, ctx: &SerializeCtx) {
                     buf.extend_from_slice(&sv.to_le_bytes());
                 }
             }
+            TypeTag::ArrayBuilder => {
+                return Err(
+                    "internal error: ArrayBuilder reached durable object writer".to_string(),
+                );
+            }
             _ => {
                 // Non-container: copy payload verbatim.
                 let payload_slice = unsafe {
@@ -445,6 +462,7 @@ fn write_objects(buf: &mut Vec<u8>, ctx: &SerializeCtx) {
             }
         }
     }
+    Ok(())
 }
 
 /// Serialize a single Value into its portable 8-byte form.
@@ -977,6 +995,9 @@ mod tests {
             let back = TypeTag::from_u8(v).unwrap();
             assert_eq!(back, tag);
         }
+        // ArrayBuilder is intentionally runtime-only and is not a durable
+        // continuation format-v1 tag.
+        assert!(TypeTag::from_u8(TypeTag::ArrayBuilder as u8).is_none());
         assert!(TypeTag::from_u8(255).is_none());
     }
 }
