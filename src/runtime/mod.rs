@@ -6000,12 +6000,7 @@ impl Runtime {
         nbc_bytes: Vec<u8>,
         snapshot_json: Vec<u8>,
     ) -> bool {
-        self.receive_migrated_actor_with_provenance(
-            actor_id,
-            nbc_bytes,
-            snapshot_json,
-            None,
-        )
+        self.receive_migrated_actor_with_provenance(actor_id, nbc_bytes, snapshot_json, None)
     }
 
     /// Provenance-preserving migration receiver used by NUL0 packet handling
@@ -6143,18 +6138,17 @@ impl Runtime {
                     return false;
                 }
             };
-        let verified_execution_artifact_id =
-            match Self::verify_snapshot_execution_artifact_identity(
-                actor_id,
-                &snapshot,
-                module.artifact_id,
-            ) {
-                Ok(identity) => identity,
-                Err(error) => {
-                    tracing::warn!("nulang-migrate: refusing {error}");
-                    return false;
-                }
-            };
+        let verified_execution_artifact_id = match Self::verify_snapshot_execution_artifact_identity(
+            actor_id,
+            &snapshot,
+            module.artifact_id,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                tracing::warn!("nulang-migrate: refusing {error}");
+                return false;
+            }
+        };
 
         let fallback_is_workflow = module.actor_metadata.iter().any(|meta| meta.is_workflow);
         let fallback_is_agent = module.actor_metadata.iter().any(|meta| meta.is_agent);
@@ -7305,8 +7299,7 @@ impl Runtime {
             Some(identity) => {
                 let Ok(runtime_manifest) =
                     crate::runtime_artifact_manifest::RuntimeArtifactManifest::from_module(
-                        &module,
-                        identity,
+                        &module, identity,
                     )
                 else {
                     return;
