@@ -3009,6 +3009,17 @@ mod tests {
             "Account.$migration_state_1_2"
         );
         assert!(
+            module.functions[function_idx].blocks.iter().any(|block| {
+                block.stmts.iter().any(|stmt| {
+                    matches!(
+                        stmt,
+                        mir::Stmt::StateSet { field, .. } if field == "balance"
+                    )
+                })
+            }),
+            "compiled migration function must contain the state mutation"
+        );
+        assert!(
             module
                 .behaviors
                 .iter()
