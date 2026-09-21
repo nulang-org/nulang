@@ -5596,6 +5596,18 @@ impl Runtime {
             }
         };
 
+        // Frozen NBC v1 does not embed the semantic sidecar, so an identified
+        // snapshot arriving through this legacy transport cannot be verified
+        // against the received bytecode. Reject it rather than trusting the
+        // snapshot to self-certify the code that should execute its state.
+        if snapshot.semantic_id.is_some() {
+            tracing::warn!(
+                "nulang-migrate: refusing identified snapshot for actor {} over legacy NBC v1 transport",
+                actor_id
+            );
+            return false;
+        }
+
         let is_workflow = module.actor_metadata.iter().any(|m| m.is_workflow);
         let is_agent = module.actor_metadata.iter().any(|m| m.is_agent);
 
@@ -6733,7 +6745,14 @@ impl Runtime {
         if shadow == home {
             return;
         }
-        let Ok(snapshot_json) = serde_json::to_vec(snapshot) else {
+        // Shadow replication still transports frozen NBC v1, which cannot
+        // prove the in-memory semantic-identity sidecar on the receiving node.
+        // Preserve the strongly identified local snapshot, but send an
+        // explicitly legacy/unverified replica until the transport carries a
+        // verifiable artifact manifest.
+        let mut replicated_snapshot = snapshot.clone();
+        replicated_snapshot.semantic_id = None;
+        let Ok(snapshot_json) = serde_json::to_vec(&replicated_snapshot) else {
             return;
         };
         let module = match self
