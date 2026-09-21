@@ -1970,8 +1970,8 @@ fn test_libsql_store_save_load_snapshot() {
     let snapshot = ActorSnapshot {
         actor_id: 1,
         sequence: 3,
-        schema_owner: None,
-        schema_version: 1,
+        schema_owner: Some("Counter".to_string()),
+        schema_version: 3,
         state,
         waiting_signal: None,
         crdt_snapshot: None,
@@ -1983,6 +1983,8 @@ fn test_libsql_store_save_load_snapshot() {
     let loaded = store.load_snapshot(1).unwrap();
     assert_eq!(loaded.actor_id, 1);
     assert_eq!(loaded.sequence, 3);
+    assert_eq!(loaded.schema_owner.as_deref(), Some("Counter"));
+    assert_eq!(loaded.schema_version, 3);
     assert_eq!(loaded.state.get("count"), Some(&PersistedValue::Int(42)));
 }
 
