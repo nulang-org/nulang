@@ -3593,6 +3593,12 @@ impl TypeChecker {
                 span,
             )?;
             subst = compose_subst(&s_match, &subst);
+            let resolved = apply_subst(&arg_ty, &subst);
+            Self::reject_secret_boundary(
+                &resolved,
+                "an actor message boundary",
+                arg.span(),
+            )?;
         }
 
         Ok((subst.clone(), apply_subst(ret, &subst)))
