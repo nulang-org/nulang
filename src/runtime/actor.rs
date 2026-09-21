@@ -48,7 +48,6 @@ pub enum ActorPriority {
 
 // -- Flight recorder (deterministic replay support) ---------------------
 
-
 /// Number of diagnostic flight-recorder entries retained per actor.
 ///
 /// Disabled by default because recording formats payload values on every
@@ -62,7 +61,6 @@ fn configured_flight_recorder_entries() -> usize {
             .unwrap_or(0)
     })
 }
-
 
 /// A single entry in an actor's flight-recorder trace.  Captures enough
 /// information to deterministically replay the message sequence that led
