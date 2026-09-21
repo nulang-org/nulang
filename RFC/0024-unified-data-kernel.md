@@ -1,6 +1,6 @@
 # RFC 0024: Unified Data Kernel
 
-- **Status:** Draft — Phase 1 storage-native scans in progress
+- **Status:** Draft — Phase 1 durable change substrate substantially implemented
 - **Tier:** Experimental
 - **Created:** 2026-09-21
 
@@ -124,6 +124,24 @@ A cursor is the tuple:
 
 A sequence number alone is not sufficient because multiple committed records
 may share one actor sequence.
+
+Commit identity is actor-scoped:
+
+```text
+DurableCommitId = (actor_id, sequence)
+DurableRecordId = (DurableCommitId, lane, ordinal)
+```
+
+This is deliberately not a cluster-wide global sequence. Independent actors
+and shards can commit without coordinating through a global counter. Physical
+storage may compact, rewrite, migrate, or tier records, but it must preserve
+the logical actor sequence and canonical same-sequence record ordering, so
+commit/record identity does not depend on a database row id, broker offset,
+LSM position, or file byte offset.
+
+Nulang Cloud extends the runtime commit identity with trusted tenant identity;
+broker partition/offset remains a transport cursor rather than application
+commit identity.
 
 The Phase 0 adapter establishes consumer semantics without changing storage.
 It is not the final high-throughput implementation because existing
@@ -308,9 +326,18 @@ This RFC does not propose:
 - [x] Add batch event append semantics; Memory and RocksDB batch natively,
   libSQL/PostgreSQL use transactions, and runtime event-sourced state rolls
   back if persistence fails.
-- [ ] Make workflow event + checkpoint publication one atomic durable commit.
-- [ ] Introduce compaction-stable global commit identity.
-- [ ] Benchmark cursor scan latency/allocation and set regression budgets.
+- [x] Make workflow event + checkpoint publication one atomic durable commit
+  across Memory, JSONL commit records, libSQL transactions, RocksDB write
+  batches, and PostgreSQL transactions.
+- [x] Introduce compaction-stable actor-scoped `DurableCommitId` and
+  `DurableRecordId`; explicitly avoid a global sequencer.
+- [x] Extend Nulang Cloud with tenant-scoped derived commit/record identity
+  independent of broker offsets.
+- [x] Add a 100k-history bounded tail-scan benchmark and route it through the
+  existing rolling median/MAD regression gate. The benchmark becomes blocking
+  after the gate accumulates the required three prior main-branch samples.
+- [ ] Record the first three main-branch scan samples and document the resulting
+  regression envelope in performance analysis.
 
 ### Phase 2 — typed indexes and query plan
 
