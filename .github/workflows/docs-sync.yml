@@ -79,10 +79,10 @@ jobs:
 
       - name: Open or update generated-assets PR
         env:
-          # Optional PAT/GitHub-App token avoids the approval gate GitHub
-          # applies to PR workflows created by GITHUB_TOKEN. Without it, the
-          # generated-assets PR is still created safely but a maintainer must
-          # approve its workflow runs in the PR UI.
+          # Optional PAT/GitHub-App token permits automatic PR creation where
+          # repository policy disables that action for GITHUB_TOKEN. Without
+          # it, the generated branch is still persisted and PR publication is
+          # best-effort rather than a false CI failure.
           GH_TOKEN: ${{ secrets.DOCS_SYNC_TOKEN || github.token }}
         run: |
           git config user.name "github-actions[bot]"
@@ -99,17 +99,19 @@ jobs:
           git commit -m "docs: auto-sync generated site assets"
           git push --force origin "HEAD:$sync_branch"
 
-          pr_number="$(gh pr list --head "$sync_branch" --base main --state open --json number --jq '.[0].number // empty')"
+          pr_number="$(gh pr list --head "$sync_branch" --base main --state open --json number --jq '.[0].number // empty' || true)"
           if [ -n "$pr_number" ]; then
             gh pr edit "$pr_number" \
               --title "docs: sync generated site assets" \
-              --body "Automated refresh of generated standard-library/API docs and the browser-playground bundle from the current main branch."
+              --body "Automated refresh of generated standard-library/API docs and the browser-playground bundle from the current main branch." \
+              || echo "::warning::Generated docs branch updated, but the workflow token could not edit PR #$pr_number."
           else
             gh pr create \
               --base main \
               --head "$sync_branch" \
               --title "docs: sync generated site assets" \
-              --body "Automated refresh of generated standard-library/API docs and the browser-playground bundle from the current main branch."
+              --body "Automated refresh of generated standard-library/API docs and the browser-playground bundle from the current main branch." \
+              || echo "::warning::Generated docs branch updated, but repository policy prevented the workflow token from creating a PR."
           fi
 
       - name: Ping DeepWiki to refresh index
