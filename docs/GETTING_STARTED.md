@@ -389,8 +389,10 @@ as `nulang nula <cmd>`:
 ```bash
 nulang nula new my-project     # scaffold a new package
 nulang nula init               # scaffold in the current directory
-nulang nula build              # resolve deps and type-check
-nulang nula build-wasm         # build to .wasm (requires wasmtime)
+nulang build                   # resolve deps + build bytecode package artifact
+nulang build --target wasm     # portable package WASM in .nula/dist/
+nulang build --target cwasm    # portable WASM + Wasmtime AOT sidecar
+nulang nula build-wasm         # compatibility alias for --target cwasm
 nulang nula run                # build and run
 nulang nula run --watch        # re-run on file changes
 nulang nula test               # run test files in tests/
