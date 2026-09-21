@@ -1,0 +1,130 @@
+---
+const evidence = [
+  {
+    eyebrow: 'Run it',
+    title: 'Browser playground',
+    body: 'Compile and run the frozen Core subset locally in your browser. The playground reuses the real lexer, parser, typechecker, MIR lowering, bytecode generator, and CoreVM sources.',
+    href: '/playground/',
+    cta: 'Open the playground',
+    external: false,
+  },
+  {
+    eyebrow: 'Verify it',
+    title: 'Conformance suite',
+    body: 'Inspect executable behavior cases instead of relying on prose. The conformance corpus records expected results for language and runtime semantics.',
+    href: 'https://github.com/nulang-org/nulang/tree/main/conformance',
+    cta: 'Browse conformance tests',
+    external: true,
+  },
+  {
+    eyebrow: 'Measure it',
+    title: 'Regression-gated benchmarks',
+    body: 'Criterion results are retained per main-branch commit and checked against a rolling noise-adaptive baseline. Performance claims should come from these measurements.',
+    href: 'https://github.com/nulang-org/nulang/tree/main/benchmarks',
+    cta: 'Inspect benchmark data',
+    external: true,
+  },
+];
+---
+
+<div class="evidence-grid" role="list" aria-label="Ways to verify Nulang">
+  {evidence.map((item) => (
+    <a
+      class="evidence-card"
+      href={item.href}
+      role="listitem"
+      target={item.external ? '_blank' : undefined}
+      rel={item.external ? 'noopener noreferrer' : undefined}
+    >
+      <span class="evidence-eyebrow">{item.eyebrow}</span>
+      <h3>{item.title}</h3>
+      <p>{item.body}</p>
+      <span class="evidence-cta">
+        {item.cta}
+        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M5 12h14" />
+          <path d="m12 5 7 7-7 7" />
+        </svg>
+      </span>
+    </a>
+  ))}
+</div>
+
+<style>
+  .evidence-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1rem;
+  }
+
+  @media (min-width: 48rem) {
+    .evidence-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+  }
+
+  .evidence-card {
+    display: flex;
+    min-height: 18rem;
+    flex-direction: column;
+    padding: 1.5rem;
+    border: 1px solid var(--nu-border);
+    border-radius: 1rem;
+    background: var(--nu-surface);
+    color: var(--nu-text);
+    text-decoration: none;
+    transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+  }
+
+  .evidence-card:hover {
+    transform: translateY(-2px);
+    border-color: color-mix(in srgb, var(--nu-accent-high) 45%, var(--nu-border));
+    box-shadow: 0 14px 36px rgba(0, 0, 0, 0.08);
+    text-decoration: none;
+  }
+
+  .evidence-eyebrow {
+    align-self: flex-start;
+    padding: 0.25rem 0.55rem;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--nu-accent-high) 10%, transparent);
+    color: var(--nu-accent-high);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  .evidence-card h3 {
+    margin: 1.1rem 0 0;
+    color: var(--nu-text);
+    font-size: 1.2rem;
+  }
+
+  .evidence-card p {
+    margin: 0.75rem 0 0;
+    color: var(--nu-text-secondary);
+    line-height: 1.65;
+  }
+
+  .evidence-cta {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    margin-top: auto;
+    padding-top: 1.5rem;
+    color: var(--nu-accent-high);
+    font-size: 0.9rem;
+    font-weight: 650;
+  }
+
+  .evidence-cta svg {
+    width: 1rem;
+    height: 1rem;
+    transition: transform 0.18s ease;
+  }
+
+  .evidence-card:hover .evidence-cta svg {
+    transform: translateX(3px);
+  }
+</style>
