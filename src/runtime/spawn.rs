@@ -343,6 +343,13 @@ pub(crate) fn spawn_from_module(
             1,
         )
     };
+    if !rt.actors.contains_key(&id) {
+        tracing::warn!(
+            actor_id = id,
+            "spawn preflight rejected actor; refusing to return an unresolved actor reference"
+        );
+        return Value::nil();
+    }
     let offsets: Vec<usize> = bytecode_offsets_for_role(module, role);
     // compensation_offsets filtered to this actor's own behaviors so
     // step-local indices in run_saga_compensation match.
