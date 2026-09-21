@@ -35,17 +35,17 @@ fn main() {
 
   // ── strict Option-based accessors ────────────────────────────────────
   assert(
-    match get(obj, "name") {
+    match get_field(obj, "name") {
       Some(JsonString(value)) => value == "nulang",
       _ => false,
     },
-    "get returns exact JsonValue")
+    "get_field returns exact JsonValue")
   assert(
-    match get(obj, "missing") {
+    match get_field(obj, "missing") {
       None => true,
       _ => false,
     },
-    "get distinguishes missing")
+    "get_field distinguishes missing")
   assert(
     match get_string_opt(obj, "name") {
       Some(value) => value == "nulang",
@@ -76,7 +76,7 @@ fn main() {
       Some(JsonNull) => true,
       _ => false,
     },
-    "get distinguishes null from missing")
+    "get_field distinguishes null from missing")
 
   // ── accessors on non-objects return the default ──────────────────────
   assert(get_string(JsonNull, "k", "d") == "d", "get_string on null")
