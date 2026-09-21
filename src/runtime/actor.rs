@@ -211,6 +211,11 @@ pub struct Actor {
     /// restarted actor receives a new incarnation even when its actor id is
     /// preserved, so old reactive read sets cannot become current by accident.
     state_incarnation: u64,
+    /// Monotonic actor-turn revision for conservative invalidation of
+    /// pointer-backed state. Mutable heap objects can change in place without
+    /// passing through `set_state_field`, so reactive queries that read a
+    /// pointer also depend on this turn token.
+    reactive_turn_revision: u64,
     pub event_log: Vec<(String, Vec<Value>)>, // Emitted events for event_sourced actors
     /// Last persisted event sequence per EventSourced field, for compaction tracking.
     pub event_sourced_sequences: HashMap<String, u64>,
@@ -366,6 +371,7 @@ impl Actor {
             state_models: HashMap::new(),
             state_revisions: HashMap::new(),
             state_incarnation: fresh_state_incarnation(),
+            reactive_turn_revision: 0,
             event_log: Vec::new(),
             event_sourced_sequences: HashMap::new(),
             event_sourced_compaction_interval: 100,
@@ -584,6 +590,22 @@ impl Actor {
     /// Process-local identity of this concrete actor activation.
     pub fn state_incarnation(&self) -> u64 {
         self.state_incarnation
+    }
+
+    /// Mark the beginning of one actor message turn.
+    ///
+    /// This revision is deliberately coarser than per-field revisions. It is
+    /// only used by reactive queries that observed pointer-backed state, where
+    /// in-place mutation can bypass `set_state_field`.
+    pub fn begin_reactive_turn(&mut self) {
+        self.reactive_turn_revision = self.reactive_turn_revision.wrapping_add(1);
+        if self.reactive_turn_revision == 0 {
+            self.reactive_turn_revision = 1;
+        }
+    }
+
+    pub fn reactive_turn_revision(&self) -> u64 {
+        self.reactive_turn_revision
     }
 
     /// Check if the actor has exceeded its per-turn reduction quota and should yield.
