@@ -1547,6 +1547,87 @@ impl PersistenceStore for LibsqlStore {
         })
     }
 
+    fn commit_workflow_event_and_snapshot(
+        &mut self,
+        actor_id: u64,
+        event: WorkflowEvent,
+        snapshot: ActorSnapshot,
+    ) -> io::Result<()> {
+        if event.sequence() != snapshot.sequence || snapshot.actor_id != actor_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow event and snapshot must describe the same actor sequence",
+            ));
+        }
+
+        let event_json = serde_json::to_string(&event)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let state_json = serde_json::to_string(&snapshot.state)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let crdt_json = serde_json::to_string(&snapshot.crdt_snapshot)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let crdt_field_map_json = serde_json::to_string(&snapshot.crdt_field_map)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let authority_json = serde_json::to_string(&snapshot.authority_tokens)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let conn = self.conn();
+
+        self.rt.block_on(async {
+            conn.execute("BEGIN IMMEDIATE", ())
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+            let result: io::Result<()> = async {
+                conn.execute(
+                    "INSERT INTO workflow_events (actor_id, sequence, event)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(actor_id, sequence) DO UPDATE SET event=excluded.event",
+                    libsql::params![actor_id as i64, event.sequence() as i64, event_json],
+                )
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+                conn.execute(
+                    "INSERT INTO snapshots
+                        (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(actor_id) DO UPDATE SET
+                        sequence=excluded.sequence,
+                        state=excluded.state,
+                        waiting_signal=excluded.waiting_signal,
+                        crdt_snapshot=excluded.crdt_snapshot,
+                        crdt_field_map=excluded.crdt_field_map,
+                        authority_tokens=excluded.authority_tokens",
+                    libsql::params![
+                        actor_id as i64,
+                        snapshot.sequence as i64,
+                        state_json,
+                        snapshot.waiting_signal.as_deref(),
+                        crdt_json.as_str(),
+                        crdt_field_map_json.as_str(),
+                        authority_json.as_str()
+                    ],
+                )
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+                Ok(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => conn
+                    .execute("COMMIT", ())
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string())),
+                Err(error) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    Err(error)
+                }
+            }
+        })
+    }
+
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
         let conn = self.conn();
         self.rt.block_on(async {
@@ -2091,6 +2172,40 @@ impl PersistenceStore for RocksDbStore {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
     }
 
+    fn commit_workflow_event_and_snapshot(
+        &mut self,
+        actor_id: u64,
+        event: WorkflowEvent,
+        snapshot: ActorSnapshot,
+    ) -> io::Result<()> {
+        if event.sequence() != snapshot.sequence || snapshot.actor_id != actor_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow event and snapshot must describe the same actor sequence",
+            ));
+        }
+
+        let workflow_cf = self.cf(Self::CF_WORKFLOW_EVENTS)?;
+        let snapshot_cf = self.cf(Self::CF_SNAPSHOTS)?;
+        let event_json = serde_json::to_vec(&event)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let snapshot_json = serde_json::to_vec(&snapshot)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(
+            workflow_cf,
+            Self::actor_seq_key(actor_id, event.sequence()),
+            event_json,
+        );
+        batch.put_cf(snapshot_cf, Self::actor_key(actor_id), snapshot_json);
+        self.db
+            .write(batch)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        self.db
+            .flush_wal(true)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))
+    }
+
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
         let cf = match self.cf(Self::CF_WORKFLOW_EVENTS) {
             Ok(cf) => cf,
@@ -2591,6 +2706,69 @@ impl PersistenceStore for PostgresStore {
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         Ok(())
+    }
+
+    fn commit_workflow_event_and_snapshot(
+        &mut self,
+        actor_id: u64,
+        event: WorkflowEvent,
+        snapshot: ActorSnapshot,
+    ) -> io::Result<()> {
+        if event.sequence() != snapshot.sequence || snapshot.actor_id != actor_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow event and snapshot must describe the same actor sequence",
+            ));
+        }
+
+        let event_json = serde_json::to_string(&event)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let state_json = serde_json::to_string(&snapshot.state)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let crdt_json = serde_json::to_string(&snapshot.crdt_snapshot)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let crdt_field_map_json = serde_json::to_string(&snapshot.crdt_field_map)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let authority_json = serde_json::to_string(&snapshot.authority_tokens)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut conn = self.conn.lock().unwrap();
+        let mut tx = conn
+            .transaction()
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+        tx.execute(
+            "INSERT INTO workflow_events (actor_id, sequence, event)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (actor_id, sequence) DO UPDATE SET event = EXCLUDED.event",
+            &[&(actor_id as i64), &(event.sequence() as i64), &event_json],
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+        tx.execute(
+            "INSERT INTO snapshots
+                (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (actor_id) DO UPDATE SET
+                sequence = EXCLUDED.sequence,
+                state = EXCLUDED.state,
+                waiting_signal = EXCLUDED.waiting_signal,
+                crdt_snapshot = EXCLUDED.crdt_snapshot,
+                crdt_field_map = EXCLUDED.crdt_field_map,
+                authority_tokens = EXCLUDED.authority_tokens",
+            &[
+                &(actor_id as i64),
+                &(snapshot.sequence as i64),
+                &state_json,
+                &snapshot.waiting_signal.as_deref(),
+                &crdt_json.as_str(),
+                &crdt_field_map_json.as_str(),
+                &authority_json.as_str(),
+            ],
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+        tx.commit()
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))
     }
 
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
