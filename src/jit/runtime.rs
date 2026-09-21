@@ -456,6 +456,20 @@ pub fn aot_take_pending_error() -> Option<String> {
     AOT_PENDING_ERROR.with(|e| e.borrow_mut().take())
 }
 
+/// Record an explicit Nulang panic from compiled native code.
+///
+/// Native code cannot unwind through the Cranelift/JIT ABI. The codegen emits
+/// this helper followed by an immediate return; the AOT driver observes the
+/// pending error after the native call returns and surfaces it as NuError.
+/// This preserves the language-level diverging behavior without Rust unwinding.
+#[no_mangle]
+pub extern "C" fn nulang_panic(message_raw: u64) -> u64 {
+    let message = resolve_string_coerce(message_raw)
+        .unwrap_or_else(|| unsafe { Value::from_raw(message_raw) }.to_string_repr());
+    aot_set_pending_error(format!("Panic: {message}"));
+    Value::nil().as_raw()
+}
+
 pub unsafe fn set_jit_callbacks(cb: *mut dyn crate::vm::ActorVmCallbacks) {
     JIT_CALLBACKS.with(|cell| {
         *cell.get() = CbPair::from_ptr(cb);
