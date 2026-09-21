@@ -61,6 +61,32 @@ Candidate implementation order:
    allocations and choose the smallest initial size that does not materially
    regress normal actors.
 
+## Same-host actor-density A/B gate
+
+Actor-density PR branches (`perf/actor-density*`) run an additional CI job that
+compares the PR base and candidate on the **same GitHub Actions runner**. This
+avoids treating absolute shared-runner measurements as stable across unrelated
+jobs.
+
+The gate builds both revisions in release mode and runs the density probe at
+10k and 100k resident actors. It records:
+
+- RSS delta and RSS bytes per idle actor;
+- initial actor-heap capacity per actor;
+- actor spawn throughput;
+- one-message-per-actor fan-out throughput;
+- shutdown/reclamation time and post-shutdown RSS.
+
+The candidate must reduce initial actor heap capacity to at most 25% of the
+base and improve RSS/actor by at least 25%. Spawn and fan-out throughput each
+have a 25% regression budget to absorb shared-runner noise; crossing that
+budget fails the job and requires investigation rather than silently accepting
+the memory/throughput trade.
+
+The raw base/candidate outputs and comparison summary are uploaded as the
+`actor-density-<pr>-<sha>` workflow artifact. These CI results are a merge
+gate for density changes, not a substitute for the fixed-host 500k/1M ladder.
+
 ## Manual density ladder
 
 Density tests should not run on every shared CI push. Run them deliberately on
@@ -91,8 +117,8 @@ For each stage record:
 - wall-clock actor creation time;
 - peak RSS and virtual memory;
 - bytes per idle actor (`(RSS_after - RSS_before) / actor_count`);
-- scheduler drain time after one message per actor;
-- p50/p95/p99 end-to-end message latency under load;
+- one-message-per-actor fan-out throughput and drain time;
+- p50/p95/p99 end-to-end message latency under sustained load (separate harness);
 - shutdown/reclamation time and residual RSS.
 
 ## Durable-actor benchmark track
