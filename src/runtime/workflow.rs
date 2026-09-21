@@ -9,8 +9,52 @@ use crate::bytecode::Constant;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{EventEntry, PersistedValue, WorkflowEvent};
-use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
+use crate::runtime::{
+    QueryDistributedCallbacks, QueryPurityGuard, Runtime, StateModel, StateReadSet,
+};
 use crate::vm::{Frame, Value, VM};
+use std::fmt;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowQueryError {
+    ActorNotFound(u64),
+    NotWorkflow(u64),
+    HandlerNotFound { actor_id: u64, name: String },
+    MissingModule(u64),
+    InvalidHandler(String),
+    PurityViolation { operation: String },
+    Execution(String),
+}
+
+impl fmt::Display for WorkflowQueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WorkflowQueryError::ActorNotFound(actor_id) => {
+                write!(f, "workflow actor {actor_id} not found")
+            }
+            WorkflowQueryError::NotWorkflow(actor_id) => {
+                write!(f, "actor {actor_id} is not a workflow")
+            }
+            WorkflowQueryError::HandlerNotFound { actor_id, name } => {
+                write!(f, "workflow actor {actor_id} has no query handler '{name}'")
+            }
+            WorkflowQueryError::MissingModule(actor_id) => {
+                write!(f, "workflow actor {actor_id} has no bytecode module")
+            }
+            WorkflowQueryError::InvalidHandler(message) => {
+                write!(f, "invalid workflow query handler: {message}")
+            }
+            WorkflowQueryError::PurityViolation { operation } => {
+                write!(f, "workflow query attempted forbidden operation {operation}")
+            }
+            WorkflowQueryError::Execution(message) => {
+                write!(f, "workflow query execution failed: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WorkflowQueryError {}
 
 // ---------------------------------------------------------------------------
 // Utility predicates
@@ -311,23 +355,41 @@ pub(crate) fn register_workflow_query(rt: &mut Runtime, actor_id: u64, name: &st
 }
 
 /// Invoke a registered query handler on a workflow actor and return its result.
+///
+/// Compatibility API: all lookup, purity, and execution failures map to
+/// `None`. Call `query_workflow_checked` when the distinction matters.
 pub(crate) fn query_workflow(rt: &mut Runtime, actor_id: u64, name: &str) -> Option<Value> {
+    query_workflow_checked(rt, actor_id, name).ok()
+}
+
+/// Checked workflow-query API used by subscriptions and nested pure queries.
+pub(crate) fn query_workflow_checked(
+    rt: &mut Runtime,
+    actor_id: u64,
+    name: &str,
+) -> Result<Value, WorkflowQueryError> {
     execute_workflow_query(rt, actor_id, name, false).map(|(value, _)| value)
 }
 
-/// Invoke a workflow query while collecting field-level state dependencies.
+/// Invoke a workflow query and collect field-level dependencies.
 ///
-/// Tracking is opt-in: the legacy `query_workflow` path does not allocate or
-/// populate a read set. Nested tracked queries create nested scopes; every
-/// state read is recorded in each active scope so an outer result inherits
-/// cross-actor dependencies.
+/// Compatibility API: failures map to `None`; use the checked variant when a
+/// caller must distinguish an invalid query from an ordinary nil result.
 pub(crate) fn query_workflow_with_dependencies(
     rt: &mut Runtime,
     actor_id: u64,
     name: &str,
-) -> Option<(Value, super::StateReadSet)> {
+) -> Option<(Value, StateReadSet)> {
+    query_workflow_with_dependencies_checked(rt, actor_id, name).ok()
+}
+
+pub(crate) fn query_workflow_with_dependencies_checked(
+    rt: &mut Runtime,
+    actor_id: u64,
+    name: &str,
+) -> Result<(Value, StateReadSet), WorkflowQueryError> {
     let (value, reads) = execute_workflow_query(rt, actor_id, name, true)?;
-    Some((value, reads.unwrap_or_default()))
+    Ok((value, reads.unwrap_or_default()))
 }
 
 fn execute_workflow_query(
@@ -335,22 +397,43 @@ fn execute_workflow_query(
     actor_id: u64,
     name: &str,
     track_dependencies: bool,
-) -> Option<(Value, Option<super::StateReadSet>)> {
+) -> Result<(Value, Option<StateReadSet>), WorkflowQueryError> {
     let (handler, module) = {
-        let actor = rt.actors.get(&actor_id)?;
+        let actor = rt
+            .actors
+            .get(&actor_id)
+            .ok_or(WorkflowQueryError::ActorNotFound(actor_id))?;
         if !matches!(actor.role(), Ok(ActorRole::Workflow)) {
-            return None;
+            return Err(WorkflowQueryError::NotWorkflow(actor_id));
         }
-        let handler = *actor.query_handlers.get(name)?;
-        (handler, actor.bytecode_module.clone()?)
+        let handler = actor.query_handlers.get(name).copied().ok_or_else(|| {
+            WorkflowQueryError::HandlerNotFound {
+                actor_id,
+                name: name.to_string(),
+            }
+        })?;
+        let module = actor
+            .bytecode_module
+            .clone()
+            .ok_or(WorkflowQueryError::MissingModule(actor_id))?;
+        (handler, module)
     };
 
     let self_ptr: *mut Runtime = rt;
     let mut vm = VM::new();
     vm.load_module(module);
-    let offset = vm.function_offset_for_value(0, handler).ok()?;
-    vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::new(self_ptr, actor_id)));
-    vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks { runtime: self_ptr }));
+    let offset = vm
+        .function_offset_for_value(0, handler)
+        .map_err(|error| WorkflowQueryError::InvalidHandler(error.to_string()))?;
+
+    let guard = QueryPurityGuard::default();
+    vm.set_actor_callbacks(Box::new(crate::runtime::BytecodeRuntimeCallbacks::new_query(
+        self_ptr,
+        actor_id,
+        guard.clone(),
+    )));
+    vm.set_distributed_callbacks(Box::new(QueryDistributedCallbacks::new(guard.clone())));
+
     let mut frame = Frame::new(None, 0);
     frame.pc = offset;
     vm.set_current_frame(frame);
@@ -358,11 +441,16 @@ fn execute_workflow_query(
     if track_dependencies {
         rt.begin_reactive_query_tracking();
     }
-    let result = vm.run_from(0, offset).ok();
+    let result = vm.run_from(0, offset);
     let reads = track_dependencies
         .then(|| rt.finish_reactive_query_tracking().unwrap_or_default());
 
-    result.map(|value| (value, reads))
+    if let Some(operation) = guard.take() {
+        return Err(WorkflowQueryError::PurityViolation { operation });
+    }
+
+    let value = result.map_err(|error| WorkflowQueryError::Execution(error.to_string()))?;
+    Ok((value, reads))
 }
 
 // ---------------------------------------------------------------------------
@@ -410,5 +498,165 @@ pub(crate) fn vm_value_to_string_in_actor(value: &Value, actor: &Actor) -> Optio
         }
     } else {
         None
+    }
+}
+
+
+#[cfg(test)]
+mod query_purity_tests {
+    use super::*;
+    use crate::bytecode::{CodeModule, Instruction, OpCode};
+    use std::collections::HashMap;
+
+    fn query_module() -> CodeModule {
+        let mut module = CodeModule::new("query-purity-test");
+        let field_idx = module.add_string_constant("count");
+        let payload_idx = module.add_string_constant("payload");
+
+        // function 0: read_count() -> self.count
+        module.function_table.push(module.current_offset());
+        module.function_local_counts.push(2);
+        module.emit(Instruction::new3(
+            OpCode::StateGet,
+            ((field_idx >> 8) & 0xFF) as u8,
+            (field_idx & 0xFF) as u8,
+            1,
+        ));
+        module.emit(Instruction::new1(OpCode::RetVal, 1));
+
+        // function 1: mutate_count() -> attempts self.count = nil, then reads.
+        // Query callbacks must reject the StateSet before actor state changes.
+        module.function_table.push(module.current_offset());
+        module.function_local_counts.push(2);
+        module.emit(Instruction::new3(
+            OpCode::StateSet,
+            ((field_idx >> 8) & 0xFF) as u8,
+            (field_idx & 0xFF) as u8,
+            0,
+        ));
+        module.emit(Instruction::new3(
+            OpCode::StateGet,
+            ((field_idx >> 8) & 0xFF) as u8,
+            (field_idx & 0xFF) as u8,
+            1,
+        ));
+        module.emit(Instruction::new1(OpCode::RetVal, 1));
+
+        // function 2: mutate_array() -> attempts to mutate pointer-backed
+        // actor state through the direct ArrStore opcode.
+        module.function_table.push(module.current_offset());
+        module.function_local_counts.push(3);
+        module.emit(Instruction::new3(
+            OpCode::StateGet,
+            ((payload_idx >> 8) & 0xFF) as u8,
+            (payload_idx & 0xFF) as u8,
+            1,
+        ));
+        module.emit(Instruction::new1(OpCode::Const0, 2));
+        module.emit(Instruction::new3(OpCode::ArrStore, 1, 2, 2));
+        module.emit(Instruction::new1(OpCode::RetVal, 1));
+
+        module
+    }
+
+    fn workflow_with_queries() -> (Runtime, u64) {
+        let mut rt = Runtime::new();
+        let mut models = HashMap::new();
+        models.insert("count".to_string(), StateModel::Durable);
+        models.insert("payload".to_string(), StateModel::Durable);
+        let actor_id = rt.spawn_workflow_actor(
+            "CounterWorkflow",
+            Box::new(|| vec![("count".to_string(), Value::int(7))]),
+            models,
+        );
+        {
+            let actor = rt.actors.get_mut(&actor_id).unwrap();
+            let payload = actor.allocate_array(vec![Value::int(99)]);
+            actor.set_state_field("payload", payload);
+            actor.bytecode_module = Some(query_module());
+        }
+        rt.register_workflow_query(actor_id, "read", Value::int(0));
+        rt.register_workflow_query(actor_id, "mutate", Value::int(1));
+        rt.register_workflow_query(actor_id, "mutate_array", Value::int(2));
+        (rt, actor_id)
+    }
+
+    #[test]
+    fn query_handler_reads_state_and_reports_dependencies() {
+        let (mut rt, actor_id) = workflow_with_queries();
+
+        let (value, reads) = rt
+            .query_workflow_with_dependencies_checked(actor_id, "read")
+            .expect("read-only query should succeed");
+
+        assert_eq!(value.as_int(), Some(7));
+        assert_eq!(reads.len(), 1);
+        assert!(reads.revision(actor_id, "count").is_some());
+        assert!(rt.state_read_set_is_current(&reads));
+    }
+
+    #[test]
+    fn query_handler_state_write_is_rejected_without_mutating_actor() {
+        let (mut rt, actor_id) = workflow_with_queries();
+
+        let error = rt
+            .query_workflow_checked(actor_id, "mutate")
+            .expect_err("query state mutation must fail closed");
+
+        assert_eq!(
+            error,
+            WorkflowQueryError::PurityViolation {
+                operation: "State.set(count)".to_string(),
+            }
+        );
+        assert_eq!(
+            rt.actors
+                .get(&actor_id)
+                .and_then(|actor| actor.get_state_field("count"))
+                .and_then(|value| value.as_int()),
+            Some(7)
+        );
+
+        // Compatibility API preserves its historic failure-as-None shape.
+        assert_eq!(rt.query_workflow(actor_id, "mutate"), None);
+    }
+
+    #[test]
+    fn query_cannot_mutate_pointer_backed_actor_state_with_direct_opcode() {
+        let (mut rt, actor_id) = workflow_with_queries();
+
+        let error = rt
+            .query_workflow_checked(actor_id, "mutate_array")
+            .expect_err("direct heap mutation of actor state must fail closed");
+        assert_eq!(
+            error,
+            WorkflowQueryError::PurityViolation {
+                operation: "Array.store".to_string(),
+            }
+        );
+
+        let payload = rt
+            .actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("payload")
+            .and_then(|value| value.as_ptr())
+            .expect("payload should remain an array pointer");
+        let first = unsafe { *(payload as *const Value) };
+        assert_eq!(first.as_int(), Some(99));
+    }
+
+    #[test]
+    fn checked_query_distinguishes_missing_handler_from_nil_result() {
+        let (mut rt, actor_id) = workflow_with_queries();
+
+        assert_eq!(
+            rt.query_workflow_checked(actor_id, "missing"),
+            Err(WorkflowQueryError::HandlerNotFound {
+                actor_id,
+                name: "missing".to_string(),
+            })
+        );
+        assert_eq!(rt.query_workflow(actor_id, "missing"), None);
     }
 }

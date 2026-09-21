@@ -25,6 +25,7 @@ use crate::runtime::heap::{ActorHeap, TypeTag as HeapTypeTag};
 #[cfg(feature = "ai-runtime")]
 use nulang_ai::{LlmMessage, LlmRequest};
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -1356,12 +1357,62 @@ fn id_arg(constants: &[crate::bytecode::Constant], args: &[crate::vm::Value], id
     s.parse::<u64>().unwrap_or(0)
 }
 
+/// Shared fail-closed guard used while a workflow query executes.
+///
+/// Query handlers may read actor state and perform deterministic local
+/// computation, but they must not mutate actor/runtime state or observe
+/// external state that is absent from the reactive dependency set.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct QueryPurityGuard {
+    violation: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl QueryPurityGuard {
+    pub(crate) fn record(&self, operation: impl Into<String>) {
+        let mut slot = self
+            .violation
+            .lock()
+            .expect("query purity guard mutex poisoned");
+        if slot.is_none() {
+            *slot = Some(operation.into());
+        }
+    }
+
+    pub(crate) fn take(&self) -> Option<String> {
+        self.violation
+            .lock()
+            .expect("query purity guard mutex poisoned")
+            .take()
+    }
+}
+
+fn query_builtin_is_allowed(effect_name: &str, op_name: Option<&str>) -> bool {
+    match effect_name {
+        // Immutable scalar/string operations.
+        "Int" | "Float" | "String" | "Array" => true,
+        // Maps are mutable in-place. Only allocation and read operations are
+        // query-safe; insert/remove could mutate a map stored in actor state.
+        "Map" => matches!(op_name, Some("new" | "get" | "contains" | "size")),
+        // String builders are mutable in-place. Reading a builder is safe,
+        // creating a fresh builder is safe, but push/append are not.
+        "StrBuilder" => matches!(op_name, Some("new" | "to_string" | "len")),
+        // Nested queries are allowed; the nested handler is subjected to the
+        // same purity boundary.
+        "Workflow" => op_name == Some("query"),
+        _ => false,
+    }
+}
+
 /// Raw-pointer callbacks used when the runtime itself executes an actor's
 /// bytecode behavior. Holds a transient borrow of the executing `Runtime`.
 #[derive(Debug)]
 pub(crate) struct BytecodeRuntimeCallbacks {
     runtime: *mut Runtime,
     actor_id: u64,
+    query_guard: Option<QueryPurityGuard>,
+    /// Heap allocations created by this query invocation. Direct VM stores
+    /// may mutate these temporaries, but not pre-existing actor-state objects.
+    query_allocations: Option<HashSet<usize>>,
 }
 
 // SAFETY: `runtime` is a transient borrow of the executing `Runtime` that
@@ -1378,11 +1429,38 @@ unsafe impl Sync for BytecodeRuntimeCallbacks {}
 
 impl BytecodeRuntimeCallbacks {
     pub(crate) fn new(runtime: *mut Runtime, actor_id: u64) -> Self {
-        BytecodeRuntimeCallbacks { runtime, actor_id }
+        BytecodeRuntimeCallbacks {
+            runtime,
+            actor_id,
+            query_guard: None,
+            query_allocations: None,
+        }
+    }
+
+    pub(crate) fn new_query(
+        runtime: *mut Runtime,
+        actor_id: u64,
+        guard: QueryPurityGuard,
+    ) -> Self {
+        BytecodeRuntimeCallbacks {
+            runtime,
+            actor_id,
+            query_guard: Some(guard),
+            query_allocations: Some(HashSet::new()),
+        }
     }
 
     fn authority_actor_id(&self) -> Option<u64> {
         (self.actor_id != 0).then_some(self.actor_id)
+    }
+
+    fn block_query_operation(&self, operation: impl Into<String>) -> bool {
+        if let Some(guard) = &self.query_guard {
+            guard.record(operation);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -1391,20 +1469,51 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         Some(self.actor_id)
     }
 
+    fn authorize_vm_side_effect(
+        &mut self,
+        operation: &str,
+        target: Option<*mut u8>,
+    ) -> bool {
+        let Some(guard) = &self.query_guard else {
+            return true;
+        };
+
+        if let Some(ptr) = target {
+            let query_owned = self
+                .query_allocations
+                .as_ref()
+                .map(|allocations| allocations.contains(&(ptr as usize)))
+                .unwrap_or(false);
+            if query_owned {
+                return true;
+            }
+        }
+
+        guard.record(operation.to_string());
+        false
+    }
+
     fn authorize_ffi(&mut self, library: &str, symbol: &str) -> bool {
+        if self.block_query_operation(format!("FFI.call({library}::{symbol})")) {
+            return false;
+        }
         unsafe {
             authorize_actor_ffi(&*self.runtime, self.authority_actor_id(), library, symbol).is_ok()
         }
     }
 
     fn alloc(&mut self, size: usize, type_tag: crate::runtime::heap::TypeTag) -> Option<*mut u8> {
-        unsafe {
+        let ptr = unsafe {
             (*self.runtime)
                 .actors
                 .get_mut(&self.actor_id)?
                 .heap
-                .alloc(size, type_tag)
+                .alloc(size, type_tag)?
+        };
+        if let Some(allocations) = self.query_allocations.as_mut() {
+            allocations.insert(ptr as usize);
         }
+        Some(ptr)
     }
 
     fn alloc_arena(
@@ -1412,13 +1521,17 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         size: usize,
         type_tag: crate::runtime::heap::TypeTag,
     ) -> Option<*mut u8> {
-        unsafe {
+        let ptr = unsafe {
             (*self.runtime)
                 .actors
                 .get_mut(&self.actor_id)?
                 .iso_arena
-                .alloc(size, type_tag)
+                .alloc(size, type_tag)?
+        };
+        if let Some(allocations) = self.query_allocations.as_mut() {
+            allocations.insert(ptr as usize);
         }
+        Some(ptr)
     }
 
     fn reset_arena(&mut self) {
@@ -1488,6 +1601,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         behavior_idx: usize,
         init: Vec<(String, crate::vm::Value)>,
     ) -> crate::vm::Value {
+        if self.block_query_operation("Actor.spawn") {
+            return crate::vm::Value::nil();
+        }
         // SAFETY: the callback is installed on the shared runtime VM only
         // while the runtime drives a behavior on the single scheduler
         // thread, so `runtime` is a live, exclusively-borrowed pointer.
@@ -1503,6 +1619,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         behavior_id: u16,
         args: &[crate::vm::Value],
     ) {
+        if self.block_query_operation("Actor.send") {
+            return;
+        }
         if let Some(target_id) = target.as_actor_id() {
             // SAFETY: as above. `send_message_by_id` is safe mid-behavior:
             // it pushes mail, bumps ORCA foreign counts, and enqueues the
@@ -1510,6 +1629,20 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             // VM is executing (see `Runtime::pending_receive_wakes`).
             unsafe { (*self.runtime).send_message_by_id(target_id, behavior_id, args) }
         }
+    }
+
+    fn ask_actor(
+        &mut self,
+        _target: crate::vm::Value,
+        _behavior_id: u16,
+        _args: &[crate::vm::Value],
+    ) -> crate::vm::Value {
+        if self.block_query_operation("Actor.ask") {
+            return crate::vm::Value::nil();
+        }
+        // Preserve the existing BytecodeRuntimeCallbacks behavior: actor Ask
+        // is not wired through this callback path outside queries.
+        crate::vm::Value::nil()
     }
 
     fn get_state_field(&self, field: &str) -> crate::vm::Value {
@@ -1526,6 +1659,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
     }
 
     fn set_state_field(&mut self, field: &str, value: crate::vm::Value) {
+        if self.block_query_operation(format!("State.set({field})")) {
+            return;
+        }
         unsafe {
             if let Some(actor) = (*self.runtime).actors.get_mut(&self.actor_id) {
                 // CRDT-backed fields mutate only through the `Crdt.*` effect
@@ -1551,12 +1687,18 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
     }
 
     fn emit_event(&mut self, event: &str, args: &[crate::vm::Value]) {
+        if self.block_query_operation(format!("Event.emit({event})")) {
+            return;
+        }
         unsafe {
             (*self.runtime).emit_event(self.actor_id, event, args);
         }
     }
 
     fn wait_signal(&mut self, name: &str) -> crate::vm::SignalWaitResult {
+        if self.block_query_operation(format!("Signal.wait({name})")) {
+            return crate::vm::SignalWaitResult::Ready(crate::vm::Value::nil());
+        }
         unsafe {
             if let Some(actor) = (*self.runtime).actors.get(&self.actor_id) {
                 if actor.received_signals.iter().any(|(n, _)| n == name) {
@@ -1567,7 +1709,10 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         }
     }
 
-    fn suspend_for_signal(&mut self, _name: &str, _vm_state: Option<crate::vm::SuspendedVmState>) {
+    fn suspend_for_signal(&mut self, name: &str, _vm_state: Option<crate::vm::SuspendedVmState>) {
+        if self.block_query_operation(format!("Signal.suspend({name})")) {
+            return;
+        }
         // State capture is handled by run_bytecode_at_offset after run_from
         // returns, avoiding aliasing the Runtime through this raw-pointer
         // callback while the VM borrow is active.
@@ -1578,6 +1723,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         effect_name: &str,
         regs: &[crate::vm::Value],
     ) -> Option<crate::vm::Value> {
+        if self.block_query_operation(format!("{effect_name}.*")) {
+            return Some(crate::vm::Value::nil());
+        }
         unsafe {
             if effect_name != "Timer" {
                 return None;
@@ -1604,6 +1752,13 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         constants: &[crate::bytecode::Constant],
         regs: &[crate::vm::Value],
     ) -> Option<crate::vm::Value> {
+        if self.query_guard.is_some() && !query_builtin_is_allowed(effect_name, op_name) {
+            let operation = op_name
+                .map(|op| format!("{effect_name}.{op}"))
+                .unwrap_or_else(|| effect_name.to_string());
+            self.block_query_operation(operation);
+            return Some(crate::vm::Value::nil());
+        }
         unsafe {
             if effect_name == "Workflow" && op_name == Some("query") {
                 let workflow_id = regs.get(0)?.as_actor_id()?;
@@ -1612,6 +1767,18 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                     Some(crate::bytecode::Constant::String(s)) => s.clone(),
                     _ => return None,
                 };
+                if let Some(guard) = &self.query_guard {
+                    return match (*self.runtime).query_workflow_checked(workflow_id, &query_name) {
+                        Ok(value) => Some(value),
+                        Err(super::workflow::WorkflowQueryError::PurityViolation { operation }) => {
+                            guard.record(format!(
+                                "Workflow.query({query_name}) -> {operation}"
+                            ));
+                            Some(crate::vm::Value::nil())
+                        }
+                        Err(_) => Some(crate::vm::Value::nil()),
+                    };
+                }
                 return (*self.runtime).query_workflow(workflow_id, &query_name);
             }
             #[cfg(feature = "sqlite")]
@@ -1840,6 +2007,13 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         module: &crate::bytecode::CodeModule,
         regs: &[crate::vm::Value],
     ) -> Option<crate::vm::Value> {
+        if self.query_guard.is_some() && !query_builtin_is_allowed(effect_name, op_name) {
+            let operation = op_name
+                .map(|op| format!("{effect_name}.{op}"))
+                .unwrap_or_else(|| effect_name.to_string());
+            self.block_query_operation(operation);
+            return Some(crate::vm::Value::nil());
+        }
         let qualified = match op_name {
             Some(op) => format!("{}.{}", effect_name, op),
             None => effect_name.to_string(),
@@ -1896,6 +2070,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
 
     #[cfg(feature = "ai-runtime")]
     fn complete_llm(&mut self, model: &str, prompt: &str) -> Option<String> {
+        if self.block_query_operation(format!("Inference.ask({model})")) {
+            return None;
+        }
         unsafe {
             let rt = &mut *self.runtime;
             if authorize_actor_host_effect(
@@ -1929,6 +2106,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
     #[cfg(feature = "ai-runtime")]
     fn llm_ask(&mut self, model: &str, prompt: &str) -> crate::vm::PerformAsyncResult {
         use crate::vm::PerformAsyncResult;
+        if self.block_query_operation(format!("Inference.ask({model})")) {
+            return PerformAsyncResult::Ready(None);
+        }
         unsafe {
             let rt = &mut *self.runtime;
             let actor_id = self.actor_id;
@@ -2052,6 +2232,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         constants: &[crate::bytecode::Constant],
         args: &[crate::vm::Value],
     ) -> crate::vm::PerformAsyncResult {
+        if self.block_query_operation(effect_op.to_string()) {
+            return crate::vm::PerformAsyncResult::Ready(None);
+        }
         use crate::vm::PerformAsyncResult;
         match effect_op {
             #[cfg(feature = "ai-runtime")]
@@ -2154,6 +2337,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
     }
 
     fn try_receive(&mut self) -> Option<(u16, crate::vm::Value)> {
+        if self.block_query_operation("Mailbox.receive") {
+            return None;
+        }
         unsafe {
             let msg = {
                 let actor = (*self.runtime).actors.get_mut(&self.actor_id)?;
@@ -2174,6 +2360,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         &mut self,
         behavior_ids: &[u16],
     ) -> Option<(usize, Vec<crate::vm::Value>)> {
+        if self.block_query_operation("Mailbox.receive_match") {
+            return None;
+        }
         unsafe {
             let (pos, payload) = {
                 let actor = (*self.runtime).actors.get_mut(&self.actor_id)?;
@@ -2189,6 +2378,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
     }
 
     fn receive_wait_suspend(&mut self, timeout_ms: i64) -> bool {
+        if self.block_query_operation("Mailbox.receive_wait") {
+            return false;
+        }
         unsafe {
             let rt = &mut *self.runtime;
             let Some(actor) = rt.actors.get_mut(&self.actor_id) else {
@@ -2213,6 +2405,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
     }
 
     fn receive_wait_matched(&mut self) {
+        if self.block_query_operation("Mailbox.receive_wait_matched") {
+            return;
+        }
         unsafe {
             let rt = &mut *self.runtime;
             let wait = rt
@@ -2228,6 +2423,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
     }
 
     fn commit_receive_match(&mut self) {
+        if self.block_query_operation("Mailbox.commit_receive") {
+            return;
+        }
         unsafe {
             let payload = (*self.runtime)
                 .actors
@@ -2240,6 +2438,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
     }
 
     fn reset_receive_match(&mut self) {
+        if self.block_query_operation("Mailbox.reset_receive") {
+            return;
+        }
         unsafe {
             if let Some(actor) = (*self.runtime).actors.get_mut(&self.actor_id) {
                 actor.mailbox.reset_receive_match();
@@ -2267,6 +2468,68 @@ pub(crate) struct BytecodeDistributedCallbacks {
 // sole active borrow of the runtime.
 unsafe impl Send for BytecodeDistributedCallbacks {}
 unsafe impl Sync for BytecodeDistributedCallbacks {}
+
+#[derive(Debug)]
+pub(crate) struct QueryDistributedCallbacks {
+    guard: QueryPurityGuard,
+}
+
+impl QueryDistributedCallbacks {
+    pub(crate) fn new(guard: QueryPurityGuard) -> Self {
+        Self { guard }
+    }
+
+    fn block(&self, operation: impl Into<String>) {
+        self.guard.record(operation);
+    }
+}
+
+impl crate::vm::DistributedVmCallbacks for QueryDistributedCallbacks {
+    fn node_id(&self) -> u64 {
+        self.block("Cluster.node_id");
+        0
+    }
+
+    fn migrate(&mut self, _actor_id: u64, _target_node_id: u64) {
+        self.block("Actor.migrate");
+    }
+
+    fn remote_ask(
+        &mut self,
+        _target_actor: u64,
+        _behavior: &str,
+        _args: &[crate::vm::Value],
+        _timeout_ms: u64,
+    ) -> crate::vm::Value {
+        self.block("Cluster.remote_ask");
+        crate::vm::Value::nil()
+    }
+
+    fn remote_send(
+        &mut self,
+        _target_actor: u64,
+        _target_node: u64,
+        _behavior: &str,
+        _args: &[crate::vm::Value],
+    ) {
+        self.block("Cluster.remote_send");
+    }
+
+    fn gossip(&mut self, _message: &str) -> crate::vm::Value {
+        self.block("Cluster.gossip");
+        crate::vm::Value::unit()
+    }
+
+    fn remote_spawn(
+        &mut self,
+        _target_node: u64,
+        _behavior: &str,
+        _init: &[(String, crate::vm::Value)],
+    ) -> crate::vm::Value {
+        self.block("Cluster.remote_spawn");
+        crate::vm::Value::actor_ref(0)
+    }
+}
 
 impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
     fn node_id(&self) -> u64 {
@@ -2953,5 +3216,35 @@ mod host_authority_tests {
         assert!(
             authorize_actor_host_effect(&rt, None, "FS", Some("read"), &constants, &regs,).is_ok()
         );
+    }
+}
+
+
+#[cfg(test)]
+mod query_purity_allowlist_tests {
+    use super::query_builtin_is_allowed;
+
+    #[test]
+    fn query_purity_allowlist_is_fail_closed() {
+        assert!(query_builtin_is_allowed("Int", Some("to_float")));
+        assert!(query_builtin_is_allowed("String", Some("length")));
+        assert!(query_builtin_is_allowed("Array", Some("set")));
+        assert!(query_builtin_is_allowed("Map", Some("get")));
+        assert!(query_builtin_is_allowed("Map", Some("size")));
+        assert!(query_builtin_is_allowed("StrBuilder", Some("to_string")));
+        assert!(query_builtin_is_allowed("Workflow", Some("query")));
+
+        assert!(!query_builtin_is_allowed("Map", Some("insert")));
+        assert!(!query_builtin_is_allowed("Map", Some("remove")));
+        assert!(!query_builtin_is_allowed("StrBuilder", Some("push")));
+        assert!(!query_builtin_is_allowed("StrBuilder", Some("append")));
+        assert!(!query_builtin_is_allowed("DB", Some("query")));
+        assert!(!query_builtin_is_allowed("FS", Some("read")));
+        assert!(!query_builtin_is_allowed("Http", Some("get")));
+        assert!(!query_builtin_is_allowed("Inference", Some("ask")));
+        assert!(!query_builtin_is_allowed("Timer", Some("sleep")));
+        assert!(!query_builtin_is_allowed("Actor", Some("send")));
+        assert!(!query_builtin_is_allowed("Crdt", Some("read")));
+        assert!(!query_builtin_is_allowed("Debug", Some("inspect")));
     }
 }
