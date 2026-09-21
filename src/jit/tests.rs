@@ -14,6 +14,30 @@ fn test_jit_session_creation() {
 }
 
 #[test]
+fn test_dense_compiled_slots_are_module_scoped() {
+    let mut jit = make_jit();
+    let ptr = std::ptr::NonNull::<u8>::dangling().as_ptr() as *const u8;
+
+    jit.store_compiled(2, 17, ptr, 9);
+
+    assert_eq!(jit.compiled_count(), 1);
+    assert!(jit.is_compiled(2, 17));
+    assert_eq!(jit.compiled_region_len(2, 17), Some(9));
+    assert!(!jit.is_compiled(1, 17));
+    assert!(!jit.is_compiled(2, 16));
+
+    // Replacing an occupied slot must not inflate the region count.
+    jit.store_compiled(2, 17, ptr, 11);
+    assert_eq!(jit.compiled_count(), 1);
+    assert_eq!(jit.compiled_region_len(2, 17), Some(11));
+
+    // The same PC in another module is a distinct slot.
+    jit.store_compiled(3, 17, ptr, 5);
+    assert_eq!(jit.compiled_count(), 2);
+    assert_eq!(jit.compiled_region_len(3, 17), Some(5));
+}
+
+#[test]
 fn test_hot_counter() {
     let mut jit = make_jit();
     assert!(!jit.record_and_check_hot(0, 0));
@@ -1504,7 +1528,7 @@ fn test_compute_recursive_classifies_cycles() {
 fn test_tier2_counter_increments() {
     let mut jit = make_jit();
     let dummy_ptr: *const u8 = std::ptr::null();
-    jit.compiled.insert((0, 100), (dummy_ptr, 5));
+    jit.store_compiled(0, 100, dummy_ptr, 5);
 
     // Counter starts at 0 (not yet in map), increments each call.
     for i in 0..TIER2_THRESHOLD - 1 {
@@ -1531,8 +1555,8 @@ fn test_tier2_counters_are_per_session() {
     let mut jit_a = make_jit();
     let mut jit_b = make_jit();
     let dummy_ptr: *const u8 = std::ptr::null();
-    jit_a.compiled.insert((0, 200), (dummy_ptr, 3));
-    jit_b.compiled.insert((0, 200), (dummy_ptr, 3));
+    jit_a.store_compiled(0, 200, dummy_ptr, 3);
+    jit_b.store_compiled(0, 200, dummy_ptr, 3);
 
     // Heat session A to threshold.
     for _ in 0..TIER2_THRESHOLD {
