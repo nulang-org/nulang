@@ -71,10 +71,10 @@ impl CompilerSemanticInventory {
 
         for decl in flatten_decls(&module.decls) {
             match decl {
-                Decl::Function { name, .. } => {
-                    if let Some(row) = effect_checker.function_row(name) {
-                        effects.push(effect_entry("function", name, row));
-                    }
+                Decl::Function { name, body, .. } => {
+                    let row =
+                        effect_checker.infer_effects(&EffectContext::empty(), body)?;
+                    effects.push(effect_entry("function", name, &row));
                 }
                 Decl::Actor {
                     name, behaviors, ..
@@ -189,11 +189,12 @@ fn actor_inventory(
     let mut protocol_error = None;
 
     for behavior in behaviors {
-        let row = match &behavior.effect {
-            Some(declared) => declared.clone(),
-            None => effect_checker.infer_effects(&ctx, &behavior.body)?,
-        };
-        let (effect_names, open_effects) = row_parts(&row);
+        let inferred_row = effect_checker.infer_effects(&ctx, &behavior.body)?;
+        let protocol_row = behavior
+            .effect
+            .clone()
+            .unwrap_or_else(|| inferred_row.clone());
+        let (effect_names, open_effects) = row_parts(&inferred_row);
         behavior_inventory.push(SemanticBehavior {
             name: behavior.name.clone(),
             effects: effect_names.clone(),
@@ -235,7 +236,7 @@ fn actor_inventory(
             behavior.name.clone(),
             params,
             response,
-            row,
+            protocol_row,
             behavior.cap,
         ) {
             Ok(member) => members.push(member),
