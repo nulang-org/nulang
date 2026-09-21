@@ -68,6 +68,7 @@ mod tests {
             handler_param: "limit".to_string(),
             handler_index: 0,
             ty: Some("Int".to_string()),
+            codec: None,
         };
         let error = bind_request_arguments(&[binding], 1, &values).unwrap_err();
         assert_eq!(error.kind, RequestDecodeErrorKind::InvalidType);
