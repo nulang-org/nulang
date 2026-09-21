@@ -7,9 +7,9 @@
 
 use crate::artifact_identity::ArtifactIdentityManifest;
 use crate::content_identity::{SemanticId, SourceId};
-use crate::runtime_artifact_manifest::RuntimeArtifactManifest;
 use crate::hir;
 use crate::mir;
+use crate::runtime_artifact_manifest::RuntimeArtifactManifest;
 use crate::semantic_identity::SemanticIdentityError;
 use crate::semantic_schema::{
     actor_definition_semantic_ids_for_typed_program, semantic_id_for_typed_program,
@@ -20,8 +20,7 @@ use crate::semantic_schema::{
 /// These constants are part of the ArtifactId contract for the standard Nulang
 /// bytecode compiler. Changing one intentionally creates a new ArtifactId even
 /// when program semantics are unchanged.
-pub const BYTECODE_ARTIFACT_COMPILER_VERSION: &str =
-    concat!("nulangc-", env!("CARGO_PKG_VERSION"));
+pub const BYTECODE_ARTIFACT_COMPILER_VERSION: &str = concat!("nulangc-", env!("CARGO_PKG_VERSION"));
 pub const BYTECODE_ARTIFACT_TARGET: &str = "portable";
 pub const BYTECODE_ARTIFACT_ABI: &str = "nulang-abi-v1";
 pub const BYTECODE_ARTIFACT_BACKEND: &str = "bytecode";
@@ -114,12 +113,13 @@ where
         .map(|flag| flag.as_ref().to_string())
         .collect();
 
-    let mut module =
-        compile_typed_bytecode(hir, mir, dependencies.iter().copied(), name)?;
-    let semantic_id = module.semantic_id.ok_or_else(|| crate::types::NuError::VMError {
-        msg: "typed bytecode compiler produced no semantic identity".to_string(),
-        span: crate::types::Span::default(),
-    })?;
+    let mut module = compile_typed_bytecode(hir, mir, dependencies.iter().copied(), name)?;
+    let semantic_id = module
+        .semantic_id
+        .ok_or_else(|| crate::types::NuError::VMError {
+            msg: "typed bytecode compiler produced no semantic identity".to_string(),
+            span: crate::types::Span::default(),
+        })?;
     let identity = ArtifactIdentityManifest::new(
         source_bytes.map(SourceId::from_bytes),
         semantic_id,
