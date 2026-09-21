@@ -204,7 +204,7 @@ The migration sequence is:
 6. have runtime host functions call the typed actor authorization boundary before external access;
 7. remove ad-hoc string matching from security-sensitive checks.
 
-Current plumbing gaps are explicit: the parser still initializes spawn capabilities to an empty vector; MIR codegen currently destructures `capabilities: _`, so it drops even programmatically constructed grants instead of filling `CodeModule::spawn_capability_grants`; and the current `spawn_actor` callback API carries no spawn-PC/grant argument for installing those grants on the child. The existence of AST/HIR/MIR fields or bytecode metadata therefore must not be treated as end-to-end enforcement yet.
+Current implementation status: source-level spawn authority is parsed into canonical typed grants, preserved through HIR/MIR, recorded per exact spawn PC in `CodeModule::spawn_capability_grants`, and installed through the runtime spawn boundary with parent-to-child attenuation. `tests/spawn_authority_provenance.rs` covers source-to-bytecode provenance, malformed-grant rejection, exact-site binding, parent escalation denial before child creation, and VM/native parity when native codegen is enabled. Remaining semantic-closure work is therefore no longer basic spawn-authority plumbing; it is broader backend/profile conformance, static affine-continuation enforcement, actor suspension/non-reentrancy, and keeping all privileged host operations on typed authority boundaries.
 
 ## Contract 5 — Protocol-typed actor references
 
