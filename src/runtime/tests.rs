@@ -6534,6 +6534,18 @@ fn test_remote_actor_send_reports_transport_backpressure_without_blocking() {
         MessageAdmission::Backpressured,
         "ordinary actor send must expose transport saturation instead of blocking"
     );
+
+    assert_eq!(
+        rt.try_send_to_grain_on_node(
+            GrainId::new("Counter", "transport-pressure"),
+            node_b,
+            "handle",
+            vec![],
+            0,
+        ),
+        MessageAdmission::Backpressured,
+        "explicit remote grain send must use the same non-blocking transport admission"
+    );
 }
 
 /// PLAN.md Phase 1 bullet 2 (DST): timer determinism. A program whose
