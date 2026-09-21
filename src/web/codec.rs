@@ -13,6 +13,14 @@ pub enum BodyCodecKind {
     Json,
 }
 
+impl BodyCodecKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BodyCodecContract {
     pub codec: BodyCodecKind,
