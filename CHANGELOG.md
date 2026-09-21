@@ -1544,3 +1544,11 @@ in this version; they are recorded here to establish their tier.
 No stability promise. The 0.x series is the alpha development track. Language
 version 1.0.0-frozen is the first version with a published stability contract;
 everything before it is implicitly Experimental.
+
+## Experimental tier
+
+### Panic backend parity and fail-closed restrictions — 2026-09-21
+- **Native function panic now preserves divergence.** MIR `RValue::Panic(message)` in ordinary native/AOT functions interns the message, records `Panic: <message>` through the existing AOT pending-error channel, and immediately returns from generated native code. `AotModule::run` / `run_in_runtime` surface the pending error as `NuError`, so statements after panic cannot execute.
+- **Native actor-behavior panic fails closed for now.** The current AOT behavior adapter has a `fn(...) -> ()` scheduler boundary and cannot propagate a native runtime error into the actor fault/supervision path. AOT compilation therefore rejects behaviors containing `Panic` rather than silently swallowing the crash. Bytecode remains the required backend for such actors until that fault channel is wired.
+- **Plain WASM and WasmFX no longer reinterpret panic as `nil`.** Both public backend validation and the low-level MIR→WASM emitter reject unsupported runtime panic deterministically. This closes the CIR/WASM silent-success path while preserving a clear migration target for future trap/error-channel support.
+
