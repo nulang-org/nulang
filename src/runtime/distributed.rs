@@ -1369,7 +1369,7 @@ pub fn process_network_packets(
                                         );
                                         continue;
                                     }
-                                    msg.payload = Arc::new(payload_vec);
+                                    msg.payload = MessagePayload::from_vec(payload_vec);
                                     if let Some(actor) = runtime.actors.get_mut(&target_actor) {
                                         let _ = actor.mailbox.push(msg);
                                         runtime.scheduler.enqueue(target_actor);
@@ -2289,7 +2289,7 @@ pub fn process_network_packets(
                         );
                         continue;
                     }
-                    msg.payload = Arc::new(payload_vec);
+                    msg.payload = MessagePayload::from_vec(payload_vec);
                     if let Some(actor) = runtime.actors.get_mut(&target_actor) {
                         let _ = actor.mailbox.push(msg);
                         runtime.scheduler.enqueue(target_actor);
