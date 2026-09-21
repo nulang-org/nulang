@@ -307,15 +307,25 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
             apply_handlers: apply_handlers.clone(),
             apply_handler_bodies: apply_handlers
                 .iter()
-                .map(|handler| hir::ApplyHandlerBody {
-                    event: handler.event.clone(),
-                    params: handler
-                        .params
-                        .iter()
-                        .map(|name| (name.clone(), Type::unit()))
-                        .collect(),
-                    body: with_fresh_defer_stack(|| lower_body(&handler.body)),
-                    span: handler.span,
+                .map(|handler| {
+                    let event_decl = events.iter().find(|event| event.name == handler.event);
+                    hir::ApplyHandlerBody {
+                        event: handler.event.clone(),
+                        params: handler
+                            .params
+                            .iter()
+                            .enumerate()
+                            .map(|(index, name)| {
+                                let ty = event_decl
+                                    .and_then(|event| event.params.get(index))
+                                    .map(|(_, ty)| lower_runtime_type(ty))
+                                    .unwrap_or_else(Type::unit);
+                                (name.clone(), ty)
+                            })
+                            .collect(),
+                        body: with_fresh_defer_stack(|| lower_body(&handler.body)),
+                        span: handler.span,
+                    }
                 })
                 .collect(),
             version: *version,
