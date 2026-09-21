@@ -5093,5 +5093,4 @@ mod tests {
             "pure migration bodies must remain legal"
         );
     }
-
 }
