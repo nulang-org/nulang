@@ -302,13 +302,18 @@ capability forwarding as the normal package build before invoking the WASM
 backend.
 
 The adjacent `*.behavior.json` file is the first implementation slice of the
-RFC 0020 Behavior Manifest. It is bound to the exact emitted WASM bytes with a
-BLAKE3 digest and records package/language/compiler identity plus source and
-lockfile provenance. Until compiler semantic inventories land, its
-`completeness` object explicitly marks effects, actor protocols, durability,
-and replay metadata as `not-emitted`; package capabilities are labelled
-`declared-not-inferred` rather than being presented as compiler-derived
-authority.
+RFC 0020 Behavior Manifest and conforms to
+`spec/behavior/v0alpha1.schema.json`. It is bound to the exact emitted WASM
+bytes with a BLAKE3 digest and records package/language/compiler identity,
+compiler-binary digest, and source/dependency provenance.
+
+Until compiler semantic inventories land, the namespaced advisory
+`extensions["nulang.org/completeness"]` record marks effects, actor protocols,
+authority, durability, and replay metadata as `not-emitted`. Package-declared
+capabilities are preserved separately under
+`extensions["nulang.org/package-capabilities"]`; they are configuration, not
+compiler-derived authority and therefore do not populate the normative
+`authority` array.
 
 For a Wasmtime-precompiled sidecar:
 
