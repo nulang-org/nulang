@@ -76,6 +76,7 @@ jobs:
   test:
     name: Build & Test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
@@ -126,6 +127,7 @@ jobs:
   release:
     name: Release Build
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
@@ -151,6 +153,7 @@ jobs:
   nula-test:
     name: Nula Package Test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: release
     env:
       # The repo sets `target-dir = "/tmp/cargo-target"` in `.cargo/config.toml`,
@@ -190,6 +193,7 @@ jobs:
   minimal-build:
     name: Build without optional features
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -216,6 +220,7 @@ jobs:
   wasm-backend:
     name: Build & Test (wasm-backend feature)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
@@ -240,6 +245,7 @@ jobs:
   lint:
     name: Format, Clippy & Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
@@ -298,6 +304,7 @@ jobs:
   lean:
     name: Lean Formalization
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
@@ -346,6 +353,7 @@ jobs:
   bench:
     name: Benchmarks (regression-gated)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: write  # Persist rolling benchmark history after regression checks pass
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
