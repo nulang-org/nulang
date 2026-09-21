@@ -18,13 +18,112 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// Number of NaN-boxed values stored directly in a message.
+///
+/// Most actor messages are zero- to four-argument control messages. Keeping
+/// those values inline avoids allocating a Vec and Arc for every local send.
+pub const INLINE_MESSAGE_VALUES: usize = 4;
+
+/// Actor-message payload with a small inline representation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MessagePayload {
+    Inline {
+        len: u8,
+        values: [Value; INLINE_MESSAGE_VALUES],
+    },
+    Shared(Arc<Vec<Value>>),
+}
+
+impl MessagePayload {
+    #[inline]
+    pub fn from_slice(values: &[Value]) -> Self {
+        if values.len() <= INLINE_MESSAGE_VALUES {
+            let mut inline = [Value::nil(); INLINE_MESSAGE_VALUES];
+            inline[..values.len()].copy_from_slice(values);
+            MessagePayload::Inline {
+                len: values.len() as u8,
+                values: inline,
+            }
+        } else {
+            MessagePayload::Shared(Arc::new(values.to_vec()))
+        }
+    }
+
+    #[inline]
+    pub fn from_vec(values: Vec<Value>) -> Self {
+        if values.len() <= INLINE_MESSAGE_VALUES {
+            Self::from_slice(&values)
+        } else {
+            MessagePayload::Shared(Arc::new(values))
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[Value] {
+        match self {
+            MessagePayload::Inline { len, values } => &values[..*len as usize],
+            MessagePayload::Shared(values) => values.as_slice(),
+        }
+    }
+
+    /// Shared form used by selective receive's existing transactional API.
+    #[inline]
+    fn shared_for_receive(&self) -> Arc<Vec<Value>> {
+        match self {
+            MessagePayload::Inline { .. } => Arc::new(self.as_slice().to_vec()),
+            MessagePayload::Shared(values) => Arc::clone(values),
+        }
+    }
+
+    #[inline]
+    fn into_shared(self) -> Arc<Vec<Value>> {
+        match self {
+            MessagePayload::Inline { len, values } => {
+                Arc::new(values[..len as usize].to_vec())
+            }
+            MessagePayload::Shared(values) => values,
+        }
+    }
+
+    #[inline]
+    pub fn is_inline(&self) -> bool {
+        matches!(self, MessagePayload::Inline { .. })
+    }
+}
+
+impl std::ops::Deref for MessagePayload {
+    type Target = [Value];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[Value]> for MessagePayload {
+    #[inline]
+    fn as_ref(&self) -> &[Value] {
+        self.as_slice()
+    }
+}
+
+impl From<Vec<Value>> for MessagePayload {
+    fn from(values: Vec<Value>) -> Self {
+        Self::from_vec(values)
+    }
+}
+
+impl From<&[Value]> for MessagePayload {
+    fn from(values: &[Value]) -> Self {
+        Self::from_slice(values)
+    }
+}
+
 /// Message sent between actors.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
     pub behavior_id: u16,
-    /// Payload values, shared via `Arc` to avoid cloning on every
-    /// `receive_match` scan. The VM never mutates incoming payloads.
-    pub payload: Arc<Vec<Value>>,
+    pub payload: MessagePayload,
     pub sender: u64,
     pub priority: MessagePriority,
     /// W3C traceparent for distributed tracing.
@@ -205,7 +304,7 @@ impl Mailbox {
             }
             if let Some(pos) = behavior_ids.iter().position(|&id| id == msg.behavior_id) {
                 *tried = true;
-                return Some((pos, idx, Arc::clone(&msg.payload)));
+                return Some((pos, idx, msg.payload.shared_for_receive()));
             }
         }
         None
@@ -316,7 +415,7 @@ impl Mailbox {
         }?;
         self.release_slot();
         self.clear_tried_flags();
-        Some(removed.0.payload)
+        Some(removed.0.payload.into_shared())
     }
 
     /// Abort a selective-receive scan. No message is consumed and ownership
@@ -335,7 +434,7 @@ mod tests {
     fn make_msg(behavior_id: u16, sender: u64) -> Message {
         Message {
             behavior_id,
-            payload: Arc::new(vec![Value::int(42)]),
+            payload: MessagePayload::from_slice(&[Value::int(42)]),
             sender,
             priority: MessagePriority::Normal,
             trace_id: None,
@@ -402,7 +501,7 @@ mod tests {
         for i in 0..1000 {
             mb.push(Message {
                 behavior_id: 0,
-                payload: Arc::new(vec![Value::int(i)]),
+                payload: MessagePayload::from_slice(&[Value::int(i)]),
                 sender: i as u64,
                 priority: MessagePriority::System,
                 trace_id: None,
@@ -500,7 +599,7 @@ mod transactional_receive_tests {
     fn msg(behavior_id: u16, sender: u64, priority: MessagePriority) -> Message {
         Message {
             behavior_id,
-            payload: Arc::new(vec![Value::int(sender as i64)]),
+            payload: MessagePayload::from_slice(&[Value::int(sender as i64)]),
             sender,
             priority,
             trace_id: None,
