@@ -512,8 +512,7 @@ mod tests {
         let string_schema = schema(primitive(PrimitiveType::String));
 
         let int_id = semantic_id_for_mir_with_actor_schemas(&mir, &[int_schema], []).unwrap();
-        let string_id =
-            semantic_id_for_mir_with_actor_schemas(&mir, &[string_schema], []).unwrap();
+        let string_id = semantic_id_for_mir_with_actor_schemas(&mir, &[string_schema], []).unwrap();
 
         assert_ne!(int_id, string_id);
     }
@@ -561,11 +560,7 @@ mod tests {
                 hir::Decl::Module {
                     name: "Inventory".to_string(),
                     exports: Vec::new(),
-                    decls: vec![hir::Decl::Actor(actor_def(
-                        "Counter",
-                        "value",
-                        field_ty,
-                    ))],
+                    decls: vec![hir::Decl::Actor(actor_def("Counter", "value", field_ty))],
                     span: Span::default(),
                 },
             ],
