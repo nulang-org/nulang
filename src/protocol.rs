@@ -44,6 +44,14 @@ impl ProtocolTypeId {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Construct a protocol type identity from its canonical 32-byte digest.
+    ///
+    /// Every 32-byte value is a valid digest representation; trust comes from
+    /// recomputing the enclosing protocol schema id before admission.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 /// One compiler-level behavior contract in an actor protocol.
