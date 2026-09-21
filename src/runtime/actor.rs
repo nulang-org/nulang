@@ -216,6 +216,14 @@ pub struct Actor {
     /// passing through `set_state_field`, so reactive queries that read a
     /// pointer also depend on this turn token.
     reactive_turn_revision: u64,
+    /// State fields changed since reactive invalidations were last drained.
+    /// Separate from persistence `dirty_fields` because checkpointing clears
+    /// persistence dirtiness before subscribers may poll.
+    reactive_dirty_fields: HashSet<String>,
+    /// True when at least one actor message turn began since the last reactive
+    /// invalidation drain. Pointer-backed subscriptions use this as their
+    /// conservative in-place-mutation signal.
+    reactive_turn_dirty: bool,
     pub event_log: Vec<(String, Vec<Value>)>, // Emitted events for event_sourced actors
     /// Last persisted event sequence per EventSourced field, for compaction tracking.
     pub event_sourced_sequences: HashMap<String, u64>,
@@ -372,6 +380,8 @@ impl Actor {
             state_revisions: HashMap::new(),
             state_incarnation: fresh_state_incarnation(),
             reactive_turn_revision: 0,
+            reactive_dirty_fields: HashSet::new(),
+            reactive_turn_dirty: false,
             event_log: Vec::new(),
             event_sourced_sequences: HashMap::new(),
             event_sourced_compaction_interval: 100,
@@ -558,6 +568,7 @@ impl Actor {
     pub fn set_state_field(&mut self, name: impl Into<String>, value: Value) {
         let name_str = name.into();
         self.dirty_fields.insert(name_str.clone());
+        self.reactive_dirty_fields.insert(name_str.clone());
         self.state_data.insert(name_str.clone(), value);
         let revision = self.state_revisions.entry(name_str.clone()).or_insert(0);
         *revision = revision.wrapping_add(1);
@@ -602,10 +613,18 @@ impl Actor {
         if self.reactive_turn_revision == 0 {
             self.reactive_turn_revision = 1;
         }
+        self.reactive_turn_dirty = true;
     }
 
     pub fn reactive_turn_revision(&self) -> u64 {
         self.reactive_turn_revision
+    }
+
+    /// Drain changes accumulated for reactive subscription invalidation.
+    pub(crate) fn take_reactive_changes(&mut self) -> (Vec<String>, bool) {
+        let fields = self.reactive_dirty_fields.drain().collect();
+        let turn_dirty = std::mem::take(&mut self.reactive_turn_dirty);
+        (fields, turn_dirty)
     }
 
     /// Check if the actor has exceeded its per-turn reduction quota and should yield.
