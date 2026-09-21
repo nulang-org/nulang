@@ -2447,6 +2447,7 @@ dependencies = [
  "libsql",
  "mimalloc",
  "mio",
+ "nulang-accelerator",
  "nulang-ai",
  "nulang-ai-local",
  "opentelemetry",
@@ -2479,6 +2480,15 @@ dependencies = [
  "wasm-encoder 0.220.1",
  "wasmtime",
  "wat",
+]
+
+[[package]]
+name = "nulang-accelerator"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

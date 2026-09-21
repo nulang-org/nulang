@@ -5,13 +5,13 @@
 > mechanism it specifies.
 >
 > **Status:** Ratified 2026-07-19 alongside RFC 0001 (Format Stability) and
-> RFC 0002 (Frozen Core). Language version 1.0-frozen.
+> RFC 0002 (Frozen Core). The Nulang 1 compatibility baseline remains frozen.
+> The active compiler is now on the **2.0.0-dev** language line under RFC 0025.
 >
-> **Pre-1.0 reality check:** Nulang is alpha software without external users
-> yet. The tier guarantees below are the *intent* and the policy the
-> maintainer works to — but until the language has real users, **expect
-> breaking changes before v1.0** and treat any guarantee here as subject to
-> revision.
+> **Nulang 2 development rule:** Nulang 1 Frozen and Stable contracts are not
+> revoked. New surfaces introduced specifically for Nulang 2 are Experimental
+> by default and may evolve while the language version carries the `-dev`
+> designation. Stabilizing them requires an explicit RFC/tier decision.
 
 ## 1. Purpose
 
@@ -65,8 +65,13 @@ warning, and is removed only in the version after next).
 
 ### Experimental
 No stability promise. May change or be removed in any release. Lives behind a
-feature flag (`wasm-backend`, `python`, `sqlite`, `lsp`) or is explicitly
-marked experimental in `CHANGELOG.md`.
+feature flag (`wasm-backend`, `python`, `sqlite`, `lsp`), is explicitly
+marked experimental in `CHANGELOG.md`, or is a Nulang 2 development surface
+covered by RFC 0025. Experimental v2 syntax, type constructors, effects, and
+runtime contracts remain mutable until explicitly promoted.
+
+This flexibility does not allow a v2 implementation to invalidate Nulang 1
+Core or reinterpret Nulang 1 frozen formats.
 
 ## 2a. Keyword Lifecycle (RFC 0010)
 
@@ -142,9 +147,11 @@ RFC's header).
   rev freely (semver) for bug fixes, performance, and Experimental features.
 - **Language version** (`Cargo.toml` `[package.metadata] language-version`,
   and the `LANGUAGE_VERSION` const in `src/format/constants.rs`): moves only
-  on RFC-ratified change to Frozen or Stable surfaces. Recorded in every
-  `.nbc` artifact. A runtime rejects an artifact whose language version
-  exceeds its own (`FormatError::IncompatibleLanguage`).
+  on RFC-ratified major/stability transitions. Recorded in every `.nbc`
+  artifact. A runtime rejects an artifact whose language version exceeds its
+  own (`FormatError::IncompatibleLanguage`). The active line is
+  `2.0.0-dev`; RFC 0025 permits explicitly Nulang-2 Experimental surfaces to
+  evolve without treating each pre-freeze revision as a new frozen language.
 
 ## 6. Deprecation
 

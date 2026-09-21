@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/nulang-ai", "crates/nulang-ai-core", "crates/nulang-ai-protocol", "crates/nulang-ai-local", "crates/nulang-ai-director", "crates/nulang-ai-manager", "crates/nulang-ai-worker", "crates/nulang-ai-mcp", "crates/nulang-capacity", "crates/nulang-ui-protocol"]
+members = ["crates/nulang-accelerator", "crates/nulang-ai", "crates/nulang-ai-core", "crates/nulang-ai-protocol", "crates/nulang-ai-local", "crates/nulang-ai-director", "crates/nulang-ai-manager", "crates/nulang-ai-worker", "crates/nulang-ai-mcp", "crates/nulang-capacity", "crates/nulang-ui-protocol"]
 # The browser-playground crate re-uses compiler sources via #[path] includes
 # and builds only for wasm32-unknown-unknown; it is intentionally standalone
 # (its own lockfile, minimal pure-Rust dep set) and excluded from workspace
@@ -33,7 +33,7 @@ autobenches = false
 # rejects an artifact whose language version exceeds its own. The runtime
 # truth is the `LANGUAGE_VERSION` const in src/format/constants.rs; this field
 # is the human-readable mirror.
-language-version = "1.0.0-frozen"
+language-version = "2.0.0-dev"
 
 [features]
 default = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
@@ -155,6 +155,8 @@ postgres = { version = "0.19", optional = true }
 libloading = { version = "0.8", optional = true }
 # Dynamic C function calls with runtime-described signatures (optional, see [features])
 libffi = { version = "5", optional = true }
+# Accelerator reference semantics shared by the VM and future device backends.
+nulang-accelerator = { path = "crates/nulang-accelerator", version = "0.1.0" }
 # AI runtime crate (optional; enabled by the `ai-runtime` feature).
 nulang-ai = { path = "crates/nulang-ai", version = "0.1.0", optional = true }
 nulang-ai-local = { path = "crates/nulang-ai-local", version = "0.1.0", optional = true }

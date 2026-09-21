@@ -189,6 +189,15 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// Return the number of elements in an array allocated on the actor heap.
     fn array_len(&self, ptr: *mut u8) -> Option<usize>;
 
+    /// Return trusted type/size metadata only when `ptr` is an exact live
+    /// payload owned by the current allocation domain.
+    ///
+    /// The default denies provenance. Heap-backed callbacks override this by
+    /// searching their trusted live-object inventory before any header access.
+    fn heap_payload_info(&self, _ptr: *mut u8) -> Option<(HeapTypeTag, usize)> {
+        None
+    }
+
     /// Allocate a fresh heap string via `self.alloc`, copy `s` into it,
     /// and null-terminate. Default implementation works for any callback
     /// with a working `alloc`; callers may override for specialization.
@@ -429,6 +438,264 @@ impl StandaloneVmCallbacks {
 ///
 /// String-id values index the constant pool; pointer values are read as
 /// null-terminated UTF-8; everything else falls back to `to_string_repr`.
+const TENSOR_RUNTIME_MAGIC: u64 = 0x4E55_5445_4E53_4F52; // "NUTENSOR"
+const TENSOR_RUNTIME_HEADER_WORDS: usize = 4;
+const TENSOR_RUNTIME_HEADER_BYTES: usize = TENSOR_RUNTIME_HEADER_WORDS * std::mem::size_of::<u64>();
+
+fn tensor_from_value(
+    callbacks: &dyn ActorVmCallbacks,
+    value: Value,
+) -> Option<nulang_accelerator::CpuTensor> {
+    let ptr = value.as_ptr()?;
+    let (type_tag, payload_size) = callbacks.heap_payload_info(ptr)?;
+    if type_tag != HeapTypeTag::Raw || payload_size < TENSOR_RUNTIME_HEADER_BYTES {
+        return None;
+    }
+
+    // SAFETY: heap_payload_info proved that ptr is an exact live payload owned
+    // by the current allocation domain and provided its requested size. All
+    // metadata/data reads below are bounds-checked against that trusted size.
+    unsafe {
+        let words = ptr as *const u64;
+        if words.read() != TENSOR_RUNTIME_MAGIC {
+            return None;
+        }
+        let rows = words.add(1).read();
+        let cols = words.add(2).read();
+        let len = words.add(3).read();
+        let data_bytes = usize::try_from(len)
+            .ok()?
+            .checked_mul(std::mem::size_of::<f64>())?;
+        let required = TENSOR_RUNTIME_HEADER_BYTES.checked_add(data_bytes)?;
+        if required > payload_size {
+            return None;
+        }
+        let data_ptr = ptr.add(TENSOR_RUNTIME_HEADER_BYTES) as *const f64;
+        let data = std::slice::from_raw_parts(data_ptr, usize::try_from(len).ok()?).to_vec();
+        nulang_accelerator::CpuTensor::matrix(
+            nulang_accelerator::DType::F64,
+            rows,
+            cols,
+            data,
+        )
+        .ok()
+    }
+}
+
+fn alloc_tensor(
+    callbacks: &mut dyn ActorVmCallbacks,
+    tensor: &nulang_accelerator::CpuTensor,
+) -> Option<Value> {
+    let (rows, cols) = tensor.matrix_shape().ok()?;
+    let data_bytes = tensor
+        .data
+        .len()
+        .checked_mul(std::mem::size_of::<f64>())?;
+    let payload_bytes = TENSOR_RUNTIME_HEADER_BYTES.checked_add(data_bytes)?;
+    let (ptr, value) = callbacks.alloc_value(payload_bytes, HeapTypeTag::Raw)?;
+    // SAFETY: alloc_value returned a fresh Raw payload of exactly
+    // payload_bytes. Metadata occupies four aligned u64 words; f64 data starts
+    // immediately afterwards at an 8-byte boundary and fits the remainder.
+    unsafe {
+        let words = ptr as *mut u64;
+        words.write(TENSOR_RUNTIME_MAGIC);
+        words.add(1).write(rows as u64);
+        words.add(2).write(cols as u64);
+        words.add(3).write(tensor.data.len() as u64);
+        std::ptr::copy_nonoverlapping(
+            tensor.data.as_ptr(),
+            ptr.add(TENSOR_RUNTIME_HEADER_BYTES) as *mut f64,
+            tensor.data.len(),
+        );
+    }
+    Some(value)
+}
+
+fn value_array(callbacks: &dyn ActorVmCallbacks, value: Value) -> Option<Vec<Value>> {
+    let ptr = value.as_ptr()?;
+    let (type_tag, payload_size) = callbacks.heap_payload_info(ptr)?;
+    if type_tag != HeapTypeTag::Array || payload_size % std::mem::size_of::<Value>() != 0 {
+        return None;
+    }
+    let len = payload_size / std::mem::size_of::<Value>();
+    // SAFETY: heap_payload_info proved that ptr is a live Array payload owned
+    // by this allocation domain, and payload_size is an exact multiple of
+    // Value.
+    Some(unsafe { std::slice::from_raw_parts(ptr as *const Value, len).to_vec() })
+}
+
+fn alloc_value_array(callbacks: &mut dyn ActorVmCallbacks, values: &[Value]) -> Option<Value> {
+    let bytes = values.len().checked_mul(std::mem::size_of::<Value>())?;
+    let (ptr, value) = callbacks.alloc_value(bytes, HeapTypeTag::Array)?;
+    // SAFETY: fresh Array payload has exactly enough room for values.len()
+    // Value slots.
+    unsafe {
+        std::ptr::copy_nonoverlapping(values.as_ptr(), ptr as *mut Value, values.len());
+    }
+    Some(value)
+}
+
+/// Execute the initial Nulang 2 tensor effect surface with deterministic CPU
+/// reference semantics. Concrete accelerator backends must match this contract.
+pub(crate) fn perform_tensor_builtin(
+    callbacks: &mut dyn ActorVmCallbacks,
+    op_name: Option<&str>,
+    regs: &[Value],
+) -> Option<Value> {
+    use nulang_accelerator::{CpuTensor, DType};
+
+    let nil = || Some(Value::nil());
+    match op_name {
+        Some("from_array") => {
+            let Some(source) = regs.first().copied() else {
+                return nil();
+            };
+            let Some(values) = value_array(callbacks, source) else {
+                return nil();
+            };
+            let Some(rows) = regs.get(1).and_then(Value::as_int) else {
+                return nil();
+            };
+            let Some(cols) = regs.get(2).and_then(Value::as_int) else {
+                return nil();
+            };
+            if rows < 0 || cols < 0 {
+                return nil();
+            }
+            let Some(data) = values.iter().map(Value::as_float).collect::<Option<Vec<_>>>() else {
+                return nil();
+            };
+            let Ok(tensor) = CpuTensor::matrix(DType::F64, rows as u64, cols as u64, data) else {
+                return nil();
+            };
+            Some(alloc_tensor(callbacks, &tensor).unwrap_or_else(Value::nil))
+        }
+        Some("zeros") => {
+            let Some(rows) = regs.first().and_then(Value::as_int) else {
+                return nil();
+            };
+            let Some(cols) = regs.get(1).and_then(Value::as_int) else {
+                return nil();
+            };
+            if rows < 0 || cols < 0 {
+                return nil();
+            }
+            let Ok(tensor) = CpuTensor::zeros(DType::F64, vec![rows as u64, cols as u64]) else {
+                return nil();
+            };
+            Some(alloc_tensor(callbacks, &tensor).unwrap_or_else(Value::nil))
+        }
+        Some("shape") => {
+            let Some(value) = regs.first().copied() else {
+                return nil();
+            };
+            let Some(tensor) = tensor_from_value(callbacks, value) else {
+                return nil();
+            };
+            let Some(values) = tensor
+                .spec
+                .shape
+                .iter()
+                .map(|dim| i64::try_from(*dim).ok().map(Value::int))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return nil();
+            };
+            Some(alloc_value_array(callbacks, &values).unwrap_or_else(Value::nil))
+        }
+        Some("to_array") => {
+            let Some(value) = regs.first().copied() else {
+                return nil();
+            };
+            let Some(tensor) = tensor_from_value(value) else {
+                return nil();
+            };
+            let values = tensor.data.iter().copied().map(Value::float).collect::<Vec<_>>();
+            Some(alloc_value_array(callbacks, &values).unwrap_or_else(Value::nil))
+        }
+        Some("add") => {
+            let (Some(lhs_value), Some(rhs_value)) =
+                (regs.first().copied(), regs.get(1).copied())
+            else {
+                return nil();
+            };
+            let (Some(lhs), Some(rhs)) =
+                (tensor_from_value(callbacks, lhs_value), tensor_from_value(callbacks, rhs_value))
+            else {
+                return nil();
+            };
+            let Ok(out) = lhs.add(&rhs) else {
+                return nil();
+            };
+            Some(alloc_tensor(callbacks, &out).unwrap_or_else(Value::nil))
+        }
+        Some("matmul") => {
+            let (Some(lhs_value), Some(rhs_value)) =
+                (regs.first().copied(), regs.get(1).copied())
+            else {
+                return nil();
+            };
+            let (Some(lhs), Some(rhs)) =
+                (tensor_from_value(lhs_value), tensor_from_value(rhs_value))
+            else {
+                return nil();
+            };
+            let Ok(out) = lhs.matmul(&rhs) else {
+                return nil();
+            };
+            Some(alloc_tensor(callbacks, &out).unwrap_or_else(Value::nil))
+        }
+        Some("relu") => {
+            let Some(value) = regs.first().copied() else {
+                return nil();
+            };
+            let Some(input) = tensor_from_value(value) else {
+                return nil();
+            };
+            let Ok(out) = input.relu() else {
+                return nil();
+            };
+            Some(alloc_tensor(callbacks, &out).unwrap_or_else(Value::nil))
+        }
+        _ => None,
+    }
+}
+
+/// Initial device-handle semantics. Device values intentionally erase to an
+/// opaque string handle until native backend sessions are wired into Runtime.
+pub(crate) fn perform_compute_builtin(
+    callbacks: &mut dyn ActorVmCallbacks,
+    op_name: Option<&str>,
+    constants: &[Constant],
+    regs: &[Value],
+) -> Option<Value> {
+    match op_name {
+        Some("default_device") => Some(callbacks.alloc_string("cpu:0")),
+        Some("device") => {
+            let requested =
+                resolve_value_string(constants, *regs.first().unwrap_or(&Value::nil()));
+            if requested.is_empty() {
+                return Some(Value::nil());
+            }
+            let resolved = if requested.eq_ignore_ascii_case("auto") {
+                "cpu:0".to_string()
+            } else {
+                requested
+            };
+            Some(callbacks.alloc_string(&resolved))
+        }
+        Some("device_name") => {
+            let name = resolve_value_string(constants, *regs.first().unwrap_or(&Value::nil()));
+            if name.is_empty() {
+                Some(Value::nil())
+            } else {
+                Some(callbacks.alloc_string(&name))
+            }
+        }
+        _ => None,
+    }
+}
+
 pub fn resolve_value_string(constants: &[Constant], value: Value) -> String {
     if let Some(id) = value.as_string_id() {
         match constants.get(id as usize) {
@@ -981,6 +1248,10 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
         }
     }
 
+    fn heap_payload_info(&self, ptr: *mut u8) -> Option<(HeapTypeTag, usize)> {
+        self.heap.live_payload_info(ptr.cast_const())
+    }
+
     fn spawn_actor(
         &mut self,
         _module: &CodeModule,
@@ -1006,6 +1277,12 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
         constants: &[Constant],
         regs: &[Value],
     ) -> Option<Value> {
+        if effect_name == "Tensor" {
+            return perform_tensor_builtin(self, op_name, regs);
+        }
+        if effect_name == "Compute" {
+            return perform_compute_builtin(self, op_name, constants, regs);
+        }
         if effect_name == "Actor" || effect_name == "Otp" {
             return Some(Value::nil());
         }

@@ -651,6 +651,29 @@ impl ActorHeap {
         }
     }
 
+    /// Return trusted metadata for an exact live payload pointer owned by this
+    /// heap without dereferencing the candidate pointer itself.
+    ///
+    /// This is the provenance gate for APIs that receive an opaque
+    /// pointer-tagged VM value. Walking the heap's trusted live list first
+    /// prevents a forged/foreign pointer from being interpreted as if an
+    /// OrcaHeader existed immediately before it.
+    pub fn live_payload_info(&self, ptr: *const u8) -> Option<(TypeTag, usize)> {
+        if ptr.is_null() {
+            return None;
+        }
+        let mut found = None;
+        self.iter_live_objects(|header, payload, _aligned_size| {
+            if std::ptr::eq(payload.cast_const(), ptr) {
+                // SAFETY: header comes from this heap's trusted live-object
+                // list, not from pointer arithmetic on the candidate pointer.
+                let header = unsafe { &*header };
+                found = Some((header.type_tag, header.payload_size));
+            }
+        });
+        found
+    }
+
     // ------------------------------------------------------------------
     // Reset
     // ------------------------------------------------------------------

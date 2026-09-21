@@ -240,7 +240,7 @@ mod tests {
         let bytes = sample_module().to_nbc(None).unwrap();
         assert_eq!(&bytes[0..4], b"NLBC");
         assert_eq!(u32::from_be_bytes(bytes[4..8].try_into().unwrap()), 1);
-        assert_eq!(u32::from_be_bytes(bytes[8..12].try_into().unwrap()), 1);
+        assert_eq!(u32::from_be_bytes(bytes[8..12].try_into().unwrap()), LANGUAGE_VERSION);
     }
 
     #[test]

@@ -84,6 +84,8 @@ pub fn parse_effect_name(name: &str) -> Effect {
         "STM" => Effect::STM,
         "Async" => Effect::Async,
         "Inference" => Effect::Inference,
+        "Compute" => Effect::Compute,
+        "Tensor" => Effect::Tensor,
         "Cost" => Effect::Cost,
         "Event" => Effect::Event,
         "FFI" => Effect::FFI,
@@ -108,7 +110,8 @@ pub fn effect_resource_category(eff: &Effect) -> Option<&'static str> {
     match eff {
         Effect::FS => Some("fs"),
         Effect::Net => Some("net"),
-        Effect::Env
+        Effect::Compute
+        | Effect::Env
         | Effect::Process
         | Effect::System
         | Effect::FFI
