@@ -42,6 +42,9 @@ version + migration.*
 
 ## Stable tier
 
+### Durable snapshot schema provenance — 2026-09-21
+- **Versioned durable snapshots** (Experimental, `src/persistence_schema.rs`, `src/runtime/persistence.rs`). Snapshots now preserve the entity schema version that produced them across checkpointing, recovery, hibernation, migration, shadow replication, and built-in persistence backends. Historical snapshots without schema metadata decode as v1, while custom backends fail closed rather than silently erasing v2+ provenance.
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 
