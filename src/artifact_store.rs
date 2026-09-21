@@ -217,8 +217,7 @@ fn decode_record(
     }
 
     let manifest_len = u32::from_le_bytes(record[6..10].try_into().expect("fixed header")) as usize;
-    let artifact_len_u64 =
-        u64::from_le_bytes(record[10..18].try_into().expect("fixed header"));
+    let artifact_len_u64 = u64::from_le_bytes(record[10..18].try_into().expect("fixed header"));
     let artifact_len = usize::try_from(artifact_len_u64)
         .map_err(|_| ArtifactStoreError::Corrupt("artifact length exceeds platform size".into()))?;
 
