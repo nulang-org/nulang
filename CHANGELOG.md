@@ -47,9 +47,10 @@ version + migration.*
   `src/fmt.rs`). `nulang fmt` now retains `remote` on sends and asks and
   retains literal `timeout` metadata on asks instead of silently rewriting
   distributed operations into local/default-timeout forms.
-- **Mutable bindings round-trip as Nulang syntax.** Formatter paths now emit
-  `var` rather than the non-language `let mut` spelling and preserve
-  explicit mutable-binding type annotations.
+- **Mutable bindings round-trip as valid Nulang syntax.** Local mutable
+  bindings emit `var`; module-level mutable declarations retain the parser's
+  current `let var` declaration form. The formatter no longer invents the
+  non-language `let mut` spelling and preserves explicit type annotations.
 - **Local actor sends have one canonical formatter spelling.** Both accepted
   local send forms still parse, but formatter output converges on
   `actor ! behavior(args)`. Explicit `send remote ...` remains keyword
