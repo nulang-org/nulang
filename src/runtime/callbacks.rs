@@ -2686,6 +2686,30 @@ mod host_authority_tests {
                 command: "printf hello".into(),
             })
         );
+
+        let (constants, regs) = string_args(&["cuda:0"]);
+        assert_eq!(
+            required_host_authority("Compute", Some("device"), &constants, &regs).unwrap(),
+            Some(AuthorityGrant::Other {
+                namespace: "Compute".into(),
+                operation: "Use".into(),
+                argument: Some("cuda:0".into()),
+            })
+        );
+
+        assert_eq!(
+            required_host_authority("Compute", Some("default_device"), &[], &[]).unwrap(),
+            Some(AuthorityGrant::Other {
+                namespace: "Compute".into(),
+                operation: "Use".into(),
+                argument: Some("auto".into()),
+            })
+        );
+        assert_eq!(
+            required_host_authority("Tensor", Some("matmul"), &[], &[]).unwrap(),
+            None,
+            "runtime-owned tensor arithmetic must not require ambient host authority"
+        );
     }
 
     #[test]
