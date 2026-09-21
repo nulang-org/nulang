@@ -210,10 +210,24 @@ Phases 1 and 2 are additive:
 
 ## Follow-up phases
 
-1. Continue migrating remaining direct role-boolean consumers (agent, supervisor,
-   recovery, and distribution paths) to `ActorRole`.
-2. Replace multiple serialized booleans with a versioned role enum in a future format
-   revision.
+Phase 3 introduces `ActorSemantics` as the preferred compatibility view for new
+compiler/runtime code. It separates three orthogonal dimensions that legacy role
+flags had conflated:
+
+- durability: transient vs durable;
+- activation: eager vs virtual;
+- surface origin: actor, agent, workflow, or organization.
+
+`ActorRole` remains as a persisted-format compatibility view until the format
+migration is safe. Runtime agent detection, VM callbacks, and MIR tool collection
+now consume normalized semantics rather than reading `is_agent` directly.
+
+Remaining work:
+
+1. Continue migrating direct role-boolean consumers that make semantic decisions;
+   plain serialization/copying of compatibility fields may remain until format migration.
+2. Replace multiple serialized booleans with versioned semantic fields in a future
+   format revision.
 3. Make effect-boundary metadata visible in tracing and replay inspection.
 4. Require stable operation IDs for replayable external effects at the Cloud/runtime
    boundary.
