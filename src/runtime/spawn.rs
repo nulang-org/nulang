@@ -21,6 +21,8 @@ pub(crate) fn spawn_actor_with_models(
     state_models: HashMap<String, StateModel>,
     persistent: bool,
     workflow: Option<&str>,
+    schema_owner: Option<&str>,
+    schema_version: u32,
 ) -> u64 {
     spawn_actor_with_id(
         rt,
@@ -29,6 +31,8 @@ pub(crate) fn spawn_actor_with_models(
         state_models,
         persistent,
         workflow,
+        schema_owner,
+        schema_version,
     )
 }
 
@@ -60,6 +64,8 @@ pub(crate) fn spawn_actor_with_id(
     state_models: HashMap<String, StateModel>,
     persistent: bool,
     workflow: Option<&str>,
+    schema_owner: Option<&str>,
+    schema_version: u32,
 ) -> u64 {
     let restart_snapshot = if persistent && workflow.is_none() {
         match preflight_persistent_snapshot(rt, id) {
@@ -77,7 +83,28 @@ pub(crate) fn spawn_actor_with_id(
         None
     };
 
+    if let Some((snapshot, _)) = restart_snapshot.as_ref() {
+        let owner_mismatch = snapshot
+            .schema_owner
+            .as_deref()
+            .zip(schema_owner)
+            .is_some_and(|(persisted, current)| persisted != current);
+        if snapshot.schema_version != schema_version || owner_mismatch {
+            tracing::warn!(
+                actor_id = id,
+                persisted_schema_owner = ?snapshot.schema_owner,
+                current_schema_owner = ?schema_owner,
+                persisted_schema_version = snapshot.schema_version,
+                current_schema_version = schema_version,
+                "refusing to activate persistent actor with incompatible durable schema; migration execution is not implemented"
+            );
+            return id;
+        }
+    }
+
     let mut actor = Actor::new(id, format!("actor_{}", id), 0);
+    actor.schema_owner = schema_owner.map(str::to_string);
+    actor.schema_version = schema_version;
     let state_fields = init();
     for (name, value) in state_fields {
         actor.set_state_field(name, value);
@@ -281,9 +308,19 @@ pub(crate) fn spawn_from_module(
             } else {
                 None
             },
+            Some(meta.name.as_str()),
+            meta.version,
         )
     } else {
-        spawn_actor_with_models(rt, Box::new(move || init), HashMap::new(), false, None)
+        spawn_actor_with_models(
+            rt,
+            Box::new(move || init),
+            HashMap::new(),
+            false,
+            None,
+            None,
+            1,
+        )
     };
     let offsets: Vec<usize> = bytecode_offsets_for_role(module, role);
     // compensation_offsets filtered to this actor's own behaviors so
