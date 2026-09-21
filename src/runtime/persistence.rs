@@ -663,6 +663,10 @@ impl JsonFileStore {
     fn events_path(&self, actor_id: u64) -> PathBuf {
         self.actor_dir(actor_id).join("events.jsonl")
     }
+
+    fn artifact_dir(&self, artifact_id: ArtifactId) -> PathBuf {
+        self.base_dir.join("artifacts").join(artifact_id.to_string())
+    }
 }
 
 impl PersistenceStore for JsonFileStore {
@@ -824,6 +828,75 @@ impl PersistenceStore for JsonFileStore {
             fs::remove_dir_all(dir)?;
         }
         Ok(())
+    }
+
+    fn save_artifact(&mut self, artifact: RetainedArtifact) -> io::Result<()> {
+        let target = self.artifact_dir(artifact.artifact_id);
+        if target.exists() {
+            let existing = self.load_artifact(artifact.artifact_id)?;
+            if existing.as_ref() == Some(&artifact) {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "immutable artifact {} already exists with different bytes",
+                    artifact.artifact_id
+                ),
+            ));
+        }
+
+        let root = self.base_dir.join("artifacts");
+        fs::create_dir_all(&root)?;
+        let temp = root.join(format!(
+            ".{}.tmp-{}",
+            artifact.artifact_id,
+            std::process::id()
+        ));
+        if temp.exists() {
+            fs::remove_dir_all(&temp)?;
+        }
+        fs::create_dir_all(&temp)?;
+
+        let write_synced = |path: &Path, bytes: &[u8]| -> io::Result<()> {
+            let mut file = fs::File::create(path)?;
+            file.write_all(bytes)?;
+            file.sync_all()
+        };
+        write_synced(&temp.join("manifest.json"), &artifact.manifest_json)?;
+        write_synced(&temp.join("module.nbc"), &artifact.nbc_bytes)?;
+        write_synced(
+            &temp.join("module.blake3"),
+            hex::encode(artifact.nbc_digest).as_bytes(),
+        )?;
+        fs::rename(&temp, &target)?;
+        Ok(())
+    }
+
+    fn load_artifact(&self, artifact_id: ArtifactId) -> io::Result<Option<RetainedArtifact>> {
+        let dir = self.artifact_dir(artifact_id);
+        if !dir.exists() {
+            return Ok(None);
+        }
+        let manifest_json = fs::read(dir.join("manifest.json"))?;
+        let nbc_bytes = fs::read(dir.join("module.nbc"))?;
+        let digest_text = fs::read_to_string(dir.join("module.blake3"))?;
+        let digest_vec = hex::decode(digest_text.trim())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let nbc_digest: [u8; 32] = digest_vec.try_into().map_err(|v: Vec<u8>| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("artifact digest must be 32 bytes, got {}", v.len()),
+            )
+        })?;
+        let retained = RetainedArtifact {
+            artifact_id,
+            manifest_json,
+            nbc_bytes,
+            nbc_digest,
+        };
+        retained.restore_module(artifact_id)?;
+        Ok(Some(retained))
     }
 }
 
