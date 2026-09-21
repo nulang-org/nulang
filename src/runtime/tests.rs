@@ -2052,6 +2052,7 @@ fn test_compiler_emits_private_replayable_apply_handler_metadata() {
     let handler = &meta.apply_handlers[0];
     assert_eq!(handler.event, "Incremented");
     assert_eq!(handler.param_count, 1);
+    assert!(handler.replay_safe, "pure event-sourced projection should be replayable");
     assert!(
         handler.function_index < module.function_table.len(),
         "apply handler must bind a real private function-table slot"
@@ -2067,6 +2068,48 @@ fn test_compiler_emits_private_replayable_apply_handler_metadata() {
     assert!(
         module.behaviors.iter().all(|behavior| behavior.name != expected_name),
         "replay apply functions must never enter the actor behavior table"
+    );
+}
+
+#[test]
+fn test_compiler_marks_apply_handler_non_replayable_when_it_touches_durable_state() {
+    let module = compile_state_migration_module(
+        r#"
+        entity Counter {
+            state event_sourced count: Int = 0
+            state durable audit_total: Int = 0
+            events
+                | Incremented(by: Int)
+            apply
+                | Incremented(by) => {
+                    self.audit_total = self.audit_total + by
+                    self.count = self.count + by
+                }
+
+            behavior inc(by: Int) {
+                emit Incremented(by)
+            }
+        }
+        "#,
+    );
+
+    let meta = module
+        .actor_metadata
+        .iter()
+        .find(|meta| meta.name == "Counter")
+        .expect("Counter metadata");
+    let handler = meta
+        .apply_handlers
+        .iter()
+        .find(|handler| handler.event == "Incremented")
+        .expect("apply metadata");
+    assert!(
+        !handler.replay_safe,
+        "touching durable state must preserve live compatibility but fail closed for replay"
+    );
+    assert!(
+        handler.function_index < module.function_table.len(),
+        "the private artifact may still exist for diagnostics/tooling"
     );
 }
 
