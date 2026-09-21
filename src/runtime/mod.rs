@@ -5684,25 +5684,12 @@ impl Runtime {
             }
         };
 
-        // Register the recovery module.
-        let offsets: Vec<usize> = module
-            .behaviors
-            .iter()
-            .map(|b| b.code_offset as usize)
-            .collect();
-        let compensation_offsets: Vec<Option<usize>> = if let Some(schema_meta) = schema_meta.as_ref().filter(|meta| meta.is_workflow) {
-            schema_meta
-                .behavior_indices
-                .iter()
-                .map(|&i| module.behaviors[i].compensate_offset)
-                .collect()
-        } else {
-            module
-                .behaviors
-                .iter()
-                .map(|behavior| behavior.compensate_offset)
-                .collect()
-        };
+        // Register exactly the runtime-local layout already selected by
+        // restore_actor_from_snapshot. In particular, workflows use compressed
+        // actor-local behavior ids and must not be widened back to the module's
+        // global behavior table for a later crash recovery.
+        let offsets = actor.bytecode_offsets.clone();
+        let compensation_offsets = actor.compensation_offsets.clone();
         if let Some(schema_meta) = &schema_meta {
             self.recovery_schema_names
                 .insert(actor_id, schema_meta.name.clone());
