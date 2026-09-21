@@ -121,10 +121,10 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                 }
             }
 
-            // State migrations are private compiler-owned functions, not
-            // actor behaviors. They are deliberately absent from func_map
-            // and ActorMeta.behavior_indices, so application call/send/ask
-            // resolution cannot address them.
+            // State migrations are compiler-private functions, not actor
+            // behaviors. They are deliberately absent from func_map and
+            // ActorMeta.behavior_indices, so source call/send/ask resolution
+            // cannot address them.
             for migration in &a.migration_state_bodies {
                 let name = migration_state_function_name(
                     &a.name,
@@ -567,7 +567,7 @@ fn lower_behavior_def(
     Ok(lowerer.b.build())
 }
 
-/// Lower a migration state transform as a private function-table entry.
+/// Lower a migration state transform as a compiler-private function-table entry.
 ///
 /// The function receives no source-visible arguments. It resolves `self`
 /// through the same runtime callback as actor behaviors, which lets a future
