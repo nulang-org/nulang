@@ -184,10 +184,16 @@ mod tests {
     #[test]
     fn identity_roundtrips_raw_digest_bytes() {
         let semantic = SemanticId::from_canonical_bytes(b"wire", []);
-        assert_eq!(SemanticId::from_digest_bytes(*semantic.as_bytes()), semantic);
+        assert_eq!(
+            SemanticId::from_digest_bytes(*semantic.as_bytes()),
+            semantic
+        );
         let artifact =
             ArtifactId::from_semantic(semantic, "compiler", "target", "abi", "backend", ["flag"]);
-        assert_eq!(ArtifactId::from_digest_bytes(*artifact.as_bytes()), artifact);
+        assert_eq!(
+            ArtifactId::from_digest_bytes(*artifact.as_bytes()),
+            artifact
+        );
     }
 
     #[test]
