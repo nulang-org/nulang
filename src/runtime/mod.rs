@@ -68,6 +68,7 @@ mod metrics;
 mod persistence;
 mod process_groups;
 mod registry;
+pub(crate) mod secrets;
 pub mod resp;
 pub mod resp_cache;
 mod spawn;
@@ -385,6 +386,9 @@ pub struct Runtime {
 
     // Process groups (v0.7)
     pub process_groups: ProcessGroups,
+    /// Runtime-owned actor-scoped secret handles. Entries contain logical
+    /// secret names only; plaintext credentials never live in this broker.
+    pub(crate) secrets: secrets::SecretBroker,
 
     // Persistence engine (v0.7)
     pub persistence: Box<dyn PersistenceStore>,
@@ -613,6 +617,7 @@ impl Runtime {
             timer_wheel: TimerWheel::new(),
             registry: ActorRegistry::new(),
             process_groups: ProcessGroups::new(),
+            secrets: secrets::SecretBroker::new(),
             pending_fetched_messages: HashMap::new(),
             persistence: Box::new(MemoryStore::new()),
             object_store: ObjectStore::new(),
