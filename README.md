@@ -7,7 +7,7 @@
 </p>
 <p align="center">
   <a href="https://nulang.org">Website</a> •
-  <a href="playground/">Playground</a> •
+  <a href="https://nulang.org/playground/">Playground</a> •
   <a href="https://nulang.cloud">Nulang Cloud</a> •
   <a href="https://github.com/nulang-org/nulang">GitHub</a>
 </p>
@@ -90,9 +90,9 @@ perform IO.print("Hello, " + name + "!")
 > 17 verified programs covering actors, effects, pattern matching, records,
 > loops, arrays, HTTP, JSON, and more.
 >
-> No install? Try the [`playground/`](playground/) — run it locally with
-> `python3 playground/server.py` (a hosted version at nulang.org/playground
-> is coming soon).
+> No install? Try the hosted [browser playground](https://nulang.org/playground/).
+> It runs the compiler frontend + CoreVM locally in WebAssembly. Actors,
+> networking, FFI, and JIT execution still require the native runtime.
 
 ---
 
@@ -102,7 +102,7 @@ perform IO.print("Hello, " + name + "!")
 - **Capability-based types** — `iso`, `trn`, `ref`, `val`, `box`, `tag`, and `lineariso` guarantee memory safety and data-race freedom. Checked at compile time; erased at runtime.
 - **Hindley-Milner type inference** — full Algorithm W with row-polymorphic records, variant types, and algebraic effect rows.
 - **Actors** — `spawn`, `send`/`!`, `ask`, selective `receive` with `after` timeout, links, monitors, supervision trees, process groups, and actor priority scheduling.
-- **Entities & workflows** — `entity` declarations (durable-first, event-sourced by default). `workflow` declarations with steps, timers, signals, and saga compensation that survive restarts.
+- **Entities & workflows** — `entity` declarations are durable-first and event-sourced by default. The higher-level `workflow` declaration surface supports steps, timers, signals, and saga compensation, and remains *Experimental* while that API evolves.
 - **`let` and `var`** — immutable and mutable bindings. Records with `{ field: value }` syntax and `{ base .. field = new_val }` update syntax. Pattern matching with guards, alias patterns, and recursive sub-patterns. `**` exponentiation. Multi-line `"""..."""` strings with `\u{...}` unicode escapes. Pipe operator `|>`.
 - **Error handling** — `catch expr fallback` (prefix or postfix), `fail Error(...)` for structured short-circuit return, `T ! E` return types, `?` unwrap.
 - **FS file I/O** — `perform FS.read(path)`, `perform FS.write(path, content)`, `perform FS.append(path, content)`, `perform FS.exists(path)`.
@@ -191,12 +191,13 @@ WASM backend test suite.
 
 ## Nulang Cloud
 
-**[Nulang Cloud](https://www.nulang.cloud)** is an optional managed platform
-for running Nulang actors in production — auto-scaling, zero cold start,
-managed durability, and location-transparent messaging across regions.
+**[Nulang Cloud](https://www.nulang.cloud)** is the optional managed platform
+for Nulang deployment, runtime, and platform tooling. It is under active
+development; check the Cloud site for the currently available surfaces rather
+than treating planned platform capabilities as production guarantees.
 
-The language and runtime in this repository are **Apache-2.0** and fully
-self-hostable. No lock-in.
+The language and runtime in this repository are **Apache-2.0** and
+self-hostable.
 
 ---
 
