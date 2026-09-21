@@ -206,6 +206,32 @@ The migration sequence is:
 
 Current plumbing gaps are explicit: the parser still initializes spawn capabilities to an empty vector; MIR codegen currently destructures `capabilities: _`, so it drops even programmatically constructed grants instead of filling `CodeModule::spawn_capability_grants`; and the current `spawn_actor` callback API carries no spawn-PC/grant argument for installing those grants on the child. The existence of AST/HIR/MIR fields or bytecode metadata therefore must not be treated as end-to-end enforcement yet.
 
+## Contract 4A — Value-level secret confidentiality
+
+Typed external authority answers **who may request a secret**. It does not by
+itself prevent the returned value from being printed, serialized, messaged, or
+written to a durable log. Confidentiality is therefore a separate type property
+from reference ownership/capability.
+
+The experimental `Secret[T]` wrapper is an opaque semantic type:
+
+- `Secret[T]` does not unify with `T`;
+- `Secret.get(name)` / `Secret.read(name)` type as `Secret[String]`;
+- secret-bearing values, including nested containers, may not cross generic
+  effect boundaries;
+- secret-bearing values may not cross actor-message or durable-event
+  boundaries by default;
+- `Secret.*` operations are the explicit confidentiality-aware boundary.
+
+This is intentionally independent from `linear` / `lineariso`. A secret may
+be reused legitimately, while linearity governs consumption and aliasing. Both
+properties may be combined when one-time secret use is required.
+
+This compiler-first phase does not claim that secret bytes are absent from heap
+memory. A later runtime phase may represent `Secret[T]` as opaque brokered
+handles, short-lived credentials, or KMS/HSM-backed capabilities without
+changing the source-level confidentiality contract.
+
 ## Contract 5 — Protocol-typed actor references
 
 ### Requirement
