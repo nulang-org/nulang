@@ -2976,9 +2976,9 @@ mod tests {
     }
     #[cfg(feature = "ureq")]
     #[test]
-    fn test_cmd_deploy_missing_token() {
+    fn test_cmd_deploy_fails_closed_before_token_validation() {
         let dir =
-            std::env::temp_dir().join(format!("nulang_deploy_token_test_{}", std::process::id()));
+            std::env::temp_dir().join(format!("nulang_deploy_gate_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _guard = ChangeDir::new(&dir);
@@ -2992,11 +2992,14 @@ mod tests {
             crate::web::adapters::AdapterKind::NulangCloud,
             false,
         );
-        assert!(result.is_err(), "deploy without token should fail");
+        assert!(result.is_err(), "managed deploy must fail while ingress is unqualified");
         if let Err(NuError::PackageError { msg, .. }) = result {
             assert!(
-                msg.contains("NULANG_CLOUD_TOKEN") || msg.contains("--token"),
-                "error should mention token: {}",
+                msg.contains("temporarily unavailable")
+                    && msg.contains("/api/v1/deploy")
+                    && msg.contains("--dry-run")
+                    && msg.contains("#471"),
+                "error should explain the qualification gate before auth validation: {}",
                 msg
             );
         }
