@@ -7397,12 +7397,13 @@ fn identified_migration_rejects_tampered_nbc_bytes() {
     module.attach_artifact_identity(&identity).unwrap();
 
     let runtime_manifest = RuntimeArtifactManifest::from_module(&module, &identity).unwrap();
-    let mut nbc_bytes = module.to_nbc(None).unwrap();
+    let nbc_bytes = module.to_nbc(None).unwrap();
+    let mut wrong_digest = *blake3::hash(&nbc_bytes).as_bytes();
+    wrong_digest[0] ^= 0xFF;
     let provenance = RuntimeArtifactProvenance {
-        nbc_blake3: *blake3::hash(&nbc_bytes).as_bytes(),
+        nbc_blake3: wrong_digest,
         runtime_manifest_json: runtime_manifest.to_json().unwrap(),
     };
-    *nbc_bytes.last_mut().unwrap() ^= 0x01;
     let snapshot_json = serde_json::to_vec(&ActorSnapshot {
         actor_id,
         semantic_id: Some(definition_id.to_string()),
