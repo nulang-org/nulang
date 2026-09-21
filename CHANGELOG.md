@@ -42,6 +42,18 @@ version + migration.*
 
 ## Stable tier
 
+### Secret value confidentiality — 2026-09-21
+- **Opaque `Secret[T]` type** (Experimental, `src/types.rs`, `src/parser.rs`,
+  `src/typechecker.rs`). Secret values are a confidentiality property
+  independent from reference capabilities such as `lineariso`.
+  `Secret.get/read(name)` infer `Secret[String]`; secret-bearing values
+  cannot cross non-`Secret` effect boundaries, actor-message boundaries, or
+  durable-event boundaries, including when nested inside containers. Pure code
+  may carry and return `Secret[T]` values normally. This phase is compiler
+  enforcement only; a runtime secret broker/opaque-handle representation is
+  follow-up work.
+
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 
