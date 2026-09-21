@@ -1,141 +1,107 @@
 ---
-// Three-step "from zero to running" section styled to match nulang.cloud.
 const steps = [
 	{
-		step: '1',
-		icon: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
-		title: 'Clone the repo',
-		description: 'Get the source from GitHub and enter the project directory.',
+		step: '01',
+		title: 'Clone',
+		description: 'Get the compiler and runtime source.',
 		command: 'git clone https://github.com/nulang-org/nulang',
 	},
 	{
-		step: '2',
-		icon: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
-		title: 'Build the compiler',
-		description: 'Compile the Rust toolchain and runtime in release mode.',
+		step: '02',
+		title: 'Build',
+		description: 'Compile the release binary.',
 		command: 'cargo build --release',
 	},
 	{
-		step: '3',
-		icon: '<polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>',
-		title: 'Start the REPL',
-		description: 'Run nulang interactively and start writing your first actor.',
+		step: '03',
+		title: 'Run',
+		description: 'Start the REPL or execute a .nula file.',
 		command: 'cargo run -- --repl',
 	},
 ];
 ---
 
-<div class="steps-grid">
-	{steps.map((s, i) => (
-		<div class="step-card">
-			<div class="step-head">
-				<div class="step-icon-chip">
-					<svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" set:html={s.icon} />
+<div class="steps-flow" aria-label="Install Nulang in three steps">
+	{steps.map((step) => (
+		<div class="step">
+			<div class="step-index">{step.step}</div>
+			<div class="step-copy">
+				<div class="step-heading">
+					<strong>{step.title}</strong>
+					<span>{step.description}</span>
 				</div>
-				<span class="step-number" aria-label={`Step ${s.step}`}>{s.step}</span>
+				<code>{step.command}</code>
 			</div>
-			<h3>{s.title}</h3>
-			<p>{s.description}</p>
-			<code class="step-command">{s.command}</code>
-			{i < steps.length - 1 && (
-				<div class="step-connector" aria-hidden="true">
-					<div class="step-line" />
-				</div>
-			)}
 		</div>
 	))}
 </div>
 
 <style>
-	@layer starlight.core {
-		.steps-grid {
-			display: grid;
+	.steps-flow {
+		display: grid;
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+		border-top: 1px solid var(--nu-border);
+		border-bottom: 1px solid var(--nu-border);
+	}
+
+	.step {
+		display: grid;
+		grid-template-columns: auto 1fr;
+		gap: 0.9rem;
+		padding: 1.4rem 1.25rem;
+	}
+
+	.step + .step {
+		border-left: 1px solid var(--nu-border);
+	}
+
+	.step-index {
+		color: var(--nu-blue);
+		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+		font-size: 0.76rem;
+		font-weight: 800;
+	}
+
+	.step-copy {
+		min-width: 0;
+	}
+
+	.step-heading {
+		display: grid;
+		gap: 0.15rem;
+	}
+
+	.step-heading strong {
+		color: var(--nu-text);
+		font-size: 0.95rem;
+	}
+
+	.step-heading span {
+		color: var(--nu-text-secondary);
+		font-size: 0.8rem;
+		line-height: 1.45;
+	}
+
+	.step code {
+		display: block;
+		margin-top: 0.75rem;
+		overflow-x: auto;
+		padding: 0;
+		background: transparent;
+		color: var(--nu-text);
+		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+		font-size: 0.72rem;
+		white-space: nowrap;
+	}
+
+	@media (max-width: 48rem) {
+		.steps-flow {
 			grid-template-columns: 1fr;
-			gap: 1.25rem;
 		}
 
-		@media (min-width: 40rem) {
-			.steps-grid {
-				grid-template-columns: repeat(3, 1fr);
-			}
-		}
-
-		.step-card {
-			position: relative;
-			display: flex;
-			flex-direction: column;
-			padding: 1.75rem;
-			border-radius: 1rem;
-			border: 1px solid var(--nu-border);
-			background: var(--nu-surface);
-		}
-
-		.step-head {
-			display: flex;
-			align-items: center;
-			justify-content: space-between;
-		}
-
-		.step-icon-chip {
-			display: grid;
-			place-items: center;
-			width: 2.75rem;
-			height: 2.75rem;
-			border-radius: 0.75rem;
-			background: rgba(243, 128, 32, 0.1);
-			color: var(--nu-accent-high);
-		}
-
-		.step-number {
-			font-size: 2rem;
-			font-weight: 700;
-			line-height: 1;
-			font-variant-numeric: tabular-nums;
-			color: var(--nu-text-tertiary);
-		}
-
-		.step-card h3 {
-			margin: 1rem 0 0.375rem;
-			font-size: 1.05rem;
-			font-weight: 600;
-			color: var(--nu-text);
-		}
-
-		.step-card p {
-			flex: 1;
-			margin: 0;
-			font-size: 0.875rem;
-			line-height: 1.6;
-			color: var(--nu-text-secondary);
-		}
-
-		.step-command {
-			display: block;
-			margin-top: 1rem;
-			padding: 0.5rem 0.75rem;
-			border-radius: 0.5rem;
-			background: var(--sl-color-bg-inline-code);
-			font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
-			font-size: 0.75rem;
-			color: var(--nu-text);
-			white-space: nowrap;
-			overflow-x: auto;
-		}
-
-		.step-connector {
-			display: none;
-		}
-
-		@media (min-width: 40rem) {
-			.step-connector {
-				display: block;
-				position: absolute;
-				top: 3.125rem;
-				right: -1.25rem;
-				width: 1.25rem;
-				height: 2px;
-				background: var(--nu-border);
-			}
+		.step + .step {
+			border-left: 0;
+			border-top: 1px solid var(--nu-border);
 		}
 	}
 </style>
