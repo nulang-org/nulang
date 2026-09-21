@@ -38,6 +38,7 @@ pub struct SemanticEffect {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticActor {
     pub name: String,
+    pub durability: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol_id: Option<String>,
     pub protocol_status: String,
@@ -76,10 +77,18 @@ impl CompilerSemanticInventory {
                     effects.push(effect_entry("function", name, &row));
                 }
                 Decl::Actor {
-                    name, behaviors, ..
+                    name,
+                    persistent,
+                    state_fields,
+                    behaviors,
+                    ..
                 } => {
+                    let durable = *persistent
+                        || state_fields.iter().any(|(_, model, _, _)| {
+                            !matches!(model, ast::StateModel::Local)
+                        });
                     let (actor, mut actor_effects) =
-                        actor_inventory(name, behaviors, effect_checker)?;
+                        actor_inventory(name, behaviors, durable, effect_checker)?;
                     actors.push(actor);
                     effects.append(&mut actor_effects);
                 }
@@ -104,7 +113,7 @@ impl CompilerSemanticInventory {
                     } = desugared
                     {
                         let (actor, mut actor_effects) =
-                            actor_inventory(name, &behaviors, effect_checker)?;
+                            actor_inventory(name, &behaviors, false, effect_checker)?;
                         actors.push(actor);
                         effects.append(&mut actor_effects);
                     }
@@ -179,6 +188,7 @@ impl CompilerSemanticInventory {
 fn actor_inventory(
     actor_name: &str,
     behaviors: &[Behavior],
+    durable: bool,
     effect_checker: &mut EffectChecker,
 ) -> NuResult<(SemanticActor, Vec<SemanticEffect>)> {
     let ctx = EffectContext::empty();
@@ -272,6 +282,11 @@ fn actor_inventory(
     Ok((
         SemanticActor {
             name: actor_name.to_string(),
+            durability: if durable {
+                "durable".to_string()
+            } else {
+                "transient".to_string()
+            },
             protocol_id,
             protocol_status,
             protocol_error,
@@ -354,6 +369,52 @@ fn effect_from_canonical_name(name: &str) -> Option<Effect> {
     })
 }
 
+/// Conservative v0alpha1 classification for a source-level effect family.
+///
+/// Operation-specific host descriptors may provide a stronger contract later.
+/// Until the semantic inventory retains operation identity, this mapping never
+/// upgrades a broad effect family beyond what is safe to claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManifestEffectClassification {
+    pub class: &'static str,
+    pub determinism: &'static str,
+    pub effect_replay: &'static str,
+    pub replay_class: &'static str,
+}
+
+pub fn classify_effect_for_manifest(name: &str) -> ManifestEffectClassification {
+    match name {
+        // Compiler/runtime-local deterministic helpers.
+        "String" | "Array" | "Cost" | "Test" | "Render" => {
+            ManifestEffectClassification {
+                class: "local",
+                determinism: "deterministic",
+                effect_replay: "safe",
+                replay_class: "local-replay-safe",
+            }
+        }
+        // These can be replayed only when their observed outcome/order is
+        // durably captured by the runtime.
+        "Rand" | "Time" | "Spawn" | "Send" | "Receive" | "Migrate"
+        | "STM" | "Async" | "Event" | "Inference" => {
+            ManifestEffectClassification {
+                class: if name == "Inference" { "external" } else { "local" },
+                determinism: "nondeterministic",
+                effect_replay: "requires-journal",
+                replay_class: "journal-result",
+            }
+        }
+        // Unknown/user-defined and broad host-facing effect families default
+        // to the weakest safe replay claim.
+        _ => ManifestEffectClassification {
+            class: "external",
+            determinism: "nondeterministic",
+            effect_replay: "nonreplayable",
+            replay_class: "external-nonreplayable",
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,8 +484,9 @@ mod tests {
         )];
         let mut checker = EffectChecker::new();
         let (actor, effects) =
-            actor_inventory("Worker", &behaviors, &mut checker).unwrap();
+            actor_inventory("Worker", &behaviors, false, &mut checker).unwrap();
 
+        assert_eq!(actor.durability, "transient");
         assert_eq!(actor.protocol_status, "complete");
         assert!(actor
             .protocol_id
@@ -443,7 +505,7 @@ mod tests {
         )];
         let mut checker = EffectChecker::new();
         let (actor, _) =
-            actor_inventory("Worker", &behaviors, &mut checker).unwrap();
+            actor_inventory("Worker", &behaviors, false, &mut checker).unwrap();
 
         assert_eq!(actor.protocol_status, "incomplete-signature");
         assert!(actor.protocol_id.is_none());
@@ -463,10 +525,26 @@ mod tests {
         )];
         let mut checker = EffectChecker::new();
         let (actor, _) =
-            actor_inventory("Worker", &behaviors, &mut checker).unwrap();
+            actor_inventory("Worker", &behaviors, false, &mut checker).unwrap();
 
         assert_eq!(actor.protocol_status, "incomplete-signature");
         assert!(actor.protocol_id.is_none());
+    }
+
+    #[test]
+    fn manifest_effect_classification_is_conservative() {
+        let local = classify_effect_for_manifest("String");
+        assert_eq!(local.class, "local");
+        assert_eq!(local.determinism, "deterministic");
+        assert_eq!(local.effect_replay, "safe");
+
+        let inference = classify_effect_for_manifest("Inference");
+        assert_eq!(inference.class, "external");
+        assert_eq!(inference.effect_replay, "requires-journal");
+
+        let network = classify_effect_for_manifest("Net");
+        assert_eq!(network.class, "external");
+        assert_eq!(network.effect_replay, "nonreplayable");
     }
 
     #[test]
