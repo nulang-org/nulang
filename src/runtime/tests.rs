@@ -2133,6 +2133,70 @@ fn test_recover_actor_adopts_current_schema_winner_after_migration_cas_conflict(
 }
 
 #[test]
+fn test_recover_actor_refuses_cas_winner_that_is_still_old_schema() {
+    let module = compile_state_migration_module(
+        r#"
+        entity Counter {
+            version: 2
+            state durable count: Int = 0
+            migration from 1 to 2 {
+                state => { self.count = self.count + 1 }
+            }
+        }
+        "#,
+    );
+    let actor_id = 919_013;
+    let mut original = ActorSnapshot {
+        actor_id,
+        sequence: 4,
+        schema_owner: Some("Counter".to_string()),
+        schema_version: 1,
+        ..ActorSnapshot::default()
+    };
+    original
+        .state
+        .insert("count".to_string(), PersistedValue::Int(8));
+
+    // Simulate a concurrent checkpoint/writer winning the revision race
+    // without performing the schema upgrade.
+    let mut winner = ActorSnapshot {
+        actor_id,
+        sequence: 5,
+        schema_owner: Some("Counter".to_string()),
+        schema_version: 1,
+        ..ActorSnapshot::default()
+    };
+    winner
+        .state
+        .insert("count".to_string(), PersistedValue::Int(20));
+
+    let mut store = RejectingSnapshotCommitStore {
+        inner: MemoryStore::new(),
+        reject_snapshot_saves: false,
+        conflict_winner: Some(winner.clone()),
+    };
+    store.save_snapshot(original).unwrap();
+
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store);
+    rt.register_recovery_module(actor_id, module, vec![], vec![]);
+
+    assert_eq!(
+        rt.recover_actor(actor_id),
+        None,
+        "a CAS loser must not retry its transform against a changed old-schema snapshot"
+    );
+    assert!(!rt.actors.contains_key(&actor_id));
+    let committed = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(committed.sequence, 5);
+    assert_eq!(committed.schema_version, 1);
+    assert_eq!(
+        committed.state.get("count"),
+        Some(&PersistedValue::Int(20))
+    );
+}
+
+#[test]
 fn test_recover_actor_does_not_publish_when_migration_snapshot_commit_fails() {
     let module = compile_state_migration_module(
         r#"
