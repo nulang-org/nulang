@@ -1982,10 +1982,10 @@ impl TypeChecker {
             // Perform effect
             Expr::Perform {
                 effect,
-                op: _,
+                op,
                 args,
                 span,
-            } => self.infer_perform(ctx, effect, args, *span),
+            } => self.infer_perform(ctx, effect, op, args, *span),
             // Emit event — check against entity's declared events if in an entity context
             Expr::Emit { event, args, span } => {
                 // Validate against entity event declarations if available
@@ -3786,22 +3786,135 @@ impl TypeChecker {
     }
 
     /// Infer perform expression.
+    ///
+    /// Most legacy effects remain dynamically typed for compatibility. The
+    /// Nulang 2 accelerator surface is deliberately stricter: Tensor/Compute
+    /// operations have compiler-owned signatures so invalid shapes of calls
+    /// are rejected before lowering.
     fn infer_perform(
         &mut self,
         ctx: &TypeContext,
-        _effect: &str,
+        effect: &str,
+        op: &str,
         args: &[Expr],
-        _span: Span,
+        span: Span,
     ) -> NuResult<(Substitution, Type)> {
         let mut subst = vec![];
+        let mut arg_types = Vec::with_capacity(args.len());
         for arg in args {
             let ctx_sub = apply_subst_to_ctx(ctx, &subst);
-            let (s, _ty) = self.infer_expr(&ctx_sub, arg)?;
+            let (s, ty) = self.infer_expr(&ctx_sub, arg)?;
             subst = compose_subst(&s, &subst);
+            arg_types.push(apply_subst(&ty, &subst));
         }
-        // Perform returns a fresh type variable
-        let ret_var = Type::Var(TypeVar::fresh());
-        Ok((subst, ret_var))
+
+        let require_arity = |expected: usize| -> NuResult<()> {
+            if args.len() == expected {
+                Ok(())
+            } else {
+                Err(NuError::type_error(
+                    format!(
+                        "{}.{} expects {} argument(s), got {}",
+                        effect,
+                        op,
+                        expected,
+                        args.len()
+                    ),
+                    span,
+                ))
+            }
+        };
+
+        let unify_arg = |subst: &mut Substitution,
+                         arg_types: &[Type],
+                         index: usize,
+                         expected: &Type|
+         -> NuResult<()> {
+            let actual = apply_subst(&arg_types[index], subst);
+            let s = mgu(&actual, expected, span)?;
+            *subst = compose_subst(&s, subst);
+            Ok(())
+        };
+
+        match (effect, op) {
+            ("Tensor", "from_array") => {
+                require_arity(3)?;
+                unify_arg(
+                    &mut subst,
+                    &arg_types,
+                    0,
+                    &Type::Array(Box::new(Type::float())),
+                )?;
+                unify_arg(&mut subst, &arg_types, 1, &Type::int())?;
+                unify_arg(&mut subst, &arg_types, 2, &Type::int())?;
+                Ok((subst, Type::tensor(Type::float())))
+            }
+            ("Tensor", "zeros") => {
+                require_arity(2)?;
+                unify_arg(&mut subst, &arg_types, 0, &Type::int())?;
+                unify_arg(&mut subst, &arg_types, 1, &Type::int())?;
+                Ok((subst, Type::tensor(Type::float())))
+            }
+            ("Tensor", "shape") => {
+                require_arity(1)?;
+                let elem = Type::Var(TypeVar::fresh());
+                unify_arg(&mut subst, &arg_types, 0, &Type::tensor(elem))?;
+                Ok((subst, Type::Array(Box::new(Type::int()))))
+            }
+            ("Tensor", "to_array") => {
+                require_arity(1)?;
+                let elem = Type::Var(TypeVar::fresh());
+                unify_arg(
+                    &mut subst,
+                    &arg_types,
+                    0,
+                    &Type::tensor(elem.clone()),
+                )?;
+                Ok((
+                    subst.clone(),
+                    Type::Array(Box::new(apply_subst(&elem, &subst))),
+                ))
+            }
+            ("Tensor", "add") | ("Tensor", "matmul") => {
+                require_arity(2)?;
+                let elem = Type::Var(TypeVar::fresh());
+                let tensor = Type::tensor(elem.clone());
+                unify_arg(&mut subst, &arg_types, 0, &tensor)?;
+                unify_arg(&mut subst, &arg_types, 1, &tensor)?;
+                Ok((subst.clone(), Type::tensor(apply_subst(&elem, &subst))))
+            }
+            ("Tensor", "relu") => {
+                require_arity(1)?;
+                let elem = Type::Var(TypeVar::fresh());
+                unify_arg(
+                    &mut subst,
+                    &arg_types,
+                    0,
+                    &Type::tensor(elem.clone()),
+                )?;
+                Ok((subst.clone(), Type::tensor(apply_subst(&elem, &subst))))
+            }
+            ("Compute", "device") => {
+                require_arity(1)?;
+                unify_arg(&mut subst, &arg_types, 0, &Type::string())?;
+                Ok((subst, Type::device()))
+            }
+            ("Compute", "default_device") => {
+                require_arity(0)?;
+                Ok((subst, Type::device()))
+            }
+            ("Compute", "device_name") => {
+                require_arity(1)?;
+                unify_arg(&mut subst, &arg_types, 0, &Type::device())?;
+                Ok((subst, Type::string()))
+            }
+            _ => {
+                // Compatibility path for existing dynamically-described
+                // effects until their signatures migrate to compiler-owned
+                // host-effect schemas.
+                Ok((subst, Type::Var(TypeVar::fresh())))
+            }
+        }
     }
 
     /// Infer handle expression.
