@@ -34,7 +34,7 @@
 
 use serde::Serialize;
 
-use crate::types::{current_source_text, source_map_file, NuError, Span};
+use crate::types::{current_source_text, source_map_file, NuError, NuWarning, Span};
 
 /// Current JSON diagnostics schema version.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -204,6 +204,22 @@ fn offset_line_col(source: &str, offset: u32) -> (usize, usize) {
     (line, col)
 }
 
+/// Convert a non-fatal compiler warning to the same machine-readable
+/// diagnostic shape used by errors.
+pub fn diagnostic_from_warning(warning: &NuWarning) -> JsonDiagnostic {
+    JsonDiagnostic {
+        code: Some(warning.code.to_string()),
+        severity: "warning".to_string(),
+        message: warning.msg.clone(),
+        span: json_span(warning.span),
+        notes: Vec::new(),
+        suggestion: warning.help.as_ref().map(|message| JsonSuggestion {
+            message: message.clone(),
+            replacement: None,
+        }),
+    }
+}
+
 /// Build a single error diagnostic from a plain message (used by `nula test`
 /// failures, where the failing test's captured stderr is the only detail).
 pub fn diagnostic_from_message(message: String) -> JsonDiagnostic {
@@ -253,6 +269,26 @@ mod tests {
         assert_eq!(v["command"], "check");
         assert_eq!(v["ok"], false);
         assert!(v["diagnostics"].is_array());
+        clear_source_map();
+    }
+
+    #[test]
+    fn test_warning_serializes_stable_code_span_and_help() {
+        set_source_map_with_file("fn main() = 1\n", Some("warn.nula"));
+        let warning = NuWarning {
+            code: "W0201",
+            msg: "non-exhaustive match: missing false".into(),
+            span: Span::new(0, 2),
+            help: Some("add an arm for false".into()),
+        };
+        let diagnostic = diagnostic_from_warning(&warning);
+        assert_eq!(diagnostic.code.as_deref(), Some("W0201"));
+        assert_eq!(diagnostic.severity, "warning");
+        assert_eq!(diagnostic.span.as_ref().unwrap().file, "warn.nula");
+        assert_eq!(
+            diagnostic.suggestion.as_ref().unwrap().message,
+            "add an arm for false"
+        );
         clear_source_map();
     }
 
