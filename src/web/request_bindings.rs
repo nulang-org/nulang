@@ -381,6 +381,7 @@ mod tests {
             handler_param: source_name.into(),
             handler_index: index,
             ty: Some(ty.into()),
+            codec: None,
         }
     }
 
