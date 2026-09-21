@@ -314,7 +314,7 @@ impl BehaviorManifest {
     }
 }
 
-fn collect_effect_set(checker: &EffectChecker, hir: Option<&hir::Module>) -> BTreeSet<Effect> {
+fn collect_effect_set(checker: &EffectChecker, hir: Option<&hir::Module>) -> Vec<Effect> {
     let mut unique = BTreeSet::new();
 
     for row in checker.function_rows().values() {
@@ -324,7 +324,12 @@ fn collect_effect_set(checker: &EffectChecker, hir: Option<&hir::Module>) -> BTr
         collect_hir_effects(&hir.decls, &mut unique);
     }
 
-    unique
+    // Effect's Rust Ord is an implementation detail tied to enum declaration
+    // order. Manifest ordering is lexical by the stable semantic effect name so
+    // an internal enum refactor cannot perturb contract bytes.
+    let mut effects: Vec<_> = unique.into_iter().collect();
+    effects.sort_by_key(ToString::to_string);
+    effects
 }
 
 fn collect_hir_effects(decls: &[hir::Decl], out: &mut BTreeSet<Effect>) {
@@ -549,17 +554,24 @@ fn state_schema_digest(actor: &hir::ActorDef) -> Result<String, BehaviorManifest
 
     for (name, model, ty, _) in fields {
         put_bytes(&mut hasher, name.as_bytes());
-        let model_bytes = serde_json::to_vec(model)
-            .map_err(|error| BehaviorManifestBuildError::Serialization(error.to_string()))?;
-        put_bytes(&mut hasher, &model_bytes);
+        put_bytes(&mut hasher, state_model_identity(*model).as_bytes());
         put_bytes(&mut hasher, &canonical_type_bytes(ty));
     }
 
     Ok(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
+fn state_model_identity(model: crate::ast::StateModel) -> String {
+    match model {
+        crate::ast::StateModel::Local => "local".to_string(),
+        crate::ast::StateModel::Durable => "durable".to_string(),
+        crate::ast::StateModel::EventSourced => "event-sourced".to_string(),
+        crate::ast::StateModel::Crdt(kind) => format!("crdt:{}", kind.keyword()),
+    }
+}
+
 fn collect_authority(
-    effects: &BTreeSet<Effect>,
+    effects: &[Effect],
     mir: Option<&mir::Module>,
 ) -> Result<Vec<AuthorityEntry>, BehaviorManifestBuildError> {
     let mut authority: BTreeMap<(AuthorityKind, Option<String>), BTreeSet<String>> =
@@ -588,7 +600,7 @@ fn collect_authority(
         }
     }
 
-    Ok(authority
+    let mut entries: Vec<_> = authority
         .into_iter()
         .map(|((kind, resource), operations)| AuthorityEntry {
             kind,
@@ -596,7 +608,27 @@ fn collect_authority(
             operations: operations.into_iter().collect(),
             required: true,
         })
-        .collect())
+        .collect();
+    entries.sort_by(|left, right| {
+        authority_kind_key(left.kind)
+            .cmp(authority_kind_key(right.kind))
+            .then_with(|| left.resource.cmp(&right.resource))
+            .then_with(|| left.operations.cmp(&right.operations))
+    });
+    Ok(entries)
+}
+
+fn authority_kind_key(kind: AuthorityKind) -> &'static str {
+    match kind {
+        AuthorityKind::Filesystem => "filesystem",
+        AuthorityKind::Network => "network",
+        AuthorityKind::Secret => "secret",
+        AuthorityKind::Inference => "inference",
+        AuthorityKind::Payment => "payment",
+        AuthorityKind::State => "state",
+        AuthorityKind::ActorDelegation => "actor-delegation",
+        AuthorityKind::Custom => "custom",
+    }
 }
 
 fn broad_authority_for_effect(effect: &Effect) -> Option<(AuthorityKind, Option<String>)> {
@@ -884,6 +916,36 @@ fn main() {
                     .as_array()
                     .is_some_and(|ops| ops.iter().any(|op| op == "connect"))
         }));
+    }
+
+    #[test]
+    fn semantic_ordering_and_state_model_identity_do_not_use_internal_enum_order() {
+        let manifest = emit(
+            r#"
+persistent actor StateKinds {
+    state durable d: Int = 0
+    state event_sourced e: Int = 0
+    state crdt gcounter c: Int = 0
+    behavior touch() { perform IO.print("x") }
+}
+fn main() {
+    perform Time.now()
+    perform FS.read("/tmp/x")
+}
+"#,
+        );
+
+        let effect_names: Vec<_> = manifest
+            .effects
+            .iter()
+            .map(|effect| effect.effect.as_str())
+            .collect();
+        let mut sorted_effect_names = effect_names.clone();
+        sorted_effect_names.sort_unstable();
+        assert_eq!(effect_names, sorted_effect_names);
+
+        let schema = manifest.actors[0].state_schema.as_deref().unwrap();
+        assert!(schema.starts_with("blake3:"));
     }
 
     #[test]
