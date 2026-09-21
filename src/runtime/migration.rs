@@ -1027,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_event_sourced_schema_until_event_executor_exists() {
+    fn state_migration_refuses_unsnapshotted_event_sourced_state_access() {
         let module = compile_module(
             r#"
             entity Counter {
@@ -1053,7 +1053,10 @@ mod tests {
             StateMigrationHistory::default(),
         )
         .unwrap_err();
-        assert!(error.contains("event-sourced field"), "{error}");
+        assert!(
+            error.contains("forbidden state field 'count'"),
+            "event-sourced state is reconstructed from history, not invented during snapshot migration: {error}"
+        );
     }
 
     #[test]
