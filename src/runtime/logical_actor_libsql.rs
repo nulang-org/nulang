@@ -229,9 +229,10 @@ impl LibsqlLogicalActorStore {
         drop(conn);
 
         if changed > 0 {
+            let logical_actor_id = grain_id.logical_id();
             return Ok(LogicalActorOwnershipRecord {
                 grain_id,
-                logical_id: grain_id.logical_id(),
+                logical_id: logical_actor_id,
                 node_id,
                 activation_handle,
                 epoch,
