@@ -1,8 +1,6 @@
 use nulang::bytecode::CodeModule;
 use nulang::content_identity::SemanticId;
-use nulang::runtime::{
-    ActorSnapshot, PersistenceStore, RecoveryIdentityPolicy, Runtime,
-};
+use nulang::runtime::{ActorSnapshot, PersistenceStore, RecoveryIdentityPolicy, Runtime};
 
 fn semantic(label: &[u8]) -> SemanticId {
     SemanticId::from_canonical_bytes(label, [])
