@@ -189,6 +189,15 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// Return the number of elements in an array allocated on the actor heap.
     fn array_len(&self, ptr: *mut u8) -> Option<usize>;
 
+    /// Return trusted type/size metadata only when `ptr` is an exact live
+    /// payload owned by the current allocation domain.
+    ///
+    /// The default denies provenance. Heap-backed callbacks override this by
+    /// searching their trusted live-object inventory before any header access.
+    fn heap_payload_info(&self, _ptr: *mut u8) -> Option<(HeapTypeTag, usize)> {
+        None
+    }
+
     /// Allocate a fresh heap string via `self.alloc`, copy `s` into it,
     /// and null-terminate. Default implementation works for any callback
     /// with a working `alloc`; callers may override for specialization.
@@ -433,20 +442,20 @@ const TENSOR_RUNTIME_MAGIC: u64 = 0x4E55_5445_4E53_4F52; // "NUTENSOR"
 const TENSOR_RUNTIME_HEADER_WORDS: usize = 4;
 const TENSOR_RUNTIME_HEADER_BYTES: usize = TENSOR_RUNTIME_HEADER_WORDS * std::mem::size_of::<u64>();
 
-fn tensor_from_value(value: Value) -> Option<nulang_accelerator::CpuTensor> {
+fn tensor_from_value(
+    callbacks: &dyn ActorVmCallbacks,
+    value: Value,
+) -> Option<nulang_accelerator::CpuTensor> {
     let ptr = value.as_ptr()?;
-    if ptr.is_null() {
+    let (type_tag, payload_size) = callbacks.heap_payload_info(ptr)?;
+    if type_tag != HeapTypeTag::Raw || payload_size < TENSOR_RUNTIME_HEADER_BYTES {
         return None;
     }
-    // SAFETY: pointer-tagged Values accepted here originate from the VM/actor
-    // heap. The ORCA header is immediately before the payload and records the
-    // requested payload size/type. We reject non-Raw objects and undersized
-    // payloads before reading tensor metadata/data.
+
+    // SAFETY: heap_payload_info proved that ptr is an exact live payload owned
+    // by the current allocation domain and provided its requested size. All
+    // metadata/data reads below are bounds-checked against that trusted size.
     unsafe {
-        let header = &*ActorHeap::header_of(ptr);
-        if header.type_tag != HeapTypeTag::Raw || header.payload_size < TENSOR_RUNTIME_HEADER_BYTES {
-            return None;
-        }
         let words = ptr as *const u64;
         if words.read() != TENSOR_RUNTIME_MAGIC {
             return None;
@@ -458,7 +467,7 @@ fn tensor_from_value(value: Value) -> Option<nulang_accelerator::CpuTensor> {
             .ok()?
             .checked_mul(std::mem::size_of::<f64>())?;
         let required = TENSOR_RUNTIME_HEADER_BYTES.checked_add(data_bytes)?;
-        if required > header.payload_size {
+        if required > payload_size {
             return None;
         }
         let data_ptr = ptr.add(TENSOR_RUNTIME_HEADER_BYTES) as *const f64;
@@ -504,13 +513,14 @@ fn alloc_tensor(
 
 fn value_array(callbacks: &dyn ActorVmCallbacks, value: Value) -> Option<Vec<Value>> {
     let ptr = value.as_ptr()?;
-    if ptr.is_null() {
+    let (type_tag, payload_size) = callbacks.heap_payload_info(ptr)?;
+    if type_tag != HeapTypeTag::Array || payload_size % std::mem::size_of::<Value>() != 0 {
         return None;
     }
-    let len = callbacks.array_len(ptr)?;
-    // SAFETY: array_len validates the heap type tag and derives the slot count
-    // from the allocation payload; every Array payload is a contiguous Value
-    // sequence.
+    let len = payload_size / std::mem::size_of::<Value>();
+    // SAFETY: heap_payload_info proved that ptr is a live Array payload owned
+    // by this allocation domain, and payload_size is an exact multiple of
+    // Value.
     Some(unsafe { std::slice::from_raw_parts(ptr as *const Value, len).to_vec() })
 }
 
@@ -579,7 +589,7 @@ pub(crate) fn perform_tensor_builtin(
             let Some(value) = regs.first().copied() else {
                 return nil();
             };
-            let Some(tensor) = tensor_from_value(value) else {
+            let Some(tensor) = tensor_from_value(callbacks, value) else {
                 return nil();
             };
             let Some(values) = tensor
@@ -610,7 +620,7 @@ pub(crate) fn perform_tensor_builtin(
                 return nil();
             };
             let (Some(lhs), Some(rhs)) =
-                (tensor_from_value(lhs_value), tensor_from_value(rhs_value))
+                (tensor_from_value(callbacks, lhs_value), tensor_from_value(callbacks, rhs_value))
             else {
                 return nil();
             };
@@ -1236,6 +1246,10 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
                 None
             }
         }
+    }
+
+    fn heap_payload_info(&self, ptr: *mut u8) -> Option<(HeapTypeTag, usize)> {
+        self.heap.live_payload_info(ptr.cast_const())
     }
 
     fn spawn_actor(
