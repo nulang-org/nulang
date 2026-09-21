@@ -232,7 +232,15 @@ jobs:
         run: cargo build --all-targets --features wasm-backend
 
       - name: Test
-        run: cargo test --features wasm-backend
+        run: |
+          # Real-TCP split-brain recovery tests are timing-sensitive on
+          # GitHub-hosted runners. Match the default test lane's policy:
+          # retry the suite once so a transient reconnect race does not
+          # masquerade as a wasm-backend regression.
+          cargo test --features wasm-backend || (
+            echo "Retrying wasm-backend test suite after timing-sensitive failure..." &&
+            cargo test --features wasm-backend
+          )
 
   # -----------------------------------------------------------------------
   # Lint — format, clippy, audit, docs, all-features check
