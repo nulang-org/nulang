@@ -643,6 +643,7 @@ mod tests {
             type_params: vec![],
             persistent: false,
             state_fields: vec![],
+            indexes: vec![],
             behaviors: vec![],
             init: vec![],
             events: vec![],
