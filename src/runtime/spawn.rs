@@ -84,7 +84,6 @@ pub(crate) fn spawn_actor_with_id(
     }
     actor.state_models = state_models;
     actor.persistent = persistent;
-    let workflow_name = workflow.map(|n| n.to_string());
     if let Some(name) = workflow {
         // Legacy storage field retained until the versioned ActorRole format
         // migration. Semantic reads use Actor::role()/ActorMeta::role().
@@ -112,37 +111,13 @@ pub(crate) fn spawn_actor_with_id(
         mgr.register_actor_fields(id, &actor);
     }
     rt.actors.insert(id, actor);
-    if workflow.is_some() {
-        let seq = crate::runtime::workflow::next_sequence(rt, id);
-        let state = {
-            let actor = rt.actors.get(&id).unwrap();
-            let mut state = Vec::new();
-            for (field_name, value) in &actor.state_data {
-                let model = actor
-                    .state_models
-                    .get(field_name)
-                    .copied()
-                    .unwrap_or(StateModel::Local);
-                if model.is_persistent() {
-                    state.push(PersistedValue::from_value_resolved(
-                        value,
-                        actor.bytecode_module.as_ref(),
-                    ));
-                }
-            }
-            state
-        };
-        let _ = rt.persistence.append_workflow_event(
-            id,
-            WorkflowEvent::WorkflowStarted {
-                sequence: seq,
-                name: workflow_name.as_ref().unwrap().clone(),
-                state,
-            },
-        );
-        crate::runtime::workflow::checkpoint_actor(rt, id);
+    // Bytecode workflows are finalized by spawn_from_module after their exact
+    // module has been attached. That ordering is required to resolve compiler
+    // string-pool values losslessly before the WorkflowStarted record is
+    // committed. Ordinary actors are ready to schedule immediately.
+    if workflow.is_none() {
+        rt.enqueue_actor(id);
     }
-    rt.enqueue_actor(id);
     id
 }
 
@@ -182,6 +157,63 @@ fn restore_persistent_state(
                 .insert(entry.field_name.clone(), entry.sequence);
         }
     }
+}
+
+/// Persist the initial durable record for a newly materialized workflow.
+///
+/// This runs only after spawn_from_module has installed the exact bytecode
+/// module and materialized string defaults onto the actor heap. Any value that
+/// has no stable PersistedValue encoding aborts activation before the workflow
+/// is placed on the scheduler.
+pub(crate) fn persist_new_workflow(
+    rt: &mut Runtime,
+    actor_id: u64,
+    workflow_name: &str,
+) -> Result<(), String> {
+    let seq = crate::runtime::workflow::next_sequence(rt, actor_id);
+    let state = {
+        let actor = rt
+            .actors
+            .get(&actor_id)
+            .ok_or_else(|| format!("workflow actor {actor_id} disappeared during spawn"))?;
+        let mut state = Vec::new();
+        for (field_name, value) in &actor.state_data {
+            let model = actor
+                .state_models
+                .get(field_name)
+                .copied()
+                .unwrap_or(StateModel::Local);
+            if model.is_persistent() {
+                let persisted =
+                    PersistedValue::try_from_value_resolved(value, actor.bytecode_module.as_ref())
+                        .map_err(|error| {
+                            format!(
+                                "workflow field '{field_name}' cannot be persisted losslessly: {error}"
+                            )
+                        })?;
+                state.push(persisted);
+            }
+        }
+        state
+    };
+
+    rt.persistence
+        .append_workflow_event(
+            actor_id,
+            WorkflowEvent::WorkflowStarted {
+                sequence: seq,
+                name: workflow_name.to_string(),
+                state,
+            },
+        )
+        .map_err(|error| format!("WorkflowStarted journal write failed: {error}"))?;
+
+    if !crate::runtime::workflow::checkpoint_actor(rt, actor_id) {
+        let _ = rt.persistence.clear(actor_id);
+        return Err("initial workflow checkpoint failed".to_string());
+    }
+
+    Ok(())
 }
 
 /// Compatibility wrapper for recovery/distribution paths that still carry the
@@ -333,6 +365,21 @@ pub(crate) fn spawn_from_module(
             };
         }
     }
+
+    if matches!(role, ActorRole::Workflow) {
+        let workflow_name = meta.map(|m| m.name.as_str()).unwrap_or("workflow");
+        if let Err(error) = persist_new_workflow(rt, id, workflow_name) {
+            tracing::warn!(
+                actor_id = id,
+                workflow = workflow_name,
+                %error,
+                "refusing to activate workflow without a lossless durable start record"
+            );
+            rt.remove_actor_reaping(id);
+            return Value::nil();
+        }
+    }
+
     // Wire AOT-native dispatch only when native codegen is present.
     #[cfg(feature = "native-codegen")]
     if let Some(meta) = meta.as_ref() {
@@ -375,6 +422,9 @@ pub(crate) fn spawn_from_module(
         layout_workflow_behavior_table(rt, id);
     }
     register_recovery_module(rt, id, module.clone(), offsets, compensation_offsets);
+    if matches!(role, ActorRole::Workflow) {
+        rt.enqueue_actor(id);
+    }
     Value::actor_ref(id)
 }
 
