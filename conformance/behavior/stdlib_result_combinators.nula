@@ -1,0 +1,31 @@
+// stdlib::result — canonical prelude type + pipeline/error combinators.
+import stdlib::result
+
+fn show_int_result(r: Result[Int, String]) -> String {
+    match r {
+        Ok(x) => "Ok(" + perform Int.to_string(x) + ")",
+        Error(e) => "Error(" + e + ")",
+    }
+}
+
+fn show_option(opt: Option[Int]) -> String {
+    match opt {
+        Some(x) => "Some(" + perform Int.to_string(x) + ")",
+        None => "None",
+    }
+}
+
+fn main() {
+    perform IO.print("map=" + show_int_result(map(Ok(3), fn(x) { x * 2 })))
+    perform IO.print("map_error_passthrough=" + show_int_result(map(Error("bad"), fn(x) { x * 2 })))
+    perform IO.print("map_err=" + show_int_result(map_err(Error("bad"), fn(e) { e + "!" })))
+    perform IO.print("and_then=" + show_int_result(and_then(Ok(3), fn(x) { Ok(x + 1) })))
+    perform IO.print("and_then_error=" + show_int_result(and_then(Error("bad"), fn(x) { Ok(x + 1) })))
+    perform IO.print("or_else=" + show_int_result(or_else(Error("bad"), fn(_e) { Ok(9) })))
+    perform IO.print("unwrap_or=" + perform Int.to_string(unwrap_or(Error("bad"), 11)))
+    perform IO.print("unwrap_or_else=" + perform Int.to_string(unwrap_or_else(Error("bad"), fn(_e) { 12 })))
+    perform IO.print("to_option_ok=" + show_option(to_option(Ok(4))))
+    perform IO.print("to_option_error=" + show_option(to_option(Error("bad"))))
+    perform IO.print("is_ok=" + (if is_ok(Ok(1)) then "yes" else "no"))
+    perform IO.print("is_err=" + (if is_err(Error("bad")) then "yes" else "no"))
+}
