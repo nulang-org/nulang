@@ -2023,16 +2023,15 @@ pub trait NetworkTransport: Send {
     fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet);
     /// Attempt a non-blocking local transport handoff.
     ///
-    /// Implementations that do not provide bounded admission may inherit this
-    /// compatibility default, which delegates to send and reports Accepted.
+    /// Implementations that do not provide bounded admission inherit a
+    /// fail-closed default. This method must never fall back to blocking send.
     fn try_send(
         &mut self,
-        to_node: NodeId,
-        to_addr: std::net::SocketAddr,
-        packet: Packet,
+        _to_node: NodeId,
+        _to_addr: std::net::SocketAddr,
+        _packet: Packet,
     ) -> TransportAdmission {
-        self.send(to_node, to_addr, packet);
-        TransportAdmission::Accepted
+        TransportAdmission::Rejected
     }
     fn receive(&self) -> Vec<IncomingPacket>;
     fn node_id(&self) -> NodeId;
