@@ -307,6 +307,19 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
             apply_handlers: apply_handlers.clone(),
             version: *version,
             migrations: migrations.clone(),
+            migration_state_bodies: migrations
+                .iter()
+                .filter_map(|migration| {
+                    migration.state_body.as_ref().map(|state_body| {
+                        hir::MigrationStateBody {
+                            from_version: migration.from_version,
+                            to_version: migration.to_version,
+                            body: with_fresh_defer_stack(|| lower_body(state_body)),
+                            span: migration.span,
+                        }
+                    })
+                })
+                .collect(),
             is_workflow: false,
             is_organization: *is_organization,
             is_agent: false,
@@ -956,6 +969,7 @@ fn desugar_agent(
         apply_handlers: Vec::new(),
         version: 1,
         migrations: Vec::new(),
+        migration_state_bodies: Vec::new(),
         is_workflow: false,
         is_organization: false,
         is_agent: true,
@@ -1125,6 +1139,7 @@ fn desugar_workflow(name: &str, items: &[ast::WorkflowItem], span: Span) -> hir:
         apply_handlers: Vec::new(),
         version: 1,
         migrations: Vec::new(),
+        migration_state_bodies: Vec::new(),
         is_workflow: true,
         is_organization: false,
         is_agent: false,

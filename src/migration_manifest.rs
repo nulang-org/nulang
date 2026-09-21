@@ -2,8 +2,10 @@
 //!
 //! Source/HIR retains executable migration bodies, while the bytecode artifact
 //! boundary needs a stable representation that is independent of compiler AST
-//! layout. This module records only validated migration topology and event-arm
-//! metadata. Executable migration code is deliberately a separate follow-up.
+//! layout. This module records validated migration topology and event-arm
+//! metadata plus optional artifact-local bindings to compiler-generated private
+//! state-transform functions. The executable bytecode lives in the ordinary
+//! function table; runtime execution/commit remains a separate follow-up.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -28,6 +30,12 @@ pub struct MigrationContractMeta {
     pub from_version: u32,
     pub to_version: u32,
     pub has_state_transform: bool,
+    /// Artifact-local private function-table index for the compiled state transform.
+    ///
+    /// Topology-only/legacy manifests may omit this. Runtime execution must
+    /// require a binding before applying a state transform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_function_index: Option<usize>,
     pub event_transforms: Vec<MigrationEventMeta>,
 }
 
@@ -112,6 +120,7 @@ impl MigrationContractMeta {
             from_version: decl.from_version,
             to_version: decl.to_version,
             has_state_transform: decl.state_body.is_some(),
+            state_function_index: None,
             event_transforms,
         }
     }
@@ -266,8 +275,16 @@ impl MigrationManifest {
     }
 
     /// Deterministic identity for the declarative migration topology.
+    ///
+    /// Artifact-local executable bindings are deliberately excluded: adding
+    /// an unrelated function may shift function-table indices without
+    /// changing the source migration contract.
     pub fn digest(&self) -> Result<String, MigrationManifestError> {
-        let json = self.to_json()?;
+        let mut topology = self.clone();
+        for contract in &mut topology.contracts {
+            contract.state_function_index = None;
+        }
+        let json = topology.to_json()?;
         Ok(blake3::hash(json.as_bytes()).to_hex().to_string())
     }
 }
@@ -325,6 +342,25 @@ mod tests {
         let restored = MigrationManifest::from_json(&json).unwrap();
         assert_eq!(restored, manifest);
         assert_eq!(restored.digest().unwrap(), manifest.digest().unwrap());
+    }
+
+    #[test]
+    fn topology_digest_ignores_artifact_local_state_function_binding() {
+        let (version, migrations) = entity_version_and_migrations(
+            r#"
+            entity Account {
+                version: 2
+                state balance: Int = 0
+                migration from 1 to 2 {
+                    state => { self.balance = self.balance + 1 }
+                }
+            }
+            "#,
+        );
+        let mut manifest = MigrationManifest::from_decls(version, &migrations).unwrap();
+        let topology_digest = manifest.digest().unwrap();
+        manifest.contracts[0].state_function_index = Some(17);
+        assert_eq!(manifest.digest().unwrap(), topology_digest);
     }
 
     #[test]

@@ -2575,6 +2575,49 @@ mod tests {
     }
 
     #[test]
+    fn test_migration_state_function_binding_survives_codegen() {
+        let module = compile_mir_source(
+            r#"
+            entity Account {
+                version: 2
+                state balance: Int = 0
+                migration from 1 to 2 {
+                    state => { self.balance = self.balance + 1 }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let meta = module
+            .actor_metadata
+            .iter()
+            .find(|meta| meta.name == "Account")
+            .expect("Account metadata");
+        let manifest =
+            crate::migration_manifest::MigrationManifest::from_json(&meta.migrations).unwrap();
+        let function_idx = manifest.contracts[0]
+            .state_function_index
+            .expect("compiled state migration binding");
+
+        let bound_offset = *module
+            .function_table
+            .get(function_idx)
+            .expect("migration function index in bytecode table");
+        let named_offset = module
+            .function_offset_by_name("Account.$migration_state_1_2")
+            .expect("compiler-owned migration function name");
+        assert_eq!(bound_offset, named_offset);
+        assert!(
+            module
+                .behaviors
+                .iter()
+                .all(|behavior| !behavior.name.contains("$migration_state_")),
+            "migration state code must never be exposed as an actor behavior"
+        );
+    }
+
+    #[test]
     fn test_mir_codegen_bitwise_or() {
         let value = run_mir_source("6 ||| 3").unwrap();
         assert_eq!(value.as_int(), Some(7));

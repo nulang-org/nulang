@@ -32,6 +32,12 @@ fn compile_err(msg: impl Into<String>, span: Span) -> NuError {
     }
 }
 
+fn migration_state_function_name(actor_name: &str, from_version: u32, to_version: u32) -> String {
+    // The dollar-prefixed segment is compiler-owned and never inserted into
+    // func_map, so source-level function resolution cannot address it.
+    format!("{actor_name}.$migration_state_{from_version}_{to_version}")
+}
+
 pub fn lower_module(hir: &hir::Module) -> NuResult<mir::Module> {
     let mut ctx = ModuleCtx::new(&hir.name);
 
@@ -118,6 +124,25 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                     ctx.parallel_branches_of.push((abs_idx, branches.clone()));
                 }
             }
+
+            // State migrations are compiler-private functions, not actor
+            // behaviors. They are deliberately absent from func_map and
+            // ActorMeta.behavior_indices, so source call/send/ask resolution
+            // cannot address them.
+            for migration in &a.migration_state_bodies {
+                let name = migration_state_function_name(
+                    &a.name,
+                    migration.from_version,
+                    migration.to_version,
+                );
+                let idx = ctx.reserve_function(&name);
+                ctx.migration_state_function_of.push((
+                    a.name.clone(),
+                    migration.from_version,
+                    migration.to_version,
+                    idx,
+                ));
+            }
             let state_models = a
                 .state_fields
                 .iter()
@@ -136,7 +161,7 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
             // the actor artifact. Executable migration bodies remain a
             // separate compiler/runtime slice; recovery must not infer code
             // from this metadata alone.
-            let migration_manifest =
+            let mut migration_manifest =
                 crate::migration_manifest::MigrationManifest::from_decls(
                     a.version,
                     &a.migrations,
@@ -150,6 +175,32 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                         a.span,
                     )
                 })?;
+
+            for contract in &mut migration_manifest.contracts {
+                if !contract.has_state_transform {
+                    continue;
+                }
+                let function_idx = ctx
+                    .migration_state_function_of
+                    .iter()
+                    .find(|(actor_name, from, to, _)| {
+                        actor_name == &a.name
+                            && *from == contract.from_version
+                            && *to == contract.to_version
+                    })
+                    .map(|(_, _, _, idx)| *idx)
+                    .ok_or_else(|| {
+                        compile_err(
+                            format!(
+                                "internal: state migration {} -> {} for '{}' has no private function slot",
+                                contract.from_version, contract.to_version, a.name
+                            ),
+                            a.span,
+                        )
+                    })?;
+                contract.state_function_index = Some(function_idx);
+            }
+
             let migrations = migration_manifest.to_json().map_err(|error| NuError::VMError {
                 msg: format!(
                     "failed to encode RFC 0008 migration manifest for entity '{}': {error}",
@@ -265,6 +316,26 @@ fn lower_decl_bodies(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                     ctx.fill_behavior(comp_idx, comp_func);
                 }
             }
+
+            for migration in &a.migration_state_bodies {
+                let function_idx = ctx
+                    .migration_state_function_of
+                    .iter()
+                    .find(|(actor_name, from, to, _)| {
+                        actor_name == &a.name
+                            && *from == migration.from_version
+                            && *to == migration.to_version
+                    })
+                    .map(|(_, _, _, idx)| *idx)
+                    .expect("state migration function slot reserved in pass 1");
+                let full_name = migration_state_function_name(
+                    &a.name,
+                    migration.from_version,
+                    migration.to_version,
+                );
+                let func = lower_migration_state_function(ctx, &full_name, &migration.body)?;
+                ctx.fill_function(function_idx, func);
+            }
         }
         hir::Decl::Module { decls, .. } => {
             for d in decls {
@@ -303,6 +374,10 @@ struct ModuleCtx {
     compensation_of: Vec<(usize, usize)>,
     /// `(behavior_idx, branch_names)` pairs; see `mir::Module`.
     parallel_branches_of: Vec<(usize, Vec<String>)>,
+    /// (actor name, from version, to version, private function-table index).
+    /// These slots are not inserted into func_map and therefore cannot be
+    /// referenced by source-level function calls.
+    migration_state_function_of: Vec<(String, u32, u32, usize)>,
     /// Declared variant constructors: ctor name -> has_payload. Populated in
     /// pass 1 from `Decl::VariantType` so construction sites (`Some(41)`,
     /// `None`) resolve regardless of source order; see `reserve_decl`.
@@ -323,6 +398,7 @@ impl ModuleCtx {
             actor_metas: Vec::new(),
             compensation_of: Vec::new(),
             parallel_branches_of: Vec::new(),
+            migration_state_function_of: Vec::new(),
             ctor_map: FxHashMap::default(),
             next_lambda: 0,
         }
@@ -492,6 +568,25 @@ fn lower_behavior_def(
     lowerer.b.assign(self_id, mir::RValue::SelfRef);
     lowerer.bind("self", self_id);
     lowerer.lower_body_top(&bh.body)?;
+    Ok(lowerer.b.build())
+}
+
+/// Lower a migration state transform as a compiler-private function-table entry.
+///
+/// The function receives no source-visible arguments. It resolves `self`
+/// through the same runtime callback as actor behaviors, which lets a future
+/// recovery executor run it against an unpublished actor instance while the
+/// function itself remains unreachable from source-level call/send/ask.
+fn lower_migration_state_function(
+    ctx: &mut ModuleCtx,
+    full_name: &str,
+    body: &hir::Body,
+) -> NuResult<mir::Function> {
+    let mut lowerer = FnLowerer::new(ctx, full_name, None);
+    let self_id = lowerer.b.add_local("self", Type::unit());
+    lowerer.b.assign(self_id, mir::RValue::SelfRef);
+    lowerer.bind("self", self_id);
+    lowerer.lower_body_top(body)?;
     Ok(lowerer.b.build())
 }
 
@@ -2905,6 +3000,36 @@ mod tests {
         assert_eq!(manifest.contracts[0].from_version, 1);
         assert_eq!(manifest.contracts[0].to_version, 2);
         assert!(manifest.contracts[0].has_state_transform);
+
+        let function_idx = manifest.contracts[0]
+            .state_function_index
+            .expect("state transform must bind a private function");
+        assert!(
+            function_idx < module.functions.len(),
+            "migration function index must be in the ordinary function table"
+        );
+        assert_eq!(
+            module.functions[function_idx].name,
+            "Account.$migration_state_1_2"
+        );
+        assert!(
+            module.functions[function_idx].blocks.iter().any(|block| {
+                block.stmts.iter().any(|stmt| {
+                    matches!(
+                        stmt,
+                        mir::Stmt::StateSet { field, .. } if field == "balance"
+                    )
+                })
+            }),
+            "compiled migration function must contain the state mutation"
+        );
+        assert!(
+            module
+                .behaviors
+                .iter()
+                .all(|behavior| !behavior.name.contains("$migration_state_")),
+            "migration state transforms must not enter the actor behavior table"
+        );
     }
 
     #[test]

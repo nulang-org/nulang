@@ -2001,6 +2001,40 @@ fn test_recover_actor_rejects_invalid_migration_manifest_even_at_current_version
 }
 
 #[test]
+fn test_recover_actor_rejects_invalid_migration_state_function_binding() {
+    let mut rt = Runtime::new();
+    let actor_id = 919_003;
+
+    rt.persistence
+        .save_snapshot(ActorSnapshot {
+            actor_id,
+            sequence: 1,
+            schema_owner: Some("Counter".to_string()),
+            schema_version: 2,
+            ..ActorSnapshot::default()
+        })
+        .unwrap();
+
+    let mut module = CodeModule::new("bad-migration-function-binding");
+    let mut meta = ActorMeta::new("Counter");
+    meta.persistent = true;
+    meta.version = 2;
+    meta.migrations = r#"{"format_version":1,"target_version":2,"contracts":[{"from_version":1,"to_version":2,"has_state_transform":true,"state_function_index":999,"event_transforms":[]}]}"#.to_string();
+    module.actor_metadata.push(meta);
+    rt.register_recovery_module(actor_id, module, vec![], vec![]);
+
+    assert_eq!(
+        rt.recover_actor(actor_id),
+        None,
+        "out-of-range migration code binding must fail closed"
+    );
+    assert!(
+        !rt.actors.contains_key(&actor_id),
+        "forged migration binding must never publish recovered state"
+    );
+}
+
+#[test]
 fn test_memory_store_latest_sequence() {
     let mut store = MemoryStore::new();
     let snapshot = ActorSnapshot {

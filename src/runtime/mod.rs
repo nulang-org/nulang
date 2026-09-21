@@ -5384,6 +5384,55 @@ impl Runtime {
                     meta.name, manifest.target_version, meta.version
                 ));
             }
+
+            // A manifest binding is not trusted merely because its index is
+            // in range. Recompute the compiler-owned private function name
+            // from actor + transition identity and require the indexed
+            // function-table offset to match that exact generated function.
+            for contract in &manifest.contracts {
+                let Some(function_idx) = contract.state_function_index else {
+                    continue;
+                };
+                let function_offset = module
+                    .function_table
+                    .get(function_idx)
+                    .copied()
+                    .ok_or_else(|| {
+                        format!(
+                            "actor '{}' migration {} -> {} binds out-of-range function index {}",
+                            meta.name,
+                            contract.from_version,
+                            contract.to_version,
+                            function_idx
+                        )
+                    })?;
+                let expected_name = format!(
+                    "{}.$migration_state_{}_{}",
+                    meta.name, contract.from_version, contract.to_version
+                );
+                let named_offset = module.function_offset_by_name(&expected_name).ok_or_else(|| {
+                    format!(
+                        "actor '{}' migration {} -> {} binds function index {} but compiler-owned function '{}' is absent",
+                        meta.name,
+                        contract.from_version,
+                        contract.to_version,
+                        function_idx,
+                        expected_name
+                    )
+                })?;
+                if named_offset != function_offset {
+                    return Err(format!(
+                        "actor '{}' migration {} -> {} binds function index {} at offset {}, but '{}' resolves to offset {}",
+                        meta.name,
+                        contract.from_version,
+                        contract.to_version,
+                        function_idx,
+                        function_offset,
+                        expected_name,
+                        named_offset
+                    ));
+                }
+            }
             Some(manifest)
         };
 
@@ -5425,6 +5474,22 @@ impl Runtime {
                     meta.version
                 )
             })?;
+            if let Some(step) = plan
+                .iter()
+                .find(|step| step.has_state_transform && step.state_function_index.is_none())
+            {
+                return Err(format!(
+                    "persisted {}@v{} requires migration {} -> {}, but that state transform has no private executable function binding",
+                    snapshot
+                        .schema_owner
+                        .as_deref()
+                        .unwrap_or(meta.name.as_str()),
+                    snapshot.schema_version,
+                    step.from_version,
+                    step.to_version
+                ));
+            }
+
             let path = plan
                 .iter()
                 .map(|step| format!("{}->{}", step.from_version, step.to_version))
