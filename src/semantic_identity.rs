@@ -11,7 +11,7 @@
 //! to executable behavior, types, effects, authority-bearing spawn grants, or
 //! durable actor metadata change the identity.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
@@ -24,6 +24,8 @@ use crate::types::{
 };
 
 const MIR_SEMANTIC_CANONICAL_VERSION: &[u8] = b"nulang.mir-semantic.v1\0";
+const ACTOR_DEFINITION_MIR_CANONICAL_VERSION: &[u8] =
+    b"nulang.actor-definition-mir.v1\0";
 
 /// Derive a compiler semantic identity from backend-independent MIR.
 ///
@@ -45,55 +47,244 @@ where
 }
 
 /// Produce the canonical MIR byte stream used by [`semantic_id_for_mir`].
+///
+/// Declaration-vector order and compiler-assigned function/behavior indices are
+/// presentation details. References are encoded by stable names/signatures, and
+/// unordered declaration collections are sorted before encoding.
 pub fn canonical_mir_bytes(module: &mir::Module) -> Result<Vec<u8>, SemanticIdentityError> {
-    let mut encoder = Encoder::default();
+    let mut encoder = Encoder::for_module(module);
     encoder.bytes(MIR_SEMANTIC_CANONICAL_VERSION);
     encoder.string(&module.name);
 
-    encoder.len(module.functions.len());
-    for function in &module.functions {
+    let mut functions: Vec<_> = module.functions.iter().collect();
+    functions.sort_by(|left, right| left.name.cmp(&right.name));
+    encoder.len(functions.len());
+    for function in functions {
         encoder.function(function)?;
     }
 
-    encoder.len(module.behaviors.len());
-    for behavior in &module.behaviors {
+    let mut behaviors: Vec<_> = module.behaviors.iter().collect();
+    behaviors.sort_by(|left, right| left.name.cmp(&right.name));
+    encoder.len(behaviors.len());
+    for behavior in behaviors {
         encoder.function(behavior)?;
     }
 
-    encoder.len(module.actor_metadata.len());
-    for actor in &module.actor_metadata {
+    let mut actors: Vec<_> = module.actor_metadata.iter().collect();
+    actors.sort_by(|left, right| left.name.cmp(&right.name));
+    encoder.len(actors.len());
+    for actor in actors {
         encoder.actor_meta(actor);
     }
 
-    // These are semantic lookup tables. Preserve emitted order: duplicate
-    // entries must not become silently equivalent to a different MIR.
-    encoder.len(module.compensation_of.len());
-    for (step, compensation) in &module.compensation_of {
-        encoder.usize(*step);
-        encoder.usize(*compensation);
+    let mut compensations = module.compensation_of.clone();
+    compensations.sort_by_key(|(step, compensation)| {
+        (
+            behavior_name(module, *step).unwrap_or_else(|| format!("#{step}")),
+            behavior_name(module, *compensation).unwrap_or_else(|| format!("#{compensation}")),
+        )
+    });
+    encoder.len(compensations.len());
+    for (step, compensation) in compensations {
+        encoder.behavior_ref(step);
+        encoder.behavior_ref(compensation);
     }
 
-    encoder.len(module.parallel_branches_of.len());
-    for (behavior, branches) in &module.parallel_branches_of {
-        encoder.usize(*behavior);
+    let mut parallel = module.parallel_branches_of.clone();
+    parallel.sort_by_key(|(behavior, _)| {
+        behavior_name(module, *behavior).unwrap_or_else(|| format!("#{behavior}"))
+    });
+    encoder.len(parallel.len());
+    for (behavior, branches) in parallel {
+        encoder.behavior_ref(behavior);
         encoder.len(branches.len());
         for branch in branches {
-            encoder.string(branch);
+            encoder.string(&branch);
         }
     }
 
-    encoder.len(module.foreign_functions.len());
-    for foreign in &module.foreign_functions {
-        encoder.string(&foreign.library);
-        encoder.string(&foreign.symbol);
-        encoder.len(foreign.params.len());
-        for param in &foreign.params {
-            encoder.ty(param);
-        }
-        encoder.ty(&foreign.ret);
+    let mut foreign: Vec<_> = module.foreign_functions.iter().collect();
+    foreign.sort_by(|left, right| {
+        left.library
+            .cmp(&right.library)
+            .then_with(|| left.symbol.cmp(&right.symbol))
+            .then_with(|| format!("{:?}", left.params).cmp(&format!("{:?}", right.params)))
+            .then_with(|| format!("{:?}", left.ret).cmp(&format!("{:?}", right.ret)))
+    });
+    encoder.len(foreign.len());
+    for function in foreign {
+        encoder.foreign_function(function);
     }
 
     Ok(encoder.out)
+}
+
+/// Canonical MIR semantics owned by one actor/entity/workflow definition.
+///
+/// Unlike [`canonical_mir_bytes`], this intentionally excludes unrelated
+/// actors and unrelated top-level helpers. It includes the actor's owned
+/// behaviors, compensation bodies, parallel-step metadata, and the transitive
+/// closure of ordinary MIR functions referenced by those bodies. This is the
+/// correct granularity for durable-definition compatibility: changing an
+/// unrelated definition must not invalidate a healthy actor's history.
+pub fn canonical_actor_definition_mir_bytes(
+    module: &mir::Module,
+    actor_name: &str,
+) -> Result<Option<Vec<u8>>, SemanticIdentityError> {
+    let Some(actor) = module
+        .actor_metadata
+        .iter()
+        .find(|actor| actor.name == actor_name)
+    else {
+        return Ok(None);
+    };
+
+    let mut encoder = Encoder::for_module(module);
+    encoder.bytes(ACTOR_DEFINITION_MIR_CANONICAL_VERSION);
+    encoder.string(&module.name);
+    encoder.actor_meta(actor);
+
+    let owned: BTreeSet<usize> = actor.behavior_indices.iter().copied().collect();
+    let mut behavior_indices: Vec<_> = owned.iter().copied().collect();
+    behavior_indices.sort_by_key(|idx| {
+        behavior_name(module, *idx).unwrap_or_else(|| format!("#{idx}"))
+    });
+
+    encoder.len(behavior_indices.len());
+    for idx in &behavior_indices {
+        if let Some(behavior) = module.behaviors.get(*idx) {
+            encoder.function(behavior)?;
+        }
+    }
+
+    let mut compensation_indices: Vec<_> = module
+        .compensation_of
+        .iter()
+        .filter_map(|(step, compensation)| owned.contains(step).then_some(*compensation))
+        .collect();
+    compensation_indices.sort_by_key(|idx| {
+        behavior_name(module, *idx).unwrap_or_else(|| format!("#{idx}"))
+    });
+    compensation_indices.dedup();
+
+    encoder.len(compensation_indices.len());
+    for idx in &compensation_indices {
+        if let Some(behavior) = module.behaviors.get(*idx) {
+            encoder.function(behavior)?;
+        }
+    }
+
+    let mut reachable_functions = BTreeSet::new();
+    for idx in behavior_indices
+        .iter()
+        .chain(compensation_indices.iter())
+        .copied()
+    {
+        if let Some(behavior) = module.behaviors.get(idx) {
+            collect_function_refs(behavior, &mut reachable_functions);
+        }
+    }
+
+    let mut cursor: Vec<_> = reachable_functions.iter().copied().collect();
+    while let Some(idx) = cursor.pop() {
+        if let Some(function) = module.functions.get(idx) {
+            let mut discovered = BTreeSet::new();
+            collect_function_refs(function, &mut discovered);
+            for next in discovered {
+                if reachable_functions.insert(next) {
+                    cursor.push(next);
+                }
+            }
+        }
+    }
+
+    let mut helpers: Vec<_> = reachable_functions.into_iter().collect();
+    helpers.sort_by_key(|idx| {
+        module
+            .functions
+            .get(*idx)
+            .map(|function| function.name.clone())
+            .unwrap_or_else(|| format!("#{idx}"))
+    });
+    encoder.len(helpers.len());
+    for idx in helpers {
+        if let Some(function) = module.functions.get(idx) {
+            encoder.function(function)?;
+        }
+    }
+
+    let mut compensations: Vec<_> = module
+        .compensation_of
+        .iter()
+        .filter(|(step, _)| owned.contains(step))
+        .copied()
+        .collect();
+    compensations.sort_by_key(|(step, compensation)| {
+        (
+            behavior_name(module, *step).unwrap_or_else(|| format!("#{step}")),
+            behavior_name(module, *compensation).unwrap_or_else(|| format!("#{compensation}")),
+        )
+    });
+    encoder.len(compensations.len());
+    for (step, compensation) in compensations {
+        encoder.behavior_ref(step);
+        encoder.behavior_ref(compensation);
+    }
+
+    let mut parallel: Vec<_> = module
+        .parallel_branches_of
+        .iter()
+        .filter(|(behavior, _)| owned.contains(behavior))
+        .cloned()
+        .collect();
+    parallel.sort_by_key(|(behavior, _)| {
+        behavior_name(module, *behavior).unwrap_or_else(|| format!("#{behavior}"))
+    });
+    encoder.len(parallel.len());
+    for (behavior, branches) in parallel {
+        encoder.behavior_ref(behavior);
+        encoder.len(branches.len());
+        for branch in branches {
+            encoder.string(&branch);
+        }
+    }
+
+    Ok(Some(encoder.out))
+}
+
+fn behavior_name(module: &mir::Module, index: usize) -> Option<String> {
+    module.behaviors.get(index).map(|behavior| behavior.name.clone())
+}
+
+fn collect_function_refs(function: &mir::Function, out: &mut BTreeSet<usize>) {
+    for block in &function.blocks {
+        for stmt in &block.stmts {
+            if let Stmt::Assign { op, .. } = stmt {
+                collect_function_refs_from_rvalue(op, out);
+            }
+        }
+    }
+}
+
+fn collect_function_refs_from_rvalue(value: &RValue, out: &mut BTreeSet<usize>) {
+    match value {
+        RValue::Call {
+            func: FuncRef::Index(index),
+            ..
+        }
+        | RValue::Closure { func: index, .. } => {
+            out.insert(*index);
+        }
+        RValue::Const(Constant::FunctionRef(index)) => {
+            out.insert(*index);
+        }
+        RValue::Spawn { init, .. } => {
+            for (_, value) in init {
+                collect_function_refs_from_rvalue(value, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,9 +311,21 @@ struct Encoder {
     type_vars: BTreeMap<u64, u32>,
     regions: BTreeMap<u64, u32>,
     skolems: BTreeMap<u64, u32>,
+    function_names: Vec<String>,
+    behavior_names: Vec<String>,
+    foreign_functions: Vec<mir::ForeignFunction>,
 }
 
 impl Encoder {
+    fn for_module(module: &mir::Module) -> Self {
+        Self {
+            function_names: module.functions.iter().map(|function| function.name.clone()).collect(),
+            behavior_names: module.behaviors.iter().map(|behavior| behavior.name.clone()).collect(),
+            foreign_functions: module.foreign_functions.clone(),
+            ..Self::default()
+        }
+    }
+
     fn byte(&mut self, value: u8) {
         self.out.push(value);
     }
@@ -587,7 +790,7 @@ impl Encoder {
                 match func {
                     FuncRef::Index(index) => {
                         self.byte(0);
-                        self.usize(*index);
+                        self.function_ref(*index);
                     }
                     FuncRef::Local(local) => {
                         self.byte(1);
@@ -598,7 +801,7 @@ impl Encoder {
             }
             RValue::Closure { func, captures } => {
                 self.byte(13);
-                self.usize(*func);
+                self.function_ref(*func);
                 self.locals(captures, ids);
             }
             RValue::Tuple(values) => {
@@ -676,7 +879,7 @@ impl Encoder {
             RValue::ReceiveCommit => self.byte(23),
             RValue::FFICall { idx, args } => {
                 self.byte(24);
-                self.usize(*idx);
+                self.foreign_ref(*idx);
                 self.locals(args, ids);
             }
             RValue::Migrate { actor, node } => {
@@ -700,7 +903,7 @@ impl Encoder {
                 capabilities,
             } => {
                 self.byte(29);
-                self.usize(*behavior_idx);
+                self.behavior_ref(*behavior_idx);
                 self.len(init.len());
                 for (field, value) in init {
                     self.string(field);
@@ -720,7 +923,7 @@ impl Encoder {
             } => {
                 self.byte(30);
                 self.u32(ids.local(*actor));
-                self.usize(*behavior_idx);
+                self.behavior_ref(*behavior_idx);
                 self.locals(args, ids);
                 self.bool(*remote);
             }
@@ -737,7 +940,7 @@ impl Encoder {
             } => {
                 self.byte(32);
                 self.u32(ids.local(*actor));
-                self.usize(*behavior_idx);
+                self.behavior_ref(*behavior_idx);
                 self.locals(args, ids);
                 self.bool(*remote);
                 self.option(timeout_ms, |encoder, timeout| encoder.u64(*timeout));
@@ -795,6 +998,46 @@ impl Encoder {
         }
     }
 
+    fn function_ref(&mut self, index: usize) {
+        if let Some(name) = self.function_names.get(index).cloned() {
+            self.byte(1);
+            self.string(&name);
+        } else {
+            self.byte(0);
+            self.usize(index);
+        }
+    }
+
+    fn behavior_ref(&mut self, index: usize) {
+        if let Some(name) = self.behavior_names.get(index).cloned() {
+            self.byte(1);
+            self.string(&name);
+        } else {
+            self.byte(0);
+            self.usize(index);
+        }
+    }
+
+    fn foreign_ref(&mut self, index: usize) {
+        if let Some(function) = self.foreign_functions.get(index).cloned() {
+            self.byte(1);
+            self.foreign_function(&function);
+        } else {
+            self.byte(0);
+            self.usize(index);
+        }
+    }
+
+    fn foreign_function(&mut self, foreign: &mir::ForeignFunction) {
+        self.string(&foreign.library);
+        self.string(&foreign.symbol);
+        self.len(foreign.params.len());
+        for param in &foreign.params {
+            self.ty(param);
+        }
+        self.ty(&foreign.ret);
+    }
+
     fn constant(&mut self, constant: &Constant) {
         match constant {
             Constant::Int(value) => {
@@ -821,11 +1064,11 @@ impl Encoder {
             }
             Constant::FunctionRef(index) => {
                 self.byte(7);
-                self.usize(*index);
+                self.function_ref(*index);
             }
             Constant::BehaviorRef(index) => {
                 self.byte(8);
-                self.usize(*index);
+                self.behavior_ref(*index);
             }
         }
     }
@@ -834,19 +1077,32 @@ impl Encoder {
         self.string(&actor.name);
         self.bool(actor.persistent);
 
-        self.len(actor.state_models.len());
-        for (name, model) in &actor.state_models {
+        let mut state_models: Vec<_> = actor.state_models.iter().collect();
+        state_models.sort_by(|left, right| left.0.cmp(&right.0));
+        self.len(state_models.len());
+        for (name, model) in state_models {
             self.string(name);
             self.state_model(*model);
         }
-        self.len(actor.state_defaults.len());
-        for (name, default) in &actor.state_defaults {
+
+        let mut state_defaults: Vec<_> = actor.state_defaults.iter().collect();
+        state_defaults.sort_by(|left, right| left.0.cmp(&right.0));
+        self.len(state_defaults.len());
+        for (name, default) in state_defaults {
             self.string(name);
             self.constant(default);
         }
-        self.len(actor.behavior_indices.len());
-        for behavior in &actor.behavior_indices {
-            self.usize(*behavior);
+
+        let mut behaviors = actor.behavior_indices.clone();
+        behaviors.sort_by_key(|idx| {
+            self.behavior_names
+                .get(*idx)
+                .cloned()
+                .unwrap_or_else(|| format!("#{idx}"))
+        });
+        self.len(behaviors.len());
+        for behavior in behaviors {
+            self.behavior_ref(behavior);
         }
 
         self.bool(actor.is_workflow);
@@ -854,8 +1110,10 @@ impl Encoder {
         self.bool(actor.is_organization);
         self.bool(actor.is_virtual);
 
-        self.len(actor.tools.len());
-        for tool in &actor.tools {
+        let mut tools: Vec<_> = actor.tools.iter().collect();
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
+        self.len(tools.len());
+        for tool in tools {
             self.string(&tool.name);
             self.string(&tool.description);
             self.json(&tool.parameters);
@@ -1059,6 +1317,59 @@ mod tests {
         assert_eq!(
             semantic_id_for_mir(&module, [a, b]).unwrap(),
             semantic_id_for_mir(&module, [b, a, b]).unwrap()
+        );
+    }
+
+    #[test]
+    fn top_level_function_reordering_does_not_change_semantic_id() {
+        let first = lower(
+            "fn left() -> Int { 20 }\nfn right() -> Int { 22 }\nleft() + right()",
+        );
+        let reordered = lower(
+            "fn right() -> Int { 22 }\nfn left() -> Int { 20 }\nleft() + right()",
+        );
+
+        assert_eq!(
+            semantic_id_for_mir(&first, []).unwrap(),
+            semantic_id_for_mir(&reordered, []).unwrap()
+        );
+    }
+
+    #[test]
+    fn actor_definition_identity_ignores_unrelated_helper_changes() {
+        let first = lower(
+            "fn used() -> Int { 1 }\nfn unrelated() -> Int { 10 }\nactor Counter { behavior get() { used() } }",
+        );
+        let changed = lower(
+            "fn used() -> Int { 1 }\nfn unrelated() -> Int { 99 }\nactor Counter { behavior get() { used() } }",
+        );
+
+        assert_eq!(
+            canonical_actor_definition_mir_bytes(&first, "Counter")
+                .unwrap()
+                .unwrap(),
+            canonical_actor_definition_mir_bytes(&changed, "Counter")
+                .unwrap()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn actor_definition_identity_tracks_reachable_helper_changes() {
+        let first = lower(
+            "fn used() -> Int { 1 }\nactor Counter { behavior get() { used() } }",
+        );
+        let changed = lower(
+            "fn used() -> Int { 2 }\nactor Counter { behavior get() { used() } }",
+        );
+
+        assert_ne!(
+            canonical_actor_definition_mir_bytes(&first, "Counter")
+                .unwrap()
+                .unwrap(),
+            canonical_actor_definition_mir_bytes(&changed, "Counter")
+                .unwrap()
+                .unwrap()
         );
     }
 
