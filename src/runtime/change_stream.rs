@@ -25,6 +25,7 @@ use super::persistence::{EventEntry, JournalEntry, PersistenceStore, WorkflowEve
     serde::Deserialize,
 )]
 #[repr(u8)]
+#[serde(rename_all = "snake_case")]
 pub enum DurableChangeLane {
     Journal = 0,
     Event = 1,
@@ -58,7 +59,7 @@ pub struct DurableChangeCursor {
 
 /// A committed durable record exposed through the unified change stream.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", content = "record")]
+#[serde(tag = "kind", content = "record", rename_all = "snake_case")]
 pub enum DurableChangeRecord {
     Journal(JournalEntry),
     Event(EventEntry),
