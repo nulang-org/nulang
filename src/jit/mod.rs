@@ -59,6 +59,12 @@ pub const HOT_THRESHOLD: u64 = 1000;
 /// or SIMD if the region is amenable).
 pub const TIER2_THRESHOLD: u64 = 10_000;
 
+/// Dense tier-2 counter sentinels. Scalar regions are permanently disabled;
+/// successfully promoted SIMD regions stop counting. Only typed scalar regions
+/// carry a normal 0..TIER2_THRESHOLD counter.
+const TIER2_PROMOTED: u32 = u32::MAX - 1;
+const TIER2_DISABLED: u32 = u32::MAX;
+
 /// Minimum length for a STRAIGHT-LINE region (no internal loop back-edge) to
 /// be worth JIT-compiling. Such a region is re-entered by the interpreter
 /// every iteration of an enclosing loop, so the JIT enter/exit + probe cost
@@ -92,10 +98,11 @@ pub struct JitSession {
     compiled: Vec<Vec<Option<(*const u8, usize)>>>,
     /// Number of occupied compiled-region slots across all modules.
     compiled_count: usize,
-    /// Per-region execution counters for already-compiled code. When a
-    /// region crosses TIER2_THRESHOLD, a more aggressive compilation is
-    /// attempted. Reset after each promotion attempt.
-    tier2_counters: FxHashMap<(usize, usize), u64>,
+    /// Dense per-region execution counters for tier-2 promotion, indexed
+    /// [module_idx][bytecode offset]. This runs on every typed JIT-region
+    /// entry, so it deliberately avoids a hash-table probe. Scalar regions
+    /// are marked TIER2_DISABLED; SIMD-promoted regions TIER2_PROMOTED.
+    tier2_counts: Vec<Vec<u32>>,
     /// Hot counters, flat `Vec<Vec<u32>>` indexed `[module_idx][offset]` so
     /// identical offsets in different modules keep independent counts.
     /// A flat array (not an `FxHashMap`) because `record_and_check_hot` runs
@@ -170,7 +177,7 @@ impl JitSession {
             may_suspend: FxHashMap::default(),
             recursive: FxHashMap::default(),
             builder_context: FunctionBuilderContext::new(),
-            tier2_counters: FxHashMap::default(),
+            tier2_counts: Vec::new(),
             ctx,
         })
     }
@@ -264,6 +271,28 @@ impl JitSession {
         &self.recursive[&module_idx]
     }
 
+    #[inline]
+    fn set_tier2_state(&mut self, module_idx: usize, offset: usize, state: u32) {
+        if module_idx >= self.tier2_counts.len() {
+            self.tier2_counts.resize(module_idx + 1, Vec::new());
+        }
+        let row = &mut self.tier2_counts[module_idx];
+        if offset >= row.len() {
+            let new_len = (offset + 1).max(row.len().max(1) * 2);
+            row.resize(new_len, TIER2_DISABLED);
+        }
+        row[offset] = state;
+    }
+
+    #[inline(always)]
+    fn tier2_state(&self, module_idx: usize, offset: usize) -> u32 {
+        self.tier2_counts
+            .get(module_idx)
+            .and_then(|row| row.get(offset))
+            .copied()
+            .unwrap_or(TIER2_DISABLED)
+    }
+
     /// Record one execution of an already-compiled region and attempt
     /// tier-2 promotion when the threshold is crossed.
     ///
@@ -275,42 +304,61 @@ impl JitSession {
         &mut self,
         module_idx: usize,
         pc: usize,
-        instructions: &[crate::bytecode::Instruction],
+        module: &crate::bytecode::CodeModule,
     ) {
-        let count = self.tier2_counters.entry((module_idx, pc)).or_insert(0);
-        *count += 1;
-        if *count < TIER2_THRESHOLD {
+        // Scalar regions have no profitable tier-2 path today, and SIMD
+        // regions are already terminal. Both are encoded as sentinels so the
+        // common compiled-region path pays only dense array reads.
+        let state = self.tier2_state(module_idx, pc);
+        if state == TIER2_DISABLED || state == TIER2_PROMOTED {
+            return;
+        }
+
+        let next = state.saturating_add(1);
+        self.set_tier2_state(module_idx, pc, next);
+        if u64::from(next) < TIER2_THRESHOLD {
             return;
         }
 
         let region_len = match self.compiled_entry(module_idx, pc) {
             Some((_, len)) if len >= 3 => len,
-            _ => return,
+            _ => {
+                self.set_tier2_state(module_idx, pc, TIER2_DISABLED);
+                return;
+            }
         };
 
-        let was_typed = self.typed_regions.contains(&(module_idx, pc));
-
-        if !was_typed {
-            // Try typed compilation with the benefit of profile data.
-            // We don't have a CodeModule here, so infer_reg_types needs
-            // one — skip for now, promotion will retry later.
-            // Reset counter to allow future retries.
-            self.tier2_counters.insert((module_idx, pc), 0);
-        } else {
-            // Try SIMD compilation for hot typed regions.
-            if let Some(_func) =
-                unsafe { self.compile_region_simd(module_idx, pc, region_len, instructions, None) }
-            {
-                // SIMD compilation succeeded; the compiled cache was
-                // updated inside compile_region_simd.
-            }
-            self.tier2_counters.insert((module_idx, pc), 0);
+        // Tier-1 already attempted static type inference. Tier-2 therefore
+        // focuses on the optimization that genuinely needs extra hotness:
+        // replacing a typed scalar loop with SIMD code. If analysis or codegen
+        // rejects the region, retry only after another full threshold.
+        let meta = typed_compiler::infer_reg_types(module, pc);
+        let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
+        let promoted = unsafe {
+            self.promote_region_simd(
+                module_idx,
+                pc,
+                region_len,
+                &module.instructions,
+                meta_ref,
+            )
         }
+        .is_some();
+
+        self.set_tier2_state(
+            module_idx,
+            pc,
+            if promoted { TIER2_PROMOTED } else { 0 },
+        );
     }
 
     /// Reset tier-2 counters (used by tests).
     pub fn reset_tier2_counters(&mut self) {
-        self.tier2_counters.clear();
+        let typed: Vec<_> = self.typed_regions.iter().copied().collect();
+        self.tier2_counts.clear();
+        for (module_idx, pc) in typed {
+            self.set_tier2_state(module_idx, pc, 0);
+        }
     }
 
     /// Compile a bytecode region starting at `start_offset` with `num_instrs`
@@ -349,6 +397,7 @@ impl JitSession {
         ) {
             Ok(ptr) => {
                 self.store_compiled(module_idx, start_offset, ptr, num_instrs);
+                self.set_tier2_state(module_idx, start_offset, TIER2_DISABLED);
                 Some(std::mem::transmute(ptr))
             }
             Err(_) => None,
@@ -406,6 +455,7 @@ impl JitSession {
             ) {
                 self.store_compiled(module_idx, start_offset, ptr, num_instrs);
                 self.typed_regions.insert((module_idx, start_offset));
+                self.set_tier2_state(module_idx, start_offset, 0);
                 return Some(std::mem::transmute(ptr));
             }
             // Typed compilation failed: fall through to the scalar compiler.
@@ -457,6 +507,47 @@ impl JitSession {
     /// Return the number of compiled regions.
     pub fn compiled_count(&self) -> usize {
         self.compiled_count
+    }
+
+    /// Recompile an already-compiled typed region as SIMD and replace its
+    /// dense compiled slot only on success. Unlike compile_region_simd, this
+    /// intentionally bypasses the existing-cache fast path; that fast path was
+    /// previously making tier-2 promotion a no-op.
+    unsafe fn promote_region_simd(
+        &mut self,
+        module_idx: usize,
+        start_offset: usize,
+        num_instrs: usize,
+        instructions: &[crate::bytecode::Instruction],
+        type_metadata: Option<&crate::jit::typed_compiler::TypeMetadata>,
+    ) -> Option<JitFunctionPtr> {
+        use crate::jit::simd_analyzer::analyze_region;
+        use crate::jit::simd_compiler::{compile_simd_region, is_simd_supported};
+
+        if !is_simd_supported() {
+            return None;
+        }
+
+        let simd_region = analyze_region(instructions, start_offset, num_instrs, type_metadata)?;
+        let func_name = format!("nulang_simd2_{}_{}", module_idx, start_offset);
+
+        match compile_simd_region(
+            &mut self.module,
+            &mut self.builder_context,
+            &mut self.ctx,
+            &func_name,
+            instructions,
+            &simd_region,
+        ) {
+            Ok(ptr) => {
+                // store_compiled replaces an occupied dense slot without
+                // changing compiled_count, so the old scalar/typed code remains
+                // valid until the new function is fully finalized.
+                self.store_compiled(module_idx, start_offset, ptr, num_instrs);
+                Some(std::mem::transmute(ptr))
+            }
+            Err(_) => None,
+        }
     }
 
     /// Compile a SIMD-vectorizable bytecode region.
@@ -517,6 +608,7 @@ impl JitSession {
         ) {
             Ok(ptr) => {
                 self.store_compiled(module_idx, start_offset, ptr, num_instrs);
+                self.set_tier2_state(module_idx, start_offset, TIER2_PROMOTED);
                 Some(std::mem::transmute(ptr))
             }
             Err(_) => self.compile_region_typed(
@@ -1074,7 +1166,7 @@ impl crate::backends::JitBackend for JitSession {
         if let Some(func) = unsafe { self.get_compiled(module_idx, pc) } {
             func(regs.as_mut_ptr(), constants.as_ptr());
             // Track post-compilation hotness for tier-2 promotion.
-            self.record_tier2_and_maybe_promote(module_idx, pc, instructions);
+            self.record_tier2_and_maybe_promote(module_idx, pc, module);
             return crate::backends::TieredAction::RanJit;
         }
 
