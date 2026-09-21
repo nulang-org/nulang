@@ -45,6 +45,16 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Artifact-bound Behavior Manifest host ABI metadata — 2026-09-20
+- **Single-pass Behavior Manifest emission** (Experimental, RFC 0020,
+  `src/behavior_build.rs`, `src/behavior_manifest.rs`). The compiler can
+  emit Wasm bytes and `nulang.behavior/v0alpha1` metadata from the same
+  import-resolved checked unit, binding artifact/compiler/source/dependency
+  provenance without a post-build semantic reparse. Manifests now carry the
+  required `nulang.host-effects/v0alpha1` canonical operation identities and
+  explicitly flag unresolved legacy/custom dispatch so canonical-only
+  deployment can fail closed.
+
 ### Compiler-owned host effect ABI — 2026-09-20
 - **Built-in host effects now lower through a versioned compiler-owned contract**
   (Experimental, `src/host_effect_abi.rs`, `spec/host-effects/v0alpha1.json`,
