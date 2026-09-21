@@ -2979,6 +2979,28 @@ mod host_authority_tests {
     }
 
     #[test]
+    fn sandboxed_actor_free_runtime_denies_host_authority_and_ffi() {
+        use crate::vm::ActorVmCallbacks;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let runtime = Rc::new(RefCell::new(Runtime::new()));
+        let mut callbacks = super::RuntimeVmCallbacks::new_sandboxed(runtime);
+        let mut module = crate::bytecode::CodeModule::new("sandboxed-top-level");
+        module.add_constant(Constant::String("/tmp/ambient.txt".into()));
+        let result = callbacks
+            .perform_builtin_effect_in_module(
+                "FS",
+                Some("read"),
+                &module,
+                &[Value::string(0)],
+            )
+            .expect("sandboxed host effect should be handled as denied");
+        assert!(result.is_nil());
+        assert!(!callbacks.authorize_ffi("libc.so.6", "getpid"));
+    }
+
+    #[test]
     fn actor_free_runtime_keeps_existing_ambient_host_contract() {
         let rt = Runtime::new();
         let (constants, regs) = string_args(&["/tmp/ambient.txt"]);
