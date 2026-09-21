@@ -9,15 +9,21 @@
 //! with canonical MIR bytes to produce the full typed-program [`SemanticId`].
 
 use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt;
 
 use crate::ast::ActorBackendKind;
 use crate::content_identity::SemanticId;
 use crate::hir;
 use crate::mir;
-use crate::semantic_identity::{canonical_mir_bytes, SemanticIdentityError};
+use crate::semantic_identity::{
+    canonical_actor_definition_mir_bytes, canonical_mir_bytes, SemanticIdentityError,
+};
 use crate::types::{Capability, Effect, EffectRow, PrimitiveType, Region, Type, TypeVar};
 
 const TYPED_PROGRAM_SEMANTIC_VERSION: &[u8] = b"nulang.typed-program-semantic.v1\0";
+const TYPED_ACTOR_DEFINITION_SEMANTIC_VERSION: &[u8] =
+    b"nulang.typed-actor-definition-semantic.v1\0";
 const ACTOR_SCHEMA_CANONICAL_VERSION: &[u8] = b"nulang.actor-state-schema.v1\0";
 
 /// Canonical compiler-owned state schema for one actor/entity/workflow/agent.
@@ -131,6 +137,125 @@ where
 {
     let schemas = actor_state_schemas_from_hir(hir);
     semantic_id_for_mir_with_actor_schemas(mir, &schemas, dependency_semantic_ids)
+}
+
+/// Derive the semantic identity of one actor/entity/workflow definition.
+///
+/// This identity is intentionally narrower than the whole-program
+/// [`SemanticId`]: it includes the actor-owned MIR behavior graph and its typed
+/// state schema, but excludes unrelated actors and unreachable top-level
+/// helpers. Durable histories should pin to this granularity rather than the
+/// entire compilation unit.
+pub fn semantic_id_for_actor_definition<I>(
+    mir: &mir::Module,
+    mir_actor_name: &str,
+    schema: &ActorStateSchema,
+    dependency_semantic_ids: I,
+) -> Result<Option<SemanticId>, SemanticIdentityError>
+where
+    I: IntoIterator<Item = SemanticId>,
+{
+    let Some(mir_bytes) = canonical_actor_definition_mir_bytes(mir, mir_actor_name)? else {
+        return Ok(None);
+    };
+    let schema_bytes = canonical_actor_state_schema_bytes(std::slice::from_ref(schema));
+
+    let mut bytes = Vec::new();
+    put_bytes(&mut bytes, TYPED_ACTOR_DEFINITION_SEMANTIC_VERSION);
+    put_bytes(&mut bytes, &mir_bytes);
+    put_bytes(&mut bytes, &schema_bytes);
+
+    Ok(Some(SemanticId::from_canonical_bytes(
+        &bytes,
+        dependency_semantic_ids,
+    )))
+}
+
+/// Derive definition-scoped semantic identities for every lowered actor.
+///
+/// HIR schema extraction and MIR actor lowering intentionally walk declarations
+/// in the same order. We verify that invariant here instead of matching by
+/// short name alone, because two namespace modules may legally contain actors
+/// with the same short name.
+pub fn actor_definition_semantic_ids_for_typed_program<I>(
+    hir: &hir::Module,
+    mir: &mir::Module,
+    dependency_semantic_ids: I,
+) -> Result<Vec<(String, SemanticId)>, ActorDefinitionIdentityError>
+where
+    I: IntoIterator<Item = SemanticId>,
+{
+    let dependencies: Vec<_> = dependency_semantic_ids.into_iter().collect();
+    let schemas = actor_state_schemas_from_hir(hir);
+
+    if schemas.len() != mir.actor_metadata.len() {
+        return Err(ActorDefinitionIdentityError::SchemaCountMismatch {
+            actors: mir.actor_metadata.len(),
+            schemas: schemas.len(),
+        });
+    }
+
+    let mut identities = Vec::with_capacity(schemas.len());
+    for (actor, schema) in mir.actor_metadata.iter().zip(schemas.iter()) {
+        let schema_short_name = schema
+            .actor_name
+            .rsplit("::")
+            .next()
+            .unwrap_or(schema.actor_name.as_str());
+        if schema_short_name != actor.name {
+            return Err(ActorDefinitionIdentityError::SchemaNameMismatch {
+                actor: actor.name.clone(),
+                schema: schema.actor_name.clone(),
+            });
+        }
+
+        let semantic_id = semantic_id_for_actor_definition(
+            mir,
+            &actor.name,
+            schema,
+            dependencies.iter().copied(),
+        )?
+        .ok_or_else(|| ActorDefinitionIdentityError::MissingMirActor(actor.name.clone()))?;
+        identities.push((actor.name.clone(), semantic_id));
+    }
+
+    Ok(identities)
+}
+
+#[derive(Debug)]
+pub enum ActorDefinitionIdentityError {
+    Semantic(SemanticIdentityError),
+    SchemaCountMismatch { actors: usize, schemas: usize },
+    SchemaNameMismatch { actor: String, schema: String },
+    MissingMirActor(String),
+}
+
+impl fmt::Display for ActorDefinitionIdentityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Semantic(error) => error.fmt(f),
+            Self::SchemaCountMismatch { actors, schemas } => write!(
+                f,
+                "cannot derive actor semantic identities: MIR has {actors} actors but typed HIR has {schemas} state schemas"
+            ),
+            Self::SchemaNameMismatch { actor, schema } => write!(
+                f,
+                "cannot derive actor semantic identity: MIR actor '{actor}' does not match typed schema '{schema}'"
+            ),
+            Self::MissingMirActor(actor) => write!(
+                f,
+                "cannot derive actor semantic identity: MIR actor '{actor}' is missing"
+            ),
+        }
+    }
+}
+
+impl Error for ActorDefinitionIdentityError {}
+
+impl From<SemanticIdentityError> for ActorDefinitionIdentityError {
+    fn from(error: SemanticIdentityError) -> Self {
+        Self::Semantic(error)
+    }
 }
 
 /// Lower-level entry point for callers that already own canonical actor schemas.
@@ -515,6 +640,43 @@ mod tests {
         let string_id = semantic_id_for_mir_with_actor_schemas(&mir, &[string_schema], []).unwrap();
 
         assert_ne!(int_id, string_id);
+    }
+
+    #[test]
+    fn actor_definition_identity_includes_typed_state_schema() {
+        let mut module = mir::Module::new("definition-test");
+        module.actor_metadata.push(ActorMeta::new("Counter"));
+
+        let int_schema = schema(primitive(PrimitiveType::Int));
+        let string_schema = schema(primitive(PrimitiveType::String));
+
+        let int_id = semantic_id_for_actor_definition(&module, "Counter", &int_schema, [])
+            .unwrap()
+            .unwrap();
+        let string_id =
+            semantic_id_for_actor_definition(&module, "Counter", &string_schema, [])
+                .unwrap()
+                .unwrap();
+
+        assert_ne!(int_id, string_id);
+    }
+
+    #[test]
+    fn actor_definition_identity_keeps_backend_out_of_semantics() {
+        let mut native = mir::Module::new("definition-backend-test");
+        native.actor_metadata.push(ActorMeta::new("Counter"));
+        let mut wasm = native.clone();
+        wasm.actor_metadata[0].backend = ActorBackendKind::WasmComponent;
+        let schema = schema(primitive(PrimitiveType::Int));
+
+        assert_eq!(
+            semantic_id_for_actor_definition(&native, "Counter", &schema, [])
+                .unwrap()
+                .unwrap(),
+            semantic_id_for_actor_definition(&wasm, "Counter", &schema, [])
+                .unwrap()
+                .unwrap()
+        );
     }
 
     #[test]
