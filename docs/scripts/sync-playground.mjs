@@ -27,9 +27,9 @@ try {
     await access(targetWasm);
     console.log('Synced playground shell; preserving the generated public WASM compiler.');
   } catch {
-    if (process.env.CF_PAGES === '1') {
+    if (process.env.CF_PAGES === '1' && process.env.CF_PAGES_BRANCH === 'main') {
       throw new Error(
-        'Refusing a Cloudflare Pages build without docs/public/playground/nulang_playground.wasm. ' +
+        'Refusing the production Cloudflare Pages build without docs/public/playground/nulang_playground.wasm. ' +
         'Docs Sync must generate and commit the compiler artifact first.'
       );
     }
