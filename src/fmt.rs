@@ -175,7 +175,11 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             indexes,
             ..
         } => {
-            let actor_prefix = if *persistent { "persistent actor" } else { "actor" };
+            let actor_prefix = if *persistent {
+                "persistent actor"
+            } else {
+                "actor"
+            };
             out.push_str(&format!("{}{} {} {{\n", sp, actor_prefix, name));
             for (fnm, model, fty, fdef) in state_fields {
                 out.push_str(&format!("{}    state ", sp));
