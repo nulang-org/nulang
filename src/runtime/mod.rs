@@ -3992,7 +3992,7 @@ impl Runtime {
     fn actor_is_agent(&self, actor_id: u64) -> bool {
         self.actors
             .get(&actor_id)
-            .map(|a| a.is_agent)
+            .map(|a| a.semantics().map(|s| s.is_agent()).unwrap_or(false))
             .unwrap_or(false)
     }
 
@@ -5016,7 +5016,11 @@ impl Runtime {
         let is_agent = self
             .recovery_modules
             .get(&actor_id)
-            .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_agent))
+            .map(|(m, _, _)| {
+                m.actor_metadata
+                    .iter()
+                    .any(|meta| meta.semantics().map(|s| s.is_agent()).unwrap_or(false))
+            })
             .unwrap_or(false);
 
         let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
