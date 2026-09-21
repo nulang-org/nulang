@@ -767,7 +767,14 @@ impl Runtime {
 
     #[tracing::instrument(level = "trace", skip(self, init))]
     pub fn spawn_actor(&mut self, init: Box<dyn FnOnce() -> Vec<(String, Value)>>) -> u64 {
-        spawn::spawn_actor_with_models(self, init, HashMap::new(), false, None)
+        spawn::spawn_actor_with_models(
+            self,
+            init,
+            HashMap::new(),
+            false,
+            None,
+            crate::persistence_schema::LEGACY_SCHEMA_VERSION,
+        )
     }
 
     /// Spawn an actor co-located on the same shard as `near_actor_id`.
@@ -798,7 +805,15 @@ impl Runtime {
         } else {
             fresh_actor_id()
         };
-        spawn::spawn_actor_with_id(self, id, init, HashMap::new(), false, None)
+        spawn::spawn_actor_with_id(
+            self,
+            id,
+            init,
+            HashMap::new(),
+            false,
+            None,
+            crate::persistence_schema::LEGACY_SCHEMA_VERSION,
+        )
     }
 
     pub fn spawn_persistent_actor(
@@ -806,7 +821,14 @@ impl Runtime {
         init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
         state_models: HashMap<String, StateModel>,
     ) -> u64 {
-        spawn::spawn_actor_with_models(self, init, state_models, true, None)
+        spawn::spawn_actor_with_models(
+            self,
+            init,
+            state_models,
+            true,
+            None,
+            crate::persistence_schema::LEGACY_SCHEMA_VERSION,
+        )
     }
 
     /// Spawn a durable workflow actor.  Workflows are always persistent and
@@ -817,7 +839,14 @@ impl Runtime {
         init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
         state_models: HashMap<String, StateModel>,
     ) -> u64 {
-        spawn::spawn_actor_with_models(self, init, state_models, true, Some(name))
+        spawn::spawn_actor_with_models(
+            self,
+            init,
+            state_models,
+            true,
+            Some(name),
+            crate::persistence_schema::LEGACY_SCHEMA_VERSION,
+        )
     }
 
     /// Spawn an actor for `module`'s behavior `behavior_idx`, seeded with
@@ -3232,11 +3261,19 @@ impl Runtime {
             }
 
             // Persist a snapshot of durable state before hibernating.
+            let schema_version = self
+                .actors
+                .get(&actor_id)
+                .map(|actor| actor.schema_version)
+                .unwrap_or(crate::persistence_schema::LEGACY_SCHEMA_VERSION);
             let Some(snapshot) = self.build_actor_snapshot(actor_id) else {
                 continue;
             };
             let sequence = snapshot.sequence;
-            if let Err(e) = self.persistence.save_snapshot(snapshot) {
+            if let Err(e) = self
+                .persistence
+                .save_snapshot_versioned(snapshot, schema_version)
+            {
                 warn!(
                     "nulang-grain: failed to save snapshot before dehydrating actor {}: {}",
                     actor_id, e
@@ -4631,12 +4668,16 @@ impl Runtime {
             Some(actor) if actor.persistent => actor.waiting_signal.clone(),
             _ => return,
         };
-        if let Some(mut snapshot) = self.persistence.load_snapshot(actor_id) {
+        if let Some((schema_version, mut snapshot)) =
+            self.persistence.load_snapshot_versioned(actor_id)
+        {
             if snapshot.waiting_signal == waiting_signal {
                 return;
             }
             snapshot.waiting_signal = waiting_signal;
-            let _ = self.persistence.save_snapshot(snapshot);
+            let _ = self
+                .persistence
+                .save_snapshot_versioned(snapshot, schema_version);
         }
     }
 
@@ -4956,7 +4997,8 @@ impl Runtime {
     /// instead of the message journal, restoring the current step index and
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
-        let snapshot = self.persistence.load_snapshot(actor_id)?;
+        let (snapshot_schema_version, snapshot) =
+            self.persistence.load_snapshot_versioned(actor_id)?;
         let authority_manifest =
             match crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens) {
                 Ok(manifest) => manifest,
@@ -4982,6 +5024,7 @@ impl Runtime {
 
         let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
         actor.persistent = true;
+        actor.schema_version = snapshot_schema_version;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
@@ -5245,6 +5288,7 @@ impl Runtime {
         actor_id: u64,
         module: &crate::bytecode::CodeModule,
         snapshot: &ActorSnapshot,
+        schema_version: u32,
         is_workflow: bool,
         is_agent: bool,
     ) -> Result<Actor, crate::authority_runtime::RuntimeAuthorityError> {
@@ -5279,6 +5323,7 @@ impl Runtime {
 
         let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
         actor.persistent = true;
+        actor.schema_version = schema_version;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
@@ -5353,13 +5398,14 @@ impl Runtime {
             grain_type.compensation_offsets.clone(),
         );
 
-        let snapshot = self.persistence.load_snapshot(stable_actor_id);
+        let snapshot = self.persistence.load_snapshot_versioned(stable_actor_id);
 
-        let actor = if let Some(ref snap) = snapshot {
+        let actor = if let Some((schema_version, ref snap)) = snapshot {
             Self::restore_actor_from_snapshot(
                 stable_actor_id,
                 &grain_type.module,
                 snap,
+                schema_version,
                 false,
                 false,
             )
@@ -5374,6 +5420,13 @@ impl Runtime {
         } else {
             let mut actor = Actor::new(stable_actor_id, grain_id.actor_name(), 0);
             actor.persistent = true;
+            actor.schema_version = grain_type
+                .module
+                .actor_metadata
+                .iter()
+                .find(|meta| meta.name == grain_id.grain_type)
+                .map(|meta| meta.version)
+                .unwrap_or(crate::persistence_schema::LEGACY_SCHEMA_VERSION);
             actor.bytecode_module = Some(grain_type.module.clone());
             actor.bytecode_offsets = grain_type.bytecode_offsets.clone();
             actor.compensation_offsets = grain_type.compensation_offsets.clone();
@@ -5409,7 +5462,7 @@ impl Runtime {
         // Replay message journal entries that arrived after the snapshot.
         if let Some(ref snap) = snapshot {
             let journal = self.persistence.read_journal(stable_actor_id);
-            for entry in journal.iter().filter(|e| e.sequence > snap.sequence) {
+            for entry in journal.iter().filter(|e| e.sequence > snap.1.sequence) {
                 let behavior_idx = entry.behavior_id as usize;
                 let payload: Vec<Value> = entry.payload.iter().map(|p| p.to_value()).collect();
                 if self.has_native_handler(stable_actor_id, behavior_idx) {
@@ -5463,9 +5516,21 @@ impl Runtime {
             }
         };
 
-        // Parse the durable state snapshot.
-        let snapshot: ActorSnapshot = match serde_json::from_slice(&snapshot_json) {
-            Ok(s) => s,
+        // Parse the durable state snapshot. Missing schema metadata is legacy v1.
+        let snapshot_text = match std::str::from_utf8(&snapshot_json) {
+            Ok(text) => text,
+            Err(e) => {
+                tracing::warn!(
+                    "nulang-migrate: bad snapshot UTF-8 for actor {}: {}",
+                    actor_id,
+                    e
+                );
+                return false;
+            }
+        };
+        let decoded = match crate::persistence_schema::decode_record::<ActorSnapshot>(snapshot_text)
+        {
+            Ok(decoded) => decoded,
             Err(e) => {
                 tracing::warn!(
                     "nulang-migrate: bad snapshot JSON for actor {}: {}",
@@ -5475,6 +5540,8 @@ impl Runtime {
                 return false;
             }
         };
+        let schema_version = decoded.schema_version;
+        let snapshot = decoded.record;
 
         let is_workflow = module.actor_metadata.iter().any(|m| m.is_workflow);
         let is_agent = module.actor_metadata.iter().any(|m| m.is_agent);
@@ -5483,6 +5550,7 @@ impl Runtime {
             actor_id,
             &module,
             &snapshot,
+            schema_version,
             is_workflow,
             is_agent,
         ) {
@@ -6599,6 +6667,7 @@ impl Runtime {
         &mut self,
         actor_id: u64,
         snapshot: &crate::runtime::persistence::ActorSnapshot,
+        schema_version: u32,
     ) {
         let Some(&epoch) = self.respawn_opted.get(&actor_id) else {
             return;
@@ -6613,7 +6682,9 @@ impl Runtime {
         if shadow == home {
             return;
         }
-        let Ok(snapshot_json) = serde_json::to_vec(snapshot) else {
+        let Ok(snapshot_json) = crate::persistence_schema::encode_record(snapshot, schema_version)
+            .map(String::into_bytes)
+        else {
             return;
         };
         let module = match self
