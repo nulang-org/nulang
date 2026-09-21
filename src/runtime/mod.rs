@@ -2591,10 +2591,13 @@ impl Runtime {
             trace_id: out_trace.clone(),
         };
         let admission = if let Some(actor) = self.actors.get_mut(&target_id) {
-            actor
-                .flight_recorder
-                .record(self.current_actor.unwrap_or(0), behavior_id, args);
             if actor.mailbox.push_local(msg).is_ok() {
+                // Record only admitted deliveries. The flight recorder stores
+                // compact raw samples and defers formatting to debugger reads,
+                // so this adds no per-message String formatting/allocation.
+                actor
+                    .flight_recorder
+                    .record(self.current_actor.unwrap_or(0), behavior_id, args);
                 // Activity resets the dehydration idle timer.
                 actor.idle_ms = 0;
                 MessageAdmission::Accepted
