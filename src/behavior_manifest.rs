@@ -108,7 +108,7 @@ pub struct Provenance {
     pub state_schema_digests: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BehaviorManifestInput<'a> {
     pub package_name: &'a str,
     pub package_version: &'a str,
