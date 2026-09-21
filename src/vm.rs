@@ -115,8 +115,7 @@ pub enum SignalWaitResult {
     NotReady,
 }
 
-/// Result of a generic async effect operation from the `PerformAsync` opcode.
-#[derive(Debug, Clone, PartialEq)]
+/// Compact identity for generic builtins classified at module load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinEffectId {
     IntToFloat,
@@ -125,6 +124,8 @@ pub enum BuiltinEffectId {
     ArrayLength,
 }
 
+/// Result of a generic async effect operation from the `PerformAsync` opcode.
+#[derive(Debug, Clone, PartialEq)]
 pub enum PerformAsyncResult {
     /// The effect completed synchronously; `Some(content)` is the string
     /// result (interned into the module's constant pool by the VM), `None`
