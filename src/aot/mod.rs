@@ -1511,7 +1511,8 @@ impl crate::vm::ActorVmCallbacks for AotTopLevelCallbacks {
                     return;
                 }
             }
-            rt.main_gc.drop_local_ref(&mut rt.main_heap, ptr);
+            let kernel = &mut rt.kernel;
+            kernel.main_gc.drop_local_ref(&mut kernel.main_heap, ptr);
         }
     }
 
@@ -1527,7 +1528,8 @@ impl crate::vm::ActorVmCallbacks for AotTopLevelCallbacks {
                     return;
                 }
             }
-            rt.main_gc.local_ref(&rt.main_heap, ptr);
+            let kernel = &mut rt.kernel;
+            kernel.main_gc.local_ref(&kernel.main_heap, ptr);
         }
     }
 
