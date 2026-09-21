@@ -1587,6 +1587,20 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         }
     }
 
+    fn ask_actor(
+        &mut self,
+        _target: crate::vm::Value,
+        _behavior_id: u16,
+        _args: &[crate::vm::Value],
+    ) -> crate::vm::Value {
+        if self.block_query_operation("Actor.ask") {
+            return crate::vm::Value::nil();
+        }
+        // Preserve the existing BytecodeRuntimeCallbacks behavior: actor Ask
+        // is not wired through this callback path outside queries.
+        crate::vm::Value::nil()
+    }
+
     fn get_state_field(&self, field: &str) -> crate::vm::Value {
         unsafe {
             let rt = &*self.runtime;
