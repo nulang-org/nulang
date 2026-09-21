@@ -3872,17 +3872,17 @@ impl TypeChecker {
             return Ok((subst, Type::secret(Type::string())));
         }
 
-        // Only the Secret namespace may accept protected values. This blocks
-        // accidental leakage through logging, HTTP/FS/DB/Python/FFI effects
-        // and future generic effect namespaces by default.
-        if effect != "Secret" {
-            for (arg, ty) in args.iter().zip(arg_types.iter()) {
-                Self::reject_secret_boundary(
-                    ty,
-                    &format!("the {effect}.{op} effect boundary"),
-                    arg.span(),
-                )?;
-            }
+        // Unknown operations fail closed even inside the Secret namespace.
+        // A Secret operation may accept protected values only when the compiler
+        // has an explicit semantic rule for that operation. This prevents a
+        // user-defined `Secret.exfiltrate(secret)` effect from bypassing the
+        // confidentiality boundary merely by choosing the reserved namespace.
+        for (arg, ty) in args.iter().zip(arg_types.iter()) {
+            Self::reject_secret_boundary(
+                ty,
+                &format!("the {effect}.{op} effect boundary"),
+                arg.span(),
+            )?;
         }
 
         Ok((subst, Type::Var(TypeVar::fresh())))
@@ -5509,13 +5509,13 @@ mod tests {
     }
 
     #[test]
-    fn test_secret_namespace_may_accept_secret_values() {
+    fn test_unknown_secret_operation_cannot_bypass_boundary() {
         let result =
-            check_src("fn consume(s: Secret[String]) { perform Secret.consume(s) }");
+            check_src("fn leak(s: Secret[String]) { perform Secret.exfiltrate(s) }");
+        let err = result.expect_err("unknown Secret operation must fail closed");
         assert!(
-            result.is_ok(),
-            "Secret-aware effects may receive protected values: {:?}",
-            result.err()
+            err.to_string().contains("secret-bearing value"),
+            "unexpected error: {err}"
         );
     }
 
