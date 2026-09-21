@@ -90,7 +90,7 @@ An attacker gains access to a single node and sends a crafted `ActorMessage` to 
 
 - **Payload**: heap pointers, closures, and actor refs are rejected at send time (`packet_payload_wire_safe`). Only ints, floats, bools, unit, and strings cross the wire.
 - **String injection**: strings travel by content (interned on receipt), so they cannot carry executable code unless the target behavior executes them.
-- **Behavior name spoofing**: behavior names are resolved on the target node via `Runtime::behavior_id_for`. Unknown names are rejected; they never alias behavior id 0. If a sender includes a content hash for code fetch/hot-reload, the fetched artifact must still resolve the requested name before delivery.
+- **Behavior name spoofing**: behavior names are resolved on the target node. Actors with a declared native/bytecode behavior surface reject unknown names; an unknown name cannot alias a real behavior id 0 handler. Metadata-free low-level Rust-embedder actors may admit raw mailbox traffic through inert id 0, but those actors have no handler at that id and therefore cannot execute attacker-selected code. If a sender includes a content hash for code fetch/hot-reload, the fetched artifact must still resolve and verify the requested name before delivery.
 
 ### Scenario B: Compromised native library
 An attacker replaces a `.so` file that a Nulang program loads via FFI.

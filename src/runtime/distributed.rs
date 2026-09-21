@@ -2171,7 +2171,7 @@ pub fn process_network_packets(
                     // If the sender attached a content hash, keep fetch-on-demand
                     // viable with an invalid sentinel until the hash path loads the
                     // missing implementation; the sentinel is never delivered.
-                    match runtime.behavior_id_for(target_actor, &behavior_name) {
+                    match runtime.behavior_id_for_delivery(target_actor, &behavior_name) {
                         Some(behavior_id) => msg.behavior_id = behavior_id,
                         None if content_hash.is_some() => msg.behavior_id = u16::MAX,
                         None => {
