@@ -20,6 +20,7 @@
 
 use crate::types::{NuError, NuResult};
 use crate::value_layout;
+use crate::wasm_runtime::DEFAULT_WASM_FUEL;
 use wasmtime::*;
 
 /// Create a Wasmtime `Config` with WasmFX stack switching enabled.
@@ -38,6 +39,9 @@ pub fn wasmfx_config() -> Config {
     // Exception tags are the payload vehicle for `suspend`; requires the
     // wasmtime "gc" feature (enabled by the `wasmfx-backend` cargo feature).
     config.wasm_exceptions(true);
+    // WasmFX guests are still untrusted guest code; stack switching does not
+    // remove the need for a deterministic termination boundary.
+    config.consume_fuel(true);
     config
 }
 
@@ -70,6 +74,9 @@ impl WasmFxRuntime {
         let module = Module::new(&engine, wasm_bytes).map_err(map_wasmtime_err)?;
 
         let mut store = Store::new(&engine, HostState::default());
+        store
+            .set_fuel(DEFAULT_WASM_FUEL)
+            .map_err(map_wasmtime_err)?;
 
         let mut linker: Linker<HostState> = Linker::new(&engine);
         linker
@@ -138,6 +145,11 @@ impl WasmFxRuntime {
 
     /// Execute the module's `nulang_init` function, returning the tagged result.
     pub fn run(&mut self) -> NuResult<crate::vm::Value> {
+        // Reset the deterministic guest budget for each invocation; a reused
+        // runtime must not inherit fuel consumed by an earlier call.
+        self.store
+            .set_fuel(DEFAULT_WASM_FUEL)
+            .map_err(map_wasmtime_err)?;
         // A root-level `suspend` (no suspender established) unwinds through
         // the call; guard against panics in the fiber machinery as well as
         // the trap Result.
@@ -285,6 +297,26 @@ mod tests {
     fn guest_result_accepts_scalar_value() {
         let value = guest_result_value(crate::value_layout::tag_int(42)).unwrap();
         assert_eq!(value.as_int(), Some(42));
+    }
+
+    #[test]
+    fn test_run_traps_when_guest_exhausts_fuel() {
+        let wasm = br#"(module
+            (import \"env\" \"memory\" (memory 1))
+            (func $start (result i64)
+                (loop $spin
+                    br $spin
+                )
+                i64.const 0
+            )
+            (export \"nulang_init\" (func $start))
+        )"#;
+        let mut runtime = WasmFxRuntime::new(wasm).expect("instantiate");
+        let err = runtime.run().expect_err("infinite guest must exhaust fuel");
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("fuel"),
+            "expected an out-of-fuel trap, got: {err}"
+        );
     }
 
     #[test]
