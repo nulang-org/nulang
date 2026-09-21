@@ -877,17 +877,13 @@ fn main() {
             .unwrap()
             .iter()
             .any(|entry| entry["effect"] == "Net"));
-        assert!(json["authority"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|entry| {
-                entry["kind"] == "network"
-                    && entry["resource"] == "api.example.com:443"
-                    && entry["operations"]
-                        .as_array()
-                        .is_some_and(|ops| ops.iter().any(|op| op == "connect"))
-            }));
+        assert!(json["authority"].as_array().unwrap().iter().any(|entry| {
+            entry["kind"] == "network"
+                && entry["resource"] == "api.example.com:443"
+                && entry["operations"]
+                    .as_array()
+                    .is_some_and(|ops| ops.iter().any(|op| op == "connect"))
+        }));
     }
 
     #[test]
