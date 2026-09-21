@@ -426,12 +426,6 @@ fn write_objects(buf: &mut Vec<u8>, ctx: &SerializeCtx) -> Result<(), String> {
         buf.extend_from_slice(&obj.payload_size.to_be_bytes());
 
         match obj.type_tag {
-            TypeTag::ArrayBuilder => {
-                return Err(
-                    "durable continuation format v1 does not support ArrayBuilder objects"
-                        .to_string(),
-                );
-            }
             TypeTag::Array
             | TypeTag::Record
             | TypeTag::Tuple
