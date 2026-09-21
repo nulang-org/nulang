@@ -114,8 +114,14 @@ pub fn compile_runtime_route_plan(
             contract.method, contract.path
         )]
     })?;
-    let direct_call = binding_compilation.bindings.len() == contract.handler_params.len()
-        && binding_compilation.bindings.len() == contract.params.len();
+    let all_handler_params_bound =
+        binding_compilation.bindings.len() == contract.handler_params.len();
+    let all_route_params_bound = contract.params.iter().all(|param| {
+        binding_compilation.bindings.iter().any(|binding| {
+            binding.source == RouteBindingSource::Path && binding.source_name == param.name
+        })
+    });
+    let direct_call = all_handler_params_bound && all_route_params_bound;
 
     Ok(RuntimeRoutePlan {
         method: contract.method.clone(),
@@ -454,6 +460,37 @@ mod tests {
         let plan = compile_runtime_route_plan(&contract("/users/:id")).unwrap();
         let params = match_runtime_route(&plan, "/users/9").unwrap();
         assert_eq!(params.get("id"), Some(&"9".to_string()));
+    }
+
+    #[test]
+    fn request_source_only_handler_is_direct_call_eligible() {
+        use crate::web::contracts::{RequestParamBindingContract, RequestParamSource};
+
+        let contract = RouteContract {
+            method: "POST".to_string(),
+            path: "/users".to_string(),
+            handler: Some("create_user".to_string()),
+            params: Vec::new(),
+            handler_params: vec![HandlerParamContract {
+                name: "payload".to_string(),
+                ty: Some("Json[CreateUser]".to_string()),
+                capability: None,
+                request: Some(RequestParamBindingContract {
+                    source: RequestParamSource::Body,
+                    source_name: "body".to_string(),
+                }),
+            }],
+            response_type: Some("Json[User]".to_string()),
+            error_type: None,
+            effects: Vec::new(),
+            reference_capability: None,
+            placement: Some("server".to_string()),
+        };
+
+        let plan = compile_runtime_route_plan(&contract).unwrap();
+        assert!(plan.direct_call);
+        assert_eq!(plan.bindings.len(), 1);
+        assert!(plan.bindings[0].codec.is_some());
     }
 
     #[test]
