@@ -91,7 +91,21 @@ pub fn run(args: &[String]) -> NuResult<()> {
                 cmd_build(json)
             }
         }
-        Some("build-wasm") => cmd_build_wasm(),
+        Some("build-wasm") => {
+            let mut emit_behavior_manifest = false;
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--emit-behavior-manifest" => emit_behavior_manifest = true,
+                    other => {
+                        return Err(NuError::PackageError {
+                            msg: format!("unknown flag '{}' for nula build-wasm", other),
+                            span: Span::default(),
+                        });
+                    }
+                }
+            }
+            cmd_build_wasm(emit_behavior_manifest)
+        },
         Some("test") => {
             let mut filter: Option<&str> = None;
             let mut verbose = false;
@@ -289,7 +303,8 @@ fn print_usage() {
     println!("                Templates: default, cli, lib, full");
     println!("  init          Scaffold a new package in the current directory");
     println!("  build         Build the package (type-check + .nbc artifact in .nula/dist/)");
-    println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
+    println!("  build-wasm [--emit-behavior-manifest]");
+    println!("                Build package to .wasm + .cwasm; optionally emit RFC 0020 sidecar");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
     println!("  run           Build and run the package entry point");
     println!("  run --watch   Build and re-run on source changes");
@@ -1211,7 +1226,7 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
 
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm.
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm in .nula/dist/.
-fn cmd_build_wasm() -> NuResult<()> {
+fn cmd_build_wasm(emit_behavior_manifest: bool) -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -1220,6 +1235,7 @@ fn cmd_build_wasm() -> NuResult<()> {
     })?;
     let name = manifest.package.name.clone();
 
+    // Resolves dependencies and writes Nulang.lock before provenance is hashed.
     let entry = prepare_package()?;
     let entry_str = entry.to_string_lossy().into_owned();
 
@@ -1232,12 +1248,133 @@ fn cmd_build_wasm() -> NuResult<()> {
     let wasm_path = dist_dir.join(format!("{}.wasm", name));
     let wasm_path_str = wasm_path.to_string_lossy().into_owned();
 
+    let mut compiler_args = vec![
+        "--backend".to_string(),
+        "wasm-aot".to_string(),
+        "--out".to_string(),
+        wasm_path_str.clone(),
+    ];
+
+    let behavior_path = dist_dir.join(format!("{}.behavior.json", name));
+    if emit_behavior_manifest {
+        let source_digest = behavior_source_tree_digest(&root, &entry)?;
+        let dependency_digest = behavior_dependency_digest(&root)?;
+        compiler_args.extend([
+            "--emit-behavior-manifest".to_string(),
+            behavior_path.to_string_lossy().into_owned(),
+            "--behavior-package-name".to_string(),
+            manifest.package.name.clone(),
+            "--behavior-package-version".to_string(),
+            manifest.package.version.clone(),
+            "--behavior-source-digest".to_string(),
+            source_digest,
+            "--behavior-dependency-digest".to_string(),
+            dependency_digest,
+        ]);
+    }
+    compiler_args.push(entry_str);
+
     eprintln!("Building {} (WASM AOT)...", name);
     eprintln!("  Compiling {} to WASM...", entry.display());
-    nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+    let arg_refs: Vec<&str> = compiler_args.iter().map(String::as_str).collect();
+    nulang_exe(&arg_refs)?;
+    if emit_behavior_manifest {
+        println!("Behavior Manifest: {}", behavior_path.display());
+    }
     println!("WASM AOT build succeeded.");
     Ok(())
 }
+
+const BEHAVIOR_SOURCE_DOMAIN: &[u8] = b"nulang.behavior.source-tree.v0alpha1\0";
+const BEHAVIOR_DEPENDENCY_DOMAIN: &[u8] = b"nulang.behavior.dependency-lock.v0alpha1\0";
+
+fn behavior_source_tree_digest(root: &Path, entry: &Path) -> NuResult<String> {
+    let mut paths = Vec::new();
+    let manifest_path = root.join(MANIFEST_FILE);
+    if manifest_path.is_file() {
+        paths.push(manifest_path);
+    }
+    collect_behavior_source_files(&root.join("src"), &mut paths)?;
+    if entry.is_file() {
+        paths.push(entry.to_path_buf());
+    }
+    paths.sort();
+    paths.dedup();
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(BEHAVIOR_SOURCE_DOMAIN);
+    put_behavior_u32(&mut hasher, paths.len() as u32);
+
+    for path in paths {
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        let bytes = std::fs::read(&path).map_err(|error| NuError::PackageError {
+            msg: format!(
+                "cannot read source input '{}' for Behavior Manifest provenance: {}",
+                path.display(),
+                error
+            ),
+            span: Span::default(),
+        })?;
+        put_behavior_bytes(&mut hasher, relative.as_bytes());
+        put_behavior_bytes(&mut hasher, &bytes);
+    }
+
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+fn collect_behavior_source_files(dir: &Path, out: &mut Vec<PathBuf>) -> NuResult<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(dir).map_err(|error| NuError::PackageError {
+        msg: format!(
+            "cannot enumerate source directory '{}' for Behavior Manifest provenance: {}",
+            dir.display(),
+            error
+        ),
+        span: Span::default(),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| NuError::PackageError {
+            msg: format!("cannot read source directory entry: {}", error),
+            span: Span::default(),
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_behavior_source_files(&path, out)?;
+        } else if path.extension().is_some_and(|extension| extension == "nula") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn behavior_dependency_digest(root: &Path) -> NuResult<String> {
+    let lock_path = root.join(LOCKFILE_FILE);
+    let bytes = std::fs::read(&lock_path).map_err(|error| NuError::PackageError {
+        msg: format!(
+            "cannot read {} for Behavior Manifest provenance: {}",
+            lock_path.display(),
+            error
+        ),
+        span: Span::default(),
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(BEHAVIOR_DEPENDENCY_DOMAIN);
+    put_behavior_bytes(&mut hasher, &bytes);
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+fn put_behavior_u32(hasher: &mut blake3::Hasher, value: u32) {
+    hasher.update(&value.to_le_bytes());
+}
+
+fn put_behavior_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    put_behavior_u32(hasher, bytes.len() as u32);
+    hasher.update(bytes);
+}
+
 
 /// `nula run`: build, then execute the entry point.
 fn cmd_run() -> NuResult<()> {
