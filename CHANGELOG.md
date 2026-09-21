@@ -1555,6 +1555,11 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Immutable ArtifactId retention and historical lookup — 2026-09-21
+- **Compiled artifacts can now be retained durably under `ArtifactId` with independent BLAKE3 byte verification** (Experimental, `src/artifact_store.rs`). The filesystem store writes one versioned manifest+artifact record, fsyncs it, and publishes it with no-clobber hard-link semantics so concurrent writers cannot overwrite historical code.
+- **Historical lookup fails closed on corruption or codegen nondeterminism.** Every load re-validates the versioned `ArtifactIdentityManifest`, requires its embedded `ArtifactId` to match the requested key, and re-hashes the retained artifact bytes. Reusing one `ArtifactId` with different emitted bytes is rejected as an artifact collision rather than silently replacing the original executable.
+- This establishes the retention primitive required by durable semantic pinning. Snapshot-level `ArtifactId` pinning and automatic recovery-module hydration remain separate follow-up work under #333.
+
 ### Standard-library Option lookup contracts — 2026-09-21
 - **Collection absence is explicit.** Experimental `stdlib::map.get`, `stdlib::list.index_of`, and `stdlib::list.find` now return `Option` instead of sentinel `-1` values. `max_of`, `min_of`, `min_by`, and `max_by` now return `None` for empty inputs. Conformance fixtures and stdlib tests pin the new contracts. This is source-breaking for Experimental stdlib callers that compared missing results with integer sentinels.
 
