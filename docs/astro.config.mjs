@@ -66,7 +66,7 @@ export default defineConfig({
           ],
         },
         {
-          label: 'Language Core · Stable',
+          label: 'Language Surface · Stable',
           collapsed: true,
           items: [
             { label: 'Syntax Basics', link: 'language/syntax/' },
