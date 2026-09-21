@@ -45,6 +45,15 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Finite-domain pattern coverage diagnostics — 2026-09-20
+- **Conservative static match coverage** (Experimental, RFC 0020,
+  `src/pattern_coverage.rs`, `src/typechecker.rs`). Matches over closed
+  variants and `Bool` emit `W0201` for provably missing witnesses and
+  `W0202` for provably redundant arms. Guarded arms do not prove coverage.
+  Default Nulang 1.x validity and the runtime non-exhaustive fallback are
+  unchanged; `--deny-warnings` provides opt-in strictness. CLI and LSP use
+  the same warning codes and source spans.
+
 ### Actor protocol rolling-upgrade compatibility — 2026-09-20
 - **Directional structural compatibility** (Experimental, `src/protocol.rs`).
   A receiver may serve an older required protocol when it preserves every
