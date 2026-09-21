@@ -544,8 +544,6 @@ const TYPE_SHADOW_REPLICATE: u8 = 16;
 // Packet
 // ---------------------------------------------------------------------------
 
-/// A packet sent over the network between Nulang nodes.
-#[derive(Debug, Clone, PartialEq)]
 /// Byte-verified identity sidecar transported as an additive NUL0-v1 tail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeArtifactProvenance {
@@ -553,6 +551,8 @@ pub struct RuntimeArtifactProvenance {
     pub runtime_manifest_json: Vec<u8>,
 }
 
+/// A packet sent over the network between Nulang nodes.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
     /// Send a message to an actor on the target node.
     ///
