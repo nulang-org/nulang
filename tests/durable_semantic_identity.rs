@@ -117,3 +117,17 @@ fn legacy_snapshot_requires_explicit_legacy_compatible_policy() {
     );
     assert_eq!(compatible.recover_actor(actor_id), Some(actor_id));
 }
+
+
+#[test]
+fn legacy_nbc_transport_rejects_self_asserted_semantic_identity() {
+    let actor_id = 410_005;
+    let id = semantic(b"transported");
+    let module = module_with_identity("transported", Some(id));
+    let nbc = module.to_nbc(None).expect("encode NBC v1");
+    let snapshot_json = serde_json::to_vec(&snapshot(actor_id, Some(id))).unwrap();
+
+    let mut runtime = Runtime::new();
+    assert!(!runtime.receive_migrated_actor(actor_id, nbc, snapshot_json));
+    assert!(!runtime.actors.contains_key(&actor_id));
+}
