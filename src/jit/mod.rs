@@ -296,10 +296,10 @@ impl JitSession {
     /// Record one execution of an already-compiled region and attempt
     /// tier-2 promotion when the threshold is crossed.
     ///
-    /// Tier-2 attempts more aggressive compilation: typed path for regions
-    /// that were compiled untyped, or SIMD for typed regions.  Promotion is
-    /// best-effort — a failed attempt just resets the counter so we retry
-    /// later.
+    /// Tier-2 attempts SIMD replacement for already-typed scalar regions.
+    /// Static analysis/codegen failure is terminal for that region: the same
+    /// immutable bytecode and type metadata would fail again, so retrying
+    /// every threshold would only add overhead.
     pub fn record_tier2_and_maybe_promote(
         &mut self,
         module_idx: usize,
@@ -330,8 +330,8 @@ impl JitSession {
 
         // Tier-1 already attempted static type inference. Tier-2 therefore
         // focuses on the optimization that genuinely needs extra hotness:
-        // replacing a typed scalar loop with SIMD code. If analysis or codegen
-        // rejects the region, retry only after another full threshold.
+        // replacing a typed scalar loop with SIMD code. Analysis/codegen is
+        // static for a region, so rejection permanently disables tier-2.
         let meta = typed_compiler::infer_reg_types(module, pc);
         let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
         let promoted = unsafe {
@@ -339,7 +339,15 @@ impl JitSession {
         }
         .is_some();
 
-        self.set_tier2_state(module_idx, pc, if promoted { TIER2_PROMOTED } else { 0 });
+        self.set_tier2_state(
+            module_idx,
+            pc,
+            if promoted {
+                TIER2_PROMOTED
+            } else {
+                TIER2_DISABLED
+            },
+        );
     }
 
     /// Reset tier-2 counters (used by tests).
