@@ -639,12 +639,7 @@ impl JsonFileStore {
     }
 }
 
-fn scan_jsonl<T, F>(
-    path: PathBuf,
-    start_sequence: u64,
-    limit: usize,
-    sequence: F,
-) -> Vec<T>
+fn scan_jsonl<T, F>(path: PathBuf, start_sequence: u64, limit: usize, sequence: F) -> Vec<T>
 where
     T: serde::de::DeserializeOwned,
     F: Fn(&T) -> u64,
@@ -1488,8 +1483,18 @@ impl PersistenceStore for LibsqlStore {
                     event_name = excluded.event_name,
                     args = excluded.args,
                     value = excluded.value",
-                libsql::params![actor_id as i64, entry.sequence as i64, entry.field_name, entry.event_name, args_json, value_json],
-            ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+                libsql::params![
+                    actor_id as i64,
+                    entry.sequence as i64,
+                    entry.field_name,
+                    entry.event_name,
+                    args_json,
+                    value_json
+                ],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
         })
     }
 
@@ -2562,7 +2567,13 @@ impl PersistenceStore for PostgresStore {
 
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        for table in ["snapshots", "journal", "workflow_events", "events", "events_v2"] {
+        for table in [
+            "snapshots",
+            "journal",
+            "workflow_events",
+            "events",
+            "events_v2",
+        ] {
             conn.execute(
                 &format!("DELETE FROM {} WHERE actor_id = $1", table),
                 &[&(actor_id as i64)],
