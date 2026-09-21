@@ -2402,6 +2402,7 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                     actor_id,
                     sequence: actor.sequence,
                     semantic_id: None,
+                    artifact_id: None,
                     state,
                     waiting_signal: actor.waiting_signal.clone(),
                     crdt_snapshot,
