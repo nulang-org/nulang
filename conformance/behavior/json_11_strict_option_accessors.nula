@@ -30,7 +30,7 @@ fn main() {
     perform IO.print("age=" + show_number(get_number_opt(obj, "age")))
     perform IO.print("active=" + show_bool(get_bool_opt(obj, "active")))
 
-    let null_state = match get(obj, "note") {
+    let null_state = match get_field(obj, "note") {
         Some(JsonNull) => "null",
         Some(_) => "other",
         None => "missing",
