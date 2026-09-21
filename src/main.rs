@@ -1558,6 +1558,35 @@ fn run_frontend(
     with_capabilities: &[String],
     deny_warnings: bool,
 ) -> NuResult<(nulang::ast::AstModule, nulang::typechecker::TypeChecker)> {
+    let (ast, type_checker, _warnings) = run_frontend_collect_warnings(
+        source,
+        file_path,
+        verbose,
+        with_capabilities,
+        deny_warnings,
+        true,
+    )?;
+    Ok((ast, type_checker))
+}
+
+/// Shared frontend with an explicit warning sink.
+///
+/// Ordinary compile/run callers request human warning rendering and preserve
+/// the historical `--deny-warnings` behavior through `run_frontend`.
+/// Machine-readable check mode disables human warning rendering and consumes
+/// the returned warning vector directly, avoiding a second parse/typecheck.
+fn run_frontend_collect_warnings(
+    source: &str,
+    file_path: Option<&str>,
+    verbose: bool,
+    with_capabilities: &[String],
+    deny_warnings: bool,
+    emit_warnings: bool,
+) -> NuResult<(
+    nulang::ast::AstModule,
+    nulang::typechecker::TypeChecker,
+    Vec<nulang::types::NuWarning>,
+)> {
     let ps = nulang::prelude_source::PRELUDE_SOURCE;
     let mut pl = Lexer::new(ps);
     nulang::types::set_source_map_with_file(ps, Some("<prelude>"));
@@ -1571,11 +1600,13 @@ fn run_frontend(
     let mut ast = parser.parse_module()?;
     // Surface non-fatal frontend warnings (e.g. RFC 0015 deprecations).
     // Warnings never fail compilation unless --deny-warnings is passed.
-    let warnings = parser.take_warnings();
+    let mut warnings = parser.take_warnings();
     if !warnings.is_empty() {
-        let use_color = std::io::stderr().is_terminal();
-        for w in &warnings {
-            eprintln!("{}", nulang::diagnostic::format_warning(w, use_color));
+        if emit_warnings {
+            let use_color = std::io::stderr().is_terminal();
+            for w in &warnings {
+                eprintln!("{}", nulang::diagnostic::format_warning(w, use_color));
+            }
         }
         if deny_warnings {
             return Err(nulang::types::NuError::parse_error(
@@ -1629,9 +1660,11 @@ fn run_frontend(
     // under --deny-warnings.
     let type_warnings = type_checker.take_warnings();
     if !type_warnings.is_empty() {
-        let use_color = std::io::stderr().is_terminal();
-        for w in &type_warnings {
-            eprintln!("{}", nulang::diagnostic::format_warning(w, use_color));
+        if emit_warnings {
+            let use_color = std::io::stderr().is_terminal();
+            for w in &type_warnings {
+                eprintln!("{}", nulang::diagnostic::format_warning(w, use_color));
+            }
         }
         if deny_warnings {
             return Err(nulang::types::NuError::parse_error(
@@ -1643,6 +1676,7 @@ fn run_frontend(
                 type_warnings[0].span,
             ));
         }
+        warnings.extend(type_warnings);
     }
 
     if verbose {
@@ -1749,7 +1783,7 @@ fn run_frontend(
         }
     }
 
-    Ok((ast, type_checker))
+    Ok((ast, type_checker, warnings))
 }
 
 #[cfg_attr(not(feature = "wasm-backend"), allow(unused_variables))]
@@ -2317,16 +2351,25 @@ fn check_source(
     verbose: bool,
     _all_errors: bool,
     with_capabilities: &[String],
-    deny_warnings: bool,
-) -> NuResult<()> {
-    let (_ast, _tc) = run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
+    emit_warnings: bool,
+) -> NuResult<Vec<nulang::types::NuWarning>> {
+    // Check mode owns warning escalation so JSON can report the actual warning
+    // diagnostics before adding the strict-mode failure diagnostic.
+    let (_ast, _tc, warnings) = run_frontend_collect_warnings(
+        source,
+        file_path,
+        verbose,
+        with_capabilities,
+        false,
+        emit_warnings,
+    )?;
 
     if verbose {
         println!("Effect check passed.");
         println!("Capability analysis passed.");
     }
 
-    Ok(())
+    Ok(warnings)
 }
 
 /// Run the full frontend in multi-error mode and return every collected
