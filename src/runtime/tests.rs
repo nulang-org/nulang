@@ -6393,6 +6393,47 @@ fn test_dst_run_scheduler_deterministic_reproducible() {
 /// Verify that `DeterministicNetworkTransport` correctly delivers
 /// messages between two runtimes connected in-memory (no real TCP).
 #[test]
+fn test_remote_admission_is_bound_to_expected_node() {
+    let mut rt = Runtime::new();
+    let expected = NodeId(11);
+    let attacker = NodeId(12);
+    let delivery_id = rt
+        .begin_remote_delivery(expected)
+        .expect("tracked delivery should allocate");
+
+    assert!(!rt.record_remote_admission(
+        attacker,
+        delivery_id,
+        ActorAdmissionStatus::Accepted,
+    ));
+    assert_eq!(rt.pending_remote_admission_count(), 1);
+    assert_eq!(rt.take_remote_admission(delivery_id), None);
+
+    assert!(rt.record_remote_admission(
+        expected,
+        delivery_id,
+        ActorAdmissionStatus::Backpressured,
+    ));
+    assert_eq!(rt.pending_remote_admission_count(), 0);
+    assert_eq!(
+        rt.take_remote_admission(delivery_id),
+        Some(ActorAdmissionStatus::Backpressured)
+    );
+}
+
+#[test]
+fn test_remote_admission_can_be_abandoned_after_timeout() {
+    let mut rt = Runtime::new();
+    let delivery_id = rt
+        .begin_remote_delivery(NodeId(21))
+        .expect("tracked delivery should allocate");
+    assert_eq!(rt.pending_remote_admission_count(), 1);
+    assert!(rt.abandon_remote_admission(delivery_id));
+    assert_eq!(rt.pending_remote_admission_count(), 0);
+    assert!(!rt.abandon_remote_admission(delivery_id));
+}
+
+#[test]
 fn test_dst_deterministic_network_transport_delivers() {
     use crate::runtime::network::{DeterministicNetworkTransport, Packet};
     use crate::runtime::NetworkTransport;
