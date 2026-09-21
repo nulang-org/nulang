@@ -6123,6 +6123,31 @@ impl Runtime {
             None => None,
         };
 
+        if let Some(index) = definition_index {
+            let Some(meta) = module.actor_metadata.get(index) else {
+                tracing::warn!(
+                    actor_id,
+                    index,
+                    "nulang-migrate: definition identity has no actor metadata"
+                );
+                return false;
+            };
+            if let Some(invalid) = meta
+                .behavior_indices
+                .iter()
+                .copied()
+                .find(|behavior_index| *behavior_index >= module.behaviors.len())
+            {
+                tracing::warn!(
+                    actor_id,
+                    actor = %meta.name,
+                    behavior_index = invalid,
+                    "nulang-migrate: actor metadata references missing behavior"
+                );
+                return false;
+            }
+        }
+
         let current_definition_id =
             definition_index.and_then(|index| module.actor_semantic_id_at(index));
         let verified_definition_semantic_id =
