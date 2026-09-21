@@ -99,6 +99,16 @@ impl AotModule {
                         &mut constants,
                         &mir_module.foreign_functions,
                     );
+                    if let mir::Stmt::Assign {
+                        op: mir::RValue::Panic(message),
+                        ..
+                    } = stmt
+                    {
+                        let panic_constant = crate::bytecode::Constant::String(message.clone());
+                        if !constants.contains(&panic_constant) {
+                            constants.push(panic_constant);
+                        }
+                    }
                 }
             }
         }
@@ -112,6 +122,16 @@ impl AotModule {
                         &mut constants,
                         &mir_module.foreign_functions,
                     );
+                    if let mir::Stmt::Assign {
+                        op: mir::RValue::Panic(message),
+                        ..
+                    } = stmt
+                    {
+                        let panic_constant = crate::bytecode::Constant::String(message.clone());
+                        if !constants.contains(&panic_constant) {
+                            constants.push(panic_constant);
+                        }
+                    }
                 }
             }
         }
