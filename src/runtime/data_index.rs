@@ -10,7 +10,7 @@ use std::fmt;
 
 use crate::ast::IndexDecl;
 use crate::data_plan::{LogicalAccessPath, LogicalQueryPlan, QueryPredicateKind};
-use crate::runtime::persistence::{ActorSnapshot, PersistedValue, PersistenceStore};
+use crate::runtime::persistence::{ActorSnapshot, EventEntry, PersistedValue, PersistenceStore};
 
 /// Totally ordered representation of persisted values suitable for B-tree keys.
 ///
@@ -77,6 +77,9 @@ pub enum EntityIndexError {
     MissingPredicateValue {
         field: String,
     },
+    MissingActorBootstrap {
+        actor_id: u64,
+    },
     UnsupportedResidualPredicate {
         field: String,
         kind: QueryPredicateKind,
@@ -111,6 +114,10 @@ impl fmt::Display for EntityIndexError {
             Self::MissingPredicateValue { field } => {
                 write!(f, "query is missing a value for predicate field '{field}'")
             }
+            Self::MissingActorBootstrap { actor_id } => write!(
+                f,
+                "actor {actor_id} must be bootstrapped from a durable snapshot before incremental index maintenance"
+            ),
             Self::UnsupportedResidualPredicate { field, kind } => write!(
                 f,
                 "local entity executor cannot yet evaluate residual {kind:?} predicate on '{field}'"
@@ -257,6 +264,87 @@ impl MemoryEntityIndexes {
             }
         }
         self.actor_ids.remove(&actor_id);
+    }
+
+    /// Apply one event-sourced field mutation to all affected indexes.
+    ///
+    /// A snapshot bootstrap is required once per actor. After that, the unified
+    /// durable change stream can feed EventEntry values directly into this
+    /// method, avoiding a separate CDC/change-capture path for event-sourced
+    /// state. Unique constraints are validated before any index is mutated.
+    pub fn apply_event(
+        &mut self,
+        actor_id: u64,
+        event: &EventEntry,
+    ) -> Result<bool, EntityIndexError> {
+        let old_keys = self
+            .actor_keys
+            .get(&actor_id)
+            .cloned()
+            .ok_or(EntityIndexError::MissingActorBootstrap { actor_id })?;
+
+        let mut updates = Vec::new();
+        for (name, state) in &self.indexes {
+            let Some(position) = state
+                .decl
+                .fields
+                .iter()
+                .position(|field| field == &event.field_name)
+            else {
+                continue;
+            };
+
+            let old_key = old_keys
+                .get(name)
+                .expect("bootstrapped actor has one key per declared index")
+                .clone();
+            let mut new_key = old_key.clone();
+            new_key.0[position] = IndexAtom::from_persisted(&event.value);
+
+            if state.decl.unique {
+                if let Some(existing) = state.entries.get(&new_key) {
+                    if let Some(conflicting_actor_id) =
+                        existing.iter().copied().find(|id| *id != actor_id)
+                    {
+                        return Err(EntityIndexError::UniqueViolation {
+                            index: name.clone(),
+                            actor_id,
+                            conflicting_actor_id,
+                        });
+                    }
+                }
+            }
+
+            updates.push((name.clone(), old_key, new_key));
+        }
+
+        if updates.is_empty() {
+            return Ok(false);
+        }
+
+        for (name, old_key, new_key) in updates {
+            let state = self
+                .indexes
+                .get_mut(&name)
+                .expect("affected index remains registered");
+            if let Some(ids) = state.entries.get_mut(&old_key) {
+                ids.remove(&actor_id);
+                if ids.is_empty() {
+                    state.entries.remove(&old_key);
+                }
+            }
+            state
+                .entries
+                .entry(new_key.clone())
+                .or_default()
+                .insert(actor_id);
+            self.actor_keys
+                .get_mut(&actor_id)
+                .expect("actor bootstrap remains registered")
+                .insert(name, new_key);
+        }
+
+        Ok(true)
     }
 
     /// Return actor ids matching the access path portion of a logical plan.
@@ -562,6 +650,114 @@ mod tests {
             indexes.candidates(&plan, &HashMap::new()).unwrap(),
             vec![4, 7]
         );
+    }
+
+    #[test]
+    fn event_change_incrementally_moves_composite_index_key() {
+        let mut indexes = MemoryEntityIndexes::new("Customer", &declarations());
+        indexes
+            .upsert_snapshot(&snapshot(1, "one@example.com", "Acme", "active"))
+            .unwrap();
+
+        let changed = indexes
+            .apply_event(
+                1,
+                &EventEntry {
+                    sequence: 2,
+                    field_name: "company".to_string(),
+                    event_name: "CompanyChanged".to_string(),
+                    args: vec![],
+                    value: PersistedValue::String("Beta".to_string()),
+                },
+            )
+            .unwrap();
+        assert!(changed);
+
+        let plan = LogicalQueryPlan {
+            entity: "Customer".to_string(),
+            access: LogicalAccessPath::Index {
+                name: "by_company_status".to_string(),
+                fields: vec!["company".to_string(), "status".to_string()],
+                unique: false,
+                matched_prefix: 1,
+            },
+            residual_predicates: vec![],
+        };
+
+        let old = indexes
+            .candidates(
+                &plan,
+                &HashMap::from([(
+                    "company".to_string(),
+                    PersistedValue::String("Acme".to_string()),
+                )]),
+            )
+            .unwrap();
+        let new = indexes
+            .candidates(
+                &plan,
+                &HashMap::from([(
+                    "company".to_string(),
+                    PersistedValue::String("Beta".to_string()),
+                )]),
+            )
+            .unwrap();
+
+        assert!(old.is_empty());
+        assert_eq!(new, vec![1]);
+    }
+
+    #[test]
+    fn event_unique_violation_is_fail_closed() {
+        let mut indexes = MemoryEntityIndexes::new("Customer", &declarations());
+        indexes
+            .upsert_snapshot(&snapshot(1, "one@example.com", "Acme", "active"))
+            .unwrap();
+        indexes
+            .upsert_snapshot(&snapshot(2, "two@example.com", "Beta", "active"))
+            .unwrap();
+
+        let err = indexes
+            .apply_event(
+                2,
+                &EventEntry {
+                    sequence: 2,
+                    field_name: "email".to_string(),
+                    event_name: "EmailChanged".to_string(),
+                    args: vec![],
+                    value: PersistedValue::String("one@example.com".to_string()),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EntityIndexError::UniqueViolation {
+                actor_id: 2,
+                conflicting_actor_id: 1,
+                ..
+            }
+        ));
+
+        let plan = LogicalQueryPlan {
+            entity: "Customer".to_string(),
+            access: LogicalAccessPath::Index {
+                name: "email".to_string(),
+                fields: vec!["email".to_string()],
+                unique: true,
+                matched_prefix: 1,
+            },
+            residual_predicates: vec![],
+        };
+        let still_old = indexes
+            .candidates(
+                &plan,
+                &HashMap::from([(
+                    "email".to_string(),
+                    PersistedValue::String("two@example.com".to_string()),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(still_old, vec![2]);
     }
 
     #[test]
