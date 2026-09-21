@@ -836,11 +836,8 @@ fn main() {
                     .map(nulang::json_diagnostics::diagnostic_from_warning)
                     .collect();
                 diags.extend(nulang::json_diagnostics::diagnostics_from_error(&e));
-                let report = nulang::json_diagnostics::JsonReport::new(
-                    "check",
-                    Some(path.clone()),
-                    diags,
-                );
+                let report =
+                    nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), diags);
                 print!("{}", report.to_json_string());
             } else {
                 print_error(&e, use_color);
