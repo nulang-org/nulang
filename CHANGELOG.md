@@ -42,6 +42,10 @@ version + migration.*
 
 ## Stable tier
 
+### Production host-authority boundary — 2026-09-20
+- **Test effect handlers no longer exist in production runtime builds** (`src/runtime/mod.rs`, `src/runtime/callbacks.rs`). Mock effect interception is now `#[cfg(test)]` and crate-private, so actor-backed host effects in production cannot take the test-handler path before external-authority enforcement.
+- **Actor-backed `Process.run` remains non-dispatched until a real process sandbox exists** (`src/runtime/callbacks.rs`, `src/stdlib.rs`). A regression test proves that even an actor holding an exact `Process::Run(...)` grant cannot turn that grant into host shell execution; docs now mark the existing `/bin/sh -c` implementation as trusted/standalone-only.
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 
