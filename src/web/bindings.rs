@@ -130,6 +130,28 @@ pub fn compile_route_bindings(contract: &RouteContract) -> BindingCompilation {
         });
     }
 
+    let typed_body = out.bindings.iter().find(|binding| {
+        binding.source == RouteBindingSource::Body && binding.codec.is_some()
+    });
+    if let Some(body) = typed_body {
+        if out
+            .bindings
+            .iter()
+            .any(|binding| binding.source == RouteBindingSource::Form)
+        {
+            out.diagnostics.push(format!(
+                "{} {}: typed body parameter '{}' uses {} and cannot be combined with form bindings",
+                contract.method,
+                contract.path,
+                body.handler_param,
+                body.codec
+                    .as_ref()
+                    .map(|codec| codec.media_type.as_str())
+                    .unwrap_or("<unknown media type>")
+            ));
+        }
+    }
+
     // A handler parameter with neither a request binding nor a same-named
     // route parameter is unbound: direct dispatch would stage nothing for its
     // slot and the legacy zero-argument fallback would feed it the closure
@@ -287,6 +309,49 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("binds unknown path input 'missing'")));
+    }
+
+    #[test]
+    fn typed_json_body_carries_codec_metadata() {
+        let mut contract = route("/users/{id: UserId}");
+        contract.handler_params = vec![HandlerParamContract {
+            name: "payload".to_string(),
+            ty: Some("Json[CreateUser]".to_string()),
+            capability: None,
+            request: Some(request(RouteBindingSource::Body, "body")),
+        }];
+
+        let compiled = compile_route_bindings(&contract);
+        assert!(compiled.diagnostics.is_empty(), "{:?}", compiled.diagnostics);
+        let body = &compiled.bindings[0];
+        let codec = body.codec.as_ref().expect("typed body codec");
+        assert_eq!(codec.media_type, "application/json");
+        assert_eq!(codec.payload_type.as_deref(), Some("CreateUser"));
+    }
+
+    #[test]
+    fn typed_json_body_cannot_mix_with_form_bindings() {
+        let mut contract = route("/users/{id: UserId}");
+        contract.handler_params = vec![
+            HandlerParamContract {
+                name: "payload".to_string(),
+                ty: Some("Json[CreateUser]".to_string()),
+                capability: None,
+                request: Some(request(RouteBindingSource::Body, "body")),
+            },
+            HandlerParamContract {
+                name: "title".to_string(),
+                ty: Some("String".to_string()),
+                capability: None,
+                request: Some(request(RouteBindingSource::Form, "title")),
+            },
+        ];
+
+        let compiled = compile_route_bindings(&contract);
+        assert!(compiled
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("cannot be combined with form bindings")));
     }
 
     #[test]
