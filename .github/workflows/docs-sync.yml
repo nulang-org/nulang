@@ -30,7 +30,8 @@ jobs:
     name: Regenerate and sync docs
     runs-on: ubuntu-latest
     permissions:
-      contents: write       # Required for auto-committing doc changes
+      contents: write
+      pull-requests: write
 
     steps:
       - name: Checkout repository
@@ -76,16 +77,35 @@ jobs:
         # which triggers on every push to main. This step validates the build
         # before any generated docs are committed.
 
-      - name: Commit and push changes
+      - name: Open or update generated-assets PR
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docs/src/content/docs/stdlib/ docs/api.md docs/public/playground/
+
           if git diff --staged --quiet; then
-            echo "No changes to commit."
+            echo "Generated docs and playground assets are already current."
+            exit 0
+          fi
+
+          sync_branch="automation/docs-sync"
+          git checkout -B "$sync_branch"
+          git commit -m "docs: auto-sync generated site assets"
+          git push --force origin "HEAD:$sync_branch"
+
+          pr_number="$(gh pr list --head "$sync_branch" --base main --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$pr_number" ]; then
+            gh pr edit "$pr_number" \
+              --title "docs: sync generated site assets" \
+              --body "Automated refresh of generated standard-library/API docs and the browser-playground bundle from the current main branch."
           else
-            git commit -m "docs: auto-sync generated site assets"
-            git push
+            gh pr create \
+              --base main \
+              --head "$sync_branch" \
+              --title "docs: sync generated site assets" \
+              --body "Automated refresh of generated standard-library/API docs and the browser-playground bundle from the current main branch."
           fi
 
       - name: Ping DeepWiki to refresh index
