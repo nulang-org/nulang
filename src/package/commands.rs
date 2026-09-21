@@ -1377,8 +1377,35 @@ fn cmd_build_web() -> NuResult<()> {
         },
     )?;
 
-    eprintln!("  Rendering {} route(s)...", routes.len());
-    for route in &routes {
+    // Emit the signal graph and Deployment IR before prerendering so the
+    // compiler-owned placement decision is also the authority for which routes
+    // become static HTML artifacts. Previously this loop rendered every
+    // registered route, including explicit/server routes.
+    let signals_path = output_dir.join("app.signals.json");
+    nulang_exe(&[
+        "--emit-signals",
+        &signals_path.to_string_lossy(),
+        &entry_str,
+    ])?;
+    let ir = crate::web::ir::generate_deployment_ir(
+        &routes,
+        Some(&signals_path),
+        &src_root,
+        &manifest.budgets,
+    );
+    let static_routes: Vec<_> = routes
+        .iter()
+        .filter(|route| {
+            ir.routes.iter().any(|ir_route| {
+                ir_route.method == route.method.as_str()
+                    && ir_route.path == route.path
+                    && ir_route.placement == "static"
+            })
+        })
+        .collect();
+
+    eprintln!("  Rendering {} static route(s)...", static_routes.len());
+    for route in static_routes {
         let html = render_route_handler(&route.handler_module, route.handler_func_idx, None)
             .ok_or_else(|| NuError::PackageError {
                 msg: format!("failed to render route {:?} {}", route.method, route.path),
@@ -1405,21 +1432,8 @@ fn cmd_build_web() -> NuResult<()> {
         copy_dir_contents(&static_dir, &output_dir)?;
     }
 
-    // Emit compile-time signal graph if the entry uses `signal` declarations.
-    let signals_path = output_dir.join("app.signals.json");
-    nulang_exe(&[
-        "--emit-signals",
-        &signals_path.to_string_lossy(),
-        &entry_str,
-    ])?;
-
-    // Generate deployment IR consumed by adapters and Nulang Cloud.
-    let ir = crate::web::ir::generate_deployment_ir(
-        &routes,
-        Some(&signals_path),
-        &src_root,
-        &manifest.budgets,
-    );
+    // Persist the same Deployment IR that governed prerendering. Adapters and
+    // Nulang Cloud therefore see the exact placement contract used by the build.
     let ir_path = output_dir.join("nulang-app.ir.json");
     let ir_json = ir.to_json();
     std::fs::write(&ir_path, ir_json).map_err(|e| NuError::PackageError {
