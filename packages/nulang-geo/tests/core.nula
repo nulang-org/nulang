@@ -115,4 +115,52 @@ fn main() {
         polygon_to_wkt(rect) == "POLYGON ((0 0, 4 0, 4 3, 0 3, 0 0))",
         "polygon WKT should close an implicit ring"
     )
+
+    let indexed = [
+        rtree_entry(bounding_box(0.0, 0.0, 1.0, 1.0, CARTESIAN), 10),
+        rtree_entry(bounding_box(2.0, 0.0, 3.0, 1.0, CARTESIAN), 20),
+        rtree_entry(bounding_box(4.0, 0.0, 5.0, 1.0, CARTESIAN), 30),
+        rtree_entry(bounding_box(6.0, 0.0, 7.0, 1.0, CARTESIAN), 40),
+        rtree_entry(bounding_box(8.0, 0.0, 9.0, 1.0, CARTESIAN), 50)
+    ];
+    let index = rtree_bulk_load(indexed, CARTESIAN, 2);
+    perform Test.assert(index.size == 5, "R-tree should preserve entry count");
+    perform Test.assert(index.fanout == 2, "R-tree should preserve normalized fanout");
+
+    let hits = rtree_query_intersects(
+        index,
+        bounding_box(2.5, -1.0, 6.2, 2.0, CARTESIAN)
+    );
+    perform Test.assert(
+        perform Array.length(hits) == 3,
+        "R-tree query should return each intersecting entry exactly once"
+    );
+    perform Test.assert(
+        hits[0] == 20 && hits[1] == 30 && hits[2] == 40,
+        "R-tree query should preserve deterministic traversal order"
+    );
+
+    let misses = rtree_query_intersects(
+        index,
+        bounding_box(20.0, 20.0, 21.0, 21.0, CARTESIAN)
+    );
+    perform Test.assert(
+        perform Array.length(misses) == 0,
+        "R-tree should prune a disjoint query"
+    );
+
+    let empty_index = rtree_bulk_load([], CARTESIAN, 1);
+    perform Test.assert(
+        empty_index.size == 0 && empty_index.fanout == 2,
+        "empty R-tree should be valid and normalize fanout"
+    );
+    perform Test.assert(
+        perform Array.length(
+            rtree_query_intersects(
+                empty_index,
+                bounding_box(0.0, 0.0, 1.0, 1.0, CARTESIAN)
+            )
+        ) == 0,
+        "empty R-tree query should return no values"
+    )
 }
