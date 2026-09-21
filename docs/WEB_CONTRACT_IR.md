@@ -290,6 +290,6 @@ The same binding codec metadata is serialized into Deployment IR and drives Open
 2. Extend the request/response algebra with bytes and streaming bodies.
 3. Add richer request decoders for optional/default values, repeated query parameters/collections, transparent aliases, and opaque/domain types.
 4. Execute requests under lightweight supervised request actors with structured cancellation/backpressure.
-4. Replace ambient request-context dependency injection with effect handlers once compatibility coverage is sufficient.
-5. Introduce authorization/resource capabilities separately from Nulang reference capabilities, including attenuation and capability-parameterized effects.
-6. Unify HTTP, SSE, and WebSocket entry points over the same actor/effect/capability execution model.
+5. Replace ambient request-context dependency injection with effect handlers once compatibility coverage is sufficient.
+6. Introduce authorization/resource capabilities separately from Nulang reference capabilities, including attenuation and capability-parameterized effects.
+7. Unify HTTP, SSE, and WebSocket entry points over the same actor/effect/capability execution model.
