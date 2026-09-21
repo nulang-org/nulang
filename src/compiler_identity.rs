@@ -16,8 +16,7 @@ use crate::content_identity::{SemanticId, SourceId};
 pub const BYTECODE_ARTIFACT_TARGET: &str = "portable-nulang-vm";
 pub const BYTECODE_ARTIFACT_ABI: &str = "nbc-v1";
 pub const BYTECODE_ARTIFACT_BACKEND: &str = "bytecode";
-pub const BYTECODE_COMPILER_VERSION: &str =
-    concat!("nulang-rust-", env!("CARGO_PKG_VERSION"));
+pub const BYTECODE_COMPILER_VERSION: &str = concat!("nulang-rust-", env!("CARGO_PKG_VERSION"));
 use crate::hir;
 use crate::mir;
 use crate::semantic_identity::SemanticIdentityError;
