@@ -8,14 +8,18 @@ NPUs. It intentionally does not add accelerator-specific syntax or opcodes.
 
 ## Phase 1
 
-The initial implementation provides:
+The current implementation provides:
 
 - extensible backend, device, and feature identifiers;
 - tensor dtype/shape/layout metadata with overflow-safe size calculations;
 - normalized device capabilities;
 - hard device requirements and ordered backend preferences;
 - deterministic device selection;
-- an atomic backend discovery/refresh trait and registry.
+- an atomic backend discovery/refresh trait and registry;
+- a deterministic CPU reference tensor executor;
+- an accelerator-neutral tensor graph IR;
+- backend-neutral buffer/session ownership;
+- the shared semantics used by the Nulang 2 `Tensor.*` VM effects.
 
 A backend adapter translates native discovery APIs into DeviceCapabilities.
 Application/runtime code asks for capabilities rather than naming vendor APIs
@@ -37,13 +41,11 @@ directly.
 
 The intended follow-up layers are:
 
-1. accelerator buffers and ownership/lifetime rules;
-2. an accelerator-neutral tensor/graph IR;
-3. a CPU reference executor for differential testing;
-4. IREE/MLIR lowering for heterogeneous GPU/NPU targets;
-5. actor placement integration with nulang-capacity;
-6. LLM-specific memory planning (weights, KV blocks, prefix caches, spill);
-7. batching, graph capture, kernel fusion, and topology-aware multi-device
-   scheduling.
+1. IREE/MLIR lowering for heterogeneous GPU/NPU targets;
+2. actor placement integration with nulang-capacity and the local device registry;
+3. LLM-specific memory planning (weights, KV blocks, prefix caches, spill);
+4. batching, graph capture, kernel fusion, and topology-aware multi-device
+   scheduling;
+5. differential conformance against at least two accelerator backends.
 
 See RFC 0024 for the architecture and compatibility boundaries.
