@@ -162,6 +162,13 @@ jobs:
           fi
           grep -q "expected constructor 'CARTESIAN', found constructor 'WGS84'" /tmp/nulang-geo-rtree-point-crs.out
 
+          if ../../target/release/nulang --check tests/compile_fail/cartesian_geojson_writer.nula > /tmp/nulang-geo-geojson-crs.out 2>&1; then
+            echo "::error::Cartesian geometry unexpectedly serialized as RFC 7946 GeoJSON"
+            cat /tmp/nulang-geo-geojson-crs.out
+            exit 1
+          fi
+          grep -q "expected constructor 'WGS84', found constructor 'CARTESIAN'" /tmp/nulang-geo-geojson-crs.out
+
       - name: Verify documentation examples
         run: NULANG_BIN=./target/release/nulang bash scripts/verify_doc_examples.sh
   # -----------------------------------------------------------------------
