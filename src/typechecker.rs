@@ -3872,17 +3872,37 @@ impl TypeChecker {
             return Ok((subst, Type::secret(Type::string())));
         }
 
-        // Only the Secret namespace may accept protected values. This blocks
-        // accidental leakage through logging, HTTP/FS/DB/Python/FFI effects
-        // and future generic effect namespaces by default.
-        if effect != "Secret" {
-            for (arg, ty) in args.iter().zip(arg_types.iter()) {
-                Self::reject_secret_boundary(
-                    ty,
-                    &format!("the {effect}.{op} effect boundary"),
-                    arg.span(),
-                )?;
+        if effect == "Secret" && matches!(op, "revoke" | "valid") {
+            if arg_types.len() != 1 {
+                return Err(NuError::TypeError {
+                    msg: format!("Secret.{op} expects exactly one Secret value"),
+                    span,
+                    expected_type: Some("1 Secret argument".to_string()),
+                    found_type: Some(format!("{} arguments", arg_types.len())),
+                    similar_names: None,
+                });
             }
+            if arg_types[0].secret_inner().is_none() {
+                return Err(NuError::TypeError {
+                    msg: format!("Secret.{op} expects a Secret[T] value"),
+                    span: args[0].span(),
+                    expected_type: Some("Secret[T]".to_string()),
+                    found_type: Some(format!("{}", arg_types[0])),
+                    similar_names: None,
+                });
+            }
+            return Ok((subst, Type::bool()));
+        }
+
+        // Unknown operations fail closed even inside the Secret namespace.
+        // Only the compiler-recognized operations above may receive protected
+        // values.
+        for (arg, ty) in args.iter().zip(arg_types.iter()) {
+            Self::reject_secret_boundary(
+                ty,
+                &format!("the {effect}.{op} effect boundary"),
+                arg.span(),
+            )?;
         }
 
         Ok((subst, Type::Var(TypeVar::fresh())))
@@ -5509,13 +5529,28 @@ mod tests {
     }
 
     #[test]
-    fn test_secret_namespace_may_accept_secret_values() {
+    fn test_recognized_secret_handle_operations_accept_secret_values() {
+        for source in [
+            "fn check(s: Secret[String]) { perform Secret.valid(s) }",
+            "fn revoke(s: Secret[String]) { perform Secret.revoke(s) }",
+        ] {
+            let result = check_src(source);
+            assert!(
+                result.is_ok(),
+                "recognized Secret operation should type-check: {:?}",
+                result.err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_unknown_secret_operation_cannot_bypass_boundary() {
         let result =
-            check_src("fn consume(s: Secret[String]) { perform Secret.consume(s) }");
+            check_src("fn leak(s: Secret[String]) { perform Secret.exfiltrate(s) }");
+        let err = result.expect_err("unknown Secret operation must fail closed");
         assert!(
-            result.is_ok(),
-            "Secret-aware effects may receive protected values: {:?}",
-            result.err()
+            err.to_string().contains("secret-bearing value"),
+            "unexpected error: {err}"
         );
     }
 
