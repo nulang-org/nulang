@@ -511,6 +511,7 @@ mod query_purity_tests {
     fn query_module() -> CodeModule {
         let mut module = CodeModule::new("query-purity-test");
         let field_idx = module.add_string_constant("count");
+        let payload_idx = module.add_string_constant("payload");
 
         // function 0: read_count() -> self.count
         module.function_table.push(module.current_offset());
@@ -541,6 +542,19 @@ mod query_purity_tests {
         ));
         module.emit(Instruction::new1(OpCode::RetVal, 1));
 
+        // function 2: direct heap mutation of pointer-backed actor state.
+        module.function_table.push(module.current_offset());
+        module.function_local_counts.push(3);
+        module.emit(Instruction::new3(
+            OpCode::StateGet,
+            ((payload_idx >> 8) & 0xFF) as u8,
+            (payload_idx & 0xFF) as u8,
+            1,
+        ));
+        module.emit(Instruction::new1(OpCode::Const0, 2));
+        module.emit(Instruction::new3(OpCode::ArrStore, 1, 2, 2));
+        module.emit(Instruction::new1(OpCode::RetVal, 1));
+
         module
     }
 
@@ -549,6 +563,7 @@ mod query_purity_tests {
         let mut models = HashMap::new();
         models.insert("count".to_string(), StateModel::Durable);
         models.insert("other".to_string(), StateModel::Durable);
+        models.insert("payload".to_string(), StateModel::Durable);
         let actor_id = rt.spawn_workflow_actor(
             "CounterWorkflow",
             Box::new(|| {
@@ -559,9 +574,15 @@ mod query_purity_tests {
             }),
             models,
         );
-        rt.actors.get_mut(&actor_id).unwrap().bytecode_module = Some(query_module());
+        {
+            let actor = rt.actors.get_mut(&actor_id).unwrap();
+            let payload = actor.allocate_array(vec![Value::int(99)]);
+            actor.set_state_field("payload", payload);
+            actor.bytecode_module = Some(query_module());
+        }
         rt.register_workflow_query(actor_id, "read", Value::int(0));
         rt.register_workflow_query(actor_id, "mutate", Value::int(1));
+        rt.register_workflow_query(actor_id, "mutate_array", Value::int(2));
         (rt, actor_id)
     }
 
@@ -603,6 +624,31 @@ mod query_purity_tests {
 
         // Compatibility API preserves its historic failure-as-None shape.
         assert_eq!(rt.query_workflow(actor_id, "mutate"), None);
+    }
+
+    #[test]
+    fn query_cannot_mutate_pointer_backed_actor_state_with_direct_opcode() {
+        let (mut rt, actor_id) = workflow_with_queries();
+
+        let error = rt
+            .query_workflow_checked(actor_id, "mutate_array")
+            .expect_err("direct heap mutation of actor state must fail closed");
+        assert_eq!(
+            error,
+            WorkflowQueryError::PurityViolation {
+                operation: "Array.store".to_string(),
+            }
+        );
+
+        let payload = rt
+            .actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("payload")
+            .and_then(|value| value.as_ptr())
+            .expect("payload should remain an array pointer");
+        let first = unsafe { *(payload as *const Value) };
+        assert_eq!(first.as_int(), Some(99));
     }
 
     #[test]
