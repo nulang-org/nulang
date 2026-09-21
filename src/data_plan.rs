@@ -56,6 +56,77 @@ pub struct LogicalQueryPlan {
     pub residual_predicates: Vec<QueryPredicate>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexSuggestion {
+    pub name: String,
+    pub fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryPlanDiagnostic {
+    pub code: &'static str,
+    pub message: String,
+    pub suggested_index: Option<IndexSuggestion>,
+}
+
+/// Produce deterministic, backend-independent query diagnostics.
+///
+/// Diagnostics describe logical work only; they never invent latency or
+/// cardinality estimates. Runtime feedback can enrich these later.
+pub fn diagnose_query_plan(
+    plan: &LogicalQueryPlan,
+    predicates: &[QueryPredicate],
+) -> Vec<QueryPlanDiagnostic> {
+    let mut diagnostics = Vec::new();
+
+    if plan.access == LogicalAccessPath::EntityScan {
+        let mut seen = BTreeSet::new();
+        let equality_fields: Vec<String> = predicates
+            .iter()
+            .filter(|predicate| predicate.kind == QueryPredicateKind::Eq)
+            .filter_map(|predicate| {
+                if seen.insert(predicate.field.as_str()) {
+                    Some(predicate.field.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let suggested_index = if equality_fields.is_empty() {
+            None
+        } else {
+            Some(IndexSuggestion {
+                name: format!("by_{}", equality_fields.join("_")),
+                fields: equality_fields,
+            })
+        };
+
+        diagnostics.push(QueryPlanDiagnostic {
+            code: "NQ001",
+            message: format!(
+                "query on '{}' requires an entity scan; no declared index matches its equality prefix",
+                plan.entity
+            ),
+            suggested_index,
+        });
+    }
+
+    if !plan.residual_predicates.is_empty() {
+        diagnostics.push(QueryPlanDiagnostic {
+            code: "NQ002",
+            message: format!(
+                "query on '{}' has {} residual predicate(s) evaluated after candidate lookup",
+                plan.entity,
+                plan.residual_predicates.len()
+            ),
+            suggested_index: None,
+        });
+    }
+
+    diagnostics
+}
+
 /// Select the strongest declared access path for an entity query shape.
 ///
 /// Phase 2 intentionally uses only deterministic structural rules:
@@ -285,6 +356,36 @@ mod tests {
             plan.residual_predicates,
             vec![QueryPredicate::range("status")]
         );
+    }
+
+    #[test]
+    fn scan_diagnostic_suggests_equality_index_without_cost_guessing() {
+        let predicates = vec![QueryPredicate::eq("company"), QueryPredicate::eq("status")];
+        let plan = plan_entity_query(&actor(), &[QueryPredicate::eq("status")]).unwrap();
+        let diagnostics = diagnose_query_plan(&plan, &predicates);
+
+        assert_eq!(diagnostics[0].code, "NQ001");
+        assert_eq!(
+            diagnostics[0].suggested_index,
+            Some(IndexSuggestion {
+                name: "by_company_status".to_string(),
+                fields: vec!["company".to_string(), "status".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn indexed_query_reports_only_residual_work() {
+        let predicates = vec![
+            QueryPredicate::eq("company"),
+            QueryPredicate::range("status"),
+        ];
+        let plan = plan_entity_query(&actor(), &predicates).unwrap();
+        let diagnostics = diagnose_query_plan(&plan, &predicates);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "NQ002");
+        assert!(diagnostics[0].suggested_index.is_none());
     }
 
     #[test]
