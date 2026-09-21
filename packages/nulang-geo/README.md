@@ -17,6 +17,7 @@ expanding the language kernel.
 - typed `Distance` values with meter/kilometer/mile conversion
 - spherical WGS84 great-circle distance
 - WKT writers for points, line strings, and single-ring polygons
+- strict 2D RFC 7946 GeoJSON readers/writers for WGS84 Point, LineString, and single-ring Polygon
 - dependency-free immutable `RTree[CRS, T]` bulk loading and intersection queries
 - leaf-level STR packing, point queries, contained-by queries, and traversal statistics
 - dependency-free implementation using portable Nulang float primitives
@@ -85,3 +86,18 @@ The suite covers CRS-tagged point and aggregate construction, bounds and
 envelopes, coordinate validation, unit conversion, planar distance/length/area/
 centroid, WKT output, an equatorial great-circle reference distance, and
 compile-fail regressions for cross-CRS operations, mixed-CRS line strings, cross-CRS R-tree box queries, and cross-CRS R-tree point queries. A reproducible `benches/rtree_query.nula` workload can be run with `nulang --bench N benches/rtree_query.nula` for before/after comparisons.
+
+
+## GeoJSON boundary
+
+The standard GeoJSON API is intentionally WGS84-only. `point_to_geojson`,
+`line_string_to_geojson`, and `polygon_to_geojson` accept WGS84 geometries,
+and the corresponding readers return WGS84 geometries. The readers implement a
+strict 2D subset: malformed positions, extra coordinate dimensions, invalid
+longitude/latitude ranges, LineStrings with fewer than two positions, polygons
+without explicit closure, and polygons with holes are rejected with `None`.
+
+The GeoJSON codec is implemented directly in `@nulang/geo` rather than by
+importing the current general JSON stdlib. This keeps the package
+dependency-free and avoids coupling geometry interoperability to JSON runtime
+behavior.
