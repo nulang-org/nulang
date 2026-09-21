@@ -42,6 +42,9 @@ version + migration.*
 
 ## Stable tier
 
+### Accelerator execution foundation — 2026-09-21
+- **Provider-neutral accelerator runtime substrate** (Experimental, `crates/nulang-accelerator/`, RFC 0024). Adds extensible backend/device identifiers, tensor shape/dtype metadata with overflow-safe byte sizing, device capability requirements, deterministic device selection, and an atomic backend-discovery registry. The first slice deliberately changes no Nulang source syntax, bytecode, value layout, or NUL0 wire format; accelerator placement remains policy over the existing actor/effect model.
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 
