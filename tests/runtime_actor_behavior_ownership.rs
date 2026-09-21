@@ -39,7 +39,10 @@ fn duplicate_hit_module() -> (nulang::bytecode::CodeModule, usize, usize) {
         .expect("Second actor metadata");
     let first_hit = *first.behavior_indices.first().expect("First.hit index");
     let second_hit = *second.behavior_indices.first().expect("Second.hit index");
-    assert_ne!(first_hit, second_hit, "fixture requires distinct behavior ids");
+    assert_ne!(
+        first_hit, second_hit,
+        "fixture requires distinct behavior ids"
+    );
     (module, first_hit, second_hit)
 }
 
@@ -142,7 +145,10 @@ fn cross_shard_numeric_delivery_rejects_foreign_schema_before_execution() {
         .find(|meta| meta.name == "Second")
         .and_then(|meta| meta.behavior_indices.first())
         .expect("Second.hit index");
-    assert_ne!(first_hit, second_hit, "fixture requires distinct behavior ids");
+    assert_ne!(
+        first_hit, second_hit,
+        "fixture requires distinct behavior ids"
+    );
 
     let mut shards = Runtime::new_sharded(2);
     let actor_id = shards[0]

@@ -104,7 +104,6 @@ fn test_legacy_snapshot_without_authority_is_deny_by_default() {
     assert!(snapshot.authority_tokens.is_empty());
 }
 
-
 #[test]
 fn p0_migrated_workflow_local_behavior_id_uses_retained_schema() {
     let source = r#"
@@ -7165,6 +7164,41 @@ fn p0_unknown_named_send_is_rejected() {
             .and_then(|v| v.as_int()),
         Some(1)
     );
+}
+
+#[test]
+fn p0_unknown_cross_shard_object_send_does_not_hydrate_orphans() {
+    fn consume(_actor: &mut Actor, _args: &[Value]) {}
+
+    let mut shards = Runtime::new_sharded(2);
+    let mut target = shards[1].spawn_actor(Box::new(Vec::new));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(Vec::new));
+    }
+    shards[1]
+        .actors
+        .get_mut(&target)
+        .unwrap()
+        .register_behavior("consume", consume);
+
+    let source_object = shards[0]
+        .object_store
+        .put(vec![1, 2, 3, 4].into_boxed_slice());
+    let destination_objects_before = shards[1].object_store.len();
+
+    shards[0].send_message(
+        target,
+        "does_not_exist",
+        &[Value::object(source_object)],
+    );
+    shards[1].drain_cross_shard_messages();
+
+    assert_eq!(
+        shards[1].object_store.len(),
+        destination_objects_before,
+        "rejected named delivery must not hydrate orphaned destination objects"
+    );
+    assert!(shards[1].actors[&target].mailbox.is_empty());
 }
 
 #[test]
