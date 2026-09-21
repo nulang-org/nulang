@@ -1,11 +1,11 @@
 # RFC 0021: Compatibility Before Permanent Freeze
 
-- **Status:** Draft
+- **Status:** Accepted
 - **Tier:** N/A (governance and compatibility policy)
 - **Author:** David Porkka (AI-assisted)
 - **Created:** 2026-09-20
-- **Resolved:** TBD
-- **Language-version at effect:** TBD on acceptance
+- **Resolved:** 2026-09-21
+- **Language-version at effect:** policy-only; no artifact language-version bump
 - **Supersedes:** parts of RFC 0001 and RFC 0002 only if accepted
 - **Superseded by:** none
 
@@ -383,7 +383,23 @@ self-hosting evidence rather than another pre-user guess.
 
 ## Resolution
 
-TBD.
+**Accepted 2026-09-21.**
+
+The language steward accepts the compatibility-before-freeze policy. Nulang
+will preserve published compatibility obligations while treating pre-adoption
+source semantics as Stable rather than permanently Frozen. Published format,
+wire, ABI, and durable-history versions remain archival obligations: an old
+version must remain readable, migratable, or fail with an explicit
+compatibility diagnostic.
+
+Acceptance is deliberately policy-only. It does not silently change parser,
+typechecker, runtime, bytecode, NUL0, or value-ABI behavior, and it does not
+rewrite historical `1.0.0-frozen` artifact metadata. Semantic corrections and
+new representation versions still require explicit RFCs, version boundaries,
+tests, and migration/diagnostic plans.
+
+Permanent semantic freezing is deferred until the adoption gate in §6 is met
+and a dedicated evidence-bearing freeze RFC names the exact surface.
 
 ## References
 
