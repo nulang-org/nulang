@@ -708,5 +708,4 @@ mod authority_tests {
             "schema mismatch must not publish a runnable actor"
         );
     }
-
 }
