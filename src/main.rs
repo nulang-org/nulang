@@ -761,6 +761,7 @@ fn main() {
                 opts.rewrite_signals.as_deref(),
                 &opts.with_capabilities,
                 opts.deny_warnings,
+                None,
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -937,6 +938,7 @@ fn main() {
                 opts.rewrite_signals.as_deref(),
                 &opts.with_capabilities,
                 opts.deny_warnings,
+                behavior_manifest_request(&opts, path),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -1179,7 +1181,7 @@ fn print_help() {
         println!("  --out <file>     Output file for WASM backends (default: out.wasm)");
     }
     println!("  --out <file>     Output path for --emit-nbc (default: <FILE> with .nbc extension)");
-    println!("  --emit-behavior-manifest <file>  Emit RFC 0020 Behavior Manifest sidecar for WASM builds");
+    println!("  --emit-behavior-manifest <file>  Emit RFC 0020 Behavior Manifest sidecar for .nbc/WASM builds");
     println!("  --behavior-package-name <name>   Override manifest package name");
     println!("  --behavior-package-version <ver> Override manifest package version");
     println!("  --behavior-source-digest <hash>  Supply package source-tree digest");
@@ -1874,14 +1876,13 @@ fn compiler_behavior_digest() -> NuResult<String> {
 fn emit_behavior_manifest_sidecar(
     request: &BehaviorManifestRequest,
     source: &str,
+    artifact_kind: nulang::behavior_manifest::ArtifactKind,
     artifact_bytes: &[u8],
     effect_checker: &EffectChecker,
     hir: &nulang::hir::Module,
     mir: &nulang::mir::Module,
 ) -> NuResult<()> {
-    use nulang::behavior_manifest::{
-        ArtifactKind, BehaviorManifest, BehaviorManifestInput,
-    };
+    use nulang::behavior_manifest::{BehaviorManifest, BehaviorManifestInput};
 
     let source_digest = request
         .source_digest
@@ -1899,7 +1900,7 @@ fn emit_behavior_manifest_sidecar(
         package_name: &request.package_name,
         package_version: &request.package_version,
         language_version: nulang::format::constants::LANGUAGE_VERSION_STR,
-        artifact_kind: ArtifactKind::WasmModule,
+        artifact_kind,
         artifact_bytes,
         compiler_digest: &compiler_digest,
         source_digest: &source_digest,
@@ -1989,6 +1990,7 @@ fn run_source(
                 emit_behavior_manifest_sidecar(
                     request,
                     source,
+                    nulang::behavior_manifest::ArtifactKind::WasmModule,
                     &wasm_bytes,
                     &effect_checker,
                     &hir,
@@ -2018,6 +2020,7 @@ fn run_source(
                 emit_behavior_manifest_sidecar(
                     request,
                     source,
+                    nulang::behavior_manifest::ArtifactKind::WasmModule,
                     &wasm_bytes,
                     &effect_checker,
                     &hir,
@@ -2066,6 +2069,7 @@ fn run_source(
                 emit_behavior_manifest_sidecar(
                     request,
                     source,
+                    nulang::behavior_manifest::ArtifactKind::WasmModule,
                     &wasm_bytes,
                     &effect_checker,
                     &hir,
@@ -2639,8 +2643,9 @@ fn compile_source_to_nbc(
     rewrite_signals: Option<&str>,
     with_capabilities: &[String],
     deny_warnings: bool,
+    behavior_manifest: Option<BehaviorManifestRequest>,
 ) -> NuResult<()> {
-    let (mut ast, type_checker, mut effect_checker) =
+    let (mut ast, type_checker, effect_checker) =
         run_frontend(source, None, false, with_capabilities, deny_warnings)?;
 
     // Optional web-framework pass: rewrite HTML for signals/actions and emit the
@@ -2657,7 +2662,15 @@ fn compile_source_to_nbc(
             span: Span::default(),
         })?;
     }
-    let m = compile_with_new_pipeline(&ast, "main", &type_checker)?;
+
+    // Keep a non-optimized MIR copy for the semantic deployment contract.
+    // MIR codegen mutates/optimizes its input, which may erase operations that
+    // the Behavior Manifest must still report conservatively.
+    let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
+    let mir = nulang::mir_lower::lower_module(&hir)?;
+    let mut codegen_mir = mir.clone();
+    let m = nulang::mir_codegen::compile_mir(&mut codegen_mir, "main")?;
+
     let source_hash = blake3::hash(source.as_bytes());
     let bytes =
         m.to_nbc(Some(*source_hash.as_bytes()))
@@ -2669,6 +2682,19 @@ fn compile_source_to_nbc(
         msg: format!("failed to write {out_path}: {e}"),
         span: Span::default(),
     })?;
+
+    if let Some(request) = behavior_manifest.as_ref() {
+        emit_behavior_manifest_sidecar(
+            request,
+            source,
+            nulang::behavior_manifest::ArtifactKind::Bytecode,
+            &bytes,
+            &effect_checker,
+            &hir,
+            &mir,
+        )?;
+    }
+
     println!(
         "Wrote {out_path} ({} bytes, .nbc format v{}, language v{})",
         bytes.len(),
