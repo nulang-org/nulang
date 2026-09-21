@@ -8122,6 +8122,7 @@ mod vm_tests {
             .expect("Perform constant must be cached");
         assert_eq!(cached.qualified.as_ref(), "Float.sqrt");
         assert_eq!(cached.parts(), ("Float", Some("sqrt")));
+        assert_eq!(cached.builtin, Some(BuiltinEffectId::FloatSqrt));
         assert!(
             vm.perform_name_cache[0][1].is_none(),
             "unreferenced constants must not be cached"
