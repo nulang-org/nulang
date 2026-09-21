@@ -344,7 +344,7 @@ jobs:
   # run-to-run noise, so a naive fixed threshold would fail PRs for
   # noise, not real regressions). Runs on push to main only (not every
   # PR) since a full criterion run of every group is slow; results are
-  # committed back so PERFORMANCE_ANALYSIS.md can cite real numbers
+  # persisted on an automation branch so PERFORMANCE_ANALYSIS.md can cite real numbers
   # instead of estimates. The gate needs >= 3 prior commits' worth of
   # history for a given benchmark before it will fail anything, so
   # early runs (and brand-new benchmarks) are informational only until
@@ -355,7 +355,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
-      contents: write  # Persist rolling benchmark history after regression checks pass
+      contents: write  # Persist rolling benchmark history on an automation branch
+      pull-requests: write
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
       - uses: actions/checkout@v7
@@ -392,13 +393,55 @@ jobs:
           path: benchmarks/*.json
           retention-days: 90
 
-      - name: Commit results to benchmarks/
+      - name: Publish benchmark history branch
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "benchmarks/$(git rev-parse --short HEAD).json"
-          git diff --staged --quiet || git commit -m "bench: record results for $(git rev-parse --short HEAD) [skip ci]"
-          git push
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          short_sha="$(git rev-parse --short HEAD)"
+          latest="benchmarks/${short_sha}.json"
+          tmp_latest="$(mktemp)"
+          cp "$latest" "$tmp_latest"
+
+          history_branch="automation/bench-history"
+          git fetch origin "$history_branch" || true
+          git checkout -B "$history_branch" "$GITHUB_SHA"
+
+          # Carry forward any not-yet-merged benchmark history from the
+          # automation branch, then restore this run's exact result.
+          if git show-ref --verify --quiet "refs/remotes/origin/$history_branch"; then
+            git checkout "origin/$history_branch" -- benchmarks || true
+          fi
+          cp "$tmp_latest" "$latest"
+
+          git add benchmarks/
+          if git diff --staged --quiet; then
+            echo "Benchmark history is already current."
+            exit 0
+          fi
+
+          git commit -m "bench: record results for ${short_sha} [skip ci]"
+          git push --force origin "HEAD:$history_branch"
+
+          # Repository policy may forbid GITHUB_TOKEN from creating PRs.
+          # The benchmark result is already safely persisted on the automation
+          # branch; PR publication is therefore best-effort control-plane work.
+          pr_number="$(gh pr list --head "$history_branch" --base main --state open --json number --jq '.[0].number // empty' || true)"
+          if [ -n "$pr_number" ]; then
+            gh pr edit "$pr_number" \
+              --title "bench: sync benchmark history" \
+              --body "Automated rolling benchmark history generated from main." \
+              || echo "::warning::Benchmark branch updated, but the workflow token could not edit PR #$pr_number."
+          else
+            gh pr create \
+              --base main \
+              --head "$history_branch" \
+              --title "bench: sync benchmark history" \
+              --body "Automated rolling benchmark history generated from main." \
+              || echo "::warning::Benchmark branch updated, but repository policy prevented the workflow token from creating a PR."
+          fi
 
       # Separate from the check step itself so the commit above always
       # happens (preserving complete rolling-window history) even when
