@@ -210,7 +210,16 @@ pub(crate) fn send_distributed(
     behavior: &str,
     args: &[Value],
 ) {
-    let _ = send_distributed_impl(rt, target, behavior, args, false);
+    let _ = send_distributed_impl(rt, target, behavior, args, false, false);
+}
+
+pub(crate) fn try_send_distributed(
+    rt: &mut Runtime,
+    target: ActorAddress,
+    behavior: &str,
+    args: &[Value],
+) -> crate::runtime::MessageAdmission {
+    send_distributed_impl(rt, target, behavior, args, false, true).admission
 }
 
 pub(crate) fn send_distributed_tracked(
@@ -228,7 +237,7 @@ pub(crate) fn try_send_distributed_tracked(
     behavior: &str,
     args: &[Value],
 ) -> crate::runtime::TrackedSendAdmission {
-    send_distributed_impl(rt, target, behavior, args, true)
+    send_distributed_impl(rt, target, behavior, args, true, true)
 }
 
 fn send_distributed_impl(
@@ -237,6 +246,7 @@ fn send_distributed_impl(
     behavior: &str,
     args: &[Value],
     tracked: bool,
+    nonblocking: bool,
 ) -> crate::runtime::TrackedSendAdmission {
     if !rt.distributed.enabled {
         let actor_id = match target {
@@ -296,6 +306,19 @@ fn send_distributed_impl(
             behavior,
             args,
         )
+    } else if nonblocking {
+        crate::runtime::TrackedSendAdmission {
+            admission: distributed::try_send_distributed(
+                rt,
+                &mut transport,
+                &cluster,
+                &mut resolver,
+                target,
+                behavior,
+                args,
+            ),
+            delivery_id: None,
+        }
     } else {
         distributed::send_distributed(
             rt,
