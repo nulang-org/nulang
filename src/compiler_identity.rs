@@ -90,6 +90,52 @@ where
     Ok(module)
 }
 
+/// Compile typed bytecode and attach complete artifact provenance.
+///
+/// This is the preferred boundary for durable/package artifacts: the returned
+/// module carries whole-program semantic identity, per-definition semantic
+/// identities, and the exact compiler/backend-specific `ArtifactId` derived
+/// by the accompanying manifest. Frozen NBC v1 still omits these sidecars;
+/// `crate::artifact_store` persists and restores them externally.
+pub fn compile_typed_bytecode_with_artifact_identity<D, I, S>(
+    source_bytes: Option<&[u8]>,
+    hir: &hir::Module,
+    mir: &mut mir::Module,
+    dependency_semantic_ids: D,
+    name: &str,
+    compiler_version: &str,
+    target: &str,
+    abi: &str,
+    backend: &str,
+    flags: I,
+) -> crate::types::NuResult<(
+    crate::bytecode::CodeModule,
+    ArtifactIdentityManifest,
+)>
+where
+    D: IntoIterator<Item = SemanticId>,
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let dependencies: Vec<_> = dependency_semantic_ids.into_iter().collect();
+    let mut module =
+        compile_typed_bytecode(hir, mir, dependencies.iter().copied(), name)?;
+    let semantic_id = module.semantic_id.ok_or_else(|| crate::types::NuError::VMError {
+        msg: "typed compilation produced no semantic identity".to_string(),
+        span: crate::types::Span::default(),
+    })?;
+    let manifest = ArtifactIdentityManifest::new(
+        source_bytes.map(SourceId::from_bytes),
+        semantic_id,
+        compiler_version,
+        target,
+        abi,
+        backend,
+        flags,
+    );
+    module.artifact_id = Some(manifest.artifact_id());
+    Ok((module, manifest))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +197,26 @@ mod tests {
         assert!(raw.actor_semantic_ids.is_empty());
     }
 
+    #[test]
+    fn typed_artifact_compile_attaches_manifest_artifact_id() {
+        let (hir, mut mir) = empty_program();
+        let (module, manifest) = compile_typed_bytecode_with_artifact_identity(
+            Some(b"fn main() { 42 }"),
+            &hir,
+            &mut mir,
+            [],
+            "typed-artifact",
+            "nulangc-test",
+            "nulang-vm-v1",
+            "nbc-v1",
+            "bytecode",
+            ["opt=0"],
+        )
+        .unwrap();
+
+        assert_eq!(module.semantic_id, Some(manifest.semantic_id()));
+        assert_eq!(module.artifact_id, Some(manifest.artifact_id()));
+    }
     #[test]
     fn backend_configuration_changes_artifact_but_not_semantic_identity() {
         let (hir, mir) = empty_program();
