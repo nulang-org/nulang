@@ -42,6 +42,9 @@ version + migration.*
 
 ## Stable tier
 
+### Multi-field event-log identity — 2026-09-21
+- **Event-sourced persistence no longer collapses multiple field projections at one sequence** (`src/runtime/persistence.rs`, `src/runtime/tests.rs`). One domain `emit` can update more than one `event_sourced` field, and the runtime persists one `EventEntry` per field at the same durable sequence. The prior libSQL/PostgreSQL primary key `(actor_id, sequence)` and RocksDB `actor||sequence` key could therefore reject or overwrite sibling field projections. SQL backends now write to an `events_v2` table keyed by `(actor_id, sequence, field_name)`, idempotently backfilling legacy rows at initialization; RocksDB appends `field_name` to new event keys and deduplicates mixed legacy/v2 rows by `(sequence, field)`, preferring the v2 value. Regression tests pin two field projections at the same sequence for libSQL and RocksDB. This is a prerequisite for correct RFC 0008 event-history migration and deterministic event replay.
+
 ### Migration contract compile-time safety — 2026-09-21
 - **RFC 0008 validation hardening** (Experimental, `src/typechecker.rs`, `src/effect_checker.rs`). Migration edges must advance exactly one positive schema version, declared chains must be contiguous and end at the entity's current version, migration event parameters/catch-all values are bound during typechecking, and migration state/event bodies are required to have an empty effect row. Runtime replay/migration execution remains unimplemented; this change prevents malformed or effectful contracts from being accepted as valid source.
 
