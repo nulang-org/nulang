@@ -1514,6 +1514,8 @@ pub(crate) mod tests {
                     7,
                     EventEntry {
                         sequence: s,
+                        schema_owner: None,
+                        schema_version: 1,
                         field_name: "count".to_string(),
                         event_name: "Incremented".to_string(),
                         args: vec![],
