@@ -872,7 +872,20 @@ fn send_distributed_inner(
 
             let content_hash = try_lookup_content_hash(runtime, behavior);
             let trace_id = runtime.current_trace.as_ref().map(|t| t.to_traceparent());
-            let delivery_id = tracked.then(|| runtime.allocate_remote_delivery_id());
+            let delivery_id = if tracked {
+                match runtime.begin_remote_delivery(node_id) {
+                    Some(delivery_id) => Some(delivery_id),
+                    None => {
+                        warn!(
+                            "nulang-net: refusing tracked send to actor {} on node {:?}: pending admission table is full",
+                            actor_id, node_id
+                        );
+                        return None;
+                    }
+                }
+            } else {
+                None
+            };
             let packet = resolver.build_packet(
                 actor_id,
                 behavior,
@@ -1267,7 +1280,12 @@ pub fn process_network_packets(
                 delivery_id,
                 status,
             } => {
-                runtime.record_remote_admission(delivery_id, status);
+                if !runtime.record_remote_admission(incoming.from_node, delivery_id, status) {
+                    warn!(
+                        "nulang-net: ignoring actor admission {} from unexpected node {:?}",
+                        delivery_id, incoming.from_node
+                    );
+                }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
             Packet::FetchBehaviorRequest { content_hash } => {
