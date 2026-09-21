@@ -1575,10 +1575,7 @@ impl Packet {
 }
 const RUNTIME_MANIFEST_TAIL_MAGIC: &[u8; 4] = b"RAM0";
 
-fn write_runtime_manifest_tail(
-    buf: &mut Vec<u8>,
-    provenance: Option<&RuntimeArtifactProvenance>,
-) {
+fn write_runtime_manifest_tail(buf: &mut Vec<u8>, provenance: Option<&RuntimeArtifactProvenance>) {
     let Some(provenance) = provenance else {
         return;
     };
