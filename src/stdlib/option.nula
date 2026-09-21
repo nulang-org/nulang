@@ -1,11 +1,14 @@
 // Nulang standard library — Option combinators.
 // Import: `import stdlib::option`
-
-/// The Option type: represents a value that may or may not be present.
-pub type Option[T] = Some(T) | None
+//
+// `Option[T] = Some(T) | None` is defined once in the auto-imported prelude.
+// This module owns operations on that canonical type; it does not redeclare it.
 
 /// Unwrap an Option, returning the Some value.
-/// Panics (via Test.assert) on None.
+///
+/// This legacy aborting operation still routes through Test.assert until
+/// explicit panic has backend parity. Prefer total combinators such as
+/// unwrap_or / unwrap_or_else in portable code.
 pub fn unwrap[T](opt: Option[T]) -> T {
     match opt {
         Some(x) => x,
@@ -34,5 +37,53 @@ pub fn map[T, U](opt: Option[T], f) -> Option[U] {
     match opt {
         Some(x) => Some(f(x)),
         None => None,
+    }
+}
+
+/// Chain an Option-returning function over a present value.
+pub fn and_then[T, U](opt: Option[T], f) -> Option[U] {
+    match opt {
+        Some(x) => f(x),
+        None => None,
+    }
+}
+
+/// Recover from None with an Option produced lazily by f.
+pub fn or_else[T](opt: Option[T], f) -> Option[T] {
+    match opt {
+        Some(x) => Some(x),
+        None => f(),
+    }
+}
+
+/// Return the contained value or a provided default.
+pub fn unwrap_or[T](opt: Option[T], default: T) -> T {
+    match opt {
+        Some(x) => x,
+        None => default,
+    }
+}
+
+/// Return the contained value or compute a default lazily.
+pub fn unwrap_or_else[T](opt: Option[T], f) -> T {
+    match opt {
+        Some(x) => x,
+        None => f(),
+    }
+}
+
+/// Keep a present value only when pred returns true.
+pub fn filter[T](opt: Option[T], pred) -> Option[T] {
+    match opt {
+        Some(x) => if pred(x) then Some(x) else None,
+        None => None,
+    }
+}
+
+/// Promote an Option to Result, using err when the value is absent.
+pub fn ok_or[T, E](opt: Option[T], err: E) -> Result[T, E] {
+    match opt {
+        Some(x) => Ok(x),
+        None => Error(err),
     }
 }
