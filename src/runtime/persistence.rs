@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use crate::vm::Value;
@@ -265,11 +265,48 @@ pub trait PersistenceStore: Send + Sync {
     /// Read all journal entries for an actor in order.
     fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry>;
 
+    /// Read at most `limit` journal entries whose sequence is greater than or
+    /// equal to `start_sequence`. Backends should override this with a native
+    /// range scan; the default preserves compatibility for custom stores.
+    fn scan_journal_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<JournalEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        self.read_journal(actor_id)
+            .into_iter()
+            .filter(|entry| entry.sequence >= start_sequence)
+            .take(limit)
+            .collect()
+    }
+
     /// Append a workflow event to the actor's event journal.
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()>;
 
     /// Read all workflow events for an actor in order.
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent>;
+
+    /// Read at most `limit` workflow events starting at an inclusive actor
+    /// sequence. See `scan_journal_from` for the compatibility contract.
+    fn scan_workflow_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<WorkflowEvent> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        self.read_workflow_events(actor_id)
+            .into_iter()
+            .filter(|event| event.sequence() >= start_sequence)
+            .take(limit)
+            .collect()
+    }
 
     /// Append a `TimerSet` workflow event.
     fn append_timer_set(
@@ -389,6 +426,25 @@ pub trait PersistenceStore: Send + Sync {
     /// Read all event-sourcing entries for an actor in order.
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry>;
 
+    /// Read at most `limit` event-sourced mutations starting at an inclusive
+    /// actor sequence. Multiple fields may legally share one sequence and must
+    /// remain in deterministic append order.
+    fn scan_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<EventEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        self.read_events(actor_id)
+            .into_iter()
+            .filter(|entry| entry.sequence >= start_sequence)
+            .take(limit)
+            .collect()
+    }
+
     /// Highest sequence number known for the actor.
     fn latest_sequence(&self, actor_id: u64) -> u64;
 
@@ -439,6 +495,22 @@ impl PersistenceStore for MemoryStore {
         self.journals.get(&actor_id).cloned().unwrap_or_default()
     }
 
+    fn scan_journal_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<JournalEntry> {
+        self.journals
+            .get(&actor_id)
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.sequence >= start_sequence)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
         self.workflow_events
             .entry(actor_id)
@@ -454,6 +526,22 @@ impl PersistenceStore for MemoryStore {
             .unwrap_or_default()
     }
 
+    fn scan_workflow_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<WorkflowEvent> {
+        self.workflow_events
+            .get(&actor_id)
+            .into_iter()
+            .flatten()
+            .filter(|event| event.sequence() >= start_sequence)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
         self.events.entry(actor_id).or_default().push(entry);
         Ok(())
@@ -461,6 +549,22 @@ impl PersistenceStore for MemoryStore {
 
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
         self.events.get(&actor_id).cloned().unwrap_or_default()
+    }
+
+    fn scan_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<EventEntry> {
+        self.events
+            .get(&actor_id)
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.sequence >= start_sequence)
+            .take(limit)
+            .cloned()
+            .collect()
     }
 
     fn latest_sequence(&self, actor_id: u64) -> u64 {
@@ -535,6 +639,44 @@ impl JsonFileStore {
     }
 }
 
+fn scan_jsonl<T, F>(
+    path: PathBuf,
+    start_sequence: u64,
+    limit: usize,
+    sequence: F,
+) -> Vec<T>
+where
+    T: serde::de::DeserializeOwned,
+    F: Fn(&T) -> u64,
+{
+    if limit == 0 {
+        return Vec::new();
+    }
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::with_capacity(limit.min(1024));
+    for line in BufReader::new(file).lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+        let value: T = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if sequence(&value) < start_sequence {
+            continue;
+        }
+        out.push(value);
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
 impl PersistenceStore for JsonFileStore {
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
         let dir = self.actor_dir(snapshot.actor_id);
@@ -604,6 +746,20 @@ impl PersistenceStore for JsonFileStore {
             .collect()
     }
 
+    fn scan_journal_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<JournalEntry> {
+        scan_jsonl(
+            self.journal_path(actor_id),
+            start_sequence,
+            limit,
+            |entry: &JournalEntry| entry.sequence,
+        )
+    }
+
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
         let dir = self.actor_dir(actor_id);
         fs::create_dir_all(&dir)?;
@@ -630,6 +786,20 @@ impl PersistenceStore for JsonFileStore {
         data.lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect()
+    }
+
+    fn scan_workflow_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<WorkflowEvent> {
+        scan_jsonl(
+            self.workflow_events_path(actor_id),
+            start_sequence,
+            limit,
+            WorkflowEvent::sequence,
+        )
     }
 
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
@@ -660,6 +830,20 @@ impl PersistenceStore for JsonFileStore {
         data.lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect()
+    }
+
+    fn scan_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<EventEntry> {
+        scan_jsonl(
+            self.events_path(actor_id),
+            start_sequence,
+            limit,
+            |entry: &EventEntry| entry.sequence,
+        )
     }
 
     fn latest_sequence(&self, actor_id: u64) -> u64 {
