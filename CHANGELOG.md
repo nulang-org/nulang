@@ -46,12 +46,16 @@ version + migration.*
 - **RFC 0020 semantic inventory emission** (Experimental, `src/semantic_inventory.rs`,
   `src/package/behavior_manifest.rs`). Portable package WASM builds now merge
   compiler-inferred effects for module functions, actor behaviors, and workflow
-  steps/compensations into the artifact-bound Behavior Manifest. Resource-gated
-  effects derive conservative `fs`/`net`/`os` authority categories.
+  steps/compensations into the artifact-bound Behavior Manifest. The public
+  document conforms to `spec/behavior/v0alpha1.schema.json`; richer per-subject
+  evidence lives under the advisory `nulang.org/compiler-semantics` extension.
+  Resource-gated effects derive conservative `fs`/`net`/`os` authority
+  categories, public effect/replay entries use conservative compiler-owned
+  classifications, and actor durability is emitted as transient/durable.
   Actor protocol identities reuse the canonical structural protocol hash and
-  are emitted only for stable behavior signatures; incomplete/open signatures
-  remain explicitly un-hashed. The compiler/package handoff is internal and is
-  removed after the public `*.behavior.json` sidecar is written.
+  are emitted only for stable explicit behavior contracts; incomplete/open
+  signatures remain explicitly un-hashed. The compiler/package handoff is
+  internal and is removed after the public `*.behavior.json` sidecar is written.
 
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
