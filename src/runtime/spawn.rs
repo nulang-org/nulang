@@ -22,6 +22,7 @@ pub(crate) fn spawn_actor_with_models(
     persistent: bool,
     workflow: Option<&str>,
     definition_semantic_id: Option<crate::content_identity::SemanticId>,
+    execution_artifact_id: Option<crate::content_identity::ArtifactId>,
 ) -> u64 {
     spawn_actor_with_id(
         rt,
@@ -31,6 +32,7 @@ pub(crate) fn spawn_actor_with_models(
         persistent,
         workflow,
         definition_semantic_id,
+        execution_artifact_id,
     )
 }
 
@@ -63,6 +65,7 @@ pub(crate) fn spawn_actor_with_id(
     persistent: bool,
     workflow: Option<&str>,
     definition_semantic_id: Option<crate::content_identity::SemanticId>,
+    execution_artifact_id: Option<crate::content_identity::ArtifactId>,
 ) -> u64 {
     let restart_snapshot = if persistent && workflow.is_none() {
         match preflight_persistent_snapshot(rt, id) {
@@ -100,8 +103,28 @@ pub(crate) fn spawn_actor_with_id(
         None => definition_semantic_id,
     };
 
+    let verified_execution_artifact_id = match restart_snapshot.as_ref() {
+        Some((snapshot, _)) => match Runtime::verify_snapshot_execution_artifact_identity(
+            id,
+            snapshot,
+            execution_artifact_id,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::warn!(
+                    actor_id = id,
+                    %error,
+                    "refusing to activate persistent actor with incompatible execution artifact"
+                );
+                return id;
+            }
+        },
+        None => execution_artifact_id,
+    };
+
     let mut actor = Actor::new(id, format!("actor_{}", id), 0);
     actor.definition_semantic_id = verified_definition_semantic_id;
+    actor.execution_artifact_id = verified_execution_artifact_id;
     let state_fields = init();
     for (name, value) in state_fields {
         actor.set_state_field(name, value);
@@ -281,6 +304,7 @@ pub(crate) fn spawn_from_module(
         None => ActorRole::Plain,
     };
     let definition_semantic_id = module.actor_semantic_id_for_behavior(behavior_idx);
+    let execution_artifact_id = module.artifact_id;
 
     let id = if let Some(meta) = meta {
         let state_models: HashMap<String, StateModel> = meta
@@ -307,6 +331,7 @@ pub(crate) fn spawn_from_module(
                 None
             },
             definition_semantic_id,
+            execution_artifact_id,
         )
     } else {
         spawn_actor_with_models(
@@ -316,6 +341,7 @@ pub(crate) fn spawn_from_module(
             false,
             None,
             definition_semantic_id,
+            execution_artifact_id,
         )
     };
     let offsets: Vec<usize> = bytecode_offsets_for_role(module, role);
@@ -334,7 +360,10 @@ pub(crate) fn spawn_from_module(
             .collect()
     };
     if let Some(actor) = rt.actors.get_mut(&id) {
-        actor.definition_semantic_id = definition_semantic_id;
+        // spawn_actor_with_models already installed the provenance verified
+        // against any durable restart snapshot. Do not overwrite it with the
+        // current module identities here: a legacy snapshot intentionally
+        // remains unverified until an explicit migration establishes provenance.
         actor.bytecode_module = Some(module.clone());
         actor.bytecode_offsets = offsets.clone();
         actor.compensation_offsets = compensation_offsets.clone();
@@ -621,6 +650,7 @@ mod authority_tests {
             true,
             None,
             None,
+            None,
         );
 
         assert_eq!(returned, actor_id);
@@ -635,6 +665,48 @@ mod authority_tests {
             .allows(&AuthorityGrant::SecretRead {
                 name: "RESTART_KEY".into(),
             }));
+    }
+
+    #[test]
+    fn legacy_restart_does_not_adopt_current_code_provenance() {
+        let mut rt = Runtime::new();
+        let actor_id = 910_003;
+        rt.persistence
+            .save_snapshot(ActorSnapshot {
+                actor_id,
+                ..ActorSnapshot::default()
+            })
+            .unwrap();
+
+        let semantic_id =
+            crate::content_identity::SemanticId::from_canonical_bytes(b"current-definition", []);
+        let artifact_id = crate::content_identity::ArtifactId::from_semantic(
+            semantic_id,
+            "nulangc-test",
+            "portable",
+            "nulang-abi-v1",
+            "bytecode",
+            ["opt=0"],
+        );
+
+        let returned = spawn_actor_with_id(
+            &mut rt,
+            actor_id,
+            Box::new(|| vec![]),
+            std::collections::HashMap::new(),
+            true,
+            None,
+            Some(semantic_id),
+            Some(artifact_id),
+        );
+
+        assert_eq!(returned, actor_id);
+        let actor = rt
+            .actors
+            .get(&actor_id)
+            .expect("persistent actor published");
+        assert_eq!(actor.definition_semantic_id, None);
+        assert_eq!(actor.execution_artifact_id, None);
     }
 
     #[test]
@@ -665,6 +737,7 @@ mod authority_tests {
             }),
             std::collections::HashMap::new(),
             true,
+            None,
             None,
             None,
         );

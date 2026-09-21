@@ -51,6 +51,10 @@ pub mod hir;
 pub mod hir_lower;
 #[path = "../../../src/type_metadata.rs"]
 pub mod type_metadata;
+#[path = "../../../src/content_identity.rs"]
+pub mod content_identity;
+#[path = "../../../src/artifact_identity.rs"]
+pub mod artifact_identity;
 #[path = "../../../src/bytecode.rs"]
 pub mod bytecode;
 #[path = "../../../src/format/mod.rs"]

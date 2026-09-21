@@ -677,6 +677,11 @@ pub struct CodeModule {
     /// owns embedded identity.
     #[serde(skip)]
     pub semantic_id: Option<crate::content_identity::SemanticId>,
+    /// Compiler/codegen-specific identity of the exact executable artifact.
+    /// This is an in-memory sidecar paired with the external versioned
+    /// ArtifactIdentityManifest; frozen NBC v1 intentionally does not embed it.
+    #[serde(skip)]
+    pub artifact_id: Option<crate::content_identity::ArtifactId>,
     /// Definition-scoped semantic identities for actor/entity/workflow
     /// declarations in this typed module, parallel to `actor_metadata`.
     /// Positional ownership avoids collapsing namespace-distinct actors that
@@ -737,6 +742,7 @@ impl CodeModule {
         CodeModule {
             name: name.into(),
             semantic_id: None,
+            artifact_id: None,
             actor_semantic_ids: Vec::new(),
             constants: Vec::new(),
             instructions: Vec::new(),
@@ -756,6 +762,42 @@ impl CodeModule {
             debug_functions: Vec::new(),
             export_table: Vec::new(),
         }
+    }
+
+    /// Bind an externally persisted artifact-identity manifest to this
+    /// compiler-proven module.
+    ///
+    /// Artifact provenance is accepted only when the manifest's semantic
+    /// identity exactly matches the module's canonical semantic sidecar.
+    /// Low-level/raw modules therefore cannot self-assert an ArtifactId.
+    pub fn attach_artifact_identity(
+        &mut self,
+        manifest: &crate::artifact_identity::ArtifactIdentityManifest,
+    ) -> Result<(), crate::artifact_identity::ArtifactIdentityError> {
+        let module_semantic = self.semantic_id.ok_or(
+            crate::artifact_identity::ArtifactIdentityError::MissingModuleSemanticIdentity,
+        )?;
+        if module_semantic != manifest.semantic_id() {
+            return Err(
+                crate::artifact_identity::ArtifactIdentityError::SemanticIdentityMismatch {
+                    module: module_semantic,
+                    manifest: manifest.semantic_id(),
+                },
+            );
+        }
+        let requested = manifest.artifact_id();
+        if let Some(existing) = self.artifact_id {
+            if existing != requested {
+                return Err(
+                    crate::artifact_identity::ArtifactIdentityError::ArtifactIdentityMismatch {
+                        expected: existing,
+                        actual: requested,
+                    },
+                );
+            }
+        }
+        self.artifact_id = Some(requested);
+        Ok(())
     }
 
     /// Compiler-proven definition identity at one actor-metadata index.

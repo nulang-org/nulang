@@ -147,8 +147,59 @@ mod tests {
 
         assert!(typed.semantic_id.is_some());
         assert!(raw.semantic_id.is_none());
+        assert!(typed.artifact_id.is_none());
+        assert!(raw.artifact_id.is_none());
         assert!(typed.actor_semantic_ids.is_empty());
         assert!(raw.actor_semantic_ids.is_empty());
+    }
+
+    #[test]
+    fn typed_module_accepts_only_manifest_for_its_semantics() {
+        let (hir, mut mir) = empty_program();
+        let mut module = compile_typed_bytecode(&hir, &mut mir, [], "typed").unwrap();
+        let semantic_id = module.semantic_id.unwrap();
+        let manifest = ArtifactIdentityManifest::new(
+            None,
+            semantic_id,
+            "nulangc-test",
+            "portable",
+            "nulang-abi-v1",
+            "bytecode",
+            ["opt=0"],
+        );
+
+        module.attach_artifact_identity(&manifest).unwrap();
+        assert_eq!(module.artifact_id, Some(manifest.artifact_id()));
+        module.attach_artifact_identity(&manifest).unwrap();
+
+        let rebound = ArtifactIdentityManifest::new(
+            None,
+            semantic_id,
+            "nulangc-test",
+            "portable",
+            "nulang-abi-v1",
+            "bytecode",
+            ["opt=3"],
+        );
+        assert!(matches!(
+            module.attach_artifact_identity(&rebound),
+            Err(crate::artifact_identity::ArtifactIdentityError::ArtifactIdentityMismatch { .. })
+        ));
+        assert_eq!(module.artifact_id, Some(manifest.artifact_id()));
+
+        let different = ArtifactIdentityManifest::new(
+            None,
+            SemanticId::from_canonical_bytes(b"different", []),
+            "nulangc-test",
+            "portable",
+            "nulang-abi-v1",
+            "bytecode",
+            ["opt=0"],
+        );
+        assert!(matches!(
+            module.attach_artifact_identity(&different),
+            Err(crate::artifact_identity::ArtifactIdentityError::SemanticIdentityMismatch { .. })
+        ));
     }
 
     #[test]

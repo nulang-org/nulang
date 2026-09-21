@@ -213,6 +213,10 @@ pub struct Actor {
     /// Compiler-proven semantic identity of this actor definition. This is
     /// intentionally narrower than the containing module's whole-program ID.
     pub definition_semantic_id: Option<crate::content_identity::SemanticId>,
+    /// Exact compiler/codegen artifact identity that activated this actor.
+    /// This is distinct from definition semantic compatibility: two artifacts
+    /// may implement the same actor semantics but are not the same executable.
+    pub execution_artifact_id: Option<crate::content_identity::ArtifactId>,
     /// Bytecode module used by this actor's bytecode behaviors.
     pub bytecode_module: Option<crate::bytecode::CodeModule>,
     /// Index of the loaded bytecode module in the runtime VM.
@@ -357,6 +361,7 @@ impl Actor {
             compensation_offsets: Vec::new(),
             compensated_steps: Vec::new(),
             definition_semantic_id: None,
+            execution_artifact_id: None,
             bytecode_module: None,
             bytecode_module_idx: None,
             parent: None,

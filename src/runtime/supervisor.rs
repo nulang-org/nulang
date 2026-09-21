@@ -134,6 +134,8 @@ pub struct RestartTemplate {
     pub behaviors: Vec<(String, fn(&mut Actor, &[Value]))>,
     /// Definition-scoped semantic identity captured from the child.
     pub definition_semantic_id: Option<crate::content_identity::SemanticId>,
+    /// Exact executable artifact identity captured from the child.
+    pub execution_artifact_id: Option<crate::content_identity::ArtifactId>,
     /// Bytecode module backing the child's bytecode behaviors, if any.
     pub bytecode_module: Option<crate::bytecode::CodeModule>,
     /// Bytecode behavior offsets by behavior id.
@@ -357,7 +359,28 @@ impl Supervisor {
         } else {
             template.definition_semantic_id
         };
+        let verified_execution_artifact_id = if let Some(ref snap) = snapshot {
+            match Runtime::verify_snapshot_execution_artifact_identity(
+                old_actor_id,
+                snap,
+                template.execution_artifact_id,
+            ) {
+                Ok(id) => id,
+                Err(error) => {
+                    warn!(
+                        supervisor = %self.name,
+                        child = %spec.id,
+                        %error,
+                        "refusing supervised restart with incompatible execution artifact"
+                    );
+                    return None;
+                }
+            }
+        } else {
+            template.execution_artifact_id
+        };
         new_actor.definition_semantic_id = verified_definition_semantic_id;
+        new_actor.execution_artifact_id = verified_execution_artifact_id;
 
         if let Some(ref snap) = snapshot {
             for (name, value) in &snap.state {

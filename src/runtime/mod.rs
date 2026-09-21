@@ -782,7 +782,7 @@ impl Runtime {
 
     #[tracing::instrument(level = "trace", skip(self, init))]
     pub fn spawn_actor(&mut self, init: Box<dyn FnOnce() -> Vec<(String, Value)>>) -> u64 {
-        spawn::spawn_actor_with_models(self, init, HashMap::new(), false, None, None)
+        spawn::spawn_actor_with_models(self, init, HashMap::new(), false, None, None, None)
     }
 
     /// Spawn an actor co-located on the same shard as `near_actor_id`.
@@ -813,7 +813,7 @@ impl Runtime {
         } else {
             fresh_actor_id()
         };
-        spawn::spawn_actor_with_id(self, id, init, HashMap::new(), false, None, None)
+        spawn::spawn_actor_with_id(self, id, init, HashMap::new(), false, None, None, None)
     }
 
     pub fn spawn_persistent_actor(
@@ -821,7 +821,7 @@ impl Runtime {
         init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
         state_models: HashMap<String, StateModel>,
     ) -> u64 {
-        spawn::spawn_actor_with_models(self, init, state_models, true, None, None)
+        spawn::spawn_actor_with_models(self, init, state_models, true, None, None, None)
     }
 
     /// Spawn a durable workflow actor.  Workflows are always persistent and
@@ -832,7 +832,7 @@ impl Runtime {
         init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
         state_models: HashMap<String, StateModel>,
     ) -> u64 {
-        spawn::spawn_actor_with_models(self, init, state_models, true, Some(name), None)
+        spawn::spawn_actor_with_models(self, init, state_models, true, Some(name), None, None)
     }
 
     /// Spawn an actor for `module`'s behavior `behavior_idx`, seeded with
@@ -3271,10 +3271,16 @@ impl Runtime {
             .get(&actor_id)
             .and_then(|actor| actor.definition_semantic_id)
             .map(|id| id.to_string());
+        let artifact_id = self
+            .actors
+            .get(&actor_id)
+            .and_then(|actor| actor.execution_artifact_id)
+            .map(|id| id.to_string());
         Some(ActorSnapshot {
             actor_id,
             sequence,
             semantic_id,
+            artifact_id,
             state,
             waiting_signal,
             crdt_snapshot,
@@ -5082,6 +5088,41 @@ impl Runtime {
         }
     }
 
+    /// Verify exact executable provenance of one snapshot.
+    ///
+    /// Artifact identity is additive to the older semantic-history contract:
+    /// a snapshot that already carries an ArtifactId must recover under that
+    /// exact executable artifact. A pre-ArtifactId snapshot remains explicitly
+    /// unverified (None) even when current code has a verified ArtifactId, so
+    /// recovery never silently upgrades historical provenance.
+    pub(crate) fn verify_snapshot_execution_artifact_identity(
+        actor_id: u64,
+        snapshot: &ActorSnapshot,
+        current: Option<crate::content_identity::ArtifactId>,
+    ) -> Result<Option<crate::content_identity::ArtifactId>, String> {
+        match snapshot.artifact_id.as_deref() {
+            Some(persisted) => {
+                let persisted = persisted
+                    .parse::<crate::content_identity::ArtifactId>()
+                    .map_err(|error| {
+                        format!(
+                            "actor {actor_id} has malformed execution artifact identity: {error}"
+                        )
+                    })?;
+                match current {
+                    Some(current) if current == persisted => Ok(Some(current)),
+                    Some(current) => Err(format!(
+                        "actor {actor_id} persisted execution artifact {persisted} does not match recovery artifact {current}"
+                    )),
+                    None => Err(format!(
+                        "actor {actor_id} persisted execution artifact {persisted} has no identified recovery artifact"
+                    )),
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Recover a persistent actor from the latest snapshot and replay the journal.
     ///
     /// For workflow actors the durable workflow event journal is replayed
@@ -5127,6 +5168,27 @@ impl Runtime {
                 actor_id
             );
         }
+        let recovery_execution_artifact_id = self
+            .recovery_modules
+            .get(&actor_id)
+            .and_then(|(module, _, _)| module.artifact_id);
+        let verified_execution_artifact_id = match Self::verify_snapshot_execution_artifact_identity(
+            actor_id,
+            &snapshot,
+            recovery_execution_artifact_id,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                warn!("nulang-recover: refusing {error}");
+                return None;
+            }
+        };
+        if snapshot.artifact_id.is_none() && recovery_execution_artifact_id.is_some() {
+            warn!(
+                "nulang-recover: actor {} uses legacy snapshot without verified executable provenance",
+                actor_id
+            );
+        }
         let authority_manifest =
             match crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens) {
                 Ok(manifest) => manifest,
@@ -5152,6 +5214,7 @@ impl Runtime {
 
         let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
         actor.definition_semantic_id = verified_definition_semantic_id;
+        actor.execution_artifact_id = verified_execution_artifact_id;
         actor.persistent = true;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
@@ -5544,6 +5607,23 @@ impl Runtime {
         } else {
             grain_type.module.actor_semantic_id(&grain_id.grain_type)
         };
+        let verified_execution_artifact_id = if let Some(ref snap) = snapshot {
+            Self::verify_snapshot_execution_artifact_identity(
+                stable_actor_id,
+                snap,
+                grain_type.module.artifact_id,
+            )
+            .map_err(|error| NuError::RuntimeError {
+                msg: format!(
+                    "cannot hydrate virtual actor {}: {}",
+                    grain_id.actor_name(),
+                    error
+                ),
+                span: Span::new(0, 0),
+            })?
+        } else {
+            grain_type.module.artifact_id
+        };
 
         let mut actor = if let Some(ref snap) = snapshot {
             Self::restore_actor_from_snapshot(
@@ -5589,6 +5669,7 @@ impl Runtime {
         };
 
         actor.definition_semantic_id = verified_definition_semantic_id;
+        actor.execution_artifact_id = verified_execution_artifact_id;
 
         // Track the grain identity.
         self.actors.insert(stable_actor_id, actor);
@@ -5672,7 +5753,7 @@ impl Runtime {
         // snapshot arriving through this legacy transport cannot be verified
         // against the received bytecode. Reject it rather than trusting the
         // snapshot to self-certify the code that should execute its state.
-        if snapshot.semantic_id.is_some() {
+        if snapshot.semantic_id.is_some() || snapshot.artifact_id.is_some() {
             tracing::warn!(
                 "nulang-migrate: refusing identified snapshot for actor {} over legacy NBC v1 transport",
                 actor_id
@@ -6379,6 +6460,7 @@ impl Runtime {
                 .map(|entry| (entry.name.clone(), entry.handler_fn))
                 .collect(),
             definition_semantic_id: actor.definition_semantic_id,
+            execution_artifact_id: actor.execution_artifact_id,
             bytecode_module: actor.bytecode_module.clone(),
             bytecode_offsets: actor.bytecode_offsets.clone(),
             compensation_offsets: actor.compensation_offsets.clone(),
@@ -6825,6 +6907,7 @@ impl Runtime {
         // verifiable artifact manifest.
         let mut replicated_snapshot = snapshot.clone();
         replicated_snapshot.semantic_id = None;
+        replicated_snapshot.artifact_id = None;
         let Ok(snapshot_json) = serde_json::to_vec(&replicated_snapshot) else {
             return;
         };

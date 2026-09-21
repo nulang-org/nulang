@@ -1555,6 +1555,11 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Exact executable provenance for durable actors — 2026-09-21
+- **Durable actors now keep definition compatibility and executable provenance as separate identities.** `SemanticId` continues to gate actor/entity/workflow definition compatibility, while an optional `ArtifactId` sidecar identifies the exact compiler/codegen artifact that activated the actor.
+- **Snapshots persist `artifact_id` additively and fail closed when it is present.** Ordinary recovery, deterministic persistent respawn, grain hydration, and supervised restart require the same exact recovery artifact. Older snapshots without `ArtifactId` remain explicitly unverified and are not silently upgraded merely because current code has artifact provenance.
+- **LibSQL/Postgres persist the new identity and frozen NBC v1 remains explicitly unverified.** Legacy migration rejects self-asserted semantic/artifact identities and shadow replication redacts both until a manifest-aware transport exists.
+
 ### Immutable ArtifactId retention and historical lookup — 2026-09-21
 - **Compiled artifacts can now be retained durably under `ArtifactId` with independent BLAKE3 byte verification** (Experimental, `src/artifact_store.rs`). The filesystem store writes one versioned manifest+artifact record, fsyncs it, and publishes it with no-clobber hard-link semantics so concurrent writers cannot overwrite historical code.
 - **Historical lookup fails closed on corruption or codegen nondeterminism.** Every load re-validates the versioned `ArtifactIdentityManifest`, requires its embedded `ArtifactId` to match the requested key, and re-hashes the retained artifact bytes. Reusing one `ArtifactId` with different emitted bytes is rejected as an artifact collision rather than silently replacing the original executable.
