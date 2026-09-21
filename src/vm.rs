@@ -115,6 +115,15 @@ pub enum SignalWaitResult {
     NotReady,
 }
 
+/// Compact identity for generic builtins classified at module load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinEffectId {
+    IntToFloat,
+    FloatSqrt,
+    StringLength,
+    ArrayLength,
+}
+
 /// Result of a generic async effect operation from the `PerformAsync` opcode.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PerformAsyncResult {
@@ -292,6 +301,22 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
         regs: &[Value],
     ) -> Option<Value> {
         self.perform_builtin_effect(effect_name, op_name, &module.constants, regs)
+    }
+
+    /// Fast hook for a module-load-classified pure builtin.
+    ///
+    /// Returning `None` declines specialization and preserves the ordinary
+    /// name-based callback path. Runtime-backed callbacks intentionally use
+    /// that default so policy, authority, and test interception remain in the
+    /// existing module-aware dispatch boundary.
+    fn perform_builtin_id_in_module(
+        &mut self,
+        builtin: BuiltinEffectId,
+        module: &CodeModule,
+        regs: &[Value],
+    ) -> Option<Value> {
+        let _ = (builtin, module, regs);
+        None
     }
 
     /// Check whether a workflow signal has been received.
@@ -992,6 +1017,47 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
     }
 
     fn send_message(&mut self, _target: Value, _behavior_id: u16, _args: &[Value]) {}
+
+    fn perform_builtin_id_in_module(
+        &mut self,
+        builtin: BuiltinEffectId,
+        module: &CodeModule,
+        regs: &[Value],
+    ) -> Option<Value> {
+        match builtin {
+            BuiltinEffectId::IntToFloat => {
+                let n = regs.first().and_then(|v| v.as_int()).unwrap_or(0);
+                Some(Value::float(n as f64))
+            }
+            BuiltinEffectId::FloatSqrt => {
+                let x = regs.first().and_then(|v| v.as_float()).unwrap_or(0.0);
+                if x < 0.0 {
+                    Some(Value::nil())
+                } else {
+                    Some(Value::float(f64::sqrt(x)))
+                }
+            }
+            BuiltinEffectId::StringLength => {
+                let s = resolve_value_string(
+                    &module.constants,
+                    *regs.first().unwrap_or(&Value::nil()),
+                );
+                Some(Value::int(s.len() as i64))
+            }
+            BuiltinEffectId::ArrayLength => {
+                let arr_ptr = regs
+                    .first()
+                    .and_then(|v| v.as_ptr())
+                    .unwrap_or(std::ptr::null_mut());
+                let len = if arr_ptr.is_null() {
+                    0
+                } else {
+                    self.array_len(arr_ptr).unwrap_or(0) as i64
+                };
+                Some(Value::int(len))
+            }
+        }
+    }
 
     /// Built-in effects for actor-free scripts: `IO.print` writes the
     /// first staged argument to stdout, `IO.read` reads one stdin line
@@ -2435,13 +2501,22 @@ pub struct SuspendedVmState {
 struct CachedPerformName {
     qualified: std::sync::Arc<str>,
     dot: Option<usize>,
+    builtin: Option<BuiltinEffectId>,
 }
 
 impl CachedPerformName {
     fn new(name: &str) -> Self {
+        let builtin = match name {
+            "Int.to_float" => Some(BuiltinEffectId::IntToFloat),
+            "Float.sqrt" => Some(BuiltinEffectId::FloatSqrt),
+            "String.length" => Some(BuiltinEffectId::StringLength),
+            "Array.length" => Some(BuiltinEffectId::ArrayLength),
+            _ => None,
+        };
         Self {
             qualified: std::sync::Arc::from(name),
             dot: name.find('.'),
+            builtin,
         }
     }
 
@@ -3841,6 +3916,32 @@ impl VM {
     ) -> NuResult<()> {
         let eff_name_idx = instr.imm16() as usize;
         let dst_reg = instr.op3;
+
+        // Handler-free pure builtins can bypass qualified-name resolution
+        // entirely. The cached ID is Copy, so this avoids even the Arc<str>
+        // refcount traffic of the Stage-1 parsed-name path. Runtime-backed
+        // callbacks decline this hook and continue through the ordinary
+        // module-aware policy/authority dispatch below.
+        if self.handler_stack.is_empty() {
+            let cached_builtin = self
+                .perform_name_cache
+                .get(module_idx)
+                .and_then(|module_cache| module_cache.get(eff_name_idx))
+                .and_then(|cached| cached.as_ref())
+                .and_then(|cached| cached.builtin);
+            if let (Some(builtin), Some(module)) =
+                (cached_builtin, self.modules.get(module_idx))
+            {
+                if let Some(result) = self.actor_callbacks.perform_builtin_id_in_module(
+                    builtin,
+                    module,
+                    &self.frames[frame_idx].regs,
+                ) {
+                    self.frames[frame_idx].regs[dst_reg as usize] = result;
+                    return Ok(());
+                }
+            }
+        }
 
         // The MIR pipeline encodes the performed operation as "Effect.op"
         // (e.g. "IO.print"). Resolve that stable identity from the module-load
@@ -8006,6 +8107,60 @@ mod vm_tests {
     }
 
     #[test]
+    fn test_cached_builtin_generic_perform_preserves_handler_precedence() {
+        let mut module = CodeModule::new("test_cached_builtin_handler_precedence");
+        module.add_handler_table(HandlerTable {
+            bindings: vec![HandlerBinding {
+                effect_name: "Float.sqrt".to_string(),
+                handler_offset: 7,
+                arg_count: 1,
+                result_reg: 0,
+                single_shot: false,
+            }],
+            fallback_offset: None,
+        });
+
+        let effect = module.add_constant(Constant::String("Float.sqrt".to_string()));
+        let nine = module.add_constant(Constant::Float(9.0));
+        let handled = module.add_constant(Constant::Float(144.0));
+
+        module.emit(Instruction::new1(OpCode::Handle, 0)); // 0
+        module.emit(Instruction::new3(
+            OpCode::ConstU,
+            ((nine >> 8) & 0xff) as u8,
+            (nine & 0xff) as u8,
+            0,
+        )); // 1
+        module.emit(Instruction::new3(
+            OpCode::Perform,
+            ((effect >> 8) & 0xff) as u8,
+            (effect & 0xff) as u8,
+            0,
+        )); // 2
+        module.emit(Instruction::new0(OpCode::Unwind)); // 3
+        module.emit(Instruction::new0(OpCode::Halt)); // 4
+        module.emit(Instruction::new0(OpCode::Nop)); // 5
+        module.emit(Instruction::new0(OpCode::Nop)); // 6
+        module.emit(Instruction::new3(
+            OpCode::ConstU,
+            ((handled >> 8) & 0xff) as u8,
+            (handled & 0xff) as u8,
+            0,
+        )); // 7
+        module.emit(Instruction::new1(OpCode::Resume, 0)); // 8
+        module.entry_point = Some(0);
+
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+        let result = vm.run().expect("handled generic builtin must run");
+        assert_eq!(
+            result.as_float(),
+            Some(144.0),
+            "explicit handler must win over cached builtin fallback"
+        );
+    }
+
+    #[test]
     fn test_perform_name_cache_tracks_only_perform_constants() {
         let mut module = CodeModule::new("test_perform_name_cache");
         module
@@ -8028,6 +8183,7 @@ mod vm_tests {
             .expect("Perform constant must be cached");
         assert_eq!(cached.qualified.as_ref(), "Float.sqrt");
         assert_eq!(cached.parts(), ("Float", Some("sqrt")));
+        assert_eq!(cached.builtin, Some(BuiltinEffectId::FloatSqrt));
         assert!(
             vm.perform_name_cache[0][1].is_none(),
             "unreferenced constants must not be cached"
