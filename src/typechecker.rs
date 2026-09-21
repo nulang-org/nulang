@@ -1634,6 +1634,7 @@ impl TypeChecker {
             Decl::Actor {
                 name,
                 state_fields,
+                indexes,
                 behaviors,
                 events,
                 migrations,
@@ -1643,6 +1644,7 @@ impl TypeChecker {
                 ctx,
                 name,
                 state_fields,
+                indexes,
                 behaviors,
                 events,
                 migrations,
@@ -3597,6 +3599,7 @@ impl TypeChecker {
         ctx: &TypeContext,
         name: &str,
         state_fields: &[(String, crate::ast::StateModel, Type, Expr)],
+        indexes: &[crate::ast::IndexDecl],
         behaviors: &[Behavior],
         events: &[crate::ast::EventDecl],
         migrations: &[crate::ast::MigrationDecl],
@@ -3639,6 +3642,66 @@ impl TypeChecker {
                             expected_ty
                         ),
                         default_expr.span(),
+                    ));
+                }
+            }
+        }
+
+        // Indexes are logical access paths over durable state. Validate them
+        // against the compiler-owned actor schema before any physical backend
+        // gets a chance to realize them.
+        let mut index_names = std::collections::HashSet::new();
+        for index in indexes {
+            if !index_names.insert(index.name.as_str()) {
+                return Err(NuError::type_error(
+                    format!("duplicate index '{}' on '{}'", index.name, name),
+                    index.span,
+                ));
+            }
+
+            let mut indexed_fields = std::collections::HashSet::new();
+            for field in &index.fields {
+                if !indexed_fields.insert(field.as_str()) {
+                    return Err(NuError::type_error(
+                        format!(
+                            "index '{}' on '{}' contains duplicate field '{}'",
+                            index.name, name, field
+                        ),
+                        index.span,
+                    ));
+                }
+
+                let Some((_, model, _, _)) = state_fields
+                    .iter()
+                    .find(|(field_name, _, _, _)| field_name == field)
+                else {
+                    let available = state_fields
+                        .iter()
+                        .map(|(field_name, _, _, _)| field_name.clone())
+                        .collect::<Vec<_>>();
+                    return Err(NuError::TypeError {
+                        msg: format!(
+                            "index '{}' on '{}' references unknown state field '{}'",
+                            index.name, name, field
+                        ),
+                        span: index.span,
+                        expected_type: Some("declared state field".to_string()),
+                        found_type: Some(field.clone()),
+                        similar_names: if available.is_empty() {
+                            None
+                        } else {
+                            Some(available)
+                        },
+                    });
+                };
+
+                if matches!(model, crate::ast::StateModel::Local) {
+                    return Err(NuError::type_error(
+                        format!(
+                            "index '{}' on '{}' cannot reference local field '{}'; indexes require durable, event-sourced, or CRDT state",
+                            index.name, name, field
+                        ),
+                        index.span,
                     ));
                 }
             }

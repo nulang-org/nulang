@@ -42,6 +42,14 @@ version + migration.*
 
 ## Stable tier
 
+### Typed durable entity indexes — 2026-09-21
+- **Compiler-owned logical secondary indexes** (Experimental, `src/ast.rs`,
+  `src/data_plan.rs`). Durable entities may declare contextual
+  `index` / `unique index` access paths. The parser and typechecker validate
+  them against durable state, HIR preserves them without choosing a storage
+  engine, and the first logical planner selects unique or composite-prefix
+  access paths independently of SQL/backend details.
+
 ### Unified durable change stream — 2026-09-21
 - **Runtime-owned durable change feed** (Experimental, `src/runtime/change_stream.rs`).
   Existing actor message journals, event-sourced mutations, and workflow events

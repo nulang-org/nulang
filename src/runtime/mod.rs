@@ -19,6 +19,7 @@ pub mod cache_routing;
 #[cfg(feature = "cache-server")]
 pub mod cache_server;
 pub mod change_stream;
+pub mod data_index;
 mod gc;
 pub mod heap;
 pub(crate) mod heap_serialize;
@@ -103,6 +104,7 @@ pub use cluster::*;
 pub use crdt::*;
 pub use crdt_manager::*;
 pub use crdt_reg::{LWWRegister, MVRegister, RGAElement, RGA};
+pub use data_index::*;
 pub use distributed::*;
 pub use gc::{ForeignRefOp, GcStats, OrcaCoordinator, OrcaGc, OrcaHeap};
 pub use grain::*;
