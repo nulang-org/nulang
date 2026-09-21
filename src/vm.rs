@@ -404,9 +404,10 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
 pub(crate) struct StandaloneVmCallbacks {
     heap: ActorHeap,
     gc: crate::runtime::OrcaGc,
-    /// Deny ambient host authority for actor-free execution. When enabled,
-    /// resource effects return nil instead of touching the host.
-    deny_ambient_host_effects: bool,
+    /// Host-authority policy for actor-free execution. Trusted local scripts,
+    /// explicitly granted execution, and deny-all sandboxes all use the same
+    /// typed authorization boundary.
+    execution_authority: crate::authority::ExecutionAuthority,
     /// Test hook: when set, `IO.print` output is recorded here instead of
     /// written to stdout.
     io_output: Option<std::rc::Rc<std::cell::RefCell<Vec<String>>>>,
@@ -422,7 +423,7 @@ impl StandaloneVmCallbacks {
         Self {
             heap,
             gc: crate::runtime::OrcaGc::new(0),
-            deny_ambient_host_effects: false,
+            execution_authority: crate::authority::ExecutionAuthority::trusted_ambient(),
             io_output: None,
             routes: Vec::new(),
         }
@@ -949,6 +950,18 @@ pub(crate) fn hashmap_op(
 }
 
 impl ActorVmCallbacks for StandaloneVmCallbacks {
+    fn authorize_ffi(&mut self, library: &str, symbol: &str) -> bool {
+        if library.is_empty() || symbol.is_empty() {
+            return false;
+        }
+        let grant = crate::authority::AuthorityGrant::Other {
+            namespace: "FFI".to_string(),
+            operation: "Call".to_string(),
+            argument: Some(format!("{library}::{symbol}")),
+        };
+        self.execution_authority.allows(&grant)
+    }
+
     fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
         self.heap.alloc(size, type_tag)
     }
@@ -1010,19 +1023,21 @@ impl ActorVmCallbacks for StandaloneVmCallbacks {
         constants: &[Constant],
         regs: &[Value],
     ) -> Option<Value> {
-        if self.deny_ambient_host_effects
-            && matches!(
-                effect_name,
-                "FS" | "Http" | "Env" | "Process" | "System" | "DB" | "Python" | "Realtime"
-            )
-        {
-            return Some(Value::nil());
-        }
-        if self.deny_ambient_host_effects
-            && effect_name == "Web"
-            && op_name == Some("serve_static")
-        {
-            return Some(Value::nil());
+        match crate::runtime::callbacks::required_host_authority(
+            effect_name,
+            op_name,
+            constants,
+            regs,
+        ) {
+            Ok(Some(grant)) if !self.execution_authority.allows(&grant) => {
+                return Some(Value::nil());
+            }
+            Err(_) => {
+                // Invalid resource descriptions fail closed at the same
+                // boundary rather than falling through to a host operation.
+                return Some(Value::nil());
+            }
+            _ => {}
         }
         if effect_name == "Actor" || effect_name == "Otp" {
             return Some(Value::nil());
@@ -2860,19 +2875,25 @@ impl VM {
         self.modules.get(f.module_idx).and_then(|m| m.line_at(f.pc))
     }
 
-    /// Enable or disable deny-by-default host authority for standalone VM
-    /// execution. The sandboxed profile blocks filesystem, network/HTTP,
-    /// environment, process, system, database, Python, realtime, and
-    /// filesystem-backed Web effects. It also denies dynamic FFI.
-    pub fn set_sandboxed_host_effects(&mut self, enabled: bool) {
+    /// Set top-level host authority for standalone execution.
+    pub fn set_execution_authority(
+        &mut self,
+        authority: crate::authority::ExecutionAuthority,
+    ) {
         if let Some(sb) = (&mut *self.actor_callbacks as &mut dyn std::any::Any)
             .downcast_mut::<StandaloneVmCallbacks>()
         {
-            sb.deny_ambient_host_effects = enabled;
+            sb.execution_authority = authority;
         }
-        if enabled {
-            self.set_ffi_sandbox(true, Vec::new());
-        }
+    }
+
+    /// Compatibility wrapper used by the CLI's `--sandboxed` flag.
+    pub fn set_sandboxed_host_effects(&mut self, enabled: bool) {
+        self.set_execution_authority(if enabled {
+            crate::authority::ExecutionAuthority::deny_all()
+        } else {
+            crate::authority::ExecutionAuthority::trusted_ambient()
+        });
     }
 
     /// Enable FFI sandboxing, restricting calls to the given library paths.
@@ -7239,7 +7260,7 @@ mod vm_tests {
     #[test]
     fn sandboxed_standalone_callbacks_deny_process_execution() {
         let mut callbacks = StandaloneVmCallbacks::new();
-        callbacks.deny_ambient_host_effects = true;
+        callbacks.execution_authority = crate::authority::ExecutionAuthority::deny_all();
         let constants = vec![Constant::String("printf should-not-run".to_string())];
         let result = callbacks
             .perform_builtin_effect(
