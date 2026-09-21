@@ -16,10 +16,10 @@ const stages = [
   },
   {
     label: 'Runtime state',
-    status: 'Alpha',
+    status: 'Implemented',
     title: 'Durable actors',
     detail: 'snapshots · journals · restart hydration · pluggable stores',
-    tone: 'alpha',
+    tone: 'implemented',
   },
 ];
 ---
@@ -76,7 +76,7 @@ const stages = [
     <div class="experimental-lane">
       <div class="lane-label">
         <span>Optional boundaries</span>
-        <span class="experimental-badge">Experimental</span>
+        <span class="experimental-badge">Experimental tier</span>
       </div>
       <div class="experimental-items">
         <div>
@@ -179,8 +179,8 @@ const stages = [
     border-left: 3px solid var(--nu-blue);
   }
 
-  .architecture-node.alpha {
-    border-left: 3px solid var(--nu-accent-high);
+  .architecture-node.implemented {
+    border-left: 3px solid var(--nu-blue);
   }
 
   .node-meta,
@@ -213,9 +213,9 @@ const stages = [
     color: var(--nu-blue);
   }
 
-  .alpha .node-status {
-    background: color-mix(in srgb, var(--nu-accent-high) 10%, transparent);
-    color: var(--nu-accent-high);
+  .implemented .node-status {
+    background: color-mix(in srgb, var(--nu-blue) 9%, transparent);
+    color: var(--nu-blue);
   }
 
   .architecture-node strong {
