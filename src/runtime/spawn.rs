@@ -21,6 +21,7 @@ pub(crate) fn spawn_actor_with_models(
     state_models: HashMap<String, StateModel>,
     persistent: bool,
     workflow: Option<&str>,
+    schema_version: u32,
 ) -> u64 {
     spawn_actor_with_id(
         rt,
@@ -29,6 +30,7 @@ pub(crate) fn spawn_actor_with_models(
         state_models,
         persistent,
         workflow,
+        schema_version,
     )
 }
 
@@ -41,13 +43,13 @@ pub(crate) fn spawn_actor_with_models(
 fn preflight_persistent_snapshot(
     rt: &Runtime,
     actor_id: u64,
-) -> Result<Option<(ActorSnapshot, AuthorityManifest)>, RuntimeAuthorityError> {
-    let Some(snapshot) = rt.persistence.load_snapshot(actor_id) else {
+) -> Result<Option<(u32, ActorSnapshot, AuthorityManifest)>, RuntimeAuthorityError> {
+    let Some((schema_version, snapshot)) = rt.persistence.load_snapshot_versioned(actor_id) else {
         return Ok(None);
     };
     let manifest =
         AuthorityManifest::from_tokens(snapshot.authority_tokens.iter().map(String::as_str))?;
-    Ok(Some((snapshot, manifest)))
+    Ok(Some((schema_version, snapshot, manifest)))
 }
 
 /// Spawn an actor with a pre-assigned id. `Runtime::spawn_actor_near` uses
@@ -60,6 +62,7 @@ pub(crate) fn spawn_actor_with_id(
     state_models: HashMap<String, StateModel>,
     persistent: bool,
     workflow: Option<&str>,
+    schema_version: u32,
 ) -> u64 {
     let restart_snapshot = if persistent && workflow.is_none() {
         match preflight_persistent_snapshot(rt, id) {
@@ -84,6 +87,7 @@ pub(crate) fn spawn_actor_with_id(
     }
     actor.state_models = state_models;
     actor.persistent = persistent;
+    actor.schema_version = schema_version;
     let workflow_name = workflow.map(|n| n.to_string());
     if let Some(name) = workflow {
         // Legacy storage field retained until the versioned ActorRole format
@@ -153,14 +157,15 @@ pub(crate) fn spawn_actor_with_id(
 fn restore_persistent_state(
     rt: &Runtime,
     actor: &mut Actor,
-    snapshot: Option<(ActorSnapshot, AuthorityManifest)>,
+    snapshot: Option<(u32, ActorSnapshot, AuthorityManifest)>,
 ) {
     // Event-sourced-only actors may have an event log but no snapshot
     // (EventSourced fields are excluded from snapshots by design), so both
     // halves run independently. Authority was parsed in the preflight phase
     // before the actor was initialized or made observable.
-    if let Some((snapshot, authority)) = snapshot {
+    if let Some((schema_version, snapshot, authority)) = snapshot {
         actor.install_authority_manifest(&authority);
+        actor.schema_version = schema_version;
         actor.sequence = snapshot.sequence;
         actor.waiting_signal = snapshot.waiting_signal;
         for (name, value) in snapshot.state {
@@ -281,9 +286,17 @@ pub(crate) fn spawn_from_module(
             } else {
                 None
             },
+            meta.version,
         )
     } else {
-        spawn_actor_with_models(rt, Box::new(move || init), HashMap::new(), false, None)
+        spawn_actor_with_models(
+            rt,
+            Box::new(move || init),
+            HashMap::new(),
+            false,
+            None,
+            crate::persistence_schema::LEGACY_SCHEMA_VERSION,
+        )
     };
     let offsets: Vec<usize> = bytecode_offsets_for_role(module, role);
     // compensation_offsets filtered to this actor's own behaviors so
@@ -305,6 +318,7 @@ pub(crate) fn spawn_from_module(
         actor.bytecode_offsets = offsets.clone();
         actor.compensation_offsets = compensation_offsets.clone();
         if let Some(meta) = meta {
+            actor.schema_version = meta.version;
             if matches!(role, ActorRole::Agent) {
                 // Legacy storage flag retained until the serialized role enum
                 // replaces the compatibility booleans.
@@ -570,6 +584,7 @@ mod authority_tests {
             std::collections::HashMap::new(),
             true,
             None,
+            crate::persistence_schema::LEGACY_SCHEMA_VERSION,
         );
 
         assert_eq!(returned, actor_id);
@@ -615,6 +630,7 @@ mod authority_tests {
             std::collections::HashMap::new(),
             true,
             None,
+            crate::persistence_schema::LEGACY_SCHEMA_VERSION,
         );
 
         assert_eq!(returned, actor_id);
