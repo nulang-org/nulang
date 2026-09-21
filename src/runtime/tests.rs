@@ -7459,3 +7459,143 @@ fn identified_migration_rejects_missing_provenance_without_downgrade() {
     assert!(!runtime.receive_migrated_actor(actor_id, nbc_bytes, snapshot_json,));
     assert!(!runtime.actors.contains_key(&actor_id));
 }
+
+#[test]
+fn runtime_artifact_cache_admits_only_verified_exact_artifact() {
+    use crate::artifact_identity::ArtifactIdentityManifest;
+    use crate::bytecode::{ActorMeta, CodeModule};
+    use crate::content_identity::SemanticId;
+    use crate::runtime::network::RuntimeArtifactProvenance;
+    use crate::runtime_artifact_manifest::RuntimeArtifactManifest;
+
+    let semantic_id = SemanticId::from_canonical_bytes(b"cache-program", []);
+    let definition_id = SemanticId::from_canonical_bytes(b"cache-definition", []);
+    let identity = ArtifactIdentityManifest::new(
+        None,
+        semantic_id,
+        "nulangc-test",
+        "portable",
+        "nulang-abi-v1",
+        "bytecode",
+        ["bytecode-format=1"],
+    );
+    let mut module = CodeModule::new("cache-module");
+    module.semantic_id = Some(semantic_id);
+    module.actor_metadata.push(ActorMeta::new("Counter"));
+    module.actor_semantic_ids.push(definition_id);
+    module.attach_artifact_identity(&identity).unwrap();
+
+    let manifest = RuntimeArtifactManifest::from_module(&module, &identity).unwrap();
+    let bytes = module.to_nbc(None).unwrap();
+    let provenance = RuntimeArtifactProvenance {
+        nbc_blake3: *blake3::hash(&bytes).as_bytes(),
+        runtime_manifest_json: manifest.to_json().unwrap(),
+    };
+
+    let mut runtime = Runtime::new();
+    runtime
+        .cache_runtime_artifact(identity.artifact_id(), bytes.clone(), provenance.clone())
+        .unwrap();
+
+    let (cached_bytes, cached_provenance) = {
+        let cached = runtime.artifact_cache.get(&identity.artifact_id()).unwrap();
+        assert_eq!(cached.bytes, bytes);
+        assert_eq!(cached.provenance, provenance);
+        assert_eq!(cached.module.artifact_id, Some(identity.artifact_id()));
+        assert_eq!(cached.module.actor_semantic_ids, vec![definition_id]);
+        (cached.bytes.clone(), cached.provenance.clone())
+    };
+
+    // Exact repeat is idempotent.
+    runtime
+        .cache_runtime_artifact(identity.artifact_id(), cached_bytes, cached_provenance)
+        .unwrap();
+}
+
+#[test]
+fn runtime_artifact_cache_rejects_wrong_expected_artifact_id() {
+    use crate::artifact_identity::ArtifactIdentityManifest;
+    use crate::bytecode::{ActorMeta, CodeModule};
+    use crate::content_identity::{ArtifactId, SemanticId};
+    use crate::runtime::network::RuntimeArtifactProvenance;
+    use crate::runtime_artifact_manifest::RuntimeArtifactManifest;
+
+    let semantic_id = SemanticId::from_canonical_bytes(b"cache-mismatch", []);
+    let definition_id = SemanticId::from_canonical_bytes(b"cache-definition", []);
+    let identity = ArtifactIdentityManifest::new(
+        None,
+        semantic_id,
+        "nulangc-test",
+        "portable",
+        "nulang-abi-v1",
+        "bytecode",
+        ["bytecode-format=1"],
+    );
+    let mut module = CodeModule::new("cache-mismatch-module");
+    module.semantic_id = Some(semantic_id);
+    module.actor_metadata.push(ActorMeta::new("Counter"));
+    module.actor_semantic_ids.push(definition_id);
+    module.attach_artifact_identity(&identity).unwrap();
+
+    let manifest = RuntimeArtifactManifest::from_module(&module, &identity).unwrap();
+    let bytes = module.to_nbc(None).unwrap();
+    let provenance = RuntimeArtifactProvenance {
+        nbc_blake3: *blake3::hash(&bytes).as_bytes(),
+        runtime_manifest_json: manifest.to_json().unwrap(),
+    };
+    let wrong = ArtifactId::from_semantic(
+        SemanticId::from_canonical_bytes(b"other", []),
+        "nulangc-test",
+        "portable",
+        "nulang-abi-v1",
+        "bytecode",
+        ["bytecode-format=1"],
+    );
+
+    let mut runtime = Runtime::new();
+    let error = runtime
+        .cache_runtime_artifact(wrong, bytes, provenance)
+        .unwrap_err();
+    assert!(error.contains("expected"), "{error}");
+    assert!(runtime.artifact_cache.is_empty());
+}
+
+#[test]
+fn runtime_artifact_fetch_materializes_identified_recovery_module_once() {
+    use crate::artifact_identity::ArtifactIdentityManifest;
+    use crate::bytecode::{ActorMeta, CodeModule};
+    use crate::content_identity::SemanticId;
+
+    let semantic_id = SemanticId::from_canonical_bytes(b"fetch-materialize", []);
+    let definition_id = SemanticId::from_canonical_bytes(b"fetch-materialize-definition", []);
+    let identity = ArtifactIdentityManifest::new(
+        None,
+        semantic_id,
+        "nulangc-test",
+        "portable",
+        "nulang-abi-v1",
+        "bytecode",
+        ["bytecode-format=1"],
+    );
+    let mut module = CodeModule::new("fetch-materialize-module");
+    module.semantic_id = Some(semantic_id);
+    module.actor_metadata.push(ActorMeta::new("Counter"));
+    module.actor_semantic_ids.push(definition_id);
+    module.attach_artifact_identity(&identity).unwrap();
+
+    let actor_id = 730_100;
+    let mut runtime = Runtime::new();
+    runtime.register_recovery_module_for_definition(actor_id, "Counter", module, vec![], vec![]);
+
+    let first = runtime
+        .runtime_artifact_for_fetch(identity.artifact_id())
+        .expect("identified recovery module should materialize");
+    assert_eq!(first.module.artifact_id, Some(identity.artifact_id()));
+    assert!(runtime.artifact_cache.contains_key(&identity.artifact_id()));
+
+    let second = runtime
+        .runtime_artifact_for_fetch(identity.artifact_id())
+        .expect("cache hit should return exact artifact");
+    assert_eq!(first.bytes, second.bytes);
+    assert_eq!(first.provenance, second.provenance);
+}

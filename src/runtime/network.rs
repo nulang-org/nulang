@@ -533,6 +533,8 @@ const TYPE_CRDT_OP: u8 = 13;
 const TYPE_MIGRATE_ACTOR: u8 = 14;
 const TYPE_NODE_GOODBYE: u8 = 15;
 const TYPE_SHADOW_REPLICATE: u8 = 16;
+const TYPE_FETCH_ARTIFACT_REQUEST: u8 = 17;
+const TYPE_FETCH_ARTIFACT_RESPONSE: u8 = 18;
 
 // ---------------------------------------------------------------------------
 // NodeId
@@ -679,6 +681,21 @@ pub enum Packet {
         /// is not known to the responding node.
         nbc_bytes: Option<Vec<u8>>,
     },
+
+    /// Request one exact compiled runtime artifact by ArtifactId.
+    FetchArtifactRequest {
+        artifact_id: crate::content_identity::ArtifactId,
+    },
+
+    /// Response to `FetchArtifactRequest`.
+    ///
+    /// A present artifact always includes both NBC bytes and the byte-verified
+    /// runtime provenance needed for cache admission. `None` means the peer
+    /// does not currently retain or reconstruct that ArtifactId.
+    FetchArtifactResponse {
+        artifact_id: crate::content_identity::ArtifactId,
+        artifact: Option<(Vec<u8>, RuntimeArtifactProvenance)>,
+    },
     /// Register a link between a local watcher and a remote target.
     Link {
         watcher: RemoteLink,
@@ -795,6 +812,8 @@ impl Packet {
             TYPE_DOWN => Self::read_down(payload)?,
             TYPE_NODE_GOODBYE => Self::read_node_goodbye(payload)?,
             TYPE_SHADOW_REPLICATE => Self::read_shadow_replicate(payload)?,
+            TYPE_FETCH_ARTIFACT_REQUEST => Self::read_fetch_artifact_request(payload)?,
+            TYPE_FETCH_ARTIFACT_RESPONSE => Self::read_fetch_artifact_response(payload)?,
             _ => return None,
         };
         Some((seq, packet))
@@ -899,6 +918,8 @@ impl Packet {
             Packet::MigrateActor { .. } => TYPE_MIGRATE_ACTOR,
             Packet::NodeGoodbye { .. } => TYPE_NODE_GOODBYE,
             Packet::ShadowReplicate { .. } => TYPE_SHADOW_REPLICATE,
+            Packet::FetchArtifactRequest { .. } => TYPE_FETCH_ARTIFACT_REQUEST,
+            Packet::FetchArtifactResponse { .. } => TYPE_FETCH_ARTIFACT_RESPONSE,
         }
     }
 
@@ -1076,6 +1097,24 @@ impl Packet {
                     None => {
                         buf.extend_from_slice(&0u32.to_be_bytes());
                     }
+                }
+            }
+            Packet::FetchArtifactRequest { artifact_id } => {
+                buf.extend_from_slice(artifact_id.as_bytes());
+            }
+            Packet::FetchArtifactResponse {
+                artifact_id,
+                artifact,
+            } => {
+                buf.extend_from_slice(artifact_id.as_bytes());
+                match artifact {
+                    Some((bytes, provenance)) => {
+                        buf.push(1);
+                        buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                        buf.extend_from_slice(bytes);
+                        write_runtime_manifest_tail(buf, Some(provenance));
+                    }
+                    None => buf.push(0),
                 }
             }
             Packet::Link { watcher, target } => {
@@ -1529,6 +1568,47 @@ impl Packet {
             epoch,
             artifact_provenance,
         })
+    }
+
+    fn read_fetch_artifact_request(payload: &[u8]) -> Option<Self> {
+        if payload.len() < 32 {
+            return None;
+        }
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(payload.get(..32)?);
+        Some(Packet::FetchArtifactRequest {
+            artifact_id: crate::content_identity::ArtifactId::from_digest_bytes(bytes),
+        })
+    }
+
+    fn read_fetch_artifact_response(payload: &[u8]) -> Option<Self> {
+        if payload.len() < 33 {
+            return None;
+        }
+        let mut id_bytes = [0u8; 32];
+        id_bytes.copy_from_slice(payload.get(..32)?);
+        let artifact_id = crate::content_identity::ArtifactId::from_digest_bytes(id_bytes);
+        match *payload.get(32)? {
+            0 => Some(Packet::FetchArtifactResponse {
+                artifact_id,
+                artifact: None,
+            }),
+            1 => {
+                let byte_len = read_u32(payload, 33)? as usize;
+                let bytes_start = 37usize;
+                let bytes_end = bytes_start.checked_add(byte_len)?;
+                if bytes_end > payload.len() {
+                    return None;
+                }
+                let bytes = payload[bytes_start..bytes_end].to_vec();
+                let provenance = read_runtime_manifest_tail(payload, bytes_end)??;
+                Some(Packet::FetchArtifactResponse {
+                    artifact_id,
+                    artifact: Some((bytes, provenance)),
+                })
+            }
+            _ => None,
+        }
     }
 
     fn read_fetch_behavior_request(payload: &[u8]) -> Option<Self> {
@@ -3841,6 +3921,73 @@ mod tests {
         let bytes = packet.to_bytes(1);
         let truncated = &bytes[..bytes.len() - 3];
         assert!(Packet::from_bytes(truncated).is_none());
+    }
+
+    #[test]
+    fn test_packet_fetch_artifact_request_roundtrip() {
+        let semantic =
+            crate::content_identity::SemanticId::from_canonical_bytes(b"fetch-request", []);
+        let artifact_id = crate::content_identity::ArtifactId::from_semantic(
+            semantic,
+            "compiler",
+            "target",
+            "abi",
+            "bytecode",
+            ["flag"],
+        );
+        let packet = Packet::FetchArtifactRequest { artifact_id };
+        let bytes = packet.to_bytes(74);
+        let (seq, decoded) = Packet::from_bytes(&bytes).expect("artifact request roundtrip");
+        assert_eq!(seq, 74);
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_fetch_artifact_response_roundtrip() {
+        let semantic =
+            crate::content_identity::SemanticId::from_canonical_bytes(b"fetch-response", []);
+        let artifact_id = crate::content_identity::ArtifactId::from_semantic(
+            semantic,
+            "compiler",
+            "target",
+            "abi",
+            "bytecode",
+            ["flag"],
+        );
+        let packet = Packet::FetchArtifactResponse {
+            artifact_id,
+            artifact: Some((
+                vec![1, 2, 3, 4],
+                RuntimeArtifactProvenance {
+                    nbc_blake3: [0xEF; 32],
+                    runtime_manifest_json: br#"{"version":1}"#.to_vec(),
+                },
+            )),
+        };
+        let bytes = packet.to_bytes(73);
+        let (seq, decoded) = Packet::from_bytes(&bytes).expect("artifact response roundtrip");
+        assert_eq!(seq, 73);
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_fetch_artifact_miss_roundtrip() {
+        let semantic = crate::content_identity::SemanticId::from_canonical_bytes(b"fetch-miss", []);
+        let artifact_id = crate::content_identity::ArtifactId::from_semantic(
+            semantic,
+            "compiler",
+            "target",
+            "abi",
+            "bytecode",
+            ["flag"],
+        );
+        let packet = Packet::FetchArtifactResponse {
+            artifact_id,
+            artifact: None,
+        };
+        let bytes = packet.to_bytes(72);
+        let (_, decoded) = Packet::from_bytes(&bytes).expect("artifact miss roundtrip");
+        assert_eq!(decoded, packet);
     }
 
     #[test]

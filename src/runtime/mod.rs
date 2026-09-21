@@ -310,6 +310,15 @@ pub enum RecoveryIdentityPolicy {
     LegacyCompatible,
 }
 
+/// One exact executable admitted to the runtime's content-addressed artifact
+/// cache after byte-digest, ArtifactId, manifest, and NBC-layout verification.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedRuntimeArtifact {
+    pub bytes: Vec<u8>,
+    pub provenance: network::RuntimeArtifactProvenance,
+    pub module: crate::bytecode::CodeModule,
+}
+
 pub struct Runtime {
     pub actors: HashMap<u64, Actor>,
     pub supervisors: HashMap<u64, Supervisor>,
@@ -455,6 +464,10 @@ pub struct Runtime {
     /// actor/workflow modules from restoring another definition's role,
     /// defaults, or state-model metadata.
     pub(crate) recovery_definition_indices: HashMap<u64, usize>,
+    /// Exact compiled artifacts admitted by ArtifactId after full provenance
+    /// verification. Unlike `behavior_cache`, this cache preserves the
+    /// whole executable + runtime semantic sidecars.
+    pub(crate) artifact_cache: HashMap<crate::content_identity::ArtifactId, CachedRuntimeArtifact>,
     /// Content-addressed bytecode cache for fetch-on-demand.
     /// When a node receives a message for an unknown content hash, it can
     /// request the bytecode from the sender and cache it here keyed by hash.
@@ -649,6 +662,7 @@ impl Runtime {
             recovery_modules: HashMap::new(),
             recovery_definition_semantic_ids: HashMap::new(),
             recovery_definition_indices: HashMap::new(),
+            artifact_cache: HashMap::new(),
             #[cfg(feature = "ai-runtime")]
             ai: AiRuntimeRegistry::new(),
             #[cfg(feature = "ai-runtime")]
@@ -676,6 +690,135 @@ impl Runtime {
             cross_shard_tx: None,
             cross_shard_rx: None,
         }
+    }
+
+    /// Admit one exact runtime artifact into the local content-addressed cache.
+    ///
+    /// Admission verifies the exact NBC bytes, re-derives the manifest's
+    /// ArtifactId, and binds all semantic sidecars to the decoded module.
+    /// Existing entries are immutable: a second representation for the same
+    /// ArtifactId is rejected rather than replacing verified code.
+    pub(crate) fn cache_runtime_artifact(
+        &mut self,
+        expected_id: crate::content_identity::ArtifactId,
+        bytes: Vec<u8>,
+        provenance: network::RuntimeArtifactProvenance,
+    ) -> Result<(), String> {
+        let actual_digest = *blake3::hash(&bytes).as_bytes();
+        if actual_digest != provenance.nbc_blake3 {
+            return Err(format!(
+                "artifact {expected_id} NBC digest does not match transported provenance"
+            ));
+        }
+
+        let runtime_manifest =
+            crate::runtime_artifact_manifest::RuntimeArtifactManifest::from_json(
+                &provenance.runtime_manifest_json,
+            )
+            .map_err(|error| format!("invalid runtime artifact manifest: {error}"))?;
+        if runtime_manifest.artifact_id() != expected_id {
+            return Err(format!(
+                "fetched runtime manifest identifies artifact {}, expected {expected_id}",
+                runtime_manifest.artifact_id()
+            ));
+        }
+
+        let mut module = crate::bytecode::CodeModule::from_nbc(&bytes)
+            .map_err(|error| format!("invalid fetched NBC artifact: {error}"))?
+            .module;
+        runtime_manifest
+            .bind_module(&mut module)
+            .map_err(|error| format!("runtime artifact manifest does not bind to NBC: {error}"))?;
+
+        if let Some(existing) = self.artifact_cache.get(&expected_id) {
+            if existing.bytes == bytes && existing.provenance == provenance {
+                return Ok(());
+            }
+            return Err(format!(
+                "artifact cache collision for immutable ArtifactId {expected_id}"
+            ));
+        }
+
+        self.artifact_cache.insert(
+            expected_id,
+            CachedRuntimeArtifact {
+                bytes,
+                provenance,
+                module,
+            },
+        );
+        Ok(())
+    }
+
+    /// Return a verified artifact suitable for serving to a peer.
+    ///
+    /// A cache miss can be satisfied from an identified recovery module; the
+    /// result is admitted through the same verifier before being returned.
+    pub(crate) fn runtime_artifact_for_fetch(
+        &mut self,
+        artifact_id: crate::content_identity::ArtifactId,
+    ) -> Option<CachedRuntimeArtifact> {
+        if let Some(cached) = self.artifact_cache.get(&artifact_id) {
+            return Some(cached.clone());
+        }
+
+        let module = self
+            .recovery_modules
+            .values()
+            .map(|(module, _, _)| module)
+            .find(|module| module.artifact_id == Some(artifact_id))
+            .cloned()?;
+        let identity = module.artifact_identity_manifest.as_ref()?;
+        let runtime_manifest =
+            crate::runtime_artifact_manifest::RuntimeArtifactManifest::from_module(
+                &module, identity,
+            )
+            .ok()?;
+        let runtime_manifest_json = runtime_manifest.to_json().ok()?;
+        let bytes = module.to_nbc(None).ok()?;
+        let provenance = network::RuntimeArtifactProvenance {
+            nbc_blake3: *blake3::hash(&bytes).as_bytes(),
+            runtime_manifest_json,
+        };
+
+        self.cache_runtime_artifact(artifact_id, bytes, provenance)
+            .ok()?;
+        self.artifact_cache.get(&artifact_id).cloned()
+    }
+
+    /// Request one exact runtime artifact from a known cluster peer.
+    ///
+    /// Delivery is asynchronous. A valid response is admitted into
+    /// `artifact_cache` by the distributed packet handler; malformed or
+    /// mismatched responses are discarded by `cache_runtime_artifact`.
+    pub fn request_runtime_artifact(
+        &mut self,
+        node: NodeId,
+        artifact_id: crate::content_identity::ArtifactId,
+    ) -> bool {
+        if self.artifact_cache.contains_key(&artifact_id) {
+            return true;
+        }
+        let address = self
+            .distributed
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.get_node(node))
+            .map(|info| info.address)
+            .or_else(|| {
+                self.distributed
+                    .transport
+                    .as_ref()
+                    .and_then(|transport| transport.connection_addr(node))
+            });
+        let Some(address) = address else {
+            return false;
+        };
+        let Some(transport) = self.distributed.transport.as_mut() else {
+            return false;
+        };
+        transport.send(node, address, Packet::FetchArtifactRequest { artifact_id });
+        true
     }
 
     /// Compute the BLAKE3 hash of `data` using the configured [`CryptoProvider`].

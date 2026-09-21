@@ -1234,6 +1234,41 @@ pub fn process_network_packets(
             Packet::Ack { packet_seq } => {
                 runtime.acked_packets.insert(packet_seq);
             }
+            Packet::FetchArtifactRequest { artifact_id } => {
+                let artifact = runtime
+                    .runtime_artifact_for_fetch(artifact_id)
+                    .map(|cached| (cached.bytes, cached.provenance));
+                let reply = Packet::FetchArtifactResponse {
+                    artifact_id,
+                    artifact,
+                };
+                let from = incoming.from_node;
+                let reply_addr = cluster
+                    .get_node(from)
+                    .map(|info| info.address)
+                    .or_else(|| transport.connection_addr(from));
+                if let Some(addr) = reply_addr {
+                    transport.send(from, addr, reply);
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::FetchArtifactResponse {
+                artifact_id,
+                artifact,
+            } => {
+                if let Some((bytes, provenance)) = artifact {
+                    if let Err(error) =
+                        runtime.cache_runtime_artifact(artifact_id, bytes, provenance)
+                    {
+                        warn!(
+                            artifact_id = %artifact_id,
+                            %error,
+                            "nulang-net: rejected fetched runtime artifact"
+                        );
+                    }
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
             Packet::FetchBehaviorRequest { content_hash } => {
                 let mut nbc_bytes: Option<Vec<u8>> = None;
                 let mut behavior_name = String::new();

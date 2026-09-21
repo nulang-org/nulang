@@ -1555,6 +1555,13 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Exact runtime artifact fetch/cache by ArtifactId — 2026-09-21
+- **Distributed runtimes now have a typed exact-artifact cache keyed by `ArtifactId`.** Cache admission verifies the transported NBC BLAKE3 digest, re-validates the versioned runtime manifest and its derived ArtifactId, binds semantic sidecars to decoded NBC, and rejects immutable-ID collisions.
+- **NUL0 gains `FetchArtifactRequest` / `FetchArtifactResponse` packets.** Requests carry the typed 32-byte ArtifactId; successful responses carry both NBC bytes and the byte-verified runtime provenance envelope. A response without valid provenance is never admitted as executable code.
+- **Peers can serve artifacts from the verified cache or reconstruct them from identified recovery modules.** Reconstructed artifacts pass back through the same admission verifier before being served, keeping a single trust boundary for local and remote artifact materialization.
+- **`Runtime::request_runtime_artifact` starts asynchronous peer fetches.** Cache hits complete immediately; cache misses send a request to the selected cluster node and verified responses populate the exact-artifact cache.
+- **Raw identity decoding is explicit.** Content identities use `from_digest_bytes` for already-hashed wire/storage representations, preserving the distinction from `SourceId::from_bytes`, which hashes source input.
+
 ### Provenance-preserving migration and shadow respawn — 2026-09-21
 - **Identified durable actors now keep their definition SemanticId and exact ArtifactId across node migration.** NUL0 v1 `MigrateActor` packets carry an additive, backward-compatible provenance tail containing a BLAKE3 digest of the exact NBC bytes plus the versioned runtime artifact manifest. Historical readers ignore the tail; current readers verify it before restoring identified state.
 - **Shadow replication preserves the same provenance.** `ShadowReplicate` stores the byte-verified manifest alongside NBC + snapshot state, and node-loss respawn reuses the provenance-verifying migration receiver instead of downgrading the replica to a legacy/unidentified snapshot.
