@@ -153,7 +153,11 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
 
         let old_values: Vec<(String, Value)> = event_sourced_names
             .iter()
-            .filter_map(|name| actor.get_state_field(name).map(|value| (name.clone(), value)))
+            .filter_map(|name| {
+                actor
+                    .get_state_field(name)
+                    .map(|value| (name.clone(), value))
+            })
             .collect();
 
         for name in &event_sourced_names {
