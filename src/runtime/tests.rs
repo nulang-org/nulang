@@ -176,7 +176,7 @@ fn test_delivery_establishes_child_context_and_inherits() {
             .mailbox
             .push(Message {
                 behavior_id: 0,
-                payload: Arc::new(vec![]),
+                payload: Arc::from(vec![]),
                 sender: 0,
                 priority: MessagePriority::Normal,
                 trace_id: Some(incoming.to_string()),
