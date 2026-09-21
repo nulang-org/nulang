@@ -4,9 +4,9 @@
 //! distribution.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::warn;
 
@@ -102,12 +102,12 @@ pub use change_stream::*;
 pub use cluster::*;
 pub use crdt::*;
 pub use crdt_manager::*;
-pub use crdt_reg::{LWWRegister, MVRegister, RGA, RGAElement};
+pub use crdt_reg::{LWWRegister, MVRegister, RGAElement, RGA};
 pub use distributed::*;
 pub use gc::{ForeignRefOp, GcStats, OrcaCoordinator, OrcaGc, OrcaHeap};
 pub use grain::*;
 pub use heap::*;
-pub use http_server::{HttpMethod, HttpServerState, WebDevServer, WebRoute, render_route_handler};
+pub use http_server::{render_route_handler, HttpMethod, HttpServerState, WebDevServer, WebRoute};
 pub use mailbox::*;
 pub use network::NetworkTransport;
 pub use network::*;
