@@ -2239,13 +2239,29 @@ pub fn process_network_packets(
                         continue;
                     }
                     msg.payload = Arc::new(payload_vec);
-                    if let Some(actor) = runtime.actors.get_mut(&target_actor) {
-                        let _ = actor.mailbox.push(msg);
-                        runtime.scheduler.enqueue(target_actor);
+                    if runtime.actors.contains_key(&target_actor) {
+                        let admission = {
+                            let actor = runtime.actors.get_mut(&target_actor).unwrap();
+                            actor.mailbox.push(msg)
+                        };
+                        match admission {
+                            Ok(()) => runtime.scheduler.enqueue(target_actor),
+                            Err(rejected) => {
+                                warn!(
+                                    "nulang-net: backpressure delivering remote message to actor {}: mailbox full",
+                                    target_actor
+                                );
+                                runtime.route_to_dlq(&rejected, "mailbox full");
+                            }
+                        }
                     } else {
                         notify_delivery_failed(runtime, msg.sender, "target actor not found");
                     }
                 }
+                // This ACK confirms transport-level processing only. A future
+                // application admission ACK/NACK must report Accepted vs
+                // Backpressured/Rejected to the sender without changing this
+                // reliability signal.
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
         }
