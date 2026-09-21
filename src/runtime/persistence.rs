@@ -543,14 +543,11 @@ impl PersistenceStore for MemoryStore {
         start_sequence: u64,
         limit: usize,
     ) -> Vec<JournalEntry> {
-        self.journals
-            .get(&actor_id)
-            .into_iter()
-            .flatten()
-            .filter(|entry| entry.sequence >= start_sequence)
-            .take(limit)
-            .cloned()
-            .collect()
+        let Some(entries) = self.journals.get(&actor_id) else {
+            return Vec::new();
+        };
+        let start = entries.partition_point(|entry| entry.sequence < start_sequence);
+        entries[start..].iter().take(limit).cloned().collect()
     }
 
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
@@ -594,14 +591,11 @@ impl PersistenceStore for MemoryStore {
         start_sequence: u64,
         limit: usize,
     ) -> Vec<WorkflowEvent> {
-        self.workflow_events
-            .get(&actor_id)
-            .into_iter()
-            .flatten()
-            .filter(|event| event.sequence() >= start_sequence)
-            .take(limit)
-            .cloned()
-            .collect()
+        let Some(events) = self.workflow_events.get(&actor_id) else {
+            return Vec::new();
+        };
+        let start = events.partition_point(|event| event.sequence() < start_sequence);
+        events[start..].iter().take(limit).cloned().collect()
     }
 
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
@@ -627,14 +621,11 @@ impl PersistenceStore for MemoryStore {
         start_sequence: u64,
         limit: usize,
     ) -> Vec<EventEntry> {
-        self.events
-            .get(&actor_id)
-            .into_iter()
-            .flatten()
-            .filter(|entry| entry.sequence >= start_sequence)
-            .take(limit)
-            .cloned()
-            .collect()
+        let Some(entries) = self.events.get(&actor_id) else {
+            return Vec::new();
+        };
+        let start = entries.partition_point(|entry| entry.sequence < start_sequence);
+        entries[start..].iter().take(limit).cloned().collect()
     }
 
     fn latest_sequence(&self, actor_id: u64) -> u64 {
