@@ -165,6 +165,29 @@ fn legacy_compatible_recovery_does_not_upgrade_provenance() {
 }
 
 #[test]
+fn legacy_nbc_transport_rejects_self_asserted_artifact_identity() {
+    let actor_id = 410_008;
+    let module = module_with_definition_identity("transported-artifact", None);
+    let nbc = module.to_nbc(None).expect("encode NBC v1");
+    let program_id = semantic(b"transported-program");
+    let artifact_id = nulang::content_identity::ArtifactId::from_semantic(
+        program_id,
+        "nulang-test",
+        "portable-nulang-vm",
+        "nbc-v1",
+        "bytecode",
+        std::iter::empty::<&str>(),
+    );
+    let mut asserted = snapshot(actor_id, None);
+    asserted.artifact_id = Some(artifact_id.to_string());
+    let snapshot_json = serde_json::to_vec(&asserted).unwrap();
+
+    let mut runtime = Runtime::new();
+    assert!(!runtime.receive_migrated_actor(actor_id, nbc, snapshot_json));
+    assert!(!runtime.actors.contains_key(&actor_id));
+}
+
+#[test]
 fn legacy_nbc_transport_rejects_self_asserted_semantic_identity() {
     let actor_id = 410_007;
     let id = semantic(b"transported");
