@@ -598,7 +598,7 @@ impl AddressResolver {
 
                 let msg = Message {
                     behavior_id: 0, // resolved from behavior_name at delivery
-                    payload: Arc::new(payload),
+                    payload: Arc::from(payload),
                     sender: sender_actor,
                     priority,
                     trace_id,
