@@ -2520,6 +2520,39 @@ fn test_libsql_store_event_schema_roundtrip() {
 
 #[cfg(feature = "sqlite")]
 #[test]
+fn test_libsql_store_preserves_multiple_event_fields_at_same_sequence() {
+    let mut store = LibsqlStore::in_memory().unwrap();
+
+    for (field, value) in [("balance", 10), ("reserved", 3)] {
+        store
+            .append_event(
+                77,
+                EventEntry {
+                    sequence: 9,
+                    schema_owner: Some("Account".to_string()),
+                    schema_version: 2,
+                    field_name: field.to_string(),
+                    event_name: "Adjusted".to_string(),
+                    args: vec![PersistedValue::Int(1)],
+                    value: PersistedValue::Int(value),
+                },
+            )
+            .unwrap();
+    }
+
+    let events = store.read_events(77);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].sequence, 9);
+    assert_eq!(events[1].sequence, 9);
+    assert_eq!(events[0].field_name, "balance");
+    assert_eq!(events[1].field_name, "reserved");
+    assert_eq!(events[0].value, PersistedValue::Int(10));
+    assert_eq!(events[1].value, PersistedValue::Int(3));
+    assert_eq!(store.latest_sequence(77), 9);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
 fn test_libsql_store_append_read_journal() {
     let mut store = LibsqlStore::in_memory().unwrap();
     store
