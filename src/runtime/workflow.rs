@@ -6,7 +6,6 @@
 //! to keep the god-object at a manageable size.
 
 use crate::bytecode::Constant;
-use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{EventEntry, PersistedValue, WorkflowEvent};
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
@@ -23,7 +22,7 @@ pub(crate) fn next_sequence(rt: &Runtime, actor_id: u64) -> u64 {
 pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
     rt.actors
         .get(&actor_id)
-        .map(|a| matches!(a.role(), Ok(ActorRole::Workflow)))
+        .map(|a| a.semantics().map(|s| s.is_workflow()).unwrap_or(false))
         .unwrap_or(false)
 }
 
