@@ -5,6 +5,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::package::behavior_manifest::BehaviorManifest;
 use crate::package::lockfile::{Lockfile, LOCKFILE_FILE};
 use crate::package::manifest::{Dependency, DependencyDetail, Manifest, MANIFEST_FILE};
 use crate::package::resolver::resolve;
@@ -1313,7 +1314,22 @@ fn cmd_build_wasm_target(aot: bool) -> NuResult<()> {
         .concat(),
     )?;
 
+    let behavior_manifest =
+        BehaviorManifest::for_wasm(&root, &manifest, &wasm_path).map_err(|error| {
+            NuError::PackageError {
+                msg: format!("cannot construct behavior manifest: {error}"),
+                span: Span::default(),
+            }
+        })?;
+    let behavior_path = behavior_manifest.write_next_to(&wasm_path).map_err(|error| {
+        NuError::PackageError {
+            msg: format!("cannot emit behavior manifest: {error}"),
+            span: Span::default(),
+        }
+    })?;
+
     println!("Build succeeded: {}", wasm_path.display());
+    println!("Behavior manifest: {}", behavior_path.display());
     if aot {
         let cwasm_path = wasm_path.with_extension("cwasm");
         println!("AOT artifact: {}", cwasm_path.display());
