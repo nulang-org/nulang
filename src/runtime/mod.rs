@@ -5190,7 +5190,11 @@ impl Runtime {
 
         if let Some((module, _, _)) = self.recovery_modules.get(&actor_id) {
             if module.artifact_id() == Some(artifact_id) {
-                match self.recovery_definition_semantic_ids.get(&actor_id).copied() {
+                match self
+                    .recovery_definition_semantic_ids
+                    .get(&actor_id)
+                    .copied()
+                {
                     Some(actual) if actual == expected_definition_semantic_id => return Ok(()),
                     Some(actual) => {
                         return Err(RecoveryIdentityError::HistoricalDefinitionMismatch {
