@@ -787,6 +787,45 @@ impl Runtime {
         self.artifact_cache.get(&artifact_id).cloned()
     }
 
+    /// Request one exact runtime artifact from a known cluster peer.
+    ///
+    /// Delivery is asynchronous. A valid response is admitted into
+    /// `artifact_cache` by the distributed packet handler; malformed or
+    /// mismatched responses are discarded by `cache_runtime_artifact`.
+    pub fn request_runtime_artifact(
+        &mut self,
+        node: NodeId,
+        artifact_id: crate::content_identity::ArtifactId,
+    ) -> bool {
+        if self.artifact_cache.contains_key(&artifact_id) {
+            return true;
+        }
+        let address = self
+            .distributed
+            .cluster
+            .as_ref()
+            .and_then(|cluster| cluster.get_node(node))
+            .map(|info| info.address)
+            .or_else(|| {
+                self.distributed
+                    .transport
+                    .as_ref()
+                    .and_then(|transport| transport.connection_addr(node))
+            });
+        let Some(address) = address else {
+            return false;
+        };
+        let Some(transport) = self.distributed.transport.as_mut() else {
+            return false;
+        };
+        transport.send(
+            node,
+            address,
+            Packet::FetchArtifactRequest { artifact_id },
+        );
+        true
+    }
+
     /// Compute the BLAKE3 hash of `data` using the configured [`CryptoProvider`].
     pub fn hash_bytes(&self, data: &[u8]) -> [u8; 32] {
         self.crypto.hash(data)
