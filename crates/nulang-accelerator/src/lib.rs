@@ -10,6 +10,14 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+pub mod graph;
+pub mod reference;
+pub mod session;
+
+pub use graph::{GraphOp, TensorGraph, TensorId};
+pub use reference::CpuTensor;
+pub use session::{AcceleratorSession, BufferId, BufferSpec, MemoryClass};
 use std::fmt;
 use thiserror::Error;
 
@@ -497,6 +505,22 @@ pub enum AcceleratorError {
     },
     #[error("tensor byte size overflow")]
     TensorSizeOverflow,
+    #[error("tensor data length mismatch: expected {expected} elements, found {found}")]
+    TensorDataLengthMismatch { expected: u64, found: usize },
+    #[error("CPU reference executor does not support dtype {0:?}")]
+    UnsupportedReferenceDType(DType),
+    #[error("expected a rank-2 matrix, found shape {shape:?}")]
+    ExpectedMatrix { shape: Vec<u64> },
+    #[error("tensor shape mismatch: left={left:?}, right={right:?}")]
+    ShapeMismatch { left: Vec<u64>, right: Vec<u64> },
+    #[error("matrix multiplication shape mismatch: left={left:?}, right={right:?}")]
+    MatMulShapeMismatch { left: Vec<u64>, right: Vec<u64> },
+    #[error("unknown tensor id {0}")]
+    UnknownTensor(u32),
+    #[error("graph input {id} does not match declared tensor spec")]
+    GraphInputMismatch { id: u32 },
+    #[error("buffer allocation of {requested} bytes exceeds device/session capacity")]
+    BufferCapacityExceeded { requested: u64 },
     #[error("duplicate device id {0}")]
     DuplicateDevice(DeviceId),
     #[error(
