@@ -1,0 +1,61 @@
+import lib
+
+fn main() {
+    let p = wgs84(-47.8828, -15.7939);
+    let point_json = point_to_geojson(p);
+    perform Test.assert(
+        point_json == "{\"type\":\"Point\",\"coordinates\":[-47.8828,-15.7939]}",
+        "point writer should emit compact RFC 7946 GeoJSON"
+    );
+    match point_from_geojson(point_json) {
+        Some(parsed) => perform Test.assert(
+            approx_equal(parsed.x, p.x, 0.0000001) &&
+            approx_equal(parsed.y, p.y, 0.0000001),
+            "point GeoJSON should round-trip"
+        ),
+        None => perform Test.assert(false, "valid point GeoJSON should parse"),
+    };
+
+    let line = line_string(
+        [wgs84(-48.0, -16.0), wgs84(-47.9, -15.9), wgs84(-47.8, -15.8)],
+        WGS84
+    );
+    let line_json = line_string_to_geojson(line);
+    match line_string_from_geojson(line_json) {
+        Some(parsed_line) => perform Test.assert(
+            perform Array.length(parsed_line.points) == 3 &&
+            approx_equal(parsed_line.points[1].x, -47.9, 0.0000001),
+            "line string GeoJSON should round-trip"
+        ),
+        None => perform Test.assert(false, "valid line string GeoJSON should parse"),
+    };
+
+    let shape = polygon(
+        [
+            wgs84(-48.0, -16.0),
+            wgs84(-47.0, -16.0),
+            wgs84(-47.0, -15.0),
+            wgs84(-48.0, -15.0)
+        ],
+        WGS84
+    );
+    let polygon_json = polygon_to_geojson(shape);
+    match polygon_from_geojson(polygon_json) {
+        Some(parsed_polygon) => perform Test.assert(
+            perform Array.length(parsed_polygon.ring) == 4 &&
+            approx_equal(parsed_polygon.ring[0].x, -48.0, 0.0000001),
+            "polygon GeoJSON should round-trip and remove duplicate closure"
+        ),
+        None => perform Test.assert(false, "valid polygon GeoJSON should parse"),
+    };
+
+    match point_from_geojson("{\"type\":\"Point\",\"coordinates\":[1,2,3]}") {
+        Some(_) => perform Test.assert(false, "3D point should be rejected by strict 2D reader"),
+        None => perform Test.assert(true, "3D point rejected"),
+    };
+
+    match polygon_from_geojson("{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[1,0],[1,1],[0,0]],[[0.2,0.2],[0.4,0.2],[0.2,0.2]]]}") {
+        Some(_) => perform Test.assert(false, "polygon holes should be rejected by single-ring reader"),
+        None => perform Test.assert(true, "polygon holes rejected"),
+    }
+}
