@@ -1,11 +1,14 @@
 // Nulang standard library — Result combinators.
 // Import: `import stdlib::result`
-
-/// The Result type: represents either success (Ok) or failure (Error).
-pub type Result[T, E] = Ok(T) | Error(E)
+//
+// `Result[T, E] = Ok(T) | Error(E)` is defined once in the auto-imported
+// prelude. This module owns operations on that canonical type.
 
 /// Unwrap a Result, returning the Ok value.
-/// Panics (via Test.assert) on Error.
+///
+/// This legacy aborting operation still routes through Test.assert until
+/// explicit panic has backend parity. Prefer total combinators such as
+/// unwrap_or / unwrap_or_else in portable code.
 pub fn unwrap[T, E](r: Result[T, E]) -> T {
     match r {
         Ok(x) => x,
@@ -18,6 +21,54 @@ pub fn map[T, U, E](r: Result[T, E], f) -> Result[U, E] {
     match r {
         Ok(x) => Ok(f(x)),
         Error(e) => Error(e),
+    }
+}
+
+/// Map a function over the error channel.
+pub fn map_err[T, E, F](r: Result[T, E], f) -> Result[T, F] {
+    match r {
+        Ok(x) => Ok(x),
+        Error(e) => Error(f(e)),
+    }
+}
+
+/// Chain a Result-returning function over a successful value.
+pub fn and_then[T, U, E](r: Result[T, E], f) -> Result[U, E] {
+    match r {
+        Ok(x) => f(x),
+        Error(e) => Error(e),
+    }
+}
+
+/// Recover from an Error using a Result produced by f.
+pub fn or_else[T, E, F](r: Result[T, E], f) -> Result[T, F] {
+    match r {
+        Ok(x) => Ok(x),
+        Error(e) => f(e),
+    }
+}
+
+/// Return the successful value or a provided default.
+pub fn unwrap_or[T, E](r: Result[T, E], default: T) -> T {
+    match r {
+        Ok(x) => x,
+        Error(_) => default,
+    }
+}
+
+/// Return the successful value or compute a fallback from the error.
+pub fn unwrap_or_else[T, E](r: Result[T, E], f) -> T {
+    match r {
+        Ok(x) => x,
+        Error(e) => f(e),
+    }
+}
+
+/// Convert a Result to Option, discarding the error value.
+pub fn to_option[T, E](r: Result[T, E]) -> Option[T] {
+    match r {
+        Ok(x) => Some(x),
+        Error(_) => None,
     }
 }
 
