@@ -582,7 +582,7 @@ fn lower_migration_state_function(
     full_name: &str,
     body: &hir::Body,
 ) -> NuResult<mir::Function> {
-    let mut lowerer = FnLowerer::new(ctx, full_name, Some(Type::unit()));
+    let mut lowerer = FnLowerer::new(ctx, full_name, None);
     let self_id = lowerer.b.add_local("self", Type::unit());
     lowerer.b.assign(self_id, mir::RValue::SelfRef);
     lowerer.bind("self", self_id);
