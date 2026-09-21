@@ -467,8 +467,7 @@ pub struct Runtime {
     /// Exact compiled artifacts admitted by ArtifactId after full provenance
     /// verification. Unlike `behavior_cache`, this cache preserves the
     /// whole executable + runtime semantic sidecars.
-    pub(crate) artifact_cache:
-        HashMap<crate::content_identity::ArtifactId, CachedRuntimeArtifact>,
+    pub(crate) artifact_cache: HashMap<crate::content_identity::ArtifactId, CachedRuntimeArtifact>,
     /// Content-addressed bytecode cache for fetch-on-demand.
     /// When a node receives a message for an unknown content hash, it can
     /// request the bytecode from the sender and cache it here keyed by hash.
@@ -818,11 +817,7 @@ impl Runtime {
         let Some(transport) = self.distributed.transport.as_mut() else {
             return false;
         };
-        transport.send(
-            node,
-            address,
-            Packet::FetchArtifactRequest { artifact_id },
-        );
+        transport.send(node, address, Packet::FetchArtifactRequest { artifact_id });
         true
     }
 
