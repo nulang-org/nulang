@@ -5129,6 +5129,152 @@ impl Runtime {
         }
     }
 
+    /// Recover a strongly identified durable actor by loading the exact
+    /// historical executable from immutable artifact retention.
+    ///
+    /// This path is intentionally unavailable to legacy snapshots: exact
+    /// artifact hydration requires both a persisted ArtifactId and a
+    /// definition-scoped SemanticId so the runtime can select one actor
+    /// definition inside a potentially multi-definition module without
+    /// guessing from short names or role flags.
+    pub fn recover_actor_from_artifact_store(
+        &mut self,
+        actor_id: u64,
+        store: &crate::artifact_store::FileArtifactStore,
+        identity_policy: RecoveryIdentityPolicy,
+    ) -> Result<u64, NuError> {
+        let snapshot = self
+            .persistence
+            .load_snapshot(actor_id)
+            .ok_or_else(|| NuError::RuntimeError {
+                msg: format!("actor {actor_id} has no durable snapshot"),
+                span: Span::new(0, 0),
+            })?;
+
+        let artifact_id = snapshot
+            .artifact_id
+            .as_deref()
+            .ok_or_else(|| NuError::RuntimeError {
+                msg: format!(
+                    "actor {actor_id} snapshot has no ArtifactId; historical executable recovery requires explicit provenance"
+                ),
+                span: Span::new(0, 0),
+            })?
+            .parse::<crate::content_identity::ArtifactId>()
+            .map_err(|error| NuError::RuntimeError {
+                msg: format!("actor {actor_id} has malformed ArtifactId: {error}"),
+                span: Span::new(0, 0),
+            })?;
+
+        let definition_id = snapshot
+            .semantic_id
+            .as_deref()
+            .ok_or_else(|| NuError::RuntimeError {
+                msg: format!(
+                    "actor {actor_id} snapshot has no definition SemanticId; exact definition selection is impossible"
+                ),
+                span: Span::new(0, 0),
+            })?
+            .parse::<crate::content_identity::SemanticId>()
+            .map_err(|error| NuError::RuntimeError {
+                msg: format!("actor {actor_id} has malformed definition SemanticId: {error}"),
+                span: Span::new(0, 0),
+            })?;
+
+        let module = store
+            .load_identified_module(artifact_id)
+            .map_err(|error| NuError::RuntimeError {
+                msg: format!(
+                    "cannot load retained executable {artifact_id} for actor {actor_id}: {error}"
+                ),
+                span: Span::new(0, 0),
+            })?;
+
+        let mut matching_definitions = module
+            .actor_semantic_ids
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| **candidate == definition_id)
+            .map(|(index, _)| index);
+        let definition_index =
+            matching_definitions
+                .next()
+                .ok_or_else(|| NuError::RuntimeError {
+                    msg: format!(
+                        "retained artifact {artifact_id} has no actor definition matching snapshot SemanticId {definition_id}"
+                    ),
+                    span: Span::new(0, 0),
+                })?;
+        if matching_definitions.next().is_some() {
+            return Err(NuError::RuntimeError {
+                msg: format!(
+                    "retained artifact {artifact_id} contains multiple actor definitions with snapshot SemanticId {definition_id}"
+                ),
+                span: Span::new(0, 0),
+            });
+        }
+
+        let meta = module
+            .actor_metadata
+            .get(definition_index)
+            .ok_or_else(|| NuError::RuntimeError {
+                msg: format!(
+                    "retained artifact {artifact_id} definition index {definition_index} has no actor metadata"
+                ),
+                span: Span::new(0, 0),
+            })?
+            .clone();
+        let role = meta.role().map_err(|error| NuError::RuntimeError {
+            msg: format!(
+                "retained artifact {artifact_id} actor definition {} has conflicting role metadata: {error}",
+                meta.name
+            ),
+            span: Span::new(0, 0),
+        })?;
+
+        let offsets = if matches!(role, crate::primitives::ActorRole::Workflow) {
+            meta.behavior_indices
+                .iter()
+                .map(|&index| module.behaviors[index].code_offset)
+                .collect()
+        } else {
+            module
+                .behaviors
+                .iter()
+                .map(|behavior| behavior.code_offset)
+                .collect()
+        };
+        let compensation_offsets = meta
+            .behavior_indices
+            .iter()
+            .map(|&index| module.behaviors[index].compensate_offset)
+            .collect();
+
+        spawn::register_recovery_module(
+            self,
+            actor_id,
+            module,
+            offsets,
+            compensation_offsets,
+            Some(definition_id),
+        );
+
+        match self.recover_actor_with_identity_policy(actor_id, identity_policy) {
+            Some(recovered) => Ok(recovered),
+            None => {
+                self.recovery_modules.remove(&actor_id);
+                self.recovery_definition_semantic_ids.remove(&actor_id);
+                self.recovery_definition_indices.remove(&actor_id);
+                Err(NuError::RuntimeError {
+                    msg: format!(
+                        "actor {actor_id} failed durable recovery under retained artifact {artifact_id}"
+                    ),
+                    span: Span::new(0, 0),
+                })
+            }
+        }
+    }
+
     /// Recover a persistent actor from the latest snapshot and replay the journal.
     ///
     /// For workflow actors the durable workflow event journal is replayed
