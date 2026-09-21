@@ -1,7 +1,7 @@
 //! VM throughput benchmarks: arithmetic, function calls, closures, dispatch,
 //! record/array access, and direct effect dispatch.
 
-use criterion::{black_box, criterion_group, BatchSize, Criterion};
+use criterion::{black_box, criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
 use nulang::bytecode::CodeModule;
 use nulang::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
 use nulang::lexer::Lexer;
@@ -123,6 +123,49 @@ fn bench_array_indexing(c: &mut Criterion) {
     });
 }
 
+fn bench_array_construction(c: &mut Criterion) {
+    let mut group = c.benchmark_group("vm/array_construction");
+    group.sample_size(10);
+
+    for count in [1_000usize, 10_000] {
+        group.throughput(Throughput::Elements(count as u64));
+
+        let immutable_source = format!(
+            "var result = []; var i = 0; while i < {count} {{ result = perform Array.push(result, i); i = i + 1; }}; perform Array.length(result)"
+        );
+        let builder_source = format!(
+            "var b = perform ArrayBuilder.new(); var i = 0; while i < {count} {{ b = perform ArrayBuilder.push(b, i); i = i + 1; }}; let result = perform ArrayBuilder.to_array(b); perform Array.length(result)"
+        );
+        let immutable = compile(&immutable_source);
+        let builder = compile(&builder_source);
+
+        group.bench_with_input(
+            BenchmarkId::new("immutable_push", count),
+            &count,
+            |b, _| {
+                b.iter_batched(
+                    || fresh_vm(&immutable),
+                    |mut vm| black_box(vm.run().unwrap()),
+                    BatchSize::SmallInput,
+                )
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("array_builder", count),
+            &count,
+            |b, _| {
+                b.iter_batched(
+                    || fresh_vm(&builder),
+                    |mut vm| black_box(vm.run().unwrap()),
+                    BatchSize::SmallInput,
+                )
+            },
+        );
+    }
+
+    group.finish();
+}
+
 /// Baseline the `Perform` hot path before module-load name caching.
 /// The performed operation is stable for every loop iteration, so repeated
 /// parsing/allocation of `Float.sqrt` is pure dispatch overhead.
@@ -197,6 +240,7 @@ criterion_group!(
     bench_closure_capture,
     bench_record_access,
     bench_array_indexing,
+    bench_array_construction,
     bench_perform_float_sqrt,
     bench_perform_int_to_float,
     bench_perform_array_length,
