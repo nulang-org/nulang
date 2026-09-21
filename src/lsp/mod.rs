@@ -2368,6 +2368,21 @@ fn nu_error_to_diagnostic(err: NuError) -> Vec<Diagnostic> {
 
 /// Build a single LSP Diagnostic from a non-Multiple NuError.
 fn single_diagnostic(err: NuError) -> Diagnostic {
+    let code = err
+        .stable_code()
+        .map(|code| NumberOrString::String(code.to_string()));
+    let kind = crate::json_diagnostics::diagnostic_kind(&err);
+    let facts = crate::json_diagnostics::diagnostic_data(&err);
+    let data = Some(match facts {
+        Some(facts) => serde_json::json!({
+            "kind": kind,
+            "facts": facts,
+        }),
+        None => serde_json::json!({
+            "kind": kind,
+        }),
+    });
+
     let (message, start_line, start_col, end_line, end_col) = match err {
         NuError::LexError { msg, span }
         | NuError::ParseError { msg, span, .. }
@@ -2408,13 +2423,13 @@ fn single_diagnostic(err: NuError) -> Diagnostic {
     Diagnostic {
         range: Range::new(start, end),
         severity: Some(DiagnosticSeverity::ERROR),
-        code: None,
+        code,
         code_description: None,
         source: Some("nulang".to_string()),
         message,
         related_information: None,
         tags: None,
-        data: None,
+        data,
     }
 }
 
@@ -3927,6 +3942,23 @@ mod lsp_tests {
         let engine = InlayHintEngine::new("fun foo) bar(");
         let hints = engine.generate_inlay_hints(None, None, None);
         assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn test_lsp_diagnostic_exposes_agent_readable_code_and_facts() {
+        let diagnostic = single_diagnostic(NuError::TypeError {
+            msg: "Type mismatch".into(),
+            span: crate::types::Span::new(0, 1),
+            expected_type: Some("Int".into()),
+            found_type: Some("String".into()),
+            similar_names: None,
+        });
+
+        assert!(diagnostic.code.is_some(), "stable error code must be present");
+        let data = diagnostic.data.expect("structured LSP diagnostic data");
+        assert_eq!(data["kind"], "type");
+        assert_eq!(data["facts"]["expected_type"], "Int");
+        assert_eq!(data["facts"]["found_type"], "String");
     }
 
     /// Regression: the LSP effect check is interprocedural, matching the CLI
