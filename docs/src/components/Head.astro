@@ -98,7 +98,7 @@ const headEntries = head
 
 const pageTitle = head.find((h) => h.tag === 'title')?.content ?? String(entry.data.title);
 const pageDescription =
-  entry.data.description ?? 'A distributed, actor-based programming language';
+  entry.data.description ?? 'An actor-based programming language for resilient software';
 ---
 {headEntries.map(({ tag: Tag, attrs, content }: any) => <Tag {...attrs} set:html={content} />)}
 {!ogTypeSeen && <meta property="og:type" content={ogType} />}
