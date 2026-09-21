@@ -774,9 +774,9 @@ impl CodeModule {
         &mut self,
         manifest: &crate::artifact_identity::ArtifactIdentityManifest,
     ) -> Result<(), crate::artifact_identity::ArtifactIdentityError> {
-        let module_semantic = self
-            .semantic_id
-            .ok_or(crate::artifact_identity::ArtifactIdentityError::MissingModuleSemanticIdentity)?;
+        let module_semantic = self.semantic_id.ok_or(
+            crate::artifact_identity::ArtifactIdentityError::MissingModuleSemanticIdentity,
+        )?;
         if module_semantic != manifest.semantic_id() {
             return Err(
                 crate::artifact_identity::ArtifactIdentityError::SemanticIdentityMismatch {
