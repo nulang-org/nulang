@@ -709,14 +709,36 @@ impl JsonFileStore {
     }
 
     fn read_workflow_commits(&self, actor_id: u64) -> Vec<WorkflowCommitRecord> {
-        let path = self.workflow_commits_path(actor_id);
-        let data = match fs::read_to_string(path) {
-            Ok(data) => data,
+        let file = match fs::File::open(self.workflow_commits_path(actor_id)) {
+            Ok(file) => file,
             Err(_) => return Vec::new(),
         };
-        data.lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
+        BufReader::new(file)
+            .lines()
+            .filter_map(Result::ok)
+            .filter_map(|line| serde_json::from_str(&line).ok())
             .collect()
+    }
+
+    fn repair_workflow_commit_tail(&self, actor_id: u64) -> io::Result<()> {
+        let path = self.workflow_commits_path(actor_id);
+        let mut file = match fs::OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let bytes = fs::read(&path)?;
+        if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+            return Ok(());
+        }
+
+        let valid_len = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|position| position + 1)
+            .unwrap_or(0);
+        file.set_len(valid_len as u64)?;
+        file.sync_all()
     }
 
     fn events_path(&self, actor_id: u64) -> PathBuf {
@@ -888,6 +910,7 @@ impl PersistenceStore for JsonFileStore {
         }
         let dir = self.actor_dir(actor_id);
         fs::create_dir_all(&dir)?;
+        self.repair_workflow_commit_tail(actor_id)?;
         let path = self.workflow_commits_path(actor_id);
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -3849,6 +3872,40 @@ mod workflow_atomic_commit_tests {
             Some(&PersistedValue::Int(2))
         );
         assert_eq!(reopened.latest_sequence(43), 11);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn json_workflow_commit_repairs_partial_trailing_record_before_append() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_workflow_commit_tail_test_{}_{}",
+            std::process::id(),
+            45
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut store = JsonFileStore::new(&dir).unwrap();
+        store
+            .commit_workflow_event_and_snapshot(45, completed(1), snapshot(45, 1))
+            .unwrap();
+
+        let path = store.workflow_commits_path(45);
+        {
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(br#"{"event":"#).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        store
+            .commit_workflow_event_and_snapshot(45, completed(2), snapshot(45, 2))
+            .unwrap();
+
+        let events = store.read_workflow_events(45);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence(), 1);
+        assert_eq!(events[1].sequence(), 2);
+        assert_eq!(store.load_snapshot(45).unwrap().sequence, 2);
 
         let _ = fs::remove_dir_all(&dir);
     }
