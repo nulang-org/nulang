@@ -1,0 +1,9 @@
+// Must fail: all LineString points must use the declared CRS.
+import lib
+
+fn main() {
+    line_string(
+        [cartesian(0.0, 0.0), wgs84(1.0, 1.0)],
+        CARTESIAN
+    )
+}
