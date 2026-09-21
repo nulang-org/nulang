@@ -503,6 +503,7 @@ impl AddressResolver {
         object_table: Vec<(u64, Vec<u8>)>,
         content_hash: Option<[u8; 32]>,
         trace_id: Option<String>,
+        delivery_id: Option<u64>,
     ) -> Packet {
         Packet::ActorMessage {
             target_actor,
@@ -515,6 +516,7 @@ impl AddressResolver {
             sender_node: NodeId(self.local_node.0),
             priority,
             trace_id,
+            delivery_id,
         }
     }
     /// Parse a received network packet into a message for local delivery.
@@ -542,6 +544,7 @@ impl AddressResolver {
         Vec<String>,
         Vec<(u64, Vec<u8>)>,
         Option<[u8; 32]>,
+        Option<u64>,
     )> {
         match packet {
             Packet::ActorMessage {
@@ -555,6 +558,7 @@ impl AddressResolver {
                 sender_node,
                 priority,
                 trace_id,
+                delivery_id,
             } => {
                 // Record the sender in our cache so we can reply.
                 let sender_cluster_node = NodeId(sender_node.0);
@@ -574,6 +578,7 @@ impl AddressResolver {
                     string_table,
                     object_table,
                     content_hash,
+                    delivery_id,
                 ))
             }
             // Non-actor-message packets are not parsed here.
@@ -782,19 +787,45 @@ pub fn send_distributed(
     behavior: &str,
     args: &[Value],
 ) {
+    let _ = send_distributed_inner(
+        runtime, transport, cluster, resolver, target, behavior, args, false,
+    );
+}
+
+/// Send a distributed message and request a terminal destination admission
+/// response. Returns a sender-local delivery id only when the message was
+/// actually handed to the remote transport.
+pub fn send_distributed_tracked(
+    runtime: &mut Runtime,
+    transport: &mut dyn NetworkTransport,
+    cluster: &ClusterState,
+    resolver: &mut AddressResolver,
+    target: ActorAddress,
+    behavior: &str,
+    args: &[Value],
+) -> Option<u64> {
+    send_distributed_inner(
+        runtime, transport, cluster, resolver, target, behavior, args, true,
+    )
+}
+
+fn send_distributed_inner(
+    runtime: &mut Runtime,
+    transport: &mut dyn NetworkTransport,
+    cluster: &ClusterState,
+    resolver: &mut AddressResolver,
+    target: ActorAddress,
+    behavior: &str,
+    args: &[Value],
+    tracked: bool,
+) -> Option<u64> {
     match resolver.resolve(cluster, target) {
         ResolveResult::Local { actor_id } => {
             runtime.send_message(actor_id, behavior, args);
+            None
         }
         ResolveResult::Remote { node_id, actor_id } => {
-            // Remember the bare id → node mapping so a LATER bare actor-ref
-            // Value (no node id) can route here too (RFC-0007).
             crate::runtime::distribution::record_remote_ref(runtime, node_id, actor_id);
-            // String payloads must cross the wire by CONTENT: a bare string
-            // id indexes the sender's module constant pool and means nothing
-            // (or the wrong thing) on the receiving node. Resolve each
-            // string arg against the sender's pool and carry the contents
-            // in the packet's string table.
             let (payload, string_table) = match resolve_wire_strings(runtime, args) {
                 Some(resolved) => resolved,
                 None => {
@@ -804,11 +835,9 @@ pub fn send_distributed(
                     );
                     let sender = runtime.current_actor.unwrap_or(0);
                     notify_delivery_failed(runtime, sender, "string payload unresolvable");
-                    return;
+                    return None;
                 }
             };
-            // Object-store refs must cross the wire with their byte payloads:
-            // object ids are local to each node's store.
             let (payload, object_table) = match resolve_wire_objects(runtime, &payload) {
                 Some(resolved) => resolved,
                 None => {
@@ -818,18 +847,22 @@ pub fn send_distributed(
                     );
                     let sender = runtime.current_actor.unwrap_or(0);
                     notify_delivery_failed(runtime, sender, "object ref unresolvable");
-                    return;
+                    return None;
                 }
             };
-            // Remote sends carry the behavior name and an optional content
-            // hash; the receiving node resolves the name and MAY verify the
-            // hash against its own behavior table on delivery.
+            let Some(node_info) = cluster.get_node(node_id) else {
+                warn!(
+                    "nulang-net: dropping message to actor {} on node {:?}: node missing from cluster membership",
+                    actor_id, node_id
+                );
+                let sender = runtime.current_actor.unwrap_or(0);
+                notify_delivery_failed(runtime, sender, "target node left cluster");
+                return None;
+            };
+
             let content_hash = try_lookup_content_hash(runtime, behavior);
-            // Carry the current handler's trace span across the wire so the
-            // remote side continues the same causal chain. The current span
-            // (not a synthetic child) crosses because `traceparent` has no
-            // parent field — the receiver creates its own child span.
             let trace_id = runtime.current_trace.as_ref().map(|t| t.to_traceparent());
+            let delivery_id = tracked.then(|| runtime.allocate_remote_delivery_id());
             let packet = resolver.build_packet(
                 actor_id,
                 behavior,
@@ -840,27 +873,18 @@ pub fn send_distributed(
                 object_table,
                 content_hash,
                 trace_id,
+                delivery_id,
             );
 
-            if let Some(node_info) = cluster.get_node(node_id) {
-                let net_node_id = NodeId(node_id.0);
-                transport.send(net_node_id, node_info.address, packet);
-            } else {
-                // The node resolved as remote but is no longer in the
-                // membership table (it left between resolve and send). Log
-                // the drop rather than losing the message silently.
-                warn!(
-                    "nulang-net: dropping message to actor {} on node {:?}: node missing from cluster membership",
-                    actor_id, node_id
-                );
-                let sender = runtime.current_actor.unwrap_or(0);
-                notify_delivery_failed(runtime, sender, "target node left cluster");
-            }
+            let net_node_id = NodeId(node_id.0);
+            transport.send(net_node_id, node_info.address, packet);
+            delivery_id
         }
         ResolveResult::Unresolvable { reason } => {
             warn!("nulang-net: dropping message to {:?}: {}", target, reason);
             let sender = runtime.current_actor.unwrap_or(0);
             notify_delivery_failed(runtime, sender, &reason);
+            None
         }
     }
 }
@@ -1129,6 +1153,7 @@ pub fn process_network_packets(
                                 m.object_table,
                                 content_hash,
                                 m.trace_id,
+                                None,
                             );
                             let reply_addr = cluster
                                 .get_node(from)
@@ -2888,6 +2913,7 @@ mod tests {
             vec![], // object_table
             None,   // content_hash
             Some(trace.to_string()),
+            Some(77),
         );
         match packet {
             Packet::ActorMessage {
