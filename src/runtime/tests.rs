@@ -7498,15 +7498,18 @@ fn runtime_artifact_cache_admits_only_verified_exact_artifact() {
         .cache_runtime_artifact(identity.artifact_id(), bytes.clone(), provenance.clone())
         .unwrap();
 
-    let cached = runtime.artifact_cache.get(&identity.artifact_id()).unwrap();
-    assert_eq!(cached.bytes, bytes);
-    assert_eq!(cached.provenance, provenance);
-    assert_eq!(cached.module.artifact_id, Some(identity.artifact_id()));
-    assert_eq!(cached.module.actor_semantic_ids, vec![definition_id]);
+    let (cached_bytes, cached_provenance) = {
+        let cached = runtime.artifact_cache.get(&identity.artifact_id()).unwrap();
+        assert_eq!(cached.bytes, bytes);
+        assert_eq!(cached.provenance, provenance);
+        assert_eq!(cached.module.artifact_id, Some(identity.artifact_id()));
+        assert_eq!(cached.module.actor_semantic_ids, vec![definition_id]);
+        (cached.bytes.clone(), cached.provenance.clone())
+    };
 
     // Exact repeat is idempotent.
     runtime
-        .cache_runtime_artifact(identity.artifact_id(), cached.bytes.clone(), cached.provenance.clone())
+        .cache_runtime_artifact(identity.artifact_id(), cached_bytes, cached_provenance)
         .unwrap();
 }
 
