@@ -677,6 +677,11 @@ pub struct CodeModule {
     /// owns embedded identity.
     #[serde(skip)]
     pub semantic_id: Option<crate::content_identity::SemanticId>,
+    /// Compiler/backend-specific identity for the exact retained artifact.
+    /// Like the semantic sidecars, frozen NBC v1 does not serialize this;
+    /// additive artifact manifests / retention metadata restore it.
+    #[serde(skip)]
+    pub artifact_id: Option<crate::content_identity::ArtifactId>,
     /// Definition-scoped semantic identities for actor/entity/workflow
     /// declarations in this typed module, parallel to `actor_metadata`.
     /// Positional ownership avoids collapsing namespace-distinct actors that
@@ -737,6 +742,7 @@ impl CodeModule {
         CodeModule {
             name: name.into(),
             semantic_id: None,
+            artifact_id: None,
             actor_semantic_ids: Vec::new(),
             constants: Vec::new(),
             instructions: Vec::new(),
