@@ -1995,8 +1995,8 @@ fn test_libsql_store_save_load_snapshot() {
     let loaded = store.load_snapshot(1).unwrap();
     assert_eq!(loaded.actor_id, 1);
     assert_eq!(loaded.sequence, 3);
-    assert_eq!(loaded.semantic_id.as_deref(), Some(definition_id.to_string().as_str()));
-    assert_eq!(loaded.artifact_id.as_deref(), Some(artifact_id.to_string().as_str()));
+    assert_eq!(loaded.semantic_id, Some(definition_id.to_string()));
+    assert_eq!(loaded.artifact_id, Some(artifact_id.to_string()));
     assert_eq!(loaded.state.get("count"), Some(&PersistedValue::Int(42)));
 }
 
