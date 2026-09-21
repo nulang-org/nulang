@@ -1,18 +1,36 @@
-//! Versioned wire envelope for protocol-typed actor references.
+//! Versioned wire envelopes for protocol-typed actor references and schemas.
 //!
 //! The current NUL0 transport format is versioned and must not be changed
-//! implicitly. This module defines an additive compatibility boundary that can
+//! implicitly. This module defines additive compatibility boundaries that can
 //! accompany distributed messages today and be integrated into a future NUL0
-//! wire-version migration without changing protocol identity semantics.
+//! wire-version migration without coupling protocol identity to VM layouts.
 
-use crate::protocol::{ProtocolActorRef, ProtocolId, ProtocolIdParseError, ProtocolMismatch};
+use crate::protocol::{
+    ProtocolActorRef, ProtocolId, ProtocolMember, ProtocolMismatch, ProtocolSchema,
+    ProtocolSchemaError, ProtocolTypeId,
+};
 use std::error::Error;
 use std::fmt;
-use std::str::FromStr;
 
 pub const PROTOCOL_WIRE_MAGIC: [u8; 4] = *b"NUPR";
 pub const PROTOCOL_WIRE_VERSION: u16 = 1;
 pub const PROTOCOL_WIRE_LEN: usize = 4 + 2 + 8 + 8 + 32;
+
+/// Separate, self-describing envelope for a canonical protocol schema.
+///
+/// This intentionally does not alter the frozen NUL0 packet header. A runtime
+/// can exchange/cache NUPS descriptors out of band and keep using the compact
+/// protocol id on ordinary messages.
+pub const PROTOCOL_SCHEMA_WIRE_MAGIC: [u8; 4] = *b"NUPS";
+pub const PROTOCOL_SCHEMA_WIRE_VERSION: u16 = 1;
+
+/// Defensive parser limits. Protocol descriptions are metadata, never an
+/// unbounded application payload.
+pub const MAX_PROTOCOL_SCHEMA_WIRE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_PROTOCOL_SCHEMA_NAME_BYTES: usize = 4 * 1024;
+pub const MAX_PROTOCOL_BEHAVIOR_NAME_BYTES: usize = 1024;
+pub const MAX_PROTOCOL_SCHEMA_MEMBERS: usize = 16_384;
+pub const MAX_PROTOCOL_MEMBER_PARAMS: usize = 1024;
 
 /// Encode one protocol-typed actor reference into the fixed v1 envelope.
 pub fn encode_protocol_actor_ref(reference: ProtocolActorRef) -> [u8; PROTOCOL_WIRE_LEN] {
@@ -27,9 +45,9 @@ pub fn encode_protocol_actor_ref(reference: ProtocolActorRef) -> [u8; PROTOCOL_W
 
 /// Decode one exact v1 protocol actor reference.
 ///
-/// Length, magic, version, and protocol-id encoding are all validated before
-/// the reference is returned. Unknown versions fail closed rather than being
-/// interpreted using the current layout.
+/// Length, magic, and version are validated before the reference is returned.
+/// Protocol ids are cryptographic digests, so every 32-byte value is a valid
+/// representation; semantic trust comes from schema/admission verification.
 pub fn decode_protocol_actor_ref(bytes: &[u8]) -> Result<ProtocolActorRef, ProtocolWireError> {
     if bytes.len() != PROTOCOL_WIRE_LEN {
         return Err(ProtocolWireError::InvalidLength {
@@ -47,7 +65,11 @@ pub fn decode_protocol_actor_ref(bytes: &[u8]) -> Result<ProtocolActorRef, Proto
 
     let node_id = u64::from_be_bytes(bytes[6..14].try_into().expect("validated fixed length"));
     let actor_id = u64::from_be_bytes(bytes[14..22].try_into().expect("validated fixed length"));
-    let protocol_id = protocol_id_from_bytes(&bytes[22..54])?;
+    let protocol_id = ProtocolId::from_bytes(
+        bytes[22..54]
+            .try_into()
+            .expect("validated fixed protocol-id length"),
+    );
 
     Ok(ProtocolActorRef::new(node_id, actor_id, protocol_id))
 }
@@ -67,14 +89,199 @@ pub fn decode_protocol_actor_ref_for(
     Ok(reference)
 }
 
-fn protocol_id_from_bytes(bytes: &[u8]) -> Result<ProtocolId, ProtocolWireError> {
-    let mut encoded = String::with_capacity(64);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+/// Encode a canonical protocol schema for distributed compatibility discovery.
+///
+/// The descriptor contains only semantic identities: behavior names plus
+/// canonical type/signature digests. Runtime ids, bytecode offsets, memory
+/// layouts, source locations, and transport addresses never enter the format.
+///
+/// The schema's computed ProtocolId is embedded and verified on decode. This
+/// makes a received descriptor safe to place in a local ProtocolRegistry after
+/// transport/authentication policy accepts its source.
+pub fn encode_protocol_schema(schema: &ProtocolSchema) -> Result<Vec<u8>, ProtocolWireError> {
+    if schema.name.as_bytes().len() > MAX_PROTOCOL_SCHEMA_NAME_BYTES {
+        return Err(ProtocolWireError::SchemaLimitExceeded("schema name"));
     }
-    ProtocolId::from_str(&encoded).map_err(ProtocolWireError::InvalidProtocolId)
+
+    let members: Vec<&ProtocolMember> = schema.members().collect();
+    if members.len() > MAX_PROTOCOL_SCHEMA_MEMBERS {
+        return Err(ProtocolWireError::SchemaLimitExceeded("member count"));
+    }
+
+    let mut out = Vec::with_capacity(64 + members.len() * 128);
+    out.extend_from_slice(&PROTOCOL_SCHEMA_WIRE_MAGIC);
+    out.extend_from_slice(&PROTOCOL_SCHEMA_WIRE_VERSION.to_be_bytes());
+    out.extend_from_slice(schema.id().as_bytes());
+    put_string(&mut out, &schema.name)?;
+
+    put_u32(&mut out, members.len())?;
+    for member in members {
+        if member.behavior.as_bytes().len() > MAX_PROTOCOL_BEHAVIOR_NAME_BYTES {
+            return Err(ProtocolWireError::SchemaLimitExceeded("behavior name"));
+        }
+        if member.params.len() > MAX_PROTOCOL_MEMBER_PARAMS {
+            return Err(ProtocolWireError::SchemaLimitExceeded("parameter count"));
+        }
+
+        put_string(&mut out, &member.behavior)?;
+        put_u32(&mut out, member.params.len())?;
+        for param in &member.params {
+            out.extend_from_slice(param.as_bytes());
+        }
+        out.extend_from_slice(member.response.as_bytes());
+        out.extend_from_slice(member.signature.as_bytes());
+
+        if out.len() > MAX_PROTOCOL_SCHEMA_WIRE_BYTES {
+            return Err(ProtocolWireError::SchemaTooLarge { actual: out.len() });
+        }
+    }
+
+    Ok(out)
+}
+
+/// Decode and verify one canonical protocol schema descriptor.
+///
+/// The declared ProtocolId is recomputed from the decoded canonical member
+/// contracts. A corrupt or forged descriptor therefore fails closed before it
+/// can influence rolling-upgrade compatibility decisions.
+pub fn decode_protocol_schema(bytes: &[u8]) -> Result<ProtocolSchema, ProtocolWireError> {
+    if bytes.len() > MAX_PROTOCOL_SCHEMA_WIRE_BYTES {
+        return Err(ProtocolWireError::SchemaTooLarge { actual: bytes.len() });
+    }
+
+    let mut cursor = WireCursor::new(bytes);
+    if cursor.read_exact::<4>()? != PROTOCOL_SCHEMA_WIRE_MAGIC {
+        return Err(ProtocolWireError::InvalidSchemaMagic);
+    }
+
+    let version = cursor.read_u16()?;
+    if version != PROTOCOL_SCHEMA_WIRE_VERSION {
+        return Err(ProtocolWireError::UnsupportedSchemaVersion { actual: version });
+    }
+
+    let declared_id = ProtocolId::from_bytes(cursor.read_exact::<32>()?);
+    let name = cursor.read_string(MAX_PROTOCOL_SCHEMA_NAME_BYTES, "schema name")?;
+
+    let member_count = cursor.read_u32()? as usize;
+    if member_count > MAX_PROTOCOL_SCHEMA_MEMBERS {
+        return Err(ProtocolWireError::SchemaLimitExceeded("member count"));
+    }
+
+    let mut members = Vec::with_capacity(member_count);
+    for _ in 0..member_count {
+        let behavior =
+            cursor.read_string(MAX_PROTOCOL_BEHAVIOR_NAME_BYTES, "behavior name")?;
+        let param_count = cursor.read_u32()? as usize;
+        if param_count > MAX_PROTOCOL_MEMBER_PARAMS {
+            return Err(ProtocolWireError::SchemaLimitExceeded("parameter count"));
+        }
+
+        let mut params = Vec::with_capacity(param_count);
+        for _ in 0..param_count {
+            params.push(ProtocolTypeId::from_bytes(cursor.read_exact::<32>()?));
+        }
+        let response = ProtocolTypeId::from_bytes(cursor.read_exact::<32>()?);
+        let signature = ProtocolTypeId::from_bytes(cursor.read_exact::<32>()?);
+        members.push(ProtocolMember {
+            behavior,
+            params,
+            response,
+            signature,
+        });
+    }
+
+    if !cursor.is_finished() {
+        return Err(ProtocolWireError::TrailingSchemaBytes {
+            actual: cursor.remaining(),
+        });
+    }
+
+    let schema = ProtocolSchema::new(name, members).map_err(ProtocolWireError::SchemaDefinition)?;
+    let actual_id = schema.id();
+    if actual_id != declared_id {
+        return Err(ProtocolWireError::SchemaDigestMismatch {
+            declared: declared_id,
+            actual: actual_id,
+        });
+    }
+
+    Ok(schema)
+}
+
+fn put_u32(out: &mut Vec<u8>, value: usize) -> Result<(), ProtocolWireError> {
+    let value = u32::try_from(value)
+        .map_err(|_| ProtocolWireError::SchemaLimitExceeded("32-bit length"))?;
+    out.extend_from_slice(&value.to_be_bytes());
+    Ok(())
+}
+
+fn put_string(out: &mut Vec<u8>, value: &str) -> Result<(), ProtocolWireError> {
+    put_u32(out, value.as_bytes().len())?;
+    out.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+struct WireCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> WireCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn read_exact<const N: usize>(&mut self) -> Result<[u8; N], ProtocolWireError> {
+        let end = self
+            .offset
+            .checked_add(N)
+            .ok_or(ProtocolWireError::TruncatedSchema)?;
+        let slice = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(ProtocolWireError::TruncatedSchema)?;
+        self.offset = end;
+        Ok(slice.try_into().expect("validated exact slice length"))
+    }
+
+    fn read_u16(&mut self) -> Result<u16, ProtocolWireError> {
+        Ok(u16::from_be_bytes(self.read_exact::<2>()?))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, ProtocolWireError> {
+        Ok(u32::from_be_bytes(self.read_exact::<4>()?))
+    }
+
+    fn read_string(
+        &mut self,
+        max_len: usize,
+        field: &'static str,
+    ) -> Result<String, ProtocolWireError> {
+        let len = self.read_u32()? as usize;
+        if len > max_len {
+            return Err(ProtocolWireError::SchemaLimitExceeded(field));
+        }
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or(ProtocolWireError::TruncatedSchema)?;
+        let slice = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(ProtocolWireError::TruncatedSchema)?;
+        self.offset = end;
+        let text = std::str::from_utf8(slice)
+            .map_err(|_| ProtocolWireError::InvalidSchemaUtf8(field))?;
+        Ok(text.to_owned())
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
+    }
+
+    fn is_finished(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,8 +289,19 @@ pub enum ProtocolWireError {
     InvalidLength { actual: usize },
     InvalidMagic,
     UnsupportedVersion { actual: u16 },
-    InvalidProtocolId(ProtocolIdParseError),
     ProtocolMismatch(ProtocolMismatch),
+    SchemaTooLarge { actual: usize },
+    InvalidSchemaMagic,
+    UnsupportedSchemaVersion { actual: u16 },
+    TruncatedSchema,
+    InvalidSchemaUtf8(&'static str),
+    SchemaLimitExceeded(&'static str),
+    TrailingSchemaBytes { actual: usize },
+    SchemaDefinition(ProtocolSchemaError),
+    SchemaDigestMismatch {
+        declared: ProtocolId,
+        actual: ProtocolId,
+    },
 }
 
 impl fmt::Display for ProtocolWireError {
@@ -98,10 +316,33 @@ impl fmt::Display for ProtocolWireError {
                 f,
                 "unsupported protocol actor-ref envelope version {actual}; runtime supports version {PROTOCOL_WIRE_VERSION}"
             ),
-            Self::InvalidProtocolId(error) => {
-                write!(f, "invalid protocol id in actor-ref envelope: {error}")
-            }
             Self::ProtocolMismatch(error) => error.fmt(f),
+            Self::SchemaTooLarge { actual } => write!(
+                f,
+                "protocol schema envelope exceeds {MAX_PROTOCOL_SCHEMA_WIRE_BYTES} bytes: {actual}"
+            ),
+            Self::InvalidSchemaMagic => f.write_str("invalid protocol schema envelope magic"),
+            Self::UnsupportedSchemaVersion { actual } => write!(
+                f,
+                "unsupported protocol schema envelope version {actual}; runtime supports version {PROTOCOL_SCHEMA_WIRE_VERSION}"
+            ),
+            Self::TruncatedSchema => f.write_str("truncated protocol schema envelope"),
+            Self::InvalidSchemaUtf8(field) => {
+                write!(f, "protocol schema {field} is not valid UTF-8")
+            }
+            Self::SchemaLimitExceeded(field) => {
+                write!(f, "protocol schema {field} exceeds the wire-format limit")
+            }
+            Self::TrailingSchemaBytes { actual } => {
+                write!(f, "protocol schema envelope has {actual} trailing bytes")
+            }
+            Self::SchemaDefinition(error) => {
+                write!(f, "invalid protocol schema definition: {error}")
+            }
+            Self::SchemaDigestMismatch { declared, actual } => write!(
+                f,
+                "protocol schema digest mismatch: declared {declared}, recomputed {actual}"
+            ),
         }
     }
 }
@@ -109,11 +350,19 @@ impl fmt::Display for ProtocolWireError {
 impl Error for ProtocolWireError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::InvalidProtocolId(error) => Some(error),
             Self::ProtocolMismatch(error) => Some(error),
-            Self::InvalidLength { .. } | Self::InvalidMagic | Self::UnsupportedVersion { .. } => {
-                None
-            }
+            Self::SchemaDefinition(error) => Some(error),
+            Self::InvalidLength { .. }
+            | Self::InvalidMagic
+            | Self::UnsupportedVersion { .. }
+            | Self::SchemaTooLarge { .. }
+            | Self::InvalidSchemaMagic
+            | Self::UnsupportedSchemaVersion { .. }
+            | Self::TruncatedSchema
+            | Self::InvalidSchemaUtf8(_)
+            | Self::SchemaLimitExceeded(_)
+            | Self::TrailingSchemaBytes { .. }
+            | Self::SchemaDigestMismatch { .. } => None,
         }
     }
 }
@@ -121,13 +370,36 @@ impl Error for ProtocolWireError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Capability, Effect, EffectRow, Type};
 
     fn protocol(byte: u8) -> ProtocolId {
-        let mut text = String::with_capacity(64);
-        for _ in 0..32 {
-            text.push_str(&format!("{byte:02x}"));
-        }
-        text.parse().unwrap()
+        ProtocolId::from_bytes([byte; 32])
+    }
+
+    fn schema(order_reversed: bool) -> ProtocolSchema {
+        let get = ProtocolMember::behavior(
+            "get",
+            vec![],
+            Type::int(),
+            EffectRow::empty(),
+            Capability::Tag,
+        )
+        .unwrap();
+        let set = ProtocolMember::behavior(
+            "set",
+            vec![Type::int()],
+            Type::unit(),
+            EffectRow::Closed(vec![Effect::Send]),
+            Capability::Tag,
+        )
+        .unwrap();
+
+        let members = if order_reversed {
+            vec![set, get]
+        } else {
+            vec![get, set]
+        };
+        ProtocolSchema::new("Counter", members).unwrap()
     }
 
     #[test]
@@ -180,5 +452,66 @@ mod tests {
             decode_protocol_actor_ref_for(&encoded, protocol(0x22)),
             Err(ProtocolWireError::ProtocolMismatch(_))
         ));
+    }
+
+    #[test]
+    fn schema_wire_round_trip_preserves_canonical_identity() {
+        let original = schema(false);
+        let encoded = encode_protocol_schema(&original).unwrap();
+        let decoded = decode_protocol_schema(&encoded).unwrap();
+
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.id(), original.id());
+    }
+
+    #[test]
+    fn schema_wire_encoding_is_declaration_order_independent() {
+        let a = schema(false);
+        let b = schema(true);
+        assert_eq!(a.id(), b.id());
+        assert_eq!(
+            encode_protocol_schema(&a).unwrap(),
+            encode_protocol_schema(&b).unwrap()
+        );
+    }
+
+    #[test]
+    fn schema_wire_rejects_tampered_member_contract() {
+        let original = schema(false);
+        let mut encoded = encode_protocol_schema(&original).unwrap();
+
+        // Flip one byte in the final signature digest while leaving the
+        // declared ProtocolId intact.
+        let last = encoded.len() - 1;
+        encoded[last] ^= 0x01;
+
+        assert!(matches!(
+            decode_protocol_schema(&encoded),
+            Err(ProtocolWireError::SchemaDigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn schema_wire_rejects_trailing_data() {
+        let original = schema(false);
+        let mut encoded = encode_protocol_schema(&original).unwrap();
+        encoded.push(0);
+
+        assert_eq!(
+            decode_protocol_schema(&encoded).unwrap_err(),
+            ProtocolWireError::TrailingSchemaBytes { actual: 1 }
+        );
+    }
+
+    #[test]
+    fn schema_wire_rejects_unknown_version() {
+        let original = schema(false);
+        let mut encoded = encode_protocol_schema(&original).unwrap();
+        encoded[4..6].copy_from_slice(&2u16.to_be_bytes());
+
+        assert_eq!(
+            decode_protocol_schema(&encoded).unwrap_err(),
+            ProtocolWireError::UnsupportedSchemaVersion { actual: 2 }
+        );
     }
 }
