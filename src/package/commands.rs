@@ -2784,6 +2784,34 @@ mod tests {
     }
 
     #[test]
+    fn test_capability_args_follow_manifest_declarations() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_build_caps_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = ChangeDir::new(&dir);
+
+        scaffold_package(&dir, "caps-pkg", "default").expect("scaffold should succeed");
+        let mut manifest = Manifest::load(&dir).expect("manifest should load");
+        manifest.package.capabilities = vec!["net".to_string(), "fs".to_string()];
+        manifest.save(&dir).expect("manifest should save");
+
+        assert_eq!(
+            capability_args(),
+            vec![
+                "--with".to_string(),
+                "net".to_string(),
+                "--with".to_string(),
+                "fs".to_string()
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_print_usage_does_not_panic() {
         print_usage();
     }
