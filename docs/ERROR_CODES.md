@@ -102,11 +102,14 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 | Range   | Category                                  |
 |---------|-------------------------------------------|
 | `W01xx` | Deprecations                              |
+| `W02xx` | Static pattern analysis                   |
 
 | Code    | Meaning                                   | Replacement (RFC)        |
 |---------|-------------------------------------------|--------------------------|
 | `W0101` | Deprecated `catch` expression (all forms) | `match` on `Ok`/`Error`, `?` under `T ! E` (RFC 0015) |
 | `W0102` | Deprecated `fail` expression              | `return Error(...)` under `T ! E` (RFC 0015) |
+| `W0201` | Provably non-exhaustive finite-domain `match` | Add arms for the reported missing witnesses (#332) |
+| `W0202` | Provably redundant/unreachable match arm | Remove, move, or refine the reported arm(s) (#332) |
 
 See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 
