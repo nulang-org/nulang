@@ -32,9 +32,13 @@ uses the register-based bytecode VM as the semantic reference implementation.
 Hot regions can tier into a Cranelift JIT; WASM is the canonical portable/cloud
 execution target; and native AOT remains a secondary backend until full semantic
 parity is demonstrated. An experimental WasmFX backend explores stack-switching
-for suspending effects. The runtime is a multi-threaded work-stealing executor
-with supervision trees, ORCA garbage collection, durable persistence, and
-experimental location-transparent distribution.
+for suspending effects. The runtime supports sharded multi-threaded execution: each `Runtime` shard has
+one owning cooperative scheduler thread, and `NULANG_SHARDS>1` runs shards in
+parallel with bounded cross-shard channels. The scheduler implementation retains
+Chase-Lev work-stealing APIs for multi-worker callers, but the live per-shard
+`run_scheduler()` path currently uses one worker slot. Supervision trees, ORCA
+garbage collection, durable persistence, and experimental location-transparent
+distribution are integrated into that model.
 
 ---
 
