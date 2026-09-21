@@ -102,11 +102,20 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 | Range   | Category                                  |
 |---------|-------------------------------------------|
 | `W01xx` | Deprecations                              |
+| `W02xx` | Static pattern analysis                   |
 
-| Code    | Meaning                                   | Replacement (RFC)        |
-|---------|-------------------------------------------|--------------------------|
+| Code    | Meaning                                   | Replacement / action |
+|---------|-------------------------------------------|----------------------|
 | `W0101` | Deprecated `catch` expression (all forms) | `match` on `Ok`/`Error`, `?` under `T ! E` (RFC 0015) |
-| `W0102` | Deprecated `fail` expression              | `return Error(...)` under `T ! E` (RFC 0015) |
+| `W0102` | Deprecated `fail` expression              | `return Error(...)` under a `T ! E` signature (RFC 0015) |
+| `W0201` | Provably non-exhaustive finite-domain `match` | Add arms for the reported missing witnesses |
+| `W0202` | Provably redundant/unreachable finite-domain match arm | Remove, move, or refine the reported arm(s) |
+
+`W0201` is deliberately a warning rather than a default hard error. RFC 0002
+freezes existing Core `match` validity and evaluation semantics; historically,
+a non-exhaustive match compiles and fails only when execution reaches an
+uncovered value. `--deny-warnings` provides strict enforcement without
+changing the default Frozen-Core contract.
 
 See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 
