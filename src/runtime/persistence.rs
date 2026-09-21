@@ -2367,7 +2367,13 @@ impl PersistenceStore for PostgresStore {
 
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        for table in ["snapshots", "journal", "workflow_events", "events", "events_v2"] {
+        for table in [
+            "snapshots",
+            "journal",
+            "workflow_events",
+            "events",
+            "events_v2",
+        ] {
             conn.execute(
                 &format!("DELETE FROM {} WHERE actor_id = $1", table),
                 &[&(actor_id as i64)],
