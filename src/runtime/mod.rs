@@ -3582,6 +3582,7 @@ impl Runtime {
                 Some(a) => a,
                 None => {
                     self.current_actor = None;
+                    self.current_trace = None;
                     return;
                 }
             };
@@ -3603,6 +3604,7 @@ impl Runtime {
                 }
                 _ => {
                     self.current_actor = None;
+                    self.current_trace = None;
                     return;
                 }
             }
@@ -3674,6 +3676,7 @@ impl Runtime {
                 }
                 self.checkpoint_actor(actor_id);
                 self.current_actor = None;
+                    self.current_trace = None;
                 return;
             }
 
@@ -3797,6 +3800,7 @@ impl Runtime {
                 }
                 self.checkpoint_actor(actor_id);
                 self.current_actor = None;
+                    self.current_trace = None;
                 return;
             }
 
@@ -3807,11 +3811,13 @@ impl Runtime {
                     Some(a) => a,
                     None => {
                         self.current_actor = None;
+                    self.current_trace = None;
                         return;
                     }
                 };
                 if let crate::runtime::actor::ActorBackend::WasmComponent { .. } = &actor.backend {
                     self.current_actor = None;
+                    self.current_trace = None;
                     return; // stub: WASM component runtime not yet integrated
                 }
             }
@@ -3821,6 +3827,7 @@ impl Runtime {
                     Some(a) => a,
                     None => {
                         self.current_actor = None;
+                    self.current_trace = None;
                         return;
                     }
                 };
@@ -3864,6 +3871,7 @@ impl Runtime {
                         Some(a) => a,
                         None => {
                             self.current_actor = None;
+                    self.current_trace = None;
                             return;
                         }
                     };
@@ -3975,6 +3983,7 @@ impl Runtime {
                 Some(a) => a,
                 None => {
                     self.current_actor = None;
+                    self.current_trace = None;
                     return;
                 }
             };
@@ -4010,6 +4019,7 @@ impl Runtime {
         // enqueue_actor can distinguish a real next turn from a self-send
         // during the turn that just completed.
         self.current_actor = None;
+                    self.current_trace = None;
         if should_requeue && requeue {
             self.enqueue_actor(actor_id);
         }
