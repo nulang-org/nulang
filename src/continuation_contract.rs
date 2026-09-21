@@ -81,13 +81,13 @@ pub struct ContinuationLayoutId([u8; 32]);
 impl ContinuationLayoutId {
     pub fn derive(
         point: ContinuationPointId,
-        resume_type: &str,
+        canonical_resume_type: &[u8],
         canonical_live_layout: &[u8],
     ) -> Self {
         let mut hasher = Hasher::new();
         hasher.update(LAYOUT_DOMAIN);
         hasher.update(point.as_bytes());
-        put_bytes(&mut hasher, resume_type.as_bytes());
+        put_bytes(&mut hasher, canonical_resume_type);
         put_bytes(&mut hasher, canonical_live_layout);
         Self(*hasher.finalize().as_bytes())
     }
@@ -265,7 +265,7 @@ mod tests {
         ContinuationContract {
             code_semantic_id: semantic(code),
             point_id: point,
-            layout_id: ContinuationLayoutId::derive(point, "Result<Receipt, Error>", layout),
+            layout_id: ContinuationLayoutId::derive(point, b"Result<Receipt, Error>", layout),
         }
     }
 
@@ -323,7 +323,7 @@ mod tests {
         let replacement = ContinuationContract {
             code_semantic_id: semantic(b"new-code"),
             point_id: point,
-            layout_id: ContinuationLayoutId::derive(point, "Result<Receipt, Error>", b"amount:Int"),
+            layout_id: ContinuationLayoutId::derive(point, b"Result<Receipt, Error>", b"amount:Int"),
         };
         assert_eq!(
             captured.check_resume_compatibility(&replacement),
