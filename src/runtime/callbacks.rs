@@ -1271,7 +1271,7 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         // reference keeps the payload alive.
         Some((
             pos,
-            Arc::try_unwrap(payload).unwrap_or_else(|arc| (*arc).clone()),
+            payload.as_slice().to_vec(),
         ))
     }
 
@@ -1283,7 +1283,7 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
                 .get_mut(&actor_id)
                 .and_then(|actor| actor.mailbox.commit_receive_match());
             if let Some(payload) = payload {
-                rt.hold_payload_refs(actor_id, &payload);
+                rt.hold_payload_refs(actor_id, payload.as_slice());
             }
         }
     }
@@ -2180,7 +2180,7 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             // the pattern+guard succeeds.
             Some((
                 pos,
-                Arc::try_unwrap(payload).unwrap_or_else(|arc| (*arc).clone()),
+                payload.as_slice().to_vec(),
             ))
         }
     }
