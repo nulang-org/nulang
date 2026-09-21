@@ -475,7 +475,7 @@ pub struct Runtime {
     /// Keyed by content hash; drained when the matching FetchBehaviorResponse
     /// arrives and the module is cached.
     pub(crate) pending_fetched_messages:
-        HashMap<[u8; 32], Vec<(u64, String, Message, Vec<String>, Vec<(u64, Vec<u8>)>)>>,
+        HashMap<[u8; 32], Vec<distributed::PendingFetchedMessage>>,
     // Pipelines and debates (v0.9 AI Runtime) - extracted into a registry so
     // the god-object shrinks and the subsystems can evolve independently.
     #[cfg(feature = "ai-runtime")]
