@@ -58,6 +58,21 @@ pub struct FabricPublishReport {
     pub forwarded_remote: usize,
 }
 
+/// One tracked cross-node route selected by a Fabric publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FabricRemoteDelivery {
+    pub delivery_id: u64,
+    pub node_id: NodeId,
+    pub actor_id: u64,
+}
+
+/// Immediate Fabric admission accounting plus asynchronous remote tickets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FabricTrackedPublishReport {
+    pub immediate: FabricPublishReport,
+    pub remote_deliveries: Vec<FabricRemoteDelivery>,
+}
+
 /// One ephemeral Fabric subscription.
 ///
 /// `node_id == None` denotes a subscription owned by this runtime process.
@@ -817,6 +832,32 @@ impl Runtime {
         topic: &str,
         args: &[Value],
     ) -> Result<FabricPublishReport, String> {
+        Ok(self
+            .fabric_publish_with_remote_tracking(topic, args, false)?
+            .immediate)
+    }
+
+    /// Publish an ephemeral Fabric message and return delivery tickets for
+    /// every selected cross-node route.
+    ///
+    /// Local/cross-shard outcomes are final in `immediate`. Remote routes
+    /// counted in `immediate.forwarded_remote` have a matching entry in
+    /// `remote_deliveries`; resolve those asynchronously with
+    /// `Runtime::take_remote_admission` or `drain_remote_admissions`.
+    pub fn fabric_publish_tracked(
+        &mut self,
+        topic: &str,
+        args: &[Value],
+    ) -> Result<FabricTrackedPublishReport, String> {
+        self.fabric_publish_with_remote_tracking(topic, args, true)
+    }
+
+    fn fabric_publish_with_remote_tracking(
+        &mut self,
+        topic: &str,
+        args: &[Value],
+        track_remote: bool,
+    ) -> Result<FabricTrackedPublishReport, String> {
         self.fabric_sync();
 
         let shard_idx = self.shard_idx;
@@ -884,6 +925,8 @@ impl Runtime {
             selected: targets.len(),
             ..FabricPublishReport::default()
         };
+        let mut remote_deliveries = Vec::new();
+
         for target in targets {
             match target {
                 FabricTarget::Local {
@@ -900,16 +943,44 @@ impl Runtime {
                     actor_id,
                     behavior,
                 } => {
-                    self.send_distributed(ActorAddress::remote(node_id, actor_id), &behavior, args);
-                    report.forwarded_remote += 1;
+                    if track_remote {
+                        match self.send_distributed_tracked(
+                            ActorAddress::remote(node_id, actor_id),
+                            &behavior,
+                            args,
+                        ) {
+                            Some(delivery_id) => {
+                                report.forwarded_remote += 1;
+                                remote_deliveries.push(FabricRemoteDelivery {
+                                    delivery_id,
+                                    node_id,
+                                    actor_id,
+                                });
+                            }
+                            None => report.rejected += 1,
+                        }
+                    } else {
+                        self.send_distributed(
+                            ActorAddress::remote(node_id, actor_id),
+                            &behavior,
+                            args,
+                        );
+                        report.forwarded_remote += 1;
+                    }
                 }
             }
         }
+
         debug_assert_eq!(
             report.selected,
             report.admitted + report.backpressured + report.rejected + report.forwarded_remote
         );
-        Ok(report)
+        debug_assert!(!track_remote || report.forwarded_remote == remote_deliveries.len());
+
+        Ok(FabricTrackedPublishReport {
+            immediate: report,
+            remote_deliveries,
+        })
     }
 
     /// Publish an ephemeral Fabric message to a concrete topic.
