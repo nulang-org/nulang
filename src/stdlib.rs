@@ -11,14 +11,14 @@
 //!
 //! | Module | File | Description |
 //! |--------|------|-------------|
-//! | `std.core` | `core.nula` | Core types (`Option[T]`, `Result[T, E]`) and combinators (auto-loaded). |
+//! | `std.core` | `core.nula` | General-purpose pure function combinators. `Option`/`Result` types live in the auto-imported prelude. |
 //! | `std.math` | `math.nula` | Math functions: `abs`, `min`, `max`, `clamp`, `pow`, `factorial`, `gcd`, `sqrt`. |
 //! | `std.list` | `list.nula` | Functional list combinators: `map`, `filter`, `fold`, `append`, `reverse`, `sort`, etc. |
 //! | `std.string` | `string.nula` | String operations: `trim`, `split`, `join`, `replace`, `to_upper`, `to_lower`, etc. |
 //! | `std.map` | `map.nula` | Int→Int key-value map via sorted arrays: `insert`, `get`, `remove`, `contains`. |
 //! | `std.set` | `set.nula` | Int set via sorted arrays: `insert`, `contains`, `remove`. |
-//! | `std.result` | `result.nula` | Extra Result combinators: `unwrap`, `map`, `is_ok`, `is_err`. |
-//! | `std.option` | `option.nula` | Extra Option combinators: `unwrap`, `map`, `is_some`, `is_none`. |
+//! | `std.result` | `result.nula` | Result operations: mapping/binding, error mapping/recovery, defaults, predicates, and Option conversion. |
+//! | `std.option` | `option.nula` | Option operations: mapping/binding, recovery, defaults, filtering, predicates, and Result conversion. |
 //! | `std.datetime` | `datetime.nula` | DateTime record type and operations: `now` (stub), `new`, `is_valid`. |
 //! | `std.http` | `http.nula` | HTTP client via built-in `Http` effect: `get`, `post`. |
 //! | `std.fs` | `fs.nula` | Filesystem I/O via built-in `FS` effect: `read`, `write`, `append`, `exists`. |
