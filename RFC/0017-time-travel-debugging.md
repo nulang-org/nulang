@@ -17,7 +17,7 @@ Introduce runtime primitives for Event Log Sourcing of actor mailboxes, enabling
 
 Debugging distributed systems and actor-based concurrency is notoriously difficult due to non-determinism (message arrival order, network latency, distributed race conditions). While Nulang provides strict actor isolation, debugging edge cases currently relies on tracing and traditional print statements.
 
-Because Nulang combines lightweight actors with reduction-bounded scheduling and pure message-passing (where payloads are `Arc<Vec<Value>>` and strings are interned), we have a distinct advantage: an actor's execution is entirely deterministic based on its initial state and the exact sequence of messages it processes. By recording this sequence, we can recreate the exact execution path locally, allowing a developer to step through state transitions backward and forward.
+Because Nulang combines lightweight actors with reduction-bounded scheduling and pure message-passing (where payloads are `Arc<[Value]>` and strings are interned), we have a distinct advantage: an actor's execution is entirely deterministic based on its initial state and the exact sequence of messages it processes. By recording this sequence, we can recreate the exact execution path locally, allowing a developer to step through state transitions backward and forward.
 
 ## Design
 
