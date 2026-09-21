@@ -45,6 +45,17 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Compiler-owned host effect ABI — 2026-09-20
+- **Built-in host effects now lower through a versioned compiler-owned contract**
+  (Experimental, `src/host_effect_abi.rs`, `spec/host-effects/v0alpha1.json`,
+  `src/mir_wasm.rs`). The compiler defines canonical operation identity,
+  deterministic request shape, response projection, minimum checked authority,
+  and replay classification for platform-provided effects. WASM lowering emits
+  canonical versioned host-operation identifiers for known operations instead
+  of requiring the host to reconstruct Nulang semantics from dotted source
+  spellings such as `Storage.write`. Unknown/custom effects retain the legacy
+  compatibility path while the experimental ABI rolls out.
+
 ### Actor protocol rolling-upgrade compatibility — 2026-09-20
 - **Directional structural compatibility** (Experimental, `src/protocol.rs`).
   A receiver may serve an older required protocol when it preserves every
