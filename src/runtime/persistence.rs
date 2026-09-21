@@ -1755,6 +1755,14 @@ impl RocksDbStore {
         key
     }
 
+    fn actor_event_key(actor_id: u64, sequence: u64, field_name: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(16 + field_name.len());
+        key.extend_from_slice(&actor_id.to_be_bytes());
+        key.extend_from_slice(&sequence.to_be_bytes());
+        key.extend_from_slice(field_name.as_bytes());
+        key
+    }
+
     fn cf(&self, name: &str) -> io::Result<&rocksdb::ColumnFamily> {
         self.db
             .cf_handle(name)
@@ -1791,7 +1799,7 @@ impl PersistenceStore for RocksDbStore {
         self.db
             .put_cf(
                 cf,
-                Self::actor_seq_key(actor_id, entry.sequence),
+                Self::actor_event_key(actor_id, entry.sequence, &entry.field_name),
                 json.as_bytes(),
             )
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1812,6 +1820,39 @@ impl PersistenceStore for RocksDbStore {
             rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
         );
         while let Some(Ok((key, value))) = iter.next() {
+            if key.len() < 8 || key[..8] != Self::actor_key(actor_id) {
+                break;
+            }
+            if let Ok(entry) = serde_json::from_slice::<JournalEntry>(&value) {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
+    fn scan_journal_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<JournalEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let cf = match self.cf(Self::CF_JOURNAL) {
+            Ok(cf) => cf,
+            Err(_) => return Vec::new(),
+        };
+        let start = Self::actor_seq_key(actor_id, start_sequence);
+        let mut iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
+        );
+        let mut entries = Vec::with_capacity(limit.min(1024));
+        while entries.len() < limit {
+            let Some(Ok((key, value))) = iter.next() else {
+                break;
+            };
             if key.len() < 8 || key[..8] != Self::actor_key(actor_id) {
                 break;
             }
@@ -1860,6 +1901,39 @@ impl PersistenceStore for RocksDbStore {
         events
     }
 
+    fn scan_workflow_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<WorkflowEvent> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let cf = match self.cf(Self::CF_WORKFLOW_EVENTS) {
+            Ok(cf) => cf,
+            Err(_) => return Vec::new(),
+        };
+        let start = Self::actor_seq_key(actor_id, start_sequence);
+        let mut iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
+        );
+        let mut events = Vec::with_capacity(limit.min(1024));
+        while events.len() < limit {
+            let Some(Ok((key, value))) = iter.next() else {
+                break;
+            };
+            if key.len() < 8 || key[..8] != Self::actor_key(actor_id) {
+                break;
+            }
+            if let Ok(event) = serde_json::from_slice::<WorkflowEvent>(&value) {
+                events.push(event);
+            }
+        }
+        events
+    }
+
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
         let cf = self.cf(Self::CF_EVENTS)?;
         let json = serde_json::to_string(&entry)
@@ -1888,6 +1962,39 @@ impl PersistenceStore for RocksDbStore {
             rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
         );
         while let Some(Ok((key, value))) = iter.next() {
+            if key.len() < 8 || key[..8] != Self::actor_key(actor_id) {
+                break;
+            }
+            if let Ok(entry) = serde_json::from_slice::<EventEntry>(&value) {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
+    fn scan_events_from(
+        &self,
+        actor_id: u64,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Vec<EventEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let cf = match self.cf(Self::CF_EVENTS) {
+            Ok(cf) => cf,
+            Err(_) => return Vec::new(),
+        };
+        let start = Self::actor_seq_key(actor_id, start_sequence);
+        let mut iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
+        );
+        let mut entries = Vec::with_capacity(limit.min(1024));
+        while entries.len() < limit {
+            let Some(Ok((key, value))) = iter.next() else {
+                break;
+            };
             if key.len() < 8 || key[..8] != Self::actor_key(actor_id) {
                 break;
             }
