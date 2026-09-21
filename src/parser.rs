@@ -3661,7 +3661,18 @@ impl Parser {
             NuError::parse_error(format!("Invalid interpolation expression: {}", e), span)
         })?;
         let mut sub_parser = Parser::new(tokens);
-        sub_parser.parse_expr()
+        let expr = sub_parser.parse_expr()?;
+        sub_parser.skip_newlines_semicolons();
+        if !sub_parser.is_at_end() {
+            return Err(NuError::parse_error(
+                format!(
+                    "Invalid interpolation expression: unexpected trailing token {}",
+                    sub_parser.peek_kind()
+                ),
+                span,
+            ));
+        }
+        Ok(expr)
     }
 
     fn parse_let_rec_named(&mut self, name: String) -> NuResult<Expr> {
@@ -8954,5 +8965,13 @@ mod tests {
     fn test_parse_par_requires_brace() {
         let result = parse_expr("par");
         assert!(result.is_err(), "bare 'par' must be a parse error");
+    }
+    #[test]
+    fn test_interpolation_rejects_trailing_tokens() {
+        let tokens = crate::lexer::Lexer::new(r##"perform IO.print("#{1 2}")"##)
+            .lex()
+            .expect("source lexes");
+        let err = Parser::new(tokens).parse_module().unwrap_err();
+        assert!(format!("{}", err).contains("unexpected trailing token"));
     }
 }
