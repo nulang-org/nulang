@@ -1671,6 +1671,7 @@ impl Runtime {
                                 vm_state,
                                 behavior_idx,
                                 step_name,
+                                reason: SuspensionReason::from_vm(kind),
                             });
                     }
                     // A chained receive-after suspend arms its timeout
@@ -3877,7 +3878,7 @@ impl Runtime {
                         self.checkpoint_actor(actor_id);
                         processed = true;
                     }
-                    Err(crate::types::NuError::Suspended(kind)) => {
+                    Err(crate::types::NuError::Suspended(_)) => {
                         // The step yielded waiting for a signal or a
                         // background LLM call. Do not mark it completed, do
                         // not run compensations, and do not checkpoint the
@@ -4458,7 +4459,6 @@ impl Runtime {
                             crate::runtime::WorkflowEvent::StepCompleted {
                                 sequence: seq,
                                 step_name: suspended.step_name.clone(),
-                                    reason: SuspensionReason::from_vm(kind),
                             },
                         );
                         (*self_ptr).checkpoint_actor(actor_id);
@@ -4851,7 +4851,7 @@ impl Runtime {
                                 vm_state,
                                 behavior_idx: 0,
                                 step_name: String::new(),
-                                    reason: SuspensionReason::from_vm(*kind),
+                                reason: SuspensionReason::from_vm(*kind),
                             });
                     }
                     self.maybe_schedule_receive_wait(actor_id, receive_timeout);
