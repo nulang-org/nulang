@@ -1279,8 +1279,8 @@ impl Runtime {
 
     /// Enqueue an actor on the scheduler at its current priority. All
     /// scheduler enqueue paths go through here so a priority set via
-    /// `perform Actor.set_priority` takes effect on the next (re)queue;
-    /// unknown actors (e.g. already exited) enqueue at the Normal default.
+    /// `perform Actor.set_priority` takes effect on the next (re)queue.
+    /// Unknown or already-exited local actors are ignored.
     pub(crate) fn enqueue_actor(&mut self, actor_id: u64) {
         // Cross-shard routing: if the actor lives on another shard, send
         // an EnqueueActor message. The receiving shard's drain loop performs
