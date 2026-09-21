@@ -65,6 +65,7 @@ mod http_server;
 #[cfg(feature = "ai-runtime")]
 mod llm;
 mod metrics;
+mod migration;
 mod persistence;
 mod process_groups;
 mod registry;
@@ -4998,13 +4999,59 @@ impl Runtime {
     /// instead of the message journal, restoring the current step index and
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
-        let snapshot = self.persistence.load_snapshot(actor_id)?;
+        let mut snapshot = self.persistence.load_snapshot(actor_id)?;
+        // Own the recovery module across a possible persistence mutation. This
+        // also keeps migration execution completely detached from the shared
+        // runtime VM and resident actor table.
         let recovery_module = self
             .recovery_modules
             .get(&actor_id)
-            .map(|(module, _, _)| module);
+            .map(|(module, _, _)| module.clone());
+
+        if let Some(module) = recovery_module.as_ref() {
+            let history = migration::StateMigrationHistory {
+                has_pending_message_journal: self
+                    .persistence
+                    .read_journal(actor_id)
+                    .iter()
+                    .any(|entry| entry.sequence > snapshot.sequence),
+                has_event_history: !self.persistence.read_events(actor_id).is_empty(),
+                has_workflow_history: !self
+                    .persistence
+                    .read_workflow_events(actor_id)
+                    .is_empty(),
+            };
+            match migration::migrate_snapshot_state(module, &snapshot, history) {
+                Ok(Some(upgraded)) => {
+                    // Commit-before-publication: the detached migrated actor is
+                    // gone at this point; only the serializable upgraded
+                    // snapshot crosses the persistence boundary. A failed save
+                    // leaves recovery unpublished.
+                    if let Err(error) = self.persistence.save_snapshot(upgraded.clone()) {
+                        warn!(
+                            "nulang-recover: migration snapshot commit failed for actor {}: {}",
+                            actor_id, error
+                        );
+                        return None;
+                    }
+                    // Shadow replication, when configured, is allowed only
+                    // after the local durable commit succeeds.
+                    self.maybe_shadow_replicate(actor_id, &upgraded);
+                    snapshot = upgraded;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(
+                        "nulang-recover: refusing actor {} because durable migration failed: {}",
+                        actor_id, error
+                    );
+                    return None;
+                }
+            }
+        }
+
         let (schema_owner, schema_version) =
-            match Self::validate_snapshot_schema(recovery_module, &snapshot) {
+            match Self::validate_snapshot_schema(recovery_module.as_ref(), &snapshot) {
                 Ok(schema) => schema,
                 Err(error) => {
                     warn!(
@@ -5333,108 +5380,11 @@ impl Runtime {
             return Ok((None, 1));
         };
 
-        let meta = if let Some(owner) = snapshot.schema_owner.as_deref() {
-            module
-                .actor_metadata
-                .iter()
-                .find(|meta| meta.name == owner)
-                .ok_or_else(|| {
-                    format!(
-                        "snapshot schema owner '{}' is absent from the recovery module",
-                        owner
-                    )
-                })?
-        } else {
-            let mut candidates = module.actor_metadata.iter().filter(|meta| meta.persistent);
-            let first = candidates.next();
-            match (first, candidates.next()) {
-                (Some(meta), None) => meta,
-                (None, _) => {
-                    if snapshot.schema_version == 1 {
-                        return Ok((None, 1));
-                    }
-                    return Err(format!(
-                        "legacy snapshot v{} has no compiler-owned schema metadata",
-                        snapshot.schema_version
-                    ));
-                }
-                (Some(_), Some(_)) => {
-                    return Err(
-                        "legacy snapshot has no schema owner and the recovery module contains multiple persistent actors"
-                            .to_string(),
-                    );
-                }
-            }
+        let Some(meta) = migration::resolve_snapshot_meta(module, snapshot)? else {
+            return Ok((None, 1));
         };
 
-        let migration_manifest = if meta.migrations.is_empty() {
-            None
-        } else {
-            let manifest =
-                crate::migration_manifest::MigrationManifest::from_json(&meta.migrations)
-                    .map_err(|error| {
-                        format!(
-                            "actor '{}' carries an invalid migration manifest: {error}",
-                            meta.name
-                        )
-                    })?;
-            if manifest.target_version != meta.version {
-                return Err(format!(
-                    "actor '{}' migration manifest targets v{} but actor metadata declares v{}",
-                    meta.name, manifest.target_version, meta.version
-                ));
-            }
-
-            // A manifest binding is not trusted merely because its index is
-            // in range. Recompute the compiler-owned private function name
-            // from actor + transition identity and require the indexed
-            // function-table offset to match that exact generated function.
-            for contract in &manifest.contracts {
-                let Some(function_idx) = contract.state_function_index else {
-                    continue;
-                };
-                let function_offset = module
-                    .function_table
-                    .get(function_idx)
-                    .copied()
-                    .ok_or_else(|| {
-                        format!(
-                            "actor '{}' migration {} -> {} binds out-of-range function index {}",
-                            meta.name,
-                            contract.from_version,
-                            contract.to_version,
-                            function_idx
-                        )
-                    })?;
-                let expected_name = format!(
-                    "{}.$migration_state_{}_{}",
-                    meta.name, contract.from_version, contract.to_version
-                );
-                let named_offset = module.function_offset_by_name(&expected_name).ok_or_else(|| {
-                    format!(
-                        "actor '{}' migration {} -> {} binds function index {} but compiler-owned function '{}' is absent",
-                        meta.name,
-                        contract.from_version,
-                        contract.to_version,
-                        function_idx,
-                        expected_name
-                    )
-                })?;
-                if named_offset != function_offset {
-                    return Err(format!(
-                        "actor '{}' migration {} -> {} binds function index {} at offset {}, but '{}' resolves to offset {}",
-                        meta.name,
-                        contract.from_version,
-                        contract.to_version,
-                        function_idx,
-                        function_offset,
-                        expected_name,
-                        named_offset
-                    ));
-                }
-            }
-            Some(manifest)
-        };
+        let migration_manifest = migration::validated_manifest(module, meta)?;
 
         if snapshot.schema_version > meta.version {
             return Err(format!(
@@ -5496,7 +5446,7 @@ impl Runtime {
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(format!(
-                "persisted {}@v{} has validated migration path [{}] to {}@v{}, but executable migration bodies are not implemented",
+                "persisted {}@v{} has validated migration path [{}] to {}@v{}, but this restore path did not commit a state migration before activation",
                 snapshot
                     .schema_owner
                     .as_deref()

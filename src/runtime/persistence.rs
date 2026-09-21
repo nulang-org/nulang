@@ -311,6 +311,11 @@ impl WorkflowEvent {
 /// Persistence backend trait. Implementations may be in-memory or disk-backed.
 pub trait PersistenceStore: Send + Sync {
     /// Persist a snapshot of durable actor state.
+    ///
+    /// Contract: returning `Err` must not expose the replacement snapshot as
+    /// the current committed snapshot. Recovery migrations rely on this
+    /// commit-before-publication boundary. Built-in file stores use
+    /// temp-file + rename and SQL stores use one atomic upsert statement.
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()>;
 
     /// Load the latest snapshot for an actor, if any.

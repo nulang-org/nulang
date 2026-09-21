@@ -1933,6 +1933,180 @@ fn test_event_sourced_counter_replays_from_event_log() {
     );
 }
 
+fn compile_state_migration_module(source: &str) -> CodeModule {
+    let tokens = crate::lexer::Lexer::new(source).lex().expect("lex migration fixture");
+    let ast = crate::parser::Parser::new(tokens)
+        .parse_module()
+        .expect("parse migration fixture");
+    let mut type_checker = crate::typechecker::TypeChecker::new();
+    type_checker
+        .check_module(&ast)
+        .expect("typecheck migration fixture");
+    let hir = crate::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
+    let mut mir = crate::mir_lower::lower_module(&hir).expect("lower migration fixture");
+    crate::mir_codegen::compile_mir(&mut mir, "runtime-migration-test")
+        .expect("compile migration fixture")
+}
+
+struct RejectingSnapshotCommitStore {
+    inner: MemoryStore,
+    reject_snapshot_saves: bool,
+}
+
+impl PersistenceStore for RejectingSnapshotCommitStore {
+    fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
+        if self.reject_snapshot_saves {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected migration snapshot commit failure",
+            ));
+        }
+        self.inner.save_snapshot(snapshot)
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.inner.load_snapshot(actor_id)
+    }
+
+    fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> std::io::Result<()> {
+        self.inner.append_journal(actor_id, entry)
+    }
+
+    fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+        self.inner.read_journal(actor_id)
+    }
+
+    fn append_workflow_event(
+        &mut self,
+        actor_id: u64,
+        event: WorkflowEvent,
+    ) -> std::io::Result<()> {
+        self.inner.append_workflow_event(actor_id, event)
+    }
+
+    fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+        self.inner.read_workflow_events(actor_id)
+    }
+
+    fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> std::io::Result<()> {
+        self.inner.append_event(actor_id, entry)
+    }
+
+    fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+        self.inner.read_events(actor_id)
+    }
+
+    fn latest_sequence(&self, actor_id: u64) -> u64 {
+        self.inner.latest_sequence(actor_id)
+    }
+
+    fn clear(&mut self, actor_id: u64) -> std::io::Result<()> {
+        self.inner.clear(actor_id)
+    }
+}
+
+#[test]
+fn test_recover_actor_executes_and_commits_state_migration_before_publication() {
+    let module = compile_state_migration_module(
+        r#"
+        entity Counter {
+            version: 2
+            state durable count: Int = 0
+            migration from 1 to 2 {
+                state => { self.count = self.count + 5 }
+            }
+        }
+        "#,
+    );
+    let actor_id = 919_010;
+    let mut snapshot = ActorSnapshot {
+        actor_id,
+        sequence: 7,
+        schema_owner: Some("Counter".to_string()),
+        schema_version: 1,
+        ..ActorSnapshot::default()
+    };
+    snapshot
+        .state
+        .insert("count".to_string(), PersistedValue::Int(10));
+
+    let mut rt = Runtime::new();
+    rt.persistence.save_snapshot(snapshot).unwrap();
+    rt.register_recovery_module(actor_id, module, vec![], vec![]);
+
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+
+    let committed = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(committed.sequence, 7, "schema migration must not invent a message sequence");
+    assert_eq!(committed.schema_version, 2);
+    assert_eq!(
+        committed.state.get("count"),
+        Some(&PersistedValue::Int(15))
+    );
+
+    let actor = rt.actors.get(&actor_id).expect("recovered actor published");
+    assert_eq!(actor.schema_version, 2);
+    assert_eq!(
+        actor.get_state_field("count").and_then(|value| value.as_int()),
+        Some(15)
+    );
+}
+
+#[test]
+fn test_recover_actor_does_not_publish_when_migration_snapshot_commit_fails() {
+    let module = compile_state_migration_module(
+        r#"
+        entity Counter {
+            version: 2
+            state durable count: Int = 0
+            migration from 1 to 2 {
+                state => { self.count = self.count + 1 }
+            }
+        }
+        "#,
+    );
+    let actor_id = 919_011;
+    let mut snapshot = ActorSnapshot {
+        actor_id,
+        sequence: 4,
+        schema_owner: Some("Counter".to_string()),
+        schema_version: 1,
+        ..ActorSnapshot::default()
+    };
+    snapshot
+        .state
+        .insert("count".to_string(), PersistedValue::Int(8));
+
+    let mut store = RejectingSnapshotCommitStore {
+        inner: MemoryStore::new(),
+        reject_snapshot_saves: false,
+    };
+    store.save_snapshot(snapshot).unwrap();
+    store.reject_snapshot_saves = true;
+
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store);
+    rt.register_recovery_module(actor_id, module, vec![], vec![]);
+
+    assert_eq!(
+        rt.recover_actor(actor_id),
+        None,
+        "failed migration commit must abort recovery"
+    );
+    assert!(
+        !rt.actors.contains_key(&actor_id),
+        "actor must remain unpublished when migration commit fails"
+    );
+
+    let still_old = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(still_old.schema_version, 1);
+    assert_eq!(
+        still_old.state.get("count"),
+        Some(&PersistedValue::Int(8)),
+        "failed replacement must leave the previous committed snapshot intact"
+    );
+}
+
 #[test]
 fn test_recover_actor_rejects_schema_version_mismatch() {
     let mut rt = Runtime::new();
@@ -1958,7 +2132,7 @@ fn test_recover_actor_rejects_schema_version_mismatch() {
     assert_eq!(
         rt.recover_actor(actor_id),
         None,
-        "recovery must fail closed until a v1 -> v2 migration executor exists"
+        "recovery must fail closed when no v1 -> v2 migration manifest/code exists"
     );
     assert!(
         !rt.actors.contains_key(&actor_id),
