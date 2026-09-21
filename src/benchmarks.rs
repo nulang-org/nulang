@@ -299,10 +299,10 @@ let s = spawn Sink {} in
 /// node sums its 10 children plus 1. The root's total is the node count,
 /// `(10^(DEPTH+1) - 1) / 9`. Measures actor-creation rate + tree aggregation.
 ///
-/// Depth is capped at 3 (1111 actors): Nulang's per-actor 16 KiB heap (with
-/// equal-size growth chaining) makes the canonical 1M-leaf skynet (~16 GiB
-/// of heap) infeasible — a cost this benchmark surfaces by construction
-/// rather than hiding.
+/// Depth is capped at 3 (1111 actors) to keep this correctness-oriented
+/// benchmark fast in routine test runs. Actor heaps are now materialized
+/// lazily, so allocation-free actors no longer commit a 16 KiB bump block at
+/// spawn; larger actor-density stress tests belong in the benchmark suite.
 #[test]
 fn bench_skynet() {
     const DEPTH: i64 = 3;

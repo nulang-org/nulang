@@ -362,7 +362,10 @@ impl Actor {
             state: ActorState::Created,
             mailbox: Mailbox::new(mailbox_cap),
             heap: {
-                let mut heap = ActorHeap::new(16 * 1024); // 16KB initial heap (density: ~64k actors/GB)
+                // Most actors never allocate heap objects. Reserve the logical
+                // 16 KiB capacity but materialize backing memory only on the
+                // first small allocation.
+                let mut heap = ActorHeap::new_lazy(16 * 1024);
                 heap.set_actor_id(id);
                 heap
             },
@@ -724,6 +727,16 @@ mod tests {
         let mut actor = Actor::new(1, "test", 0);
         let val = actor.allocate_string("hello");
         assert!(!val.is_nil(), "allocation should return a non-nil value");
+    }
+
+    #[test]
+    fn test_new_actor_heap_is_unmaterialized() {
+        let actor = Actor::new(1, "lazy", 0);
+        assert!(
+            !actor.heap.has_active_bump_block(),
+            "new actors should not commit 16 KiB until they allocate"
+        );
+        assert_eq!(actor.heap.used(), 0);
     }
 
     #[test]

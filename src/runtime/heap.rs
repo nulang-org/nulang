@@ -335,18 +335,11 @@ impl ActorHeap {
     pub fn new(total_size: usize) -> Self {
         assert!(total_size > 0, "ActorHeap size must be > 0");
 
-        // Try the thread-local heap pool before the global allocator.
-        let (base, actual_size) = HEAP_POOL
-            .with(|pool| pool.borrow_mut().acquire(total_size))
-            .unwrap_or_else(|| {
-                let layout = std::alloc::Layout::from_size_align(total_size, ALIGN)
-                    .expect("invalid ActorHeap layout");
-                let base = unsafe { std::alloc::alloc(layout) };
-                if base.is_null() {
-                    std::alloc::handle_alloc_error(layout);
-                }
-                (base, total_size)
-            });
+        let (base, actual_size) = Self::acquire_bump_block(total_size).unwrap_or_else(|| {
+            let layout = std::alloc::Layout::from_size_align(total_size, ALIGN)
+                .expect("invalid ActorHeap layout");
+            std::alloc::handle_alloc_error(layout)
+        });
 
         ActorHeap {
             actor_id: 0,
@@ -354,6 +347,34 @@ impl ActorHeap {
             current: base,
             limit: unsafe { base.add(actual_size) },
             total_size: actual_size,
+            used_bytes: 0,
+            prior_used: 0,
+            retired_blocks: Vec::new(),
+            free_lists: [std::ptr::null_mut(); NUM_SIZE_CLASSES],
+            los_blocks: Vec::new(),
+            live_head: std::ptr::null_mut(),
+            live_tail: std::ptr::null_mut(),
+            live_count: 0,
+            total_allocs: 0,
+            total_frees: 0,
+            peak_used: 0,
+        }
+    }
+
+    /// Create a heap whose first bump block is allocated only on demand.
+    ///
+    /// The requested capacity is retained in `total_size`, but no backing
+    /// block is acquired until the first non-LOS allocation. This is intended
+    /// for actors that may remain allocation-free for their entire lifetime.
+    pub fn new_lazy(total_size: usize) -> Self {
+        assert!(total_size > 0, "ActorHeap size must be > 0");
+
+        ActorHeap {
+            actor_id: 0,
+            base: std::ptr::null_mut(),
+            current: std::ptr::null_mut(),
+            limit: std::ptr::null_mut(),
+            total_size,
             used_bytes: 0,
             prior_used: 0,
             retired_blocks: Vec::new(),
@@ -468,6 +489,9 @@ impl ActorHeap {
         }
 
         // --- Slow path: bump allocation, chaining a new block on exhaustion ---
+        if self.base.is_null() {
+            self.activate_bump_block(block_size)?;
+        }
         unsafe {
             if self.current.add(block_size) > self.limit {
                 // The active block is full.  Objects never move (raw payload
@@ -592,6 +616,13 @@ impl ActorHeap {
         self.total_size - self.used_bytes
     }
 
+    /// Whether this heap currently owns an active bump block.
+    ///
+    /// Lazy actor heaps return false until their first small allocation.
+    pub fn has_active_bump_block(&self) -> bool {
+        !self.base.is_null()
+    }
+
     /// Number of objects currently alive (allocated but not freed).
     pub fn live_count(&self) -> usize {
         self.live_count
@@ -687,6 +718,32 @@ impl ActorHeap {
     // ==================================================================
     // Internal helpers
     // ==================================================================
+
+    /// Acquire one bump block from the thread-local pool or global allocator.
+    fn acquire_bump_block(min_size: usize) -> Option<(*mut u8, usize)> {
+        if let Some(block) = HEAP_POOL.with(|pool| pool.borrow_mut().acquire(min_size)) {
+            return Some(block);
+        }
+
+        let layout = std::alloc::Layout::from_size_align(min_size, ALIGN).ok()?;
+        let base = unsafe { std::alloc::alloc(layout) };
+        if base.is_null() {
+            return None;
+        }
+        Some((base, min_size))
+    }
+
+    /// Materialize the active bump block for a lazily-created heap.
+    fn activate_bump_block(&mut self, min_capacity: usize) -> Option<()> {
+        debug_assert!(self.base.is_null());
+        let requested = self.total_size.max(min_capacity);
+        let (base, actual_size) = Self::acquire_bump_block(requested)?;
+        self.base = base;
+        self.current = base;
+        self.limit = unsafe { base.add(actual_size) };
+        self.total_size = actual_size;
+        Some(())
+    }
 
     /// Chain a fresh bump block onto the heap and make it the active block.
     ///
@@ -1032,16 +1089,44 @@ impl Drop for ActorHeap {
         self.release_los_blocks();
         // Return retired bump blocks to the pool.
         self.release_retired_blocks();
-        // Return the primary bump block to the pool.
-        HEAP_POOL.with(|pool| {
-            pool.borrow_mut().release(self.base, self.total_size);
-        });
+        // Return the primary bump block to the pool if it was materialized.
+        if !self.base.is_null() {
+            HEAP_POOL.with(|pool| {
+                pool.borrow_mut().release(self.base, self.total_size);
+            });
+        }
     }
 }
 
 // =============================================================================
 // Unit Tests
 // =============================================================================
+
+#[test]
+fn test_lazy_heap_materializes_on_first_small_allocation() {
+    let mut heap = ActorHeap::new_lazy(16 * 1024);
+    assert!(!heap.has_active_bump_block());
+    assert_eq!(heap.used(), 0);
+    assert_eq!(heap.free_bytes(), 16 * 1024);
+
+    let ptr = heap.alloc(8, TypeTag::Raw).expect("lazy heap alloc failed");
+    assert!(!ptr.is_null());
+    assert!(heap.has_active_bump_block());
+    assert!(heap.used() > 0);
+}
+
+#[test]
+fn test_lazy_heap_large_object_does_not_materialize_bump_block() {
+    let mut heap = ActorHeap::new_lazy(16 * 1024);
+    let ptr = heap
+        .alloc(LOS_THRESHOLD + 1, TypeTag::Raw)
+        .expect("LOS alloc failed");
+    assert!(!ptr.is_null());
+    assert!(
+        !heap.has_active_bump_block(),
+        "LOS-only allocation should not commit the actor bump block"
+    );
+}
 
 #[test]
 fn test_alloc_and_write() {
