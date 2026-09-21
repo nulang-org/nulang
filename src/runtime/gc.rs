@@ -481,15 +481,6 @@ impl OrcaGc {
                 // coordinator only delivers ops for live objects.
                 unsafe { self.free_object(heap, payload_ptr) };
 
-                // Remove from deferred list so process_deferred doesn't
-                // access freed memory.
-                if let Some(pos) = self
-                    .deferred_decrements
-                    .iter()
-                    .position(|&h| h == op.object_header)
-                {
-                    self.deferred_decrements.swap_remove(pos);
-                }
             }
         }
     }
@@ -547,8 +538,10 @@ impl OrcaGc {
             if local == 0 && foreign == 0 && !is_sticky {
                 self.deferred_decrements.swap_remove(i);
                 let payload_ptr = Self::payload_from_header(header_ptr);
-                // SAFETY: payload_ptr is derived from a live header.
-                unsafe { self.free_object(heap, payload_ptr) };
+                // SAFETY: payload_ptr is derived from a live header. The
+                // current header was already removed above, so skip the
+                // otherwise redundant deferred-list lookup for this object.
+                unsafe { self.free_object_impl(heap, payload_ptr, false) };
             } else {
                 i += 1;
             }
@@ -604,6 +597,27 @@ impl OrcaGc {
     /// # Safety
     /// `payload_ptr` must be a live pointer returned by `alloc_object`.
     unsafe fn free_object(&mut self, heap: &mut dyn OrcaHeap, payload_ptr: *mut u8) {
+        // Normal reclamation may target an object that is still present in
+        // the deferred list, so preserve the defensive removal behavior.
+        self.free_object_impl(heap, payload_ptr, true);
+    }
+
+    /// Free an object, optionally removing this object's header from the
+    /// deferred list.
+    ///
+    /// `remove_from_deferred = false` is used only when the caller has just
+    /// removed this exact header with `swap_remove`. Recursive child releases
+    /// still go through `free_object` and therefore retain the defensive
+    /// deferred-list cleanup they need.
+    ///
+    /// # Safety
+    /// Same preconditions as `free_object`.
+    unsafe fn free_object_impl(
+        &mut self,
+        heap: &mut dyn OrcaHeap,
+        payload_ptr: *mut u8,
+        remove_from_deferred: bool,
+    ) {
         let header_ptr = heap.header_ptr(payload_ptr);
         let (size, type_tag, owner) = {
             let header = &*header_ptr;
@@ -635,14 +649,10 @@ impl OrcaGc {
 
         // A recursive child release above may have freed objects that were
         // still queued here; never let the deferred list point at freed
-        // memory (process_deferred drains one entry at a time for the same
-        // reason). Linear scan + swap_remove avoids Vec::retain's full copy.
-        if let Some(pos) = self
-            .deferred_decrements
-            .iter()
-            .position(|&h| h == header_ptr)
-        {
-            self.deferred_decrements.swap_remove(pos);
+        // memory. Callers that already removed this exact header can skip
+        // this lookup, while recursive child releases keep the defensive path.
+        if remove_from_deferred {
+            self.remove_deferred(header_ptr);
         }
 
         self.stats.objects_freed += 1;
@@ -1096,8 +1106,11 @@ mod tests {
 
         // foreign_count is now 0, local_count is 0, object should be freed.
         assert_eq!(heap.live_count(), 0);
-        // process_foreign_op removes the freed object from deferred_decrements.
+        // free_object performs the single required deferred-list removal;
+        // process_foreign_op must not need a second scan.
         assert_eq!(gc.deferred_decrements.len(), 0);
+        gc.process_deferred(&mut heap);
+        assert_eq!(heap.live_count(), 0);
 
         // Running process_deferred is now a no-op.
         gc.process_deferred(&mut heap);
