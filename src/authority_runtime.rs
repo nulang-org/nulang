@@ -34,10 +34,7 @@ pub enum RuntimeAuthorityError {
     /// Durable actor creation could not commit its required initial journal or
     /// snapshot. This remains distinct from an authority denial so callers can
     /// report infrastructure failure without misclassifying it as policy.
-    Persistence {
-        operation: String,
-        message: String,
-    },
+    Persistence { operation: String, message: String },
 }
 
 impl fmt::Display for RuntimeAuthorityError {
@@ -53,7 +50,10 @@ impl fmt::Display for RuntimeAuthorityError {
                 write!(f, "capability denied: {grant}")
             }
             RuntimeAuthorityError::Persistence { operation, message } => {
-                write!(f, "durable spawn persistence failed during {operation}: {message}")
+                write!(
+                    f,
+                    "durable spawn persistence failed during {operation}: {message}"
+                )
             }
         }
     }
