@@ -137,6 +137,11 @@ pub struct ActorSnapshot {
     /// unverified; a present identity must match recovery definition code.
     #[serde(default)]
     pub semantic_id: Option<String>,
+    /// Exact compiler/codegen ArtifactId of the executable that produced this
+    /// durable state. Missing on older snapshots means executable provenance is
+    /// unknown and must not be silently upgraded during recovery.
+    #[serde(default)]
+    pub artifact_id: Option<String>,
     pub state: HashMap<String, PersistedValue>,
     /// For workflow actors, the name of the signal the current step is
     /// suspended waiting for, if any.  This is part of the snapshot so that
@@ -872,7 +877,8 @@ impl LibsqlStore {
                     crdt_snapshot TEXT,
                     crdt_field_map TEXT,
                     authority_tokens TEXT,
-                    semantic_id TEXT
+                    semantic_id TEXT,
+                    artifact_id TEXT
                 )",
                 (),
             )
@@ -899,6 +905,11 @@ impl LibsqlStore {
             // NULL and are treated as explicit legacy/unverified snapshots.
             let _ = conn
                 .execute("ALTER TABLE snapshots ADD COLUMN semantic_id TEXT", ())
+                .await;
+            // Exact executable provenance is additive. Existing rows remain
+            // NULL and therefore explicitly lack verified ArtifactId history.
+            let _ = conn
+                .execute("ALTER TABLE snapshots ADD COLUMN artifact_id TEXT", ())
                 .await;
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS journal (
@@ -1015,9 +1026,9 @@ impl PersistenceStore for LibsqlStore {
         let conn = self.conn();
         self.rt.block_on(async {
             conn.execute(
-                "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens, semantic_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, authority_tokens=excluded.authority_tokens, semantic_id=excluded.semantic_id",
-                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), authority_json.as_str(), snapshot.semantic_id.as_deref()],
+                "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens, semantic_id, artifact_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, authority_tokens=excluded.authority_tokens, semantic_id=excluded.semantic_id, artifact_id=excluded.artifact_id",
+                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), authority_json.as_str(), snapshot.semantic_id.as_deref(), snapshot.artifact_id.as_deref()],
             ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
         })
     }
@@ -1027,7 +1038,7 @@ impl PersistenceStore for LibsqlStore {
         self.rt.block_on(async {
             let mut rows = conn
                 .query(
-                    "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens, semantic_id FROM snapshots WHERE actor_id = ?1",
+                    "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens, semantic_id, artifact_id FROM snapshots WHERE actor_id = ?1",
                     libsql::params![actor_id as i64],
                 )
                 .await
@@ -1040,6 +1051,7 @@ impl PersistenceStore for LibsqlStore {
             let crdt_field_map_json: Option<String> = row.get(4).ok()?;
             let authority_json: Option<String> = row.get(5).ok()?;
             let semantic_id: Option<String> = row.get(6).ok()?;
+            let artifact_id: Option<String> = row.get(7).ok()?;
             let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> = match crdt_json {
                 Some(j) => serde_json::from_str(&j).ok()?,
                 None => None,
@@ -1066,6 +1078,7 @@ impl PersistenceStore for LibsqlStore {
                 actor_id,
                 sequence: sequence as u64,
                 semantic_id,
+                artifact_id,
                 state,
                 waiting_signal,
                 crdt_snapshot,
@@ -1629,7 +1642,8 @@ impl PostgresStore {
                 crdt_snapshot TEXT,
                 crdt_field_map TEXT,
                 authority_tokens TEXT,
-                semantic_id TEXT
+                semantic_id TEXT,
+                artifact_id TEXT
             )",
             &[],
         )
@@ -1641,6 +1655,11 @@ impl PostgresStore {
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         conn.execute(
             "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS semantic_id TEXT",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS artifact_id TEXT",
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1695,8 +1714,8 @@ impl PersistenceStore for PostgresStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens, semantic_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens, semantic_id, artifact_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT (actor_id) DO UPDATE SET
                sequence = EXCLUDED.sequence,
                state = EXCLUDED.state,
@@ -1704,7 +1723,8 @@ impl PersistenceStore for PostgresStore {
                crdt_snapshot = EXCLUDED.crdt_snapshot,
                crdt_field_map = EXCLUDED.crdt_field_map,
                authority_tokens = EXCLUDED.authority_tokens,
-               semantic_id = EXCLUDED.semantic_id",
+               semantic_id = EXCLUDED.semantic_id,
+               artifact_id = EXCLUDED.artifact_id",
             &[
                 &(snapshot.actor_id as i64),
                 &(snapshot.sequence as i64),
@@ -1714,6 +1734,7 @@ impl PersistenceStore for PostgresStore {
                 &crdt_field_map_json.as_str(),
                 &authority_json.as_str(),
                 &snapshot.semantic_id.as_deref(),
+                &snapshot.artifact_id.as_deref(),
             ],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1724,7 +1745,7 @@ impl PersistenceStore for PostgresStore {
         let mut conn = self.conn.lock().unwrap();
         let row = conn
             .query_one(
-                "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens, semantic_id
+                "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens, semantic_id, artifact_id
                  FROM snapshots WHERE actor_id = $1",
                 &[&(actor_id as i64)],
             )
@@ -1736,6 +1757,7 @@ impl PersistenceStore for PostgresStore {
         let crdt_field_map_json: Option<String> = row.get(4);
         let authority_json: Option<String> = row.get(5);
         let semantic_id: Option<String> = row.get(6);
+        let artifact_id: Option<String> = row.get(7);
         let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> =
             crdt_json.and_then(|j| serde_json::from_str(&j).ok());
         let crdt_field_map: Option<HashMap<String, u64>> =
@@ -1758,6 +1780,7 @@ impl PersistenceStore for PostgresStore {
             actor_id,
             sequence: sequence as u64,
             semantic_id,
+            artifact_id,
             state,
             waiting_signal,
             crdt_snapshot,
