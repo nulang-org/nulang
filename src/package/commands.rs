@@ -1209,7 +1209,23 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
     })
 }
 
-/// `nula build-wasm`: compile package to .wasm + AOT .cwasm.
+/// Build the compiler argv for `nula build-wasm`.
+///
+/// Keep package capability semantics identical to `nula build` / `nula run`:
+/// dropping these grants makes the WASM deployment path default-deny effects
+/// that the package explicitly declared.
+fn build_wasm_compile_args(wasm_path: &str, entry: &str) -> Vec<String> {
+    let mut args = vec![
+        "--backend".to_string(),
+        "wasm-aot".to_string(),
+        "--out".to_string(),
+        wasm_path.to_string(),
+        entry.to_string(),
+    ];
+    args.extend(capability_args());
+    args
+}
+
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm in .nula/dist/.
 fn cmd_build_wasm() -> NuResult<()> {
     let root = package_root()?;
@@ -1234,7 +1250,9 @@ fn cmd_build_wasm() -> NuResult<()> {
 
     eprintln!("Building {} (WASM AOT)...", name);
     eprintln!("  Compiling {} to WASM...", entry.display());
-    nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
+    let args = build_wasm_compile_args(&wasm_path_str, &entry_str);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    nulang_exe(&arg_refs)?;
     println!("WASM AOT build succeeded.");
     Ok(())
 }
@@ -2710,6 +2728,40 @@ mod tests {
     fn test_nulang_exe_rejects_invalid_args() {
         let result = nulang_exe(&["--nonexistent-flag"]);
         assert!(result.is_err(), "unknown flags should fail");
+    }
+
+    #[test]
+    fn test_build_wasm_compile_args_forward_manifest_capabilities() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_build_wasm_caps_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = ChangeDir::new(&dir);
+
+        scaffold_package(&dir, "wasm-caps", "default").expect("scaffold should succeed");
+        let mut manifest = Manifest::load(&dir).expect("manifest should load");
+        manifest.package.capabilities = vec!["net".to_string(), "fs".to_string()];
+        manifest.save(&dir).expect("manifest should save");
+
+        let args = build_wasm_compile_args("out.wasm", "src/main.nula");
+        assert_eq!(
+            args,
+            vec![
+                "--backend",
+                "wasm-aot",
+                "--out",
+                "out.wasm",
+                "src/main.nula",
+                "--with",
+                "net",
+                "--with",
+                "fs",
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
