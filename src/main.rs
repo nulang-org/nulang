@@ -120,7 +120,7 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
-                        opts.sandboxed,
+                        execution_authority_from_sandboxed(opts.sandboxed),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -718,7 +718,7 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                         opts.deny_warnings,
-                        opts.sandboxed,
+                        execution_authority_from_sandboxed(opts.sandboxed),
                     ) {
                         print_error(&e, uc);
                     }
@@ -763,7 +763,7 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                         opts.deny_warnings,
-                        opts.sandboxed,
+                        execution_authority_from_sandboxed(opts.sandboxed),
                     )
                 },
                 n,
@@ -783,7 +783,7 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
-                        opts.sandboxed,
+                        execution_authority_from_sandboxed(opts.sandboxed),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -864,7 +864,11 @@ fn main() {
         // compiler. This is the durable-distribution path — a `.nbc` minted
         // in 2026 runs on any conforming runtime in 2126.
         if path.ends_with(".nbc") {
-            if let Err(e) = run_nbc_file(path, opts.verify_source.as_deref(), opts.sandboxed) {
+            if let Err(e) = run_nbc_file(
+                path,
+                opts.verify_source.as_deref(),
+                execution_authority_from_sandboxed(opts.sandboxed),
+            ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
             }
@@ -947,7 +951,7 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                         opts.deny_warnings,
-                        opts.sandboxed,
+                        execution_authority_from_sandboxed(opts.sandboxed),
                     )
                 },
                 n,
@@ -967,7 +971,7 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
-                        opts.sandboxed,
+                        execution_authority_from_sandboxed(opts.sandboxed),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -1003,7 +1007,7 @@ fn main() {
             &opts.with_capabilities,
             opts.store_path.as_deref(),
             opts.deny_warnings,
-                        opts.sandboxed,
+                        execution_authority_from_sandboxed(opts.sandboxed),
         ) {
             print_error(&e, use_color);
             std::process::exit(exit_code(&e));
@@ -1787,6 +1791,16 @@ fn run_frontend(
     Ok((ast, type_checker))
 }
 
+fn execution_authority_from_sandboxed(
+    sandboxed: bool,
+) -> nulang::authority::ExecutionAuthority {
+    if sandboxed {
+        nulang::authority::ExecutionAuthority::deny_all()
+    } else {
+        nulang::authority::ExecutionAuthority::trusted_ambient()
+    }
+}
+
 #[cfg_attr(not(feature = "wasm-backend"), allow(unused_variables))]
 fn run_source(
     source: &str,
@@ -1799,7 +1813,7 @@ fn run_source(
     with_capabilities: &[String],
     store_path: Option<&str>,
     deny_warnings: bool,
-    sandboxed: bool,
+    execution_authority: nulang::authority::ExecutionAuthority,
 ) -> NuResult<()> {
     let (ast, type_checker) =
         run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
@@ -2098,7 +2112,12 @@ fn run_source(
             };
             let value = if has_actors {
                 let (value, runtime) =
-                    run_with_runtime(m, metrics_port, store_dir.as_deref(), sandboxed)?;
+                    run_with_runtime(
+                        m,
+                        metrics_port,
+                        store_dir.as_deref(),
+                        execution_authority.clone(),
+                    )?;
                 // Surface workflow step failures: a failed step used to be
                 // silent (exit 0, no diagnostic) — SPEC2 §10 known-issue #5.
                 let failures = runtime.borrow().workflow_failures();
@@ -2120,7 +2139,7 @@ fn run_source(
                 value
             } else {
                 let mut vm = VM::new();
-                vm.set_sandboxed_host_effects(sandboxed);
+                vm.set_execution_authority(execution_authority.clone());
                 vm.load_module(m);
                 vm.run()?
             };
@@ -2261,7 +2280,7 @@ fn run_with_runtime(
     m: nulang::bytecode::CodeModule,
     metrics_port: Option<u16>,
     store_dir: Option<&str>,
-    sandboxed: bool,
+    execution_authority: nulang::authority::ExecutionAuthority,
 ) -> NuResult<(
     nulang::vm::Value,
     std::rc::Rc<std::cell::RefCell<nulang::runtime::Runtime>>,
@@ -2292,11 +2311,10 @@ fn run_with_runtime(
         let runtime = std::rc::Rc::new(std::cell::RefCell::new(shard_0));
         let mut vm = VM::new();
         vm.load_module(m);
-        let callbacks = if sandboxed {
-            nulang::runtime::RuntimeVmCallbacks::new_sandboxed(runtime.clone())
-        } else {
-            nulang::runtime::RuntimeVmCallbacks::new(runtime.clone())
-        };
+        let callbacks = nulang::runtime::RuntimeVmCallbacks::with_execution_authority(
+            runtime.clone(),
+            execution_authority.clone(),
+        );
         vm.set_actor_callbacks(Box::new(callbacks));
         let value = vm.run()?;
         // Drop the VM (and its callback box, which holds an Rc clone) so
@@ -2340,11 +2358,10 @@ fn run_with_runtime(
         runtime.borrow_mut().register_module_grains(&m);
         let mut vm = VM::new();
         vm.load_module(m);
-        let callbacks = if sandboxed {
-            nulang::runtime::RuntimeVmCallbacks::new_sandboxed(runtime.clone())
-        } else {
-            nulang::runtime::RuntimeVmCallbacks::new(runtime.clone())
-        };
+        let callbacks = nulang::runtime::RuntimeVmCallbacks::with_execution_authority(
+            runtime.clone(),
+            execution_authority.clone(),
+        );
         vm.set_actor_callbacks(Box::new(callbacks));
         if let Some(port) = metrics_port {
             let _ = runtime.borrow_mut().enable_metrics_server(port);
@@ -2498,7 +2515,11 @@ fn compile_source_to_nbc(
 /// Load and run a `.nbc` artifact directly, optionally verifying its recorded
 /// source hash against a source file. This is the durable-distribution path:
 /// no compiler invocation, no source parse — just `from_nbc` + `VM::run`.
-fn run_nbc_file(path: &str, verify_source: Option<&str>, sandboxed: bool) -> NuResult<()> {
+fn run_nbc_file(
+    path: &str,
+    verify_source: Option<&str>,
+    execution_authority: nulang::authority::ExecutionAuthority,
+) -> NuResult<()> {
     let bytes = std::fs::read(path).map_err(|e| nulang::types::NuError::VMError {
         msg: format!("cannot read .nbc file '{path}': {e}"),
         span: Span::default(),
@@ -2539,7 +2560,7 @@ fn run_nbc_file(path: &str, verify_source: Option<&str>, sandboxed: bool) -> NuR
     }
 
     let mut vm = VM::new();
-    vm.set_sandboxed_host_effects(sandboxed);
+    vm.set_execution_authority(execution_authority.clone());
     vm.load_module(artifact.module);
     let value = vm.run()?;
     let result_str = value.to_string_repr();
@@ -2707,7 +2728,13 @@ mod tests {
         let module = compile_with_new_pipeline(&ast, "test", &type_checker)
             .expect("actor program should compile");
         let (_value, runtime) =
-            run_with_runtime(module, None, None).expect("actor program should run");
+            run_with_runtime(
+                module,
+                None,
+                None,
+                nulang::authority::ExecutionAuthority::trusted_ambient(),
+            )
+            .expect("actor program should run");
         let rt = runtime.borrow();
         let actor = rt.actors.values().next().expect("one actor should exist");
         assert_eq!(
