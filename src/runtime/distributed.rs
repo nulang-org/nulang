@@ -1472,7 +1472,7 @@ pub fn process_network_packets(
                                     } else {
                                         notify_delivery_failed(
                                             runtime,
-                                            pending.msg.sender,
+                                            sender,
                                             "target actor not found on retry",
                                         );
                                         ActorAdmissionStatus::Rejected
@@ -2430,6 +2430,7 @@ pub fn process_network_packets(
                         continue;
                     }
                     msg.payload = Arc::new(payload_vec);
+                    let sender = msg.sender;
                     let status = if runtime.actors.contains_key(&target_actor) {
                         let pushed = {
                             let actor = runtime.actors.get_mut(&target_actor).unwrap();
@@ -2450,7 +2451,7 @@ pub fn process_network_packets(
                             }
                         }
                     } else {
-                        notify_delivery_failed(runtime, msg.sender, "target actor not found");
+                        notify_delivery_failed(runtime, sender, "target actor not found");
                         ActorAdmissionStatus::Rejected
                     };
                     send_actor_admission(
