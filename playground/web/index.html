@@ -5,6 +5,15 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Nulang Playground</title>
 <meta name="description" content="Run Nulang in your browser — the compiler and CoreVM run locally as WebAssembly. No server, no install.">
+<script>
+  (() => {
+    const stored = localStorage.getItem('starlight-theme');
+    const theme = stored === 'dark' || stored === 'light'
+      ? stored
+      : (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    document.documentElement.dataset.theme = theme;
+  })();
+</script>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
