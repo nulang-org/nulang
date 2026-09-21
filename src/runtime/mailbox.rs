@@ -354,7 +354,7 @@ mod tests {
         let popped = mb.pop().unwrap();
         assert_eq!(popped.behavior_id, 1);
         assert_eq!(popped.sender, 100);
-        assert_eq!(*popped.payload, vec![Value::int(42)]);
+        assert_eq!(popped.payload.as_ref(), &[Value::int(42)]);
         assert!(mb.is_empty());
         assert_eq!(mb.pop(), None);
     }
