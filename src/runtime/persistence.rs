@@ -128,6 +128,26 @@ fn default_schema_version() -> u32 {
     1
 }
 
+/// Compare persisted durable schema metadata with the currently executing
+/// declaration. Owner-less metadata is accepted only as the legacy v1 shape;
+/// once a writer has emitted an owner, losing that identity is never treated
+/// as compatible.
+pub(crate) fn durable_schema_compatible(
+    persisted_owner: Option<&str>,
+    persisted_version: u32,
+    current_owner: Option<&str>,
+    current_version: u32,
+) -> bool {
+    if persisted_version != current_version {
+        return false;
+    }
+    match (persisted_owner, current_owner) {
+        (Some(persisted), Some(current)) => persisted == current,
+        (Some(_), None) => false,
+        (None, _) => persisted_version == 1,
+    }
+}
+
 /// A serializable snapshot of an actor's durable state.
 ///
 /// RFC 0008 treats snapshots without explicit schema metadata as version 1.
@@ -196,6 +216,13 @@ pub struct JournalEntry {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EventEntry {
     pub sequence: u64,
+    /// Compiler-owned durable schema identity for this event entry.
+    #[serde(default)]
+    pub schema_owner: Option<String>,
+    /// Schema version under which the event was committed. Legacy event logs
+    /// deserialize as version 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     /// Name of the EventSourced field being mutated.
     pub field_name: String,
     /// Event name (e.g. "Incremented", "Custom").
