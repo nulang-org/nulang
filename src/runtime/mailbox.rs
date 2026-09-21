@@ -442,6 +442,26 @@ mod tests {
     }
 
     #[test]
+    fn small_payloads_are_inline_and_large_payloads_are_shared() {
+        for len in 0..=INLINE_MESSAGE_VALUES {
+            let values: Vec<Value> = (0..len).map(|i| Value::int(i as i64)).collect();
+            let payload = MessagePayload::from_slice(&values);
+            assert!(payload.is_inline(), "{len}-value payload should stay inline");
+            assert_eq!(payload.as_slice(), values.as_slice());
+        }
+
+        let values: Vec<Value> = (0..=INLINE_MESSAGE_VALUES)
+            .map(|i| Value::int(i as i64))
+            .collect();
+        let payload = MessagePayload::from_slice(&values);
+        assert!(
+            !payload.is_inline(),
+            "payloads above the inline capacity should use shared storage"
+        );
+        assert_eq!(payload.as_slice(), values.as_slice());
+    }
+
+    #[test]
     fn test_push_and_pop() {
         let mut mb = Mailbox::new(4);
         let msg = make_msg(1, 100);
@@ -453,7 +473,7 @@ mod tests {
         let popped = mb.pop().unwrap();
         assert_eq!(popped.behavior_id, 1);
         assert_eq!(popped.sender, 100);
-        assert_eq!(*popped.payload, vec![Value::int(42)]);
+        assert_eq!(popped.payload.as_slice(), &[Value::int(42)]);
         assert!(mb.is_empty());
         assert_eq!(mb.pop(), None);
     }
