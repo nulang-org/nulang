@@ -305,6 +305,13 @@ pub enum MessageAdmission {
     Rejected,
 }
 
+/// Immediate admission plus optional destination ticket for a tracked send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackedSendAdmission {
+    pub admission: MessageAdmission,
+    pub delivery_id: Option<u64>,
+}
+
 /// Terminal admission reported by a remote node for a tracked actor message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemoteMessageAdmission {
@@ -6571,7 +6578,23 @@ impl Runtime {
         behavior: &str,
         args: &[Value],
     ) -> Option<u64> {
-        distribution::send_distributed_tracked(self, target, behavior, args)
+        self.try_send_distributed_tracked(target, behavior, args)
+            .delivery_id
+    }
+
+    /// Non-blocking tracked send with precise immediate admission.
+    ///
+    /// A remote `Forwarded` result carries a delivery id that later resolves
+    /// to destination Accepted/Backpressured/Rejected. Immediate
+    /// Backpressured means the local transport/ticket boundary could not admit
+    /// the send and no remote ticket remains pending.
+    pub fn try_send_distributed_tracked(
+        &mut self,
+        target: ActorAddress,
+        behavior: &str,
+        args: &[Value],
+    ) -> TrackedSendAdmission {
+        distribution::try_send_distributed_tracked(self, target, behavior, args)
     }
 
     pub fn send_distributed(&mut self, target: ActorAddress, behavior: &str, args: &[Value]) {
