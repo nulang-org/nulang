@@ -80,11 +80,13 @@ impl RuntimeArtifactManifest {
             .iter()
             .zip(module.actor_semantic_ids.iter().copied())
             .enumerate()
-            .map(|(index, (metadata, semantic_id))| RuntimeDefinitionIdentity {
-                metadata_index: index as u32,
-                name: metadata.name.clone(),
-                semantic_id,
-            })
+            .map(
+                |(index, (metadata, semantic_id))| RuntimeDefinitionIdentity {
+                    metadata_index: index as u32,
+                    name: metadata.name.clone(),
+                    semantic_id,
+                },
+            )
             .collect();
 
         Ok(Self {
@@ -132,10 +134,7 @@ impl RuntimeArtifactManifest {
 
     /// Bind identities back onto an NBC-decoded module after verifying the
     /// persisted metadata layout. No existing conflicting sidecar is replaced.
-    pub fn bind_module(
-        &self,
-        module: &mut CodeModule,
-    ) -> Result<(), RuntimeArtifactManifestError> {
+    pub fn bind_module(&self, module: &mut CodeModule) -> Result<(), RuntimeArtifactManifestError> {
         if module.name != self.module_name {
             return Err(RuntimeArtifactManifestError::ModuleNameMismatch {
                 module: module.name.clone(),
@@ -286,10 +285,7 @@ impl RuntimeArtifactManifest {
     }
 }
 
-fn parse_identity<T>(
-    field: &'static str,
-    value: &str,
-) -> Result<T, RuntimeArtifactManifestError>
+fn parse_identity<T>(field: &'static str, value: &str) -> Result<T, RuntimeArtifactManifestError>
 where
     T: FromStr,
     T::Err: fmt::Display,
