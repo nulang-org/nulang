@@ -4120,6 +4120,7 @@ fn test_actor_migration_between_two_nodes() {
         actor_id,
         nbc_bytes,
         snapshot_json,
+        artifact_provenance: None,
     };
     let addr_b = rt_b.distributed.transport.as_ref().unwrap().listen_addr();
     rt_a.distributed
