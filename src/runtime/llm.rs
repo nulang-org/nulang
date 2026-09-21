@@ -132,7 +132,7 @@ impl Default for LlmState {
 
 use super::{
     agent, compute_backoff, suspension_marker, BytecodeDistributedCallbacks,
-    BytecodeRuntimeCallbacks, Runtime,
+    BytecodeRuntimeCallbacks, Runtime, SuspensionReason,
 };
 use crate::primitives::ActorRole;
 use crate::runtime::persistence::WorkflowEvent;
@@ -483,7 +483,7 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                     (*self_ptr).checkpoint_actor(actor_id);
                 }
             }
-            Err(crate::types::NuError::Suspended(_)) => {
+            Err(crate::types::NuError::Suspended(kind)) => {
                 // Suspended again (e.g. a chained `perform LLM.ask` or a
                 // signal wait): re-capture the VM state so the next
                 // completion or signal can resume it.
@@ -498,6 +498,7 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                                 vm_state,
                                 behavior_idx: suspended.behavior_idx,
                                 step_name: suspended.step_name,
+                                reason: SuspensionReason::from_vm(kind),
                             });
                     }
                     // A chained receive-after suspend arms its timeout
