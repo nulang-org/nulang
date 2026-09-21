@@ -44,7 +44,6 @@ fn apply_handler_function_name(actor_name: &str, event: &str) -> String {
     format!("{actor_name}.$apply_{event}")
 }
 
-
 /// Conservative proof that an apply handler can be re-run as a deterministic
 /// event projection without observing non-event-sourced actor state or
 /// invoking actor/effect surfaces that the isolated replay VM must deny.
@@ -61,9 +60,7 @@ fn apply_handler_replay_safe(
     match expr {
         Expr::Literal(..) | Expr::Var(..) | Expr::Panic(..) => true,
         Expr::SelfRef(_) => false,
-        Expr::FString(parts, _)
-        | Expr::Tuple(parts, _)
-        | Expr::Array(parts, _) => parts
+        Expr::FString(parts, _) | Expr::Tuple(parts, _) | Expr::Array(parts, _) => parts
             .iter()
             .all(|part| apply_handler_replay_safe(part, event_sourced_fields)),
         Expr::Record(fields, _) => fields
@@ -146,12 +143,12 @@ fn apply_handler_replay_safe(
             apply_handler_replay_safe(cond, event_sourced_fields)
                 && apply_handler_replay_safe(body, event_sourced_fields)
         }
-        Expr::Return(value, _) | Expr::Break(value, _) => value
-            .as_ref()
-            .map_or(true, |value| apply_handler_replay_safe(value, event_sourced_fields)),
-        Expr::Recover { body, .. }
-        | Expr::Hide { body, .. }
-        | Expr::Seal { body, .. } => apply_handler_replay_safe(body, event_sourced_fields),
+        Expr::Return(value, _) | Expr::Break(value, _) => value.as_ref().map_or(true, |value| {
+            apply_handler_replay_safe(value, event_sourced_fields)
+        }),
+        Expr::Recover { body, .. } | Expr::Hide { body, .. } | Expr::Seal { body, .. } => {
+            apply_handler_replay_safe(body, event_sourced_fields)
+        }
 
         // Conservative v1 replay subset. Function calls and all actor/effect
         // surfaces are excluded until their transitive purity/capability
@@ -263,11 +260,8 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
             for handler in &a.apply_handler_bodies {
                 let name = apply_handler_function_name(&a.name, &handler.event);
                 let idx = ctx.reserve_function(&name);
-                ctx.apply_handler_function_of.push((
-                    a.name.clone(),
-                    handler.event.clone(),
-                    idx,
-                ));
+                ctx.apply_handler_function_of
+                    .push((a.name.clone(), handler.event.clone(), idx));
             }
 
             // State migrations are compiler-private functions, not actor
@@ -307,19 +301,16 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
             // separate compiler/runtime slice; recovery must not infer code
             // from this metadata alone.
             let mut migration_manifest =
-                crate::migration_manifest::MigrationManifest::from_decls(
-                    a.version,
-                    &a.migrations,
-                )
-                .map_err(|error| {
-                    NuError::type_error(
-                        format!(
-                            "invalid RFC 0008 migration chain for entity '{}': {error}",
-                            a.name
-                        ),
-                        a.span,
-                    )
-                })?;
+                crate::migration_manifest::MigrationManifest::from_decls(a.version, &a.migrations)
+                    .map_err(|error| {
+                        NuError::type_error(
+                            format!(
+                                "invalid RFC 0008 migration chain for entity '{}': {error}",
+                                a.name
+                            ),
+                            a.span,
+                        )
+                    })?;
 
             for contract in &mut migration_manifest.contracts {
                 if !contract.has_state_transform {
@@ -346,20 +337,20 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                 contract.state_function_index = Some(function_idx);
             }
 
-            let migrations = migration_manifest.to_json().map_err(|error| NuError::VMError {
-                msg: format!(
-                    "failed to encode RFC 0008 migration manifest for entity '{}': {error}",
-                    a.name
-                ),
-                span: a.span,
-            })?;
+            let migrations = migration_manifest
+                .to_json()
+                .map_err(|error| NuError::VMError {
+                    msg: format!(
+                        "failed to encode RFC 0008 migration manifest for entity '{}': {error}",
+                        a.name
+                    ),
+                    span: a.span,
+                })?;
 
             let event_sourced_fields: HashSet<String> = a
                 .state_fields
                 .iter()
-                .filter(|(_, model, _, _)| {
-                    matches!(model, crate::ast::StateModel::EventSourced)
-                })
+                .filter(|(_, model, _, _)| matches!(model, crate::ast::StateModel::EventSourced))
                 .map(|(name, _, _, _)| name.clone())
                 .collect();
             let apply_handlers = a
@@ -379,10 +370,7 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                         .iter()
                         .find(|source| source.event == handler.event)
                         .map(|source| {
-                            apply_handler_replay_safe(
-                                &source.body,
-                                &event_sourced_fields,
-                            )
+                            apply_handler_replay_safe(&source.body, &event_sourced_fields)
                         })
                         .unwrap_or(false);
                     crate::bytecode::ApplyHandlerMeta {
@@ -507,18 +495,12 @@ fn lower_decl_bodies(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                 let function_idx = ctx
                     .apply_handler_function_of
                     .iter()
-                    .find(|(actor_name, event, _)| {
-                        actor_name == &a.name && event == &handler.event
-                    })
+                    .find(|(actor_name, event, _)| actor_name == &a.name && event == &handler.event)
                     .map(|(_, _, idx)| *idx)
                     .expect("apply handler function slot reserved in pass 1");
                 let full_name = apply_handler_function_name(&a.name, &handler.event);
-                let func = lower_apply_handler_function(
-                    ctx,
-                    &full_name,
-                    &handler.params,
-                    &handler.body,
-                )?;
+                let func =
+                    lower_apply_handler_function(ctx, &full_name, &handler.params, &handler.body)?;
                 ctx.fill_function(function_idx, func);
             }
 
@@ -3279,7 +3261,9 @@ mod tests {
         .expect_err("incomplete migration chain must fail lowering");
 
         assert!(
-            error.to_string().contains("missing migration transition 1 -> 2"),
+            error
+                .to_string()
+                .contains("missing migration transition 1 -> 2"),
             "unexpected error: {error}"
         );
     }
