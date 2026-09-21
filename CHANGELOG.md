@@ -42,6 +42,10 @@ version + migration.*
 
 ## Stable tier
 
+### Durable semantic history pinning — 2026-09-21
+- **Durable actor snapshots can now record compiler-derived `SemanticId` and fail closed on identified-code mismatch** (Experimental, `src/compiler_identity.rs`, `src/bytecode.rs`, `src/runtime/persistence.rs`, `src/runtime/mod.rs`). Typed compiler entry points attach an in-memory semantic-identity sidecar to `CodeModule`; raw MIR/NBC modules remain explicitly unidentified. `recover_actor_with_identity_policy` adds strict versus legacy-compatible recovery for pre-identity histories, while any snapshot that already carries identity always requires exactly matching identified recovery code.
+- **Frozen NBC v1 migration/shadow transport remains explicitly unverified.** The transport does not copy a semantic identity string it cannot prove against received bytecode, and receivers reject self-asserted identified snapshots over legacy NBC v1. ArtifactId retention and verifiable cross-node artifact manifests remain follow-up work under #333.
+
 ### Canonical compiler semantic identity — 2026-09-21
 - **Compiler-owned `SemanticId` now derives from canonical backend-independent MIR plus typed actor-state schemas** (Experimental, `src/semantic_identity.rs`, `src/semantic_schema.rs`, `src/compiler_identity.rs`). The encoding alpha-normalizes compiler-generated IDs, excludes presentation/debug metadata and backend selection, includes executable/effect/authority/durable semantics, and folds dependency semantic identities deterministically. `ArtifactIdentityManifest` assembly now has a typed-program entry point that keeps exact `SourceId`, semantic identity, and backend-specific `ArtifactId` distinct without changing frozen NBC v1.
 
