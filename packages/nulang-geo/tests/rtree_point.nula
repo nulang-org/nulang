@@ -1,0 +1,14 @@
+import lib
+
+fn main() {
+    let entries = [
+        rtree_entry(bounding_box(0.0, 0.0, 1.0, 1.0, CARTESIAN), 1),
+        rtree_entry(bounding_box(4.0, 4.0, 5.0, 5.0, CARTESIAN), 5)
+    ];
+    let tree = rtree_bulk_load_str(entries, CARTESIAN, 2);
+    let hits = rtree_query_point(tree, cartesian(4.5, 4.5));
+    perform Test.assert(
+        perform Array.length(hits) == 1 && hits[0] == 5,
+        "point query should return bounds containing the point"
+    )
+}
