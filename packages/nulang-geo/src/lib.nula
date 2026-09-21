@@ -8,8 +8,10 @@
 // PROJ, GDAL, H3/S2, GeoArrow, and GeoParquet adapters belong in follow-on
 // packages/extensions once the pure-Nulang API is stable.
 
-/// Marker type for WGS84 longitude/latitude coordinates (EPSG:4326 / OGC CRS84
-/// axis convention: x=longitude, y=latitude).
+/// Marker type for WGS84 geographic coordinates stored as x=longitude,
+/// y=latitude. This follows OGC:CRS84 axis order. It deliberately does not
+/// claim strict EPSG:4326 axis semantics, whose formal axis order is
+/// latitude then longitude.
 pub type Wgs84 = WGS84
 
 /// Marker type for Web Mercator coordinates (EPSG:3857, meters).
