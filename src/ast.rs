@@ -487,6 +487,37 @@ impl CrdtType {
     }
 }
 
+/// Consistency semantics implied by a state declaration.
+///
+/// This is intentionally separate from persistence. A field can be durable
+/// without being multi-writer, and a replicated CRDT has different conflict
+/// semantics from actor-owned state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StateConsistency {
+    /// State is visible only to the local actor activation.
+    Local,
+    /// One actor activation owns mutation at a time. Distribution must fence
+    /// stale owners before another activation may take over.
+    ActorOwned,
+    /// Concurrent replicas converge through the declared CRDT merge rule.
+    Convergent,
+}
+
+/// Recovery history retained for a state declaration.
+///
+/// These values describe the semantic recovery contract, not a concrete
+/// storage engine. Cloud/runtime implementations may choose different stores
+/// as long as they preserve the contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StateDurability {
+    /// No recovery contract; the declared initial value is restored.
+    Ephemeral,
+    /// Recover from a durable materialized state plus ordered mutation history.
+    SnapshotJournal,
+    /// Recover by replaying an authoritative event history.
+    EventLog,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StateModel {
     Local,
@@ -499,6 +530,31 @@ pub enum StateModel {
 impl StateModel {
     pub fn is_crdt(&self) -> bool {
         matches!(self, StateModel::Crdt(_))
+    }
+
+    /// The mutation/replication consistency contract for this state model.
+    pub const fn consistency(self) -> StateConsistency {
+        match self {
+            StateModel::Local => StateConsistency::Local,
+            StateModel::Durable | StateModel::EventSourced => StateConsistency::ActorOwned,
+            StateModel::Crdt(_) => StateConsistency::Convergent,
+        }
+    }
+
+    /// The crash-recovery history contract for this state model.
+    pub const fn durability(self) -> StateDurability {
+        match self {
+            StateModel::Local => StateDurability::Ephemeral,
+            StateModel::Durable | StateModel::Crdt(_) => StateDurability::SnapshotJournal,
+            StateModel::EventSourced => StateDurability::EventLog,
+        }
+    }
+
+    /// Whether safe distributed activation requires a single-owner fencing
+    /// protocol. Local state has no cross-node ownership contract and CRDT
+    /// state is deliberately multi-writer.
+    pub const fn requires_single_writer(self) -> bool {
+        matches!(self.consistency(), StateConsistency::ActorOwned)
     }
 }
 
@@ -1220,6 +1276,38 @@ mod tests {
     #[test]
     fn test_state_model_default() {
         assert_eq!(StateModel::default(), StateModel::Local);
+    }
+
+    #[test]
+    fn test_state_model_semantic_axes() {
+        assert_eq!(StateModel::Local.consistency(), StateConsistency::Local);
+        assert_eq!(StateModel::Local.durability(), StateDurability::Ephemeral);
+        assert!(!StateModel::Local.requires_single_writer());
+
+        assert_eq!(
+            StateModel::Durable.consistency(),
+            StateConsistency::ActorOwned
+        );
+        assert_eq!(
+            StateModel::Durable.durability(),
+            StateDurability::SnapshotJournal
+        );
+        assert!(StateModel::Durable.requires_single_writer());
+
+        assert_eq!(
+            StateModel::EventSourced.consistency(),
+            StateConsistency::ActorOwned
+        );
+        assert_eq!(
+            StateModel::EventSourced.durability(),
+            StateDurability::EventLog
+        );
+        assert!(StateModel::EventSourced.requires_single_writer());
+
+        let crdt = StateModel::Crdt(CrdtType::ORSet);
+        assert_eq!(crdt.consistency(), StateConsistency::Convergent);
+        assert_eq!(crdt.durability(), StateDurability::SnapshotJournal);
+        assert!(!crdt.requires_single_writer());
     }
 
     #[test]
