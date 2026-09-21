@@ -11,6 +11,7 @@ fn bench_memory_store(c: &mut Criterion) {
                 actor_id: 1,
                 sequence: 0,
                 semantic_id: None,
+                artifact_id: None,
                 state: std::collections::HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
