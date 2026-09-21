@@ -30,7 +30,7 @@ macro_rules! define_id {
             /// Reconstruct an identity from its already-hashed 32-byte wire or
             /// storage representation. Domain separation applies when the
             /// identity is originally derived, not when its digest is decoded.
-            pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+            pub const fn from_digest_bytes(bytes: [u8; 32]) -> Self {
                 Self(bytes)
             }
 
@@ -184,10 +184,10 @@ mod tests {
     #[test]
     fn identity_roundtrips_raw_digest_bytes() {
         let semantic = SemanticId::from_canonical_bytes(b"wire", []);
-        assert_eq!(SemanticId::from_bytes(*semantic.as_bytes()), semantic);
+        assert_eq!(SemanticId::from_digest_bytes(*semantic.as_bytes()), semantic);
         let artifact =
             ArtifactId::from_semantic(semantic, "compiler", "target", "abi", "backend", ["flag"]);
-        assert_eq!(ArtifactId::from_bytes(*artifact.as_bytes()), artifact);
+        assert_eq!(ArtifactId::from_digest_bytes(*artifact.as_bytes()), artifact);
     }
 
     #[test]
