@@ -1209,24 +1209,14 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
     })
 }
 
-/// Build the compiler argv for `nula build-wasm`.
+/// `nula build-wasm`: compile the package to Wasm + Behavior Manifest +
+/// AOT artifact from one checked compiler unit.
 ///
-/// Keep package capability semantics identical to `nula build` / `nula run`:
-/// dropping these grants makes the WASM deployment path default-deny effects
-/// that the package explicitly declared.
-fn build_wasm_compile_args(wasm_path: &str, entry: &str) -> Vec<String> {
-    let mut args = vec![
-        "--backend".to_string(),
-        "wasm-aot".to_string(),
-        "--out".to_string(),
-        wasm_path.to_string(),
-        entry.to_string(),
-    ];
-    args.extend(capability_args());
-    args
-}
-
-/// `nula build-wasm`: compile package to .wasm + AOT .cwasm in .nula/dist/.
+/// The integrated path is intentionally in-process: package capabilities,
+/// dependency provenance, import resolution, MIR host-operation inventory,
+/// emitted Wasm bytes, and the Behavior Manifest must describe the same
+/// compilation rather than being reconstructed by a second compiler process.
+#[cfg(feature = "wasm-backend")]
 fn cmd_build_wasm() -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
@@ -1236,8 +1226,32 @@ fn cmd_build_wasm() -> NuResult<()> {
     })?;
     let name = manifest.package.name.clone();
 
+    // Resolves dependencies and writes the exact Nulang.lock whose bytes are
+    // bound into the emitted Behavior Manifest.
     let entry = prepare_package()?;
-    let entry_str = entry.to_string_lossy().into_owned();
+
+    let lock_path = root.join(LOCKFILE_FILE);
+    let dependency_bytes = std::fs::read(&lock_path).map_err(|e| NuError::PackageError {
+        msg: format!(
+            "cannot read dependency lock {} after package resolution: {}",
+            lock_path.display(),
+            e
+        ),
+        span: Span::default(),
+    })?;
+
+    let compiler_path = std::env::current_exe().map_err(|e| NuError::PackageError {
+        msg: format!("cannot locate compiler executable for provenance: {}", e),
+        span: Span::default(),
+    })?;
+    let compiler_bytes = std::fs::read(&compiler_path).map_err(|e| NuError::PackageError {
+        msg: format!(
+            "cannot read compiler executable {} for provenance: {}",
+            compiler_path.display(),
+            e
+        ),
+        span: Span::default(),
+    })?;
 
     let dist_dir = root.join(".nula").join("dist");
     std::fs::create_dir_all(&dist_dir).map_err(|e| NuError::PackageError {
@@ -1245,16 +1259,65 @@ fn cmd_build_wasm() -> NuResult<()> {
         span: Span::default(),
     })?;
 
-    let wasm_path = dist_dir.join(format!("{}.wasm", name));
-    let wasm_path_str = wasm_path.to_string_lossy().into_owned();
-
-    eprintln!("Building {} (WASM AOT)...", name);
+    let module_path = build_module_path();
+    eprintln!("Building {} (WASM AOT + Behavior Manifest)...", name);
     eprintln!("  Compiling {} to WASM...", entry.display());
-    let args = build_wasm_compile_args(&wasm_path_str, &entry_str);
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    nulang_exe(&arg_refs)?;
+
+    let output = crate::behavior_build::compile_wasm_behavior(
+        crate::behavior_build::BehaviorBuildInput {
+            source_path: &entry,
+            package_name: &manifest.package.name,
+            package_version: &manifest.package.version,
+            dependency_bytes: &dependency_bytes,
+            compiler_implementation: "nulang-rust",
+            compiler_version: env!("CARGO_PKG_VERSION"),
+            compiler_bytes: &compiler_bytes,
+            module_path: module_path.as_deref(),
+            with_capabilities: &manifest.package.capabilities,
+            deny_warnings: false,
+        },
+    )?;
+
+    let wasm_path = dist_dir.join(format!("{}.wasm", name));
+    std::fs::write(&wasm_path, &output.wasm_bytes).map_err(|e| NuError::PackageError {
+        msg: format!("cannot write {}: {}", wasm_path.display(), e),
+        span: Span::default(),
+    })?;
+
+    let behavior_path = dist_dir.join(format!("{}.behavior.json", name));
+    let behavior_json = output
+        .manifest
+        .to_canonical_json()
+        .map_err(|e| NuError::PackageError {
+            msg: format!("cannot serialize Behavior Manifest: {}", e),
+            span: Span::default(),
+        })?;
+    std::fs::write(&behavior_path, behavior_json).map_err(|e| NuError::PackageError {
+        msg: format!("cannot write {}: {}", behavior_path.display(), e),
+        span: Span::default(),
+    })?;
+
+    // Precompile the exact Wasm bytes whose digest is recorded in the manifest.
+    let cwasm_path = dist_dir.join(format!("{}.cwasm", name));
+    crate::wasm_runtime::aot_compile(
+        &wasm_path.to_string_lossy(),
+        &cwasm_path.to_string_lossy(),
+    )?;
+
     println!("WASM AOT build succeeded.");
+    println!("  {}", wasm_path.display());
+    println!("  {}", cwasm_path.display());
+    println!("  {}", behavior_path.display());
     Ok(())
+}
+
+#[cfg(not(feature = "wasm-backend"))]
+fn cmd_build_wasm() -> NuResult<()> {
+    Err(NuError::PackageError {
+        msg: "nula build-wasm requires a compiler built with the 'wasm-backend' feature"
+            .to_string(),
+        span: Span::default(),
+    })
 }
 
 /// `nula run`: build, then execute the entry point.
@@ -2730,35 +2793,64 @@ mod tests {
         assert!(result.is_err(), "unknown flags should fail");
     }
 
+    #[cfg(feature = "wasm-backend")]
     #[test]
-    fn test_build_wasm_compile_args_forward_manifest_capabilities() {
+    fn test_build_wasm_emits_bound_manifest_and_honors_capabilities() {
         let dir = std::env::temp_dir().join(format!(
-            "nulang_build_wasm_caps_test_{}",
+            "nulang_build_wasm_manifest_test_{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _guard = ChangeDir::new(&dir);
 
-        scaffold_package(&dir, "wasm-caps", "default").expect("scaffold should succeed");
+        scaffold_package(&dir, "wasm-manifest", "default").expect("scaffold should succeed");
+        std::fs::write(
+            dir.join("src").join("main.nula"),
+            "perform Http.get(\"https://example.com\")\n",
+        )
+        .unwrap();
+
         let mut manifest = Manifest::load(&dir).expect("manifest should load");
-        manifest.package.capabilities = vec!["net".to_string(), "fs".to_string()];
+        manifest.package.capabilities = vec!["net".to_string()];
         manifest.save(&dir).expect("manifest should save");
 
-        let args = build_wasm_compile_args("out.wasm", "src/main.nula");
+        cmd_build_wasm().expect("build-wasm should honor the declared net capability");
+
+        let dist = dir.join(".nula").join("dist");
+        let wasm_path = dist.join("wasm-manifest.wasm");
+        let cwasm_path = dist.join("wasm-manifest.cwasm");
+        let behavior_path = dist.join("wasm-manifest.behavior.json");
+        assert!(wasm_path.is_file(), "Wasm artifact must be emitted");
+        assert!(cwasm_path.is_file(), "AOT artifact must be emitted");
+        assert!(behavior_path.is_file(), "Behavior Manifest must be emitted");
+
+        let wasm_bytes = std::fs::read(&wasm_path).unwrap();
+        let behavior: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&behavior_path).unwrap()).unwrap();
+
         assert_eq!(
-            args,
-            vec![
-                "--backend",
-                "wasm-aot",
-                "--out",
-                "out.wasm",
-                "src/main.nula",
-                "--with",
-                "net",
-                "--with",
-                "fs",
-            ]
+            behavior["artifact"]["digest"],
+            crate::behavior_manifest::digest(&wasm_bytes)
+        );
+        assert_eq!(
+            behavior["host_abi"]["schema"],
+            crate::host_effect_abi::HOST_EFFECT_ABI_SCHEMA
+        );
+        assert!(
+            behavior["host_abi"]["required_operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|operation| {
+                    operation
+                        == "nulang.host-effects/v0alpha1:nulang:http/string#GET"
+                }),
+            "canonical Http.get host operation must be bound to the artifact"
+        );
+        assert_eq!(
+            behavior["host_abi"]["requires_legacy_extension_dispatch"],
+            false
         );
 
         let _ = std::fs::remove_dir_all(&dir);
