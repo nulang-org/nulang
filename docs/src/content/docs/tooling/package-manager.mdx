@@ -301,22 +301,26 @@ dependency resolution, language-version checks, module-path setup, and declared
 capability forwarding as the normal package build before invoking the WASM
 backend.
 
-The adjacent `*.behavior.json` file is the compiler/package contract defined
-by RFC 0020. It is bound to the exact emitted WASM bytes with a BLAKE3 digest
-and records package/language/compiler identity plus source and lockfile
-provenance.
+The adjacent `*.behavior.json` file conforms to
+`spec/behavior/v0alpha1.schema.json` and is bound to the exact emitted WASM
+bytes. Normative fields include compiler-binary/source/dependency digests,
+normalized actor records, unique effect records, required authority categories,
+durability summaries, and conservative replay metadata.
 
 The compiler also contributes a conservative semantic inventory covering every
-declared module function, actor behavior, and workflow step/compensation.
-Effect entries contain compiler-inferred body effects, and resource-gated
-effects derive coarse required authority categories (`fs`, `net`, `os`).
-Actor protocol IDs reuse the canonical structural protocol hash and are emitted
-only when the behavior signatures are stable enough to hash; otherwise each
-actor carries an explicit incomplete status instead of a guessed identity.
+declared module function, actor behavior, and workflow step/compensation. Rich
+per-subject evidence is retained under the advisory
+`extensions["nulang.org/compiler-semantics"]` namespace rather than changing
+the public v0alpha1 field shapes. Actor protocol IDs reuse the canonical
+structural protocol hash and are emitted only when parameter types, return
+type, and a closed effect contract are explicit; otherwise the compiler
+extension records an incomplete status and the public actor omits `protocol`.
 
-Package-declared capabilities remain separately labelled as declarations.
-Interfaces, durable-state schemas/migrations, and replay classifications are
-still marked `not-emitted` until their compiler-owned contracts land.
+Package-declared capabilities remain advisory configuration under
+`extensions["nulang.org/package-capabilities"]`. The normative `authority`
+array is populated only from compiler-inferred requirements. State-schema and
+migration identities are not emitted yet; durability currently reports only
+the compiler-known persistence class.
 
 For a Wasmtime-precompiled sidecar:
 
