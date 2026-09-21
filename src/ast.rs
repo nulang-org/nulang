@@ -657,7 +657,7 @@ pub struct ImplMethod {
 ///
 /// Indexes describe typed access paths; they do not select a physical database
 /// or storage engine. Backends may realize the same declaration differently.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexDecl {
     pub name: String,
     pub fields: Vec<String>,
