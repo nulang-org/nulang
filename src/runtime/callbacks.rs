@@ -26,6 +26,7 @@ use crate::runtime::heap::{ActorHeap, TypeTag as HeapTypeTag};
 use nulang_ai::{LlmMessage, LlmRequest};
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// Spawn using authority metadata attached to the exact executing bytecode PC.
 /// Any malformed metadata or parent escalation fails closed before a child is
@@ -1268,7 +1269,10 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         // Ownership is established only after pattern+guard commit. Until
         // then the message remains logically queued and its in-flight ORCA
         // reference keeps the payload alive.
-        Some((pos, payload.to_vec()))
+        Some((
+            pos,
+            Arc::try_unwrap(payload).unwrap_or_else(|arc| (*arc).clone()),
+        ))
     }
 
     fn commit_receive_match(&mut self) {
@@ -2174,7 +2178,10 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             };
             // Ownership is established only by commit_receive_match after
             // the pattern+guard succeeds.
-            Some((pos, payload.to_vec()))
+            Some((
+                pos,
+                Arc::try_unwrap(payload).unwrap_or_else(|arc| (*arc).clone()),
+            ))
         }
     }
 
