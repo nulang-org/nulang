@@ -801,8 +801,24 @@ pub fn send_distributed(
     args: &[Value],
 ) {
     let _ = send_distributed_inner(
-        runtime, transport, cluster, resolver, target, behavior, args, false,
+        runtime, transport, cluster, resolver, target, behavior, args, false, false,
     );
+}
+
+/// Attempt a non-blocking distributed send with precise immediate admission.
+pub fn try_send_distributed(
+    runtime: &mut Runtime,
+    transport: &mut dyn NetworkTransport,
+    cluster: &ClusterState,
+    resolver: &mut AddressResolver,
+    target: ActorAddress,
+    behavior: &str,
+    args: &[Value],
+) -> MessageAdmission {
+    send_distributed_inner(
+        runtime, transport, cluster, resolver, target, behavior, args, false, true,
+    )
+    .admission
 }
 
 /// Compatibility tracked-send API returning only the asynchronous delivery id.
@@ -832,7 +848,7 @@ pub fn try_send_distributed_tracked(
     args: &[Value],
 ) -> TrackedSendAdmission {
     send_distributed_inner(
-        runtime, transport, cluster, resolver, target, behavior, args, true,
+        runtime, transport, cluster, resolver, target, behavior, args, true, true,
     )
 }
 
@@ -845,6 +861,7 @@ fn send_distributed_inner(
     behavior: &str,
     args: &[Value],
     tracked: bool,
+    nonblocking: bool,
 ) -> TrackedSendAdmission {
     match resolver.resolve(cluster, target) {
         ResolveResult::Local { actor_id } => TrackedSendAdmission {
@@ -929,7 +946,7 @@ fn send_distributed_inner(
             );
 
             let net_node_id = NodeId(node_id.0);
-            if tracked {
+            if nonblocking {
                 match transport.try_send(net_node_id, node_info.address, packet) {
                     TransportAdmission::Accepted => TrackedSendAdmission {
                         admission: MessageAdmission::Forwarded,
