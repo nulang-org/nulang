@@ -742,6 +742,27 @@ impl CrdtManager {
         }
     }
 
+    /// Remove every CRDT replica owned by one actor.
+    ///
+    /// Workflow creation uses this to roll back manager state when its initial
+    /// durable journal/snapshot commit fails before the actor is published.
+    /// Actor field registrations own their CRDT ids exclusively, so removing
+    /// the forward/reverse mappings and corresponding replicas is safe.
+    pub fn unregister_actor_fields(&mut self, actor_id: u64) {
+        let owned: Vec<CrdtId> = self
+            .field_map
+            .iter()
+            .filter_map(|((owner, _), id)| (*owner == actor_id).then_some(*id))
+            .collect();
+
+        self.field_map.retain(|(owner, _), _| *owner != actor_id);
+        for id in owned {
+            self.field_reverse.remove(&id);
+            self.entries.remove(&id);
+            self.sync_base.remove(&id);
+        }
+    }
+
     /// Register a CRDT-backed state field for an actor.
     ///
     /// Creates a CRDT entry of the given type initialized from `initial_value`,
