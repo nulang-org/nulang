@@ -3009,10 +3009,11 @@ mod tests {
             "Account.$migration_state_1_2"
         );
         assert!(
-            !module.actor_metadata[0]
-                .behavior_indices
-                .contains(&function_idx),
-            "migration function must not be an actor behavior"
+            module
+                .behaviors
+                .iter()
+                .all(|behavior| !behavior.name.contains("$migration_state_")),
+            "migration state transforms must not enter the actor behavior table"
         );
     }
 
