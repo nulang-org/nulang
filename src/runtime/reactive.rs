@@ -160,7 +160,7 @@ impl std::fmt::Display for ReactiveSubscriptionError {
             ReactiveSubscriptionError::NotFound(id) => {
                 write!(f, "reactive subscription {} not found", id.0)
             }
-            ReactiveSubscriptionError::Query(error) => error.fmt(f),
+            ReactiveSubscriptionError::Query(error) => write!(f, "{error}"),
         }
     }
 }
