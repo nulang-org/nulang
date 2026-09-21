@@ -1079,7 +1079,9 @@ fn decode_verified_fetched_behavior(
         entry.name == behavior_name && entry.content_hash.as_ref() == Some(content_hash)
     });
     if !matches_identity {
-        return Err("decoded module does not contain the claimed behavior/content hash".to_string());
+        return Err(
+            "decoded module does not contain the claimed behavior/content hash".to_string(),
+        );
     }
     Ok(module)
 }
@@ -1299,9 +1301,7 @@ pub fn process_network_packets(
                 // before serving bytes onward to another node.
                 if nbc_bytes.is_none() {
                     if let Some(cached) = runtime.behavior_cache.get(&content_hash) {
-                        if let Some(name) =
-                            behavior_name_for_content_hash(cached, &content_hash)
-                        {
+                        if let Some(name) = behavior_name_for_content_hash(cached, &content_hash) {
                             match cached.to_nbc(None) {
                                 Ok(bytes) => {
                                     nbc_bytes = Some(bytes);
@@ -1333,11 +1333,7 @@ pub fn process_network_packets(
                 nbc_bytes,
             } => {
                 if let Some(bytes) = nbc_bytes {
-                    match decode_verified_fetched_behavior(
-                        &bytes,
-                        &behavior_name,
-                        &content_hash,
-                    ) {
+                    match decode_verified_fetched_behavior(&bytes, &behavior_name, &content_hash) {
                         Ok(module) => {
                             runtime.behavior_cache.insert(content_hash, module);
                             // Retry any messages that were waiting for this bytecode
