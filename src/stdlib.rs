@@ -20,8 +20,8 @@
 //! | `std.result` | `result.nula` | Extra Result combinators: `unwrap`, `map`, `is_ok`, `is_err`. |
 //! | `std.option` | `option.nula` | Extra Option combinators: `unwrap`, `map`, `is_some`, `is_none`. |
 //! | `std.datetime` | `datetime.nula` | DateTime record type and operations: `now` (stub), `new`, `is_valid`. |
-//! | `std.http` | `http.nula` | HTTP client via built-in `Http` effect: `get`, `post`. |
-//! | `std.fs` | `fs.nula` | Filesystem I/O via built-in `FS` effect: `read`, `write`, `append`, `exists`. |
+//! | `std.http` | `http.nula` | Result-based HTTP wrappers over the built-in `Http` effect: `get`, `post`. |
+//! | `std.fs` | `fs.nula` | Result-based filesystem wrappers over the built-in `FS` effect: `read`, `write`, `append`, `exists`. |
 //! | `std.json` | `json.nula` | JSON parsing and serialization: `parse`, `stringify`, field accessors. |
 //! | `std.test` | `test.nula` | Testing primitives: `assert_eq`, `assert_true`, `assert_false`, `fail`. |
 //!
