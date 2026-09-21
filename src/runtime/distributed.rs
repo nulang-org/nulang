@@ -1343,7 +1343,7 @@ pub fn process_network_packets(
                                     };
                                     msg.behavior_id = behavior_id;
                                     // Intern string and object payloads, then deliver
-                                    let mut payload_vec = (*msg.payload).clone();
+                                    let mut payload_vec = msg.payload.as_slice().to_vec();
                                     if !intern_wire_strings(
                                         runtime,
                                         target_actor,
@@ -2263,7 +2263,7 @@ pub fn process_network_packets(
                     // dangling pool ids.
                     // Clone the Arc payload into a mutable Vec, intern the
                     // strings, then wrap the result back into a fresh Arc.
-                    let mut payload_vec = (*msg.payload).clone();
+                    let mut payload_vec = msg.payload.as_slice().to_vec();
                     if !intern_wire_strings(runtime, target_actor, &mut payload_vec, &string_table)
                     {
                         warn!(
