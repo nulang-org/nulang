@@ -42,6 +42,15 @@ version + migration.*
 
 ## Stable tier
 
+### Runtime secret handle broker — 2026-09-21
+- **Actor-scoped opaque secret handles** (Experimental, `src/runtime/secrets.rs`,
+  `src/runtime/callbacks.rs`). `Secret.get/read` now mint checked runtime
+  handles after the existing exact `Secret::Read(name)` authority gate. The
+  broker stores only actor id + logical secret name and does not fetch or place
+  credential plaintext in VM-visible strings/heap values. `Secret.valid` and
+  `Secret.revoke` are explicit handle operations, and actor exit revokes all
+  owned handles. No generic plaintext reveal operation is provided.
+
 ### Secret value confidentiality — 2026-09-21
 - **Opaque `Secret[T]` type** (Experimental, `src/types.rs`, `src/parser.rs`,
   `src/typechecker.rs`). Secret values are a confidentiality property
