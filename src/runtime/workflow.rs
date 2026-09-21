@@ -134,12 +134,16 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
     let seq = next_sequence(rt, actor_id);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.event_log.push((event.to_string(), args.to_vec()));
-        let event_sourced_names: Vec<String> = actor
+        let mut event_sourced_names: Vec<String> = actor
             .state_models
             .iter()
             .filter(|(_, model)| **model == StateModel::EventSourced)
             .map(|(name, _)| name.clone())
             .collect();
+        // HashMap iteration order is intentionally unspecified. Persist same-
+        // sequence field events in canonical field-name order so durable-change
+        // cursors are stable across restarts and persistence backends.
+        event_sourced_names.sort();
         for name in &event_sourced_names {
             if let Some(n) = actor.get_state_field(name).and_then(|v| v.as_int()) {
                 actor.set_state_field(name, Value::int(n + 1));
