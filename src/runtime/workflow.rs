@@ -7,7 +7,6 @@
 
 use crate::bytecode::Constant;
 use crate::primitives::ActorRole;
-use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{EventEntry, PersistedValue, WorkflowEvent};
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
 use crate::vm::{Frame, Value, VM};
@@ -425,29 +424,3 @@ pub(crate) fn schedule_workflow_timer(
 // Helpers (re-exported from mod.rs; kept here for cohesion)
 // ---------------------------------------------------------------------------
 
-/// Convert a VM value into a Rust string, reading pointer payloads as
-/// null-terminated UTF-8 and string-id values via the actor's bytecode module.
-pub(crate) fn vm_value_to_string_in_actor(value: &Value, actor: &Actor) -> Option<String> {
-    if let Some(id) = value.as_string_id() {
-        actor
-            .bytecode_module
-            .as_ref()
-            .and_then(|m| m.constants.get(id as usize))
-            .and_then(|c| match c {
-                Constant::String(s) => Some(s.clone()),
-                _ => None,
-            })
-    } else if let Some(ptr) = value.as_ptr() {
-        if ptr.is_null() {
-            Some(String::new())
-        } else {
-            Some(unsafe {
-                std::ffi::CStr::from_ptr(ptr as *const std::ffi::c_char)
-                    .to_string_lossy()
-                    .into_owned()
-            })
-        }
-    } else {
-        None
-    }
-}
