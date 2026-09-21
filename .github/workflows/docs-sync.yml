@@ -16,6 +16,7 @@ on:
       - 'examples/**'
       - 'scripts/**'
       - 'docs/**'
+      - '!docs/public/playground/**'
       - 'playground/web/**'
       - 'crates/nulang-playground/**'
       - '.github/workflows/docs-sync.yml'
@@ -83,7 +84,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "docs: auto-sync generated site assets [skip ci]"
+            git commit -m "docs: auto-sync generated site assets"
             git push
           fi
 
