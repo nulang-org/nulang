@@ -6000,103 +6000,201 @@ impl Runtime {
         nbc_bytes: Vec<u8>,
         snapshot_json: Vec<u8>,
     ) -> bool {
+        self.receive_migrated_actor_with_provenance(
+            actor_id,
+            nbc_bytes,
+            snapshot_json,
+            None,
+        )
+    }
+
+    /// Provenance-preserving migration receiver used by NUL0 packet handling
+    /// and shadow re-spawn. The public three-argument entry point above remains
+    /// the legacy compatibility path.
+    pub(crate) fn receive_migrated_actor_with_provenance(
+        &mut self,
+        actor_id: u64,
+        nbc_bytes: Vec<u8>,
+        snapshot_json: Vec<u8>,
+        artifact_provenance: Option<network::RuntimeArtifactProvenance>,
+    ) -> bool {
         use crate::bytecode::CodeModule;
         use crate::runtime::persistence::ActorSnapshot;
 
-        // Parse the bytecode module.
-        let module = match CodeModule::from_nbc(&nbc_bytes) {
-            Ok(artifact) => artifact.module,
-            Err(e) => {
-                tracing::warn!(
-                    "nulang-migrate: bad NBC module for actor {}: {}",
-                    actor_id,
-                    e
-                );
-                return false;
-            }
-        };
-
-        // Parse the durable state snapshot.
         let snapshot: ActorSnapshot = match serde_json::from_slice(&snapshot_json) {
-            Ok(s) => s,
-            Err(e) => {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
                 tracing::warn!(
                     "nulang-migrate: bad snapshot JSON for actor {}: {}",
                     actor_id,
-                    e
+                    error
                 );
                 return false;
             }
         };
 
-        // Frozen NBC v1 does not embed the semantic sidecar, so an identified
-        // snapshot arriving through this legacy transport cannot be verified
-        // against the received bytecode. Reject it rather than trusting the
-        // snapshot to self-certify the code that should execute its state.
-        if snapshot.semantic_id.is_some() || snapshot.artifact_id.is_some() {
-            tracing::warn!(
-                "nulang-migrate: refusing identified snapshot for actor {} over legacy NBC v1 transport",
-                actor_id
-            );
-            return false;
+        let mut module = match CodeModule::from_nbc(&nbc_bytes) {
+            Ok(artifact) => artifact.module,
+            Err(error) => {
+                tracing::warn!(
+                    "nulang-migrate: bad NBC module for actor {}: {}",
+                    actor_id,
+                    error
+                );
+                return false;
+            }
+        };
+
+        match artifact_provenance {
+            Some(provenance) => {
+                let actual_digest = *blake3::hash(&nbc_bytes).as_bytes();
+                if actual_digest != provenance.nbc_blake3 {
+                    tracing::warn!(
+                        actor_id,
+                        "nulang-migrate: NBC byte digest does not match transported artifact provenance"
+                    );
+                    return false;
+                }
+                let runtime_manifest =
+                    match crate::runtime_artifact_manifest::RuntimeArtifactManifest::from_json(
+                        &provenance.runtime_manifest_json,
+                    ) {
+                        Ok(manifest) => manifest,
+                        Err(error) => {
+                            tracing::warn!(
+                                actor_id,
+                                %error,
+                                "nulang-migrate: invalid runtime artifact provenance"
+                            );
+                            return false;
+                        }
+                    };
+                if let Err(error) = runtime_manifest.bind_module(&mut module) {
+                    tracing::warn!(
+                        actor_id,
+                        %error,
+                        "nulang-migrate: runtime artifact provenance does not bind to NBC module"
+                    );
+                    return false;
+                }
+            }
+            None if snapshot.semantic_id.is_some() || snapshot.artifact_id.is_some() => {
+                tracing::warn!(
+                    actor_id,
+                    "nulang-migrate: refusing identified snapshot without byte-verified artifact provenance"
+                );
+                return false;
+            }
+            None => {}
         }
 
-        let is_workflow = module.actor_metadata.iter().any(|m| m.is_workflow);
-        let is_agent = module.actor_metadata.iter().any(|m| m.is_agent);
+        let definition_index = match snapshot.semantic_id.as_deref() {
+            Some(value) => {
+                let definition_id = match value.parse::<crate::content_identity::SemanticId>() {
+                    Ok(id) => id,
+                    Err(error) => {
+                        tracing::warn!(
+                            actor_id,
+                            %error,
+                            "nulang-migrate: malformed definition SemanticId"
+                        );
+                        return false;
+                    }
+                };
+                let mut matches = module
+                    .actor_semantic_ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, candidate)| **candidate == definition_id)
+                    .map(|(index, _)| index);
+                let Some(index) = matches.next() else {
+                    tracing::warn!(
+                        actor_id,
+                        %definition_id,
+                        "nulang-migrate: retained module has no matching actor definition"
+                    );
+                    return false;
+                };
+                if matches.next().is_some() {
+                    tracing::warn!(
+                        actor_id,
+                        %definition_id,
+                        "nulang-migrate: actor definition identity is ambiguous in retained module"
+                    );
+                    return false;
+                }
+                Some(index)
+            }
+            None => None,
+        };
 
-        let actor = match Self::restore_actor_from_snapshot(
+        let current_definition_id =
+            definition_index.and_then(|index| module.actor_semantic_id_at(index));
+        let verified_definition_semantic_id =
+            match Self::verify_snapshot_definition_semantic_identity(
+                actor_id,
+                &snapshot,
+                current_definition_id,
+                RecoveryIdentityPolicy::LegacyCompatible,
+            ) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    tracing::warn!("nulang-migrate: refusing {error}");
+                    return false;
+                }
+            };
+        let verified_execution_artifact_id =
+            match Self::verify_snapshot_execution_artifact_identity(
+                actor_id,
+                &snapshot,
+                module.artifact_id,
+            ) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    tracing::warn!("nulang-migrate: refusing {error}");
+                    return false;
+                }
+            };
+
+        let fallback_is_workflow = module.actor_metadata.iter().any(|meta| meta.is_workflow);
+        let fallback_is_agent = module.actor_metadata.iter().any(|meta| meta.is_agent);
+        let mut actor = match Self::restore_actor_from_snapshot(
             actor_id,
             &module,
             &snapshot,
-            is_workflow,
-            is_agent,
+            definition_index,
+            fallback_is_workflow,
+            fallback_is_agent,
         ) {
             Ok(actor) => actor,
-            Err(err) => {
+            Err(error) => {
                 warn!(
                     "nulang-migrate: invalid authority manifest for actor {}: {}",
-                    actor_id, err
+                    actor_id, error
                 );
                 return false;
             }
         };
+        actor.definition_semantic_id = verified_definition_semantic_id;
+        actor.execution_artifact_id = verified_execution_artifact_id;
 
-        // Register the recovery module.
-        let offsets: Vec<usize> = module
-            .behaviors
-            .iter()
-            .map(|b| b.code_offset as usize)
-            .collect();
-        // Filter compensation_offsets to this actor's own behaviors using
-        // behavior_indices from the first workflow ActorMeta (a migrated
-        // actor module carries its own metadata).
-        let compensation_offsets: Vec<Option<usize>> = module
-            .actor_metadata
-            .iter()
-            .find(|m| m.is_workflow)
-            .map(|meta| {
-                meta.behavior_indices
-                    .iter()
-                    .map(|&i| module.behaviors[i].compensate_offset.map(|o| o as usize))
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                module
-                    .behaviors
-                    .iter()
-                    .map(|b| b.compensate_offset.map(|o| o as usize))
-                    .collect()
-            });
-        self.recovery_modules
-            .insert(actor_id, (module, offsets, compensation_offsets));
+        let offsets = actor.bytecode_offsets.clone();
+        let compensation_offsets = actor.compensation_offsets.clone();
+        spawn::register_recovery_module(
+            self,
+            actor_id,
+            module,
+            offsets,
+            compensation_offsets,
+            verified_definition_semantic_id,
+        );
 
-        // Restore CRDT state if present.
         if let Some(crdt_snap) = &snapshot.crdt_snapshot {
             if let Some(manager) = &mut self.crdt_manager {
                 let crdt_map: HashMap<CrdtId, (CrdtType, Vec<u8>)> = crdt_snap
                     .iter()
                     .filter_map(|(id, ty, bytes)| {
-                        CrdtType::from_u8(*ty).map(|t| (CrdtId(*id), (t, bytes.clone())))
+                        CrdtType::from_u8(*ty).map(|ty| (CrdtId(*id), (ty, bytes.clone())))
                     })
                     .collect();
                 manager.restore(crdt_map);
@@ -6113,18 +6211,24 @@ impl Runtime {
             }
         }
 
+        let is_workflow = actor.is_workflow;
+        self.actors.insert(actor_id, actor);
         if is_workflow {
             self.layout_workflow_behavior_table(actor_id);
         }
-        self.actors.insert(actor_id, actor);
-        if let Some(ref mut mgr) = self.crdt_manager {
+        if let Some(ref mut manager) = self.crdt_manager {
             if let Some(actor) = self.actors.get(&actor_id) {
-                mgr.register_actor_fields(actor_id, actor);
+                manager.register_actor_fields(actor_id, actor);
             }
         }
         self.enqueue_actor(actor_id);
 
-        tracing::info!("nulang-migrate: actor {} received and enqueued", actor_id);
+        tracing::info!(
+            actor_id,
+            identified = verified_definition_semantic_id.is_some()
+                || verified_execution_artifact_id.is_some(),
+            "nulang-migrate: actor received and enqueued"
+        );
         true
     }
 
