@@ -532,6 +532,7 @@ const TYPE_CRDT_OP: u8 = 13;
 const TYPE_MIGRATE_ACTOR: u8 = 14;
 const TYPE_NODE_GOODBYE: u8 = 15;
 const TYPE_SHADOW_REPLICATE: u8 = 16;
+const TYPE_ACTOR_ADMISSION: u8 = 17;
 
 // ---------------------------------------------------------------------------
 // NodeId
@@ -542,6 +543,33 @@ const TYPE_SHADOW_REPLICATE: u8 = 16;
 // ---------------------------------------------------------------------------
 // Packet
 // ---------------------------------------------------------------------------
+
+/// Terminal destination-side admission result for a tracked remote actor message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorAdmissionStatus {
+    Accepted,
+    Backpressured,
+    Rejected,
+}
+
+impl ActorAdmissionStatus {
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::Accepted => 0,
+            Self::Backpressured => 1,
+            Self::Rejected => 2,
+        }
+    }
+
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Accepted),
+            1 => Some(Self::Backpressured),
+            2 => Some(Self::Rejected),
+            _ => None,
+        }
+    }
+}
 
 /// A packet sent over the network between Nulang nodes.
 #[derive(Debug, Clone, PartialEq)]
@@ -580,6 +608,18 @@ pub enum Packet {
         /// Optional trace-id carried across nodes so a span begun on the
         /// sending node can continue on the receiving node (SPEC2 §15.3).
         trace_id: Option<String>,
+        /// Optional sender-generated correlation id for application-level
+        /// destination admission. Older peers ignore this additive tail.
+        delivery_id: Option<u64>,
+    },
+
+    /// Application-level admission response for a tracked actor message.
+    ///
+    /// This is deliberately separate from `Ack`: transport receipt does not
+    /// imply destination mailbox admission.
+    ActorAdmission {
+        delivery_id: u64,
+        status: ActorAdmissionStatus,
     },
 
     /// Heartbeat / ping between nodes.
@@ -776,6 +816,7 @@ impl Packet {
             TYPE_DOWN => Self::read_down(payload)?,
             TYPE_NODE_GOODBYE => Self::read_node_goodbye(payload)?,
             TYPE_SHADOW_REPLICATE => Self::read_shadow_replicate(payload)?,
+            TYPE_ACTOR_ADMISSION => Self::read_actor_admission(payload)?,
             _ => return None,
         };
         Some((seq, packet))
@@ -877,6 +918,7 @@ impl Packet {
             Packet::MigrateActor { .. } => TYPE_MIGRATE_ACTOR,
             Packet::NodeGoodbye { .. } => TYPE_NODE_GOODBYE,
             Packet::ShadowReplicate { .. } => TYPE_SHADOW_REPLICATE,
+            Packet::ActorAdmission { .. } => TYPE_ACTOR_ADMISSION,
         }
     }
 
@@ -893,6 +935,7 @@ impl Packet {
                 sender_node,
                 priority,
                 trace_id,
+                delivery_id,
             } => {
                 buf.extend_from_slice(&target_actor.to_be_bytes());
                 write_string(buf, behavior_name);
@@ -927,6 +970,22 @@ impl Packet {
                     }
                     None => buf.push(0),
                 }
+                // delivery_id is an additive tail so old decoders can ignore
+                // it and new decoders can still accept old actor messages.
+                match delivery_id {
+                    Some(delivery_id) => {
+                        buf.push(1);
+                        buf.extend_from_slice(&delivery_id.to_be_bytes());
+                    }
+                    None => buf.push(0),
+                }
+            }
+            Packet::ActorAdmission {
+                delivery_id,
+                status,
+            } => {
+                buf.extend_from_slice(&delivery_id.to_be_bytes());
+                buf.push(status.to_u8());
             }
             Packet::Heartbeat { node_id, timestamp } => {
                 buf.extend_from_slice(&node_id.0.to_be_bytes());
@@ -1160,15 +1219,39 @@ impl Packet {
             object_table.push((id, bytes));
         }
         // trace_id: 1-byte flag + optional string content.
-        let trace_id = if offset < payload.len() && payload[offset] == 1 {
-            let _ = offset.checked_add(1)?;
-            let (tid, consumed) = read_string(payload, offset + 1)?;
-            let _ = offset.checked_add(consumed + 1)?;
-            Some(tid)
-        } else {
-            let _ = offset.checked_add(1)?;
-            None
+        let trace_flag = *payload.get(offset)?;
+        offset = offset.checked_add(1)?;
+        let trace_id = match trace_flag {
+            0 => None,
+            1 => {
+                let (tid, consumed) = read_string(payload, offset)?;
+                offset = offset.checked_add(consumed)?;
+                Some(tid)
+            }
+            _ => return None,
         };
+
+        // delivery_id is an additive tail. Absence means the packet came from
+        // a peer using the pre-admission actor-message encoding.
+        let delivery_id = if offset >= payload.len() {
+            None
+        } else {
+            let flag = *payload.get(offset)?;
+            offset = offset.checked_add(1)?;
+            match flag {
+                0 => None,
+                1 => {
+                    let value = read_u64(payload, offset)?;
+                    offset = offset.checked_add(8)?;
+                    Some(value)
+                }
+                _ => return None,
+            }
+        };
+        if offset != payload.len() {
+            return None;
+        }
+
         Some(Packet::ActorMessage {
             target_actor,
             behavior_name,
@@ -1180,6 +1263,17 @@ impl Packet {
             sender_node,
             priority,
             trace_id,
+            delivery_id,
+        })
+    }
+
+    fn read_actor_admission(payload: &[u8]) -> Option<Self> {
+        if payload.len() != 9 {
+            return None;
+        }
+        Some(Packet::ActorAdmission {
+            delivery_id: read_u64(payload, 0)?,
+            status: ActorAdmissionStatus::from_u8(*payload.get(8)?)?,
         })
     }
 
@@ -2706,6 +2800,7 @@ mod tests {
             sender_node: NodeId(0xDEAD_BEEF_CAFE_BABE),
             priority: MessagePriority::Normal,
             trace_id: None,
+            delivery_id: None,
         };
 
         let bytes = packet.to_bytes(0x1234);
@@ -2731,6 +2826,7 @@ mod tests {
             sender_node: NodeId(0x1111_2222_3333_4444),
             priority: MessagePriority::Normal,
             trace_id: None,
+            delivery_id: None,
         };
 
         let bytes = packet.to_bytes(77);
@@ -2757,6 +2853,7 @@ mod tests {
             sender_node: NodeId(0x2222_3333_4444_5555),
             priority: MessagePriority::Normal,
             trace_id: None,
+            delivery_id: None,
         };
 
         let bytes = packet.to_bytes(88);
@@ -2780,6 +2877,7 @@ mod tests {
             sender_node: NodeId(1),
             priority: MessagePriority::Normal,
             trace_id: None,
+            delivery_id: None,
         };
         let bytes = packet.to_bytes(1);
         // Chop the string table in half: the declared count/content no
@@ -3243,6 +3341,7 @@ mod tests {
             sender_node: NodeId(5),
             priority: MessagePriority::Normal,
             trace_id: None,
+            delivery_id: None,
         };
         assert!(packet_payload_wire_safe(&mk(vec![Value::int(1)], vec![])));
         assert!(packet_payload_wire_safe(&mk(
@@ -3332,6 +3431,7 @@ mod tests {
             sender_node: transport_a.node_id(),
             priority: MessagePriority::Normal,
             trace_id: None,
+            delivery_id: None,
         };
         transport_a.send(node_b_id, addr_b_actual, bad);
 
@@ -3384,6 +3484,7 @@ mod tests {
             sender_node: transport_a.node_id(),
             priority: MessagePriority::Normal,
             trace_id: None,
+            delivery_id: None,
         };
         transport_a.send(node_b_id, addr_b_actual, good.clone());
 
@@ -3440,6 +3541,7 @@ mod tests {
             sender_node: transport_a.node_id(),
             priority: MessagePriority::Normal,
             trace_id: None,
+            delivery_id: None,
         };
         transport_a.send(node_b_id, addr_b_actual, good.clone());
 
