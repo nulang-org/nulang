@@ -5023,21 +5023,67 @@ impl Runtime {
             };
             match migration::migrate_snapshot_state(module, &snapshot, history) {
                 Ok(Some(upgraded)) => {
-                    // Commit-before-publication: the detached migrated actor is
-                    // gone at this point; only the serializable upgraded
-                    // snapshot crosses the persistence boundary. A failed save
-                    // leaves recovery unpublished.
-                    if let Err(error) = self.persistence.save_snapshot(upgraded.clone()) {
-                        warn!(
-                            "nulang-recover: migration snapshot commit failed for actor {}: {}",
-                            actor_id, error
-                        );
-                        return None;
+                    // Commit-before-publication with an optimistic durable
+                    // revision fence. The executor transformed exactly
+                    // `snapshot`; do not let it overwrite a snapshot whose
+                    // sequence or schema identity changed concurrently.
+                    let expected_revision =
+                        SnapshotRevision::from_snapshot(&snapshot);
+                    match self
+                        .persistence
+                        .compare_and_swap_snapshot(&expected_revision, upgraded.clone())
+                    {
+                        Ok(SnapshotCasResult::Committed) => {
+                            // Shadow replication, when configured, is allowed
+                            // only after the local fenced commit succeeds.
+                            self.maybe_shadow_replicate(actor_id, &upgraded);
+                            snapshot = upgraded;
+                        }
+                        Ok(SnapshotCasResult::Conflict) => {
+                            // Another writer won. Never retry migration against
+                            // the stale input in this recovery attempt. It is
+                            // safe to continue only when the winner already
+                            // committed this artifact's current schema.
+                            let Some(winner) = self.persistence.load_snapshot(actor_id) else {
+                                warn!(
+                                    "nulang-recover: migration CAS conflicted for actor {}, but the winning snapshot could not be reloaded",
+                                    actor_id
+                                );
+                                return None;
+                            };
+                            let winner_current = migration::resolve_snapshot_meta(module, &winner)
+                                .ok()
+                                .flatten()
+                                .map(|meta| {
+                                    winner.schema_version == meta.version
+                                        && winner.schema_owner.as_deref()
+                                            == Some(meta.name.as_str())
+                                })
+                                .unwrap_or(false);
+                            if !winner_current {
+                                warn!(
+                                    "nulang-recover: migration CAS conflicted for actor {} and the winning snapshot is not at the current schema; refusing stale retry",
+                                    actor_id
+                                );
+                                return None;
+                            }
+                            snapshot = winner;
+                        }
+                        Ok(SnapshotCasResult::Unsupported) => {
+                            warn!(
+                                "nulang-recover: persistence backend cannot atomically fence schema migration for actor {}; refusing unsafe upgrade",
+                                actor_id
+                            );
+                            return None;
+                        }
+                        Err(error) => {
+                            warn!(
+                                "nulang-recover: migration snapshot CAS failed for actor {}: {}",
+                                actor_id, error
+                            );
+                            return None;
+                        }
                     }
-                    // Shadow replication, when configured, is allowed only
-                    // after the local durable commit succeeds.
-                    self.maybe_shadow_replicate(actor_id, &upgraded);
-                    snapshot = upgraded;
                 }
                 Ok(None) => {}
                 Err(error) => {
