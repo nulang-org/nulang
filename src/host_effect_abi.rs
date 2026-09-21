@@ -11,6 +11,8 @@
 //! positional tagged-value argument ABI. Custom effects retain their legacy
 //! source tag until they opt into an explicit versioned host contract.
 
+use crate::primitives::DeliverySemantics;
+
 /// Experimental host-effect ABI schema identity.
 ///
 /// This is intentionally independent from the Nulang language version and from
@@ -64,6 +66,53 @@ pub enum HostReplayClass {
     ExternalNonreplayable,
 }
 
+/// Runtime recovery policy derived from the compiler-owned replay class.
+///
+/// This is deliberately stricter than a lossy conversion to
+/// [`DeliverySemantics`]. In particular, a non-replayable external effect must
+/// remain distinguishable from an effect that merely delegates recovery to its
+/// backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HostDurableRecoveryPolicy {
+    /// Pure computation does not need a durable external-effect journal entry.
+    NoJournalRequired,
+    /// Re-running the operation is semantically safe, even if it happens more
+    /// than once.
+    RetryAtLeastOnce,
+    /// The configured backend owns the crash-recovery contract.
+    DelegateToBackend,
+    /// Re-run only with the same stable logical operation id as a deduplication
+    /// or idempotency key.
+    RetryWithDeduplication,
+    /// Automatic redispatch would be unsound after an ambiguous crash.
+    ManualResolution,
+}
+
+impl HostDurableRecoveryPolicy {
+    /// Convert only policies representable by the current durable-effect
+    /// delivery vocabulary. `None` is intentional for pure operations and
+    /// manual-resolution effects: callers must inspect the policy instead of
+    /// silently strengthening their guarantees.
+    pub const fn delivery_semantics(self) -> Option<DeliverySemantics> {
+        match self {
+            Self::NoJournalRequired | Self::ManualResolution => None,
+            Self::RetryAtLeastOnce => Some(DeliverySemantics::AtLeastOnce),
+            Self::DelegateToBackend => Some(DeliverySemantics::BackendDefined),
+            Self::RetryWithDeduplication => {
+                Some(DeliverySemantics::EffectivelyOnceWithDeduplication)
+            }
+        }
+    }
+
+    /// Whether recovery may automatically invoke the operation again.
+    pub const fn permits_automatic_redispatch(self) -> bool {
+        match self {
+            Self::RetryAtLeastOnce | Self::RetryWithDeduplication => true,
+            Self::NoJournalRequired | Self::DelegateToBackend | Self::ManualResolution => false,
+        }
+    }
+}
+
 impl HostReplayClass {
     /// Exact v0alpha1 Behavior Manifest spelling.
     pub const fn manifest_class(self) -> &'static str {
@@ -74,6 +123,22 @@ impl HostReplayClass {
             Self::ExternalIdempotent => "external-idempotent",
             Self::ExternalRequiresIdempotencyKey => "external-requires-idempotency-key",
             Self::ExternalNonreplayable => "external-nonreplayable",
+        }
+    }
+
+    /// Derive the runtime recovery policy without inventing stronger delivery
+    /// guarantees than the compiler-owned replay contract.
+    pub const fn durable_recovery_policy(self) -> HostDurableRecoveryPolicy {
+        match self {
+            Self::Pure => HostDurableRecoveryPolicy::NoJournalRequired,
+            Self::LocalReplaySafe | Self::ExternalIdempotent => {
+                HostDurableRecoveryPolicy::RetryAtLeastOnce
+            }
+            Self::JournalResult => HostDurableRecoveryPolicy::DelegateToBackend,
+            Self::ExternalRequiresIdempotencyKey => {
+                HostDurableRecoveryPolicy::RetryWithDeduplication
+            }
+            Self::ExternalNonreplayable => HostDurableRecoveryPolicy::ManualResolution,
         }
     }
 }
@@ -507,6 +572,43 @@ mod tests {
             operation.canonical_id(),
             "nulang.host-effects/v0alpha1:nulang:storage/string#Write"
         );
+    }
+
+    #[test]
+    fn replay_classes_map_to_runtime_recovery_without_strengthening_guarantees() {
+        assert_eq!(
+            HostReplayClass::Pure.durable_recovery_policy(),
+            HostDurableRecoveryPolicy::NoJournalRequired
+        );
+        assert_eq!(
+            HostReplayClass::LocalReplaySafe
+                .durable_recovery_policy()
+                .delivery_semantics(),
+            Some(DeliverySemantics::AtLeastOnce)
+        );
+        assert_eq!(
+            HostReplayClass::JournalResult
+                .durable_recovery_policy()
+                .delivery_semantics(),
+            Some(DeliverySemantics::BackendDefined)
+        );
+        assert_eq!(
+            HostReplayClass::ExternalIdempotent
+                .durable_recovery_policy()
+                .delivery_semantics(),
+            Some(DeliverySemantics::AtLeastOnce)
+        );
+        assert_eq!(
+            HostReplayClass::ExternalRequiresIdempotencyKey
+                .durable_recovery_policy()
+                .delivery_semantics(),
+            Some(DeliverySemantics::EffectivelyOnceWithDeduplication)
+        );
+
+        let nonreplayable = HostReplayClass::ExternalNonreplayable.durable_recovery_policy();
+        assert_eq!(nonreplayable, HostDurableRecoveryPolicy::ManualResolution);
+        assert_eq!(nonreplayable.delivery_semantics(), None);
+        assert!(!nonreplayable.permits_automatic_redispatch());
     }
 
     #[test]
