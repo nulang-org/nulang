@@ -1,0 +1,31 @@
+// stdlib::option — canonical prelude type + total combinators.
+import stdlib::option
+
+fn show_int(opt: Option[Int]) -> String {
+    match opt {
+        Some(x) => "Some(" + perform Int.to_string(x) + ")",
+        None => "None",
+    }
+}
+
+fn show_result(r: Result[Int, String]) -> String {
+    match r {
+        Ok(x) => "Ok(" + perform Int.to_string(x) + ")",
+        Error(e) => "Error(" + e + ")",
+    }
+}
+
+fn main() {
+    perform IO.print("map=" + show_int(map(Some(3), fn(x) { x * 2 })))
+    perform IO.print("and_then=" + show_int(and_then(Some(3), fn(x) { Some(x + 1) })))
+    perform IO.print("and_then_none=" + show_int(and_then(None, fn(x) { Some(x + 1) })))
+    perform IO.print("or_else=" + show_int(or_else(None, fn() { Some(7) })))
+    perform IO.print("filter_yes=" + show_int(filter(Some(8), fn(x) { x > 5 })))
+    perform IO.print("filter_no=" + show_int(filter(Some(2), fn(x) { x > 5 })))
+    perform IO.print("unwrap_or=" + perform Int.to_string(unwrap_or(None, 11)))
+    perform IO.print("unwrap_or_else=" + perform Int.to_string(unwrap_or_else(None, fn() { 12 })))
+    perform IO.print("ok_or_some=" + show_result(ok_or(Some(5), "missing")))
+    perform IO.print("ok_or_none=" + show_result(ok_or(None, "missing")))
+    perform IO.print("is_some=" + (if is_some(Some(1)) then "yes" else "no"))
+    perform IO.print("is_none=" + (if is_none(None) then "yes" else "no"))
+}
