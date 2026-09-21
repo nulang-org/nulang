@@ -33,7 +33,7 @@ autobenches = false
 # rejects an artifact whose language version exceeds its own. The runtime
 # truth is the `LANGUAGE_VERSION` const in src/format/constants.rs; this field
 # is the human-readable mirror.
-language-version = "1.0.0-frozen"
+language-version = "2.0.0-dev"
 
 [features]
 default = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
