@@ -26,7 +26,7 @@
 //! SIGN_EXT     = 0xFFFF_0000_0000_0000
 //! ```
 
-use cranelift::codegen::ir::FuncRef;
+use cranelift::codegen::ir::{BlockArg, FuncRef};
 use cranelift::prelude::*;
 use cranelift_frontend::FunctionBuilder;
 use cranelift_jit::JITModule;
