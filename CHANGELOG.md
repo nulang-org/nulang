@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### Actor mailbox QoS and pressure-aware batching — 2026-09-22
+- **Bulk actor traffic now has a distinct mailbox lane** (`src/runtime/mailbox.rs`). System, Normal, and Bulk messages no longer share the same application queue: the runtime drains System before Normal before Bulk while preserving FIFO ordering within each lane, including scheduler-local and selective-receive staging paths.
+- **Mailboxes expose a constant-time coarse pressure signal** (`Normal` / `Elevated` / `High` / `Critical`) from bounded utilization or conservative depth thresholds for unbounded mailboxes.
+- **Same-actor micro-batching adapts to receiver pressure** (`src/runtime/mod.rs`): the normal 16-message cache-local quantum grows to 24/32/64 as mailbox pressure rises, while the existing reduction budget remains the fairness ceiling. No ORCA ownership or multi-worker-per-shard invariant changed.
+
 ### Canonical compiler semantic identity — 2026-09-21
 - **Compiler-owned `SemanticId` now derives from canonical backend-independent MIR plus typed actor-state schemas** (Experimental, `src/semantic_identity.rs`, `src/semantic_schema.rs`, `src/compiler_identity.rs`). The encoding alpha-normalizes compiler-generated IDs, excludes presentation/debug metadata and backend selection, includes executable/effect/authority/durable semantics, and folds dependency semantic identities deterministically. `ArtifactIdentityManifest` assembly now has a typed-program entry point that keeps exact `SourceId`, semantic identity, and backend-specific `ArtifactId` distinct without changing frozen NBC v1.
 
