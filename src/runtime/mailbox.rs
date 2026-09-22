@@ -105,12 +105,16 @@ impl Mailbox {
     /// Bounded normal/bulk traffic uses CAS so concurrent producers cannot all
     /// observe the same free slot and overfill the mailbox.
     fn reserve_slot(&self, system: bool) -> bool {
+        // queued_count is only capacity/accounting state; message publication
+        // is synchronized by the SegQueue itself. Atomic modification order is
+        // sufficient to prevent bounded producers from over-reserving slots,
+        // so this counter does not need acquire/release fences.
         if system || self.capacity == 0 {
-            self.queued_count.fetch_add(1, Ordering::AcqRel);
+            self.queued_count.fetch_add(1, Ordering::Relaxed);
             return true;
         }
 
-        let mut current = self.queued_count.load(Ordering::Acquire);
+        let mut current = self.queued_count.load(Ordering::Relaxed);
         loop {
             if current >= self.capacity {
                 return false;
@@ -118,8 +122,8 @@ impl Mailbox {
             match self.queued_count.compare_exchange_weak(
                 current,
                 current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => return true,
                 Err(observed) => current = observed,
@@ -128,7 +132,7 @@ impl Mailbox {
     }
 
     fn release_slot(&self) {
-        let previous = self.queued_count.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.queued_count.fetch_sub(1, Ordering::Relaxed);
         debug_assert!(previous > 0, "mailbox logical count underflow");
     }
 
@@ -243,7 +247,7 @@ impl Mailbox {
 
     /// Total logical message count. Safe to query concurrently.
     pub fn len(&self) -> usize {
-        self.queued_count.load(Ordering::Acquire)
+        self.queued_count.load(Ordering::Relaxed)
     }
 
     pub fn is_empty(&self) -> bool {
