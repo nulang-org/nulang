@@ -45,8 +45,8 @@ use crate::cranelift_utils::{
     emit_bitcast_f64_to_i64_canonicalized, emit_sext48, emit_tag_bool, emit_tag_int,
     PAYLOAD_MASK_I64, SIGN_BIT_I64, SIGN_EXTEND, TAG_BOOL_I64, TAG_INT_I64, TAG_NIL_I64,
 };
-pub use crate::type_metadata::{KnownType, TypeMetadata};
 use crate::type_metadata::REG_COUNT;
+pub use crate::type_metadata::{KnownType, TypeMetadata};
 // Bytecode-level type inference
 // ---------------------------------------------------------------------------
 
@@ -360,7 +360,6 @@ pub(crate) fn store_reg(builder: &mut FunctionBuilder, regs_ptr: Value, idx: usi
     builder.ins().store(MemFlags::new(), val, addr, 0);
 }
 
-
 /// One unboxed integer value carried in native SSA form.
 ///
 /// The dirty flag means the VM register file has not yet been synchronized
@@ -403,12 +402,7 @@ impl IntRegCache {
     }
 
     #[inline]
-    fn get_or_load(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        regs_ptr: Value,
-        reg: usize,
-    ) -> Value {
+    fn get_or_load(&mut self, builder: &mut FunctionBuilder, regs_ptr: Value, reg: usize) -> Value {
         if let Some(entry) = self.regs.get(reg).and_then(|entry| *entry) {
             return entry.value;
         }
@@ -1017,9 +1011,7 @@ pub fn compile_bytecode_region_typed(
     {
         let target = match instr.opcode {
             OpCode::Jmp => Some((pc as i64 + instr.simm16() as i64) as usize),
-            OpCode::JmpT | OpCode::JmpF => {
-                Some((pc as i64 + instr.offset16() as i64) as usize)
-            }
+            OpCode::JmpT | OpCode::JmpF => Some((pc as i64 + instr.offset16() as i64) as usize),
             _ => None,
         };
         if let Some(target) = target {
@@ -1041,11 +1033,9 @@ pub fn compile_bytecode_region_typed(
         }
 
         let cache_aware = match instr.opcode {
-            OpCode::Nop
-            | OpCode::Const0
-            | OpCode::Const1
-            | OpCode::Const2
-            | OpCode::ConstM1 => true,
+            OpCode::Nop | OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
+                true
+            }
             OpCode::ConstU => matches!(
                 module.constants.get(instr.imm16() as usize),
                 Some(Constant::Int(_))
@@ -1053,28 +1043,16 @@ pub fn compile_bytecode_region_typed(
             OpCode::Load | OpCode::Store | OpCode::Move | OpCode::Dup => {
                 meta.is_known(instr.op1 as usize, KnownType::Int)
             }
-            OpCode::Swap => meta.both_known(
-                instr.op1 as usize,
-                instr.op2 as usize,
-                KnownType::Int,
-            ),
-            OpCode::IAdd | OpCode::ISub | OpCode::IMul => meta.both_known(
-                instr.op1 as usize,
-                instr.op2 as usize,
-                KnownType::Int,
-            ),
+            OpCode::Swap => meta.both_known(instr.op1 as usize, instr.op2 as usize, KnownType::Int),
+            OpCode::IAdd | OpCode::ISub | OpCode::IMul => {
+                meta.both_known(instr.op1 as usize, instr.op2 as usize, KnownType::Int)
+            }
             OpCode::INeg | OpCode::IInc | OpCode::IDec => {
                 meta.is_known(instr.op1 as usize, KnownType::Int)
             }
-            OpCode::ICmpEq
-            | OpCode::ICmpLt
-            | OpCode::ICmpGt
-            | OpCode::ICmpLe
-            | OpCode::ICmpGe => meta.both_known(
-                instr.op1 as usize,
-                instr.op2 as usize,
-                KnownType::Int,
-            ),
+            OpCode::ICmpEq | OpCode::ICmpLt | OpCode::ICmpGt | OpCode::ICmpLe | OpCode::ICmpGe => {
+                meta.both_known(instr.op1 as usize, instr.op2 as usize, KnownType::Int)
+            }
             _ => false,
         };
         if !cache_aware {
