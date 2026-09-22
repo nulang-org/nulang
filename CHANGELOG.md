@@ -1219,14 +1219,12 @@ in this version; they are recorded here to establish their tier.
   dict-constant calls, field accesses, and method invocations at the
   HIR level, producing correct runtime results. Full end-to-end
   verified with integration tests.
-- **RFC 0003 — Content-addressed functions.** Proposal document
-  (`RFC/0003-content-addressing.md`): defines a deterministic
-  content-hash-based code identity scheme for distributed code
-  deployment, cache invalidation, and reproducible builds across
-  heterogeneous Nulang runtimes. Status: Draft. Content hashing
-  infrastructure (BLAKE3 `source_hash` in `.nbc` artifacts) is
-  available per RFC 0001; full code-identity registry and
-  content-addressed deployment are not yet implemented.
+- **RFC 0003 — Content identity and addressed code (revised).** The original
+  single content-hash proposal is replaced by separate `SourceId`,
+  `SemanticId`, `ArtifactId`, and exact executable `ArtifactDigest` roles,
+  aligned with RFC 0019 semantic closure and RFC 0020 Behavior Manifests.
+  `SourceId`/`SemanticId`/`ArtifactId` and canonical MIR semantic identity are
+  implemented; general addressed-code registry/fetch remains Experimental.
 - **`::` import resolution.** Module imports now support `::`-delimited
   paths: `import stdlib::set`, `import mypkg::utils::math`. The resolver
   (`src/resolver.rs`) maps `stdlib::*` prefixes to the standard library
