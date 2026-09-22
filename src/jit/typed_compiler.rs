@@ -609,87 +609,6 @@ struct SimpleLoopSsaPlan {
     carried: Vec<(usize, KnownType)>,
 }
 
-fn register_write_type(instr: &Instruction, reg: usize) -> Option<Option<KnownType>> {
-    let op1 = instr.op1 as usize;
-    let op2 = instr.op2 as usize;
-    let op3 = instr.op3 as usize;
-
-    let typed_write = |dst: usize, ty: KnownType| {
-        if dst == reg {
-            Some(Some(ty))
-        } else {
-            None
-        }
-    };
-    let unknown_write = |dst: usize| {
-        if dst == reg {
-            Some(None)
-        } else {
-            None
-        }
-    };
-
-    match instr.opcode {
-        OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
-            typed_write(op1, KnownType::Int)
-        }
-        OpCode::ConstU => unknown_write(op3),
-        OpCode::Load | OpCode::Store | OpCode::Move | OpCode::Dup => unknown_write(op2),
-        OpCode::Swap => {
-            if reg == op1 || reg == op2 {
-                Some(None)
-            } else {
-                None
-            }
-        }
-        OpCode::IAdd
-        | OpCode::ISub
-        | OpCode::IMul
-        | OpCode::Xor
-        | OpCode::Shl
-        | OpCode::Shr
-        | OpCode::BitAnd
-        | OpCode::BitOr => typed_write(op3, KnownType::Int),
-        OpCode::IDiv | OpCode::IMod => unknown_write(op3),
-        OpCode::INeg => typed_write(op2, KnownType::Int),
-        OpCode::IInc | OpCode::IDec => typed_write(op1, KnownType::Int),
-        OpCode::FAdd | OpCode::FSub | OpCode::FMul | OpCode::FNeg => {
-            typed_write(op3, KnownType::Float)
-        }
-        OpCode::FDiv => unknown_write(op3),
-        OpCode::ICmpEq
-        | OpCode::ICmpLt
-        | OpCode::ICmpGt
-        | OpCode::ICmpLe
-        | OpCode::ICmpGe
-        | OpCode::FCmpEq
-        | OpCode::FCmpLt
-        | OpCode::FCmpGt => typed_write(op3, KnownType::Bool),
-        OpCode::Not => typed_write(op2, KnownType::Bool),
-        OpCode::And | OpCode::Or => typed_write(op3, KnownType::Bool),
-        OpCode::IToF => typed_write(op2, KnownType::Float),
-        OpCode::FToI => typed_write(op2, KnownType::Int),
-        OpCode::ArrLoad => unknown_write(op3),
-        _ => None,
-    }
-}
-
-fn type_at_simple_loop_backedge(
-    instructions: &[Instruction],
-    start_offset: usize,
-    backedge_pc: usize,
-    meta: &TypeMetadata,
-    reg: usize,
-) -> KnownType {
-    let mut ty = meta.get_type(reg);
-    for instr in &instructions[start_offset..backedge_pc] {
-        if let Some(write) = register_write_type(instr, reg) {
-            ty = write.unwrap_or(KnownType::Unknown);
-        }
-    }
-    ty
-}
-
 fn simple_loop_ssa_plan(
     instructions: &[Instruction],
     start_offset: usize,
@@ -717,23 +636,41 @@ fn simple_loop_ssa_plan(
     }
     let backedge_pc = backedge_pc?;
 
-    // The body from header to backedge must be linear. The backedge itself is
-    // the only control-flow split we thread native values through.
-    if instructions[start_offset..backedge_pc]
-        .iter()
-        .any(|instr| matches!(instr.opcode, OpCode::Jmp | OpCode::JmpT | OpCode::JmpF))
-    {
-        return None;
-    }
+    // Permit either a completely linear loop body or one conservative
+    // forward if/if-else diamond. The internal CFG plan provides the exact
+    // must-type state at its join; everything after the join must remain
+    // linear until the loop backedge.
+    let internal_cfg = simple_cfg_ssa_plan(instructions, start_offset, backedge_pc, type_metadata);
+
+    let backedge_state = if let Some(cfg) = &internal_cfg {
+        for pc in start_offset..backedge_pc {
+            if matches!(
+                instructions[pc].opcode,
+                OpCode::Jmp | OpCode::JmpT | OpCode::JmpF
+            ) && pc != cfg.branch_pc
+                && Some(pc) != cfg.then_jump_pc
+            {
+                return None;
+            }
+        }
+
+        simulate_local_types(instructions, cfg.join_pc, backedge_pc, &cfg.join_state)
+    } else {
+        if instructions[start_offset..backedge_pc]
+            .iter()
+            .any(|instr| matches!(instr.opcode, OpCode::Jmp | OpCode::JmpT | OpCode::JmpF))
+        {
+            return None;
+        }
+        simulate_local_types(instructions, start_offset, backedge_pc, &meta.regs)
+    };
 
     if matches!(
         instructions[backedge_pc].opcode,
         OpCode::JmpT | OpCode::JmpF
     ) {
         let cond = instructions[backedge_pc].op1 as usize;
-        if type_at_simple_loop_backedge(instructions, start_offset, backedge_pc, meta, cond)
-            != KnownType::Bool
-        {
+        if backedge_state[cond] != KnownType::Bool {
             return None;
         }
     }
@@ -741,19 +678,11 @@ fn simple_loop_ssa_plan(
     let mut carried = Vec::new();
     for reg in 0..256 {
         let ty = meta.get_type(reg);
-        if !matches!(ty, KnownType::Int | KnownType::Float) {
-            continue;
-        }
-
-        // Thread only registers whose representation remains stable for the
-        // entire loop body. Nullable division, dynamic copies, swaps, and
-        // other representation-changing writes are deliberately excluded.
-        if type_at_simple_loop_backedge(instructions, start_offset, backedge_pc, meta, reg) == ty {
+        if matches!(ty, KnownType::Int | KnownType::Float) && backedge_state[reg] == ty {
             carried.push((reg, ty));
         }
     }
 
-    // Avoid bloating CLIF block signatures in unusually large inferred states.
     if carried.is_empty() || carried.len() > 32 {
         return None;
     }
@@ -1697,11 +1626,7 @@ pub fn compile_bytecode_region_typed(
     }
 
     let loop_ssa = simple_loop_ssa_plan(instructions, start_offset, end_offset, type_metadata);
-    let cfg_ssa = if loop_ssa.is_none() {
-        simple_cfg_ssa_plan(instructions, start_offset, end_offset, type_metadata)
-    } else {
-        None
-    };
+    let cfg_ssa = simple_cfg_ssa_plan(instructions, start_offset, end_offset, type_metadata);
 
     // Clear the codegen context
     ctx.clear();
@@ -4216,6 +4141,63 @@ mod typed_tests {
         );
         assert!(plan.join_carried.contains(&(1, KnownType::Int)));
         assert_eq!(plan.join_state[0], KnownType::Unknown);
+    }
+
+    #[test]
+    fn test_branchy_loop_keeps_cfg_join_and_backedge_in_native_ssa() {
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            Instruction::new3(OpCode::ICmpLt, 1, 7, 4), // pc0: i < threshold
+            Instruction::new3(OpCode::JmpF, 4, 0, 3),   // pc1 -> pc4 else
+            Instruction::new3(OpCode::IAdd, 0, 1, 0),   // pc2 then: acc += i
+            Instruction::new2(OpCode::Jmp, 0, 2),       // pc3 -> pc5 join
+            Instruction::new3(OpCode::ISub, 0, 8, 0),   // pc4 else: acc -= 1
+            Instruction::new1(OpCode::IInc, 1),         // pc5 join: i++
+            Instruction::new3(OpCode::ICmpLt, 1, 6, 5), // pc6: i < limit
+            Instruction::new3(OpCode::JmpT, 5, 0xFF, 0xF9), // pc7 -> pc0
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        for reg in [0usize, 1, 6, 7, 8] {
+            meta.set_type(reg, KnownType::Int);
+        }
+
+        let loop_plan = simple_loop_ssa_plan(&instructions, 0, instructions.len(), Some(&meta))
+            .expect("branchy numeric loop should retain loop SSA");
+        assert_eq!(loop_plan.backedge_pc, 7);
+        assert!(loop_plan.carried.contains(&(0, KnownType::Int)));
+        assert!(loop_plan.carried.contains(&(1, KnownType::Int)));
+
+        let cfg_plan = simple_cfg_ssa_plan(&instructions, 0, instructions.len(), Some(&meta))
+            .expect("internal branch should retain CFG SSA");
+        assert_eq!(cfg_plan.join_pc, 5);
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_branchy_loop_cfg_and_backedge_ssa",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("branchy loop should compile with composed SSA plans");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+        let mut regs = [0u64; 256];
+        regs[0] = Value::int(0).as_raw();
+        regs[1] = Value::int(0).as_raw();
+        regs[6] = Value::int(10).as_raw();
+        regs[7] = Value::int(5).as_raw();
+        regs[8] = Value::int(1).as_raw();
+
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(unsafe { Value::from_bits(regs[0]) }.as_int(), Some(5));
+        assert_eq!(unsafe { Value::from_bits(regs[1]) }.as_int(), Some(10));
     }
 
     // ------------------------------------------------------------------
