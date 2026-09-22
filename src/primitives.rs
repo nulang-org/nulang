@@ -119,7 +119,10 @@ pub enum RuntimePrimitive {
     State,
     Message,
     Effect,
+    /// Reference capability / aliasing and sendability semantics.
     Capability,
+    /// External permission to cross a host/security boundary.
+    Authority,
     Supervisor,
     Time,
 }
@@ -212,7 +215,7 @@ impl std::fmt::Display for ActorRoleConflict {
 impl std::error::Error for ActorRoleConflict {}
 
 impl crate::hir::ActorDef {
-    /// Return the canonical semantic role of this lowered actor.
+    /// Return the legacy compatibility role of this lowered actor.
     ///
     /// New HIR consumers should prefer this helper to testing the legacy flags
     /// separately. Once all consumers use it, the flags can be replaced by a
@@ -228,7 +231,7 @@ impl crate::hir::ActorDef {
 }
 
 impl crate::bytecode::ActorMeta {
-    /// Return the canonical role encoded in serialized actor metadata without
+    /// Return the compatibility role encoded in serialized actor metadata without
     /// changing the bytecode format.
     ///
     /// Keeping this derivation identical to HIR is the first migration step
@@ -245,7 +248,7 @@ impl crate::bytecode::ActorMeta {
 }
 
 impl crate::runtime::Actor {
-    /// Return the canonical role of a live runtime actor.
+    /// Return the compatibility role of a live runtime actor.
     ///
     /// Runtime actors currently persist only the legacy workflow/agent flags;
     /// organization and virtual status are compiler/placement metadata. Keeping
