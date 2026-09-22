@@ -1601,6 +1601,19 @@ fn test_tier2_simd_promotion_replaces_tier1_entry() {
         Some(0),
         "successful promotion resets the tier-2 counter"
     );
+    assert_eq!(jit.simd_compiled_count(), 1);
+
+    // Once promoted, the region must not heat again or attempt to redeclare
+    // the same tier-2 JIT symbol.
+    for _ in 0..TIER2_THRESHOLD {
+        jit.record_tier2_and_maybe_promote(0, 0, &instructions);
+    }
+    assert_eq!(
+        jit.tier2_counters.get(&(0, 0)).copied(),
+        Some(0),
+        "SIMD regions must stay at tier 2 without reheating"
+    );
+    assert_eq!(jit.simd_compiled_count(), 1);
 }
 
 #[test]
