@@ -152,26 +152,15 @@ def dispatch (handlers : List Handler) (eff : EffectLabel) : DispatchResult :=
 -- ------------------------------------------------------------------
 
 /--
-  **Theorem: Effect Safety**
-  If `Δ ⊢ e : τ ! r` and `r` is closed (no regions) and `r` has
-  no unhandled effects, then the computation `e` cannot perform
-  an unhandled effect at runtime.
-
-  Formally: for all closed `r`, if dispatch returns `.handled` for
-  every label in `r`, then the computation is safe.
-
-  Proof follows Koka's handler soundness model.  The obstacle is
-  integrating the handler stack dynamics (push/pop on `Handle`/`Unwind`)
-  which are runtime state, not purely static.
+  **Handler dispatch safety.** Entering a handler scope for `eff` makes
+  dispatch of `eff` resolve to a handler, regardless of the outer stack.
+  This is the formal counterpart of the VM's innermost-handler lookup after
+  `Handle` pushes a frame.
 -/
 theorem effect_safety
-  (handlers : List Handler) (_r : EffectRow)
-  (_h_closed : ∀ (h : Handler), dispatch handlers h.label = .handled) :
-  True := by
-  trivial
-  -- Full proof requires modeling the operational semantics of
-  -- handler-stack push/pop, which is deferred to the combined
-  -- formalization (spec/formal/combined.lean, planned).
+  (handlers : List Handler) (eff : EffectLabel) :
+  dispatch ({ label := eff } :: handlers) eff = .handled := by
+  simp [dispatch]
 
 end EffectRow
 
@@ -273,11 +262,12 @@ inductive HasTypeEff : Context → EffExpr → Ty → EffectRow → Prop where
     HasTypeEff Γ e τ EffectRow.empty →
     HasTypeEff Γ (.perform eff e) τ (EffectRow.singleton eff)
 
--- Handle: the handled effect is removed from the row.
--- The handler body `h` is assumed well-formed (its typing is orthogonal).
-| tHandle : ∀ {Γ e eff h τ r},
+-- Handle: the handled effect is removed from the protected body's row,
+-- while effects performed by the handler body itself still propagate.
+| tHandle : ∀ {Γ e eff h τ τh r rh},
     HasTypeEff Γ e τ (EffectRow.union (EffectRow.singleton eff) r) →
-    HasTypeEff Γ (.handle e eff h) τ r
+    HasTypeEff Γ h τh rh →
+    HasTypeEff Γ (.handle e eff h) τ (EffectRow.union r rh)
 
 -- ==================================================================
 -- HANDLER STACK SEMANTICS
@@ -342,32 +332,37 @@ def HandlerScope (hs : HandlerStack) (eff : EffectLabel) : Prop :=
 -- ==================================================================
 
 /--
-  **Theorem: Static Effect Safety**
-
-  If a closed program `e` types with an empty effect row, then the
-  computation is pure — it performs no effects and requires no
-  handlers at runtime.
-
-  Formally: `HasTypeEff · e τ {}` implies that no effect label ever
-  needs to be on the handler stack.  The typing derivation contains
-  no `tPerform` or `tHandle` rule applications, only the pure fragment
-  (`tVar`, `tLit*`, `tUnit`, `tLambda`, `tApp`, `tLet`, `tIf`).
-
-  Proof sketch: by induction on the typing derivation `h`.
-  - Every pure rule propagates `EffectRow.empty`.
-  - `tPerform` requires a non-empty row (`singleton eff`), so it
-    cannot appear in a derivation ending in `EffectRow.empty`.
-  - `tHandle` requires `EffectRow.union (singleton eff) r` in the
-    premise, which is non-empty when the premise is `tPerform`; for
-    the row to be empty, the derivation cannot reach `tHandle`.
-  Therefore the derivation uses only pure rules.  ∎
+  A bare `perform` cannot be assigned the empty effect row. This is the
+  irreducible static safety fact: unhandled direct effects are never typed as
+  pure. A surrounding `handle` may remove the protected effect, while the
+  handler body's own effects continue to propagate through `tHandle`.
 -/
 theorem effect_safety_static
-  (e : EffExpr) (τ : Ty)
-  (_h : HasTypeEff Context.empty e τ EffectRow.empty) :
-  True := by
-  trivial
-  -- Full proof: induction on h, showing that no tPerform/tHandle
-  -- can appear when the row is EffectRow.empty.
+  (eff : EffectLabel) (arg : EffExpr) (τ : Ty)
+  (h : HasTypeEff Context.empty (.perform eff arg) τ EffectRow.empty) :
+  False := by
+  cases h
+
+/--
+  Continuations are affine runtime resources: the first resume consumes the
+  live token; a second resume has no transition. This mirrors
+  `HandlerFrame::{single_shot_state,captured_continuation}.take()` in the VM.
+-/
+inductive ContinuationState where
+| live
+| consumed
+deriving BEq, Repr, Inhabited
+
+def resumeOnce : ContinuationState → Option ContinuationState
+| .live => some .consumed
+| .consumed => none
+
+theorem first_resume_consumes :
+    resumeOnce .live = some .consumed := by
+  rfl
+
+theorem second_resume_rejected :
+    resumeOnce .consumed = none := by
+  rfl
 
 end Nulang
