@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### Semantic closure diagnostics and backend profiles — 2026-09-22
+- **Finite-domain match coverage warnings** (`src/pattern_coverage.rs`, `src/typechecker.rs`). Closed variant and `Bool` matches now emit `W0201` for provably missing cases and `W0202` for provably redundant arms after ordinary type inference succeeds. Default source validity is unchanged; `--deny-warnings` provides opt-in strictness, and unsupported/infinite domains retain the runtime fallback.
+- **Canonical backend-profile manifest** (`spec/backend-profiles/v0alpha1.json`). The bytecode VM is recorded as the semantic reference, JIT as a bytecode-fallback optimization profile, WASM as the canonical portable target, and current WASM/WasmFX/native semantic restrictions are machine-readable. `scripts/generate_backend_profiles.py --check` ties those declarations to code-level rejection evidence and generated `docs/BACKEND_PROFILES.md`; `verify_implementation.py` now gates drift.
+- **Safety documentation corrected to match implementation.** Public docs no longer claim unconditional compile-time match exhaustiveness, compile-time handler installation, infallible mailbox delivery, process-wide pause isolation, or automatic rollback of external workflow side effects.
+
 ### Canonical compiler semantic identity — 2026-09-21
 - **Compiler-owned `SemanticId` now derives from canonical backend-independent MIR plus typed actor-state schemas** (Experimental, `src/semantic_identity.rs`, `src/semantic_schema.rs`, `src/compiler_identity.rs`). The encoding alpha-normalizes compiler-generated IDs, excludes presentation/debug metadata and backend selection, includes executable/effect/authority/durable semantics, and folds dependency semantic identities deterministically. `ArtifactIdentityManifest` assembly now has a typed-program entry point that keeps exact `SourceId`, semantic identity, and backend-specific `ArtifactId` distinct without changing frozen NBC v1.
 
