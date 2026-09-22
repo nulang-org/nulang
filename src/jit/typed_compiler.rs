@@ -1350,6 +1350,13 @@ pub fn compile_bytecode_region_typed(
         }
     }
 
+    let loop_ssa = simple_loop_ssa_plan(
+        instructions,
+        start_offset,
+        end_offset,
+        type_metadata,
+    );
+
     // Clear the codegen context
     ctx.clear();
 
@@ -1379,6 +1386,16 @@ pub fn compile_bytecode_region_typed(
     for i in start_offset..end_offset {
         blocks.insert(i, builder.create_block());
     }
+    if let (Some(plan), Some(&header)) = (&loop_ssa, blocks.get(&start_offset)) {
+        for &(_, ty) in &plan.carried {
+            let clif_ty = match ty {
+                KnownType::Int => types::I64,
+                KnownType::Float => types::F64,
+                _ => unreachable!("loop SSA only threads Int/Float registers"),
+            };
+            builder.append_block_param(header, clif_ty);
+        }
+    }
     let return_block = builder.create_block();
     // Use a thread-local helper for the safepoint so concurrent VMs do not
     // share a process-global actor reduction counter.
@@ -1390,9 +1407,20 @@ pub fn compile_bytecode_region_typed(
     let exhausted = builder.ins().icmp(IntCC::NotEqual, safepoint_result, zero);
     let yield_block = builder.create_block();
     if let Some(&first_block) = blocks.get(&start_offset) {
+        let entry_args: Vec<BlockArg> = loop_ssa
+            .as_ref()
+            .map(|plan| {
+                plan.carried
+                    .iter()
+                    .map(|&(reg, ty)| {
+                        BlockArg::from(native_value_from_vm(&mut builder, regs_ptr, reg, ty))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         builder
             .ins()
-            .brif(exhausted, yield_block, &[], first_block, &[]);
+            .brif(exhausted, yield_block, &[], first_block, &entry_args);
     } else {
         builder
             .ins()
@@ -1420,6 +1448,25 @@ pub fn compile_bytecode_region_typed(
         let instr = instructions[pc];
         let block = *blocks.get(&pc).unwrap();
         builder.switch_to_block(block);
+
+        if pc == start_offset {
+            if let Some(plan) = &loop_ssa {
+                let params = builder.block_params(block).to_vec();
+                for (&(reg, ty), &value) in plan.carried.iter().zip(params.iter()) {
+                    match ty {
+                        KnownType::Int => {
+                            int_cache.set(reg, value);
+                            float_cache.invalidate(reg);
+                        }
+                        KnownType::Float => {
+                            float_cache.set(reg, value);
+                            int_cache.invalidate(reg);
+                        }
+                        _ => unreachable!("loop SSA only threads Int/Float registers"),
+                    }
+                }
+            }
+        }
 
         match instr.opcode {
             // -- Special --
