@@ -183,7 +183,6 @@ pub fn infer_reg_types(module: &CodeModule, pc: usize) -> TypeMetadata {
         let in_window = |target: usize| target >= start && target < end;
         match instr.opcode {
             OpCode::Jmp => {
-                int_cache.flush(&mut builder, regs_ptr);
                 let target = (at as i64 + instr.simm16() as i64) as usize;
                 if in_window(target) {
                     push_succ(target, &mut states, &mut queue, &mut in_queue, &next);
@@ -1460,6 +1459,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         &helpers,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1828,6 +1828,7 @@ pub fn compile_bytecode_region_typed(
 
             // -- Control Flow --
             OpCode::Jmp => {
+                int_cache.flush(&mut builder, regs_ptr);
                 let target = (pc as i64 + instr.simm16() as i64) as usize;
                 if let Some(&target_block) = blocks.get(&target) {
                     builder.ins().jump(target_block, &[]);
