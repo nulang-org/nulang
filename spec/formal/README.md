@@ -10,8 +10,10 @@
 > split-flow model whose `may`/union and `must`/intersection branch laws
 > are proved in `capabilities.lean`; the former single-context
 > `linear_at_most_once` conjecture and its `sorry` were removed because
-> that statement was known false. Effect-safety theorems (`effects.lean`)
-> remain vacuous `True` stubs pending the handler-stack proof.
+> that statement was known false. `effects.lean` now also has non-vacuous
+> proofs for pushed-handler dispatch, rejection of a bare `perform` as pure,
+> and affine continuation consumption. The stronger whole-program operational
+> effect-safety theorem remains open.
 
 ## Purpose
 
@@ -31,7 +33,7 @@ Two layers are formalized:
 | `Nulang/Effects.lean` | Effect rows, `subrow`, `union` | Formalized |
 | `types.lean` | HM `HasType`, small-step semantics, `progress`/`preservation`/`type_soundness` | **Proved** |
 | `capabilities.lean` | Capability lattice laws, sendability, split linear-flow branch laws | **Proved for the modeled laws; no `sorry`** |
-| `effects.lean` | Effect rows, `effect_safety`, `effect_safety_static` | `True` stubs (not proved) |
+| `effects.lean` | Effect rows, handler dispatch, static direct-perform safety, affine continuation state | **Local safety laws proved; full operational theorem open** |
 
 ## Theorems
 
@@ -69,16 +71,22 @@ left as a `sorry` because it was false under the single-context
 `HasTypeCap` judgment. A future full input/output-context typing judgment can
 lift these proved flow laws over the complete Core expression relation.
 
-### Effect Safety — stubbed (not proved)
-```
-Theorem effect_safety:
-  A program with closed effect row {} cannot perform an unhandled effect
-```
-The intended statement: if a function's effect row is empty, every `perform`
-in its body is statically handled — no runtime "unhandled effect" errors.
-The current `effect_safety`/`effect_safety_static` bodies in `effects.lean`
-are vacuous `True` stubs (`by trivial`), not proofs — the real proof requires
-modeling the handler-stack push/pop dynamics, deferred to `combined.lean`.
+### Effect and continuation safety — local laws proved
+`effects.lean` no longer uses vacuous `True` theorems. It proves three
+concrete invariants that correspond directly to the implementation:
+
+1. pushing a handler for an effect makes dispatch of that effect resolve as
+   handled;
+2. a bare `perform` cannot inhabit the empty effect row; and
+3. the continuation state machine is affine: the first resume consumes the
+   live continuation and a second resume has no transition.
+
+The `tHandle` rule also types the handler body and propagates its own effects
+instead of assuming that body is orthogonally well formed. What remains open is
+the stronger whole-program theorem connecting arbitrary typed evaluation steps,
+handler-stack push/pop dynamics, and absence of runtime unhandled-effect errors.
+That proof belongs in the combined operational model rather than being claimed
+from these local lemmas.
 
 ## Build
 
