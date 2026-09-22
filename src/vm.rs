@@ -2431,6 +2431,83 @@ pub struct SuspendedVmState {
     pub step_count: usize,
 }
 
+#[cfg(feature = "native-codegen")]
+fn compute_jit_candidate_pcs(module: &CodeModule) -> Vec<bool> {
+    let len = module.instructions.len();
+    let mut candidates = vec![false; len];
+    if len == 0 {
+        return candidates;
+    }
+
+    let mut mark = |pc: usize| {
+        if pc < len {
+            candidates[pc] = true;
+        }
+    };
+
+    // Stable execution entry points are always worth tracking.
+    mark(module.entry_point.unwrap_or(0));
+    for &pc in &module.function_table {
+        mark(pc);
+    }
+    for behavior in &module.behaviors {
+        mark(behavior.code_offset);
+    }
+    for info in &module.debug_functions {
+        mark(info.code_offset);
+    }
+    // Statement starts are cheap compiler-provided region boundaries and also
+    // cover less-common control-flow constructs whose jump tables are not
+    // decoded here (for example Switch).
+    for &(pc, _) in &module.line_table {
+        mark(pc);
+    }
+
+    for (pc, instr) in module.instructions.iter().enumerate() {
+        let next = pc + 1;
+        match instr.opcode {
+            OpCode::Jmp => {
+                let target = pc as i64 + i64::from(instr.simm16());
+                if target >= 0 {
+                    mark(target as usize);
+                }
+                // The bytecode immediately after an unconditional branch is
+                // commonly another basic block (for example an else arm).
+                mark(next);
+            }
+            OpCode::JmpT | OpCode::JmpF => {
+                let target = pc as i64 + i64::from(instr.offset16());
+                if target >= 0 {
+                    mark(target as usize);
+                }
+                mark(next);
+            }
+            op => {
+                // If the current opcode stops a compilable region, its
+                // successor is a potential hot fragment entry. Calls and
+                // PerformDirect deserve the same treatment even though the
+                // JIT can fold some statically-safe instances.
+                if !crate::jit::is_opcode_compilable(op)
+                    || matches!(
+                        op,
+                        OpCode::Call
+                            | OpCode::TailCall
+                            | OpCode::ClosureCall
+                            | OpCode::PerformDirect
+                            | OpCode::Ret
+                            | OpCode::RetVal
+                            | OpCode::Halt
+                    )
+                {
+                    mark(next);
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
 /// Register-based bytecode virtual machine.
 ///
 /// Executes Nulang bytecode modules with:
@@ -2457,6 +2534,14 @@ pub struct VM {
     jit_session: Option<Box<dyn JitBackend>>,
     /// Per-module constant pools converted to raw bits for the JIT.
     jit_constants: Vec<Vec<u64>>,
+    /// Per-module bitmap of bytecode PCs worth probing for JIT hotness.
+    ///
+    /// Most interpreted instructions are not useful region entry points.
+    /// Skipping the JIT vtable call and counter update at those PCs keeps cold
+    /// execution close to the pure-interpreter path while retaining function,
+    /// behavior, statement, branch, and post-boundary entries.
+    #[cfg(feature = "native-codegen")]
+    jit_candidate_pcs: Vec<Vec<bool>>,
     /// Runtime error raised by a re-entrant JIT direct call (taken from the
     /// JIT pending-error thread-local in `try_jit_execute`; consumed by
     /// `step` so the error surfaces as a VM error). None when the last JIT
@@ -2653,6 +2738,8 @@ impl VM {
                 None
             },
             jit_constants: Vec::new(),
+            #[cfg(feature = "native-codegen")]
+            jit_candidate_pcs: Vec::new(),
             jit_pending_error: None,
             node_id: 0,
             pending_migrations: Vec::new(),
@@ -2945,8 +3032,12 @@ impl VM {
     /// Load a bytecode module into the VM.
     pub fn load_module(&mut self, module: CodeModule) {
         let bits = constants_to_jit_bits(&module.constants);
+        #[cfg(feature = "native-codegen")]
+        let jit_candidates = compute_jit_candidate_pcs(&module);
         self.modules.push(module);
         self.jit_constants.push(bits);
+        #[cfg(feature = "native-codegen")]
+        self.jit_candidate_pcs.push(jit_candidates);
     }
 
     /// Number of hot regions compiled through the type-directed JIT path
@@ -3458,6 +3549,22 @@ impl VM {
     fn try_jit_execute(&mut self, frame_idx: usize) -> bool {
         let module_idx = self.frames[frame_idx].module_idx;
         let pc = self.frames[frame_idx].pc;
+
+        // Most PCs can never be profitable JIT region entries. Avoid the
+        // backend vtable dispatch and hot-counter mutation entirely for those
+        // instructions. Every region compiled by this VM must first become
+        // hot through one of these candidate PCs, so compiled starts remain
+        // reachable through the same gate.
+        if !self
+            .jit_candidate_pcs
+            .get(module_idx)
+            .and_then(|row| row.get(pc))
+            .copied()
+            .unwrap_or(false)
+        {
+            return false;
+        }
+
         // Raw pointer to self for the re-entrant direct-call helper, computed
         // BEFORE the `&mut self.jit_session` borrow below (the VM is stable
         // and single-threaded for the duration of this region execution).
@@ -6758,6 +6865,39 @@ mod vm_tests {
             "Error should mention missing continuation: {}",
             err_msg
         );
+    }
+
+    #[cfg(feature = "native-codegen")]
+    #[test]
+    fn test_jit_candidate_pcs_mark_region_boundaries() {
+        let mut module = CodeModule::new("test_jit_candidates");
+        module.emit(Instruction::new1(OpCode::Const0, 0)); // 0: entry
+        module.emit(Instruction::new3(OpCode::IAdd, 0, 0, 0)); // 1: ordinary straight-line pc
+        let branch = module.emit(Instruction::new2(OpCode::JmpF, 0, 0)); // 2
+        module.emit(Instruction::new3(OpCode::Call, 0, 0, 0)); // 3: branch fallthrough
+        module.emit(Instruction::new3(OpCode::IAdd, 0, 0, 0)); // 4: post-call boundary
+        module.emit(Instruction::new0(OpCode::Halt)); // 5: branch target
+        module.entry_point = Some(0);
+
+        let target = 5i16 - branch as i16;
+        module.instructions[branch].op2 = ((target >> 8) & 0xff) as u8;
+        module.instructions[branch].op3 = (target & 0xff) as u8;
+
+        let candidates = compute_jit_candidate_pcs(&module);
+        assert!(candidates[0], "module entry must be a JIT candidate");
+        assert!(
+            !candidates[1],
+            "ordinary straight-line arithmetic should avoid JIT probing"
+        );
+        assert!(
+            candidates[3],
+            "conditional branch fallthrough must remain a candidate"
+        );
+        assert!(
+            candidates[4],
+            "the instruction after a call must remain a candidate"
+        );
+        assert!(candidates[5], "branch target must remain a candidate");
     }
 
     /// Test 16: JIT-compiled hot loop produces the same result as the interpreter.
