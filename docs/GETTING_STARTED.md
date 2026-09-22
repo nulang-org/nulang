@@ -398,10 +398,12 @@ fn main() {
 `persistent actor` remains available when you want actor syntax with durable
 state defaults rather than the entity-first event-sourced model.
 
-The older `agent`, `workflow`, and `database` declaration forms are still
-recognized, but the compiler marks them deprecated. New code should compose
-ordinary actors/entities with effect-based or Cloud SDK libraries instead of
-building around those declaration-specific runtimes.
+Higher-level `agent` and `workflow` declarations remain Experimental
+ergonomic source forms under RFC 0017, but they must lower to the same
+actor/state/effect runtime semantics rather than creating separate execution
+models. `database` is also Experimental. For long-lived domain state, prefer
+`entity` as the durable primitive and treat higher-level forms as convenience
+syntax rather than separate runtime species.
 
 ## 12. Error Handling
 
