@@ -57,6 +57,9 @@ version + migration.*
 ### Lazy actor bump heaps — 2026-09-21
 - **Idle actors no longer allocate their initial bump block at spawn** (Experimental, `src/runtime/heap.rs`, `src/runtime/actor.rs`). `ActorHeap::new` now validates and records the initial capacity without acquiring memory; the first small-object allocation materializes a pooled/global block, while large-object-space-only actors can remain bump-block-free. Reset/drop and heap-pool paths preserve the existing non-moving object and ownership invariants.
 
+### Cached JSON durable writers — 2026-09-21
+- **JSON persistence reuses append file descriptors without weakening durability** (Experimental, `src/runtime/persistence.rs`). Per-actor journal, workflow-event, and event-sourcing handles are opened lazily and cached, eliminating repeated directory traversal and open/close syscalls while retaining `sync_all()` before every append returns. Clones start with empty descriptor caches and `clear(actor_id)` drops cached handles before deleting files.
+
 ### Production host-authority boundary — 2026-09-20
 - **Test effect handlers no longer exist in production runtime builds** (`src/runtime/mod.rs`, `src/runtime/callbacks.rs`). Mock effect interception is now `#[cfg(test)]` and crate-private, so actor-backed host effects in production cannot take the test-handler path before external-authority enforcement.
 - **Actor-backed `Process.run` remains non-dispatched until a real process sandbox exists** (`src/runtime/callbacks.rs`, `src/stdlib.rs`). A regression test proves that even an actor holding an exact `Process::Run(...)` grant cannot turn that grant into host shell execution; docs now mark the existing `/bin/sh -c` implementation as trusted/standalone-only.
