@@ -360,7 +360,6 @@ pub(crate) fn store_reg(builder: &mut FunctionBuilder, regs_ptr: Value, idx: usi
     builder.ins().store(MemFlags::new(), val, addr, 0);
 }
 
-
 /// Normalize an unboxed integer to Nulang's signed 48-bit Int domain.
 ///
 /// The boxed VM masks every integer result to 48 payload bits before the next
