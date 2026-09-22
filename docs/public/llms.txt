@@ -30,7 +30,7 @@ Nulang is a systems language with static types, algebraic effects, capability ch
 - **Portable/cloud target:** WASM.
 - **Secondary backend:** native AOT where semantic parity is demonstrated.
 - **Experimental surfaces:** WasmFX, Fabric, RESP cache server, typed protocol hardening, multi-node distribution, source-level CRDT state/replication, `agent`/`workflow` ergonomic sugar under RFC 0017, and other items marked Experimental in the changelog.
-- **CRDT caveat:** typed `.nula` `state crdt <type>` fields and `Crdt.*` operations are implemented and conformance-tested, but recovery currently restores CRDT snapshots/materialized values without rebuilding the field-name→CRDT-id mapping automatically; recovered actors need re-registration before `Crdt.*` is fully usable.
+- **CRDT status:** typed `.nula` `state crdt <type>` fields and `Crdt.*` operations are implemented and conformance-tested. Checkpoints persist CRDT replicas plus field-name→CRDT-id mappings, and recovery restores/re-registers them. The source-level CRDT/distribution surface remains Experimental.
 
 ## Quick Install
 ```bash
