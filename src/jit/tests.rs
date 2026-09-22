@@ -140,16 +140,8 @@ fn test_whole_function_candidate_crosses_early_forward_branch() {
     let mut jit = make_jit();
     let meta = typed_compiler::infer_reg_types(&module, 0);
     let meta_ref = (!meta.is_empty()).then_some(&meta);
-    let ptr = unsafe {
-        jit.compile_region_typed(
-            0,
-            0,
-            len,
-            &module.instructions,
-            meta_ref,
-            &calls,
-        )
-    };
+    let ptr =
+        unsafe { jit.compile_region_typed(0, 0, len, &module.instructions, meta_ref, &calls) };
     assert!(ptr.is_some(), "eligible whole function must compile");
     assert_eq!(jit.compiled_region_len(0, 0), Some(12));
 
