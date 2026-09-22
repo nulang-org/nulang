@@ -516,6 +516,10 @@ pub struct JsonFileStore {
     journal_files: HashMap<u64, fs::File>,
     workflow_event_files: HashMap<u64, fs::File>,
     event_files: HashMap<u64, fs::File>,
+    /// Reused serialization scratch space. A record is fully encoded here
+    /// before any bytes reach an append log, preserving the old all-or-error
+    /// serialization behavior without allocating a new String per append.
+    append_buffer: Vec<u8>,
 }
 
 impl Clone for JsonFileStore {
@@ -528,6 +532,7 @@ impl Clone for JsonFileStore {
             journal_files: HashMap::new(),
             workflow_event_files: HashMap::new(),
             event_files: HashMap::new(),
+            append_buffer: Vec::new(),
         }
     }
 }
@@ -541,6 +546,7 @@ impl JsonFileStore {
             journal_files: HashMap::new(),
             workflow_event_files: HashMap::new(),
             event_files: HashMap::new(),
+            append_buffer: Vec::new(),
         })
     }
 
@@ -566,11 +572,20 @@ impl JsonFileStore {
 
     fn append_json_line_cached<T: serde::Serialize>(
         files: &mut HashMap<u64, fs::File>,
+        buffer: &mut Vec<u8>,
         actor_id: u64,
         path: PathBuf,
         value: &T,
     ) -> io::Result<()> {
         use std::collections::hash_map::Entry;
+
+        // Serialize the complete record before touching the log. Reusing one
+        // Vec amortizes allocation while preserving the previous guarantee
+        // that a serialization error cannot leave a partial JSON record.
+        buffer.clear();
+        serde_json::to_writer(&mut *buffer, value)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        buffer.push(b'\n');
 
         // Bound descriptor retention. Every append is sync_all()'d before this
         // point can be reached again, so dropping an evicted handle cannot
@@ -596,13 +611,11 @@ impl JsonFileStore {
             }
         };
 
-        serde_json::to_writer(&mut *file, value)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        file.write_all(b"\n")?;
+        file.write_all(buffer)?;
         // Preserve the existing durability contract: each append reaches
         // stable storage before the call returns. The optimization here is
-        // descriptor/directory reuse plus allocation-free serialization, not
-        // weaker persistence semantics.
+        // descriptor/directory reuse plus amortized serialization storage,
+        // not weaker persistence semantics.
         file.sync_all()
     }
 }
@@ -650,7 +663,13 @@ impl PersistenceStore for JsonFileStore {
 
     fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {
         let path = self.journal_path(actor_id);
-        Self::append_json_line_cached(&mut self.journal_files, actor_id, path, &entry)
+        Self::append_json_line_cached(
+            &mut self.journal_files,
+            &mut self.append_buffer,
+            actor_id,
+            path,
+            &entry,
+        )
     }
 
     fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
@@ -668,6 +687,7 @@ impl PersistenceStore for JsonFileStore {
         let path = self.workflow_events_path(actor_id);
         Self::append_json_line_cached(
             &mut self.workflow_event_files,
+            &mut self.append_buffer,
             actor_id,
             path,
             &event,
@@ -687,7 +707,13 @@ impl PersistenceStore for JsonFileStore {
 
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
         let path = self.events_path(actor_id);
-        Self::append_json_line_cached(&mut self.event_files, actor_id, path, &entry)
+        Self::append_json_line_cached(
+            &mut self.event_files,
+            &mut self.append_buffer,
+            actor_id,
+            path,
+            &entry,
+        )
     }
 
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
