@@ -1,6 +1,6 @@
 use crate::{
-    ActivityDispatchResult, ActivityProgress, ActivitySpec, AppendOutcome, Backoff,
-    DurableWorkflowExecutor, RetryPolicy, WorkflowEngineError, WorkflowEvent, WorkflowHistory,
+    ActivityProgress, ActivitySpec, AppendOutcome, Backoff, DurableWorkflowExecutor, RetryPolicy,
+    WorkflowEngineError, WorkflowEvent, WorkflowHistory,
     WorkflowId, WorkflowRuntime,
 };
 use blake3::Hasher;
@@ -126,7 +126,6 @@ impl DurableSagaExecutor {
                     plan_hash,
                 },
             )?;
-            state.started = true;
         }
 
         if state.completed {
@@ -134,7 +133,7 @@ impl DurableSagaExecutor {
         }
 
         if let Some(failure) = state.failure.clone() {
-            return compensate(runtime, workflow_id, plan, history.revision, state, failure);
+            return compensate(runtime, workflow_id, plan, state, failure);
         }
 
         loop {
@@ -205,14 +204,7 @@ impl DurableSagaExecutor {
                         error,
                     };
                     state.failure = Some(failure.clone());
-                    return compensate(
-                        runtime,
-                        workflow_id,
-                        plan,
-                        history.revision,
-                        state,
-                        failure,
-                    );
+                    return compensate(runtime, workflow_id, plan, state, failure);
                 }
             }
         }
@@ -239,7 +231,6 @@ fn compensate<R: WorkflowRuntime>(
     runtime: &mut R,
     workflow_id: &WorkflowId,
     plan: &SagaPlan,
-    mut revision: u64,
     mut state: SagaState,
     failure: SagaFailure,
 ) -> Result<SagaProgress, WorkflowEngineError<R::Error>> {
@@ -258,7 +249,7 @@ fn compensate<R: WorkflowRuntime>(
                 let history = runtime
                     .load_history(workflow_id)
                     .map_err(WorkflowEngineError::Runtime)?;
-                revision = append(
+                append(
                     runtime,
                     workflow_id,
                     history.revision,
@@ -300,7 +291,6 @@ fn compensate<R: WorkflowRuntime>(
         }
     }
 
-    let _ = revision;
     Ok(SagaProgress::FailedAndCompensated {
         failed_step_index: failure.step_index,
         failed_step_name: failure.step_name,
@@ -578,7 +568,7 @@ fn hash_action(hasher: &mut Hasher, action: &SagaAction) {
             hasher.update(&max_delay_ms.to_le_bytes());
             hasher.update(&multiplier.to_le_bytes());
         }
-    }
+    };
 }
 
 fn hash_bytes(hasher: &mut Hasher, bytes: &[u8]) {
@@ -589,6 +579,7 @@ fn hash_bytes(hasher: &mut Hasher, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ActivityDispatchResult;
     use std::{collections::VecDeque, fmt};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
