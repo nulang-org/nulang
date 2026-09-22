@@ -1034,13 +1034,17 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             Some(op) => format!("{}.{}", effect_name, op),
             None => effect_name.to_string(),
         };
-        // Check test handlers before real dispatch — allows tests to
-        // intercept effects without a `handle` block in source.
+        // Test-only interception is compiled out of production builds so
+        // privileged host effects cannot bypass the authority boundary.
+        #[cfg(test)]
         {
             let rt = self.runtime.borrow();
             if let Some(result) = rt.check_test_handler(&qualified, regs) {
                 return Some(result);
             }
+        }
+        {
+            let rt = self.runtime.borrow();
             if let Err(error) = authorize_actor_host_effect(
                 &rt,
                 rt.current_actor,
@@ -1842,7 +1846,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             None => effect_name.to_string(),
         };
         unsafe {
-            // Check test handlers before real dispatch.
+            // Test-only interception is compiled out of production builds so
+            // privileged host effects cannot bypass the authority boundary.
+            #[cfg(test)]
             if let Some(result) = (*self.runtime).check_test_handler(&qualified, regs) {
                 return Some(result);
             }
@@ -2940,6 +2946,53 @@ mod host_authority_tests {
         assert!(
             runtime.borrow().http_server.is_none(),
             "denied Http.serve must not bind a socket"
+        );
+    }
+
+    #[test]
+    fn actor_process_grant_does_not_enable_shell_execution_without_sandbox() {
+        use crate::vm::ActorVmCallbacks;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let unique = format!(
+            "nulang-process-boundary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let marker = std::env::temp_dir().join(unique);
+        let command = format!("touch {}", marker.display());
+
+        let runtime = Rc::new(RefCell::new(Runtime::new()));
+        let actor_id = 800_007;
+        {
+            let mut rt = runtime.borrow_mut();
+            let mut actor = Actor::new(actor_id, "process-authority-boundary", 8);
+            let token = format!("Process::Run({command})");
+            let manifest = AuthorityManifest::from_tokens([token.as_str()]).unwrap();
+            actor.install_authority_manifest(&manifest);
+            rt.actors.insert(actor_id, actor);
+            rt.current_actor = Some(actor_id);
+        }
+
+        let mut module = crate::bytecode::CodeModule::new("process-authority-boundary");
+        module.add_constant(Constant::String(command));
+        let regs = [Value::string(0)];
+        let mut callbacks = super::RuntimeVmCallbacks::new(runtime);
+
+        let result =
+            callbacks.perform_builtin_effect_in_module("Process", Some("run"), &module, &regs);
+
+        assert!(
+            result.is_none(),
+            "actor-backed Process.run must remain undispatched until an isolated process sandbox exists"
+        );
+        assert!(
+            !marker.exists(),
+            "holding Process::Run authority must not by itself grant host shell execution"
         );
     }
 
