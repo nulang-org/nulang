@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Tier-2 SIMD JIT promotion — 2026-09-22
+- **Hot typed JIT regions can now actually replace tier-1 code with SIMD code at the tier-2 threshold** (Experimental, `src/jit/mod.rs`, `src/jit/tests.rs`). The promotion path bypasses the normal compiled-region cache guard, installs the SIMD function only after successful analysis/codegen, preserves the existing tier-1 function on failure, and records promoted regions so they do not repeatedly reheat and attempt duplicate recompilation.
+
 ### Candidate-only JIT hotness probing — 2026-09-22
 - **Cold interpreted execution now probes JIT hotness only at candidate compiled-region entries** (`src/vm.rs`). The VM precomputes per-module candidates for execution/function/behavior entries, source-statement starts, branch targets/fallthroughs, and successors of compilation boundaries, avoiding JIT backend dispatch and hot-counter mutation at ordinary straight-line bytecode PCs without changing language semantics.
 
