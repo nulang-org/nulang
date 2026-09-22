@@ -22,7 +22,7 @@ Nulang's capability system (inspired by Pony) prevents data races and use-after-
 
 **Key guarantees**:
 
-- **No data races**: only `iso` and `val` are sendable between actors. Mutable `ref` and `trn` cannot cross actor boundaries.
+- **No data races**: `lineariso`, `iso`, `val`, and `tag` are sendable between actors (the compiler also has an internal `linear` capability). Mutable `ref` and `trn` cannot cross actor boundaries.
 - **Compile-time only**: capabilities are erased at runtime. There is zero overhead for capability checks — they are proved by the type checker and then discarded.
 - **LinearIso enforcement**: `lineariso` is tracked per binding along every control-flow path. Sending or capturing a `lineariso` value consumes it; branch-merge analysis ensures at-most-once use conservatively.
 
