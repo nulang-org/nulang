@@ -1432,6 +1432,80 @@ fn test_typed_path_matches_scalar_path() {
     );
 }
 
+/// Native integer caching must preserve the VM's signed 48-bit wrap after
+/// every operation, not only when the cached value is eventually spilled.
+/// Otherwise MAX_I48 + 1 would remain a positive host i64 and a following
+/// comparison would observe the wrong sign before boxing.
+#[test]
+fn test_typed_int_cache_wraps_before_native_reuse() {
+    use crate::jit::typed_compiler::{KnownType, TypeMetadata};
+    use crate::vm::Value;
+
+    const MAX_I48: i64 = (1_i64 << 47) - 1;
+    const MIN_I48: i64 = -(1_i64 << 47);
+
+    let instructions = vec![
+        Instruction::new3(OpCode::IAdd, 0, 1, 0),
+        Instruction::new3(OpCode::ICmpLt, 0, 2, 3),
+    ];
+
+    let run = |func: JitFunctionPtr| -> [u64; 256] {
+        let mut regs = [Value::nil().as_raw(); 256];
+        regs[0] = Value::int(MAX_I48).as_raw();
+        regs[1] = Value::int(1).as_raw();
+        regs[2] = Value::int(0).as_raw();
+        let consts: [u64; 0] = [];
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        regs
+    };
+
+    let mut scalar_jit = make_jit();
+    let scalar = unsafe {
+        scalar_jit.compile_region(
+            0,
+            0,
+            instructions.len(),
+            &instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("scalar overflow region should compile");
+    let scalar_regs = run(scalar);
+
+    let mut meta = TypeMetadata::new();
+    meta.set_type(0, KnownType::Int);
+    meta.set_type(1, KnownType::Int);
+    meta.set_type(2, KnownType::Int);
+
+    let mut typed_jit = make_jit();
+    let typed = unsafe {
+        typed_jit.compile_region_typed(
+            0,
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("typed overflow region should compile");
+    let typed_regs = run(typed);
+
+    assert_eq!(
+        unsafe { Value::from_bits(typed_regs[0]) }.as_int(),
+        Some(MIN_I48)
+    );
+    assert_eq!(
+        unsafe { Value::from_bits(typed_regs[3]) }.as_bool(),
+        Some(true),
+        "comparison must see the wrapped negative i48 value"
+    );
+    assert_eq!(
+        typed_regs, scalar_regs,
+        "native cached integer overflow must match scalar JIT bit-for-bit"
+    );
+}
+
 /// (c) Absent or unprovable metadata must keep the scalar behavior:
 /// `compile_region_typed` with `None` compiles via the scalar compiler, and
 /// a loop whose register types are clobbered by an unmodeled opcode runs
