@@ -292,9 +292,14 @@ Use the package build command when another runtime or deployment platform needs 
 ```bash
 nulang nula build --target wasm
 # .nula/dist/<name>.wasm
+# .nula/dist/<name>.behavior.json
 ```
 
 This is the canonical **portable package artifact** path. It performs the same dependency resolution, language-version checks, module-path setup, and declared-capability forwarding as the normal package build before invoking the WASM backend.
+
+The adjacent `*.behavior.json` file is the first implementation slice of RFC 0020. It is bound to the exact emitted WASM bytes with a BLAKE3 digest and records package/language/compiler identity plus source/dependency provenance.
+
+Until compiler semantic inventories are emitted, the advisory `extensions["nulang.org/completeness"]` record marks interfaces, actors, effects, authority, durability, and replay as `not-emitted`. Package-declared capabilities remain under `extensions["nulang.org/package-capabilities"]`; they are configuration, not compiler-derived authority, and do not populate the normative `authority` array.
 
 For a Wasmtime-precompiled sidecar:
 
