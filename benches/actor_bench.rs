@@ -1,7 +1,8 @@
 //! Actor throughput benchmarks.
 
 use criterion::{black_box, criterion_group, Criterion};
-use nulang::runtime::Runtime;
+use nulang::bytecode::{CodeModule, Constant};
+use nulang::runtime::{Actor, Runtime, StateModel};
 use nulang::vm::Value;
 
 fn bench_spawn_send_receive(c: &mut Criterion) {
@@ -38,4 +39,28 @@ fn bench_message_throughput(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_spawn_send_receive, bench_message_throughput);
+fn bench_state_lookup(c: &mut Criterion) {
+    let mut actor = Actor::new(1, "bench", 0);
+    actor
+        .state_models
+        .insert("count".to_string(), StateModel::Local);
+    actor.set_state_field("count", Value::int(42));
+
+    let mut module = CodeModule::new("state-bench");
+    let count_idx = module.add_constant(Constant::String("count".to_string()));
+    actor.install_state_schema(&module, &["count".to_string()]);
+
+    c.bench_function("actor/state_get_string_map", |b| {
+        b.iter(|| black_box(actor.get_state_field(black_box("count"))))
+    });
+    c.bench_function("actor/state_get_dense_slot", |b| {
+        b.iter(|| black_box(actor.get_state_field_by_constant(black_box(count_idx))))
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_spawn_send_receive,
+    bench_message_throughput,
+    bench_state_lookup
+);
