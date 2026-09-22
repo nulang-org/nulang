@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use crate::runtime::heap::{ActorHeap, TypeTag as HeapTypeTag};
 use crate::vm::Value;
 
 use tracing::warn;
@@ -55,44 +56,134 @@ pub enum PersistedValue {
     Actor(u64),
 }
 
-impl PersistedValue {
-    pub fn from_value(v: &Value) -> Self {
-        if let Some(i) = v.as_int() {
-            PersistedValue::Int(i)
-        } else if let Some(f) = v.as_float() {
-            PersistedValue::Float(f)
-        } else if let Some(b) = v.as_bool() {
-            PersistedValue::Bool(b)
-        } else if v.is_nil() {
-            PersistedValue::Nil
-        } else if v.is_unit() {
-            PersistedValue::Unit
-        } else if let Some(a) = v.as_actor_id() {
-            PersistedValue::Actor(a)
-        } else {
-            // Pointers and string references cannot be safely restored without
-            // the owning heap / constant pool, so they normalize to nil.
-            // Callers with module access should use from_value_resolved instead.
-            PersistedValue::Nil
+/// Failure to encode a live VM value into the durable persistence format.
+///
+/// Durable execution must never reinterpret an unsupported live value as Nil:
+/// that turns a recoverable serialization limitation into silent state
+/// corruption. Callers on durability boundaries must propagate or explicitly
+/// handle this error before publishing a snapshot or journal entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersistValueError {
+    UnresolvedStringId(u32),
+    NullHeapPointer,
+    InvalidHeapStringUtf8,
+    UnsupportedHeapType(String),
+    UnsupportedValue,
+}
+
+impl std::fmt::Display for PersistValueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnresolvedStringId(id) => {
+                write!(f, "string constant id {id} has no resolvable module entry")
+            }
+            Self::NullHeapPointer => write!(f, "null heap pointer cannot be persisted"),
+            Self::InvalidHeapStringUtf8 => write!(f, "heap string contains invalid UTF-8"),
+            Self::UnsupportedHeapType(tag) => {
+                write!(f, "heap value type {tag} has no durable encoding")
+            }
+            Self::UnsupportedValue => write!(f, "VM value has no durable encoding"),
         }
     }
+}
 
-    /// Like `from_value`, but resolves string pool IDs to their UTF-8 content
-    /// when a bytecode module is available. Falls back to `from_value` for
-    /// unresolved strings (which normalizes them to `Nil`).
-    pub fn from_value_resolved(v: &Value, module: Option<&crate::bytecode::CodeModule>) -> Self {
+impl std::error::Error for PersistValueError {}
+
+impl PersistedValue {
+    /// Encode a VM value without access to a bytecode constant pool.
+    ///
+    /// Primitive scalars, actor references, and runtime heap strings are
+    /// losslessly supported. String-pool IDs require
+    /// try_from_value_resolved. Other heap/object/closure values fail closed
+    /// until they have an explicit stable durable codec.
+    pub fn try_from_value(v: &Value) -> Result<Self, PersistValueError> {
+        if let Some(i) = v.as_int() {
+            return Ok(PersistedValue::Int(i));
+        }
+        if let Some(f) = v.as_float() {
+            return Ok(PersistedValue::Float(f));
+        }
+        if let Some(b) = v.as_bool() {
+            return Ok(PersistedValue::Bool(b));
+        }
+        if v.is_nil() {
+            return Ok(PersistedValue::Nil);
+        }
+        if v.is_unit() {
+            return Ok(PersistedValue::Unit);
+        }
+        if let Some(a) = v.as_actor_id() {
+            return Ok(PersistedValue::Actor(a));
+        }
         if let Some(id) = v.as_string_id() {
-            if let Some(content) = module
+            return Err(PersistValueError::UnresolvedStringId(id));
+        }
+        if let Some(ptr) = v.as_ptr() {
+            if ptr.is_null() {
+                return Err(PersistValueError::NullHeapPointer);
+            }
+
+            // SAFETY: a pointer-tagged Value admitted into the runtime carries
+            // provenance from ActorHeap/VM allocation. header_of only walks
+            // back to that allocation's fixed OrcaHeader. Raw external pointer
+            // bits are rejected at FFI/WASM boundaries before they can become
+            // trusted pointer-tagged Values.
+            let header = unsafe { &*ActorHeap::header_of(ptr) };
+            if header.type_tag != HeapTypeTag::String {
+                return Err(PersistValueError::UnsupportedHeapType(format!(
+                    "{:?}",
+                    header.type_tag
+                )));
+            }
+
+            // String allocations reserve payload bytes plus a trailing NUL.
+            // Bound the read by the owning allocation so persistence never
+            // scans past it, and remove only the allocator's trailing NUL.
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, header.payload_size) };
+            let content = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+            let string = std::str::from_utf8(content)
+                .map_err(|_| PersistValueError::InvalidHeapStringUtf8)?;
+            return Ok(PersistedValue::String(string.to_owned()));
+        }
+
+        Err(PersistValueError::UnsupportedValue)
+    }
+
+    /// Losslessly encode a VM value, resolving compiler string-pool IDs from
+    /// the exact bytecode module that produced the value.
+    pub fn try_from_value_resolved(
+        v: &Value,
+        module: Option<&crate::bytecode::CodeModule>,
+    ) -> Result<Self, PersistValueError> {
+        if let Some(id) = v.as_string_id() {
+            let content = module
                 .and_then(|m| m.constants.get(id as usize))
                 .and_then(|c| match c {
                     crate::bytecode::Constant::String(s) => Some(s.clone()),
                     _ => None,
                 })
-            {
-                return PersistedValue::String(content);
-            }
+                .ok_or(PersistValueError::UnresolvedStringId(id))?;
+            return Ok(PersistedValue::String(content));
         }
-        Self::from_value(v)
+        Self::try_from_value(v)
+    }
+
+    /// Legacy lossy conversion retained for embedders while durability
+    /// call-sites migrate to the fail-closed API.
+    #[deprecated(
+        note = "lossy persistence can turn unsupported values into Nil; use try_from_value"
+    )]
+    pub fn from_value(v: &Value) -> Self {
+        Self::try_from_value(v).unwrap_or(PersistedValue::Nil)
+    }
+
+    /// Legacy lossy conversion retained for embedders while durability
+    /// call-sites migrate to the fail-closed API.
+    #[deprecated(
+        note = "lossy persistence can turn unsupported values into Nil; use try_from_value_resolved"
+    )]
+    pub fn from_value_resolved(v: &Value, module: Option<&crate::bytecode::CodeModule>) -> Self {
+        Self::try_from_value_resolved(v, module).unwrap_or(PersistedValue::Nil)
     }
 
     pub fn to_value(&self) -> Value {
@@ -2220,7 +2311,7 @@ mod persisted_value_tests {
     fn test_from_value_resolved_resolves_string_from_module() {
         let v = Value::int(42);
         assert_eq!(
-            PersistedValue::from_value_resolved(&v, None),
+            PersistedValue::try_from_value_resolved(&v, None).unwrap(),
             PersistedValue::Int(42)
         );
     }
@@ -2231,19 +2322,55 @@ mod persisted_value_tests {
         let hello_idx = module.add_constant(Constant::String("hello".to_string()));
 
         let v = Value::string(hello_idx as u32);
-        let pv = PersistedValue::from_value_resolved(&v, Some(&module));
+        let pv = PersistedValue::try_from_value_resolved(&v, Some(&module)).unwrap();
         assert_eq!(pv, PersistedValue::String("hello".to_string()));
     }
 
     #[test]
-    fn test_from_value_resolved_returns_nil_without_module() {
+    fn test_try_from_value_resolved_rejects_string_without_module() {
         let mut module = CodeModule::new("test");
         let hello_idx = module.add_constant(Constant::String("hello".to_string()));
         let v = Value::string(hello_idx as u32);
 
-        // Without a module, the string can't be resolved — falls back to Nil.
-        let pv = PersistedValue::from_value_resolved(&v, None);
-        assert_eq!(pv, PersistedValue::Nil);
+        assert_eq!(
+            PersistedValue::try_from_value_resolved(&v, None),
+            Err(PersistValueError::UnresolvedStringId(hello_idx as u32))
+        );
+    }
+
+    #[test]
+    fn test_try_from_value_preserves_heap_string() {
+        use crate::runtime::heap::{ActorHeap, TypeTag};
+
+        let mut heap = ActorHeap::new(1024);
+        let bytes = b"heap-string";
+        let ptr = heap.alloc(bytes.len() + 1, TypeTag::String).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+            *ptr.add(bytes.len()) = 0;
+        }
+        let value = unsafe { Value::ptr(ptr) };
+
+        assert_eq!(
+            PersistedValue::try_from_value(&value).unwrap(),
+            PersistedValue::String("heap-string".to_string())
+        );
+    }
+
+    #[test]
+    fn test_try_from_value_rejects_structured_heap_value_instead_of_nil() {
+        use crate::runtime::heap::{ActorHeap, TypeTag};
+
+        let mut heap = ActorHeap::new(1024);
+        let ptr = heap
+            .alloc(std::mem::size_of::<Value>(), TypeTag::Array)
+            .unwrap();
+        let value = unsafe { Value::ptr(ptr) };
+
+        assert!(matches!(
+            PersistedValue::try_from_value(&value),
+            Err(PersistValueError::UnsupportedHeapType(tag)) if tag == "Array"
+        ));
     }
 
     #[test]
@@ -2267,7 +2394,7 @@ mod persisted_value_tests {
         let original = Value::string(idx as u32);
 
         // Checkpoint: resolve string to content.
-        let persisted = PersistedValue::from_value_resolved(&original, Some(&module));
+        let persisted = PersistedValue::try_from_value_resolved(&original, Some(&module)).unwrap();
         assert_eq!(persisted, PersistedValue::String("round-trip".to_string()));
 
         // Serialize → deserialize (JSON).
