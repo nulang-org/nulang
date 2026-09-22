@@ -112,9 +112,12 @@ from the target design of Layers 2–4, to keep in mind while reading §3–§5:
   on scoped OS threads. The live per-shard dequeue path uses scheduler worker
   slot 0; Chase-Lev peer stealing is implemented for generic multi-worker callers
   but is not active inside the current live shard loop.
-- **Persistence** ships three `PersistenceStore` backends — `MemoryStore`,
-  `JsonFileStore`, `LibsqlStore` (`src/runtime/persistence.rs`) — not
-  PostgreSQL or S3.
+- **Persistence** is behind the `PersistenceStore` trait. The runtime
+  includes `MemoryStore` and `JsonFileStore`; the default `sqlite` feature
+  provides `LibsqlStore` (local SQLite/libSQL plus remote Turso support), and
+  optional `rocksdb` / `postgres` features provide `RocksDbStore` and
+  `PostgresStore`. The CLI accepts `--store <uri>` and
+  `NULANG_STORE_PATH` for durable programs.
 - **The NUL0 transport** is a hand-rolled, length-prefixed TCP protocol whose
   fixed header is 13 bytes (4-byte `NUL0` magic, 1-byte packet type, 8-byte
   sequence); the version/flags/MAC fields, TLS, QUIC, and Poly1305 drawn in
