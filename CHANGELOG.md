@@ -51,6 +51,16 @@ version + migration.*
 
 ## Stable tier
 
+### Durable workflow signals and timers — 2026-09-22
+- **`nulang-workflow` now provides crash-replayable signal delivery and durable
+  timer waits** (Experimental, `crates/nulang-workflow/src/coordination.rs`).
+  Signals have caller-supplied idempotency identities and stable wait
+  identities; delivery records pin the exact payload returned to a wait so
+  replay cannot consume a second signal. Timer schedules persist their delay
+  and deadline before host arming, hosts re-arm idempotently by timer id on
+  recovery, and elapsed persisted deadlines are committed as fired without
+  depending on an in-memory timer surviving a restart.
+
 ### Durable SDK saga compensation — 2026-09-22
 - **`nulang-workflow` now provides replay-safe saga orchestration**
   (Experimental, `crates/nulang-workflow/src/saga.rs`). Saga plans are pinned

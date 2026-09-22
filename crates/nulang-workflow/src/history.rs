@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 const ACTIVITY_INVOCATION_DOMAIN: &[u8] = b"nulang.workflow.activity.v1\0";
+const SIGNAL_WAIT_DOMAIN: &[u8] = b"nulang.workflow.signal-wait.v1\0";
+const TIMER_DOMAIN: &[u8] = b"nulang.workflow.timer.v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WorkflowId(String);
@@ -66,6 +68,80 @@ fn hash_len_prefixed(hasher: &mut Hasher, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SignalId(String);
+
+impl SignalId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SignalId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SignalWaitId([u8; 32]);
+
+impl SignalWaitId {
+    pub fn derive(workflow_id: &WorkflowId, name: &str, occurrence: u32) -> Self {
+        let mut hasher = Hasher::new();
+        hasher.update(SIGNAL_WAIT_DOMAIN);
+        hash_len_prefixed(&mut hasher, workflow_id.as_str().as_bytes());
+        hash_len_prefixed(&mut hasher, name.as_bytes());
+        hasher.update(&occurrence.to_le_bytes());
+        Self(*hasher.finalize().as_bytes())
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for SignalWaitId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_hex(f, &self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct TimerId([u8; 32]);
+
+impl TimerId {
+    pub fn derive(workflow_id: &WorkflowId, name: &str, occurrence: u32) -> Self {
+        let mut hasher = Hasher::new();
+        hasher.update(TIMER_DOMAIN);
+        hash_len_prefixed(&mut hasher, workflow_id.as_str().as_bytes());
+        hash_len_prefixed(&mut hasher, name.as_bytes());
+        hasher.update(&occurrence.to_le_bytes());
+        Self(*hasher.finalize().as_bytes())
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for TimerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_hex(f, &self.0)
+    }
+}
+
+fn write_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8; 32]) -> fmt::Result {
+    for byte in bytes {
+        write!(f, "{byte:02x}")?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkflowEvent {
     ActivityPrepared {
@@ -110,15 +186,26 @@ pub enum WorkflowEvent {
         saga_id: String,
     },
     SignalReceived {
+        signal_id: SignalId,
+        name: String,
+        payload: Vec<u8>,
+    },
+    SignalDelivered {
+        wait_id: SignalWaitId,
+        signal_id: SignalId,
         name: String,
         payload: Vec<u8>,
     },
     TimerScheduled {
+        timer_id: TimerId,
         name: String,
+        occurrence: u32,
+        delay_millis: u64,
+        scheduled_at_millis: u64,
         fire_at_millis: u64,
     },
     TimerFired {
-        name: String,
+        timer_id: TimerId,
         fire_at_millis: u64,
     },
 }
@@ -148,6 +235,19 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.to_string().len(), 64);
         assert_eq!(first.idempotency_key(), first.to_string());
+    }
+
+    #[test]
+    fn test_signal_wait_and_timer_ids_are_stable_and_domain_separated() {
+        let workflow = WorkflowId::new("workflow:1");
+        let signal = SignalWaitId::derive(&workflow, "approval", 0);
+        let signal_again = SignalWaitId::derive(&workflow, "approval", 0);
+        let timer = TimerId::derive(&workflow, "approval", 0);
+
+        assert_eq!(signal, signal_again);
+        assert_ne!(signal.to_string(), timer.to_string());
+        assert_eq!(signal.to_string().len(), 64);
+        assert_eq!(timer.to_string().len(), 64);
     }
 
     #[test]
