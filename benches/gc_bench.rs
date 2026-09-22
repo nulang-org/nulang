@@ -60,7 +60,6 @@ fn bench_cycle_detection(c: &mut Criterion) {
     });
 }
 
-
 fn bench_actor_heap_medium_alloc(c: &mut Criterion) {
     const ALLOCS: usize = 64;
     let mut group = c.benchmark_group("gc/actor_heap_medium_alloc");
