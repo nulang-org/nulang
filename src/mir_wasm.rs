@@ -257,6 +257,12 @@ impl WasmBackend {
     // ── Compile ───────────────────────────────────────────────────
 
     pub fn compile(&mut self, mir: &mir::Module, _module_name: &str) -> NuResult<Vec<u8>> {
+        // Consume the same canonical optimized MIR as bytecode and native AOT
+        // while preserving this backend's immutable-input API.
+        let mut optimized_mir = (*mir).clone();
+        crate::mir_codegen::optimize_mir_module(&mut optimized_mir);
+        let mir = &optimized_mir;
+
         self.foreign_functions = mir.foreign_functions.clone();
         // Pre-scan: build the module-wide record field name → slot index map
         // (mirrors the AOT backend) so Record literals and LoadFieldNamed agree.
@@ -2957,6 +2963,70 @@ mod tests {
         let mir = crate::mir_lower::lower_module(&hir)?;
         let mut backend = WasmBackend::new();
         backend.compile(&mir, "test")
+    }
+
+    #[test]
+    fn test_compile_uses_optimized_clone_before_unsupported_prescan() {
+        use crate::bytecode::Constant;
+        use crate::mir::{self, RValue, Terminator};
+
+        let mut builder =
+            mir::FunctionBuilder::new("__main", Some(crate::types::Type::int()));
+        let cond = builder.add_temp(crate::types::Type::bool());
+        let result = builder.add_temp(crate::types::Type::int());
+        let actor = builder.add_temp(crate::types::Type::int());
+        let node = builder.add_temp(crate::types::Type::int());
+        let dead = builder.add_temp(crate::types::Type::unit());
+        let then_block = builder.create_block();
+        let else_block = builder.create_block();
+
+        builder.assign(cond, RValue::Const(Constant::Bool(true)));
+        builder.terminate(Terminator::Branch {
+            cond,
+            then_: then_block,
+            else_: else_block,
+        });
+
+        builder.switch_to(then_block);
+        builder.assign(result, RValue::Const(Constant::Int(42)));
+        builder.terminate(Terminator::Return(Some(result)));
+
+        builder.switch_to(else_block);
+        builder.assign(actor, RValue::Const(Constant::Int(1)));
+        builder.assign(node, RValue::Const(Constant::Int(2)));
+        // Remote migration is intentionally unsupported by the standalone
+        // WASM backend. Because this arm is statically unreachable, canonical
+        // MIR optimization should remove it before the unsupported-op scan.
+        builder.assign(dead, RValue::Migrate { actor, node });
+        builder.terminate(Terminator::Return(Some(result)));
+
+        let mut module = mir::Module::new("wasm_optimized_dead_branch");
+        module.functions.push(builder.build());
+        let original = module.clone();
+
+        let mut backend = WasmBackend::new();
+        let wasm = backend
+            .compile(&module, "wasm_optimized_dead_branch")
+            .expect("dead unsupported branch should be pruned before WASM prescan");
+
+        assert_eq!(&wasm[0..4], b"\0asm");
+        assert_eq!(
+            module, original,
+            "WASM optimization must operate on a private clone"
+        );
+        assert!(
+            module.functions[0].blocks[else_block.0 as usize]
+                .stmts
+                .iter()
+                .any(|stmt| matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        op: RValue::Migrate { .. },
+                        ..
+                    }
+                )),
+            "caller-owned MIR must retain the dead unsupported operation"
+        );
     }
 
     #[test]
