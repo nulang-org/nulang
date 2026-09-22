@@ -26,7 +26,8 @@ Implemented and tested: the full compiler pipeline (AST → HIR → MIR),
 register-based bytecode VM, Cranelift JIT, supervision (one-for-one,
 one-for-all, rest-for-one, simple-one-for-one), links/monitors/process
 groups, algebraic effects with resume, HM inference, capabilities, persistent
-actors with checkpointing + journaling (memory, JSON-file, and libsql store
+actors with checkpointing + journaling through `PersistenceStore` (memory,
+JSON-file, default-feature libSQL/SQLite, plus optional RocksDB and PostgreSQL
 backends), `entity`/`events`/`apply`/`emit` event sourcing, the `nula`
 package manager, LSP server, REPL, test runner, an extensive Rust test suite,
 and a `.nula` conformance suite under `conformance/`.
@@ -92,20 +93,20 @@ current CI result is more meaningful than a number copied into this FAQ.
 
 ## Do durable actors really survive `kill -9`?
 
-Not yet, end-to-end — verified by running it. What works today: crash
-*containment* (a supervised actor that dies is handled by its supervisor,
-siblings keep state, the process stays up — see the executed demo in
-`docs/launch/demo-script.md`), plus journaling and checkpointing of
-persistent-actor state after every behavior. State-rebuild recovery is
-implemented and pinned by an integration test at the Rust runtime level
-(`recover_actor` with a shared store; JSON-file and SQLite backends have
-round-trip tests), but two wirings are missing: the CLI constructs an
-in-memory store (`src/runtime/mod.rs`) with no flag for a file backend, and
-supervised restarts currently come back with fresh state — confirmed by
-execution while preparing the demo. Wiring recovery into supervisor restarts
-and exposing a file-backed store from the CLI is the top pre-1.0 milestone.
-We know "durable" invites the kill -9 test — the gap is disclosed here
-rather than discovered by you.
+The persistence path is now wired far enough that this is no longer the same
+gap described by the original launch draft. Durable programs can select a
+disk-backed store with `--store <uri>` or `NULANG_STORE_PATH`; the CLI
+supports JSON-file storage and feature-gated libSQL/SQLite, RocksDB, and
+PostgreSQL forms. Persistent supervised children hydrate their saved snapshot
+during `Supervisor::rebuild_child`, and `Runtime::recover_actor` restores
+snapshot/journal state for runtime/process recovery paths.
+
+That still does **not** justify a blanket production-grade "survives any
+kill -9 with zero data loss" claim. Durability depends on the selected store,
+its fsync/transaction guarantees, the exact crash boundary, semantic/artifact
+compatibility, and the remaining stabilization work documented in
+`docs/SEMANTIC_STABILIZATION_CONTRACT.md`. Treat destructive crash/recovery
+tests as release evidence, not as an assumption.
 
 ## What's the performance story?
 
