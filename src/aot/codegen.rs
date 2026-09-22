@@ -3563,6 +3563,34 @@ mod tests {
     }
 
     #[test]
+    fn test_aot_checked_neg_int48_min_overflow() {
+        let mut builder =
+            mir::FunctionBuilder::new("__main", Some(crate::types::Type::int()));
+        let x = builder.add_temp(crate::types::Type::int());
+        builder.assign(
+            x,
+            mir::RValue::Const(crate::bytecode::Constant::Int(
+                crate::value_layout::INT48_MIN,
+            )),
+        );
+        let neg = builder.add_temp(crate::types::Type::int());
+        builder.assign(neg, mir::RValue::Unary(crate::ast::UnOp::Neg, x));
+        builder.terminate(mir::Terminator::Return(Some(neg)));
+
+        let mut module = mir::Module::new("checked_neg");
+        module.functions.push(builder.build());
+
+        let aot = crate::aot::AotModule::compile(&module).expect("AOT compile");
+        let err = aot
+            .run()
+            .expect_err("negating INT48_MIN must raise instead of wrapping");
+        assert!(
+            err.to_string().contains("integer overflow"),
+            "unexpected AOT error: {err}"
+        );
+    }
+
+    #[test]
     fn test_is_all_int_false_with_bool_param() {
         let mut builder = mir::FunctionBuilder::new("mixed", Some(crate::types::Type::int()));
         builder.add_param("x", crate::types::Type::int());
