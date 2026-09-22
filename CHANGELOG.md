@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Formal latent function effects — 2026-09-22
+- **The Lean effect calculus now has an effect-aware function type** (`EffTy.fn(arg, result, latentRow)`). Lambda typing stores the body's row in the function type, variables preserve that latent contract, and application explicitly unions the latent row with function/argument evaluation effects.
+- **The pure HM `Ty` proof remains untouched.** The effect layer uses a separate monomorphic `EffContext`, avoiding a circular dependency from the already-proved HM core into `EffectRow`. The remaining effect-safety obligation is progress/preservation over expression + handler-stack state, not latent-row accounting.
+
 ### Formal effect-handler safety foundation — 2026-09-22
 - **Lean effect handlers now require typed handler bodies** (`spec/formal/effects.lean`). The formal `tHandle` rule no longer permits an arbitrary untyped handler expression: body and handler effect rows must be discharged by the installed handler or preserved in the outward residual row.
 - **Vacuous effect-safety placeholders were replaced with checked dispatch lemmas.** `effect_safety` and `effect_safety_static` now conclude concrete handled-dispatch properties; entering a handler scope is proved to establish dispatch safety. The stronger whole-language progress/preservation theorem remains explicitly open until latent function effect rows are represented in the formal function type.

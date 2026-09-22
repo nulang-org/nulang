@@ -74,7 +74,7 @@ among Phases 1-4's broader production-readiness work.
 | CI matrix | build/test/release/wasm/minimal/lint/lean/package-smoke |
 | Direct deps | 72 |
 | Transitive deps | 472 (verified `Cargo.lock` `grep -c '^name = '`, 2026-08-14; was 504 before a 2026-08-02 libsql feature trim dropped the unused tonic/axum gRPC stack, then 468, already stale before that) |
-| Formal proofs (Lean 4) | Core type soundness **proved** (`progress`/`preservation`/`type_soundness` machine-checked 2026-08-14); capability lattice proved (5/6 theorems — `linear_at_most_once` remains `sorry`, needs split-context refinement); local handler-stack effect dispatch safety proved and handler bodies typed; whole-language effect progress/preservation remains open pending latent function-effect formalization |
+| Formal proofs (Lean 4) | Core type soundness **proved** (`progress`/`preservation`/`type_soundness` machine-checked 2026-08-14); capability lattice proved (5/6 theorems — `linear_at_most_once` remains `sorry`, needs split-context refinement); local handler-stack effect dispatch safety proved, handler bodies typed, and latent function effects represented by `EffTy.fn`; whole-language effect progress/preservation over expression + handler-stack state remains open |
 | Conformance suite | 300 behavior cases + grammar cases |
 | Bootstrap self-hosting | Stage 13; not yet self-compiling |
 | Benchmarks | `benches/` uses criterion (7 files, 404 lines); no CI regression tracking |
@@ -949,9 +949,9 @@ runtime withstands adversarial operational review. Both hold up as
      split-context `HasTypeCap` refinement.
    - `effects.lean`: local handler-stack dispatch safety is proved and
      `tHandle` now requires a typed handler body whose effects are either
-     discharged or preserved outward. Whole-language progress/preservation is
-     still open because the simplified formal `Ty.fn` does not yet carry the
-     compiler's latent function effect row.
+     discharged or preserved outward. `EffTy.fn` now carries latent function
+     effect rows and `tApp` accounts for them. Whole-language
+     progress/preservation over expression + handler-stack state remains open.
    - `combined.lean`: type + capability + effect judgment soundness —
      open.
    - CI gate on `lake build` blocks any PR that touches

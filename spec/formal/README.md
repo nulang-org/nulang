@@ -8,9 +8,11 @@
 > lattice laws (`join` assoc/comm/idem) and `cap_sendable`/
 > `discharge_sendable` are proved. The effect formalization now proves local
 > handler-stack dispatch safety and requires typed handler bodies; the previous
-> vacuous `True` safety stubs are gone. Two whole-language obligations remain:
-> `linear_at_most_once` (requires a split input/output capability context) and
-> effect progress/preservation with latent function effect rows.
+> vacuous `True` safety stubs are gone. The effect calculus now also carries
+> latent rows in its own `EffTy.fn` type, so higher-order application accounts
+> for body effects. Two whole-language obligations remain: `linear_at_most_once`
+> (requires a split input/output capability context) and effect
+> progress/preservation over expression + handler-stack state.
 
 ## Purpose
 
@@ -75,11 +77,12 @@ effect in lexical handler scope cannot dispatch as unhandled. Entering a
 themselves required to typecheck with effect rows whose effects are either
 discharged by the installed handler or preserved in the outward residual row.
 
-The stronger whole-language theorem remains open for a specific reason: the
-simplified formal `Ty.fn` does not yet carry latent effect rows, while the Rust
-compiler's function type does. Proving application safety before modeling those
-latent rows would be unsound. The next step is an effect-aware function type and
-progress/preservation over evaluation plus the handler stack.
+The effect calculus now uses `EffTy.fn(arg, result, latentRow)`, so lambda
+typing stores body effects in the function type and application explicitly
+unions that latent row into the call's effect row. The stronger whole-language
+theorem remains open because the formal model still lacks a small-step
+operational semantics that steps expressions together with the handler stack.
+The next step is progress/preservation over that combined runtime state.
 
 ## Build
 
