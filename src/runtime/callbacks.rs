@@ -1220,12 +1220,7 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             return None;
         }
         if let Some(actor_id) = rt.current_actor {
-            if rt
-                .actors
-                .get(&actor_id)
-                .map(|a| a.is_agent)
-                .unwrap_or(false)
-            {
+            if rt.actor_is_agent(actor_id) {
                 return rt.complete_agent_llm(actor_id, prompt);
             }
         }
@@ -1913,12 +1908,7 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             {
                 return None;
             }
-            if rt
-                .actors
-                .get(&self.actor_id)
-                .map(|a| a.is_agent)
-                .unwrap_or(false)
-            {
+            if rt.actor_is_agent(self.actor_id) {
                 return rt.complete_agent_llm(self.actor_id, prompt);
             }
             let request = rt.build_actor_llm_request(self.actor_id, model, prompt)?;
@@ -1954,11 +1944,7 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                         // durable-state write-back must not run on the worker.
                         let prev_current_actor = rt.current_actor;
                         rt.current_actor = Some(actor_id);
-                        let is_agent = rt
-                            .actors
-                            .get(&actor_id)
-                            .map(|a| a.is_agent)
-                            .unwrap_or(false);
+                        let is_agent = rt.actor_is_agent(actor_id);
                         let content = if is_agent {
                             let module = rt
                                 .actors
@@ -2021,11 +2007,7 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
 
             // Build the request on the scheduler thread, then hand it to a
             // background worker for the HTTP call.
-            let is_agent = rt
-                .actors
-                .get(&actor_id)
-                .map(|a| a.is_agent)
-                .unwrap_or(false);
+            let is_agent = rt.actor_is_agent(actor_id);
             let request = if is_agent {
                 agent::build_agent_llm_request(rt, actor_id, prompt)
             } else {

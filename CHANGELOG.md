@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Canonical actor-role semantic reads — 2026-09-22
+- **Agent/runtime dispatch now consumes the canonical `ActorRole` compatibility view** (`src/runtime/mod.rs`, `src/runtime/callbacks.rs`). Legacy role booleans remain storage/serialization fields, but LLM and agent-memory semantic decisions no longer read `is_agent` independently.
+- **MIR codegen fails closed on conflicting specialized roles** (`src/mir_codegen.rs`). Agent tool collection resolves `ActorMeta::role()`; metadata claiming multiple specialized roles is rejected before bytecode is emitted. `tests/actor_role_semantics.rs` pins the invariant without changing existing artifact formats.
+
 ### Canonical compiler semantic identity — 2026-09-21
 - **Compiler-owned `SemanticId` now derives from canonical backend-independent MIR plus typed actor-state schemas** (Experimental, `src/semantic_identity.rs`, `src/semantic_schema.rs`, `src/compiler_identity.rs`). The encoding alpha-normalizes compiler-generated IDs, excludes presentation/debug metadata and backend selection, includes executable/effect/authority/durable semantics, and folds dependency semantic identities deterministically. `ArtifactIdentityManifest` assembly now has a typed-program entry point that keeps exact `SourceId`, semantic identity, and backend-specific `ArtifactId` distinct without changing frozen NBC v1.
 

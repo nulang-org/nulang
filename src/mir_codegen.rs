@@ -408,8 +408,16 @@ impl MirCodegen {
 
         // Collect tools from agent actors into module.tools so the runtime
         // can resolve @tool-annotated functions for agent LLM requests.
+        //
+        // Role interpretation must go through the canonical compatibility
+        // boundary rather than reading legacy booleans independently. Invalid
+        // metadata therefore fails compilation instead of accidentally taking
+        // one specialized runtime path.
         for meta in &self.module.actor_metadata {
-            if meta.is_agent {
+            let role = meta
+                .role()
+                .map_err(|error| compile_err(error.to_string(), Span::default()))?;
+            if matches!(role, crate::primitives::ActorRole::Agent) {
                 for tool in &meta.tools {
                     if !self.module.tools.iter().any(|t| t.name == tool.name) {
                         self.module.tools.push(tool.clone());
