@@ -3564,8 +3564,7 @@ mod tests {
 
     #[test]
     fn test_aot_checked_neg_int48_min_overflow() {
-        let mut builder =
-            mir::FunctionBuilder::new("__main", Some(crate::types::Type::int()));
+        let mut builder = mir::FunctionBuilder::new("__main", Some(crate::types::Type::int()));
         let x = builder.add_temp(crate::types::Type::int());
         builder.assign(
             x,
