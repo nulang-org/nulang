@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Runtime actor schema identity — 2026-09-22
+- **Module-spawned actors now retain their canonical owning `ActorMeta.name` at runtime** (`src/runtime/spawn.rs`). This preserves the target actor schema needed for subsequent fail-closed behavior ownership checks without changing manually spawned/native actor instance names. Regression coverage pins both paths.
+
+
 ### Canonical compiler semantic identity — 2026-09-21
 - **Compiler-owned `SemanticId` now derives from canonical backend-independent MIR plus typed actor-state schemas** (Experimental, `src/semantic_identity.rs`, `src/semantic_schema.rs`, `src/compiler_identity.rs`). The encoding alpha-normalizes compiler-generated IDs, excludes presentation/debug metadata and backend selection, includes executable/effect/authority/durable semantics, and folds dependency semantic identities deterministically. `ArtifactIdentityManifest` assembly now has a typed-program entry point that keeps exact `SourceId`, semantic identity, and backend-specific `ArtifactId` distinct without changing frozen NBC v1.
 
