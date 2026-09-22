@@ -1551,6 +1551,72 @@ fn test_tier2_counter_increments() {
 }
 
 #[test]
+fn test_tier2_simd_promotion_replaces_tier1_entry() {
+    use crate::jit::simd_compiler::is_simd_supported;
+
+    if !is_simd_supported() {
+        return;
+    }
+
+    // Synthetic vectorizable region:
+    //   c[i] = a[i] + b[i]
+    // ArrLen supplies a runtime trip count to the SIMD compiler.
+    let instructions = vec![
+        Instruction::new2(OpCode::ArrLen, 0, 7),
+        Instruction::new3(OpCode::ArrLoad, 0, 3, 4),
+        Instruction::new3(OpCode::ArrLoad, 1, 3, 5),
+        Instruction::new3(OpCode::IAdd, 4, 5, 6),
+        Instruction::new3(OpCode::ArrStore, 2, 3, 6),
+        Instruction::new1(OpCode::IInc, 3),
+    ];
+
+    let mut jit = make_jit();
+
+    // Tier-2 only runs for an already-compiled typed region. Install a
+    // sentinel tier-1 entry so the test specifically verifies replacement
+    // semantics rather than tier-1 compilation.
+    let tier1_ptr = std::ptr::NonNull::<u8>::dangling().as_ptr() as *const u8;
+    jit.store_compiled(0, 0, tier1_ptr, instructions.len());
+    jit.typed_regions.insert((0, 0));
+
+    for _ in 0..TIER2_THRESHOLD {
+        jit.record_tier2_and_maybe_promote(0, 0, &instructions);
+    }
+
+    let (tier2_ptr, len) = jit
+        .compiled_entry(0, 0)
+        .expect("tier-2 promotion must leave a compiled entry installed");
+    assert_ne!(
+        tier2_ptr, tier1_ptr,
+        "tier-2 must replace the existing tier-1 function, not return it from the cache"
+    );
+    assert_eq!(len, instructions.len());
+    assert_eq!(
+        jit.compiled_count(),
+        1,
+        "replacing a compiled slot must not increase the compiled-region count"
+    );
+    assert_eq!(
+        jit.tier2_counters.get(&(0, 0)).copied(),
+        Some(0),
+        "successful promotion resets the tier-2 counter"
+    );
+    assert_eq!(jit.simd_compiled_count(), 1);
+
+    // Once promoted, the region must not heat again or attempt to redeclare
+    // the same tier-2 JIT symbol.
+    for _ in 0..TIER2_THRESHOLD {
+        jit.record_tier2_and_maybe_promote(0, 0, &instructions);
+    }
+    assert_eq!(
+        jit.tier2_counters.get(&(0, 0)).copied(),
+        Some(0),
+        "SIMD regions must stay at tier 2 without reheating"
+    );
+    assert_eq!(jit.simd_compiled_count(), 1);
+}
+
+#[test]
 fn test_tier2_counters_are_per_session() {
     let mut jit_a = make_jit();
     let mut jit_b = make_jit();
