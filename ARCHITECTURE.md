@@ -126,12 +126,12 @@ from the target design of Layers 2–4, to keep in mind while reading §3–§5:
   `TlsConfig::MutualTls`. QUIC and the older diagram's bespoke per-packet
   Poly1305/MAC layout are not the current implementation.
 
-- **Application-specific declaration DSLs are no longer the strategic core.**
-  `agent`, `workflow`, and `database` declarations still parse for
-  compatibility, but the compiler emits deprecation diagnostics directing new
-  code toward ordinary actors/entities plus Cloud SDK libraries. The durable
-  `entity` surface is the preferred language-level abstraction for long-lived
-  domain state.
+- **Higher-level declarations share one runtime model.** Accepted RFC 0017
+  defines actors/state/messages/effects/capabilities/supervision/time as the
+  canonical primitives. `agent` and `workflow` remain Experimental
+  ergonomic source forms that lower to those primitives; `database` remains
+  Experimental. The durable `entity` surface is the preferred language-level
+  abstraction for long-lived domain identity/state.
 
 ---
 
