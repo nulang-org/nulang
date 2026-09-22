@@ -1,0 +1,53 @@
+{
+  "schema": "nulang.backend-profiles/v0alpha1",
+  "semantic_reference": "bytecode",
+  "canonical_portable_target": "wasm",
+  "profiles": [
+    {
+      "id": "bytecode",
+      "maturity": "stable",
+      "role": "semantic-reference",
+      "fallback": null,
+      "restrictions": []
+    },
+    {
+      "id": "jit",
+      "maturity": "stable",
+      "role": "optimization",
+      "fallback": "bytecode",
+      "restrictions": [],
+      "notes": "Unsupported hot regions remain in the bytecode interpreter; JIT must not change language semantics."
+    },
+    {
+      "id": "wasm",
+      "maturity": "experimental",
+      "role": "portable-cloud",
+      "fallback": null,
+      "restrictions": [
+        "user-defined-effect-handlers",
+        "continuation-resume"
+      ]
+    },
+    {
+      "id": "wasmfx",
+      "maturity": "experimental",
+      "role": "stack-switching-research",
+      "fallback": null,
+      "restrictions": [
+        "user-defined-effect-handlers",
+        "continuation-resume"
+      ],
+      "notes": "Built-in suspending effects may use stack switching, but user-defined handler/resume parity is incomplete."
+    },
+    {
+      "id": "native",
+      "maturity": "experimental",
+      "role": "secondary-aot",
+      "fallback": null,
+      "restrictions": [
+        "continuation-resume",
+        "full-language-parity-not-guaranteed"
+      ]
+    }
+  ]
+}
