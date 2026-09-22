@@ -47,10 +47,12 @@ Integrated with ORCA: keys/values retained on insert, released on
 remove/overwrite, and `TypeTag::Map` added to `free_object` slot-release.
 **Risk:** medium (reclamation protocol). **Shipped** (5 tests).
 
-### 4. Actor heap density (`runtime/actor.rs`)
-**Cost:** every actor eagerly allocated a 64 KiB bump block at spawn.
-**Fix:** default block 16 KiB — ~4× density (≈64k actors/GB). (Full lazy
-first-block allocation deferred — see below.)
+### 4. Actor heap density (`runtime/actor.rs`, `runtime/heap.rs`)
+**Cost:** every actor originally allocated a 64 KiB bump block at spawn.
+**Fix:** the configured first block is 16 KiB and is now materialized lazily
+on the first small-object allocation. Heap-idle and LOS-only actors therefore
+do not consume a bump backing block at spawn; active heaps retain the existing
+size-class reuse and grow-on-demand chaining behavior.
 **Risk:** low. **Shipped.**
 
 ## Considered, measured, and rejected
