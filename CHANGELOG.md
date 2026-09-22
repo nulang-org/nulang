@@ -1573,6 +1573,9 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Dense actor state slots — 2026-09-22
+- **Schema-known actor state reads bypass string materialization and hashing.** The runtime derives a constant-pool-index-to-dense-slot table from existing actor metadata when bytecode is attached, while preserving the frozen NBC v1 `StateGet`/`StateSet` encoding and the public string-keyed `state_data` compatibility mirror. VM callbacks use the indexed path when available and fall back to legacy string lookup for dynamic/unmapped fields; CRDT raw-assignment rejection is unchanged. Recovery, virtual-actor hydration, and supervisor restart rebuild the runtime-only slot schema.
+
 ### Allocation-free protocol actor-ref decoding — 2026-09-21
 - **ProtocolId wire decode no longer hex-allocates.** The fixed 32-byte protocol digest is reconstructed directly with `ProtocolId::from_bytes` instead of expanding to a 64-character hex `String` and reparsing it. Wire bytes and compatibility semantics are unchanged.
 
