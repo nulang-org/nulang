@@ -9,6 +9,7 @@ mod engine;
 mod history;
 mod lease;
 mod retry;
+mod saga;
 
 pub use engine::{
     ActivityDispatchRequest, ActivityDispatchResult, ActivityProgress, ActivitySpec, AppendOutcome,
@@ -20,3 +21,7 @@ pub use lease::{
     WorkerLeaseStore,
 };
 pub use retry::{Backoff, RetryPolicy};
+
+pub use saga::{
+    DurableSagaExecutor, SagaAction, SagaPhase, SagaPlan, SagaProgress, SagaStep,
+};
