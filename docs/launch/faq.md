@@ -35,7 +35,7 @@ and a `.nula` conformance suite under `conformance/`.
 Experimental (feature-gated or marked): multi-node distribution over TCP,
 WASM/WASM Component Model/WasmFX backends, the secondary native AOT backend
 (restricted semantics), AI runtime, Fabric, RESP cache serving, typed
-actor-protocol hardening, the deprecated `agent`/`workflow`/`database`
+actor-protocol hardening, the Experimental `agent`/`workflow`/`database`
 declaration surfaces, source-level CRDT state/replication, and the
 remaining CRDT recovery hardening. `.nula` CRDT fields and `Crdt.*`
 operations are implemented; a recovered actor currently needs its field-name
