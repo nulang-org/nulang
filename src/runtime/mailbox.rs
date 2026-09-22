@@ -574,7 +574,6 @@ mod tests {
         assert_eq!(count, 400);
     }
 
-
     #[test]
     fn normal_traffic_precedes_bulk_traffic() {
         let mut mb = Mailbox::new(8);
