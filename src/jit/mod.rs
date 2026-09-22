@@ -1060,57 +1060,64 @@ impl crate::backends::JitBackend for JitSession {
         self.hot_counts.clear();
     }
 
-    fn tiered_execute_step_typed(
+    fn prepare_tiered_step(
         &mut self,
         module_idx: usize,
         pc: usize,
         module: &crate::bytecode::CodeModule,
+    ) -> bool {
+        let instructions = &module.instructions;
+
+        // The VM has already performed the hot/compiled probe. For an
+        // existing native region, do any tier-2 bookkeeping while the module
+        // is borrowed, before native execution begins.
+        if self.compiled_entry(module_idx, pc).is_some() {
+            self.record_tier2_and_maybe_promote(module_idx, pc, instructions);
+            return true;
+        }
+
+        let ms = self.may_suspend_for(module_idx, module).to_vec();
+        let rc = self.recursive_for(module_idx, module).to_vec();
+        let (region_len, native_calls) =
+            find_compilable_region_with_calls(pc, instructions, module, Some(&ms), Some(&rc));
+        if region_len >= 3 {
+            let meta = typed_compiler::infer_reg_types(module, pc);
+            let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
+            if unsafe {
+                self.compile_region_typed(
+                    module_idx,
+                    pc,
+                    region_len,
+                    instructions,
+                    meta_ref,
+                    &native_calls,
+                )
+            }
+            .is_some()
+            {
+                return true;
+            }
+        }
+
+        // Rejected (too small / fragmented) or compile failed. Reset the hot
+        // counter so the next interpreted step does not immediately rescan.
+        if module_idx < self.hot_counts.len() && pc < self.hot_counts[module_idx].len() {
+            self.hot_counts[module_idx][pc] = 0;
+        }
+        false
+    }
+
+    fn execute_compiled(
+        &mut self,
+        module_idx: usize,
+        pc: usize,
         regs: &mut [u64; 256],
         constants: &[u64],
     ) -> crate::backends::TieredAction {
-        let instructions = &module.instructions;
-
-        // Check if already compiled
-        if let Some(func) = unsafe { self.get_compiled(module_idx, pc) } {
-            func(regs.as_mut_ptr(), constants.as_ptr());
-            // Track post-compilation hotness for tier-2 promotion.
-            self.record_tier2_and_maybe_promote(module_idx, pc, instructions);
-            return crate::backends::TieredAction::RanJit;
-        }
-
-        // Record execution for hotness
-        if self.record_and_check_hot(module_idx, pc) {
-            let ms = self.may_suspend_for(module_idx, module).to_vec();
-            let rc = self.recursive_for(module_idx, module).to_vec();
-            let (region_len, native_calls) =
-                find_compilable_region_with_calls(pc, instructions, module, Some(&ms), Some(&rc));
-            if region_len >= 3 {
-                let meta = typed_compiler::infer_reg_types(module, pc);
-                let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
-                if let Some(func) = unsafe {
-                    self.compile_region_typed(
-                        module_idx,
-                        pc,
-                        region_len,
-                        instructions,
-                        meta_ref,
-                        &native_calls,
-                    )
-                } {
-                    func(regs.as_mut_ptr(), constants.as_ptr());
-                    return crate::backends::TieredAction::RanJit;
-                }
-            }
-            // Rejected (too small / fragmented) or compile failed. Reset the
-            // hot counter so the per-step `record_and_check_hot` doesn't keep
-            // returning true and re-scanning every step — a rejected pc would
-            // otherwise call `find_compilable_region` on every execution,
-            // regressing call-heavy loops ~5x.
-            if module_idx < self.hot_counts.len() && pc < self.hot_counts[module_idx].len() {
-                self.hot_counts[module_idx][pc] = 0;
-            }
-        }
-
-        crate::backends::TieredAction::Interpret
+        let Some(func) = (unsafe { self.get_compiled(module_idx, pc) }) else {
+            return crate::backends::TieredAction::Interpret;
+        };
+        func(regs.as_mut_ptr(), constants.as_ptr());
+        crate::backends::TieredAction::RanJit
     }
 }
