@@ -1,10 +1,20 @@
 # Nulang Product Requirements Document
 ## Strategic Repositioning: A Durable Computation Language for Long-Lived Software Entities
 
-**Version:** 0.1 — Draft  
+**Version:** 0.1 — Historical strategic draft  
 **Date:** 2026-07-21  
-**Status:** Internal strategic review  
-**Author:** AI assistant review based on current `nulang` repository and proposed strategic updates  
+**Status:** Directional design snapshot; not current implementation status  
+**Author:** AI assistant review based on the July 2026 `nulang` repository and proposed strategic updates  
+
+> **Status note (reviewed 2026-09-22):** This PRD records the July
+> repositioning that led toward durable entities and composition over
+> application-specific DSLs. It is retained as strategic context, not as an
+> implementation contract. For current semantics/status use `SPEC2.md`,
+> `CHANGELOG.md`, `GOVERNANCE.md`, and
+> `docs/SEMANTIC_STABILIZATION_CONTRACT.md`. RFC 0021 supersedes this
+> document's assumption that pre-adoption Nulang Core source semantics are
+> permanently Frozen; they are currently Stable until an evidence-bearing
+> external-adoption freeze gate is satisfied.
 
 ---
 
@@ -44,9 +54,14 @@ This shift matters for a 50–100+ year horizon because AI model APIs, GPU provi
 
 ---
 
-# 4. Frozen Core Specification
+# 4. Core Scope (historical PRD terminology)
 
-The Frozen Core is the minimal subset of Nulang that must remain unchanged across major revisions. It is intentionally tiny. It is defined by [RFC 0002: Frozen Core](./../RFC/0002-frozen-core.md) and already implemented in the current repository.
+This section captures the July 2026 proposal to keep a tiny permanently Frozen
+source core. RFC 0021 later changed that compatibility policy: Nulang Core is
+still the portability/self-hosting kernel, but its pre-adoption source
+semantics are currently **Stable**, not permanently Frozen. Published artifact,
+wire, and value-layout versions remain separate versioned compatibility
+obligations.
 
 ## 4.1 What is in the Frozen Core
 
