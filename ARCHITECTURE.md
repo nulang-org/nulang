@@ -393,9 +393,11 @@ fallback when selective receive (`ReceiveMatch` 0x8F, shipped — see
 `lower_receive` in `src/mir_lower.rs`) finds no matching arm;
 `FOpen`/`FRead`/`FWrite`/`FClose` are stubs.
 
-**JIT tiering** (`src/jit/`): the VM keeps an optional `JitSession`. Before
-each instruction it snapshots the frame registers into a `[u64; 256]` and
-calls `jit::tiered_execute_step_typed`:
+**JIT tiering** (`src/jit/`): the VM keeps an optional `JitSession`. Each
+instruction first probes for compiled/hot code. When native execution is ready,
+the VM prepares the region while borrowing the module, then moves the JIT
+backend and raw-bit constant cache out of `VM` before the native call. This
+ensures re-entrant direct-call helpers cannot re-borrow the same JIT session:
 
 1. If a compiled function exists for `(module, pc)`, run it — its ABI is
    `extern "C" fn(*mut u64 regs, *const u64 constants)`.

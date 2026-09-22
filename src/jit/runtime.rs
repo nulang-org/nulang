@@ -469,61 +469,19 @@ pub fn clear_jit_callbacks() {
 }
 
 // ---------------------------------------------------------------------------
-// Constant-pool thread-local for JIT runtime helpers (string comparison)
+// JIT string resolution
 // ---------------------------------------------------------------------------
 
-/// Pointer-length pair for the current module's constant pool, stored as
-/// two usize values to avoid zero-initialization UB in the thread-local.
-#[derive(Clone, Copy)]
-struct ConstantsPtr(*const Constant, usize);
-
-impl ConstantsPtr {
-    const NULL: Self = ConstantsPtr(std::ptr::null(), 0);
-
-    /// # Safety
-    /// The slice must be valid for the duration of the JIT execution.
-    unsafe fn as_slice(self) -> &'static [Constant] {
-        if self.0.is_null() {
-            &[]
-        } else {
-            std::slice::from_raw_parts(self.0, self.1)
-        }
-    }
-}
-
-thread_local! {
-    static JIT_CONSTANTS: UnsafeCell<ConstantsPtr> = UnsafeCell::new(ConstantsPtr::NULL);
-}
-
-/// Set the current module's constant pool for JIT runtime helpers.
-///
-/// # Safety
-/// The slice must remain valid until `clear_jit_constants` is called.
-pub unsafe fn set_jit_constants(constants: &[Constant]) {
-    JIT_CONSTANTS.with(|cell| {
-        *cell.get() = ConstantsPtr(constants.as_ptr(), constants.len());
-    });
-}
-
-pub fn clear_jit_constants() {
-    JIT_CONSTANTS.with(|cell| unsafe {
-        *cell.get() = ConstantsPtr::NULL;
-    });
-}
-
 /// Resolve a raw u64 value to its string content (for comparison).
-/// Returns None for non-string values or when the constant pool is unavailable.
+///
+/// Interned strings are resolved through the active VM plus its module index.
+/// No borrowed constant-pool slice is stored in thread-local state, so native
+/// execution does not retain a Rust reference into VM-owned module storage
+/// across a re-entrant interpreter call.
 fn resolve_jit_string(raw: u64) -> Option<String> {
     if (raw & TAG_MASK) == TAG_STRING {
-        // Interned string: look up in the thread-local constant pool.
         let id = (raw & PAYLOAD_MASK) as u32;
-        JIT_CONSTANTS.with(|cell| unsafe {
-            let cp = (*cell.get()).as_slice();
-            match cp.get(id as usize) {
-                Some(Constant::String(s)) => Some(s.clone()),
-                _ => None,
-            }
-        })
+        resolve_active_vm_string(id)
     } else if (raw & TAG_MASK) == TAG_PTR {
         let ptr = (raw & PAYLOAD_MASK) as *mut u8;
         if ptr.is_null() {
@@ -629,20 +587,43 @@ pub fn take_jit_branch_exit_pc() -> Option<usize> {
 // The single-threaded VM currently executing a compiled region (set by
 // `VM::step` around each `tiered_execute_step_typed` call; the VM is
 // thread-confined, so a thread-local pointer is sound).
+const NO_JIT_MODULE: usize = usize::MAX;
+
 thread_local! {
-    static JIT_VM: Cell<*mut crate::vm::VM> = Cell::new(std::ptr::null_mut());
+    static JIT_VM: Cell<*mut crate::vm::VM> = const { Cell::new(std::ptr::null_mut()) };
+    static JIT_MODULE_IDX: Cell<usize> = const { Cell::new(NO_JIT_MODULE) };
 }
 
-pub unsafe fn set_jit_vm(vm: *mut crate::vm::VM) {
+pub unsafe fn set_jit_vm(vm: *mut crate::vm::VM, module_idx: usize) {
     JIT_VM.with(|cell| cell.set(vm));
+    JIT_MODULE_IDX.with(|cell| cell.set(module_idx));
 }
 
 pub fn clear_jit_vm() {
     JIT_VM.with(|cell| cell.set(std::ptr::null_mut()));
+    JIT_MODULE_IDX.with(|cell| cell.set(NO_JIT_MODULE));
 }
 
 fn get_jit_vm() -> *mut crate::vm::VM {
     JIT_VM.with(|cell| cell.get())
+}
+
+fn get_jit_module_idx() -> Option<usize> {
+    JIT_MODULE_IDX.with(|cell| {
+        let idx = cell.get();
+        (idx != NO_JIT_MODULE).then_some(idx)
+    })
+}
+
+fn resolve_active_vm_string(id: u32) -> Option<String> {
+    let vm_ptr = get_jit_vm();
+    let module_idx = get_jit_module_idx()?;
+    if vm_ptr.is_null() {
+        return None;
+    }
+    // SAFETY: JIT_VM is installed only for the duration of native execution.
+    // Callers create only a short-lived shared borrow for an immutable lookup.
+    unsafe { (&*vm_ptr).constant_string(module_idx, id) }
 }
 
 // Runtime error raised while running a re-entrant callee (e.g. step-limit).
@@ -668,7 +649,7 @@ pub fn take_jit_pending_vm_error() -> Option<String> {
 /// callbacks / safepoint / branch markers.
 struct JitThreadState {
     vm: *mut crate::vm::VM,
-    constants: ConstantsPtr,
+    module_idx: usize,
     callbacks: CbPair,
     safepoint: *mut u64,
     yield_pc: u64,
@@ -677,9 +658,9 @@ struct JitThreadState {
 }
 
 fn save_jit_thread_state() -> JitThreadState {
-    let (vm, constants, callbacks) = (
+    let (vm, module_idx, callbacks) = (
         JIT_VM.with(|c| c.get()),
-        JIT_CONSTANTS.with(|c| unsafe { *c.get() }),
+        JIT_MODULE_IDX.with(|c| c.get()),
         JIT_CALLBACKS.with(|c| unsafe { *c.get() }),
     );
     let (safepoint, yield_pc, branch_exit_pc) = (
@@ -690,7 +671,7 @@ fn save_jit_thread_state() -> JitThreadState {
     let pending_error = AOT_PENDING_ERROR.with(|e| e.borrow().clone());
     JitThreadState {
         vm,
-        constants,
+        module_idx,
         callbacks,
         safepoint,
         yield_pc,
@@ -701,8 +682,8 @@ fn save_jit_thread_state() -> JitThreadState {
 
 fn restore_jit_thread_state(s: JitThreadState) {
     JIT_VM.with(|c| c.set(s.vm));
+    JIT_MODULE_IDX.with(|c| c.set(s.module_idx));
     unsafe {
-        JIT_CONSTANTS.with(|c| *c.get() = s.constants);
         JIT_CALLBACKS.with(|c| *c.get() = s.callbacks);
     }
     JIT_SAFEPOINT_PTR.with(|c| c.set(s.safepoint));
@@ -1019,18 +1000,11 @@ pub fn resolve_string_coerce(raw: u64) -> Option<String> {
         return Some(val.as_bool().unwrap().to_string());
     }
     if (raw & TAG_MASK) == TAG_STRING {
-        // String constant from the module pool: content lives in the JIT or
-        // AOT constant pool, keyed by the payload index.
+        // String constant from the active JIT VM or, when running standalone
+        // AOT code, from the owned AOT constant pool.
         let id = (raw & PAYLOAD_MASK) as u32;
-        let from_jit = JIT_CONSTANTS.with(|cell| unsafe {
-            let cp = (*cell.get()).as_slice();
-            cp.get(id as usize).and_then(|c| match c {
-                crate::bytecode::Constant::String(s) => Some(s.clone()),
-                _ => None,
-            })
-        });
-        if from_jit.is_some() {
-            return from_jit;
+        if let Some(from_jit) = resolve_active_vm_string(id) {
+            return Some(from_jit);
         }
         return AOT_CONSTANTS.with(|cell| {
             let guard = cell.borrow();
