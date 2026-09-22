@@ -435,14 +435,13 @@ impl Mailbox {
     /// after the pattern+guard succeeds.
     pub fn commit_receive_match(&mut self) -> Option<Arc<Vec<Value>>> {
         let (lane, idx, payload) = self.active_match.take()?;
-        let removed = match lane {
+        let _removed = match lane {
             MatchLane::System => self.system_skip_buffer.remove(idx),
             MatchLane::Local => self.local_skip_buffer.remove(idx),
             MatchLane::Normal => self.skip_buffer.remove(idx),
         }?;
         self.release_slot_local();
         self.clear_tried_flags();
-        let _ = removed;
         Some(payload)
     }
 
