@@ -1,10 +1,10 @@
 //! MPSC mailbox with priority bands and optional capacity limit.
 //!
-//! Two priority bands (`System` and `Normal`/`Bulk`) ensure that supervisor
-//! exit signals and monitor DOWN messages are never delayed behind a queue
-//! of regular application messages. When a capacity limit is configured,
-//! `System` messages always bypass the limit while `Normal` and `Bulk`
-//! messages are rejected with backpressure when the mailbox is full.
+//! Three priority bands (`System`, `Normal`, and `Bulk`) ensure that supervisor
+//! exit signals and latency-sensitive application messages are never delayed
+//! behind bulk work. When a capacity limit is configured, `System` messages
+//! always bypass the limit while `Normal` and `Bulk` messages are rejected
+//! with backpressure when the mailbox is full.
 //!
 //! Concurrent producers use the lock-free `SegQueue`s through `push(&self)`.
 //! Scheduler-local traffic uses a plain `VecDeque` through methods requiring
@@ -38,6 +38,19 @@ pub enum MessagePriority {
     Bulk = 2,
 }
 
+/// Coarse mailbox pressure signal used by schedulers and transports.
+///
+/// The thresholds are intentionally cheap to compute from the logical queue
+/// depth. Bounded mailboxes use capacity utilization; unbounded mailboxes use
+/// conservative absolute depth thresholds so pressure is still observable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailboxPressure {
+    Normal,
+    Elevated,
+    High,
+    Critical,
+}
+
 /// MPSC mailbox with priority bands and optional capacity.
 ///
 /// Concurrent producers may call [`Mailbox::push`] through shared references;
@@ -49,6 +62,8 @@ enum MatchLane {
     System,
     Local,
     Normal,
+    LocalBulk,
+    Bulk,
 }
 
 /// MPSC mailbox with priority bands and optional capacity.
@@ -61,9 +76,13 @@ enum MatchLane {
 pub struct Mailbox {
     system_queue: SegQueue<Message>,
     normal_queue: SegQueue<Message>,
-    /// Same-thread local queue. Only scheduler-owned `&mut self` methods
+    bulk_queue: SegQueue<Message>,
+    /// Same-thread normal queue. Only scheduler-owned `&mut self` methods
     /// access it; concurrent producers never touch it.
     local_queue: VecDeque<Message>,
+    /// Same-thread bulk queue. Keeping this distinct preserves QoS even for
+    /// actor-to-actor sends originating on the owning scheduler thread.
+    local_bulk_queue: VecDeque<Message>,
     capacity: usize,
     queued_count: AtomicUsize,
     /// System messages already observed by a selective receive. They remain
@@ -74,6 +93,10 @@ pub struct Mailbox {
     local_skip_buffer: VecDeque<(Message, bool)>,
     /// Normal messages staged by selective receive.
     skip_buffer: VecDeque<(Message, bool)>,
+    /// Scheduler-local bulk messages staged by selective receive.
+    local_bulk_skip_buffer: VecDeque<(Message, bool)>,
+    /// Concurrent bulk messages staged by selective receive.
+    bulk_skip_buffer: VecDeque<(Message, bool)>,
     /// The most recently returned candidate. A second `receive_match` call
     /// means the previous candidate's guard rejected it; only this active
     /// candidate may be consumed by `commit_receive_match`.
@@ -89,12 +112,16 @@ impl Mailbox {
         Mailbox {
             system_queue: SegQueue::new(),
             normal_queue: SegQueue::new(),
+            bulk_queue: SegQueue::new(),
             local_queue: VecDeque::new(),
+            local_bulk_queue: VecDeque::new(),
             capacity,
             queued_count: AtomicUsize::new(0),
             system_skip_buffer: VecDeque::new(),
             local_skip_buffer: VecDeque::new(),
             skip_buffer: VecDeque::new(),
+            local_bulk_skip_buffer: VecDeque::new(),
+            bulk_skip_buffer: VecDeque::new(),
             active_match: None,
         }
     }
@@ -138,10 +165,10 @@ impl Mailbox {
         if !self.reserve_slot(system) {
             return Err(msg);
         }
-        if system {
-            self.system_queue.push(msg);
-        } else {
-            self.normal_queue.push(msg);
+        match msg.priority {
+            MessagePriority::System => self.system_queue.push(msg),
+            MessagePriority::Normal => self.normal_queue.push(msg),
+            MessagePriority::Bulk => self.bulk_queue.push(msg),
         }
         Ok(())
     }
@@ -152,7 +179,14 @@ impl Mailbox {
         if !self.reserve_slot(system) {
             return Err(msg);
         }
-        self.local_queue.push_back(msg);
+        match msg.priority {
+            // System traffic joins the dedicated concurrent System lane even
+            // when produced by the scheduler thread. This preserves the
+            // System > Normal > Bulk contract without another local queue.
+            MessagePriority::System => self.system_queue.push(msg),
+            MessagePriority::Normal => self.local_queue.push_back(msg),
+            MessagePriority::Bulk => self.local_bulk_queue.push_back(msg),
+        }
         Ok(())
     }
 
@@ -169,7 +203,11 @@ impl Mailbox {
             .or_else(|| self.local_skip_buffer.pop_front().map(|(m, _)| m))
             .or_else(|| self.local_queue.pop_front())
             .or_else(|| self.skip_buffer.pop_front().map(|(m, _)| m))
-            .or_else(|| self.normal_queue.pop());
+            .or_else(|| self.normal_queue.pop())
+            .or_else(|| self.local_bulk_skip_buffer.pop_front().map(|(m, _)| m))
+            .or_else(|| self.local_bulk_queue.pop_front())
+            .or_else(|| self.bulk_skip_buffer.pop_front().map(|(m, _)| m))
+            .or_else(|| self.bulk_queue.pop());
         if result.is_some() {
             self.active_match = None;
             self.release_slot();
@@ -178,20 +216,24 @@ impl Mailbox {
     }
 
     fn stage_arrivals(&mut self) {
-        // Scheduler-local system messages join the system lane; other local
-        // traffic stays in its own lane so its FIFO position is stable.
+        // Scheduler-local normal traffic stays in its own lane so its FIFO
+        // position is stable. Local System traffic is inserted directly into
+        // system_queue by push_local().
         while let Some(msg) = self.local_queue.pop_front() {
-            if msg.priority == MessagePriority::System {
-                self.system_skip_buffer.push_back((msg, false));
-            } else {
-                self.local_skip_buffer.push_back((msg, false));
-            }
+            debug_assert_eq!(msg.priority, MessagePriority::Normal);
+            self.local_skip_buffer.push_back((msg, false));
+        }
+        while let Some(msg) = self.local_bulk_queue.pop_front() {
+            self.local_bulk_skip_buffer.push_back((msg, false));
         }
         while let Some(msg) = self.system_queue.pop() {
             self.system_skip_buffer.push_back((msg, false));
         }
         while let Some(msg) = self.normal_queue.pop() {
             self.skip_buffer.push_back((msg, false));
+        }
+        while let Some(msg) = self.bulk_queue.pop() {
+            self.bulk_skip_buffer.push_back((msg, false));
         }
     }
 
@@ -238,6 +280,18 @@ impl Mailbox {
             self.active_match = Some((MatchLane::Normal, idx));
             return Some((pos, payload));
         }
+        if let Some((pos, idx, payload)) =
+            Self::scan_staged(&mut self.local_bulk_skip_buffer, behavior_ids)
+        {
+            self.active_match = Some((MatchLane::LocalBulk, idx));
+            return Some((pos, payload));
+        }
+        if let Some((pos, idx, payload)) =
+            Self::scan_staged(&mut self.bulk_skip_buffer, behavior_ids)
+        {
+            self.active_match = Some((MatchLane::Bulk, idx));
+            return Some((pos, payload));
+        }
         None
     }
 
@@ -277,6 +331,18 @@ impl Mailbox {
             self.normal_queue.push(msg);
         }
 
+        snapshot.extend(self.local_bulk_skip_buffer.iter().map(|(m, _)| m.clone()));
+        snapshot.extend(self.local_bulk_queue.iter().cloned());
+        snapshot.extend(self.bulk_skip_buffer.iter().map(|(m, _)| m.clone()));
+        let mut bulk_live = Vec::new();
+        while let Some(msg) = self.bulk_queue.pop() {
+            snapshot.push(msg.clone());
+            bulk_live.push(msg);
+        }
+        for msg in bulk_live {
+            self.bulk_queue.push(msg);
+        }
+
         snapshot
     }
 
@@ -292,6 +358,31 @@ impl Mailbox {
         self.capacity
     }
 
+    /// Return a coarse pressure state without allocation or locking.
+    ///
+    /// Bounded mailboxes use utilization thresholds of 50%, 75%, and 90%.
+    /// Unbounded mailboxes use depths of 1K, 4K, and 16K messages so an actor
+    /// can still advertise overload before memory growth becomes pathological.
+    pub fn pressure(&self) -> MailboxPressure {
+        let depth = self.len();
+        if self.capacity == 0 {
+            return match depth {
+                0..=1023 => MailboxPressure::Normal,
+                1024..=4095 => MailboxPressure::Elevated,
+                4096..=16383 => MailboxPressure::High,
+                _ => MailboxPressure::Critical,
+            };
+        }
+
+        let utilization = depth.saturating_mul(100) / self.capacity.max(1);
+        match utilization {
+            0..=49 => MailboxPressure::Normal,
+            50..=74 => MailboxPressure::Elevated,
+            75..=89 => MailboxPressure::High,
+            _ => MailboxPressure::Critical,
+        }
+    }
+
     fn clear_tried_flags(&mut self) {
         for (_, tried) in self.system_skip_buffer.iter_mut() {
             *tried = false;
@@ -300,6 +391,12 @@ impl Mailbox {
             *tried = false;
         }
         for (_, tried) in self.skip_buffer.iter_mut() {
+            *tried = false;
+        }
+        for (_, tried) in self.local_bulk_skip_buffer.iter_mut() {
+            *tried = false;
+        }
+        for (_, tried) in self.bulk_skip_buffer.iter_mut() {
             *tried = false;
         }
     }
@@ -313,6 +410,8 @@ impl Mailbox {
             MatchLane::System => self.system_skip_buffer.remove(idx),
             MatchLane::Local => self.local_skip_buffer.remove(idx),
             MatchLane::Normal => self.skip_buffer.remove(idx),
+            MatchLane::LocalBulk => self.local_bulk_skip_buffer.remove(idx),
+            MatchLane::Bulk => self.bulk_skip_buffer.remove(idx),
         }?;
         self.release_slot();
         self.clear_tried_flags();
@@ -475,6 +574,74 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 400);
+    }
+
+    #[test]
+    fn normal_traffic_precedes_bulk_traffic() {
+        let mut mb = Mailbox::new(8);
+        let mut bulk = make_msg(1, 10);
+        bulk.priority = MessagePriority::Bulk;
+        let normal = make_msg(2, 20);
+
+        mb.push(bulk).unwrap();
+        mb.push(normal).unwrap();
+
+        assert_eq!(mb.pop().unwrap().priority, MessagePriority::Normal);
+        assert_eq!(mb.pop().unwrap().priority, MessagePriority::Bulk);
+    }
+
+    #[test]
+    fn local_normal_traffic_precedes_local_bulk_traffic() {
+        let mut mb = Mailbox::new(8);
+        let mut bulk = make_msg(1, 10);
+        bulk.priority = MessagePriority::Bulk;
+        let normal = make_msg(2, 20);
+
+        mb.push_local(bulk).unwrap();
+        mb.push_local(normal).unwrap();
+
+        assert_eq!(mb.pop().unwrap().priority, MessagePriority::Normal);
+        assert_eq!(mb.pop().unwrap().priority, MessagePriority::Bulk);
+    }
+
+    #[test]
+    fn local_system_traffic_preempts_local_normal_traffic() {
+        let mut mb = Mailbox::new(8);
+        let normal = make_msg(1, 10);
+        let mut system = make_msg(2, 20);
+        system.priority = MessagePriority::System;
+
+        mb.push_local(normal).unwrap();
+        mb.push_local(system).unwrap();
+
+        assert_eq!(mb.pop().unwrap().priority, MessagePriority::System);
+        assert_eq!(mb.pop().unwrap().priority, MessagePriority::Normal);
+    }
+
+    #[test]
+    fn pressure_tracks_bounded_utilization() {
+        let mut mb = Mailbox::new(100);
+        assert_eq!(mb.pressure(), MailboxPressure::Normal);
+
+        for i in 0..50 {
+            mb.push(make_msg(i, i as u64)).unwrap();
+        }
+        assert_eq!(mb.pressure(), MailboxPressure::Elevated);
+
+        for i in 50..75 {
+            mb.push(make_msg(i, i as u64)).unwrap();
+        }
+        assert_eq!(mb.pressure(), MailboxPressure::High);
+
+        for i in 75..90 {
+            mb.push(make_msg(i, i as u64)).unwrap();
+        }
+        assert_eq!(mb.pressure(), MailboxPressure::Critical);
+
+        for _ in 0..41 {
+            mb.pop().unwrap();
+        }
+        assert_eq!(mb.pressure(), MailboxPressure::Normal);
     }
 
     #[test]

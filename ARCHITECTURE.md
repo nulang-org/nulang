@@ -81,11 +81,13 @@ Other verified divergences from the target design of Layers 2–4, to keep in
 mind while reading §3–§5:
 
 - **Spawned actors currently default to unbounded mailboxes**, but the mailbox
-  implementation is no longer an unbounded single FIFO. `Mailbox` has separate
-  System and Normal/Bulk concurrent lanes, a scheduler-local lane, transactional
-  selective-receive staging, and an optional capacity limit. Bounded normal/bulk
-  pushes fail with explicit backpressure while System messages bypass the limit.
-  Cross-shard transport is separately bounded by 1024-entry `sync_channel`s.
+  implementation is no longer an unbounded single FIFO. `Mailbox` has distinct
+  System, Normal, and Bulk QoS lanes (including scheduler-local Normal/Bulk
+  queues), transactional selective-receive staging, and an optional capacity
+  limit. Delivery prefers System → Normal → Bulk while preserving FIFO within
+  each lane. Bounded normal/bulk pushes fail with explicit backpressure while
+  System messages bypass the limit. Cross-shard transport is separately bounded
+  by 1024-entry `sync_channel`s.
 - **Actor identity is a bare `u64`** from a global atomic counter
   (`fresh_actor_id`, `src/runtime/mod.rs`); `spawn` is explicit — there is no
   Orleans-style string identity, no activation-on-first-message, and no

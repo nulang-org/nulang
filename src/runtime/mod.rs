@@ -2930,12 +2930,21 @@ impl Runtime {
             self.tick_timers();
             self.step_actor(actor_id);
             // Micro-batch: continue processing the same actor for a few more
-            // messages to maximize L1 instruction-cache retention.  The
-            // per-turn reduction budget (checked by should_yield) acts as
-            // the safety limit - a hot actor that exhausts its budget will
-            // be requeued behind other actors.
-            const BATCH_SIZE: usize = 16;
-            for _ in 1..BATCH_SIZE {
+            // messages to maximize L1 instruction-cache retention. Increase
+            // the quantum under mailbox pressure so overloaded consumers drain
+            // faster, while the per-turn reduction budget remains the fairness
+            // safety limit and forces hot actors back behind peers.
+            let batch_size = self
+                .actors
+                .get(&actor_id)
+                .map(|actor| match actor.mailbox.pressure() {
+                    MailboxPressure::Normal => 16,
+                    MailboxPressure::Elevated => 24,
+                    MailboxPressure::High => 32,
+                    MailboxPressure::Critical => 64,
+                })
+                .unwrap_or(16);
+            for _ in 1..batch_size {
                 let should_continue = self
                     .actors
                     .get(&actor_id)
