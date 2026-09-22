@@ -2129,12 +2129,8 @@ impl Runtime {
         let Some(module) = actor.bytecode_module.as_ref() else {
             return false;
         };
-        behavior_ownership::module_behavior_index_for_actor(
-            module,
-            &actor.name,
-            behavior_idx,
-        )
-        .is_some()
+        behavior_ownership::module_behavior_index_for_actor(module, &actor.name, behavior_idx)
+            .is_some()
             && self.has_bytecode_handler(target_id, behavior_idx)
     }
 
@@ -2154,12 +2150,8 @@ impl Runtime {
             return u16::try_from(idx).ok();
         }
         let module = actor.bytecode_module.as_ref()?;
-        behavior_ownership::runtime_behavior_id_for_actor_name(
-            module,
-            &actor.name,
-            behavior,
-        )
-        .and_then(|idx| u16::try_from(idx).ok())
+        behavior_ownership::runtime_behavior_id_for_actor_name(module, &actor.name, behavior)
+            .and_then(|idx| u16::try_from(idx).ok())
     }
 
     /// Resolve a public name-based delivery without reintroducing the old
