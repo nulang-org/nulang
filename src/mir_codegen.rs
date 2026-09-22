@@ -1470,10 +1470,10 @@ fn float_locals(func: &mir::Function) -> Vec<bool> {
 //                             newly unreachable blocks are emptied;
 //   5. jump threading       — trampoline blocks (0 stmts + Jump) are
 //                             bypassed and marked unreachable;
-//   6. dead-store elimination — stores whose dst is never read anywhere in
-//                             the function are dropped (function-wide read
-//                             set — block-local liveness alone would be
-//                             unsound across loop back-edges and joins).
+//   6. dead-store elimination — ordinary functions use backward CFG
+//                             liveness across loops/joins; dynamic
+//                             effect-handler functions keep the conservative
+//                             function-wide fallback.
 //
 // Everything here is semantics-preserving with respect to the bytecode VM.
 // Notable VM quirks the folding accounts for:
@@ -2176,19 +2176,93 @@ fn thread_jumps(func: &mut mir::Function) -> bool {
     changed
 }
 
-/// Drop stores whose destination is never read anywhere in the function.
+/// Eliminate dead scalar stores with backward CFG liveness.
 ///
-/// Block-local liveness alone would be unsound: a "dead" store can feed a
-/// loop back-edge or a join point in a different block (e.g. a
-/// loop-carried variable whose next-iteration read sits earlier in the same
-/// block). The conservative condition is a function-wide read set: the
-/// store is removable only when its dst is read nowhere at all. Captured
-/// locals are excluded too — a closure reads them through `CapLoad` outside
-/// this function's MIR.
+/// Ordinary functions use a classical live-in/live-out fixpoint, so a store
+/// may be removed when its value is dead on every successor path even if the
+/// same local is read elsewhere in the function. This handles loops and joins
+/// correctly without the previous function-wide "read anywhere" restriction.
 ///
-/// Self-moves (`x = Load(x)`) are removed unconditionally: the register
-/// already holds the value, so the statement is a no-op.
+/// Functions with effect-handler tables deliberately keep the older,
+/// function-wide rule. Handler bodies can be entered dynamically by Perform
+/// through edges that are not represented by ordinary MIR terminators, so
+/// treating only the visible CFG as complete would be unsound.
+///
+/// Source-named locals remain materialized for debugger visibility; closure
+/// captures and heap-capable locals are also protected. Self-moves
+/// (`x = Load(x)`) are always removable because they do not change the
+/// observable register value.
 fn dead_store_elim(func: &mut mir::Function) -> bool {
+    if !func.handler_tables.is_empty() {
+        return dead_store_elim_function_wide(func);
+    }
+    dead_store_elim_cfg(func)
+}
+
+fn protected_dce_locals(func: &mir::Function) -> (Vec<bool>, Vec<bool>, HashSet<mir::LocalId>) {
+    let named: Vec<bool> = func
+        .locals
+        .iter()
+        .map(|local| {
+            local
+                .name
+                .as_deref()
+                .map(|name| !name.starts_with("__"))
+                .unwrap_or(false)
+        })
+        .collect();
+    let heap_capable: Vec<bool> = func
+        .locals
+        .iter()
+        .map(|local| may_hold_heap_ptr(&local.ty))
+        .collect();
+    let captures = func.captures.iter().copied().collect();
+    (named, heap_capable, captures)
+}
+
+fn dce_assignment_is_protected(
+    dst: mir::LocalId,
+    named: &[bool],
+    heap_capable: &[bool],
+    captures: &HashSet<mir::LocalId>,
+) -> bool {
+    let idx = dst.0 as usize;
+    named.get(idx).copied().unwrap_or(true)
+        || heap_capable.get(idx).copied().unwrap_or(true)
+        || captures.contains(&dst)
+}
+
+fn update_line_table_after_dce(
+    line_table: &mut Vec<((mir::BlockId, usize), u32)>,
+    block_id: mir::BlockId,
+    removed: &[usize],
+) {
+    if removed.is_empty() {
+        return;
+    }
+
+    let mut new_line_table = Vec::with_capacity(line_table.len());
+    for &((block, stmt_idx), line) in line_table.iter() {
+        if block == block_id {
+            if removed.contains(&stmt_idx) {
+                continue;
+            }
+            let shifted = removed.iter().filter(|&&removed_idx| removed_idx < stmt_idx).count();
+            new_line_table.push(((block, stmt_idx - shifted), line));
+        } else {
+            new_line_table.push(((block, stmt_idx), line));
+        }
+    }
+    *line_table = new_line_table;
+}
+
+/// Conservative fallback for functions with dynamic effect-handler entries.
+///
+/// This is the pre-CFG-liveness policy: an anonymous side-effect-free store
+/// is removed only when its destination is never read anywhere in the
+/// function. Dynamic handler entry therefore cannot make the analysis miss a
+/// hidden predecessor.
+fn dead_store_elim_function_wide(func: &mut mir::Function) -> bool {
     let mut reads: HashSet<mir::LocalId> = HashSet::new();
     for block in &func.blocks {
         for stmt in &block.stmts {
@@ -2197,62 +2271,181 @@ fn dead_store_elim(func: &mut mir::Function) -> bool {
         terminator_reads(&block.terminator, &mut reads);
     }
 
+    let (named, _heap_capable, captures) = protected_dce_locals(func);
     let mut changed = false;
     for block in &mut func.blocks {
         let block_id = block.id;
-        let mut removed: Vec<usize> = Vec::new();
-        let mut kept: Vec<mir::Stmt> = Vec::with_capacity(block.stmts.len());
-        for (si, stmt) in std::mem::take(&mut block.stmts).into_iter().enumerate() {
+        let mut removed = Vec::new();
+        let mut kept = Vec::with_capacity(block.stmts.len());
+
+        for (stmt_idx, stmt) in std::mem::take(&mut block.stmts).into_iter().enumerate() {
             let removable = match &stmt {
                 mir::Stmt::Assign { dst, op } => {
                     let self_move = matches!(op, mir::RValue::Load(src) if src == dst);
-                    // Source-named locals stay visible to the debugger at
-                    // breakpoints: constant propagation can make their
-                    // definition look dead (the folded RValue no longer
-                    // references them), but removing the store would make
-                    // the paused frame report nil. Only anonymous temps and
-                    // compiler-generated names (hir_lower's `__tmpN`) are
-                    // safe to drop.
-                    let named = func
-                        .locals
-                        .get(dst.0 as usize)
-                        .and_then(|l| l.name.as_deref())
-                        .map(|n| !n.starts_with("__"))
-                        .unwrap_or(false);
+                    let idx = dst.0 as usize;
+                    let is_named = named.get(idx).copied().unwrap_or(true);
                     self_move
-                        || (!named
-                            && !func.captures.contains(dst)
+                        || (!is_named
+                            && !captures.contains(dst)
                             && !reads.contains(dst)
                             && !rvalue_side_effecting(op))
                 }
                 _ => false,
             };
+
             if removable {
-                removed.push(si);
+                removed.push(stmt_idx);
                 changed = true;
             } else {
                 kept.push(stmt);
             }
         }
-        // Fix up source-line indices for surviving statements: entries for
-        // removed statements are dropped, entries after them shift down.
-        if !removed.is_empty() {
-            let mut new_line_table = Vec::with_capacity(func.line_table.len());
-            for &((b, si), line) in &func.line_table {
-                if b == block_id {
-                    if removed.contains(&si) {
-                        continue;
-                    }
-                    let shifted = removed.iter().filter(|&&r| r < si).count();
-                    new_line_table.push(((b, si - shifted), line));
-                } else {
-                    new_line_table.push(((b, si), line));
-                }
-            }
-            func.line_table = new_line_table;
-        }
+
+        update_line_table_after_dce(&mut func.line_table, block_id, &removed);
         block.stmts = kept;
     }
+    changed
+}
+
+fn block_use_def(
+    block: &mir::Block,
+) -> (HashSet<mir::LocalId>, HashSet<mir::LocalId>) {
+    let mut uses = HashSet::new();
+    let mut defs = HashSet::new();
+
+    for stmt in &block.stmts {
+        let mut reads = HashSet::new();
+        stmt_reads(stmt, &mut reads);
+        for local in reads {
+            if !defs.contains(&local) {
+                uses.insert(local);
+            }
+        }
+
+        if let mir::Stmt::Assign { dst, .. } = stmt {
+            defs.insert(*dst);
+        }
+    }
+
+    let mut term_reads = HashSet::new();
+    terminator_reads(&block.terminator, &mut term_reads);
+    for local in term_reads {
+        if !defs.contains(&local) {
+            uses.insert(local);
+        }
+    }
+
+    (uses, defs)
+}
+
+/// Classical backward live-variable analysis over the ordinary MIR CFG.
+///
+/// The sets are monotone and finite, so the fixpoint terminates even with
+/// arbitrary loops. Block ids are dense indices in Function::blocks.
+fn cfg_liveness(
+    func: &mir::Function,
+) -> (
+    Vec<HashSet<mir::LocalId>>,
+    Vec<HashSet<mir::LocalId>>,
+) {
+    let n = func.blocks.len();
+    let mut uses = Vec::with_capacity(n);
+    let mut defs = Vec::with_capacity(n);
+    for block in &func.blocks {
+        let (block_uses, block_defs) = block_use_def(block);
+        uses.push(block_uses);
+        defs.push(block_defs);
+    }
+
+    let mut live_in = vec![HashSet::new(); n];
+    let mut live_out = vec![HashSet::new(); n];
+
+    loop {
+        let mut changed = false;
+
+        for idx in (0..n).rev() {
+            let mut new_out = HashSet::new();
+            for succ in terminator_successors(&func.blocks[idx].terminator) {
+                if succ < n {
+                    new_out.extend(live_in[succ].iter().copied());
+                }
+            }
+
+            let mut new_in = uses[idx].clone();
+            for local in &new_out {
+                if !defs[idx].contains(local) {
+                    new_in.insert(*local);
+                }
+            }
+
+            if new_out != live_out[idx] {
+                live_out[idx] = new_out;
+                changed = true;
+            }
+            if new_in != live_in[idx] {
+                live_in[idx] = new_in;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    (live_in, live_out)
+}
+
+fn dead_store_elim_cfg(func: &mut mir::Function) -> bool {
+    let (_live_in, live_out) = cfg_liveness(func);
+    let (named, heap_capable, captures) = protected_dce_locals(func);
+
+    let mut changed = false;
+    for (block_idx, block) in func.blocks.iter_mut().enumerate() {
+        let block_id = block.id;
+        let mut live = live_out[block_idx].clone();
+        terminator_reads(&block.terminator, &mut live);
+
+        let old_stmts = std::mem::take(&mut block.stmts);
+        let mut kept_rev = Vec::with_capacity(old_stmts.len());
+        let mut removed = Vec::new();
+
+        for (stmt_idx, stmt) in old_stmts.into_iter().enumerate().rev() {
+            match &stmt {
+                mir::Stmt::Assign { dst, op } => {
+                    let self_move = matches!(op, mir::RValue::Load(src) if src == dst);
+                    let protected =
+                        dce_assignment_is_protected(*dst, &named, &heap_capable, &captures);
+                    let removable = self_move
+                        || (!protected && !live.contains(dst) && !rvalue_side_effecting(op));
+
+                    if removable {
+                        removed.push(stmt_idx);
+                        changed = true;
+                        // A removed pure assignment does not evaluate its
+                        // operands, so none of its reads become live.
+                        continue;
+                    }
+
+                    // Kept assignment defines dst before evaluating earlier
+                    // statements; its old value is no longer needed here.
+                    live.remove(dst);
+                    rvalue_reads(op, &mut live);
+                    kept_rev.push(stmt);
+                }
+                _ => {
+                    stmt_reads(&stmt, &mut live);
+                    kept_rev.push(stmt);
+                }
+            }
+        }
+
+        kept_rev.reverse();
+        removed.sort_unstable();
+        update_line_table_after_dce(&mut func.line_table, block_id, &removed);
+        block.stmts = kept_rev;
+    }
+
     changed
 }
 
