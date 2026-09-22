@@ -1013,8 +1013,7 @@ pub fn compile_bytecode_region_typed(
     // every instruction. Leaders are the region entry, branch targets, and
     // post-terminator fallthrough points. Straight-line bytecode is emitted
     // into one CLIF block, eliminating an unconditional jump per instruction.
-    let basic_block_leaders =
-        typed_basic_block_leaders(start_offset, end_offset, instructions);
+    let basic_block_leaders = typed_basic_block_leaders(start_offset, end_offset, instructions);
     let mut blocks: HashMap<usize, Block> = HashMap::new();
     let mut ordered_leaders: Vec<_> = basic_block_leaders.iter().copied().collect();
     ordered_leaders.sort_unstable();
