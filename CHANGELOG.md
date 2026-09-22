@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Formal effect-row/handler-stack accounting — 2026-09-22
+- **Closed effect rows now have a formal runtime-accounting predicate.** `EffectRow.accountedBy` requires every statically named effect to be in the active handler stack and deliberately rejects open rows whose unknown tail cannot be proven handled.
+- **Handler discharge is connected to runtime scope.** Lean proves that `dischargedBy handled residual observed` plus an accounted outward row implies the observed body/handler row is accounted after pushing `handled`. A typed-handler corollary establishes this for both the protected computation and handler body.
+
 ### Formal latent function effects — 2026-09-22
 - **The Lean effect calculus now has an effect-aware function type** (`EffTy.fn(arg, result, latentRow)`). Lambda typing stores the body's row in the function type, variables preserve that latent contract, and application explicitly unions the latent row with function/argument evaluation effects.
 - **The pure HM `Ty` proof remains untouched.** The effect layer uses a separate monomorphic `EffContext`, avoiding a circular dependency from the already-proved HM core into `EffectRow`. The remaining effect-safety obligation is progress/preservation over expression + handler-stack state, not latent-row accounting.
