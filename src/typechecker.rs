@@ -1076,6 +1076,10 @@ pub struct TypeChecker {
     pub collect_errors: bool,
     /// Errors collected when `collect_errors` is set (empty otherwise).
     pub collected_errors: Vec<crate::types::NuError>,
+    /// Non-fatal semantic diagnostics discovered after types are known.
+    /// Kept separate from parser warnings so callers can decide when to
+    /// surface stabilization diagnostics without changing runtime behavior.
+    pub warnings: Vec<crate::types::NuWarning>,
 }
 
 /// Pre-computed class and instance tables extracted from an AST module.
@@ -1157,7 +1161,13 @@ impl TypeChecker {
             rigid_vars: FxHashSet::default(),
             collect_errors: false,
             collected_errors: Vec::new(),
+            warnings: Vec::new(),
         }
+    }
+
+    /// Drain non-fatal type-directed diagnostics accumulated by the checker.
+    pub fn take_warnings(&mut self) -> Vec<crate::types::NuWarning> {
+        std::mem::take(&mut self.warnings)
     }
 
     /// Type-check an entire module, returning the type of the last declaration.
@@ -3339,6 +3349,121 @@ impl TypeChecker {
         Ok((final_subst.clone(), apply_subst(&elem_var, &final_subst)))
     }
 
+    /// Return a conservative set of definitely-uncovered finite cases.
+    ///
+    /// This intentionally does not attempt to prove coverage for infinite
+    /// domains (Int/String/Float) or complex structural patterns yet. It only
+    /// reports a case when the checker can prove the match may miss it. Guarded
+    /// arms are excluded by the caller because a guard may evaluate to false.
+    fn finite_missing_match_cases(ty: &Type, patterns: &[&Pattern]) -> Option<Vec<String>> {
+        fn strip_alias<'a>(pattern: &'a Pattern) -> &'a Pattern {
+            match pattern {
+                Pattern::Alias(_, inner) => strip_alias(inner),
+                other => other,
+            }
+        }
+
+        fn irrefutable(pattern: &Pattern, ty: &Type) -> bool {
+            match strip_alias(pattern) {
+                Pattern::Wild | Pattern::Var(_) => true,
+                Pattern::Tuple(items) => match ty {
+                    Type::Tuple(types) if items.len() == types.len() => items
+                        .iter()
+                        .zip(types)
+                        .all(|(pattern, ty)| irrefutable(pattern, ty)),
+                    _ => false,
+                },
+                Pattern::Record(fields) => match ty {
+                    Type::Record(types) => fields.iter().all(|(name, pattern)| {
+                        types
+                            .iter()
+                            .find(|(field, _)| field == name)
+                            .is_some_and(|(_, ty)| irrefutable(pattern, ty))
+                    }),
+                    _ => false,
+                },
+                Pattern::Lit(Literal::Nil) => *ty == Type::nil(),
+                Pattern::Lit(Literal::Unit) => *ty == Type::unit(),
+                _ => false,
+            }
+        }
+
+        if patterns.iter().any(|pattern| irrefutable(pattern, ty)) {
+            return Some(Vec::new());
+        }
+
+        match ty {
+            Type::Primitive(PrimitiveType::Bool) => {
+                let mut seen_true = false;
+                let mut seen_false = false;
+                for pattern in patterns {
+                    match strip_alias(pattern) {
+                        Pattern::Lit(Literal::Bool(true)) => seen_true = true,
+                        Pattern::Lit(Literal::Bool(false)) => seen_false = true,
+                        _ => {}
+                    }
+                }
+                let mut missing = Vec::new();
+                if !seen_true {
+                    missing.push("true".to_string());
+                }
+                if !seen_false {
+                    missing.push("false".to_string());
+                }
+                Some(missing)
+            }
+            Type::Primitive(PrimitiveType::Nil) => Some(vec!["nil".to_string()]),
+            Type::Primitive(PrimitiveType::Unit) => Some(vec!["()".to_string()]),
+            Type::Variant(variants) => {
+                let mut missing = Vec::new();
+                for (name, payload_ty) in variants {
+                    let mut bare_constructor = false;
+                    let mut payload_patterns: Vec<&Pattern> = Vec::new();
+                    for pattern in patterns {
+                        if let Pattern::Variant(pattern_name, payload) = strip_alias(pattern) {
+                            if pattern_name == name {
+                                match payload.as_deref() {
+                                    Some(inner) => payload_patterns.push(inner),
+                                    None => bare_constructor = true,
+                                }
+                            }
+                        }
+                    }
+
+                    if bare_constructor {
+                        continue;
+                    }
+
+                    match payload_ty {
+                        None => {
+                            if payload_patterns.is_empty() {
+                                missing.push(name.clone());
+                            }
+                        }
+                        Some(payload_ty) => {
+                            if payload_patterns.is_empty() {
+                                missing.push(format!("{}(_)", name));
+                                continue;
+                            }
+                            if let Some(inner_missing) =
+                                Self::finite_missing_match_cases(payload_ty, &payload_patterns)
+                            {
+                                for inner in inner_missing {
+                                    missing.push(format!("{}({})", name, inner));
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(missing)
+            }
+            Type::Nominal { underlying, .. } => {
+                Self::finite_missing_match_cases(underlying, patterns)
+            }
+            _ => None,
+        }
+    }
+
     /// Infer the type of a pattern match expression.
     fn infer_match(
         &mut self,
@@ -3380,6 +3505,25 @@ impl TypeChecker {
                 found_type: Some("0 match arms".to_string()),
                 similar_names: None,
             });
+        }
+
+        // Guards do not contribute to total coverage: even a wildcard guard
+        // can evaluate to false. For now we deliberately report only missing
+        // cases that can be proved from finite types; the runtime fallback is
+        // retained for compatibility while the full usefulness matrix lands.
+        let scrut_ty_now = apply_subst(&scrut_ty, &subst);
+        let unguarded_patterns: Vec<&Pattern> = arms
+            .iter()
+            .filter_map(|(pattern, guard, _)| guard.is_none().then_some(pattern))
+            .collect();
+        if let Some(missing) = Self::finite_missing_match_cases(&scrut_ty_now, &unguarded_patterns)
+        {
+            if !missing.is_empty() {
+                self.warnings
+                    .push(crate::types::NuWarning::non_exhaustive_match(
+                        span, &missing,
+                    ));
+            }
         }
 
         // Unify all arm types
@@ -4735,6 +4879,67 @@ mod tests {
         };
         let (s, ty) = tc.infer_expr(&ctx, &expr).unwrap();
         assert_eq!(apply_subst(&ty, &s), Type::int());
+    }
+
+    #[test]
+    fn test_match_coverage_warns_for_missing_variant() {
+        let mut tc = TypeChecker::new();
+        let mut ctx = TypeContext::new();
+        let color = Type::Variant(vec![
+            ("Red".to_string(), None),
+            ("Green".to_string(), None),
+            ("Blue".to_string(), None),
+        ]);
+        ctx.bind("color".to_string(), color, Capability::Ref, false);
+        let expr = Expr::Match {
+            scrutinee: Box::new(var("color")),
+            arms: vec![
+                (Pattern::Variant("Red".to_string(), None), None, int_lit(1)),
+                (
+                    Pattern::Variant("Green".to_string(), None),
+                    None,
+                    int_lit(2),
+                ),
+            ],
+            span: sp(),
+        };
+        tc.infer_expr(&ctx, &expr).unwrap();
+        let warnings = tc.take_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "W0201");
+        assert!(warnings[0].msg.contains("Blue"));
+    }
+
+    #[test]
+    fn test_match_coverage_accepts_complete_bool() {
+        let mut tc = TypeChecker::new();
+        let ctx = TypeContext::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(bool_lit(true)),
+            arms: vec![
+                (Pattern::Lit(Literal::Bool(true)), None, int_lit(1)),
+                (Pattern::Lit(Literal::Bool(false)), None, int_lit(0)),
+            ],
+            span: sp(),
+        };
+        tc.infer_expr(&ctx, &expr).unwrap();
+        assert!(tc.take_warnings().is_empty());
+    }
+
+    #[test]
+    fn test_match_coverage_guarded_wildcard_is_not_total() {
+        let mut tc = TypeChecker::new();
+        let ctx = TypeContext::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(bool_lit(true)),
+            arms: vec![(Pattern::Wild, Some(bool_lit(false)), int_lit(1))],
+            span: sp(),
+        };
+        tc.infer_expr(&ctx, &expr).unwrap();
+        let warnings = tc.take_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].msg.contains("true"));
+        assert!(warnings[0].msg.contains("false"));
     }
 
     // -----------------------------------------------------------------------
