@@ -704,11 +704,7 @@ fn compute_may_suspend(module: &crate::bytecode::CodeModule) -> Vec<bool> {
     // is not a statically-recovered direct callee).
     for i in 0..n {
         let start = module.function_table[i];
-        let end = if i + 1 < n {
-            module.function_table[i + 1]
-        } else {
-            module.instructions.len()
-        };
+        let end = function_end_for(module, i);
         for pc in start..end {
             let op = module.instructions[pc].opcode;
             if matches!(op, OpCode::Call | OpCode::ClosureCall) {
@@ -771,11 +767,7 @@ fn compute_recursive(module: &crate::bytecode::CodeModule) -> Vec<bool> {
     let mut reach = vec![vec![false; n]; n];
     for i in 0..n {
         let start = module.function_table[i];
-        let end = if i + 1 < n {
-            module.function_table[i + 1]
-        } else {
-            module.instructions.len()
-        };
+        let end = function_end_for(module, i);
         for pc in start..end {
             if matches!(
                 module.instructions[pc].opcode,
@@ -894,6 +886,31 @@ pub(crate) fn func_start_for(module: &crate::bytecode::CodeModule, pc: usize) ->
         .unwrap_or(0)
 }
 
+/// Exclusive bytecode end for a named function.
+///
+/// Real compiler output includes `DebugFunctionInfo.code_len`, which is the
+/// authoritative boundary for the final named function too. Falling back to
+/// the next function-table offset preserves compatibility with hand-built
+/// modules/tests that do not carry debug metadata.
+fn function_end_for(module: &crate::bytecode::CodeModule, function_idx: usize) -> usize {
+    let Some(&start) = module.function_table.get(function_idx) else {
+        return module.instructions.len();
+    };
+    module
+        .debug_functions
+        .iter()
+        .find(|info| info.code_offset == start)
+        .map(|info| start.saturating_add(info.code_len))
+        .unwrap_or_else(|| {
+            module
+                .function_table
+                .get(function_idx + 1)
+                .copied()
+                .unwrap_or(module.instructions.len())
+        })
+        .min(module.instructions.len())
+}
+
 /// If the instruction at `pc` is a `Call` of a provably-non-suspending direct
 /// callee (recoverable via `direct_call_target` and gated on `may_suspend`
 /// and on not being in a direct-call recursion cycle), return the callee's
@@ -955,18 +972,7 @@ pub(crate) fn find_compilable_whole_function_with_calls(
         return None;
     }
 
-    let fallback_end = module
-        .function_table
-        .get(function_idx + 1)
-        .copied()
-        .unwrap_or(module.instructions.len());
-    let end = module
-        .debug_functions
-        .iter()
-        .find(|info| info.code_offset == start_pc)
-        .map(|info| start_pc.saturating_add(info.code_len))
-        .unwrap_or(fallback_end)
-        .min(module.instructions.len());
+    let end = function_end_for(module, function_idx);
 
     if end <= start_pc {
         return None;
