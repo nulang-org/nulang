@@ -20,7 +20,7 @@ The specification is organized into five conceptual layers:
 
 3. **The Durable Execution Layer** (Chapter 9) extends the actor runtime with persistence. Persistent actors survive process restarts through automatic checkpointing, event journaling, deterministic replay, and snapshotting.
 
-4. **The Distributed Platform Layer** (Chapter 12) extends the durable actor runtime across machine boundaries. Remote messaging, gossip membership, typed source-level CRDT fields, `Crdt.*` operations, and CRDT replication are implemented but Experimental. Virtual-actor activation and several production hardening goals remain incomplete. CRDT recovery has a documented limitation: `recover_actor` restores materialized/snapshot state but does not yet rebuild the field-name→CRDT-id mapping automatically; see §9.10 and §12.5.
+4. **The Distributed Platform Layer** (Chapter 12) extends the durable actor runtime across machine boundaries. Remote messaging, gossip membership, typed source-level CRDT fields, `Crdt.*` operations, and CRDT replication are implemented but Experimental. CRDT checkpoints persist both replica state and the actor field-name→CRDT-id mapping; `recover_actor` restores those mappings and re-registers declared CRDT fields. Virtual-actor/deployment behavior and other production hardening goals remain incomplete.
 
 5. **The AI Runtime Layer** (Chapter 11) provides language-integrated access to large language models, tool use, memory systems, and planning. AI capabilities are expressed through the same algebraic effect system used for IO and network effects, and are gated by the same capability-based security model.
 
@@ -2309,14 +2309,12 @@ entry. `read` materializes the value back into `state_data`, so `self.field`
 reads stay consistent. `.nula`-level conformance coverage lives in
 `conformance/behavior/crdt_*.nula`.
 
-**Recovery limitation:** `recover_actor` restores the materialized
-`state_data` value and the `CrdtManager` entries from `crdt_snapshot`, but
-does not rebuild `CrdtManager.field_map` (the `(actor_id, field_name) →
-CrdtId` link is not persisted). On a recovered actor, `self.field` still
-reads the materialized value, but `perform Crdt.*` is a silent nil no-op
-until the field is re-registered. Pinned by
-`test_crdt_field_survives_recovery` (a post-recovery `Crdt.increment`
-leaves `state_data["count"]` unchanged).
+**Recovery status:** checkpoints persist the materialized actor
+state, serialized CRDT replicas, and the actor-local
+`field_name → CrdtId` mapping. `recover_actor` restores the CRDT manager
+snapshot, rebuilds both forward and reverse field mappings, and then
+idempotently calls `register_actor_fields` so declared CRDT fields remain
+addressable through `perform Crdt.*` after recovery.
 ---
 
 # Chapter 10: Workflows
@@ -2771,8 +2769,8 @@ type and materializes the value back into `self.count`); a raw
 `self.count = expr` assignment on a crdt field is ignored. The prior
 `self.count = self.count + 1` example no longer conforms — that form is
 rejected as an out-of-set mutation. On a recovered actor, `self.count` still
-reads the materialized value but `perform Crdt.*` is a silent nil no-op
-(`field_map` is not rebuilt on recovery — see §9.10's recovery limitation).
+restores the serialized CRDT state and persisted field mapping; recovered
+declared CRDT fields are re-registered before execution resumes (see §9.10).
 
 ## 12.6 Fault Tolerance
 
