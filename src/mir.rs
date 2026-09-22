@@ -178,6 +178,10 @@ pub enum Stmt {
         field: String,
         src: LocalId,
     },
+    /// Zero-cost structured-concurrency metadata preserved from HIR.
+    ParallelMarker {
+        marker: crate::primitives::ParallelRegionMarker,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
