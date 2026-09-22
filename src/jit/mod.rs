@@ -704,11 +704,7 @@ fn compute_may_suspend(module: &crate::bytecode::CodeModule) -> Vec<bool> {
     // is not a statically-recovered direct callee).
     for i in 0..n {
         let start = module.function_table[i];
-        let end = if i + 1 < n {
-            module.function_table[i + 1]
-        } else {
-            module.instructions.len()
-        };
+        let end = function_end_for(module, i);
         for pc in start..end {
             let op = module.instructions[pc].opcode;
             if matches!(op, OpCode::Call | OpCode::ClosureCall) {
@@ -771,11 +767,7 @@ fn compute_recursive(module: &crate::bytecode::CodeModule) -> Vec<bool> {
     let mut reach = vec![vec![false; n]; n];
     for i in 0..n {
         let start = module.function_table[i];
-        let end = if i + 1 < n {
-            module.function_table[i + 1]
-        } else {
-            module.instructions.len()
-        };
+        let end = function_end_for(module, i);
         for pc in start..end {
             if matches!(
                 module.instructions[pc].opcode,
@@ -894,6 +886,31 @@ pub(crate) fn func_start_for(module: &crate::bytecode::CodeModule, pc: usize) ->
         .unwrap_or(0)
 }
 
+/// Exclusive bytecode end for a named function.
+///
+/// Real compiler output includes `DebugFunctionInfo.code_len`, which is the
+/// authoritative boundary for the final named function too. Falling back to
+/// the next function-table offset preserves compatibility with hand-built
+/// modules/tests that do not carry debug metadata.
+fn function_end_for(module: &crate::bytecode::CodeModule, function_idx: usize) -> usize {
+    let Some(&start) = module.function_table.get(function_idx) else {
+        return module.instructions.len();
+    };
+    module
+        .debug_functions
+        .iter()
+        .find(|info| info.code_offset == start)
+        .map(|info| start.saturating_add(info.code_len))
+        .unwrap_or_else(|| {
+            module
+                .function_table
+                .get(function_idx + 1)
+                .copied()
+                .unwrap_or(module.instructions.len())
+        })
+        .min(module.instructions.len())
+}
+
 /// If the instruction at `pc` is a `Call` of a provably-non-suspending direct
 /// callee (recoverable via `direct_call_target` and gated on `may_suspend`
 /// and on not being in a direct-call recursion cycle), return the callee's
@@ -925,6 +942,86 @@ pub(crate) fn native_direct_call(
         return None;
     }
     Some(idx)
+}
+
+/// Identify a complete, single-return named function that can be compiled as
+/// one native region.
+///
+/// This deliberately starts conservative: the function must be non-suspending,
+/// non-recursive, end in exactly one `Ret`/`RetVal`, contain only opcodes the
+/// region compiler already understands, and keep every branch target inside
+/// the function. The terminal return stays in the interpreter so frame-pop and
+/// return-value semantics remain unchanged.
+///
+/// Unlike the ordinary region scanner, this path may cross an *early forward
+/// branch*. That is the important win: hot branchy functions whose first basic
+/// block is shorter than `STRAIGHT_LINE_MIN` can stay resident in one compiled
+/// CFG instead of bouncing through the interpreter at each branch.
+pub(crate) fn find_compilable_whole_function_with_calls(
+    start_pc: usize,
+    module: &crate::bytecode::CodeModule,
+    may_suspend: &[bool],
+    recursive: &[bool],
+) -> Option<(usize, std::collections::HashMap<usize, usize>)> {
+    use crate::bytecode::OpCode;
+
+    let function_idx = module
+        .function_table
+        .iter()
+        .position(|&pc| pc == start_pc)?;
+    if may_suspend.get(function_idx) != Some(&false) || recursive.get(function_idx) != Some(&false)
+    {
+        return None;
+    }
+
+    let end = function_end_for(module, function_idx);
+
+    if end <= start_pc {
+        return None;
+    }
+    let terminal_pc = end - 1;
+    if !matches!(
+        module.instructions.get(terminal_pc)?.opcode,
+        OpCode::Ret | OpCode::RetVal
+    ) {
+        return None;
+    }
+
+    let region_len = terminal_pc - start_pc;
+    if region_len < STRAIGHT_LINE_MIN {
+        return None;
+    }
+
+    let mut native_calls = std::collections::HashMap::new();
+    for pc in start_pc..terminal_pc {
+        let instr = *module.instructions.get(pc)?;
+        let op = instr.opcode;
+
+        if matches!(op, OpCode::Ret | OpCode::RetVal | OpCode::Halt) {
+            // Multiple/early returns need native frame-return support rather
+            // than the current branch-exit trampoline. Keep them interpreted.
+            return None;
+        }
+
+        if op == OpCode::Call {
+            let callee = native_direct_call(module, pc, Some(may_suspend), Some(recursive))?;
+            native_calls.insert(pc, callee);
+        } else if !compiler::is_opcode_compilable(op) {
+            return None;
+        }
+
+        if matches!(op, OpCode::Jmp | OpCode::JmpT | OpCode::JmpF) {
+            let target = match op {
+                OpCode::Jmp => pc as i64 + instr.simm16() as i64,
+                _ => pc as i64 + instr.offset16() as i64,
+            };
+            if target < start_pc as i64 || target >= end as i64 {
+                return None;
+            }
+        }
+    }
+
+    Some((region_len, native_calls))
 }
 
 /// Like [`find_compilable_region`], but additionally continues past `Call`
@@ -1082,8 +1179,15 @@ impl crate::backends::JitBackend for JitSession {
         if self.record_and_check_hot(module_idx, pc) {
             let ms = self.may_suspend_for(module_idx, module).to_vec();
             let rc = self.recursive_for(module_idx, module).to_vec();
-            let (region_len, native_calls) =
-                find_compilable_region_with_calls(pc, instructions, module, Some(&ms), Some(&rc));
+            // Prefer a complete non-suspending function at its entry. This can
+            // cross early forward branches that the generic hot-region policy
+            // intentionally rejects when the first basic block is tiny.
+            let (region_len, native_calls) = find_compilable_whole_function_with_calls(
+                pc, module, &ms, &rc,
+            )
+            .unwrap_or_else(|| {
+                find_compilable_region_with_calls(pc, instructions, module, Some(&ms), Some(&rc))
+            });
             if region_len >= 3 {
                 let meta = typed_compiler::infer_reg_types(module, pc);
                 let meta_ref = if meta.is_empty() { None } else { Some(&meta) };

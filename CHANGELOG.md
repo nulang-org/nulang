@@ -1573,6 +1573,10 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Conservative whole-function JIT promotion — 2026-09-22
+- **Hot single-return named functions can compile as one native CFG across early forward branches.** The tiering path now prefers whole-function promotion at a function entry when static analysis proves the function non-suspending and non-recursive, every branch stays inside the function, every call resolves to an existing safe direct-call target, and all remaining opcodes are already supported by the region compiler. The terminal `Ret`/`RetVal` remains interpreted, preserving existing frame-return semantics; functions with early returns, effects, recursion, indirect/unsafe calls, or escaping branches fall back to ordinary region tiering.
+- **Branch-heavy function evidence is benchmarked explicitly.** The JIT benchmark suite now compares a hot branchy function-call loop against the identical interpreter-only workload.
+
 ### Allocation-free protocol actor-ref decoding — 2026-09-21
 - **ProtocolId wire decode no longer hex-allocates.** The fixed 32-byte protocol digest is reconstructed directly with `ProtocolId::from_bytes` instead of expanding to a 64-character hex `String` and reparsing it. Wire bytes and compatibility semantics are unchanged.
 

@@ -92,6 +92,70 @@ fn test_find_compilable_region() {
 }
 
 #[test]
+fn test_whole_function_candidate_crosses_early_forward_branch() {
+    // The ordinary region policy rejects this function at pc0 because its
+    // first basic block begins with a forward branch before STRAIGHT_LINE_MIN.
+    // The whole-function path can safely keep the complete CFG resident
+    // because all targets remain inside one non-suspending, single-return
+    // function.
+    let mut module = CodeModule::new("whole_function_branch");
+    module.function_table.push(0);
+    module.function_local_counts.push(8);
+
+    module.emit(Instruction::new3(OpCode::JmpF, 0, 0, 5)); // 0 -> 5
+    module.emit(Instruction::new3(OpCode::IAdd, 1, 2, 3)); // 1
+    module.emit(Instruction::new3(OpCode::ISub, 3, 2, 3)); // 2
+    module.emit(Instruction::new3(OpCode::IMul, 3, 2, 3)); // 3
+    module.emit(Instruction::new2(OpCode::Jmp, 0, 5)); // 4 -> 9
+    module.emit(Instruction::new3(OpCode::IAdd, 1, 2, 3)); // 5
+    module.emit(Instruction::new3(OpCode::ISub, 3, 2, 3)); // 6
+    module.emit(Instruction::new3(OpCode::IMul, 3, 2, 3)); // 7
+    module.emit(Instruction::new3(OpCode::IAdd, 3, 2, 3)); // 8
+    module.emit(Instruction::new3(OpCode::IAdd, 3, 2, 3)); // 9
+    module.emit(Instruction::new3(OpCode::ISub, 3, 2, 3)); // 10
+    module.emit(Instruction::new3(OpCode::IMul, 3, 2, 3)); // 11
+    module.emit(Instruction::new1(OpCode::RetVal, 3)); // 12
+
+    let may_suspend = compute_may_suspend(&module);
+    let recursive = compute_recursive(&module);
+    assert_eq!(
+        find_compilable_region_with_calls(
+            0,
+            &module.instructions,
+            &module,
+            Some(&may_suspend),
+            Some(&recursive),
+        )
+        .0,
+        0,
+        "ordinary region policy should reject the tiny entry block"
+    );
+
+    let (len, calls) =
+        find_compilable_whole_function_with_calls(0, &module, &may_suspend, &recursive)
+            .expect("whole function should be eligible");
+    assert_eq!(len, 12, "terminal RetVal stays in the interpreter");
+    assert!(calls.is_empty());
+
+    let mut jit = make_jit();
+    let meta = typed_compiler::infer_reg_types(&module, 0);
+    let meta_ref = (!meta.is_empty()).then_some(&meta);
+    let ptr =
+        unsafe { jit.compile_region_typed(0, 0, len, &module.instructions, meta_ref, &calls) };
+    assert!(ptr.is_some(), "eligible whole function must compile");
+    assert_eq!(jit.compiled_region_len(0, 0), Some(12));
+
+    // A malformed/out-of-function branch must fail closed.
+    module.instructions[0] = Instruction::new3(OpCode::JmpF, 0, 0, 100);
+    let may_suspend = compute_may_suspend(&module);
+    let recursive = compute_recursive(&module);
+    assert!(
+        find_compilable_whole_function_with_calls(0, &module, &may_suspend, &recursive).is_none(),
+        "whole-function compilation must reject escaping branches"
+    );
+}
+
+#[test]
 fn test_find_region_stops_at_unsupported() {
     // A SMALL straight-line fragment ending at an unsupported opcode is
     // rejected (returns 0): it is a loop-head prefix that the interpreter
@@ -1612,6 +1676,39 @@ fn test_arrlen_scalar_register_destination() {
         "JIT-compiled loop (including ArrLen) must match the interpreter; cold={expected} warm={}",
         warm_val.as_int().unwrap_or(-1)
     );
+}
+
+#[test]
+fn test_function_analyses_stop_at_debug_code_range() {
+    // Compiler output places actor behaviors and the entry prologue after
+    // named functions. The final named function must not inherit a later
+    // behavior's suspending opcode merely because there is no next
+    // function_table entry to bound it.
+    let mut module = CodeModule::new("function_bounds");
+    module.function_table.push(0);
+    module.function_local_counts.push(4);
+    module.emit(Instruction::new3(OpCode::IAdd, 0, 1, 2)); // named function
+    module.emit(Instruction::new1(OpCode::RetVal, 2));
+    module.debug_functions.push(DebugFunctionInfo {
+        name: "pure".into(),
+        code_offset: 0,
+        code_len: 2,
+        params: vec![],
+        locals: vec![],
+    });
+
+    // Simulate a later actor behavior that can suspend. It is intentionally
+    // outside the named function's debug code range.
+    module.emit(Instruction::new0(OpCode::PerformDirect));
+    module.emit(Instruction::new0(OpCode::Ret));
+
+    assert_eq!(function_end_for(&module, 0), 2);
+    assert_eq!(
+        compute_may_suspend(&module),
+        vec![false],
+        "later behavior bytecode must not taint the final named function"
+    );
+    assert_eq!(compute_recursive(&module), vec![false]);
 }
 
 /// `compute_may_suspend` and `direct_call_target`: a pure recursive function
