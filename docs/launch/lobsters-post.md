@@ -20,33 +20,32 @@ Erlang's actors and supervision, an ML-derived type system (full Hindley-Milner
 inference, row-polymorphic records and variants, effect rows), Pony's
 reference capabilities (`iso/trn/ref/val/box/tag/lineariso`) checked at
 compile time and erased at runtime, and persistent actors whose state is
-checkpointed and journaled after every behavior. `entity` declarations are
-event-sourced by default. (Caveat up front: journal-based state rebuild is
-implemented and integration-tested at the runtime level, but not yet wired to
-supervised restarts on the CLI path — a restarted actor currently starts
-fresh. Details in docs/launch/demo-script.md, which documents an executed
-crash-containment demo.)
+checkpointed and journaled after behaviors. `entity` declarations are
+event-sourced by default. Durable stores are selectable through `--store` /
+`NULANG_STORE_PATH`, and persistent supervised children hydrate saved state
+when restarted. This is still alpha; destructive recovery testing against the
+chosen store/configuration is required before making stronger durability
+claims.
 
 Pipeline: AST → HIR → MIR → register-based bytecode VM, with a Cranelift JIT
-and experimental AOT/WASM backends. The runtime is a multi-threaded
-work-stealing executor with ORCA GC, links/monitors, process groups, and
-supervision strategies (one-for-one, one-for-all, rest-for-one,
-simple-one-for-one).
+and experimental native AOT/WASM backends. Actor execution is sharded: each
+live shard has one cooperative scheduler owner, and multiple shards can run in
+parallel. Chase-Lev peer stealing exists in the scheduler implementation but
+is not used by the current live per-shard loop. ORCA GC, links/monitors,
+process groups, and supervision strategies are integrated into that runtime.
 
 Things I expect lobste.rs to poke at, preemptively:
 
 - **Maturity**: alpha, no external users, expect breaking changes pre-1.0.
   GOVERNANCE.md defines frozen/stable/experimental tiers and what each
   guarantees.
-- **Tests/proofs**: ~1,680 Rust tests, a `.nula` conformance suite
-  (`conformance/`), a self-hosting bootstrap verified through stage 2, and
-  partial Lean 4 / Coq formalization under `formal/` (the shift_compose lemma
-  is 12/13 proved — i.e., not finished).
-- **Known sharp edges are documented in-tree**: e.g. `send` to a nonexistent
-  behavior currently runs behavior 0 instead of erroring (documented in SPEC2
-  §8.5 with conformance evidence), and `state crdt` fields parse but behave as
-  `durable` because the CRDT wiring is Rust-level only so far. SPEC2 has dated
-  "implementation status" notes throughout rather than aspiration-as-fact.
+- **Tests/proofs**: a large Rust test suite, a `.nula` conformance suite
+  (`conformance/`), a self-hosting bootstrap path, and partial formalization
+  under `formal/`. CI is the source of truth for current test/proof counts.
+- **Known sharp edges are documented in-tree**: typed actor-protocol admission
+  remains experimental, and `state crdt` fields parse but currently behave as
+  `durable` because the Rust CRDT engine is not yet wired to that source-level
+  state model. SPEC2 separates implemented behavior from planned semantics.
 - **Distribution**: multi-node `send`/`ask` over TCP (NUL0 wire protocol) and
   gossip membership work but are marked experimental.
 
