@@ -42,9 +42,11 @@ garbage collection, durable persistence, and experimental location-transparent
 distribution are integrated into that model.
 
 For durable application design, prefer `entity` plus ordinary actor/effect
-composition. The legacy `agent`, `workflow`, and `database` declaration
-surfaces are still parsed, but the compiler marks them deprecated and directs
-new code toward ordinary actors/entities plus Cloud SDK libraries.
+composition. Accepted RFC 0017 defines one canonical runtime model built from
+actors, state, messages, effects, capabilities, supervision, and time.
+`agent` and `workflow` remain Experimental ergonomic source forms so long as
+they lower to that model; `database` remains an Experimental application-
+specific declaration rather than a core runtime primitive.
 
 ---
 
@@ -130,7 +132,7 @@ perform IO.print("Hello, " + name + "!")
 - **Hindley-Milner type inference** — full Algorithm W with row-polymorphic records, variant types, and algebraic effect rows.
 - **Actors** — `spawn`, `send`/`!`, `ask`, selective `receive` with `after` timeout, links, monitors, supervision trees, process groups, and actor priority scheduling.
 - **Typed actor protocols** — structural `ActorRef[P]` contracts can restrict public actor APIs to required behaviors. Compiler-derived protocol fingerprints, a trusted schema registry, directional compatibility checks, and pre-mailbox admission are implemented as *Experimental* protocol hardening.
-- **Durable entities** — `entity` declarations are durable-first and event-sourced by default, and are the preferred surface for long-lived domain state. `persistent actor` remains available for durable actor semantics. Legacy `agent`, `workflow`, and `database` declarations are *Experimental/deprecated*; new code should compose ordinary actors/entities with Cloud SDK libraries.
+- **Durable entities** — `entity` declarations are durable-first and event-sourced by default, and are the preferred surface for long-lived domain state. `persistent actor` remains available for durable actor semantics. `agent` and `workflow` are *Experimental* ergonomic forms that lower to the canonical actor/effect runtime model under RFC 0017; `database` remains Experimental.
 - **`let` and `var`** — immutable and mutable bindings. Records with `{ field: value }` syntax and `{ base .. field = new_val }` update syntax. Pattern matching with guards, alias patterns, and recursive sub-patterns. `**` exponentiation. Multi-line `"""..."""` strings with `\u{...}` unicode escapes. Pipe operator `|>`.
 - **Error handling** — `catch expr fallback` (prefix or postfix), `fail Error(...)` for structured short-circuit return, `T ! E` return types, `?` unwrap.
 - **FS file I/O** — `perform FS.read(path)`, `perform FS.write(path, content)`, `perform FS.append(path, content)`, `perform FS.exists(path)`.
@@ -138,7 +140,7 @@ perform IO.print("Hello, " + name + "!")
 - **Test runner** — `nula test` discovers `.nula` files under `tests/`; uses the `Test` effect (`perform Test.assert_eq(a, b)`, `perform Test.assert(cond, msg)`, etc.).
 - **LSP server** — `nulang --lsp` with diagnostics, hover, goto-definition, references, document symbols, rename, completion, code actions, inlay hints, formatting, signature help, and semantic tokens.
 - **REPL** — `nulang --repl` with `:help <topic>`, `:type <expr>`, `:load <file>`, tab completion, and automatic multi-line input.
-- **AI runtime** — optional LLM providers (OpenAI, Ollama), episodic/semantic/procedural memory, pipelines, debates, and supervisor teams behind the `ai-runtime` feature flag. The legacy `agent` declaration remains for compatibility but is deprecated; new AI applications should compose ordinary actors/entities with the AI libraries/effects. *Experimental.*
+- **AI runtime** — optional LLM providers (OpenAI, Ollama), episodic/semantic/procedural memory, pipelines, debates, and supervisor teams behind the `ai-runtime` feature flag. The `agent` declaration is an *Experimental* ergonomic actor specialization under RFC 0017; the reusable runtime semantics live in ordinary actor/effect primitives and AI libraries.
 - **Distribution & CRDTs** — location-transparent `send`/`ask` over TCP (NUL0 wire protocol), gossip membership, and eight CRDT implementations. `.nula` supports typed `state crdt <type>` fields plus `perform Crdt.*` operations with per-type validation. *Experimental.* A known recovery limitation remains: recovered CRDT state restores materialized values and CRDT snapshots, but `recover_actor` does not yet rebuild the persisted field-name→CRDT-id mapping, so `Crdt.*` can no-op until re-registration.
 - **Fabric** — an *Experimental* messaging/stream substrate layered on the actor transport, with topic routing, consumer groups, durable replicated streams, quorum commit, epoch fencing, bounded repair/retry, and confirmed-removal failover. See [`docs/FABRIC.md`](docs/FABRIC.md).
 - **RESP-compatible cache kernel** — an *Experimental* Redis-compatible cache path with packed shard-local storage, Redis Cluster slot routing/`MOVED`, ordered pipelining, and an optional dedicated Mio reactor via the `cache-server` feature. See [`docs/RESP_CACHE_ARCHITECTURE.md`](docs/RESP_CACHE_ARCHITECTURE.md).
@@ -217,7 +219,7 @@ the external-adoption freeze gate is satisfied. See
 |------|-------|
 | **Frozen** | Published v1 compatibility contracts: `.nbc` format v1, NUL0 v1, value layout v1, plus any explicitly Frozen effect contracts. Old versions are never silently reinterpreted; future versions may evolve behind explicit version boundaries. |
 | **Stable** | Nulang Core (pre-adoption), HM type system, effect rows, capability lattice, actor surface. Breaking changes require an RFC, an explicit version transition, diagnostics, and a migration path. |
-| **Experimental** | Everything else — including `wasm-backend`/`wasm-component`/`wasmfx-backend`, `cache-server`, the AI runtime, Fabric, typed actor-protocol hardening, the deprecated `agent`/`workflow`/`database` declaration surfaces, multi-node distribution, source-level CRDT state/replication, optional persistence backends, and other items marked Experimental in [`CHANGELOG.md`](CHANGELOG.md). |
+| **Experimental** | Everything else — including `wasm-backend`/`wasm-component`/`wasmfx-backend`, `cache-server`, the AI runtime, Fabric, typed actor-protocol hardening, the Experimental `agent`/`workflow`/`database` declaration surfaces, multi-node distribution, source-level CRDT state/replication, optional persistence backends, and other items marked Experimental in [`CHANGELOG.md`](CHANGELOG.md). |
 
 > **Pre-1.0 disclaimer:** Nulang does not have external users yet. The tier
 > guarantees above are the maintainer's stated policy and intent, but **expect
