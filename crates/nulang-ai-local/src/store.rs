@@ -4,7 +4,8 @@ use chrono::{DateTime, Utc};
 use nulang_ai_core::{
     ConversationState, Goal, GoalGraph, GoalStatus, ManagerKind, Task, TaskStatus,
 };
-use rusqlite::{params, Connection};
+use nulang_workflow::{AppendOutcome, WorkflowEvent, WorkflowHistory, WorkflowId};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
@@ -21,6 +22,8 @@ pub enum StoreError {
     GoalNotFound(Uuid),
     #[error("conversation not found: {0}")]
     ConversationNotFound(Uuid),
+    #[error("workflow history is corrupt: {0}")]
+    WorkflowHistoryCorrupt(String),
 }
 
 pub struct SqliteStore {
@@ -77,6 +80,12 @@ impl SqliteStore {
                 active_goal_id TEXT,
                 messages_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS workflow_histories (
+                workflow_id TEXT PRIMARY KEY,
+                revision INTEGER NOT NULL,
+                history_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
             "#,
@@ -281,6 +290,134 @@ impl SqliteStore {
         })
     }
 
+    pub fn load_workflow_history(
+        &self,
+        workflow_id: &WorkflowId,
+    ) -> Result<WorkflowHistory, StoreError> {
+        let conn = Connection::open(&self.path)?;
+        let row = conn
+            .query_row(
+                "SELECT revision, history_json FROM workflow_histories WHERE workflow_id = ?1",
+                params![workflow_id.as_str()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+
+        let Some((revision, history_json)) = row else {
+            return Ok(WorkflowHistory::default());
+        };
+        let history: WorkflowHistory = serde_json::from_str(&history_json)?;
+        if history.revision != revision as u64 {
+            return Err(StoreError::WorkflowHistoryCorrupt(format!(
+                "workflow {} stores revision {} but history contains {}",
+                workflow_id, revision, history.revision
+            )));
+        }
+        Ok(history)
+    }
+
+    pub fn append_workflow_event(
+        &self,
+        workflow_id: &WorkflowId,
+        expected_revision: u64,
+        event: WorkflowEvent,
+    ) -> Result<AppendOutcome, StoreError> {
+        let mut conn = Connection::open(&self.path)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row = tx
+            .query_row(
+                "SELECT revision, history_json FROM workflow_histories WHERE workflow_id = ?1",
+                params![workflow_id.as_str()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+
+        let mut history = match row {
+            Some((revision, history_json)) => {
+                if revision as u64 != expected_revision {
+                    return Ok(AppendOutcome::Conflict);
+                }
+                let history: WorkflowHistory = serde_json::from_str(&history_json)?;
+                if history.revision != expected_revision {
+                    return Err(StoreError::WorkflowHistoryCorrupt(format!(
+                        "workflow {} stores revision {} but history contains {}",
+                        workflow_id, revision, history.revision
+                    )));
+                }
+                history
+            }
+            None => {
+                if expected_revision != 0 {
+                    return Ok(AppendOutcome::Conflict);
+                }
+                WorkflowHistory::default()
+            }
+        };
+
+        history.events.push(event);
+        history.revision = expected_revision.saturating_add(1);
+        let history_json = serde_json::to_string(&history)?;
+        tx.execute(
+            r#"INSERT INTO workflow_histories (
+                workflow_id, revision, history_json, updated_at
+            ) VALUES (?1,?2,?3,?4)
+            ON CONFLICT(workflow_id) DO UPDATE SET
+                revision=excluded.revision,
+                history_json=excluded.history_json,
+                updated_at=excluded.updated_at
+            "#,
+            params![
+                workflow_id.as_str(),
+                history.revision as i64,
+                history_json,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        tx.commit()?;
+
+        Ok(AppendOutcome::Appended {
+            new_revision: history.revision,
+        })
+    }
+
+    pub fn list_resumable_tasks(&self) -> Result<Vec<Task>, StoreError> {
+        let conn = Connection::open(&self.path)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, goal_id, parent_task_id, manager, description, dependencies, required_capabilities, acceptance_criteria, budget_usd, timeout_secs, status, assigned_agent_id, created_at, updated_at
+             FROM tasks
+             WHERE status IN ('created', 'ready', 'assigned', 'running')
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let id = Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_else(|_| Uuid::nil());
+            let goal_id =
+                Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_else(|_| Uuid::nil());
+            Ok(Task {
+                id,
+                goal_id,
+                parent_task_id: row
+                    .get::<_, Option<String>>(2)?
+                    .and_then(|s| Uuid::parse_str(&s).ok()),
+                manager: parse_manager_kind(row.get(3)?),
+                description: row.get(4)?,
+                dependencies: serde_json::from_str(&row.get::<_, String>(5)?)
+                    .unwrap_or_default(),
+                required_capabilities: serde_json::from_str(&row.get::<_, String>(6)?)
+                    .unwrap_or_default(),
+                acceptance_criteria: serde_json::from_str(&row.get::<_, String>(7)?)
+                    .unwrap_or_default(),
+                budget_usd: row.get(8)?,
+                timeout: Duration::from_secs(row.get::<_, i64>(9)? as u64),
+                status: parse_task_status(row.get(10)?),
+                assigned_agent_id: row.get(11)?,
+                created_at: parse_ts(row.get(12)?),
+                updated_at: parse_ts(row.get(13)?),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     pub fn list_goals(&self) -> Result<Vec<Goal>, StoreError> {
         let conn = Connection::open(&self.path)?;
         let mut stmt = conn.prepare(
@@ -389,5 +526,54 @@ fn parse_manager_kind(raw: String) -> ManagerKind {
         "data" => ManagerKind::Data,
         "voice" => ManagerKind::Voice,
         _ => ManagerKind::Engineering,
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nulang_workflow::RetryPolicy;
+
+    fn temp_store() -> (PathBuf, SqliteStore) {
+        let dir = std::env::temp_dir().join(format!("nulang-ai-store-test-{}", Uuid::new_v4()));
+        let store = SqliteStore::open(&dir).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn workflow_history_append_uses_revision_cas() {
+        let (dir, store) = temp_store();
+        let workflow_id = WorkflowId::new("agent-task:test");
+        let event = WorkflowEvent::ActivityPrepared {
+            invocation_id: nulang_workflow::ActivityInvocationId::derive(
+                &workflow_id,
+                "execute",
+                0,
+                "agent.worker.execute",
+            ),
+            step: "execute".into(),
+            operation: "agent.worker.execute".into(),
+            request: b"task".to_vec(),
+            retry: RetryPolicy::none(),
+        };
+
+        assert_eq!(
+            store
+                .append_workflow_event(&workflow_id, 0, event.clone())
+                .unwrap(),
+            AppendOutcome::Appended { new_revision: 1 }
+        );
+        assert_eq!(
+            store
+                .append_workflow_event(&workflow_id, 0, event)
+                .unwrap(),
+            AppendOutcome::Conflict
+        );
+
+        let history = store.load_workflow_history(&workflow_id).unwrap();
+        assert_eq!(history.revision, 1);
+        assert_eq!(history.events.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
