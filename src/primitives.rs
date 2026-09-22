@@ -1,19 +1,118 @@
-//! Canonical semantic primitives for the Nulang runtime.
+//! Canonical semantic vocabulary for Nulang execution.
 //!
-//! Nulang intentionally keeps the runtime model smaller than the surface
-//! syntax. `agent`, `workflow`, `entity`, `organization`, and virtual-actor
-//! syntax are compositions or specializations of actors; they are not
-//! independent execution species.
+//! Nulang has one semantic core and multiple composable execution forms.
+//! Ordinary local computation, scoped concurrent tasks, and actors are distinct
+//! execution domains. Persistence and identity are orthogonal properties rather
+//! than actor species.
 //!
-//! This module is the compatibility boundary while older metadata still uses
-//! boolean role flags. New compiler/runtime code should ask for an
-//! [`ActorRole`] instead of branching independently on `is_agent`,
-//! `is_workflow`, `is_organization`, and `virtual_`.
+//! The existing [`ActorRole`] remains a compatibility boundary while older
+//! compiler/runtime metadata still uses mutually-exclusive boolean role flags.
+//! It describes source/lowering provenance for actor-backed constructs; it must
+//! not be used as the complete semantic model for new features.
 
-/// The seven semantic primitives that make up the Nulang execution model.
+/// The execution domain in which a computation runs.
 ///
-/// Higher-level features should lower to compositions of these primitives
-/// instead of introducing additional runtime species.
+/// This axis deliberately does not encode durability, identity, placement, or
+/// authority. Those properties compose independently.
+///
+/// `ScopedTask` names the semantic target for structured concurrency. The
+/// current `par { ... }` implementation is still sequential until the scoped
+/// concurrency lowering described by RFC 0024 is implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExecutionDomain {
+    /// Ordinary lexical computation: functions, expressions, and optimized
+    /// local numeric/data-parallel code.
+    Local,
+    /// Child computation whose lifetime is bounded by a lexical parent scope.
+    ScopedTask,
+    /// Independently addressable isolated state with mailbox/turn semantics.
+    Actor,
+}
+
+/// Persistence semantics are orthogonal to the execution domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PersistenceSemantics {
+    /// State/computation disappears when its owning execution lifetime ends.
+    Ephemeral,
+    /// Runtime-managed state/history survives restart.
+    Durable,
+    /// An append-only domain-event history is the source of truth.
+    EventSourced,
+    /// State is replicated/merged according to an explicit convergence model.
+    Replicated,
+}
+
+/// Identity semantics are orthogonal to both execution and persistence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IdentitySemantics {
+    /// No independently addressable identity.
+    Anonymous,
+    /// Identity exists only within the owning structured-concurrency scope.
+    Scoped,
+    /// Runtime identity exists for the lifetime of the live computation.
+    Runtime,
+    /// Stable logical identity may survive activation, restart, or placement.
+    Stable,
+}
+
+/// Activation is actor-specific policy, not an actor role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ActorActivation {
+    /// The actor/entity is explicitly created or restored by the runtime.
+    Explicit,
+    /// A stable key may transparently hydrate/dehydrate the actor on demand.
+    Virtual,
+}
+
+/// Minimal orthogonal execution profile.
+///
+/// This type is intentionally representation-agnostic and is not serialized in
+/// bytecode yet. It gives compiler/runtime code a vocabulary that does not
+/// conflate "actor", "durable", and "stable identity" into one role enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExecutionSemantics {
+    pub domain: ExecutionDomain,
+    pub persistence: PersistenceSemantics,
+    pub identity: IdentitySemantics,
+}
+
+impl ExecutionSemantics {
+    pub const fn new(
+        domain: ExecutionDomain,
+        persistence: PersistenceSemantics,
+        identity: IdentitySemantics,
+    ) -> Self {
+        Self {
+            domain,
+            persistence,
+            identity,
+        }
+    }
+
+    pub const LOCAL: Self = Self::new(
+        ExecutionDomain::Local,
+        PersistenceSemantics::Ephemeral,
+        IdentitySemantics::Anonymous,
+    );
+
+    pub const SCOPED_TASK: Self = Self::new(
+        ExecutionDomain::ScopedTask,
+        PersistenceSemantics::Ephemeral,
+        IdentitySemantics::Scoped,
+    );
+
+    pub const ACTOR: Self = Self::new(
+        ExecutionDomain::Actor,
+        PersistenceSemantics::Ephemeral,
+        IdentitySemantics::Runtime,
+    );
+}
+
+/// Legacy actor-runtime primitive inventory introduced by RFC 0017.
+///
+/// These names remain useful for decomposing actor runtime internals, but they
+/// are not the complete ontology of the language. In particular, local
+/// computation and scoped tasks are execution domains in their own right.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimePrimitive {
     Actor,
@@ -25,11 +124,14 @@ pub enum RuntimePrimitive {
     Time,
 }
 
-/// Surface-level role carried by an actor after lowering.
+/// Legacy compatibility classifier carried by actor-backed lowered forms.
 ///
-/// `Agent`, `Workflow`, `Organization`, and `Virtual` are compatibility roles
-/// describing how an actor was produced. They do not change the fact that the
-/// executable runtime object is an actor.
+/// `Agent`, `Workflow`, `Organization`, and `Virtual` describe how older
+/// metadata produced an actor. They are not intended to be mutually-exclusive
+/// semantic dimensions in the long-term model: for example, virtuality is an
+/// [`ActorActivation`] policy, while workflow durability belongs on the
+/// persistence/execution axes. New features should prefer explicit semantic
+/// properties and use this enum only while compatibility flags are migrated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActorRole {
     Plain,
@@ -220,6 +322,39 @@ pub enum DeliverySemantics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_domain_is_independent_from_persistence_and_identity() {
+        let ephemeral_actor = ExecutionSemantics::ACTOR;
+        let durable_entity = ExecutionSemantics::new(
+            ExecutionDomain::Actor,
+            PersistenceSemantics::Durable,
+            IdentitySemantics::Stable,
+        );
+        let event_sourced_entity = ExecutionSemantics::new(
+            ExecutionDomain::Actor,
+            PersistenceSemantics::EventSourced,
+            IdentitySemantics::Stable,
+        );
+
+        assert_eq!(ephemeral_actor.domain, durable_entity.domain);
+        assert_ne!(ephemeral_actor.persistence, durable_entity.persistence);
+        assert_ne!(durable_entity.persistence, event_sourced_entity.persistence);
+        assert_eq!(durable_entity.identity, IdentitySemantics::Stable);
+    }
+
+    #[test]
+    fn scoped_tasks_are_not_actor_roles() {
+        assert_eq!(ExecutionSemantics::SCOPED_TASK.domain, ExecutionDomain::ScopedTask);
+        assert_eq!(
+            ExecutionSemantics::SCOPED_TASK.persistence,
+            PersistenceSemantics::Ephemeral
+        );
+        assert_eq!(
+            ExecutionSemantics::SCOPED_TASK.identity,
+            IdentitySemantics::Scoped
+        );
+    }
 
     #[test]
     fn plain_actor_has_plain_role() {
