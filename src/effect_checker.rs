@@ -1903,8 +1903,8 @@ impl CapabilityAnalyzer {
     ///
     /// Unlike `LinearIso`/`Linear` (which are consumed on every variable
     /// reference via `Expr::Var`), plain `Iso` is consumed only at explicit
-    /// ownership-transfer points.  The same `consumed` set is used so that
-    /// branch merge, loop rejection, and shadowing work identically.
+    /// ownership-transfer points. The split flow tracks a move on any path
+    /// separately from moves guaranteed on every path.
     fn consume_if_iso(
         &mut self,
         name: &str,
@@ -1912,7 +1912,7 @@ impl CapabilityAnalyzer {
         consumed: &mut LinearFlow,
     ) -> NuResult<()> {
         self.consumed_spans.push(span);
-        if !consumed.insert(name.to_string()) {
+        if !consumed.consume(name) {
             let first_span = self.first_consumed.get(name);
             let mut msg = format!("iso value `{}` used after being moved", name);
             if let Some(fs) = first_span {
@@ -1929,7 +1929,9 @@ impl CapabilityAnalyzer {
                 "an `iso` value has exactly one owner; after ownership transfer, accessing the original binding would create a second alias to actor-isolated mutable state",
             ));
         }
-        self.first_consumed.insert(name.to_string(), span);
+        self.first_consumed
+            .entry(name.to_string())
+            .or_insert(span);
         Ok(())
     }
 
