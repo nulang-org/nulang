@@ -51,6 +51,17 @@ version + migration.*
 
 ## Stable tier
 
+### Fenced workflow worker leases — 2026-09-22
+- **Durable activity workers now have a reusable lease/heartbeat/fencing contract**
+  (Experimental, `crates/nulang-workflow/src/lease.rs`,
+  `crates/nulang-ai-local/`). Lease reacquisition after expiry/release always
+  advances a monotonic fencing token, SQLite implements transactional acquire,
+  heartbeat, release, and fence checks, and local agent task state transitions
+  are committed only when the same transaction verifies the current fence.
+  This prevents stale workers from overwriting newer task state after lease
+  loss while preserving the workflow SDK's explicit at-least-once external
+  effect semantics.
+
 ### Durable workflow SDK foundation — 2026-09-22
 - **A standalone `nulang-workflow` crate now defines replay-safe durable activity
   execution** (Experimental, `crates/nulang-workflow/`). The SDK records
