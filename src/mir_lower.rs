@@ -2524,7 +2524,9 @@ fn count_local_uses(func: &mir::Function) -> Vec<usize> {
                     used.push(*idx);
                     used.push(*src);
                 }
-                mir::Stmt::EnterHandle { .. } | mir::Stmt::PopHandler => {}
+                mir::Stmt::EnterHandle { .. }
+                | mir::Stmt::PopHandler
+                | mir::Stmt::ParallelMarker { .. } => {}
                 mir::Stmt::Emit { args, .. } => used.extend(args.iter().copied()),
                 mir::Stmt::StateSet { src, .. } => used.push(*src),
             }
@@ -2634,6 +2636,7 @@ fn walk_hir_body(body: &hir::Body, acc: &mut HashSet<String>) {
                     walk_hir_operand(a, acc);
                 }
             }
+            hir::Stmt::ParallelMarker { .. } => {}
         }
     }
     match &body.terminator {
