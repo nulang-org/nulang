@@ -677,6 +677,9 @@ impl WorkerLeaseStore for SqliteStore {
         lease: &WorkerLease,
         now_millis: u64,
     ) -> Result<LeaseReleaseOutcome, Self::Error> {
+        if lease.fencing_token > i64::MAX as u64 {
+            return Ok(LeaseReleaseOutcome::Lost);
+        }
         let mut conn = Connection::open(&self.path)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = tx.execute(
@@ -687,7 +690,7 @@ impl WorkerLeaseStore for SqliteStore {
             params![
                 lease.resource_id,
                 lease.owner_id,
-                sqlite_token(lease.fencing_token),
+                lease.fencing_token as i64,
                 sqlite_millis(now_millis),
             ],
         )?;
@@ -740,10 +743,6 @@ fn lease_expiry(now_millis: u64, lease_duration_millis: u64) -> u64 {
 }
 
 fn sqlite_millis(value: u64) -> i64 {
-    value.min(i64::MAX as u64) as i64
-}
-
-fn sqlite_token(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
 }
 
