@@ -73,6 +73,14 @@ two major versions.*
   Regression coverage verifies message delivery after NBC round-trip and
   durable-store selection for persistent actors.
 
+### Cross-language performance evidence suite — 2026-09-22
+- **A checksum-validated same-host comparison harness now covers compute and
+  actor workloads** (Experimental, `benchmarks/crosslang/`). The suite
+  pre-emits Nulang NBC artifacts, normalizes actor comparisons to one execution
+  lane, records median/MAD/raw samples plus peak RSS and toolchain metadata, and
+  treats shared-runner output as informational rather than publication-quality
+  evidence.
+
 ### Actor protocol rolling-upgrade compatibility — 2026-09-20
 - **Directional structural compatibility** (Experimental, `src/protocol.rs`).
   A receiver may serve an older required protocol when it preserves every

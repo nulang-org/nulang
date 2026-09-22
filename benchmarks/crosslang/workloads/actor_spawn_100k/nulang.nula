@@ -1,0 +1,16 @@
+actor Idle {
+    behavior noop() {
+        unit
+    }
+}
+
+fn main() {
+    var i = 0
+    while i < 100000 {
+        let actor = spawn Idle {}
+        let actor_tag = actor :cap tag
+        i = i + 1
+    }
+    perform IO.print(i)
+    unit
+}

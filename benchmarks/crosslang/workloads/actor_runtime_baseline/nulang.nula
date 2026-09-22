@@ -1,0 +1,10 @@
+actor Idle {
+    behavior noop() {
+        unit
+    }
+}
+
+fn main() {
+    perform IO.print(0)
+    unit
+}
