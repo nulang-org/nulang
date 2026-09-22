@@ -1841,7 +1841,7 @@ impl CapabilityAnalyzer {
         for (name, binding_cap) in &ctx.bindings {
             if binding_cap.is_linear() && !consumed.must_contain(name) {
                 let msg = format!(
-                    "linear value `{}` is never used ({} bindings must be consumed exactly once — pass it to a function, `send` it, or `consume {}` it explicitly)",
+                    "linear value `{}` is not consumed on every path (it is never used on at least one path; {} bindings must be consumed exactly once — pass it to a function, `send` it, or `consume {}` it explicitly)",
                     name, binding_cap, name
                 );
                 self.diagnostics.push(msg.clone());
@@ -2071,7 +2071,7 @@ impl CapabilityAnalyzer {
                     && !consumed.must_contain(name)
                 {
                     let msg = format!(
-                        "linear value `{}` is never used ({} bindings must be consumed exactly once — pass it to a function, `send` it, or `consume {}` it explicitly)",
+                        "linear value `{}` is not consumed on every path (it is never used on at least one path; {} bindings must be consumed exactly once — pass it to a function, `send` it, or `consume {}` it explicitly)",
                         name, val_cap, name
                     );
                     self.diagnostics.push(msg.clone());
