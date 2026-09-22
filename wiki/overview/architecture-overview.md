@@ -1,5 +1,5 @@
 ---
-updated: 2026-08-02
+updated: 2026-09-22
 sources:
   - AGENTS.md
   - SPEC2.md
@@ -10,7 +10,7 @@ tags: [overview, architecture]
 
 # Architecture Overview
 
-Nulang is a distributed, actor-based programming language written in Rust (edition 2021, Cargo workspace with a primary `nulang` crate and a `nulang-ai` support crate). It fuses Erlang-style fault-tolerant actors with a Rust/Pony-inspired type system, algebraic effects, a register-based bytecode VM, a Cranelift JIT, WASM/AOT backends, and a v0.9 AI runtime.
+Nulang is a distributed, actor-based programming language written in Rust (edition 2021, Cargo workspace with a primary `nulang` crate and optional support crates). It combines fault-tolerant actors, HM typing, reference capabilities, algebraic effects, a register-based bytecode VM, a Cranelift JIT, experimental WASM/native backends, and an optional AI runtime.
 
 ## Subsystem map
 
@@ -22,7 +22,7 @@ Nulang is a distributed, actor-based programming language written in Rust (editi
 | HIR/MIR | `src/hir_lower.rs`, `src/mir_lower.rs`, `src/mir_codegen.rs` | AST → HIR → MIR → bytecode (MIR-exclusive pipeline). |
 | Bytecode VM | `src/vm.rs`, `src/bytecode.rs`, `src/value_layout.rs` | 256-register frames, i64-tagged values, 135 opcodes. |
 | JIT | `src/jit/` | Cranelift-backed hot-region compilation, typed + SIMD tiers. |
-| Actor runtime | `src/runtime/` | Work-stealing scheduler, ORCA GC, supervision, mailboxes. |
+| Actor runtime | `src/runtime/` | Sharded cooperative scheduling, ORCA GC, supervision, mailboxes. |
 | Distribution | `src/runtime/network.rs`, `cluster.rs`, `distributed.rs` | NUL0 TCP wire protocol, gossip membership, remote spawn. |
 | CRDTs | `src/runtime/crdt.rs`, `crdt_reg.rs`, `crdt_manager.rs` | 8 CRDT types with delta-state replication. |
 | WASM backend | `src/mir_wasm.rs`, `src/wasm_runtime.rs` | MIR → WASM via `wasm-encoder`; Wasmtime host runtime. |
@@ -35,23 +35,23 @@ Nulang is a distributed, actor-based programming language written in Rust (editi
 | Package manager | `src/package/` | `nula` — manifest, lockfile, resolver, commands. |
 | Format layer | `src/format/` | Frozen `.nbc` bytecode, NUL0 wire versioning, migration registry. |
 
-## Two-backend model
+## Execution backend model
 
-The frontend (lexer → parser → typechecker → effect/capability checker → HIR → MIR) is shared. From MIR, three backends fan out:
+The frontend (lexer → parser → typechecker → effect/capability checker → HIR → MIR) is shared. The bytecode VM is the semantic reference; other backends must prove parity against it.
 
-1. **Bytecode VM** (default): MIR → bytecode → register VM (with Cranelift JIT tiering).
-2. **AOT native** (`--backend native`): MIR → Cranelift CLIF → native object code (unboxed via compile-time type metadata).
-3. **WASM** (`--backend wasm|wasm-run|wasm-aot`, requires `wasm-backend` feature): MIR → `.wasm` via `wasm-encoder`, executed by Wasmtime with guard pages, inlining, SIMD, and optional AOT compilation to `.cwasm`.
+1. **Bytecode VM** (default): MIR → bytecode → register VM, with Cranelift JIT tiering for hot regions.
+2. **WASM** (`--backend wasm|wasm-run|wasm-aot`, requires `wasm-backend`): MIR → `.wasm` via `wasm-encoder`, executed by Wasmtime. The experimental `wasm-component` path emits WIT alongside WASM.
+3. **Native AOT** (`--backend native`): MIR → Cranelift CLIF → native object code. This remains secondary until semantic parity is demonstrated.
 
 ## Concurrency model
 
-There is **no async/await in the VM or runtime.** Actor concurrency is cooperative reduction-yielding, built on `crossbeam` deques/queues + `std::sync` atomics/RwLock/mpsc + raw `unsafe` pointers for ORCA GC. The runtime is a multi-threaded work-stealing executor: `Runtime` is a shard (actor subset by `actor_id % shard_count`), each shard runs on one worker thread, and a Chase-Lev work-stealing scheduler distributes work across `worker_count` threads per shard. Cross-shard messaging uses `mpsc::SyncSender` channels; only value-type payloads cross shard boundaries.
+There is **no async/await in the VM or actor runtime.** Actor execution is cooperative and reduction-yielding. A `Runtime` owns one shard (actors partition by `actor_id % shard_count`) and one live scheduler thread; `NULANG_SHARDS>1` runs multiple shards in parallel with bounded `mpsc::SyncSender` cross-shard channels. The scheduler retains Chase-Lev peer-stealing APIs for alternate/future multi-worker callers, but the current live per-shard `run_scheduler()` path uses worker slot 0 rather than peer stealing.
 
 The only async surfaces are `main.rs` (`#[tokio::main]`), the LSP server (`tower-lsp` over tokio stdin/stdout), and the AI LLM client (`async_trait`, exposed to sync callers via `complete_sync`).
 
 ## Actor lifecycle (short version)
 
-Spawn → schedule (Chase-Lev deque, priority queues High/Normal/Low) → step (mailbox dequeue → handler dispatch → reduction budget → yield or continue) → GC (ORCA delta ops + incremental cycle detection) → fault (link/monitor propagation, supervisor restart strategies).
+Spawn → schedule (priority queues High/Normal/Low on the shard owner) → step (mailbox dequeue → handler dispatch → reduction budget → yield or continue) → GC (ORCA delta ops + incremental cycle detection) → fault (link/monitor propagation, supervisor restart strategies).
 
 For the full protocol see [[../subsystems/actor-runtime]] _(to be created on next ingest of `src/runtime/`)_.
 

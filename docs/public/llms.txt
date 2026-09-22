@@ -20,7 +20,7 @@ Nulang is a systems language with static types, algebraic effects, capability ch
 - WASM as the canonical portable/cloud target; experimental WasmFX support explores stack-switching for suspending effects
 - Secondary native AOT backend for supported subsets and differential/conformance work; do not assume full bytecode parity
 - Experimental Fabric messaging/streams and an experimental RESP-compatible cache kernel with Redis Cluster routing
-- Optional AI runtime workspace: provider-agnostic LLM clients, agent declarations, memory, pipelines, debates, supervisor teams, and director/manager/worker support crates
+- Optional AI runtime workspace: provider-agnostic LLM clients, Experimental `agent` ergonomic syntax under RFC 0017, memory, pipelines, debates, supervisor teams, and director/manager/worker support crates
 - Register-based bytecode VM with 135 opcodes and 256-register frames
 
 ## Status and backend contract
@@ -29,8 +29,8 @@ Nulang is a systems language with static types, algebraic effects, capability ch
 - **Optimization layer:** Cranelift JIT.
 - **Portable/cloud target:** WASM.
 - **Secondary backend:** native AOT where semantic parity is demonstrated.
-- **Experimental surfaces:** WasmFX, Fabric, RESP cache server, typed protocol hardening, multi-node distribution, and other items marked Experimental in the changelog.
-- **CRDT caveat:** Rust/runtime CRDT types exist, but `.nula` `state crdt` fields are not yet fully wired and currently behave as durable state.
+- **Experimental surfaces:** WasmFX, Fabric, RESP cache server, typed protocol hardening, multi-node distribution, source-level CRDT state/replication, `agent`/`workflow` ergonomic sugar under RFC 0017, and other items marked Experimental in the changelog.
+- **CRDT status:** typed `.nula` `state crdt <type>` fields and `Crdt.*` operations are implemented and conformance-tested. Checkpoints persist CRDT replicas plus field-name→CRDT-id mappings, and recovery restores/re-registers them. The source-level CRDT/distribution surface remains Experimental.
 
 ## Quick Install
 ```bash

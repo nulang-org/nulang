@@ -35,7 +35,7 @@ Full flag list (from `nulang node --help`):
 | `--plaintext` | — | Disable TLS (insecure, dev only) |
 
 :::caution
-If no TLS material is provided, the node logs a warning and uses the **plaintext** transport. Without `--plaintext`, supplying `--tls-cert`/`--tls-key`/`--tls-ca` enables mutual TLS (see [RFC 0013](https://github.com/nulang/nulang/blob/main/RFC/0013-authenticated-transport.md)). Treat plaintext as development-only.
+If no TLS material is provided, the node logs a warning and uses the **plaintext** transport. Without `--plaintext`, supplying `--tls-cert`/`--tls-key`/`--tls-ca` enables mutual TLS (see [RFC 0013](https://github.com/nulang-org/nulang/blob/main/RFC/0013-authenticated-transport.md)). Treat plaintext as development-only.
 :::
 
 ## Joining a Cluster with `--seed`
@@ -65,7 +65,7 @@ Membership states and timings (from `src/runtime/cluster.rs`):
 | Gossip fanout | 2 peers per tick |
 | Active view size | 4 (bounds heartbeat traffic) |
 
-By default there is **no quorum logic**: a partition leaves both sides running independently, and a healed partition re-merges by incarnation number. Passing `--expected-nodes N` opts into the **static-quorum split-brain resolver** ([RFC 0011](https://github.com/nulang/nulang/blob/main/RFC/0011-split-brain-resolver.md)): each side of a partition counts the reachable members against the expected size, and the side that cannot muster a quorum **downs itself** (its actors checkpoint and it sends a `NodeGoodbye` before shutting its transport). The resolver is consulted on a 5-second probe interval.
+By default there is **no quorum logic**: a partition leaves both sides running independently, and a healed partition re-merges by incarnation number. Passing `--expected-nodes N` opts into the **static-quorum split-brain resolver** ([RFC 0011](https://github.com/nulang-org/nulang/blob/main/RFC/0011-split-brain-resolver.md)): each side of a partition counts the reachable members against the expected size, and the side that cannot muster a quorum **downs itself** (its actors checkpoint and it sends a `NodeGoodbye` before shutting its transport). The resolver is consulted on a 5-second probe interval.
 
 ```bash
 # Both nodes agree on the expected cluster size
@@ -129,16 +129,16 @@ Mechanics worth knowing (from `src/runtime/distributed.rs`):
 - **Placeholder addresses**: `spawn@` returns immediately with a placeholder whose actor id is the spawn *request id*. The real actor id arrives with `SpawnResponse`; messages sent to the placeholder in the meantime queue and flush once the response lands.
 - **Local fallback**: with no distributed runtime (or when the target id is the local node), `spawn@` spawns locally — the same program runs unchanged in single-node development.
 - **Explicit remote send/ask**: `send remote a beh(args)` and `ask remote a beh(args) timeout ms` force the wire path. A bare actor ref that came from `spawn@` or an inbound message routes remotely automatically via the runtime's id→node reverse index.
-- **Behavior names on the wire**: remote messages carry the behavior **name**, not an index. The receiver resolves it against the target actor's behavior table (suffix match), falling back to behavior id 0 for unknown names — mirroring local `send`.
+- **Behavior names on the wire**: remote messages carry the behavior **name**, not an index. The receiver resolves it against the target actor's declared behavior metadata. Actors with declared named behaviors reject unknown names on delivery instead of aliasing behavior id 0; only metadata-free low-level runtime actors retain inert raw-mailbox compatibility behavior.
 - **Payload rules**: strings travel by content (per-packet string table interned on receipt); heap pointers, closures, actor refs, and `nil` are rejected at send time.
 
 ## Surviving Node Loss
 
-When a node is confirmed gone, its durable actors must come back somewhere — but never as two live copies. [RFC 0014](https://github.com/nulang/nulang/blob/main/RFC/0014-node-failure-respawn.md) defines the protocol:
+When a node is confirmed gone, its durable actors must come back somewhere — but never as two live copies. [RFC 0014](https://github.com/nulang-org/nulang/blob/main/RFC/0014-node-failure-respawn.md) defines the protocol:
 
 1. **Confirmed-gone only**: re-spawn triggers on the `Removed` membership state — either a graceful `NodeGoodbye` (immediate) or a `Failed` node promoted after a 60-second confirmation timeout while the survivor holds quorum. A merely partitioned node re-joins via the probe path and is never re-spawned over.
 2. **Location directory**: each re-spawn-opted durable actor is announced in a gossip-replicated directory `(actor_id, node_id, epoch)`, merged highest-epoch-wins.
-3. **Shadow replica**: every checkpoint of an opted-in actor is replicated to a deterministic shadow node (the healthy member with the smallest node id other than the home node). Re-spawn restores the actor on the shadow from its last acknowledged snapshot, so no write is lost.
+3. **Shadow replica**: checkpoints for an opted-in actor are replicated to a deterministic shadow node (the healthy member with the smallest node id other than the home node). Re-spawn can restore from the last acknowledged replicated snapshot. Work committed after that acknowledged point may still be lost if the home node fails before the next durable replication boundary.
 4. **Epoch self-demote**: a node that re-joins after being declared `Removed` finds a higher epoch in the directory for its own actor and self-demotes — forwarding in-flight sends to the replacement — so exactly one live copy ever exists.
 
 The opt-in is a per-child supervisor policy. Policy `3` = `respawn_on_node_loss` (durable children only; it implies `permanent` for the local exit protocol):
@@ -214,4 +214,4 @@ Today the CLI piece of this story is intentionally narrow: `nulang node` runs an
 
 - [Distribution & Clustering](/actors/distribution/) — wire protocol, gossip, and CRDT internals
 - [Supervision Trees](/actors/supervision/) — supervisor strategies and child policies, including `respawn_on_node_loss`
-- [RFC 0014: Node-Failure Re-Spawn](https://github.com/nulang/nulang/blob/main/RFC/0014-node-failure-respawn.md) — the full durability-on-failure design
+- [RFC 0014: Node-Failure Re-Spawn](https://github.com/nulang-org/nulang/blob/main/RFC/0014-node-failure-respawn.md) — the full durability-on-failure design

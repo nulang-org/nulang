@@ -1,6 +1,6 @@
 # Nulang Language Specification v2.0
 
-## July 2026
+## September 2026
 
 ---
 
@@ -20,7 +20,7 @@ The specification is organized into five conceptual layers:
 
 3. **The Durable Execution Layer** (Chapter 9) extends the actor runtime with persistence. Persistent actors survive process restarts through automatic checkpointing, event journaling, deterministic replay, and snapshotting.
 
-4. **The Distributed Platform Layer** (Chapter 12) extends the durable actor runtime across machine boundaries. Virtual actors are transparently activated on any cluster node (**Planned**). Messages are routed across the network. CRDT state converges automatically (**Planned** — the CRDT replication machinery is implemented and tested at the Rust level, but `state crdt` fields are not yet wired to it and behave as `durable`; see §9.10 and §12.5). Faults are contained and recovered.
+4. **The Distributed Platform Layer** (Chapter 12) extends the durable actor runtime across machine boundaries. Remote messaging, gossip membership, typed source-level CRDT fields, `Crdt.*` operations, and CRDT replication are implemented but Experimental. CRDT checkpoints persist both replica state and the actor field-name→CRDT-id mapping; `recover_actor` restores those mappings and re-registers declared CRDT fields. Virtual-actor/deployment behavior and other production hardening goals remain incomplete.
 
 5. **The AI Runtime Layer** (Chapter 11) provides language-integrated access to large language models, tool use, memory systems, and planning. AI capabilities are expressed through the same algebraic effect system used for IO and network effects, and are gated by the same capability-based security model.
 
@@ -32,22 +32,22 @@ Unless otherwise noted, examples in sections describing *implemented* features a
 
 # Implementation Status (Current Alpha)
 
-This document is the design target for Nulang 2.0. The implementation in this repository is an alpha (the v0.9 series) that realizes a substantial subset of the design. This section records, as of the current commit, what is implemented and what remains planned, so readers can distinguish descriptions of working behavior from aspirational ones. Sections that describe unimplemented surface are marked **Planned** inline.
+This document is the design target for Nulang 2.0. The implementation in this repository is alpha software (crate version 0.1.0) that realizes a substantial subset of the design. This section records the implementation status reviewed on September 22, 2026 so readers can distinguish working behavior from aspirational semantics. Sections that describe unimplemented surface are marked **Planned** inline. The active compatibility/stabilization policy in `GOVERNANCE.md`, RFC 0021, and `docs/SEMANTIC_STABILIZATION_CONTRACT.md` takes precedence over older stability wording that may remain in design-oriented sections of this specification.
 
-> **Verification note (July 2026).** The syntax, keyword, and semantic claims in Chapters 1–12 and Appendices A–C were re-verified against the implementation in July 2026 — specifically `src/lexer.rs` (keyword inventory, literals, operators), `src/parser.rs` (grammar), `src/ast.rs` (AST shapes), `src/typechecker.rs` (inference, defaults), `src/effect_checker.rs` (effect rows, capability lattice, sendability), `src/vm.rs` (runtime effect dispatch, arithmetic), `src/hir_lower.rs` (pipe semantics, AI builtins), `src/main.rs` (CLI), and `src/fuzz.rs` (typechecker fuzzer). Chapters 13–15 and Appendix D describe planned surfaces and were only annotated as such, not verified line-by-line.
+> **Verification note (September 22, 2026).** The public status summary was re-checked against the current compiler/runtime paths, including `src/lexer.rs`, `src/parser.rs`, `src/ast.rs`, `src/typechecker.rs`, `src/effect_checker.rs`, `src/vm.rs`, `src/hir_lower.rs`, `src/main.rs`, `src/runtime/persistence.rs`, `src/runtime/supervisor.rs`, and the WASM/JIT backends. This does not mean every historical paragraph below was re-verified line-by-line; inline **Planned** / **Experimental** markers and the active stabilization contract remain authoritative where detailed design prose gets ahead of implementation.
 
 **Implemented and verified against the source tree:**
 
 - Triple-quoted multi-line strings (`\"\"\"...\"\"\"`) and `\u{...}` unicode escapes: standard escapes processed inside triple-quoted strings; interpolation not supported inside them; surrogate/out-of-range code points rejected with a `LexError` — `src/lexer.rs`. (Stable)
 - The core expression language: literals (`Int`, `Float`, `String`, `Bool`, `Unit`, `Nil`), `let` / `let rec` bindings with `in`, `fn` lambdas, tuples, records, arrays, `if`/`then`/`else`, `match` (wildcard, variable, literal, tuple, record, variant, and `@` alias patterns), blocks, the pipe operator `|>`, and the operator set of Chapter 2.
-- Top-level declarations: `fn` (with `[T]` type parameters, `->` return types, `!` effect rows, `: cap` capability annotations, and `@tool` annotations), `type` (alias, record, and variant forms), `effect`, `actor` / `persistent actor`, `entity`, `organization`, `agent`, `workflow`, `module`, `import`, and `extern` FFI blocks.
+- Top-level declarations: `fn` (with `[T]` type parameters, `->` return types, `!` effect rows, `: cap` capability annotations, and `@tool` annotations), `type` (alias, record, and variant forms), `effect`, `actor` / `persistent actor`, `entity`, `organization`, `agent`, `workflow`, `database`, `module`, `import`, and `extern` FFI blocks. Under accepted RFC 0017, `agent` and `workflow` are Experimental ergonomic forms that must lower to the canonical actor/state/effect runtime model rather than defining independent execution species; `database` remains Experimental.
 - Hindley-Milner type inference (Algorithm W) over tuples, records, variants, arrays, function types carrying effect rows and capabilities, and `&cap T` reference types.
 - Algebraic effects: `perform Effect.op(args)`, `handle body { | Effect.op(x) => value }`, closed and open effect rows written `{IO, FS}` and `{IO, | row}`, enforced `!` annotations on `fn` and `behavior` bodies, and runtime handlers with resume semantics.
 - Reference capabilities `iso`, `trn`, `ref`, `val`, `box`, `tag`, plus `lineariso` with exactly-once consumption tracking. Capabilities are checked at compile time and erased at runtime. Sendability (`lineariso`, `iso`, `val`, `tag`) is enforced for message arguments.
 - Actors and entities: `actor`, `persistent actor`, `organization` (desugars to `entity`), and `entity` (desugars to `persistent actor` with `event_sourced` as the default state model); `spawn Actor { field = value }`, `spawn Actor {} as "name"` for stable identity, `send actor behavior(args)` and `actor ! behavior(args)`, `ask actor behavior(args)`, `receive { | Behavior(x) => expr }`, `self.field` state access, and the four state models (`local`, `durable`, `event_sourced`, `crdt`).
-- Persistence for `persistent actor`s: durable snapshot/journal recovery and event-sourced replay, backed by in-memory, JSON-file, and SQLite stores.
-- Workflows: `workflow Name { step name { body } compensate { expr } ... }` with `parallel { ... }` step groups, saga compensation in reverse order, `perform Signal.wait("name")`, and `perform Timer.sleep("name", ms)`, all durable across restarts.
-- The AI runtime: `agent` declarations with model, system prompt, tools, episodic/semantic/procedural memory, and pricing; the generic `PerformAsync` opcode dispatches LLM, Pipeline, Supervisor, and Debate effects via `effect_op` strings (e.g. `"Inference.ask"`, `"Pipeline.run"`); agent behaviors (`ask`, `usage`, `store_fact`, `recall`); tool schemas generated from `@tool` functions; and the `Pipeline`, `Supervisor`, and `Debate` orchestration builtins. The pure AI types live in the `nulang-ai` workspace crate (`crates/nulang-ai/`); the core crate re-exports them behind the `ai-runtime` feature flag.
+- Persistence for `persistent actor`s: durable snapshot/journal recovery and event-sourced replay behind `PersistenceStore`. `MemoryStore` and `JsonFileStore` are built in; the default `sqlite` feature provides `LibsqlStore` (local SQLite/libSQL and remote Turso support), while optional `rocksdb` and `postgres` features provide `RocksDbStore` and `PostgresStore`. Durable programs can select storage with `--store <uri>` or `NULANG_STORE_PATH`.
+- Workflow surface: `workflow Name { step name { body } compensate { expr } ... }` implements parallel step groups, reverse-order saga compensation, signals, and durable timers/recovery. RFC 0017 keeps `workflow` as Experimental ergonomic syntax provided it lowers to the same canonical actor/state/effect runtime model.
+- The optional AI runtime provides LLM providers, episodic/semantic/procedural memory, pipelines, debates, supervisors, tool schemas, usage/cost accounting, and async effect dispatch behind the `ai-runtime` feature. The pure AI types live in the `nulang-ai` workspace crate. RFC 0017 keeps `agent` as Experimental ergonomic syntax that lowers to ordinary actor/effect primitives.
 - A register-based bytecode VM with a Cranelift JIT tiering path; an OTP-style supervision runtime (restart strategies and policies, links, monitors, exit signals); a distributed runtime (TCP wire protocol, gossip membership, location-transparent addressing — Experimental; the eight CRDT types exist and are tested only at the Rust embedder level, with no `.nula`-level surface — see §9.10); a REPL; and an LSP server.
 - Typeclass declarations: `class`/`impl` with dictionary-passing transform for method calls on concrete types (Phase 4, Experimental). See `CHANGELOG.md`. **Verified 2026-08-02, constrained-generic crash fixed 2026-08-13:** literal-receiver dispatch works end-to-end (minimal declarations, two-concrete-type dispatch, missing-impl rejection, superclass syntax all confirmed against the real binary). The canonical constrained-generic case — a typeclass bound on a type-variable receiver (`fn eq_check[T: Eq](a: T, b: T) -> Bool { a.eq(b) }`) — used to type-check and then **crash at runtime** ("Not a function: nil"): the dictionary transform only resolved literal receivers, not type-variable ones. Fixed at the HIR level (`DictKind::Param`); the call site now passes the concrete dictionary argument (`infer_type_arg` → `_impl_Eq_Int`). Pinned by `conformance/behavior/typeclass_06_constrained_generic_runtime_crash.nula` (now passes, exit 0).
 - Generics (`fn f[T](...)`, `type T[A] = ...`, §7.8): basic generics — one or more independent type parameters, per-callsite type inference, return-only type parameters — work end-to-end. **Verified 2026-08-02, both gaps fixed 2026-08-13:** (1) recursive generic ADTs can now be constructed — §7.8's `type Tree[T] = Leaf | Node((Tree[T], T, Tree[T]))` type-checks its own constructor call, pinned for two independent recursive shapes (`generics_03` accept, `generics_07` accept); (2) declared type parameters are now skolemized inside the function body — a generic function that pins its type parameter to a concrete type via an internal literal (`fn fresh[T]() -> T { 0 - 1 }`) is rejected AT THE DEFINITION (rigid placeholder cannot unify with `Int`), not at a later mismatched call site (`generics_08` expects the type error, exit 4). See `conformance/behavior/generics_03/07/08_*.nula`.
@@ -91,12 +91,12 @@ This document is the design target for Nulang 2.0. The implementation in this re
 - All 13 stdlib modules functional: `core`, `list`, `string`, `set`, `map`, `test`, `fs`, `option`, `result`, `datetime`, `math`, `json`, `http` — all parse, import, and resolve with all VM primitives available — `src/stdlib/`. (Experimental)
 - LSP code lenses, document links, enriched hover: `textDocument/codeLens` shows reference counts; `textDocument/documentLink` creates clickable import links; `textDocument/hover` includes doc comments, effects, and type signatures — `src/lsp/mod.rs`. (Experimental)
 - LSP completion documentation: keyword and built-in effect completion items carry markdown documentation strings — `src/lsp/mod.rs`. (Experimental)
-- 15 verified example programs under `examples/` with `examples/README.md` — from basic IO to JSON, HTTP, Option/Result, and ranges. (Experimental)
+- 17 verified example programs under `examples/` with `examples/README.md` — from basic IO through actors, effects, HTTP/JSON, Option/Result, and ranges. (Experimental)
 - `consume` / `recover` expressions: `consume x` marks a linear (`lineariso`) variable as consumed (reusing the existing at-most-once tracker); `recover { body }` is an isolated scope whose result must be sendable (checked in `src/effect_checker.rs`; the typechecker infers the body's type unchanged and lowering is transparent — it does **not** wrap the result in `Ok`/`Error`). See §3.9.2. Commit `e0cf432`. (Experimental)
 
 **Planned (described in this specification, not implemented):**
 
-- The WebAssembly compilation target (Chapter 13): WASM compilation exists behind the `wasm-backend` feature flag via `--backend wasm|wasm-run|wasm-aot`. WIT interface generation and WASI worlds are not yet implemented.
+- Full WebAssembly semantic parity and component capability integration (Chapter 13): MIR→WASM, Wasmtime execution/AOT, and experimental `--backend wasm-component` WIT generation are implemented. Full bytecode parity, complete WASI/component capability mapping, and production-grade component interoperability remain planned.
 - Higher-kinded types, `Char` and `Decimal` primitives, character literals (Sections 2.4, 3.6).
 - `<-` message syntax and indentation-based layout (Section 2.8).
 - Authority capabilities (`capability` declarations on actors, delegation, revocation, auditing — Sections 1.5 and 5.3–5.6), `config` blocks, the `tool` declaration form inside actors, `virtual` actors, `select`, `await`, `await_human`, `sleep_until`, and `retry` blocks.
@@ -2309,27 +2309,23 @@ entry. `read` materializes the value back into `state_data`, so `self.field`
 reads stay consistent. `.nula`-level conformance coverage lives in
 `conformance/behavior/crdt_*.nula`.
 
-**Recovery limitation:** `recover_actor` restores the materialized
-`state_data` value and the `CrdtManager` entries from `crdt_snapshot`, but
-does not rebuild `CrdtManager.field_map` (the `(actor_id, field_name) →
-CrdtId` link is not persisted). On a recovered actor, `self.field` still
-reads the materialized value, but `perform Crdt.*` is a silent nil no-op
-until the field is re-registered. Pinned by
-`test_crdt_field_survives_recovery` (a post-recovery `Crdt.increment`
-leaves `state_data["count"]` unchanged).
+**Recovery status:** checkpoints persist the materialized actor
+state, serialized CRDT replicas, and the actor-local
+`field_name → CrdtId` mapping. `recover_actor` restores the CRDT manager
+snapshot, rebuilds both forward and reverse field mappings, and then
+idempotently calls `register_actor_fields` so declared CRDT fields remain
+addressable through `perform Crdt.*` after recovery.
 ---
 
 # Chapter 10: Workflows
 
-**Deprecated (RFC 0004, Draft).** `workflow` is on a path out of the
-language surface entirely, toward an ordinary `actor` + Cloud SDK
-(`nlc.workflow`) library pattern. The keyword remains functional today
-(the CLI emits a deprecation warning on `workflow` declarations) and
-this chapter still describes its current behavior, but treat everything
-below as a snapshot of a feature being phased out, not a design target
-to invest deeply against. `conformance/behavior/workflow_*.nula` pins
-the current, verified behavior precisely — treat it as more current
-than this prose for edge cases.
+**Experimental unified-runtime surface (RFC 0017).** RFC 0004's proposed
+removal/deprecation path was never accepted and is superseded by accepted
+RFC 0017. `workflow` remains valid ergonomic syntax, but it is not a separate
+runtime species: its semantics must lower to the canonical actor/state/effect/
+supervision/time primitives. `conformance/behavior/workflow_*.nula` pins the
+current verified behavior; treat it as more current than this prose for edge
+cases.
 
 **Known issues, current implementation (verified 2026-08-02, not fixed
 in this pass beyond the first):**
@@ -2561,8 +2557,10 @@ The runtime-backed `Signal.wait(name)` operation (performed as `perform Signal.w
   dispatches all AI effects (`Inference.ask`, `Pipeline.run`, etc.) through
   the generic effect mechanism. The monolithic AI opcode range (`LlmAsk`,
   `PipelineNew`…`DebateRun`, 0x9D–0xC5) has been removed.
-- `agent`/`workflow`/`database` declarations are deprecated (RFC 0004);
-  new code should use `actor` with Cloud SDK imports.
+- `agent` and `workflow` are Experimental ergonomic declarations under
+  RFC 0017 and lower to the canonical actor/effect runtime model. RFC 0004's
+  proposed removal direction was not accepted. `database` remains
+  Experimental and is not part of the canonical runtime primitive set.
 ## 11.2 Agent Declarations
 
 An `agent` declaration defines an LLM-backed actor. The `model` field is required; all other fields are optional:
@@ -2771,8 +2769,8 @@ type and materializes the value back into `self.count`); a raw
 `self.count = expr` assignment on a crdt field is ignored. The prior
 `self.count = self.count + 1` example no longer conforms — that form is
 rejected as an out-of-set mutation. On a recovered actor, `self.count` still
-reads the materialized value but `perform Crdt.*` is a silent nil no-op
-(`field_map` is not rebuilt on recovery — see §9.10's recovery limitation).
+restores the serialized CRDT state and persisted field mapping; recovered
+declared CRDT fields are re-registered before execution resumes (see §9.10).
 
 ## 12.6 Fault Tolerance
 
@@ -4069,15 +4067,14 @@ config cluster {
 | `prompt` | `perform llm.complete()` | Effects replace direct LLM calls |
 | `agent.llm` | `perform llm` | Effect syntax replaces agent method calls |
 
-## D.7 Deprecation Timeline
+## D.7 Historical Migration Sketch
 
-| Version | Action |
-|---------|--------|
-| v1.6 | Deprecation warnings for v1 keywords |
-| v1.7 | Migration tool provided (`nulang migrate`) |
-| v1.8 | v1 keywords deprecated, opt-out via flag |
-| v1.9 | v1 keywords removed |
-| v2.0 | Only v2 syntax supported |
+The versioned keyword-removal timeline in earlier drafts is **not current
+policy**. RFC 0004 was never accepted, and accepted RFC 0017 supersedes its
+removal direction for `agent` and `workflow`: those forms may remain as
+Experimental ergonomic syntax when they lower to the canonical runtime
+primitives. Any future source removal requires a new accepted RFC and the
+compatibility process in `GOVERNANCE.md`.
 
 ## D.8 Migration Tool
 

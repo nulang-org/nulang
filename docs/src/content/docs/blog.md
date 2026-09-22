@@ -7,7 +7,7 @@ description: The benefits of Nulang compared to other languages and the goal beh
 
 Nulang is a **durable computation language**. Its core purpose is to let you describe software that keeps running across crashes, restarts, node migrations, and decades of change. The unit of thought is an **entity**: a named identity that carries state, responds to messages, evolves over time, and persists by default.
 
-The goal is not to compete with every programming language. It's to fill a gap: there is no language today that gives you actors, algebraic effects, static types, and durable state in one coherent system.
+The goal is not to compete with every programming language. Nulang explores a particular combination of actors, algebraic effects, static typing, reference capabilities, and durable state in one runtime.
 
 ---
 
@@ -20,10 +20,10 @@ Both languages share the actor model, supervision trees, and "let it crash" phil
 | **Type system** | Static, HM-inferred, row-polymorphic | Dynamic (Erlang) / Gradual (Elixir) |
 | **Effects** | Algebraic effects, compile-time checked | No effect tracking |
 | **Execution** | Semantic-reference bytecode + tiered Cranelift JIT; experimental WASM and secondary native AOT | BEAM VM + JIT, garbage-collected |
-| **Memory model** | Per-actor heaps, ORCA GC | Shared heap, per-process GC |
+| **Memory model** | Per-actor heaps, ORCA GC | Per-process heaps with BEAM-managed garbage collection |
 | **AI library** | Optional nulang-ai library with memory | Library-level (Nx, Bumblebee) |
 
-**Takeaway**: If you want Erlang's fault tolerance with static types that catch bugs at compile time and native performance, Nulang is designed for you.
+**Takeaway**: Nulang is aimed at developers who want Erlang-style fault-tolerance concepts with static typing, capabilities, effects, and durable state. The BEAM remains far more mature operationally, and Nulang does not currently claim a universal performance advantage.
 
 ---
 
@@ -36,7 +36,7 @@ Rust and Nulang share a focus on safety and performance, but their domains diffe
 | **Concurrency model** | Actors + messages | async/await, channels, Arc&lt;Mutex&lt;T&gt;&gt; |
 | **Distribution** | Built-in clustering, CRDTs | Manual (gRPC, custom protocols) |
 | **Fault tolerance** | Supervision trees, cascading restart | Manual error handling, panic=abort |
-| **Workflows** | Built-in durable workflows | Temporal/Sidekiq libraries |
+| **Durable orchestration** | Durable actor/entity primitives; `workflow` is Experimental ergonomic sugar under RFC 0017 | External workflow engines/libraries such as Temporal |
 | **Type safety** | HM inference + capabilities | Ownership + borrows + lifetimes |
 
 **Takeaway**: Rust gives you fine-grained memory control. Nulang gives you fault-tolerant distribution out of the box. Use Rust for systems programming; use Nulang for distributed applications.
@@ -51,7 +51,7 @@ Go's strength is simplicity. Nulang's strength is correctness under failure:
 |---|---|---|
 | **Concurrency** | Actors with supervision | Goroutines + channels |
 | **Error handling** | Pattern matching, supervision | `if err != nil` |
-| **Type system** | HM inference, row polymorphism, ADTs | Structural types, no generics (pre-1.18) |
+| **Type system** | HM inference, row polymorphism, ADTs | Static structural typing with interfaces and generics |
 | **Effects** | Compile-time effect tracking | No effect system |
 | **Distribution** | Built into the language | Library-level |
 
@@ -65,13 +65,13 @@ The AI ecosystem has converged on Python and TypeScript, but both languages were
 
 | | Nulang | Python/TypeScript |
 |---|---|---|
-| **Agent declaration** | Declarative `agent` keyword | Library objects (LangChain, etc.) |
-| **Memory** | 3 built-in subsystems | Manual vector DB integration |
-| **Multi-agent** | Pipelines, debates, supervisors | Custom orchestration code |
-| **Determinism** | Type-checked effect isolation | No effect guarantees |
-| **Persistence** | Built-in checkpointing, event sourcing | External databases |
+| **AI integration** | Optional `nulang-ai` runtime/library; `agent` is Experimental ergonomic sugar under RFC 0017 | Large library ecosystems and SDKs |
+| **Memory** | Episodic, semantic, and procedural memory support | Commonly library/vector-store based |
+| **Multi-agent** | Pipeline, debate, and supervisor abstractions in `nulang-ai` | Framework-dependent orchestration |
+| **Effects** | AI calls can participate in the language effect model | Side effects are library/runtime conventions |
+| **Persistence** | Can compose AI work with durable actors/entities | Commonly external databases/workflow engines |
 
-**Takeaway**: Python and TypeScript have vast AI library ecosystems. Nulang gives you declarative primitives that eliminate boilerplate for the common patterns: define an agent, give it memory, compose agents into teams. No LangChain required.
+**Takeaway**: Python and TypeScript currently have much larger AI ecosystems. Nulang's design goal is to compose AI libraries with the same actor, effect, capability, and durability primitives used by the rest of an application rather than making AI syntax the language's foundation.
 
 ---
 
@@ -81,16 +81,16 @@ Every decade brings new AI models, new cloud providers, and new orchestration fr
 
 - **Actors** were meaningful in 1973 (Hewitt et al.) and will be meaningful in 2073.
 - **Algebraic effects** generalize exceptions, async/await, generators, and state — all in one mechanism.
-- **Reference capabilities** prevent data races without a GC or borrow checker.
-- **Durable state** means your program's execution survives the machine it runs on.
+- **Reference capabilities** provide compile-time aliasing/sendability constraints without Rust-style borrowing; the runtime still uses ORCA garbage collection.
+- **Durable state** gives actors/entities runtime-managed persistence and recovery mechanisms across failures, subject to the configured store and recovery semantics.
 
-Nulang freezes these primitives in a [Frozen Core](https://github.com/nulang-org/nulang/blob/main/GOVERNANCE.md) and builds everything else — AI, cloud services, billing, multi-tenancy — as evolvable layers.
+Nulang keeps a small portability/core layer and evolves higher-level surfaces separately. Under [RFC 0021](https://github.com/nulang-org/nulang/blob/main/RFC/0021-compatibility-before-freeze.md), pre-adoption source semantics are currently Stable rather than permanently Frozen; published artifact/wire/ABI versions remain explicit compatibility obligations.
 
 ---
 
 ## When to Use Nulang
 
-- You're building a system that **must not lose state** across restarts.
+- You're building a system where **durable state and recovery semantics** should be part of the runtime model rather than entirely application-managed.
 - You need **fault tolerance** but don't want to learn OTP from scratch.
 - You want **static types** that catch bugs before they reach production.
 - You're building **AI agents** that need memory, tool use, and multi-agent coordination.

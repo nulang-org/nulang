@@ -1,42 +1,33 @@
 # The Demo — Supervised Chat Server (crash containment, executed)
 
-**Validation status: EXECUTED.** The program below was type-checked and run
-with `nulang --check` / `nulang chat_server.nula` on a debug build
-(`cargo build --no-default-features`, Rust 1.95.0, commit `654910f` on main).
-The output shown is the observed output, verbatim. Every construct is also
-covered by conformance tests (`actor_09_supervisor_one_for_one_restart`,
-`org_03_org_and_entity_same_event_sourced_default`, `persist_07_*`) and
-verified examples (`examples/chat_room.nula`, `examples/supervisor_tree.nula`).
+**Validation status: HISTORICAL EXECUTED TRANSCRIPT.** The program below was
+type-checked and run against commit `654910f` with Rust 1.95.0; the displayed
+output is the verbatim result from that commit. **Do not treat the old recovery
+notes as current-main behavior.** Since this demo was recorded, durable-store
+selection and persistent supervisor-restart hydration have been wired. Re-run
+the script against the exact release/commit you plan to demonstrate and record
+new observed output before publishing a fresh performance or durability claim.
 
 ## Honesty note — read before recording
 
-The original launch narrative was "durable chat server survives kill -9 with
-state intact." **Execution against the real compiler showed that is not true
-today through the CLI**, so this script does not claim it:
+The original launch preparation discovered a real durability gap at commit
+`654910f`: supervised persistent children restarted from template state
+instead of a durable snapshot, and the CLI did not expose a durable store.
+Those findings are preserved here as historical evidence, but they have since
+been superseded.
 
-- A supervised actor that crashes **is** contained: the supervisor keeps its
-  child set, siblings keep their state, the process exits 0 (demonstrated
-  below — observed output).
-- But a restarted actor comes back with **fresh state**, not journal-rebuilt
-  state, on the CLI path. Observed during preparation of this script: a
-  `persistent actor` with `state durable` fields under a one-for-one
-  supervisor returned `0` / `nil` for its fields after a supervised
-  `Actor.exit(1)` crash. State-rebuild-on-recovery *is* implemented and
-  pinned by integration tests at the Rust runtime level
-  (`test_event_sourced_apply_handler_recovery`,
-  `src/integration_tests/mod.rs:2711`, which drives `recover_actor` with a
-  shared store directly), and the JSON-file/SQLite `PersistenceStore`
-  backends have round-trip tests — but the CLI runtime constructs an
-  in-memory store (`src/runtime/mod.rs:516`) and the supervisor-restart →
-  `recover_actor` wiring is not observable from `.nula` source today.
-- Additionally, `ask`-ing a crashed actor's old reference shows the
-  behavior-name-resolution caveats documented in SPEC2 §8.5. Don't build the
-  demo on talking to a restarted actor.
+Current main now exposes `--store <uri>` / `NULANG_STORE_PATH`, and
+`Supervisor::rebuild_child` loads a saved snapshot for persistent children
+before re-keying it to the new actor id. `Runtime::recover_actor` remains the
+explicit snapshot/journal recovery path. This is stronger than the original
+demo, but still does **not** justify an unconditional "kill -9 safe" claim:
+store durability settings, crash ordering, semantic/artifact compatibility,
+and stale-writer fencing still determine the guarantee.
 
-So the demo sells what is real: **actors, supervision, "let it crash"
-containment, and event-sourced entities — with a candid on-camera roadmap
-beat for durable recovery.** That is still a good demo, and it can survive a
-HN comments section because every word of it is reproducible.
+For a new recording, keep the crash-containment segment, then add a separate
+destructive recovery run against the selected disk-backed store and exact
+release commit. Treat the observed recovery result as evidence; do not reuse
+the old transcript as proof of current behavior.
 
 ## `chat_server.nula` (~75 lines, executed)
 
@@ -171,23 +162,21 @@ see SPEC2 §9.6's implementation note), and the `apply` handler adds `by`;
 land: `emit`/`apply`/`events` are language syntax, and every emission is
 journaled by the runtime.
 
-## Segment 3 — durability, the honest roadmap beat (do NOT fake)
+## Segment 3 — durability, revalidate before recording
 
-Say on camera, and in any post that mentions durability:
+For a current recording, use wording like:
 
-> "What you saw is crash *containment* — supervision keeps the system up when
-> an actor dies. Durability is the next layer: persistent actors checkpoint
-> and journal after every behavior, the storage backends (in-memory,
-> JSON-file, SQLite) and state-rebuild recovery are implemented and pinned by
-> integration tests, but the CLI doesn't expose recovery across a supervised
-> restart or a process restart yet — a restarted actor currently starts
-> fresh. Wiring `recover_actor` into supervisor restarts and adding a CLI
-> flag for a file-backed store is the top pre-1.0 milestone. When that lands,
-> this exact demo gets its kill -9 sequel."
+> "The runtime checkpoints and journals persistent actors, the CLI can select a
+> durable store with `--store`, and persistent supervised children hydrate
+> their saved snapshot when restarted. I still treat crash recovery as a
+> tested property of a specific store/configuration/release rather than a
+> blanket guarantee, so this demo includes an actual destructive restart."
 
-If asked for evidence, show
-`src/integration_tests/mod.rs:2711` (`test_event_sourced_apply_handler_recovery`)
-and the `JsonFileStore` round-trip tests in `src/runtime/persistence.rs`.
+Use a temporary disk-backed store, run the program, terminate the process at a
+controlled boundary, restart against the same store, and show the recovered
+state. Capture the exact commit, store URI/backend, and durability settings in
+the recording notes. The semantic stabilization contract requires this kind of
+fault-injection evidence before strengthening production claims.
 
 ## Recording instructions
 

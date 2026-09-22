@@ -6,7 +6,13 @@ description: Compose multiple agents using the nulang-ai library — pipelines, 
 
 ## Patterns for Multiple Agents
 
-The nulang-ai library provides three multi-agent patterns that compose agents into structured workflows. Each pattern addresses a different coordination need.
+The `nulang-ai` library provides multi-agent orchestration primitives independent of the long-term source-language surface.
+
+:::note[Examples use Experimental `agent` syntax]
+Accepted RFC 0017 allows `agent` to remain as ergonomic syntax that lowers to the canonical actor/effect model. The reusable concepts are the library-level pipeline, debate, and supervisor abstractions; do not treat the keyword as a separate runtime species or a Stable core primitive.
+:::
+
+Each pattern addresses a different coordination need.
 
 | Pattern | Use case |
 |---------|----------|

@@ -31,14 +31,22 @@ and row-polymorphic algebraic effects. The compiler pipeline (AST → HIR → MI
 uses the register-based bytecode VM as the semantic reference implementation.
 Hot regions can tier into a Cranelift JIT; WASM is the canonical portable/cloud
 execution target; and native AOT remains a secondary backend until full semantic
-parity is demonstrated. An experimental WasmFX backend explores stack-switching
-for suspending effects. The runtime supports sharded multi-threaded execution: each `Runtime` shard has
+parity is demonstrated. The experimental WASM Component Model path can emit WIT
+alongside WASM for component-oriented interop, while the experimental WasmFX
+backend explores stack-switching for suspending effects. The runtime supports sharded multi-threaded execution: each `Runtime` shard has
 one owning cooperative scheduler thread, and `NULANG_SHARDS>1` runs shards in
 parallel with bounded cross-shard channels. The scheduler implementation retains
 Chase-Lev work-stealing APIs for multi-worker callers, but the live per-shard
 `run_scheduler()` path currently uses one worker slot. Supervision trees, ORCA
 garbage collection, durable persistence, and experimental location-transparent
 distribution are integrated into that model.
+
+For durable application design, prefer `entity` plus ordinary actor/effect
+composition. Accepted RFC 0017 defines one canonical runtime model built from
+actors, state, messages, effects, capabilities, supervision, and time.
+`agent` and `workflow` remain Experimental ergonomic source forms so long as
+they lower to that model; `database` remains an Experimental application-
+specific declaration rather than a core runtime primitive.
 
 ---
 
@@ -124,19 +132,21 @@ perform IO.print("Hello, " + name + "!")
 - **Hindley-Milner type inference** — full Algorithm W with row-polymorphic records, variant types, and algebraic effect rows.
 - **Actors** — `spawn`, `send`/`!`, `ask`, selective `receive` with `after` timeout, links, monitors, supervision trees, process groups, and actor priority scheduling.
 - **Typed actor protocols** — structural `ActorRef[P]` contracts can restrict public actor APIs to required behaviors. Compiler-derived protocol fingerprints, a trusted schema registry, directional compatibility checks, and pre-mailbox admission are implemented as *Experimental* protocol hardening.
-- **Entities & workflows** — `entity` declarations are durable-first and event-sourced by default. The higher-level `workflow` declaration surface supports steps, timers, signals, and saga compensation, and remains *Experimental* while that API evolves.
+- **Durable entities** — `entity` declarations are durable-first and event-sourced by default, and are the preferred surface for long-lived domain state. `persistent actor` remains available for durable actor semantics. `agent` and `workflow` are *Experimental* ergonomic forms that lower to the canonical actor/effect runtime model under RFC 0017; `database` remains Experimental.
 - **`let` and `var`** — immutable and mutable bindings. Records with `{ field: value }` syntax and `{ base .. field = new_val }` update syntax. Pattern matching with guards, alias patterns, and recursive sub-patterns. `**` exponentiation. Multi-line `"""..."""` strings with `\u{...}` unicode escapes. Pipe operator `|>`.
 - **Error handling** — `catch expr fallback` (prefix or postfix), `fail Error(...)` for structured short-circuit return, `T ! E` return types, `?` unwrap.
 - **FS file I/O** — `perform FS.read(path)`, `perform FS.write(path, content)`, `perform FS.append(path, content)`, `perform FS.exists(path)`.
 - **Package manager** — `nula new/init/build/run/test/add/remove/list/clean/doc`. See [below](#package-manager).
 - **Test runner** — `nula test` discovers `.nula` files under `tests/`; uses the `Test` effect (`perform Test.assert_eq(a, b)`, `perform Test.assert(cond, msg)`, etc.).
-- **LSP server** — `nulang --lsp` with diagnostics, hover, goto-definition, references, rename, completion, inlay hints, formatting, signature help, and semantic tokens.
+- **LSP server** — `nulang --lsp` with diagnostics, hover, goto-definition, references, document symbols, rename, completion, code actions, inlay hints, formatting, signature help, and semantic tokens.
 - **REPL** — `nulang --repl` with `:help <topic>`, `:type <expr>`, `:load <file>`, tab completion, and automatic multi-line input.
-- **AI runtime** — `agent` declarations, LLM providers (OpenAI, Ollama), episodic/semantic/procedural memory, pipelines, debates, and supervisor teams. Gated behind the `ai-runtime` feature flag. *Experimental.*
-- **Distribution** — location-transparent `send`/`ask` over TCP (NUL0 wire protocol) and gossip membership. *Experimental.* The 8 CRDT types (`GCounter`, `ORSet`, …) are implemented and tested at the Rust embedder level only — `.nula`-level `state crdt` fields are not yet wired to them and behave as `durable` (see SPEC2 §9.10).
+- **AI runtime** — optional LLM providers (OpenAI, Ollama), episodic/semantic/procedural memory, pipelines, debates, and supervisor teams behind the `ai-runtime` feature flag. The `agent` declaration is an *Experimental* ergonomic actor specialization under RFC 0017; the reusable runtime semantics live in ordinary actor/effect primitives and AI libraries.
+- **Distribution & CRDTs** — location-transparent `send`/`ask` over TCP (NUL0 wire protocol), gossip membership, and eight CRDT implementations. `.nula` supports typed `state crdt <type>` fields plus `perform Crdt.*` operations with per-type validation. CRDT snapshots include the actor field-name→CRDT-id mapping, and recovery restores/re-registers those mappings. *Experimental.*
 - **Fabric** — an *Experimental* messaging/stream substrate layered on the actor transport, with topic routing, consumer groups, durable replicated streams, quorum commit, epoch fencing, bounded repair/retry, and confirmed-removal failover. See [`docs/FABRIC.md`](docs/FABRIC.md).
 - **RESP-compatible cache kernel** — an *Experimental* Redis-compatible cache path with packed shard-local storage, Redis Cluster slot routing/`MOVED`, ordered pipelining, and an optional dedicated Mio reactor via the `cache-server` feature. See [`docs/RESP_CACHE_ARCHITECTURE.md`](docs/RESP_CACHE_ARCHITECTURE.md).
-- **WASM backend** — MIR→WASM compilation via `--backend wasm|wasm-run|wasm-aot`, with Wasmtime hosting and SIMD support. This is the canonical portable/cloud execution target, but the current plain-WASM profile still supports fewer language/runtime semantics than bytecode. The separate `wasmfx-backend` feature is an *Experimental* stack-switching path for suspending effects.
+- **WASM backend** — MIR→WASM compilation via `--backend wasm|wasm-run|wasm-aot`, with Wasmtime hosting and SIMD support. This is the canonical portable/cloud execution target, but the current plain-WASM profile still supports fewer language/runtime semantics than bytecode.
+- **WASM Component Model** — `--backend wasm-component` emits WIT alongside WASM for component-oriented interop. The component-model runtime path is *Experimental* and does not imply bytecode semantic parity.
+- **WasmFX backend** — the separate `wasmfx-backend` feature is an *Experimental* stack-switching path for suspending effects.
 - **Secondary native AOT backend** — `--backend native` compiles a restricted subset through Cranelift. It remains useful for differential testing and supported pure/native workloads, but it is not the semantic reference and must not be assumed to have full parity with bytecode. *Experimental.*
 
 ---
@@ -145,7 +155,8 @@ perform IO.print("Hello, " + name + "!")
 
 | Document | Description |
 |----------|-------------|
-| [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) | Installation, values, effects, actors, pattern matching — with runnable code snippets |
+| [`docs/README.md`](docs/README.md) | Documentation map: authoritative references, implementation-status docs, RFCs, and archived design material |
+| [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) | Installation, values, effects, actors, durable entities, pattern matching — with runnable code snippets |
 | [`docs/TUTORIAL.md`](docs/TUTORIAL.md) | **Tutorial:** Build a Weather CLI step by step — variables, functions, HTTP, JSON, pattern matching, records, file I/O |
 | [`docs/PITFALLS.md`](docs/PITFALLS.md) | Common mistakes: `::` vs `.`, `let` vs `var`, `perform` keyword, `catch`/`fail`, record syntax, and more |
 | [`examples/`](examples/) + [`README`](examples/README.md) | 17 verified, self-contained example programs |
@@ -208,7 +219,7 @@ the external-adoption freeze gate is satisfied. See
 |------|-------|
 | **Frozen** | Published v1 compatibility contracts: `.nbc` format v1, NUL0 v1, value layout v1, plus any explicitly Frozen effect contracts. Old versions are never silently reinterpreted; future versions may evolve behind explicit version boundaries. |
 | **Stable** | Nulang Core (pre-adoption), HM type system, effect rows, capability lattice, actor surface. Breaking changes require an RFC, an explicit version transition, diagnostics, and a migration path. |
-| **Experimental** | Everything else — including `wasm-backend`/`wasmfx-backend`, `cache-server`, the AI runtime, Fabric, typed actor-protocol hardening, multi-node distribution, CRDTs (Rust-level only so far), optional persistence backends, and other items marked Experimental in [`CHANGELOG.md`](CHANGELOG.md). |
+| **Experimental** | Everything else — including `wasm-backend`/`wasm-component`/`wasmfx-backend`, `cache-server`, the AI runtime, Fabric, typed actor-protocol hardening, the Experimental `agent`/`workflow`/`database` declaration surfaces, multi-node distribution, source-level CRDT state/replication, optional persistence backends, and other items marked Experimental in [`CHANGELOG.md`](CHANGELOG.md). |
 
 > **Pre-1.0 disclaimer:** Nulang does not have external users yet. The tier
 > guarantees above are the maintainer's stated policy and intent, but **expect

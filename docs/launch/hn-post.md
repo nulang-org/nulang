@@ -24,20 +24,21 @@ Erlang's supervision trees and message-passing actors, give them a
 Hindley-Milner type system with full inference, add Pony-style reference
 capabilities (`iso`/`trn`/`ref`/`val`/`box`/`tag`) for compile-time data-race
 freedom, and make actors *durable* — persistent actors checkpoint and journal
-their state after every behavior, and `entity` declarations are event-sourced
-by default. (Candor up front: journal-based state rebuild is implemented and
-integration-tested at the runtime level, but isn't yet wired to supervised
-restarts — a restarted actor currently starts fresh. That's the top pre-1.0
-milestone; the demo in docs/launch/demo-script.md shows what *does* work
-today, with observed output recorded.)
+their state after behaviors, and `entity` declarations are event-sourced by
+default. Durable-store selection is now wired through `--store` /
+`NULANG_STORE_PATH`, and persistent supervised children hydrate saved state
+during restart. This is still alpha: crash-safety depends on the selected
+store and exact failure boundary, so destructive recovery tests remain part of
+the stabilization gate rather than a blanket durability claim.
 
 What's real today: the compiler (Rust; AST → HIR → MIR) targeting a
 register-based bytecode VM with a Cranelift JIT, supervision, links/monitors,
 an effect system (`perform`/`handle` with resume semantics — effects are
-checked in function signatures), persistent actors with three storage
-backends, a package manager (`nula`), an LSP server, and ~1,680 passing tests.
-There are also Coq/Lean formalization efforts in the repo (partial — see
-formal/).
+checked in function signatures), persistent actors behind a pluggable
+`PersistenceStore` (memory, JSON-file, libSQL/SQLite, plus optional RocksDB
+and PostgreSQL), a package manager (`nula`), an LSP server, and a large Rust
+test/conformance suite. There are also formalization efforts in the repo;
+current CI is the source of truth for test counts.
 
 What's experimental or unfinished, honestly: multi-node distribution (works
 over TCP, marked experimental), the WASM/WasmFX and native AOT execution paths (experimental and semantically
@@ -75,9 +76,9 @@ Gleam attempts.
 **3. "Is this AI-generated?"**
 The repo is public — judge the commit history. LLM tools were used as
 assistants during development (as disclosed in the repo's RFC/status docs),
-but the design, architecture decisions, and this launch post are human. The
-~1,680-test suite, conformance suite under `conformance/`, and bootstrap
+but the design, architecture decisions, and this launch post are human. The test suite, conformance suite under `conformance/`, and bootstrap
 verification are there so you don't have to take anyone's word for anything.
+Test counts move quickly, so CI is more useful than a copied number here.
 
 **4. "Production-ready?"**
 No. It's alpha, explicitly. The README says so, the stability tiers in
@@ -86,11 +87,13 @@ expected. What's offered today is a real, test-covered implementation you can
 build and run — not a production commitment.
 
 **5. "Performance?"**
-Register-based bytecode VM with a Cranelift JIT, multi-threaded work-stealing
-scheduler, ORCA garbage collection. Benchmarks live in `benches/` and
-PERFORMANCE_ANALYSIS.md. We have not done competitive benchmarking against
-BEAM and won't claim wins we haven't measured — perf work is ongoing and the
-AOT backend is experimental.
+Register-based bytecode VM with a Cranelift JIT, sharded multi-threaded
+execution, and ORCA garbage collection. Each live shard has one cooperative
+scheduler owner; multiple shards run in parallel. Chase-Lev stealing exists in
+the scheduler implementation but is not used by the current live per-shard
+loop. Benchmarks live in `benches/` and `docs/PERFORMANCE_ANALYSIS.md`.
+We have not published competitive BEAM/Pony results and won't claim wins we
+haven't measured.
 
 **6. "Why not Pony? You even took its capabilities."**
 Pony is a major influence (credit due: `iso/trn/ref/val/box/tag` are Pony's).
@@ -100,25 +103,26 @@ Erlang-style supervision with links and monitors. Pony's actor persistence is
 not a language-level feature.
 
 **7. "Durable actors that survive kill -9 — really?"**
-Not yet, through the CLI — and we're saying so up front. The persistence
-machinery is real and tested: a `PersistenceStore` trait with in-memory,
-JSON-file, and SQLite backends; checkpointing and journaling after each
-behavior step; and state-rebuild recovery pinned by an integration test that
-drives `recover_actor` directly (`src/integration_tests/mod.rs`). But two
-wirings are missing: the CLI constructs an in-memory store (no flag for a
-file backend), and a supervised restart currently comes back with fresh
-state — we verified this by running it while preparing the demo
-(`docs/launch/demo-script.md` documents the observed behavior). Wiring
-recovery into supervisor restarts and the CLI is the top pre-1.0 milestone.
-What works today, and what the demo shows: crash containment — a supervised
-actor dies, siblings keep their state, the system stays up.
+The old launch answer is obsolete: durable-store selection is now exposed by
+the CLI (`--store` / `NULANG_STORE_PATH`), `Runtime::recover_actor` restores
+snapshot/journal state, and persistent supervised children hydrate a saved
+snapshot in `Supervisor::rebuild_child`. The runtime includes memory and
+JSON stores, default-feature libSQL/SQLite, and optional RocksDB/PostgreSQL
+backends.
+
+That is not the same as claiming production-grade zero-loss recovery from
+every `kill -9`. Store durability settings, crash ordering, artifact/schema
+compatibility, and stale-writer fencing still matter. The active requirement is
+to prove recovery with destructive fault-injection tests before strengthening
+the claim.
 
 **8. "Algebraic effects and actors and capabilities and durability — isn't this too much?"**
 Fair. The mitigations: the effect system is how all I/O is expressed (there's
 one way to do side effects, not four); capabilities are mostly inferred and
-erased at runtime; and the frozen/stable/experimental tiers mean the core you
-learn first is small and won't break. But yes — the feature surface is broad
-for an alpha, and GOVERNANCE.md exists precisely to keep it honest.
+erased at runtime; and the stability tiers keep experimental surfaces distinguishable from
+current Stable semantics. But yes — the feature surface is broad for an alpha,
+and the project now deliberately delays permanent source freezing until there
+is external adoption evidence.
 
 **9. "Who is this for? What's the use case?"**
 Long-lived stateful services that hate losing state: chat/team servers,
@@ -127,8 +131,10 @@ Anywhere you'd reach for Erlang/OTP or an event-sourcing framework plus a
 supervision library, and would rather have the compiler check it.
 
 **10. "1.0.0-frozen but alpha? Windows? Editor support?"**
-`1.0.0-frozen` is a *language* version for the frozen core (bytecode format,
-wire protocol, Nulang Core) — the implementation is alpha; see GOVERNANCE.md.
-Windows isn't supported yet (use WSL); it's on the roadmap. There's a VS Code
-extension in `editors/vscode/` (syntax + LSP) and `nulang --lsp` implements
-hover/goto-def/rename/completion/diagnostics.
+`1.0.0-frozen` is historical artifact metadata. RFC 0021 reclassified
+pre-adoption source semantics so the current source language is not permanently
+frozen; published versioned compatibility contracts remain obligations.
+Tagged release CI now validates Windows x86_64 alongside Linux x86_64/aarch64
+and macOS aarch64. There's a VS Code extension in `editors/vscode/`, and
+`nulang --lsp` provides diagnostics, hover, navigation, rename, completion,
+formatting, code actions, inlay hints, semantic tokens, and more.

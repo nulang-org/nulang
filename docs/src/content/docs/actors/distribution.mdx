@@ -52,14 +52,14 @@ Cluster membership uses **heartbeat-based discovery** and a **gossip protocol** 
 
 Membership state carries an **incarnation number** — higher incarnations win in merge conflicts, preventing split-brain regressions.
 
-Remote spawn is accessed via the Rust API: behaviors are registered with `Runtime::register_spawnable_behavior`, and the wire protocol uses `Packet::SpawnRequest`/`SpawnResponse` for cross-node actor creation. The receiver spawns the named behavior only if it was pre-registered; unknown names return a failed response. A language-level remote-spawn expression is planned but not yet implemented.
+Remote spawn is available through the `spawn@<node_expr> Actor { ... }` source form and the Rust runtime APIs. The wire protocol uses `Packet::SpawnRequest`/`SpawnResponse`; the receiving node still must have the requested spawnable behavior registered, and unknown names fail closed. The current `nulang node` CLI hosts an empty network runtime, so loading arbitrary `.nula` modules into a node remains a deployment/runtime gap.
 
 ## Wire Protocol
 
 The distribution layer uses a custom TCP protocol:
 
 - **Magic**: `NUL0` (4 bytes)
-- **Handshake**: 8-byte node id exchange
+- **Handshake**: 16-byte versioned `NUL0` handshake (magic + wire version + node id)
 - **Frames**: Length-prefixed, big-endian encoded
 - **Packet types**: `ActorMessage`, `Heartbeat`, `Ack`, `SpawnRequest`, `SpawnResponse`, `CrdtSync`, `CrdtDeltaSync`, `Gossip`
 
@@ -95,17 +95,23 @@ CRDT types (`GCounter`, `PNCounter`, `GSet`, `ORSet`, `AWORSet`, `LWWRegister`, 
 
 Each op is rejected (returns `nil`) when the field's CRDT type doesn't match, and also returns `nil` outside an actor context. See [CRDT Stdlib Reference](/stdlib/crdt/) for details.
 
+:::note[Recovery]
+CRDT checkpoints include materialized actor state, serialized CRDT replicas, and the actor's field-name→CRDT-id mapping. `recover_actor` restores the replica snapshot, rebuilds forward/reverse mappings, and re-registers declared CRDT fields before resumed execution.
+:::
+
 ## Persistence
 
 Actors can be persisted for durability:
 
 | Store | Description |
 |-------|-------------|
-| `MemoryStore` | In-memory (default, ephemeral) |
-| `JsonFileStore` | JSON file on disk |
-| `SqliteStore` | SQLite database (via rusqlite) |
+| `MemoryStore` | In-memory (ephemeral) |
+| `JsonFileStore` | JSON-file durable backend |
+| `LibsqlStore` | Default-feature libSQL backend: local SQLite/libSQL or remote Turso |
+| `RocksDbStore` | Optional RocksDB backend (`rocksdb` feature) |
+| `PostgresStore` | Optional PostgreSQL backend (`postgres` feature) |
 
-Persistent actors support journaling and checkpointing for crash recovery.
+Persistent actors support journaling and checkpointing for crash recovery. Durable programs can select storage through `--store <uri>` or `NULANG_STORE_PATH`; recovery guarantees depend on the backend and crash boundary.
 
 ```nulang
 // State durability is configured at the runtime level

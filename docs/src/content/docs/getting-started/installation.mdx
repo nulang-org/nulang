@@ -10,8 +10,9 @@ import CopyMarkdown from '../../../components/CopyMarkdown.astro';
 
 - **Rust** 1.95.0 (pinned by `rust-toolchain.toml`; [rustup](https://rustup.rs))
 - **Python 3** development headers (for PyO3 interop)
-- **Linux** or **macOS**. Windows is not supported yet — use
-  [WSL](https://learn.microsoft.com/windows/wsl/) and build inside a Linux environment.
+- **Linux**, **macOS**, or **Windows x86_64**. Tagged release CI currently
+  validates Linux x86_64/aarch64, macOS aarch64, and Windows x86_64. Other
+  source-build combinations may work but are not release-tested.
 - A C compiler and linker (GCC/Clang + GNU `bfd` linker on Linux)
 
 ## Building from Source
@@ -90,6 +91,14 @@ Install Python via Homebrew:
 ```bash
 brew install python@3.14
 ```
+
+### Windows
+
+Use the tagged Windows x86_64 release for the lowest-friction install. For
+source builds, use the pinned Rust toolchain and a compatible C/C++ build
+environment; optional native dependencies may impose additional platform
+requirements. WSL remains a valid alternative when you want the Linux build
+environment.
 
 ## Next Steps
 

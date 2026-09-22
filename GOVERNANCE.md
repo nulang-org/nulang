@@ -56,22 +56,19 @@ warning, and is removed only in the version after next).
 - The effect-row system (closed/open, regions).
 - The capability lattice (`iso/trn/ref/val/box/tag/lineariso`) and subtyping.
 - The actor surface (`spawn`, `send`, `receive`, supervision).
-- ~~CRDT operations and their merge semantics~~ — **erratum (2026-08-02):**
-  removed. This was never an accurate claim: there is no `.nula`-level
-  syntax to construct or operate on any CRDT type today (no type
-  selector, no `Crdt.*` effect module — `state crdt` fields behave
-  identically to `state durable`; see `SPEC2.md` §9.10/§12.5). Since no
-  conforming program could ever have relied on this surface, its removal
-  is a documentation correction, not a stability-tier deprecation — there
-  is nothing to deprecate. The Rust-level `CrdtManager` delta-sync
-  protocol (`src/runtime/crdt.rs`, `crdt_reg.rs`) is real and tested, but
-  is an embedder API, not a tiered language surface, until an RFC wires
-  it to `state crdt` fields.
+- CRDT operations are **not Stable-tier language surface**. An August 2026
+  erratum correctly removed an earlier unsupported Stable claim. Source-level
+  typed `state crdt <type>` fields and `Crdt.*` operations were implemented
+  later and are covered by conformance tests, but they remain **Experimental**
+  under the unified runtime work (RFC 0017) until an accepted RFC explicitly
+  promotes their source semantics.
 
 ### Experimental
 No stability promise. May change or be removed in any release. Lives behind a
 feature flag (`wasm-backend`, `python`, `sqlite`, `lsp`) or is explicitly
-marked experimental in `CHANGELOG.md`.
+marked experimental in `CHANGELOG.md`. Current examples include multi-node
+distribution, source-level CRDT state/replication, and the higher-level
+`agent`/`workflow` runtime sugar governed by RFC 0017.
 
 ## 2a. Keyword Lifecycle (RFC 0010)
 
