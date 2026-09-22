@@ -197,14 +197,17 @@ nulang nula doc              # generate Markdown API docs
 
 ## Project Status & Stability
 
-Nulang is **alpha software**. The language version is `1.0.0-frozen`
-(RFC 0001/0002). Every public surface is classified into one of three tiers
-(see [`GOVERNANCE.md`](GOVERNANCE.md) for the full definitions):
+Nulang is **alpha software**. Existing v1 artifacts still carry the historical
+`1.0.0-frozen` language metadata, but accepted RFC 0021 no longer treats
+pre-adoption source semantics as permanently Frozen. Published formats remain
+archival compatibility obligations, while source semantics stay Stable until
+the external-adoption freeze gate is satisfied. See
+[`GOVERNANCE.md`](GOVERNANCE.md) for the full definitions:
 
 | Tier | Scope |
 |------|-------|
-| **Frozen** | Never breaks — `.nbc` bytecode format, NUL0 wire protocol, value layout, Nulang Core, and the `IO`/`Spawn`/`Send`/`Receive` built-in effects. |
-| **Stable** | HM type system, effect rows, capability lattice, actor surface. Breaking changes require an RFC and a deprecation cycle. |
+| **Frozen** | Published v1 compatibility contracts: `.nbc` format v1, NUL0 v1, value layout v1, plus any explicitly Frozen effect contracts. Old versions are never silently reinterpreted; future versions may evolve behind explicit version boundaries. |
+| **Stable** | Nulang Core (pre-adoption), HM type system, effect rows, capability lattice, actor surface. Breaking changes require an RFC, an explicit version transition, diagnostics, and a migration path. |
 | **Experimental** | Everything else — including `wasm-backend`/`wasmfx-backend`, `cache-server`, the AI runtime, Fabric, typed actor-protocol hardening, multi-node distribution, CRDTs (Rust-level only so far), optional persistence backends, and other items marked Experimental in [`CHANGELOG.md`](CHANGELOG.md). |
 
 > **Pre-1.0 disclaimer:** Nulang does not have external users yet. The tier
