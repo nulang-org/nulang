@@ -123,7 +123,7 @@ perform IO.print("Hello, " + name + "!")
 ## Feature Highlights
 
 - **Algebraic effects** — `perform Effect.op(args)` / `handle body with { | Effect.op(x) => ... }` with resume semantics. Effect dependencies are explicit in function signatures via `!` rows.
-- **Capability-based types** — `iso`, `trn`, `ref`, `val`, `box`, `tag`, and `lineariso` guarantee memory safety and data-race freedom. Checked at compile time; erased at runtime.
+- **Reference-capability types** — `iso`, `trn`, `ref`, `val`, `box`, `tag`, and `lineariso` govern aliasing, mutation, ownership, and cross-actor sendability. They are distinct from external authority grants.
 - **Hindley-Milner type inference** — full Algorithm W with row-polymorphic records, variant types, and algebraic effect rows.
 - **Actors** — `spawn`, `send`/`!`, `ask`, selective `receive` with `after` timeout, links, monitors, supervision trees, process groups, and actor priority scheduling.
 - **Typed actor protocols** — structural `ActorRef[P]` contracts can restrict public actor APIs to required behaviors. Compiler-derived protocol fingerprints, a trusted schema registry, directional compatibility checks, and pre-mailbox admission are implemented as *Experimental* protocol hardening.
@@ -160,6 +160,7 @@ perform IO.print("Hello, " + name + "!")
 | [`docs/FABRIC.md`](docs/FABRIC.md) | Experimental distributed messaging and durable stream substrate |
 | [`docs/RESP_CACHE_ARCHITECTURE.md`](docs/RESP_CACHE_ARCHITECTURE.md) | Experimental RESP-compatible cache architecture and cluster-routing invariants |
 | [`editors/vscode/`](editors/vscode/) | VS Code extension (syntax highlighting, language essentials, snippets) — build a `.vsix` or install manually |
+| [`RFC/0024-orthogonal-execution-model.md`](RFC/0024-orthogonal-execution-model.md) | Orthogonal model for local computation, scoped tasks, actors, persistence, and identity |
 | [`RFC/`](RFC/) | RFC proposals (format stability, frozen core, deprecation cycles, roadmap) |
 
 ### Docs auto-sync and DeepWiki
