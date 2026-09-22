@@ -5155,6 +5155,17 @@ impl Runtime {
                 .flat_map(|m| &m.state_models)
                 .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
                 .collect();
+            let mut declared_fields: Vec<String> = module
+                .actor_metadata
+                .iter()
+                .flat_map(|m| m.state_models.iter().map(|(name, _)| name.clone()))
+                .collect();
+            for (name, _) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
+                if !declared_fields.contains(name) {
+                    declared_fields.push(name.clone());
+                }
+            }
+            actor.install_state_schema(module, &declared_fields);
         }
         if is_workflow {
             self.actors.insert(actor_id, actor);
@@ -5336,6 +5347,17 @@ impl Runtime {
             .flat_map(|m| &m.state_models)
             .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
             .collect();
+        let mut declared_fields: Vec<String> = module
+            .actor_metadata
+            .iter()
+            .flat_map(|m| m.state_models.iter().map(|(name, _)| name.clone()))
+            .collect();
+        for (name, _) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
+            if !declared_fields.contains(name) {
+                declared_fields.push(name.clone());
+            }
+        }
+        actor.install_state_schema(module, &declared_fields);
 
         // Restore durable state fields from the snapshot.
         for (name, value) in &snapshot.state {
@@ -5423,6 +5445,22 @@ impl Runtime {
                 .iter()
                 .map(|(name, model)| (name.clone(), *model))
                 .collect();
+            let mut declared_fields: Vec<String> = grain_type
+                .default_models
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect();
+            for (name, _) in grain_type
+                .module
+                .actor_metadata
+                .iter()
+                .flat_map(|m| &m.state_defaults)
+            {
+                if !declared_fields.contains(name) {
+                    declared_fields.push(name.clone());
+                }
+            }
+            actor.install_state_schema(&grain_type.module, &declared_fields);
             // Fill declared initial values.
             for (name, c) in grain_type
                 .module
