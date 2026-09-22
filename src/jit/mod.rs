@@ -297,13 +297,16 @@ impl JitSession {
             // Reset counter to allow future retries.
             self.tier2_counters.insert((module_idx, pc), 0);
         } else {
-            // Try SIMD compilation for hot typed regions.
-            if let Some(_func) =
-                unsafe { self.compile_region_simd(module_idx, pc, region_len, instructions, None) }
-            {
-                // SIMD compilation succeeded; the compiled cache was
-                // updated inside compile_region_simd.
-            }
+            // Try SIMD compilation for hot typed regions. This must bypass the
+            // normal compiled-region cache guard: tier 2 is replacing an
+            // existing tier-1 function, not compiling a cold region.
+            //
+            // Promotion is transactional. If SIMD analysis/codegen fails, the
+            // existing tier-1 entry remains installed and execution continues
+            // with it on the next hit.
+            let _ = unsafe {
+                self.compile_region_simd_replace(module_idx, pc, region_len, instructions, None)
+            };
             self.tier2_counters.insert((module_idx, pc), 0);
         }
     }
@@ -418,6 +421,52 @@ impl JitSession {
             instructions,
             native_calls,
         )
+    }
+
+    /// Recompile an already-installed tier-1 region as SIMD code and replace
+    /// its dense compiled slot only after SIMD codegen succeeds.
+    ///
+    /// Unlike [`compile_region_simd`], this deliberately does not return an
+    /// existing cached entry: tier-2 promotion exists specifically to replace
+    /// that entry. It also does not fall back to scalar/typed compilation on
+    /// failure, because the previously compiled tier-1 function is already the
+    /// correct fallback and must remain installed.
+    ///
+    /// # Safety
+    /// Same safety requirements as [`compile_region`].
+    unsafe fn compile_region_simd_replace(
+        &mut self,
+        module_idx: usize,
+        start_offset: usize,
+        num_instrs: usize,
+        instructions: &[crate::bytecode::Instruction],
+        type_metadata: Option<&crate::jit::typed_compiler::TypeMetadata>,
+    ) -> Option<JitFunctionPtr> {
+        use crate::jit::simd_analyzer::analyze_region;
+        use crate::jit::simd_compiler::{compile_simd_region, is_simd_supported};
+
+        if !is_simd_supported() {
+            return None;
+        }
+
+        let simd_region =
+            analyze_region(instructions, start_offset, num_instrs, type_metadata)?;
+        let func_name = format!("nulang_simd_t2_{}_{}", module_idx, start_offset);
+
+        match compile_simd_region(
+            &mut self.module,
+            &mut self.builder_context,
+            &mut self.ctx,
+            &func_name,
+            instructions,
+            &simd_region,
+        ) {
+            Ok(ptr) => {
+                self.store_compiled(module_idx, start_offset, ptr, num_instrs);
+                Some(std::mem::transmute(ptr))
+            }
+            Err(_) => None,
+        }
     }
 
     /// Return the number of regions compiled through the type-directed path.
