@@ -190,6 +190,18 @@ fn try_spawn_actor_with_id(
             if let Some(ref mut mgr) = rt.crdt_manager {
                 mgr.unregister_actor_fields(id);
             }
+
+            // WorkflowStarted may already have committed when the initial
+            // snapshot fails. A failed spawn must not leave that half-created
+            // durable identity behind for later recovery/reconciliation.
+            if let Err(cleanup_error) = rt.persistence.clear(id) {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}; failed to clear partial durable workflow state: {cleanup_error}"
+                    ),
+                ));
+            }
             return Err(error);
         }
     }
@@ -691,6 +703,10 @@ mod authority_tests {
         assert_ne!(actor_id, 0);
         assert!(!rt.actors.contains_key(&actor_id));
         assert!(probe.load_snapshot(actor_id).is_none());
+        assert!(
+            probe.read_workflow_events(actor_id).is_empty(),
+            "failed initial workflow creation must remove the committed start event"
+        );
     }
 
     #[test]
