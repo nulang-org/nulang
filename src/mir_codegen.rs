@@ -1922,10 +1922,7 @@ fn rewrite_terminator_aliases(
     }
 }
 
-fn kill_scalar_aliases(
-    aliases: &mut FxHashMap<mir::LocalId, mir::LocalId>,
-    dst: mir::LocalId,
-) {
+fn kill_scalar_aliases(aliases: &mut FxHashMap<mir::LocalId, mir::LocalId>, dst: mir::LocalId) {
     aliases.remove(&dst);
     aliases.retain(|_, src| *src != dst);
 }
@@ -3707,6 +3704,142 @@ mod optimize_tests {
                 .iter()
                 .any(|c| matches!(c, Constant::String(s) if s == "hello ")),
             "intermediate concat constant must not survive"
+        );
+    }
+
+    #[test]
+    fn test_scalar_copy_propagation_removes_temp_move() {
+        let mut b = mir::FunctionBuilder::new("copy_prop", Some(crate::types::Type::int()));
+        let x = b.add_param("x", crate::types::Type::int());
+        let copied = b.add_temp(crate::types::Type::int());
+        let one = b.add_temp(crate::types::Type::int());
+        let out = b.add_temp(crate::types::Type::int());
+        b.assign(copied, mir::RValue::Load(x));
+        b.assign(one, mir::RValue::Const(Constant::Int(1)));
+        b.assign(
+            out,
+            mir::RValue::Binary(crate::ast::BinOp::Add, copied, one),
+        );
+        b.terminate(mir::Terminator::Return(Some(out)));
+
+        let mut func = b.build();
+        let mut consts = Vec::new();
+        optimize_function(&mut func, &mut consts);
+
+        assert!(
+            !func.blocks[0]
+                .stmts
+                .iter()
+                .any(|stmt| matches!(stmt, mir::Stmt::Assign { dst, .. } if *dst == copied)),
+            "anonymous scalar copy should be propagated and removed"
+        );
+        assert!(
+            func.blocks[0].stmts.iter().any(|stmt| matches!(
+                stmt,
+                mir::Stmt::Assign {
+                    dst,
+                    op: mir::RValue::Binary(crate::ast::BinOp::Add, lhs, _),
+                } if *dst == out && *lhs == x
+            )),
+            "consumer should read the original scalar source directly"
+        );
+    }
+
+    #[test]
+    fn test_scalar_copy_propagation_kills_alias_on_source_reassign() {
+        let mut b = mir::FunctionBuilder::new("copy_kill", Some(crate::types::Type::int()));
+        let x = b.add_param("x", crate::types::Type::int());
+        let copied = b.add_temp(crate::types::Type::int());
+        b.assign(copied, mir::RValue::Load(x));
+        b.assign(x, mir::RValue::Const(Constant::Int(7)));
+        b.terminate(mir::Terminator::Return(Some(copied)));
+
+        let mut func = b.build();
+        let mut consts = Vec::new();
+        optimize_function(&mut func, &mut consts);
+
+        assert_eq!(
+            func.blocks[0].terminator,
+            mir::Terminator::Return(Some(copied)),
+            "copy must retain the pre-reassignment value instead of aliasing the new source"
+        );
+    }
+
+    #[test]
+    fn test_constant_branch_fold_prunes_dead_arm() {
+        let mut b = mir::FunctionBuilder::new("branch_fold", Some(crate::types::Type::int()));
+        let then_block = b.create_block();
+        let else_block = b.create_block();
+        let cond = b.add_temp(crate::types::Type::bool());
+        b.assign(cond, mir::RValue::Const(Constant::Bool(true)));
+        b.terminate(mir::Terminator::Branch {
+            cond,
+            then_: then_block,
+            else_: else_block,
+        });
+
+        b.switch_to(then_block);
+        let yes = b.add_temp(crate::types::Type::int());
+        b.assign(yes, mir::RValue::Const(Constant::Int(1)));
+        b.terminate(mir::Terminator::Return(Some(yes)));
+
+        b.switch_to(else_block);
+        let no = b.add_temp(crate::types::Type::int());
+        b.assign(no, mir::RValue::Const(Constant::Int(2)));
+        b.terminate(mir::Terminator::Return(Some(no)));
+
+        let mut func = b.build();
+        let mut consts = Vec::new();
+        optimize_function(&mut func, &mut consts);
+
+        assert_eq!(
+            func.blocks[0].terminator,
+            mir::Terminator::Jump(then_block),
+            "constant true branch should collapse to the taken edge"
+        );
+        assert!(
+            func.blocks[else_block.0 as usize].stmts.is_empty(),
+            "untaken branch body should be pruned"
+        );
+        assert_eq!(
+            func.blocks[else_block.0 as usize].terminator,
+            mir::Terminator::Return(None),
+            "pruned block keeps block-id stability with an empty return"
+        );
+    }
+
+    #[test]
+    fn test_unreachable_pruning_preserves_effect_handler_roots() {
+        let mut b = mir::FunctionBuilder::new("handler_root", None);
+        let handler = b.create_block();
+        b.add_handler_table(mir::HandlerTableDef {
+            bindings: vec![mir::HandlerBindingDef {
+                effect_name: "E".to_string(),
+                params: Vec::new(),
+                resume: false,
+                single_shot: true,
+                body: handler,
+            }],
+        });
+        b.terminate(mir::Terminator::Return(None));
+
+        b.switch_to(handler);
+        let result = b.add_temp(crate::types::Type::int());
+        b.assign(result, mir::RValue::Const(Constant::Int(9)));
+        b.terminate(mir::Terminator::Return(Some(result)));
+
+        let mut func = b.build();
+        let mut consts = Vec::new();
+        optimize_function(&mut func, &mut consts);
+
+        assert_eq!(
+            func.blocks[handler.0 as usize].terminator,
+            mir::Terminator::Return(Some(result)),
+            "handler body is dynamically reachable through Perform and must remain a root"
+        );
+        assert!(
+            !func.blocks[handler.0 as usize].stmts.is_empty(),
+            "handler body statements must survive ordinary CFG pruning"
         );
     }
 
