@@ -559,11 +559,11 @@ impl JsonFileStore {
         self.actor_dir(actor_id).join("events.jsonl")
     }
 
-    fn append_json_line_cached(
+    fn append_json_line_cached<T: serde::Serialize>(
         files: &mut HashMap<u64, fs::File>,
         actor_id: u64,
         path: PathBuf,
-        json: &str,
+        value: &T,
     ) -> io::Result<()> {
         use std::collections::hash_map::Entry;
 
@@ -581,10 +581,13 @@ impl JsonFileStore {
             }
         };
 
-        writeln!(file, "{}", json)?;
+        serde_json::to_writer(&mut *file, value)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        file.write_all(b"\n")?;
         // Preserve the existing durability contract: each append reaches
         // stable storage before the call returns. The optimization here is
-        // descriptor/directory reuse, not weaker persistence semantics.
+        // descriptor/directory reuse plus allocation-free serialization, not
+        // weaker persistence semantics.
         file.sync_all()
     }
 }
@@ -632,9 +635,7 @@ impl PersistenceStore for JsonFileStore {
 
     fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {
         let path = self.journal_path(actor_id);
-        let json = serde_json::to_string(&entry)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Self::append_json_line_cached(&mut self.journal_files, actor_id, path, &json)
+        Self::append_json_line_cached(&mut self.journal_files, actor_id, path, &entry)
     }
 
     fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
@@ -650,9 +651,12 @@ impl PersistenceStore for JsonFileStore {
 
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
         let path = self.workflow_events_path(actor_id);
-        let json = serde_json::to_string(&event)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Self::append_json_line_cached(&mut self.workflow_event_files, actor_id, path, &json)
+        Self::append_json_line_cached(
+            &mut self.workflow_event_files,
+            actor_id,
+            path,
+            &event,
+        )
     }
 
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
@@ -668,9 +672,7 @@ impl PersistenceStore for JsonFileStore {
 
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
         let path = self.events_path(actor_id);
-        let json = serde_json::to_string(&entry)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Self::append_json_line_cached(&mut self.event_files, actor_id, path, &json)
+        Self::append_json_line_cached(&mut self.event_files, actor_id, path, &entry)
     }
 
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
