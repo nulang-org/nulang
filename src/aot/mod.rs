@@ -1927,8 +1927,7 @@ mod tests {
         use crate::bytecode::Constant;
         use crate::mir::{self, RValue, Terminator};
 
-        let mut builder =
-            mir::FunctionBuilder::new("__main", Some(crate::types::Type::int()));
+        let mut builder = mir::FunctionBuilder::new("__main", Some(crate::types::Type::int()));
         let cond = builder.add_temp(crate::types::Type::bool());
         let result = builder.add_temp(crate::types::Type::int());
         let dead = builder.add_temp(crate::types::Type::unit());
@@ -1959,7 +1958,8 @@ mod tests {
 
         let aot = super::AotModule::compile(&module)
             .expect("dead unsupported branch should be pruned before AOT codegen");
-        let value = aot.run().expect("optimized AOT module should run");
+        let raw = aot.run().expect("optimized AOT module should run");
+        let value = unsafe { crate::vm::Value::from_bits(raw) };
         assert_eq!(value.as_int(), Some(42));
 
         assert_eq!(
