@@ -36,10 +36,10 @@ Experimental (feature-gated or marked): multi-node distribution over TCP,
 WASM/WASM Component Model/WasmFX backends, the secondary native AOT backend
 (restricted semantics), AI runtime, Fabric, RESP cache serving, typed
 actor-protocol hardening, the Experimental `agent`/`workflow`/`database`
-declaration surfaces, source-level CRDT state/replication, and the
-remaining CRDT recovery hardening. `.nula` CRDT fields and `Crdt.*`
-operations are implemented; a recovered actor currently needs its field-name
-mapping re-registered before CRDT operations are fully usable.
+declaration surfaces, and source-level CRDT state/replication.
+`.nula` CRDT fields and `Crdt.*` operations are implemented; checkpoints
+persist CRDT state plus field mappings, and recovery restores/re-registers
+those mappings.
 
 Actor protocol checking now rejects unknown behaviors and wrong arity when the
 receiver is statically known, and explicit `ActorRef[P]` values enforce their
