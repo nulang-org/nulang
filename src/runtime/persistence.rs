@@ -4,7 +4,7 @@
 //! snapshot of durable actor state and an append-only journal of messages.
 //! On recovery the runtime loads the latest snapshot and replays the journal.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -502,16 +502,58 @@ impl PersistenceStore for MemoryStore {
 /// File-backed persistence store using JSON.
 /// Each actor gets `<base_dir>/<actor_id>/snapshot.json`, `journal.jsonl`,
 /// and `workflow_events.jsonl`.
-#[derive(Debug, Clone)]
+///
+/// Append handles are cached, but deliberately bounded per log kind so a node
+/// with many durable actors cannot exhaust its process file-descriptor limit.
+const JSON_APPEND_FILE_CACHE_CAPACITY: usize = 64;
+
+#[derive(Debug)]
 pub struct JsonFileStore {
     base_dir: PathBuf,
+    /// Open append handles keyed by actor. Keeping these descriptors alive
+    /// avoids repeated directory traversal + open/close syscalls on every
+    /// durable journal write. Each append still syncs before returning.
+    journal_files: HashMap<u64, fs::File>,
+    workflow_event_files: HashMap<u64, fs::File>,
+    event_files: HashMap<u64, fs::File>,
+    /// Actor directories already created by this store instance. The runtime
+    /// repeatedly checkpoints the same actors, so this avoids a create_dir_all
+    /// path walk on every snapshot/append after the first write.
+    known_actor_dirs: HashSet<u64>,
+    /// Reused serialization scratch space. A record is fully encoded here
+    /// before any bytes reach durable storage, preserving all-or-error
+    /// serialization without allocating a new String per write.
+    append_buffer: Vec<u8>,
+}
+
+impl Clone for JsonFileStore {
+    fn clone(&self) -> Self {
+        // File descriptors are intentionally not shared across clones. A clone
+        // reopens its append handles lazily, preserving independent ownership
+        // and append offsets while keeping Clone's historical API contract.
+        JsonFileStore {
+            base_dir: self.base_dir.clone(),
+            journal_files: HashMap::new(),
+            workflow_event_files: HashMap::new(),
+            event_files: HashMap::new(),
+            known_actor_dirs: HashSet::new(),
+            append_buffer: Vec::new(),
+        }
+    }
 }
 
 impl JsonFileStore {
     pub fn new<P: AsRef<Path>>(base_dir: P) -> io::Result<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
         fs::create_dir_all(&base_dir)?;
-        Ok(JsonFileStore { base_dir })
+        Ok(JsonFileStore {
+            base_dir,
+            journal_files: HashMap::new(),
+            workflow_event_files: HashMap::new(),
+            event_files: HashMap::new(),
+            known_actor_dirs: HashSet::new(),
+            append_buffer: Vec::new(),
+        })
     }
 
     fn actor_dir(&self, actor_id: u64) -> PathBuf {
@@ -533,22 +575,90 @@ impl JsonFileStore {
     fn events_path(&self, actor_id: u64) -> PathBuf {
         self.actor_dir(actor_id).join("events.jsonl")
     }
+
+    fn ensure_actor_dir(&mut self, actor_id: u64) -> io::Result<()> {
+        if self.known_actor_dirs.contains(&actor_id) {
+            return Ok(());
+        }
+        fs::create_dir_all(self.actor_dir(actor_id))?;
+        self.known_actor_dirs.insert(actor_id);
+        Ok(())
+    }
+
+    fn append_json_line_cached<T: serde::Serialize>(
+        files: &mut HashMap<u64, fs::File>,
+        known_actor_dirs: &mut HashSet<u64>,
+        buffer: &mut Vec<u8>,
+        actor_id: u64,
+        path: PathBuf,
+        value: &T,
+    ) -> io::Result<()> {
+        use std::collections::hash_map::Entry;
+
+        // Serialize the complete record before touching the log. Reusing one
+        // Vec amortizes allocation while preserving the previous guarantee
+        // that a serialization error cannot leave a partial JSON record.
+        buffer.clear();
+        serde_json::to_writer(&mut *buffer, value)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        buffer.push(b'\n');
+
+        // Bound descriptor retention. Every append is sync_all()'d before this
+        // point can be reached again, so dropping an evicted handle cannot
+        // weaken the durability contract. Arbitrary eviction keeps the hot
+        // path simple; a later profile can justify LRU machinery if needed.
+        if !files.contains_key(&actor_id) && files.len() >= JSON_APPEND_FILE_CACHE_CAPACITY {
+            if let Some(evict_actor) = files.keys().next().copied() {
+                files.remove(&evict_actor);
+            }
+        }
+
+        let file = match files.entry(actor_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                if !known_actor_dirs.contains(&actor_id) {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    known_actor_dirs.insert(actor_id);
+                }
+                let file = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                entry.insert(file)
+            }
+        };
+
+        file.write_all(buffer)?;
+        // Preserve the existing durability contract: each append reaches
+        // stable storage before the call returns. The optimization here is
+        // descriptor/directory reuse plus amortized serialization storage,
+        // not weaker persistence semantics.
+        file.sync_all()
+    }
 }
 
 impl PersistenceStore for JsonFileStore {
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
-        let dir = self.actor_dir(snapshot.actor_id);
-        fs::create_dir_all(&dir)?;
-        let path = self.snapshot_path(snapshot.actor_id);
-        let json = serde_json::to_string_pretty(&snapshot)
+        // Fully serialize before touching the on-disk snapshot. Reusing the
+        // store scratch buffer avoids a fresh pretty-JSON String allocation
+        // on every checkpoint while preserving the old serialization failure
+        // semantics.
+        self.append_buffer.clear();
+        serde_json::to_writer_pretty(&mut self.append_buffer, &snapshot)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        self.ensure_actor_dir(snapshot.actor_id)?;
+        let dir = self.actor_dir(snapshot.actor_id);
+        let path = self.snapshot_path(snapshot.actor_id);
         // Write to a temp file in the same directory, then atomically rename
         // it into place: a crash mid-write can no longer leave a truncated
         // snapshot.json that recovery would silently treat as "no state".
         let tmp_path = dir.join("snapshot.json.tmp");
         {
             let mut file = fs::File::create(&tmp_path)?;
-            file.write_all(json.as_bytes())?;
+            file.write_all(&self.append_buffer)?;
             file.sync_all()?;
         }
         fs::rename(&tmp_path, &path)?;
@@ -577,20 +687,15 @@ impl PersistenceStore for JsonFileStore {
     }
 
     fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {
-        let dir = self.actor_dir(actor_id);
-        fs::create_dir_all(&dir)?;
         let path = self.journal_path(actor_id);
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        let json = serde_json::to_string(&entry)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        writeln!(file, "{}", json)?;
-        // fsync before returning so the append is durable, not just in
-        // the page cache (same discipline as save_snapshot's temp file).
-        file.sync_all()?;
-        Ok(())
+        Self::append_json_line_cached(
+            &mut self.journal_files,
+            &mut self.known_actor_dirs,
+            &mut self.append_buffer,
+            actor_id,
+            path,
+            &entry,
+        )
     }
 
     fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
@@ -605,20 +710,15 @@ impl PersistenceStore for JsonFileStore {
     }
 
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
-        let dir = self.actor_dir(actor_id);
-        fs::create_dir_all(&dir)?;
         let path = self.workflow_events_path(actor_id);
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        let json = serde_json::to_string(&event)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        writeln!(file, "{}", json)?;
-        // fsync before returning so the append is durable, not just in
-        // the page cache (same discipline as save_snapshot's temp file).
-        file.sync_all()?;
-        Ok(())
+        Self::append_json_line_cached(
+            &mut self.workflow_event_files,
+            &mut self.known_actor_dirs,
+            &mut self.append_buffer,
+            actor_id,
+            path,
+            &event,
+        )
     }
 
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
@@ -633,22 +733,15 @@ impl PersistenceStore for JsonFileStore {
     }
 
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
-        let dir = self.actor_dir(actor_id);
-        fs::create_dir_all(&dir)?;
         let path = self.events_path(actor_id);
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        let json = serde_json::to_string(&entry)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        writeln!(file, "{}", json)?;
-        // fsync before returning so the event is durable, not just in the
-        // page cache (same discipline as append_journal/append_workflow_event
-        // and save_snapshot's temp file). EventSourced state reconstructs
-        // from this log on recovery, so a lost append is a lost commit.
-        file.sync_all()?;
-        Ok(())
+        Self::append_json_line_cached(
+            &mut self.event_files,
+            &mut self.known_actor_dirs,
+            &mut self.append_buffer,
+            actor_id,
+            path,
+            &entry,
+        )
     }
 
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
@@ -689,6 +782,14 @@ impl PersistenceStore for JsonFileStore {
     }
 
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
+        // Drop cached descriptors before removing the actor directory. This is
+        // required on platforms that do not permit deleting open files and
+        // prevents later appends from targeting an unlinked inode on Unix.
+        self.journal_files.remove(&actor_id);
+        self.workflow_event_files.remove(&actor_id);
+        self.event_files.remove(&actor_id);
+        self.known_actor_dirs.remove(&actor_id);
+
         let dir = self.actor_dir(actor_id);
         if dir.exists() {
             fs::remove_dir_all(dir)?;
@@ -2077,6 +2178,72 @@ mod json_file_store_tests {
         assert_eq!(journal[0].sequence, 1);
         assert_eq!(journal[1].behavior_id, 1);
         assert_eq!(journal[1].payload, vec![PersistedValue::Int(20)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_json_file_store_reuses_append_handles() {
+        let dir = fresh_dir("cached_handles");
+        let mut store = JsonFileStore::new(&dir).unwrap();
+
+        for sequence in 1..=3 {
+            store
+                .append_journal(
+                    7,
+                    JournalEntry {
+                        sequence,
+                        behavior_id: 1,
+                        payload: vec![PersistedValue::Int(sequence as i64)],
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.journal_files.len(), 1);
+        assert_eq!(store.read_journal(7).len(), 3);
+
+        let cloned = store.clone();
+        assert!(
+            cloned.journal_files.is_empty(),
+            "clones must reopen append handles independently"
+        );
+
+        store.clear(7).unwrap();
+        assert!(store.journal_files.is_empty());
+        assert!(!store.known_actor_dirs.contains(&7));
+        assert!(!store.actor_dir(7).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_json_file_store_append_handle_cache_is_bounded() {
+        let dir = fresh_dir("bounded_handles");
+        let mut store = JsonFileStore::new(&dir).unwrap();
+
+        for actor_id in 1..=(JSON_APPEND_FILE_CACHE_CAPACITY as u64 + 5) {
+            store
+                .append_journal(
+                    actor_id,
+                    JournalEntry {
+                        sequence: 1,
+                        behavior_id: 0,
+                        payload: vec![],
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.journal_files.len(),
+            JSON_APPEND_FILE_CACHE_CAPACITY,
+            "writer cache must not grow with the durable actor population"
+        );
+        // Eviction closes only already-synced descriptors; every actor's data
+        // remains readable after its handle leaves the cache.
+        for actor_id in 1..=(JSON_APPEND_FILE_CACHE_CAPACITY as u64 + 5) {
+            assert_eq!(store.read_journal(actor_id).len(), 1);
+        }
+
         let _ = fs::remove_dir_all(&dir);
     }
 
