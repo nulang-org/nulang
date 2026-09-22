@@ -3736,9 +3736,24 @@ impl VM {
                 return 1;
             }
         };
+        // Re-entrant native calls are only sound when the outer JIT backend
+        // and its borrowed execution cache have been detached from the VM.
+        // These debug invariants turn any future ownership regression into an
+        // immediate test/debug failure instead of latent aliasing UB.
+        debug_assert!(
+            self.jit_session.is_none(),
+            "re-entrant JIT direct call entered while VM still owns the JIT backend"
+        );
+
         // The callee lives in the same module as the caller (function_table
         // is per-module; direct calls are within-module).
         let module_idx = self.frames[caller_idx].module_idx;
+        debug_assert!(
+            self.jit_constants
+                .get(module_idx)
+                .map_or(true, |constants| constants.is_empty()),
+            "re-entrant JIT direct call entered while VM still owns JIT constants"
+        );
         let code_offset = match self
             .modules
             .get(module_idx)
