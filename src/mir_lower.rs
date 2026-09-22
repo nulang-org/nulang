@@ -2881,6 +2881,32 @@ mod tests {
     }
 
     #[test]
+    fn test_par_region_markers_survive_into_mir() {
+        let module = lower_source("par { 1; 2; 3 }").unwrap();
+        let main = find_fn(&module, "__main");
+        let markers: Vec<crate::primitives::ParallelRegionMarker> = main
+            .blocks
+            .iter()
+            .flat_map(|b| b.stmts.iter())
+            .filter_map(|stmt| match stmt {
+                mir::Stmt::ParallelMarker { marker } => Some(*marker),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            markers,
+            vec![
+                crate::primitives::ParallelRegionMarker::Begin { branches: 3 },
+                crate::primitives::ParallelRegionMarker::Branch { index: 0 },
+                crate::primitives::ParallelRegionMarker::Branch { index: 1 },
+                crate::primitives::ParallelRegionMarker::Branch { index: 2 },
+                crate::primitives::ParallelRegionMarker::End,
+            ]
+        );
+    }
+
+    #[test]
     fn test_chained_string_concat_with_int_lowers_to_strconcat() {
         // Regression: `s + 2 + 3` where s is a String must lower BOTH adds to
         // StrConcat. Previously the second add lowered to Binary(Add): the
