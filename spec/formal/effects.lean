@@ -433,6 +433,18 @@ theorem accountedBy_singleton_iff
   accountedBy hs (singleton eff) ↔ HandlerScope hs eff := by
   simp [accountedBy, singleton]
 
+/--
+  Handler-stack accounting distributes over effect-row union.
+
+  This is important for application/let/branch rules: if the combined outward
+  row is accounted, each constituent obligation is accounted independently.
+-/
+theorem accountedBy_union_iff
+  (hs : HandlerStack) (left right : EffectRow) :
+  accountedBy hs (union left right) ↔
+    accountedBy hs left ∧ accountedBy hs right := by
+  cases left <;> cases right <;> simp [accountedBy, union]
+
 end EffectRow
 
 -- ==================================================================
@@ -553,6 +565,49 @@ theorem typed_handle_rows_accounted_after_push
           hs eff _ _ bodyDischarged h_residual,
         EffectRow.dischargedBy_preserves_accounting
           hs eff _ _ handlerDischarged h_residual⟩
+
+/--
+  An accounted application accounts for all three effect sources separately:
+  evaluating the function expression, evaluating the argument, and invoking the
+  callee's latent effect contract.
+-/
+theorem typed_application_effect_rows_accounted
+  {Γ : EffContext} {e₁ e₂ : EffExpr} {τ : EffTy} {row : EffectRow}
+  (typed : HasTypeEff Γ (.app e₁ e₂) τ row)
+  (hs : HandlerStack)
+  (h_row : EffectRow.accountedBy hs row) :
+  ∃ argTy immediateFn immediateArg latent,
+    HasTypeEff Γ e₁ (.fn argTy τ latent) immediateFn ∧
+    HasTypeEff Γ e₂ argTy immediateArg ∧
+    EffectRow.accountedBy hs immediateFn ∧
+    EffectRow.accountedBy hs immediateArg ∧
+    EffectRow.accountedBy hs latent := by
+  rcases typed_application_accounts_for_latent_effects typed with
+    ⟨argTy, immediateFn, immediateArg, latent, fnTyped, argTyped, rfl⟩
+  have h_outer :=
+    (EffectRow.accountedBy_union_iff
+      hs immediateFn (EffectRow.union immediateArg latent)).mp h_row
+  have h_inner :=
+    (EffectRow.accountedBy_union_iff hs immediateArg latent).mp h_outer.2
+  exact ⟨argTy, immediateFn, immediateArg, latent,
+    fnTyped, argTyped, h_outer.1, h_inner.1, h_inner.2⟩
+
+/--
+  A typed direct `perform` whose outward row is accounted by the active stack
+  cannot dispatch as unhandled.
+-/
+theorem typed_perform_dispatches_when_accounted
+  {Γ : EffContext} {argument : EffExpr} {eff : EffectLabel}
+  {τ : EffTy} {row : EffectRow}
+  (typed : HasTypeEff Γ (.perform eff argument) τ row)
+  (hs : HandlerStack)
+  (h_row : EffectRow.accountedBy hs row) :
+  HandlerStack.dispatch hs eff = EffectRow.DispatchResult.handled := by
+  cases typed with
+  | tPerform argumentTyped =>
+      have h_scope : HandlerScope hs eff :=
+        (EffectRow.accountedBy_singleton_iff hs eff).mp h_row
+      exact effect_safety_static hs eff h_scope
 
 /-
   The effect calculus now preserves latent function rows through variables and
