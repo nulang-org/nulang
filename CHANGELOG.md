@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Runtime allocation and mailbox accounting — 2026-09-22
+- **Actor bump heaps now allocate their first backing block lazily** (`src/runtime/heap.rs`). Spawning an actor no longer consumes a 16 KiB heap block unless the actor actually performs a small-object heap allocation; LOS-only and heap-idle actors keep the bump block unmaterialized. Existing size-class reuse, chained growth, reset, and ORCA pointer stability are unchanged.
+- **Mailbox logical-count atomics now use relaxed ordering** (`src/runtime/mailbox.rs`). The counter only enforces capacity/accounting; `SegQueue` remains the publication/synchronization mechanism. Atomic modification order still prevents concurrent bounded producers from over-reserving slots without paying unnecessary acquire/release fences.
+
 ### Canonical compiler semantic identity — 2026-09-21
 - **Compiler-owned `SemanticId` now derives from canonical backend-independent MIR plus typed actor-state schemas** (Experimental, `src/semantic_identity.rs`, `src/semantic_schema.rs`, `src/compiler_identity.rs`). The encoding alpha-normalizes compiler-generated IDs, excludes presentation/debug metadata and backend selection, includes executable/effect/authority/durable semantics, and folds dependency semantic identities deterministically. `ArtifactIdentityManifest` assembly now has a typed-program entry point that keeps exact `SourceId`, semantic identity, and backend-specific `ArtifactId` distinct without changing frozen NBC v1.
 
