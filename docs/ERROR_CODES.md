@@ -108,15 +108,22 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 |---------|-------------------------------------------|--------------------------|
 | `W0101` | Deprecated `catch` expression (all forms) | `match` on `Ok`/`Error`, `?` under `T ! E` (RFC 0015) |
 | `W0102` | Deprecated `fail` expression              | `return Error(...)` under `T ! E` (RFC 0015) |
-| `W0201` | Provably non-exhaustive finite `match`     | Add the missing finite case(s) or an unguarded `| _ => ...` fallback |
+| `W0201` | Non-exhaustive typed `match` with witness pattern(s) | Add the missing case(s) or an unguarded `| _ => ...` fallback |
+| `W0202` | Unreachable/subsumed match arm              | Remove/reorder the arm or narrow an earlier unguarded pattern |
 
-### W0201 scope
+### W0201/W0202 pattern analysis
 
-The initial W0201 implementation is deliberately conservative. It proves
-coverage for booleans and closed variants, including recursively finite variant
-payloads. Guarded arms do not contribute to totality because the guard may be
-false. Infinite domains and structural pattern matrices are left undecided
-rather than diagnosed until the full usefulness algorithm is implemented.
+Pattern diagnostics use a typed Maranget-style usefulness matrix. The analysis
+covers nested variants, booleans, tuples, records, Nil/Unit, and literal
+patterns over infinite primitive domains. W0201 reports concrete uncovered
+witness patterns (up to a bounded diagnostic set), while W0202 reports arms
+whose pattern is fully subsumed by previous unguarded arms. Guarded arms are
+checked for reachability but never contribute to total coverage because their
+guard may evaluate to false.
+
+Malformed patterns that cannot be reconciled with the inferred scrutinee type
+remain conservative: they never count toward a type's complete constructor
+signature.
 
 See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 
