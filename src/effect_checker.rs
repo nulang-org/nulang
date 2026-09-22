@@ -4814,8 +4814,8 @@ mod tests {
     fn test_database_declaration_has_no_unaccepted_rfc_0004_deprecation() {
         let ast = parse_module(
             r#"
-            database Users = {
-                table accounts {}
+            database Users {
+                accounts {}
             }
             "#,
         );
