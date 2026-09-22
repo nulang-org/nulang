@@ -5,6 +5,7 @@
 //! identity, optimistic history concurrency, retry scheduling, and cached
 //! completion replay.
 
+mod coordination;
 mod engine;
 mod history;
 mod lease;
@@ -15,7 +16,10 @@ pub use engine::{
     ActivityDispatchRequest, ActivityDispatchResult, ActivityProgress, ActivitySpec, AppendOutcome,
     DurableWorkflowExecutor, WorkflowEngineError, WorkflowRuntime,
 };
-pub use history::{ActivityInvocationId, WorkflowEvent, WorkflowHistory, WorkflowId};
+pub use history::{
+    ActivityInvocationId, SignalId, SignalWaitId, TimerId, WorkflowEvent, WorkflowHistory,
+    WorkflowId,
+};
 pub use lease::{
     FenceCheck, LeaseAcquireOutcome, LeaseReleaseOutcome, LeaseRenewOutcome, WorkerLease,
     WorkerLeaseStore,
@@ -24,4 +28,9 @@ pub use retry::{Backoff, RetryPolicy};
 
 pub use saga::{
     DurableSagaExecutor, SagaAction, SagaPhase, SagaPlan, SagaProgress, SagaStep,
+};
+
+pub use coordination::{
+    DurableSignalExecutor, DurableTimerExecutor, SignalNotifyOutcome, SignalProgress,
+    TimerArmRequest, TimerProgress, WorkflowTimerRuntime,
 };
