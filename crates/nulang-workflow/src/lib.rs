@@ -5,6 +5,7 @@
 //! identity, optimistic history concurrency, retry scheduling, and cached
 //! completion replay.
 
+mod async_engine;
 mod coordination;
 mod engine;
 mod history;
@@ -33,4 +34,8 @@ pub use saga::{
 pub use coordination::{
     DurableSignalExecutor, DurableTimerExecutor, SignalNotifyOutcome, SignalProgress,
     TimerArmRequest, TimerProgress, WorkflowTimerRuntime,
+};
+
+pub use async_engine::{
+    AsyncDurableWorkflowExecutor, AsyncWorkflowRuntime, WorkflowFuture,
 };
