@@ -30,7 +30,7 @@ use cranelift_frontend::FunctionBuilder;
 use cranelift_jit::JITModule;
 use cranelift_module::{Linkage, Module};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::{CodeModule, Constant, Instruction, OpCode};
 use crate::jit::compiler::{emit_arr_load, emit_yield_pc, CompileError};
@@ -183,6 +183,7 @@ pub fn infer_reg_types(module: &CodeModule, pc: usize) -> TypeMetadata {
         let in_window = |target: usize| target >= start && target < end;
         match instr.opcode {
             OpCode::Jmp => {
+                int_cache.flush(&mut builder, regs_ptr);
                 let target = (at as i64 + instr.simm16() as i64) as usize;
                 if in_window(target) {
                     push_succ(target, &mut states, &mut queue, &mut in_queue, &next);
@@ -391,6 +392,109 @@ pub(crate) fn emit_const(builder: &mut FunctionBuilder, regs_ptr: Value, dst: us
     store_reg(builder, regs_ptr, dst, tagged);
 }
 
+/// Region-local cache for proven Int registers.
+///
+/// Cached values use Nulang's *unboxed* representation: a sign-extended,
+/// normalized 48-bit integer in an i64 CLIF value. Only dirty registers are
+/// written back to the VM register file. This lets straight-line typed JIT
+/// sequences keep values in SSA across bytecode instruction boundaries while
+/// preserving the boxed VM ABI at control-flow and helper-call boundaries.
+#[derive(Default)]
+struct NativeIntCache {
+    values: HashMap<usize, Value>,
+    dirty: HashSet<usize>,
+}
+
+impl NativeIntCache {
+    fn load(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        regs_ptr: Value,
+        reg: usize,
+    ) -> Value {
+        if let Some(&value) = self.values.get(&reg) {
+            return value;
+        }
+        let raw = load_reg(builder, regs_ptr, reg);
+        let value = emit_sext48(builder, raw);
+        self.values.insert(reg, value);
+        value
+    }
+
+    fn set(&mut self, reg: usize, value: Value) {
+        self.values.insert(reg, value);
+        self.dirty.insert(reg);
+    }
+
+    fn invalidate(&mut self, reg: usize) {
+        self.values.remove(&reg);
+        self.dirty.remove(&reg);
+    }
+
+    fn flush(&mut self, builder: &mut FunctionBuilder, regs_ptr: Value) {
+        let dirty: Vec<usize> = self.dirty.drain().collect();
+        for reg in dirty {
+            if let Some(&value) = self.values.get(&reg) {
+                let tagged = emit_tag_int(builder, value);
+                store_reg(builder, regs_ptr, reg, tagged);
+            }
+        }
+        self.values.clear();
+    }
+}
+
+/// Normalize an unboxed integer exactly as boxing + reloading would.
+///
+/// Nulang Ints carry a signed 48-bit payload. Keeping a raw i64 across
+/// multiple operations must therefore preserve the implicit wrap that
+/// `emit_tag_int` followed by `emit_sext48` used to provide after every
+/// bytecode instruction.
+fn normalize_unboxed_int(builder: &mut FunctionBuilder, value: Value) -> Value {
+    emit_sext48(builder, value)
+}
+
+/// Count in-region CFG predecessors for every bytecode instruction.
+///
+/// The native cache may cross an instruction boundary only when the next
+/// block has a single predecessor. Join blocks force materialization so no
+/// cached CLIF value is used along a path it does not dominate.
+fn region_predecessor_counts(
+    instructions: &[Instruction],
+    start_offset: usize,
+    end_offset: usize,
+) -> Vec<usize> {
+    let mut counts = vec![0usize; end_offset.saturating_sub(start_offset)];
+
+    let mut add = |target: usize| {
+        if target >= start_offset && target < end_offset {
+            counts[target - start_offset] += 1;
+        }
+    };
+
+    for pc in start_offset..end_offset {
+        let instr = instructions[pc];
+        match instr.opcode {
+            OpCode::Jmp => {
+                add((pc as i64 + instr.simm16() as i64) as usize);
+            }
+            OpCode::JmpT | OpCode::JmpF => {
+                add((pc as i64 + instr.offset16() as i64) as usize);
+                if pc + 1 < end_offset {
+                    add(pc + 1);
+                }
+            }
+            OpCode::Halt | OpCode::Ret | OpCode::RetVal => {}
+            _ => {
+                if pc + 1 < end_offset {
+                    add(pc + 1);
+                }
+            }
+        }
+    }
+
+    counts
+}
+
 // ---------------------------------------------------------------------------
 // Runtime Helper Registration
 // ---------------------------------------------------------------------------
@@ -436,25 +540,22 @@ pub(crate) fn register_runtime_helpers<M: Module>(
 fn emit_typed_ibinop(
     builder: &mut FunctionBuilder,
     regs_ptr: Value,
+    cache: &mut NativeIntCache,
     op1: usize,
     op2: usize,
     dst: usize,
     op: TypedIntOp,
 ) {
-    let a_raw = load_reg(builder, regs_ptr, op1);
-    let b_raw = load_reg(builder, regs_ptr, op2);
-
-    let a = emit_sext48(builder, a_raw);
-    let b = emit_sext48(builder, b_raw);
+    let a = cache.load(builder, regs_ptr, op1);
+    let b = cache.load(builder, regs_ptr, op2);
 
     let result = match op {
         TypedIntOp::Add => builder.ins().iadd(a, b),
         TypedIntOp::Sub => builder.ins().isub(a, b),
         TypedIntOp::Mul => builder.ins().imul(a, b),
     };
-
-    let tagged = emit_tag_int(builder, result);
-    store_reg(builder, regs_ptr, dst, tagged);
+    let result = normalize_unboxed_int(builder, result);
+    cache.set(dst, result);
 }
 
 /// Emit a float binary operation with direct CLIF (no runtime call).
@@ -542,15 +643,14 @@ enum TypedIntDivOp {
 fn emit_typed_idivmod(
     builder: &mut FunctionBuilder,
     regs_ptr: Value,
+    cache: &mut NativeIntCache,
     op1: usize,
     op2: usize,
     dst: usize,
     op: TypedIntDivOp,
 ) {
-    let a_raw = load_reg(builder, regs_ptr, op1);
-    let b_raw = load_reg(builder, regs_ptr, op2);
-    let a = emit_sext48(builder, a_raw);
-    let b = emit_sext48(builder, b_raw);
+    let a = cache.load(builder, regs_ptr, op1);
+    let b = cache.load(builder, regs_ptr, op2);
 
     // Cranelift sdiv/srem trap on zero. Select a harmless divisor for the
     // machine instruction, then select nil for the observable result.
@@ -567,6 +667,7 @@ fn emit_typed_idivmod(
     let nil = builder.ins().iconst(types::I64, TAG_NIL_I64);
     let observable = builder.ins().select(is_zero, nil, tagged);
     store_reg(builder, regs_ptr, dst, observable);
+    cache.invalidate(dst);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -581,15 +682,14 @@ enum TypedIntBitOp {
 fn emit_typed_ibitop(
     builder: &mut FunctionBuilder,
     regs_ptr: Value,
+    cache: &mut NativeIntCache,
     op1: usize,
     op2: usize,
     dst: usize,
     op: TypedIntBitOp,
 ) {
-    let a_raw = load_reg(builder, regs_ptr, op1);
-    let b_raw = load_reg(builder, regs_ptr, op2);
-    let a = emit_sext48(builder, a_raw);
-    let b = emit_sext48(builder, b_raw);
+    let a = cache.load(builder, regs_ptr, op1);
+    let b = cache.load(builder, regs_ptr, op2);
 
     let result = match op {
         TypedIntBitOp::Xor => builder.ins().bxor(a, b),
@@ -607,8 +707,8 @@ fn emit_typed_ibitop(
             }
         }
     };
-    let tagged = emit_tag_int(builder, result);
-    store_reg(builder, regs_ptr, dst, tagged);
+    let result = normalize_unboxed_int(builder, result);
+    cache.set(dst, result);
 }
 
 /// CLIF float binary operations whose result is always a Float.
@@ -633,20 +733,19 @@ enum TypedFloatOp {
 fn emit_typed_icmp(
     builder: &mut FunctionBuilder,
     regs_ptr: Value,
+    cache: &mut NativeIntCache,
     op1: usize,
     op2: usize,
     dst: usize,
     cc: IntCC,
 ) {
-    let a_raw = load_reg(builder, regs_ptr, op1);
-    let b_raw = load_reg(builder, regs_ptr, op2);
-
-    let a = emit_sext48(builder, a_raw);
-    let b = emit_sext48(builder, b_raw);
+    let a = cache.load(builder, regs_ptr, op1);
+    let b = cache.load(builder, regs_ptr, op2);
 
     let cond = builder.ins().icmp(cc, a, b);
     let tagged_bool = emit_tag_bool(builder, cond);
     store_reg(builder, regs_ptr, dst, tagged_bool);
+    cache.invalidate(dst);
 }
 
 /// Emit a typed float comparison with direct CLIF.
@@ -680,12 +779,12 @@ fn emit_typed_fcmp(
 fn emit_typed_iunary(
     builder: &mut FunctionBuilder,
     regs_ptr: Value,
+    cache: &mut NativeIntCache,
     src: usize,
     dst: usize,
     op: TypedIntUnaryOp,
 ) {
-    let raw = load_reg(builder, regs_ptr, src);
-    let val = emit_sext48(builder, raw);
+    let val = cache.load(builder, regs_ptr, src);
 
     let result = match op {
         TypedIntUnaryOp::Neg => builder.ins().ineg(val),
@@ -699,8 +798,8 @@ fn emit_typed_iunary(
         }
     };
 
-    let tagged = emit_tag_int(builder, result);
-    store_reg(builder, regs_ptr, dst, tagged);
+    let result = normalize_unboxed_int(builder, result);
+    cache.set(dst, result);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -721,6 +820,7 @@ enum TypedIntUnaryOp {
 fn emit_typed_logic(
     builder: &mut FunctionBuilder,
     regs_ptr: Value,
+    cache: &mut NativeIntCache,
     op1: usize,
     op2: usize,
     dst: usize,
@@ -766,8 +866,18 @@ fn emit_typed_logic(
             TypedLogicOp::And => "nulang_and",
             TypedLogicOp::Or => "nulang_or",
         };
-        emit_binop_runtime(builder, _helpers, regs_ptr, op1, op2, dst, helper_name);
+        emit_binop_runtime(
+            builder,
+            _helpers,
+            regs_ptr,
+            cache,
+            op1,
+            op2,
+            dst,
+            helper_name,
+        );
     }
+    cache.invalidate(dst);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -781,21 +891,33 @@ enum TypedLogicOp {
 // ---------------------------------------------------------------------------
 
 /// Emit typed int-to-float conversion with direct CLIF.
-fn emit_typed_itof(builder: &mut FunctionBuilder, regs_ptr: Value, src: usize, dst: usize) {
-    let raw = load_reg(builder, regs_ptr, src);
-    let val = emit_sext48(builder, raw);
+fn emit_typed_itof(
+    builder: &mut FunctionBuilder,
+    regs_ptr: Value,
+    cache: &mut NativeIntCache,
+    src: usize,
+    dst: usize,
+) {
+    let val = cache.load(builder, regs_ptr, src);
     let float_val = builder.ins().fcvt_from_sint(types::F64, val);
     let bits = emit_bitcast_f64_to_i64(builder, float_val);
     store_reg(builder, regs_ptr, dst, bits);
+    cache.invalidate(dst);
 }
 
 /// Emit typed float-to-int conversion with direct CLIF.
-fn emit_typed_ftoi(builder: &mut FunctionBuilder, regs_ptr: Value, src: usize, dst: usize) {
+fn emit_typed_ftoi(
+    builder: &mut FunctionBuilder,
+    regs_ptr: Value,
+    cache: &mut NativeIntCache,
+    src: usize,
+    dst: usize,
+) {
     let bits = load_reg(builder, regs_ptr, src);
     let float_val = emit_bitcast_i64_to_f64(builder, bits);
     let int_val = builder.ins().fcvt_to_sint_sat(types::I64, float_val);
-    let tagged = emit_tag_int(builder, int_val);
-    store_reg(builder, regs_ptr, dst, tagged);
+    let int_val = normalize_unboxed_int(builder, int_val);
+    cache.set(dst, int_val);
 }
 
 // ---------------------------------------------------------------------------
@@ -807,11 +929,13 @@ fn emit_binop_runtime(
     builder: &mut FunctionBuilder,
     helpers: &HashMap<&str, FuncRef>,
     regs_ptr: Value,
+    cache: &mut NativeIntCache,
     op1: usize,
     op2: usize,
     dst: usize,
     helper_name: &str,
 ) {
+    cache.flush(builder, regs_ptr);
     let a = load_reg(builder, regs_ptr, op1);
     let b = load_reg(builder, regs_ptr, op2);
     let func_ref = *helpers.get(helper_name).unwrap();
@@ -825,10 +949,12 @@ fn emit_unary_runtime(
     builder: &mut FunctionBuilder,
     helpers: &HashMap<&str, FuncRef>,
     regs_ptr: Value,
+    cache: &mut NativeIntCache,
     src: usize,
     dst: usize,
     helper_name: &str,
 ) {
+    cache.flush(builder, regs_ptr);
     let a = load_reg(builder, regs_ptr, src);
     let func_ref = *helpers.get(helper_name).unwrap();
     let call = builder.ins().call(func_ref, &[a]);
@@ -1008,8 +1134,11 @@ pub fn compile_bytecode_region_typed(
 
     // Seal all new blocks.
     builder.seal_block(yield_block);
-    // Mutable copy of type metadata so we can propagate result types
+    // Mutable copy of type metadata so we can propagate result types.
     let mut meta = type_metadata.map(|m| m.clone()).unwrap_or_default();
+    let predecessor_counts =
+        region_predecessor_counts(instructions, start_offset, end_offset);
+    let mut int_cache = NativeIntCache::default();
 
     // Compile each instruction
     for pc in start_offset..end_offset {
@@ -1021,19 +1150,20 @@ pub fn compile_bytecode_region_typed(
             // -- Special --
             OpCode::Nop => {}
             OpCode::Halt => {
+                int_cache.flush(&mut builder, regs_ptr);
                 builder.ins().jump(return_block, &[]);
             }
-            OpCode::Const0 => {
-                emit_const(&mut builder, regs_ptr, instr.op1 as usize, 0);
-            }
-            OpCode::Const1 => {
-                emit_const(&mut builder, regs_ptr, instr.op1 as usize, 1);
-            }
-            OpCode::Const2 => {
-                emit_const(&mut builder, regs_ptr, instr.op1 as usize, 2);
-            }
-            OpCode::ConstM1 => {
-                emit_const(&mut builder, regs_ptr, instr.op1 as usize, -1);
+            OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
+                let value = match instr.opcode {
+                    OpCode::Const0 => 0,
+                    OpCode::Const1 => 1,
+                    OpCode::Const2 => 2,
+                    OpCode::ConstM1 => -1,
+                    _ => unreachable!(),
+                };
+                let raw = builder.ins().iconst(types::I64, value);
+                int_cache.set(instr.op1 as usize, raw);
+                meta.set_type(instr.op1 as usize, KnownType::Int);
             }
             OpCode::ConstU => {
                 let idx = instr.imm16() as usize;
@@ -1048,6 +1178,7 @@ pub fn compile_bytecode_region_typed(
                 // Destination is op3, matching the interpreter and the scalar
                 // compiler (op1/op2 hold the 16-bit constant index).
                 store_reg(&mut builder, regs_ptr, instr.op3 as usize, val);
+                int_cache.invalidate(instr.op3 as usize);
                 meta.set_type(instr.op3 as usize, KnownType::Unknown);
             }
 
@@ -1055,19 +1186,37 @@ pub fn compile_bytecode_region_typed(
             // Load/Store are plain register copies in this pipeline, exactly
             // like Move/Dup (mirroring the scalar compiler).
             OpCode::Load | OpCode::Store | OpCode::Move | OpCode::Dup => {
-                let val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
-                store_reg(&mut builder, regs_ptr, instr.op2 as usize, val);
-                meta.propagate_result(instr.op2 as usize, instr.op1 as usize);
+                let src = instr.op1 as usize;
+                let dst = instr.op2 as usize;
+                if meta.is_known(src, KnownType::Int) {
+                    let val = int_cache.load(&mut builder, regs_ptr, src);
+                    int_cache.set(dst, val);
+                } else {
+                    let val = load_reg(&mut builder, regs_ptr, src);
+                    store_reg(&mut builder, regs_ptr, dst, val);
+                    int_cache.invalidate(dst);
+                }
+                meta.propagate_result(dst, src);
             }
             OpCode::Swap => {
-                let v1 = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
-                let v2 = load_reg(&mut builder, regs_ptr, instr.op2 as usize);
-                store_reg(&mut builder, regs_ptr, instr.op1 as usize, v2);
-                store_reg(&mut builder, regs_ptr, instr.op2 as usize, v1);
-                let ty1 = meta.get_type(instr.op1 as usize);
-                let ty2 = meta.get_type(instr.op2 as usize);
-                meta.set_type(instr.op1 as usize, ty2);
-                meta.set_type(instr.op2 as usize, ty1);
+                let r1 = instr.op1 as usize;
+                let r2 = instr.op2 as usize;
+                let ty1 = meta.get_type(r1);
+                let ty2 = meta.get_type(r2);
+                if ty1 == KnownType::Int && ty2 == KnownType::Int {
+                    let v1 = int_cache.load(&mut builder, regs_ptr, r1);
+                    let v2 = int_cache.load(&mut builder, regs_ptr, r2);
+                    int_cache.set(r1, v2);
+                    int_cache.set(r2, v1);
+                } else {
+                    int_cache.flush(&mut builder, regs_ptr);
+                    let v1 = load_reg(&mut builder, regs_ptr, r1);
+                    let v2 = load_reg(&mut builder, regs_ptr, r2);
+                    store_reg(&mut builder, regs_ptr, r1, v2);
+                    store_reg(&mut builder, regs_ptr, r2, v1);
+                }
+                meta.set_type(r1, ty2);
+                meta.set_type(r2, ty1);
             }
 
             // -- Integer Arithmetic (typed when both operands known Int) --
@@ -1077,6 +1226,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_ibinop(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1087,14 +1237,16 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         &helpers,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
                         "nulang_iadd",
                     );
                 }
-                // Both branches always produce an Int-tagged result; the
-                // destination's type must not stay stale after a fallback.
+                // Both branches produce an Int result. The typed branch leaves
+                // it unboxed in the native cache; the fallback branch flushes
+                // the cache and stores a boxed result directly.
                 meta.set_type(dst, KnownType::Int);
             }
             OpCode::ISub => {
@@ -1103,6 +1255,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_ibinop(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1113,6 +1266,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         &helpers,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1127,6 +1281,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_ibinop(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1137,6 +1292,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         &helpers,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1151,6 +1307,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_idivmod(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1161,6 +1318,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         &helpers,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1177,6 +1335,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_idivmod(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1187,6 +1346,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         &helpers,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1201,6 +1361,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_iunary(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         dst,
                         TypedIntUnaryOp::Neg,
@@ -1210,6 +1371,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         &helpers,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         dst,
                         "nulang_ineg",
@@ -1220,18 +1382,48 @@ pub fn compile_bytecode_region_typed(
             OpCode::IInc => {
                 let reg = instr.op1 as usize;
                 if meta.is_known(reg, KnownType::Int) {
-                    emit_typed_iunary(&mut builder, regs_ptr, reg, reg, TypedIntUnaryOp::Inc);
+                    emit_typed_iunary(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        reg,
+                        reg,
+                        TypedIntUnaryOp::Inc,
+                    );
                 } else {
-                    emit_unary_runtime(&mut builder, &helpers, regs_ptr, reg, reg, "nulang_iinc");
+                    emit_unary_runtime(
+                        &mut builder,
+                        &helpers,
+                        regs_ptr,
+                        &mut int_cache,
+                        reg,
+                        reg,
+                        "nulang_iinc",
+                    );
                 }
                 meta.set_type(reg, KnownType::Int);
             }
             OpCode::IDec => {
                 let reg = instr.op1 as usize;
                 if meta.is_known(reg, KnownType::Int) {
-                    emit_typed_iunary(&mut builder, regs_ptr, reg, reg, TypedIntUnaryOp::Dec);
+                    emit_typed_iunary(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        reg,
+                        reg,
+                        TypedIntUnaryOp::Dec,
+                    );
                 } else {
-                    emit_unary_runtime(&mut builder, &helpers, regs_ptr, reg, reg, "nulang_idec");
+                    emit_unary_runtime(
+                        &mut builder,
+                        &helpers,
+                        regs_ptr,
+                        &mut int_cache,
+                        reg,
+                        reg,
+                        "nulang_idec",
+                    );
                 }
                 meta.set_type(reg, KnownType::Int);
             }
@@ -1249,6 +1441,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_ibitop(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1293,6 +1486,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         &helpers,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1300,6 +1494,7 @@ pub fn compile_bytecode_region_typed(
                     );
                 }
                 meta.set_type(dst, KnownType::Float);
+                int_cache.invalidate(dst);
             }
             OpCode::FSub => {
                 let dst = instr.op3 as usize;
@@ -1317,6 +1512,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         &helpers,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1324,6 +1520,7 @@ pub fn compile_bytecode_region_typed(
                     );
                 }
                 meta.set_type(dst, KnownType::Float);
+                int_cache.invalidate(dst);
             }
             OpCode::FMul => {
                 let dst = instr.op3 as usize;
@@ -1341,6 +1538,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         &helpers,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1348,6 +1546,7 @@ pub fn compile_bytecode_region_typed(
                     );
                 }
                 meta.set_type(dst, KnownType::Float);
+                int_cache.invalidate(dst);
             }
             OpCode::FDiv => {
                 let dst = instr.op3 as usize;
@@ -1364,6 +1563,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         &helpers,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1371,6 +1571,7 @@ pub fn compile_bytecode_region_typed(
                     );
                 }
                 meta.set_type(dst, KnownType::Unknown);
+                int_cache.invalidate(dst);
             }
 
             // -- Typed Comparisons --
@@ -1380,6 +1581,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_icmp(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1390,6 +1592,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         &helpers,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1397,6 +1600,7 @@ pub fn compile_bytecode_region_typed(
                     );
                 }
                 meta.set_bool_result(dst);
+                int_cache.invalidate(dst);
             }
             OpCode::ICmpLt => {
                 let dst = instr.op3 as usize;
@@ -1404,6 +1608,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_icmp(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1414,6 +1619,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         &helpers,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1421,6 +1627,7 @@ pub fn compile_bytecode_region_typed(
                     );
                 }
                 meta.set_bool_result(dst);
+                int_cache.invalidate(dst);
             }
             OpCode::ICmpGt => {
                 let dst = instr.op3 as usize;
@@ -1428,6 +1635,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_icmp(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1438,6 +1646,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         &helpers,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1445,6 +1654,7 @@ pub fn compile_bytecode_region_typed(
                     );
                 }
                 meta.set_bool_result(dst);
+                int_cache.invalidate(dst);
             }
             OpCode::ICmpLe => {
                 let dst = instr.op3 as usize;
@@ -1452,6 +1662,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_icmp(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1462,6 +1673,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         &helpers,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1469,6 +1681,7 @@ pub fn compile_bytecode_region_typed(
                     );
                 }
                 meta.set_bool_result(dst);
+                int_cache.invalidate(dst);
             }
             OpCode::ICmpGe => {
                 let dst = instr.op3 as usize;
@@ -1476,6 +1689,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_icmp(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1486,6 +1700,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         &helpers,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1493,6 +1708,7 @@ pub fn compile_bytecode_region_typed(
                     );
                 }
                 meta.set_bool_result(dst);
+                int_cache.invalidate(dst);
             }
             OpCode::FCmpEq => {
                 // Always use the runtime helper: `nulang_fcmp_eq` compares with
@@ -1503,12 +1719,14 @@ pub fn compile_bytecode_region_typed(
                     &mut builder,
                     &helpers,
                     regs_ptr,
+                    &mut int_cache,
                     instr.op1 as usize,
                     instr.op2 as usize,
                     dst,
                     "nulang_fcmp_eq",
                 );
                 meta.set_bool_result(dst);
+                int_cache.invalidate(dst);
             }
             OpCode::FCmpLt => {
                 let dst = instr.op3 as usize;
@@ -1526,6 +1744,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         &helpers,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1533,6 +1752,7 @@ pub fn compile_bytecode_region_typed(
                     );
                 }
                 meta.set_bool_result(dst);
+                int_cache.invalidate(dst);
             }
             OpCode::FCmpGt => {
                 let dst = instr.op3 as usize;
@@ -1550,6 +1770,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         &helpers,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1557,6 +1778,7 @@ pub fn compile_bytecode_region_typed(
                     );
                 }
                 meta.set_bool_result(dst);
+                int_cache.invalidate(dst);
             }
 
             // -- Logic --
@@ -1565,16 +1787,19 @@ pub fn compile_bytecode_region_typed(
                     &mut builder,
                     &helpers,
                     regs_ptr,
+                    &mut int_cache,
                     instr.op1 as usize,
                     instr.op2 as usize,
                     "nulang_not",
                 );
                 meta.set_bool_result(instr.op2 as usize);
+                int_cache.invalidate(instr.op2 as usize);
             }
             OpCode::And => {
                 emit_typed_logic(
                     &mut builder,
                     regs_ptr,
+                    &mut int_cache,
                     instr.op1 as usize,
                     instr.op2 as usize,
                     instr.op3 as usize,
@@ -1583,11 +1808,13 @@ pub fn compile_bytecode_region_typed(
                     &meta,
                 );
                 meta.set_bool_result(instr.op3 as usize);
+                int_cache.invalidate(instr.op3 as usize);
             }
             OpCode::Or => {
                 emit_typed_logic(
                     &mut builder,
                     regs_ptr,
+                    &mut int_cache,
                     instr.op1 as usize,
                     instr.op2 as usize,
                     instr.op3 as usize,
@@ -1596,6 +1823,7 @@ pub fn compile_bytecode_region_typed(
                     &meta,
                 );
                 meta.set_bool_result(instr.op3 as usize);
+                int_cache.invalidate(instr.op3 as usize);
             }
 
             // -- Control Flow --
@@ -1614,6 +1842,7 @@ pub fn compile_bytecode_region_typed(
                 }
             }
             OpCode::JmpT => {
+                int_cache.flush(&mut builder, regs_ptr);
                 let target = (pc as i64 + instr.offset16() as i64) as usize;
                 let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
                 // Branch conditions are NaN-tagged bools; truthiness is the low
@@ -1642,6 +1871,7 @@ pub fn compile_bytecode_region_typed(
                 }
             }
             OpCode::JmpF => {
+                int_cache.flush(&mut builder, regs_ptr);
                 let target = (pc as i64 + instr.offset16() as i64) as usize;
                 let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
                 let one = builder.ins().iconst(types::I64, 1);
@@ -1673,25 +1903,43 @@ pub fn compile_bytecode_region_typed(
                 let src = instr.op1 as usize;
                 let dst = instr.op2 as usize;
                 if meta.is_known(src, KnownType::Int) {
-                    emit_typed_itof(&mut builder, regs_ptr, src, dst);
+                    emit_typed_itof(&mut builder, regs_ptr, &mut int_cache, src, dst);
                 } else {
-                    emit_unary_runtime(&mut builder, &helpers, regs_ptr, src, dst, "nulang_itof");
+                    emit_unary_runtime(
+                        &mut builder,
+                        &helpers,
+                        regs_ptr,
+                        &mut int_cache,
+                        src,
+                        dst,
+                        "nulang_itof",
+                    );
                 }
                 meta.set_type(dst, KnownType::Float);
+                int_cache.invalidate(dst);
             }
             OpCode::FToI => {
                 let src = instr.op1 as usize;
                 let dst = instr.op2 as usize;
                 if meta.is_known(src, KnownType::Float) {
-                    emit_typed_ftoi(&mut builder, regs_ptr, src, dst);
+                    emit_typed_ftoi(&mut builder, regs_ptr, &mut int_cache, src, dst);
                 } else {
-                    emit_unary_runtime(&mut builder, &helpers, regs_ptr, src, dst, "nulang_ftoi");
+                    emit_unary_runtime(
+                        &mut builder,
+                        &helpers,
+                        regs_ptr,
+                        &mut int_cache,
+                        src,
+                        dst,
+                        "nulang_ftoi",
+                    );
                 }
                 meta.set_type(dst, KnownType::Int);
             }
 
             // -- Return --
             OpCode::Ret | OpCode::RetVal => {
+                int_cache.flush(&mut builder, regs_ptr);
                 builder.ins().jump(return_block, &[]);
             }
 
@@ -1710,6 +1958,7 @@ pub fn compile_bytecode_region_typed(
             }
             // Everything else
             _ => {
+                int_cache.flush(&mut builder, regs_ptr);
                 builder.ins().jump(return_block, &[]);
             }
         }
@@ -1722,8 +1971,13 @@ pub fn compile_bytecode_region_typed(
 
         if !is_terminator {
             if let Some(&next_block) = blocks.get(&(pc + 1)) {
+                let next_preds = predecessor_counts[pc + 1 - start_offset];
+                if next_preds != 1 {
+                    int_cache.flush(&mut builder, regs_ptr);
+                }
                 builder.ins().jump(next_block, &[]);
             } else {
+                int_cache.flush(&mut builder, regs_ptr);
                 builder.ins().jump(return_block, &[]);
             }
         }
