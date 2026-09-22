@@ -432,6 +432,12 @@ def main() -> int:
                 try:
                     cmd = build_command(language, workload_dir, build_dir, nulang_bin)
                     run_env: dict[str, str] = {}
+                    if language == "nulang":
+                        # These are intentionally long-running, checksum-validated
+                        # benchmark kernels. Keep the production VM's default
+                        # runaway-program guard unchanged; raise it only for the
+                        # bounded benchmark child process.
+                        run_env["NULANG_STEP_LIMIT"] = "100000000"
                     if is_actor_workload:
                         if language == "nulang":
                             run_env["NULANG_SHARDS"] = "1"
