@@ -77,21 +77,76 @@ pub fn run(args: &[String]) -> NuResult<()> {
         }
         Some("init") => cmd_init(),
         Some("build") => {
-            let web = args.get(1).map(String::as_str) == Some("--web");
+            let mut web = false;
+            let mut json = false;
+            let mut target: Option<&str> = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--web" => web = true,
+                    "--json" => json = true,
+                    "--target" => {
+                        i += 1;
+                        if i >= args.len() {
+                            return Err(NuError::PackageError {
+                                msg: "--target requires bytecode, wasm, or cwasm".to_string(),
+                                span: Span::default(),
+                            });
+                        }
+                        target = Some(args[i].as_str());
+                    }
+                    other => {
+                        return Err(NuError::PackageError {
+                            msg: format!("unknown flag '{}' for nula build", other),
+                            span: Span::default(),
+                        });
+                    }
+                }
+                i += 1;
+            }
+
+            if web && (json || target.is_some()) {
+                return Err(NuError::PackageError {
+                    msg: "--web cannot be combined with --json or --target".to_string(),
+                    span: Span::default(),
+                });
+            }
+
             if web {
                 cmd_build_web()
             } else {
-                let json = args[1..].iter().any(|a| a == "--json");
-                if args.len() > 1 && !json {
-                    return Err(NuError::PackageError {
-                        msg: format!("unknown flag '{}' for nula build", args[1]),
+                match target.unwrap_or("bytecode") {
+                    "bytecode" | "nbc" => cmd_build(json),
+                    "wasm" => {
+                        if json {
+                            return Err(NuError::PackageError {
+                                msg: "--json is not yet supported with --target wasm".to_string(),
+                                span: Span::default(),
+                            });
+                        }
+                        cmd_build_wasm_target(false)
+                    }
+                    "cwasm" => {
+                        if json {
+                            return Err(NuError::PackageError {
+                                msg: "--json is not yet supported with --target cwasm".to_string(),
+                                span: Span::default(),
+                            });
+                        }
+                        cmd_build_wasm_target(true)
+                    }
+                    other => Err(NuError::PackageError {
+                        msg: format!(
+                            "unknown build target '{}' (expected bytecode, wasm, or cwasm)",
+                            other
+                        ),
                         span: Span::default(),
-                    });
+                    }),
                 }
-                cmd_build(json)
             }
         }
-        Some("build-wasm") => cmd_build_wasm(),
+        // Compatibility alias for the historical AOT-oriented package build.
+        Some("build-wasm") => cmd_build_wasm_target(true),
         Some("test") => {
             let mut filter: Option<&str> = None;
             let mut verbose = false;
@@ -288,8 +343,11 @@ fn print_usage() {
     println!("                Scaffold a new package directory");
     println!("                Templates: default, cli, lib, full");
     println!("  init          Scaffold a new package in the current directory");
-    println!("  build         Build the package (type-check + .nbc artifact in .nula/dist/)");
-    println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
+    println!("  build [--target bytecode|wasm|cwasm]");
+    println!("                Build the package; bytecode is the default");
+    println!("                wasm emits portable .wasm in .nula/dist/");
+    println!("                cwasm emits portable .wasm plus AOT .cwasm");
+    println!("  build-wasm    Compatibility alias for 'build --target cwasm'");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
     println!("  run           Build and run the package entry point");
     println!("  run --watch   Build and re-run on source changes");
@@ -1209,9 +1267,15 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
     })
 }
 
-/// `nula build-wasm`: compile package to .wasm + AOT .cwasm.
-/// `nula build-wasm`: compile package to .wasm + AOT .cwasm in .nula/dist/.
-fn cmd_build_wasm() -> NuResult<()> {
+/// Build the current package into the portable WASM artifact consumed by
+/// deployment platforms. When `aot` is true, also ask the compiler to emit
+/// the engine-specific CWASM sidecar used by the historical `build-wasm` alias.
+///
+/// This path deliberately goes through `prepare_package()` and
+/// `capability_args()` so package dependency resolution, language-version
+/// checks, module paths, and declared capabilities stay identical to the
+/// normal package build.
+fn cmd_build_wasm_target(aot: bool) -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     let manifest = Manifest::load(&root).map_err(|e| NuError::PackageError {
@@ -1231,11 +1295,29 @@ fn cmd_build_wasm() -> NuResult<()> {
 
     let wasm_path = dist_dir.join(format!("{}.wasm", name));
     let wasm_path_str = wasm_path.to_string_lossy().into_owned();
+    let backend = if aot { "wasm-aot" } else { "wasm" };
+    let caps = capability_args();
+    let cap_refs: Vec<&str> = caps.iter().map(|s| s.as_str()).collect();
 
-    eprintln!("Building {} (WASM AOT)...", name);
-    eprintln!("  Compiling {} to WASM...", entry.display());
-    nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
-    println!("WASM AOT build succeeded.");
+    eprintln!(
+        "Building {} ({})...",
+        name,
+        if aot { "WASM + AOT" } else { "portable WASM" }
+    );
+    eprintln!("  Compiling {}...", entry.display());
+    nulang_exe(
+        &[
+            &["--backend", backend, "--out", &wasm_path_str, &entry_str],
+            &cap_refs[..],
+        ]
+        .concat(),
+    )?;
+
+    println!("Build succeeded: {}", wasm_path.display());
+    if aot {
+        let cwasm_path = wasm_path.with_extension("cwasm");
+        println!("AOT artifact: {}", cwasm_path.display());
+    }
     Ok(())
 }
 
@@ -2701,6 +2783,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn test_capability_args_follow_manifest_declarations() {
+        let dir = std::env::temp_dir().join(format!(
+            "nulang_build_caps_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = ChangeDir::new(&dir);
+
+        scaffold_package(&dir, "caps-pkg", "default").expect("scaffold should succeed");
+        let mut manifest = Manifest::load(&dir).expect("manifest should load");
+        manifest.package.capabilities = vec!["net".to_string(), "fs".to_string()];
+        manifest.save(&dir).expect("manifest should save");
+
+        assert_eq!(
+            capability_args(),
+            vec![
+                "--with".to_string(),
+                "net".to_string(),
+                "--with".to_string(),
+                "fs".to_string()
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn test_print_usage_does_not_panic() {
         print_usage();
