@@ -319,41 +319,36 @@ impl ActorHeap {
     // Construction
     // ------------------------------------------------------------------
 
-    /// Create a new per-actor heap with the given total backing size.
+    /// Create a new per-actor heap with the given initial bump-block size.
     ///
-    /// The backing memory is allocated with the global allocator and is
-    /// 8-byte aligned.  The block is eagerly reserved but lazily committed
-    /// (the bump pointer touches pages on demand), and when it fills up the
-    /// heap grows by chaining another block — see [`ActorHeap::grow_bump_block`].
-    /// The `actor_id` defaults to `0`; the caller should
-    /// invoke [`ActorHeap::set_actor_id`] as soon as the real actor ID is
-    /// known.
+    /// Construction is allocation-free: the first bump block is acquired only
+    /// when the actor performs its first small-object allocation. This keeps
+    /// idle actors from reserving one allocator block each. The first allocation
+    /// still prefers the thread-local heap pool before the global allocator.
+    /// Large-object-space allocations do not force a bump block to exist.
+    ///
+    /// Once materialized, the active block is 8-byte aligned and grows by
+    /// chaining another block when exhausted — see
+    /// [`ActorHeap::grow_bump_block`]. The `actor_id` defaults to `0`;
+    /// the caller should invoke [`ActorHeap::set_actor_id`] as soon as the
+    /// real actor ID is known.
     ///
     /// # Panics
     ///
     /// Panics if `total_size` is zero or the layout is invalid.
     pub fn new(total_size: usize) -> Self {
         assert!(total_size > 0, "ActorHeap size must be > 0");
-
-        // Try the thread-local heap pool before the global allocator.
-        let (base, actual_size) = HEAP_POOL
-            .with(|pool| pool.borrow_mut().acquire(total_size))
-            .unwrap_or_else(|| {
-                let layout = std::alloc::Layout::from_size_align(total_size, ALIGN)
-                    .expect("invalid ActorHeap layout");
-                let base = unsafe { std::alloc::alloc(layout) };
-                if base.is_null() {
-                    std::alloc::handle_alloc_error(layout);
-                }
-                (base, total_size)
-            });
+        // Preserve the constructor's layout-validation contract without
+        // allocating the backing block yet.
+        std::alloc::Layout::from_size_align(total_size, ALIGN)
+            .expect("invalid ActorHeap layout");
 
         ActorHeap {
             actor_id: 0,
-            base,
-            current: base,
-            limit: unsafe { base.add(actual_size) },
-            total_size: actual_size,
+            base: std::ptr::null_mut(),
+            current: std::ptr::null_mut(),
+            limit: std::ptr::null_mut(),
+            total_size,
             used_bytes: 0,
             prior_used: 0,
             retired_blocks: Vec::new(),
@@ -374,6 +369,39 @@ impl ActorHeap {
     /// into their header.  Existing objects are **not** updated.
     pub fn set_actor_id(&mut self, id: u64) {
         self.actor_id = id;
+    }
+
+    /// Acquire a bump block of at least `min_capacity` bytes, preferring the
+    /// thread-local recycle pool. The returned size may exceed the request when
+    /// a larger pooled block is reused.
+    fn acquire_bump_block(&self, min_capacity: usize) -> Option<(*mut u8, usize)> {
+        let requested = self.total_size.max(min_capacity);
+        if let Some(block) = HEAP_POOL.with(|pool| pool.borrow_mut().acquire(requested)) {
+            return Some(block);
+        }
+
+        let layout = std::alloc::Layout::from_size_align(requested, ALIGN).ok()?;
+        // SAFETY: `layout` is non-zero and valid.
+        let base = unsafe { std::alloc::alloc(layout) };
+        if base.is_null() {
+            return None;
+        }
+        Some((base, requested))
+    }
+
+    /// Materialize the first bump block on demand.
+    fn ensure_bump_block(&mut self, min_capacity: usize) -> Option<()> {
+        if !self.base.is_null() {
+            return Some(());
+        }
+
+        let (base, actual_size) = self.acquire_bump_block(min_capacity)?;
+        self.base = base;
+        self.current = base;
+        // SAFETY: `base` owns `actual_size` bytes from the allocator/pool.
+        self.limit = unsafe { base.add(actual_size) };
+        self.total_size = actual_size;
+        Some(())
     }
 
     // ------------------------------------------------------------------
@@ -468,6 +496,7 @@ impl ActorHeap {
         }
 
         // --- Slow path: bump allocation, chaining a new block on exhaustion ---
+        self.ensure_bump_block(block_size)?;
         unsafe {
             if self.current.add(block_size) > self.limit {
                 // The active block is full.  Objects never move (raw payload
@@ -702,21 +731,22 @@ impl ActorHeap {
     ///
     /// Returns `None` only when the global allocator fails.
     fn grow_bump_block(&mut self, min_capacity: usize) -> Option<()> {
-        let new_size = self.total_size.max(min_capacity);
-        let layout = std::alloc::Layout::from_size_align(new_size, ALIGN).ok()?;
-        // SAFETY: layout has non-zero size (`total_size` > 0) and is valid.
-        let base = unsafe { std::alloc::alloc(layout) };
-        if base.is_null() {
-            // Report OS OOM as exhaustion, matching alloc's `None` contract.
-            return None;
-        }
+        debug_assert!(
+            !self.base.is_null(),
+            "grow_bump_block requires a materialized active block"
+        );
+        let old_base = self.base;
+        let old_size = self.total_size;
+        let old_used = self.used_bytes;
+        let (base, new_size) = self.acquire_bump_block(min_capacity)?;
 
         // Retire the exhausted block; its contents stay exactly where they are.
-        self.retired_blocks.push((self.base, self.total_size));
-        self.prior_used += self.used_bytes;
+        self.retired_blocks.push((old_base, old_size));
+        self.prior_used += old_used;
 
         self.base = base;
         self.current = base;
+        // SAFETY: `base` owns `new_size` bytes from the allocator/pool.
         self.limit = unsafe { base.add(new_size) };
         self.total_size = new_size;
         self.used_bytes = 0;
@@ -1032,16 +1062,57 @@ impl Drop for ActorHeap {
         self.release_los_blocks();
         // Return retired bump blocks to the pool.
         self.release_retired_blocks();
-        // Return the primary bump block to the pool.
-        HEAP_POOL.with(|pool| {
-            pool.borrow_mut().release(self.base, self.total_size);
-        });
+        // A never-used heap has no primary bump block to return.
+        if !self.base.is_null() {
+            HEAP_POOL.with(|pool| {
+                pool.borrow_mut().release(self.base, self.total_size);
+            });
+        }
     }
 }
 
 // =============================================================================
 // Unit Tests
 // =============================================================================
+
+#[test]
+fn test_new_defers_bump_block_allocation() {
+    let heap = ActorHeap::new(16 * 1024);
+    assert!(heap.base.is_null());
+    assert!(heap.current.is_null());
+    assert!(heap.limit.is_null());
+    assert_eq!(heap.used(), 0);
+    assert_eq!(heap.free_bytes(), 16 * 1024);
+}
+
+#[test]
+fn test_first_small_alloc_materializes_bump_block() {
+    let mut heap = ActorHeap::new(16 * 1024);
+    heap.set_actor_id(77);
+    let payload = heap.alloc(8, TypeTag::Raw).expect("alloc failed");
+
+    assert!(!heap.base.is_null());
+    assert!(!heap.current.is_null());
+    assert!(!heap.limit.is_null());
+    unsafe {
+        assert_eq!((*ActorHeap::header_of(payload)).actor_id, 77);
+    }
+}
+
+#[test]
+fn test_los_allocation_does_not_materialize_bump_block() {
+    let mut heap = ActorHeap::new(16 * 1024);
+    let payload = heap.alloc(1024, TypeTag::Raw).expect("LOS alloc failed");
+
+    assert!(heap.base.is_null());
+    assert_eq!(heap.live_count(), 1);
+    unsafe {
+        heap.free(payload);
+    }
+    heap.reset();
+    assert!(heap.base.is_null());
+    assert_eq!(heap.live_count(), 0);
+}
 
 #[test]
 fn test_alloc_and_write() {
