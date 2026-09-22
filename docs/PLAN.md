@@ -944,9 +944,11 @@ runtime withstands adversarial operational review. Both hold up as
    definitions in `spec/formal/`:
    - `types.lean`: `progress`/`preservation`/`type_soundness` —
      **proved 2026-08-14**.
-   - `capabilities.lean`: `cap_sendable` (only `val`/`tag` cross actor
-     boundaries) — proved; `linear_iso_at_most_once` — open, needs the
-     split-context `HasTypeCap` refinement.
+   - `capabilities.lean`: `cap_sendable` and the capability lattice laws
+     are proved. The compiler's split linear-consumption join is now modeled
+     with `may`/union and `must`/intersection facts; the branch laws are
+     proved with no admitted theorem in this rooted file. A full expression-
+     level input/output-context typing judgment remains future strengthening.
    - `effects.lean`: `effect_safety` (closed row `{}` cannot perform an
      unhandled effect) — still a `True` stub, not proved; progress+
      preservation for handler dispatch — open.
@@ -956,19 +958,16 @@ runtime withstands adversarial operational review. Both hold up as
      `src/typechecker.rs`, `src/effect_checker.rs`, or `src/types.rs`
      without a corresponding Lean update or an explicit `@sorry_ok`
      annotation reviewed by the steward.
-2. **LinearIso must-use enforcement.** Upgrade the at-most-once check
-   in `CapabilityAnalyzer` (`src/effect_checker.rs`) to exactly-once
-   with a proof. The Lean statement is the source of truth.
-   **Partial progress (2026-08-02):** exactly-once is now enforced for
-   `let`-bound linear values (`Expr::Let`'s must-use check, with a
-   transparent-rebind exemption for bare `let a = x` aliases — 8 new
-   tests). Still open: function/lambda parameter-level must-use (a
-   linear value already bound in the *initial* context, e.g. a
-   parameter, is not yet checked), and the Lean proof itself
-   (`linear_at_most_once` in `capabilities.lean` is still `sorry` —
-   the Rust-side implementation moved ahead of the formal statement,
-   and the statement requires the split-context refinement of
-   `HasTypeCap`, documented 2026-08-14).
+2. **LinearIso must-use enforcement.** **Implemented, strengthened 2026-09-22.**
+   `CapabilityAnalyzer` enforces exactly-once use for let-bound and
+   initial-context linear bindings. Branch joins now use split ownership flow:
+   `may` is unioned to prevent reuse after a move on any reaching path, while
+   `must` is intersected so a must-use obligation is discharged only when
+   every path consumes it. Loop and receive-guard repeat hazards are rejected.
+   `spec/formal/capabilities.lean` proves the corresponding split-flow branch
+   laws and removes the old known-false single-context conjecture. Remaining
+   formal work is the stronger full Core input/output-context typing judgment.
+
 3. **Backend-trait completion (RFC 0003 item 6 full wiring).** Route
    `src/jit/`, `src/mir_wasm.rs`, `src/wasm_runtime.rs`, and
    `src/python/` behind the traits already defined in `src/backends/`.
