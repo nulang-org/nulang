@@ -51,6 +51,15 @@ version + migration.*
 
 ## Stable tier
 
+### Durable SDK saga compensation — 2026-09-22
+- **`nulang-workflow` now provides replay-safe saga orchestration**
+  (Experimental, `crates/nulang-workflow/src/saga.rs`). Saga plans are pinned
+  by a canonical content hash, forward steps commit contiguously, terminal
+  failure records the exact failed step, and compensations execute in reverse
+  commit order through the same durable activity engine. Completed
+  compensations are journaled so crash recovery does not repeat already
+  recorded rollback work; incompatible plan/history changes fail closed.
+
 ### Fenced workflow worker leases — 2026-09-22
 - **Durable activity workers now have a reusable lease/heartbeat/fencing contract**
   (Experimental, `crates/nulang-workflow/src/lease.rs`,
