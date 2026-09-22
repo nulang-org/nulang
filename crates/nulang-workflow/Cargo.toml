@@ -1,0 +1,10 @@
+[package]
+name = "nulang-workflow"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Durable workflow orchestration primitives for Nulang"
+
+[lib]
+name = "nulang_workflow"
+path = "src/lib.rs"
