@@ -2,8 +2,10 @@
 //!
 //! When the typechecker knows a register holds an `Int` or `Float`, the JIT
 //! can skip NaN-tag manipulation and emit direct CLIF instructions (`iadd`,
-//! `fadd`, etc.) instead of calling runtime helpers. This eliminates ~30% of
-//! runtime overhead in numeric loops.
+//! `fadd`, etc.) instead of calling runtime helpers. Proven integer values are
+//! also carried unboxed across straight-line basic-block segments and written
+//! back only at synchronization boundaries, avoiding repeated register-memory
+//! traffic and NaN-tag churn.
 //!
 //! # Architecture
 //!
@@ -1304,7 +1306,14 @@ pub fn compile_bytecode_region_typed(
             OpCode::IInc => {
                 let reg = instr.op1 as usize;
                 if meta.is_known(reg, KnownType::Int) {
-                    emit_typed_iunary(&mut builder, regs_ptr, reg, reg, TypedIntUnaryOp::Inc);
+                    emit_typed_iunary(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        reg,
+                        reg,
+                        TypedIntUnaryOp::Inc,
+                    );
                 } else {
                     emit_unary_runtime(&mut builder, &helpers, regs_ptr, reg, reg, "nulang_iinc");
                 }
@@ -1313,7 +1322,14 @@ pub fn compile_bytecode_region_typed(
             OpCode::IDec => {
                 let reg = instr.op1 as usize;
                 if meta.is_known(reg, KnownType::Int) {
-                    emit_typed_iunary(&mut builder, regs_ptr, reg, reg, TypedIntUnaryOp::Dec);
+                    emit_typed_iunary(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        reg,
+                        reg,
+                        TypedIntUnaryOp::Dec,
+                    );
                 } else {
                     emit_unary_runtime(&mut builder, &helpers, regs_ptr, reg, reg, "nulang_idec");
                 }
