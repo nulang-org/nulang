@@ -6,11 +6,11 @@
 > **Status:** The Core soundness chain — `progress`, `preservation`,
 > `type_soundness` — is machine-checked (2026-08-14). The capability
 > lattice laws (`join` assoc/comm/idem) and `cap_sendable`/
-> `discharge_sendable` are proved. Two items remain open:
-> `linear_at_most_once` (requires the split-context refinement of
-> `HasTypeCap`, documented in `capabilities.lean`) and the effect-safety
-> theorems (`effects.lean`), which are still vacuous `True` stubs, not
-> proofs (deferred to the `combined.lean` handler-stack model).
+> `discharge_sendable` are proved. The effect formalization now proves local
+> handler-stack dispatch safety and requires typed handler bodies; the previous
+> vacuous `True` safety stubs are gone. Two whole-language obligations remain:
+> `linear_at_most_once` (requires a split input/output capability context) and
+> effect progress/preservation with latent function effect rows.
 
 ## Purpose
 
@@ -30,7 +30,7 @@ Two layers are formalized:
 | `Nulang/Effects.lean` | Effect rows, `subrow`, `union` | Formalized |
 | `types.lean` | HM `HasType`, small-step semantics, `progress`/`preservation`/`type_soundness` | **Proved** |
 | `capabilities.lean` | Capability lattice laws, `cap_sendable`, `discharge_sendable` | Proved (`linear_at_most_once` open) |
-| `effects.lean` | Effect rows, `effect_safety`, `effect_safety_static` | `True` stubs (not proved) |
+| `effects.lean` | Effect rows, typed handler bodies, handler-stack dispatch safety | **Local safety proved**; whole-language effect progress/preservation open |
 
 ## Theorems
 
@@ -63,16 +63,23 @@ requires the split-context refinement `Γ ⊢ e : τ / Γ'`, which is out of sco
 for the current formalization and stated as a conjecture per the RFC 0003
 Item 2 contingency.
 
-### Effect Safety — stubbed (not proved)
+### Effect Safety — local handler dispatch proved; whole-language proof open
 ```
-Theorem effect_safety:
-  A program with closed effect row {} cannot perform an unhandled effect
+Theorem effect_safety_static:
+  HandlerScope hs eff →
+  HandlerStack.dispatch hs eff = handled
 ```
-The intended statement: if a function's effect row is empty, every `perform`
-in its body is statically handled — no runtime "unhandled effect" errors.
-The current `effect_safety`/`effect_safety_static` bodies in `effects.lean`
-are vacuous `True` stubs (`by trivial`), not proofs — the real proof requires
-modeling the handler-stack push/pop dynamics, deferred to `combined.lean`.
+`effects.lean` now models handler-stack dispatch directly and proves that an
+effect in lexical handler scope cannot dispatch as unhandled. Entering a
+`handle` scope is proved to establish that scope, and handler bodies are
+themselves required to typecheck with effect rows whose effects are either
+discharged by the installed handler or preserved in the outward residual row.
+
+The stronger whole-language theorem remains open for a specific reason: the
+simplified formal `Ty.fn` does not yet carry latent effect rows, while the Rust
+compiler's function type does. Proving application safety before modeling those
+latent rows would be unsound. The next step is an effect-aware function type and
+progress/preservation over evaluation plus the handler stack.
 
 ## Build
 
