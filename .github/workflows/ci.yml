@@ -238,6 +238,23 @@ jobs:
 
       - name: Test
         run: cargo test --features wasm-backend
+      - name: Smoke portable package WASM build
+        env:
+          CARGO_TARGET_DIR: ./target
+        run: |
+          cargo build --bin nulang --features wasm-backend
+          tmp="$(mktemp -d)"
+          ./target/debug/nulang nula new "$tmp/portable-pkg"
+          (
+            cd "$tmp/portable-pkg"
+            "$GITHUB_WORKSPACE/target/debug/nulang" nula build --target wasm
+          )
+          test -f "$tmp/portable-pkg/.nula/dist/portable-pkg.wasm"
+          python3 - "$tmp/portable-pkg/.nula/dist/portable-pkg.wasm" <<'PY'
+          import pathlib, sys
+          p = pathlib.Path(sys.argv[1])
+          assert p.read_bytes()[:4] == b"\x00asm", p
+          PY
 
   # -----------------------------------------------------------------------
   # Lint — format, clippy, audit, docs, all-features check
