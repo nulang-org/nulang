@@ -43,7 +43,7 @@ use crate::jit::compiler::{emit_arr_load, emit_yield_pc, CompileError};
 
 use crate::cranelift_utils::{
     emit_bitcast_f64_to_i64_canonicalized, emit_sext48, emit_tag_bool, emit_tag_int,
-    PAYLOAD_MASK_I64, SIGN_BIT_I64, SIGN_EXTEND, TAG_BOOL_I64, TAG_INT_I64, TAG_NIL_I64,
+    PAYLOAD_MASK_I64, TAG_BOOL_I64, TAG_INT_I64, TAG_NIL_I64,
 };
 use crate::type_metadata::REG_COUNT;
 pub use crate::type_metadata::{KnownType, TypeMetadata};
@@ -445,16 +445,6 @@ impl IntRegCache {
     fn flush_and_clear(&mut self, builder: &mut FunctionBuilder, regs_ptr: Value) {
         self.flush(builder, regs_ptr);
         self.clear();
-    }
-}
-
-#[inline]
-fn normalize_i48(value: i64) -> i64 {
-    let payload = value & PAYLOAD_MASK_I64;
-    if payload & SIGN_BIT_I64 != 0 {
-        payload | SIGN_EXTEND
-    } else {
-        payload
     }
 }
 
@@ -1036,10 +1026,7 @@ pub fn compile_bytecode_region_typed(
             OpCode::Nop | OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
                 true
             }
-            OpCode::ConstU => matches!(
-                module.constants.get(instr.imm16() as usize),
-                Some(Constant::Int(_))
-            ),
+            OpCode::ConstU => false,
             OpCode::Load | OpCode::Store | OpCode::Move | OpCode::Dup => {
                 meta.is_known(instr.op1 as usize, KnownType::Int)
             }
@@ -1087,30 +1074,21 @@ pub fn compile_bytecode_region_typed(
             }
             OpCode::ConstU => {
                 let idx = instr.imm16() as usize;
-                let dst = instr.op3 as usize;
-                if let Some(Constant::Int(value)) = module.constants.get(idx) {
-                    let value = builder.ins().iconst(types::I64, normalize_i48(*value));
-                    int_cache.set_dirty(dst, value);
-                    meta.set_type(dst, KnownType::Int);
+                let offset = (idx * 8) as i32;
+                let addr = if offset == 0 {
+                    consts_ptr
                 } else {
-                    let offset = (idx * 8) as i32;
-                    let addr = if offset == 0 {
-                        consts_ptr
-                    } else {
-                        let off = builder.ins().iconst(types::I64, offset as i64);
-                        builder.ins().iadd(consts_ptr, off)
-                    };
-                    let val = builder.ins().load(types::I64, MemFlags::new(), addr, 0);
-                    store_reg(&mut builder, regs_ptr, dst, val);
-                    meta.set_type(
-                        dst,
-                        match module.constants.get(idx) {
-                            Some(Constant::Float(_)) => KnownType::Float,
-                            Some(Constant::Bool(_)) => KnownType::Bool,
-                            _ => KnownType::Unknown,
-                        },
-                    );
-                }
+                    let off = builder.ins().iconst(types::I64, offset as i64);
+                    builder.ins().iadd(consts_ptr, off)
+                };
+                let val = builder.ins().load(types::I64, MemFlags::new(), addr, 0);
+                // ConstU crosses the conservative cache boundary because this
+                // compiler entry point receives the Cranelift JIT module, not
+                // the Nulang CodeModule constant metadata. Keep the existing
+                // boxed ABI here and recover native SSA on later proven uses.
+                store_reg(&mut builder, regs_ptr, instr.op3 as usize, val);
+                int_cache.invalidate(instr.op3 as usize);
+                meta.set_type(instr.op3 as usize, KnownType::Unknown);
             }
 
             // -- Register --
