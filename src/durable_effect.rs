@@ -21,12 +21,15 @@
 //! the contract and prevent future implementations from quietly upgrading an
 //! at-least-once external call into an unsound "exactly once" promise.
 
+use crate::content_identity::SemanticId;
+use crate::effect_site_identity::EffectSiteId;
 use crate::primitives::{DeliverySemantics, EffectBoundary};
 use blake3::Hasher;
 use std::fmt;
 use std::str::FromStr;
 
 const EFFECT_ID_DOMAIN: &[u8] = b"nulang.durable-effect.v1\0";
+const SEMANTIC_EFFECT_ID_DOMAIN: &[u8] = b"nulang.durable-effect.semantic.v1\0";
 const COMPENSATION_ID_DOMAIN: &[u8] = b"nulang.durable-compensation.v1\0";
 const REQUEST_DIGEST_DOMAIN: &[u8] = b"nulang.durable-effect-request.v1\0";
 
@@ -52,6 +55,31 @@ impl DurableEffectId {
         hash_len_prefixed(&mut hasher, execution_key.as_bytes());
         hasher.update(&effect_ordinal.to_le_bytes());
         hash_len_prefixed(&mut hasher, effect_operation.as_bytes());
+        Self(*hasher.finalize().as_bytes())
+    }
+    /// Derive a durable effect identity from compiler-owned semantic identity.
+    ///
+    /// This is the preferred identity path for durable code that has an owning
+    /// `SemanticId` and compiler-assigned `EffectSiteId`. `execution_key` must
+    /// be replay-stable and identify the logical durable instance plus the
+    /// turn/step context that owns this effect occurrence. Retries MUST reuse
+    /// the same key and occurrence index.
+    ///
+    /// Recovery of an operation already prepared under an older semantic
+    /// version must reuse the journaled `DurableEffectId` rather than re-derive
+    /// it using newly deployed code.
+    pub fn derive_semantic(
+        owner_semantic_id: SemanticId,
+        effect_site_id: EffectSiteId,
+        execution_key: &[u8],
+        occurrence_index: u32,
+    ) -> Self {
+        let mut hasher = Hasher::new();
+        hasher.update(SEMANTIC_EFFECT_ID_DOMAIN);
+        hasher.update(owner_semantic_id.as_bytes());
+        hasher.update(effect_site_id.as_bytes());
+        hash_len_prefixed(&mut hasher, execution_key);
+        hasher.update(&occurrence_index.to_le_bytes());
         Self(*hasher.finalize().as_bytes())
     }
 
@@ -433,6 +461,12 @@ impl DurableCompensationRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effect_site_identity::effect_sites_for_mir;
+    use crate::hir_lower;
+    use crate::lexer::Lexer;
+    use crate::mir_lower;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
 
     fn spec(delivery: DeliverySemantics) -> DurableEffectSpec {
         DurableEffectSpec::new(
@@ -442,7 +476,70 @@ mod tests {
             delivery,
         )
     }
+    fn semantic_effect_identity_inputs() -> (SemanticId, EffectSiteId) {
+        let source = "effect Payment { charge: Int -> Int }\nfn run(amount: Int) -> Int ! {Payment} { perform Payment.charge(amount) }\nrun(10)";
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.lex().unwrap();
+        let mut parser = Parser::new(tokens);
+        let ast = parser.parse_module().unwrap();
+        let mut typechecker = TypeChecker::new();
+        typechecker.check_module(&ast).unwrap();
+        let hir = hir_lower::lower_module(&ast, &typechecker.inferred_decl_types);
+        let mir = mir_lower::lower_module(&hir).unwrap();
+        let site = effect_sites_for_mir(&mir)
+            .into_iter()
+            .find(|site| site.owner_name == "run")
+            .expect("Payment.charge effect site");
+        let semantic_id = SemanticId::from_canonical_bytes(b"payments-run-v1", []);
+        (semantic_id, site.id)
+    }
 
+    #[test]
+    fn semantic_operation_id_is_stable_without_runtime_actor_identity() {
+        let (semantic_id, site_id) = semantic_effect_identity_inputs();
+        let first =
+            DurableEffectId::derive_semantic(semantic_id, site_id, b"order/7/turn/3", 0);
+        let replay =
+            DurableEffectId::derive_semantic(semantic_id, site_id, b"order/7/turn/3", 0);
+
+        assert_eq!(first, replay);
+    }
+
+    #[test]
+    fn semantic_operation_id_changes_with_semantics_execution_or_occurrence() {
+        let (semantic_id, site_id) = semantic_effect_identity_inputs();
+        let different_semantics = SemanticId::from_canonical_bytes(b"payments-run-v2", []);
+        let base =
+            DurableEffectId::derive_semantic(semantic_id, site_id, b"order/7/turn/3", 0);
+
+        assert_ne!(
+            base,
+            DurableEffectId::derive_semantic(
+                different_semantics,
+                site_id,
+                b"order/7/turn/3",
+                0,
+            )
+        );
+        assert_ne!(
+            base,
+            DurableEffectId::derive_semantic(
+                semantic_id,
+                site_id,
+                b"order/8/turn/3",
+                0,
+            )
+        );
+        assert_ne!(
+            base,
+            DurableEffectId::derive_semantic(
+                semantic_id,
+                site_id,
+                b"order/7/turn/3",
+                1,
+            )
+        );
+    }
     #[test]
     fn operation_id_is_stable_for_replay() {
         let first = DurableEffectId::derive(42, "charge-order-7", 0, "Payment.charge");
