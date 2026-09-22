@@ -716,10 +716,7 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         crate::vm::Value::nil()
     }
 
-    fn get_state_field_indexed(
-        &self,
-        field_constant_idx: usize,
-    ) -> Option<crate::vm::Value> {
+    fn get_state_field_indexed(&self, field_constant_idx: usize) -> Option<crate::vm::Value> {
         let rt = self.runtime.borrow();
         let actor_id = rt.current_actor?;
         rt.actors
