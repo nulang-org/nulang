@@ -149,16 +149,16 @@ fn normalize_pattern(pattern: &Pattern, ty: &Type) -> CorePat {
         },
         Pattern::Record(pattern_fields) => match ty {
             Type::Record(type_fields) => {
-                let real_fields: Vec<(&String, &Type)> = type_fields
+                let real_fields: Vec<(String, Type)> = type_fields
                     .iter()
                     .filter(|(name, _)| name != RECORD_ROW_TAIL_FIELD)
-                    .map(|(name, ty)| (name, ty))
+                    .cloned()
                     .collect();
 
                 if pattern_fields.iter().any(|(name, _)| {
                     !real_fields
                         .iter()
-                        .any(|(field_name, _)| field_name.as_str() == name)
+                        .any(|(field_name, _)| field_name == name)
                 }) {
                     return CorePat::Ctor(
                         Constructor::Opaque(format!("record:{pattern_fields:?}")),
@@ -168,14 +168,14 @@ fn normalize_pattern(pattern: &Pattern, ty: &Type) -> CorePat {
 
                 let field_names = real_fields
                     .iter()
-                    .map(|(name, _)| (*name).clone())
+                    .map(|(name, _)| name.clone())
                     .collect::<Vec<_>>();
                 let args = real_fields
                     .iter()
                     .map(|(name, ty)| {
                         pattern_fields
                             .iter()
-                            .find(|(pattern_name, _)| pattern_name == *name)
+                            .find(|(pattern_name, _)| pattern_name == name)
                             .map(|(_, pattern)| normalize_pattern(pattern, ty))
                             .unwrap_or(CorePat::Wild)
                     })
@@ -262,12 +262,13 @@ fn constructor_universe(ty: &Type) -> Option<Vec<ConstructorInfo>> {
             let real_fields = fields
                 .iter()
                 .filter(|(name, _)| name != RECORD_ROW_TAIL_FIELD)
+                .cloned()
                 .collect::<Vec<_>>();
             Some(vec![ConstructorInfo {
                 ctor: Constructor::Record(
                     real_fields.iter().map(|(name, _)| name.clone()).collect(),
                 ),
-                arg_types: real_fields.iter().map(|(_, ty)| (*ty).clone()).collect(),
+                arg_types: real_fields.iter().map(|(_, ty)| ty.clone()).collect(),
             }])
         }
         // Int/Float/String and the remaining runtime domains have an open or
