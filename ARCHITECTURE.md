@@ -157,11 +157,13 @@ Core surface forms (`src/ast.rs`, `src/parser.rs`):
   §6.3).
 
 There is no `switch` and no `case` keyword — `match` arms are introduced by
-`|`. Pattern matching is typed. The type checker now emits conservative `W0201`
-diagnostics for provably missing finite cases (booleans and closed variants,
-including recursively finite payloads); guarded arms do not count toward total
-coverage. The full usefulness/exhaustiveness matrix is not implemented yet, so
-complex or infinite-domain matches may still compile and fail at runtime.
+`|`. Pattern matching is typed and analyzed with a Maranget-style usefulness
+matrix. `W0201` reports uncovered witness patterns across nested variants,
+tuples, records, booleans, Nil/Unit, and literal patterns over infinite
+primitive domains; `W0202` reports arms subsumed by earlier unguarded arms.
+Guarded arms are reachability-checked but never count toward total coverage.
+These diagnostics remain warnings during the compatibility phase, and
+`--deny-warnings` promotes them to build failures.
 
 ### 2.2 HM Type Inference
 
@@ -194,8 +196,7 @@ Pony-style lattice (`iso`, `lineariso`, `trn`, `ref`, `val`, `box`, `tag`;
 subtyping computed via `join`). `LinearIso` adds exactly-once linear
 consumption tracking. Capabilities are compile-time only — see §2.4.
 
-**What does not exist:** no complete Maranget-style usefulness matrix for
-`match`; current checking is the conservative finite-case `W0201` phase. Type inference deliberately does not
+**Pattern usefulness:** the current `Pattern` AST is covered by a typed usefulness matrix; malformed patterns that do not reconcile with the inferred scrutinee type are handled conservatively rather than being allowed to prove exhaustiveness. Type inference deliberately does not
 cross actor boundaries — behavior signatures are explicit annotations — so
 actors remain separately checkable units.
 
