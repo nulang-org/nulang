@@ -1371,7 +1371,7 @@ pub fn process_network_packets(
                                     }
                                     msg.payload = Arc::new(payload_vec);
                                     if let Some(actor) = runtime.actors.get_mut(&target_actor) {
-                                        let _ = actor.mailbox.push(msg);
+                                        let _ = actor.mailbox.push_local(msg);
                                         runtime.enqueue_actor(target_actor);
                                     } else {
                                         notify_delivery_failed(
@@ -2291,7 +2291,7 @@ pub fn process_network_packets(
                     }
                     msg.payload = Arc::new(payload_vec);
                     if let Some(actor) = runtime.actors.get_mut(&target_actor) {
-                        let _ = actor.mailbox.push(msg);
+                        let _ = actor.mailbox.push_local(msg);
                         runtime.enqueue_actor(target_actor);
                     } else {
                         notify_delivery_failed(runtime, msg.sender, "target actor not found");
