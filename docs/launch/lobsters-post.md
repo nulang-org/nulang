@@ -44,9 +44,9 @@ Things I expect lobste.rs to poke at, preemptively:
   under `formal/`. CI is the source of truth for current test/proof counts.
 - **Known sharp edges are documented in-tree**: typed actor-protocol admission
   remains experimental. Source-level typed CRDT fields and `Crdt.*` operations
-  are now wired and conformance-tested, but recovered actors still need the
-  field-name→CRDT-id mapping rebuilt/re-registered before CRDT operations are
-  fully usable. SPEC2 documents that recovery gap explicitly.
+  are wired and conformance-tested, including persisted field mappings used by
+  recovery; the broader multi-node CRDT/distribution surface remains
+  Experimental.
 - **Distribution**: multi-node `send`/`ask` over TCP (NUL0 wire protocol) and
   gossip membership work but are marked experimental.
 
