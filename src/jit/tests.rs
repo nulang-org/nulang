@@ -1525,48 +1525,86 @@ fn test_compute_recursive_classifies_cycles() {
 }
 
 #[test]
-fn test_tier2_counter_increments() {
+fn test_tier2_counter_increments_and_becomes_terminal() {
     let mut jit = make_jit();
+    let module = CodeModule::new("tier2_counter");
     let dummy_ptr: *const u8 = std::ptr::null();
     jit.store_compiled(0, 100, dummy_ptr, 5);
 
-    // Counter starts at 0 (not yet in map), increments each call.
     for i in 0..TIER2_THRESHOLD - 1 {
-        jit.record_tier2_and_maybe_promote(0, 100, &[]);
+        jit.record_tier2_and_maybe_promote(0, 100, &module);
+        let region = jit.compiled_entry(0, 100).expect("compiled region");
         assert_eq!(
-            jit.tier2_counters.get(&(0, 100)).copied(),
-            Some(i + 1),
+            u64::from(region.tier2_executions),
+            i + 1,
             "counter should be {} after {} calls",
             i + 1,
             i + 1
         );
+        assert!(!region.tier2_terminal);
     }
-    // Crossing threshold resets counter to 0.
-    jit.record_tier2_and_maybe_promote(0, 100, &[]);
-    assert_eq!(jit.tier2_counters.get(&(0, 100)).copied(), Some(0));
 
-    // Reset clears all.
+    // An untyped region has no new information to specialize at tier 2, so
+    // crossing the threshold marks it terminal instead of retrying forever.
+    jit.record_tier2_and_maybe_promote(0, 100, &module);
+    let terminal = jit.compiled_entry(0, 100).expect("compiled region");
+    assert_eq!(terminal.tier2_executions, 0);
+    assert!(terminal.tier2_terminal);
+
+    // Terminal regions stay completely stable on subsequent probes.
+    jit.record_tier2_and_maybe_promote(0, 100, &module);
+    let still_terminal = jit.compiled_entry(0, 100).expect("compiled region");
+    assert_eq!(still_terminal.tier2_executions, 0);
+    assert!(still_terminal.tier2_terminal);
+
+    // Tests can reset the embedded state without rebuilding the JIT session.
     jit.reset_tier2_counters();
-    assert!(jit.tier2_counters.is_empty());
+    let reset = jit.compiled_entry(0, 100).expect("compiled region");
+    assert_eq!(reset.tier2_executions, 0);
+    assert!(!reset.tier2_terminal);
 }
 
 #[test]
-fn test_tier2_counters_are_per_session() {
+fn test_tier2_state_is_per_session() {
     let mut jit_a = make_jit();
     let mut jit_b = make_jit();
+    let module = CodeModule::new("tier2_sessions");
     let dummy_ptr: *const u8 = std::ptr::null();
     jit_a.store_compiled(0, 200, dummy_ptr, 3);
     jit_b.store_compiled(0, 200, dummy_ptr, 3);
 
-    // Heat session A to threshold.
     for _ in 0..TIER2_THRESHOLD {
-        jit_a.record_tier2_and_maybe_promote(0, 200, &[]);
+        jit_a.record_tier2_and_maybe_promote(0, 200, &module);
     }
-    assert_eq!(jit_a.tier2_counters.get(&(0, 200)).copied(), Some(0));
-    // Session B is untouched — no counter entry.
-    assert!(
-        jit_b.tier2_counters.get(&(0, 200)).is_none(),
-        "session B should have no counter since we never called record_tier2 on it"
+
+    let a = jit_a.compiled_entry(0, 200).expect("session A region");
+    assert_eq!(a.tier2_executions, 0);
+    assert!(a.tier2_terminal);
+
+    let b = jit_b.compiled_entry(0, 200).expect("session B region");
+    assert_eq!(b.tier2_executions, 0);
+    assert!(!b.tier2_terminal, "session B must remain untouched");
+}
+
+#[test]
+fn test_tier2_simd_promotion_does_not_short_circuit_on_cached_region() {
+    let mut jit = make_jit();
+    let dummy_ptr: *const u8 = std::ptr::null();
+    jit.store_compiled(0, 0, dummy_ptr, 3);
+    let instructions = vec![
+        Instruction::new0(OpCode::Nop),
+        Instruction::new0(OpCode::Nop),
+        Instruction::new0(OpCode::Nop),
+    ];
+
+    // This region is not SIMD-vectorizable. The tier-2 replacement helper
+    // must analyze it and return false rather than treating the cached tier-1
+    // pointer as a successful promotion.
+    let promoted = unsafe { jit.promote_region_simd(0, 0, 3, &instructions, None) };
+    assert!(!promoted);
+    assert_eq!(
+        jit.compiled_entry(0, 0).expect("compiled region").ptr,
+        dummy_ptr
     );
 }
 
