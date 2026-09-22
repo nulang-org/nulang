@@ -833,17 +833,52 @@ struct SimpleCfgSsaPlan {
     fallthrough_pc: usize,
     join_pc: usize,
     then_jump_pc: Option<usize>,
-    carried: Vec<(usize, KnownType)>,
+    arm_carried: Vec<(usize, KnownType)>,
+    join_carried: Vec<(usize, KnownType)>,
     branch_state: [KnownType; 256],
     join_state: [KnownType; 256],
 }
 
 impl SimpleCfgSsaPlan {
     fn param_blocks(&self) -> Vec<usize> {
-        let mut blocks = vec![self.fallthrough_pc, self.target_pc, self.join_pc];
+        let mut blocks = Vec::new();
+        if !self.arm_carried.is_empty() {
+            blocks.push(self.fallthrough_pc);
+            if self.target_pc != self.join_pc {
+                blocks.push(self.target_pc);
+            }
+        }
+        if !self.join_carried.is_empty() {
+            blocks.push(self.join_pc);
+        }
         blocks.sort_unstable();
         blocks.dedup();
         blocks
+    }
+
+    fn carried_for_block(&self, pc: usize) -> Option<&[(usize, KnownType)]> {
+        if pc == self.join_pc && !self.join_carried.is_empty() {
+            Some(&self.join_carried)
+        } else if (pc == self.fallthrough_pc
+            || (pc == self.target_pc && self.target_pc != self.join_pc))
+            && !self.arm_carried.is_empty()
+        {
+            Some(&self.arm_carried)
+        } else {
+            None
+        }
+    }
+
+    fn branch_carried(&self) -> Vec<(usize, KnownType)> {
+        let mut carried = self.arm_carried.clone();
+        if self.target_pc == self.join_pc {
+            for &(reg, ty) in &self.join_carried {
+                if !carried.iter().any(|&(existing, _)| existing == reg) {
+                    carried.push((reg, ty));
+                }
+            }
+        }
+        carried
     }
 
     fn metadata_state(&self, pc: usize) -> Option<&[KnownType; 256]> {
@@ -1032,15 +1067,25 @@ fn simple_cfg_ssa_plan(
     };
 
     let join_state = meet_type_states(&then_end_state, &else_end_state);
-    let mut carried = Vec::new();
+
+    let mut arm_carried = Vec::new();
+    let mut join_carried = Vec::new();
     for reg in 0..256 {
-        let ty = branch_state[reg];
-        if matches!(ty, KnownType::Int | KnownType::Float) && join_state[reg] == ty {
-            carried.push((reg, ty));
+        let branch_ty = branch_state[reg];
+        if matches!(branch_ty, KnownType::Int | KnownType::Float) {
+            arm_carried.push((reg, branch_ty));
+        }
+
+        let join_ty = join_state[reg];
+        if matches!(join_ty, KnownType::Int | KnownType::Float) {
+            join_carried.push((reg, join_ty));
         }
     }
 
-    if carried.is_empty() || carried.len() > 32 {
+    if (arm_carried.is_empty() && join_carried.is_empty())
+        || arm_carried.len() > 32
+        || join_carried.len() > 32
+    {
         return None;
     }
 
@@ -1050,7 +1095,8 @@ fn simple_cfg_ssa_plan(
         fallthrough_pc,
         join_pc,
         then_jump_pc,
-        carried,
+        arm_carried,
+        join_carried,
         branch_state,
         join_state,
     })
@@ -1699,7 +1745,10 @@ pub fn compile_bytecode_region_typed(
     if let Some(plan) = &cfg_ssa {
         for pc in plan.param_blocks() {
             let block = blocks[&pc];
-            for &(_, ty) in &plan.carried {
+            let carried = plan
+                .carried_for_block(pc)
+                .expect("CFG SSA parameter block must have carried values");
+            for &(_, ty) in carried {
                 let clif_ty = match ty {
                     KnownType::Int => types::I64,
                     KnownType::Float => types::F64,
@@ -1785,11 +1834,11 @@ pub fn compile_bytecode_region_typed(
             if let Some(state) = plan.metadata_state(pc) {
                 meta.regs = *state;
             }
-            if plan.param_blocks().contains(&pc) {
+            if let Some(carried) = plan.carried_for_block(pc) {
                 int_cache.clear();
                 float_cache.clear();
                 let params = builder.block_params(block).to_vec();
-                for (&(reg, ty), &value) in plan.carried.iter().zip(params.iter()) {
+                for (&(reg, ty), &value) in carried.iter().zip(params.iter()) {
                     match ty {
                         KnownType::Int => {
                             int_cache.set(reg, value);
@@ -2615,14 +2664,14 @@ pub fn compile_bytecode_region_typed(
                         regs_ptr,
                         &mut int_cache,
                         &mut float_cache,
-                        &plan.carried,
+                        &plan.join_carried,
                     );
                     let args = native_carried_args(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
                         &mut float_cache,
-                        &plan.carried,
+                        &plan.join_carried,
                     );
                     builder.ins().jump(blocks[&plan.join_pc], &args);
                     int_cache.clear();
@@ -2689,31 +2738,35 @@ pub fn compile_bytecode_region_typed(
                     .is_some_and(|plan| plan.branch_pc == pc && plan.target_pc == target)
                 {
                     let plan = cfg_ssa.as_ref().unwrap();
+                    let branch_carried = plan.branch_carried();
                     flush_non_carried_native_caches(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
                         &mut float_cache,
-                        &plan.carried,
+                        &branch_carried,
                     );
                     let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
                     let one = builder.ins().iconst(types::I64, 1);
                     let cond_bit = builder.ins().band(cond_val, one);
                     let zero = builder.ins().iconst(types::I64, 0);
                     let is_true = builder.ins().icmp(IntCC::NotEqual, cond_bit, zero);
+                    let target_carried = plan.carried_for_block(plan.target_pc).unwrap_or(&[]);
+                    let fallthrough_carried =
+                        plan.carried_for_block(plan.fallthrough_pc).unwrap_or(&[]);
                     let target_args = native_carried_args(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
                         &mut float_cache,
-                        &plan.carried,
+                        target_carried,
                     );
                     let fallthrough_args = native_carried_args(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
                         &mut float_cache,
-                        &plan.carried,
+                        fallthrough_carried,
                     );
                     builder.ins().brif(
                         is_true,
@@ -2795,31 +2848,35 @@ pub fn compile_bytecode_region_typed(
                     .is_some_and(|plan| plan.branch_pc == pc && plan.target_pc == target)
                 {
                     let plan = cfg_ssa.as_ref().unwrap();
+                    let branch_carried = plan.branch_carried();
                     flush_non_carried_native_caches(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
                         &mut float_cache,
-                        &plan.carried,
+                        &branch_carried,
                     );
                     let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
                     let one = builder.ins().iconst(types::I64, 1);
                     let cond_bit = builder.ins().band(cond_val, one);
                     let zero = builder.ins().iconst(types::I64, 0);
                     let is_false = builder.ins().icmp(IntCC::Equal, cond_bit, zero);
+                    let target_carried = plan.carried_for_block(plan.target_pc).unwrap_or(&[]);
+                    let fallthrough_carried =
+                        plan.carried_for_block(plan.fallthrough_pc).unwrap_or(&[]);
                     let target_args = native_carried_args(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
                         &mut float_cache,
-                        &plan.carried,
+                        target_carried,
                     );
                     let fallthrough_args = native_carried_args(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
                         &mut float_cache,
-                        &plan.carried,
+                        fallthrough_carried,
                     );
                     builder.ins().brif(
                         is_false,
@@ -2956,14 +3013,14 @@ pub fn compile_bytecode_region_typed(
                         regs_ptr,
                         &mut int_cache,
                         &mut float_cache,
-                        &plan.carried,
+                        &plan.join_carried,
                     );
                     let args = native_carried_args(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
                         &mut float_cache,
-                        &plan.carried,
+                        &plan.join_carried,
                     );
                     builder.ins().jump(blocks[&plan.join_pc], &args);
                     int_cache.clear();
@@ -3995,10 +4052,10 @@ mod typed_tests {
     fn test_simple_cfg_ssa_plan_if_else() {
         let instructions = vec![
             Instruction::new3(OpCode::JmpT, 4, 0, 3), // pc0 -> pc3
-            Instruction::new3(OpCode::IAdd, 0, 1, 0),
+            Instruction::new3(OpCode::IAdd, 0, 1, 2),
             Instruction::new2(OpCode::Jmp, 0, 2), // pc2 -> pc4
-            Instruction::new3(OpCode::ISub, 0, 1, 0),
-            Instruction::new3(OpCode::IMul, 0, 1, 2),
+            Instruction::new3(OpCode::ISub, 0, 1, 2),
+            Instruction::new3(OpCode::IMul, 2, 1, 3),
             Instruction::new0(OpCode::Halt),
         ];
         let mut meta = TypeMetadata::new();
@@ -4013,8 +4070,16 @@ mod typed_tests {
         assert_eq!(plan.target_pc, 3);
         assert_eq!(plan.join_pc, 4);
         assert_eq!(plan.then_jump_pc, Some(2));
-        assert!(plan.carried.contains(&(0, KnownType::Int)));
-        assert!(plan.carried.contains(&(1, KnownType::Int)));
+        assert!(plan.arm_carried.contains(&(0, KnownType::Int)));
+        assert!(plan.arm_carried.contains(&(1, KnownType::Int)));
+        assert!(
+            !plan.arm_carried.iter().any(|&(reg, _)| reg == 2),
+            "r2 is not known before the branch"
+        );
+        assert!(
+            plan.join_carried.contains(&(2, KnownType::Int)),
+            "r2 is produced as Int on both arms and should merge natively"
+        );
     }
 
     #[test]
@@ -4024,10 +4089,10 @@ mod typed_tests {
         let mut jit = make_jit();
         let instructions = vec![
             Instruction::new3(OpCode::JmpT, 4, 0, 3),
-            Instruction::new3(OpCode::IAdd, 0, 1, 0),
+            Instruction::new3(OpCode::IAdd, 0, 1, 2),
             Instruction::new2(OpCode::Jmp, 0, 2),
-            Instruction::new3(OpCode::ISub, 0, 1, 0),
-            Instruction::new3(OpCode::IMul, 0, 1, 2),
+            Instruction::new3(OpCode::ISub, 0, 1, 2),
+            Instruction::new3(OpCode::IMul, 2, 1, 3),
             Instruction::new0(OpCode::Halt),
         ];
         let mut meta = TypeMetadata::new();
@@ -4056,11 +4121,11 @@ mod typed_tests {
         false_regs[4] = Value::bool(false).as_raw();
         func(false_regs.as_mut_ptr(), consts.as_ptr());
         assert_eq!(
-            unsafe { Value::from_bits(false_regs[0]) }.as_int(),
+            unsafe { Value::from_bits(false_regs[2]) }.as_int(),
             Some(13)
         );
         assert_eq!(
-            unsafe { Value::from_bits(false_regs[2]) }.as_int(),
+            unsafe { Value::from_bits(false_regs[3]) }.as_int(),
             Some(39)
         );
 
@@ -4069,8 +4134,8 @@ mod typed_tests {
         true_regs[1] = Value::int(3).as_raw();
         true_regs[4] = Value::bool(true).as_raw();
         func(true_regs.as_mut_ptr(), consts.as_ptr());
-        assert_eq!(unsafe { Value::from_bits(true_regs[0]) }.as_int(), Some(7));
-        assert_eq!(unsafe { Value::from_bits(true_regs[2]) }.as_int(), Some(21));
+        assert_eq!(unsafe { Value::from_bits(true_regs[2]) }.as_int(), Some(7));
+        assert_eq!(unsafe { Value::from_bits(true_regs[3]) }.as_int(), Some(21));
     }
 
     #[test]
@@ -4146,10 +4211,10 @@ mod typed_tests {
         let plan = simple_cfg_ssa_plan(&instructions, 0, instructions.len(), Some(&meta))
             .expect("stable r1 should keep the CFG plan alive");
         assert!(
-            !plan.carried.iter().any(|&(reg, _)| reg == 0),
+            !plan.join_carried.iter().any(|&(reg, _)| reg == 0),
             "r0 changes Int -> Float on only one path and must not be native at the join"
         );
-        assert!(plan.carried.contains(&(1, KnownType::Int)));
+        assert!(plan.join_carried.contains(&(1, KnownType::Int)));
         assert_eq!(plan.join_state[0], KnownType::Unknown);
     }
 
