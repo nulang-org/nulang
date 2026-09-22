@@ -20,6 +20,7 @@ use crate::package::manifest::Manifest;
 pub const BEHAVIOR_MANIFEST_SCHEMA: &str = "nulang.behavior/v0alpha1";
 pub const COMPLETENESS_EXTENSION: &str = "nulang.org/completeness";
 pub const PACKAGE_CAPABILITIES_EXTENSION: &str = "nulang.org/package-capabilities";
+pub const HOST_EFFECT_ABI_EXTENSION: &str = "nulang.org/host-effect-abi";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BehaviorManifest {
@@ -141,6 +142,12 @@ pub struct SemanticCompleteness {
     pub replay: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostEffectAbiBinding {
+    pub schema: String,
+    pub contract_digest: String,
+}
+
 impl BehaviorManifest {
     /// Build the artifact/provenance slice of RFC 0020 for an already-emitted
     /// portable WASM artifact.
@@ -198,6 +205,17 @@ impl BehaviorManifest {
             .collect();
 
         let mut extensions = BTreeMap::new();
+        extensions.insert(
+            HOST_EFFECT_ABI_EXTENSION.to_string(),
+            serde_json::to_value(HostEffectAbiBinding {
+                schema: crate::host_effect_abi::HOST_EFFECT_ABI_SCHEMA.to_string(),
+                contract_digest: digest_bytes(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/spec/host-effects/v0alpha1.json"
+                ))),
+            })
+            .map_err(BehaviorManifestError::Json)?,
+        );
         extensions.insert(
             COMPLETENESS_EXTENSION.to_string(),
             serde_json::to_value(SemanticCompleteness {
@@ -386,6 +404,19 @@ capabilities = ["net", "fs", "net"]
             .as_str()
             .is_some_and(|digest| digest.starts_with("blake3:") && digest.len() == 71));
         assert!(manifest.authority.is_empty());
+        let host_abi: HostEffectAbiBinding = serde_json::from_value(
+            manifest
+                .extensions
+                .get(HOST_EFFECT_ABI_EXTENSION)
+                .cloned()
+                .expect("host effect ABI binding"),
+        )
+        .unwrap();
+        assert_eq!(host_abi.schema, crate::host_effect_abi::HOST_EFFECT_ABI_SCHEMA);
+        assert!(
+            host_abi.contract_digest.starts_with("blake3:")
+                && host_abi.contract_digest.len() == 71
+        );
         assert_eq!(
             manifest
                 .extensions
