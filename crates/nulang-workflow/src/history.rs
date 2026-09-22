@@ -86,6 +86,29 @@ pub enum WorkflowEvent {
         invocation_id: ActivityInvocationId,
         result: Vec<u8>,
     },
+    SagaStarted {
+        saga_id: String,
+        plan_hash: [u8; 32],
+    },
+    SagaStepCommitted {
+        saga_id: String,
+        step_index: u32,
+        step_name: String,
+    },
+    SagaFailed {
+        saga_id: String,
+        failed_step_index: u32,
+        failed_step_name: String,
+        error: String,
+    },
+    SagaStepCompensated {
+        saga_id: String,
+        step_index: u32,
+        step_name: String,
+    },
+    SagaCompleted {
+        saga_id: String,
+    },
     SignalReceived {
         name: String,
         payload: Vec<u8>,
