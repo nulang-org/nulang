@@ -3549,13 +3549,9 @@ mod tests {
     }
     #[test]
     fn test_is_all_int_false_with_explicit_nil_const() {
-        let mut builder =
-            mir::FunctionBuilder::new("nil_const", Some(crate::types::Type::int()));
+        let mut builder = mir::FunctionBuilder::new("nil_const", Some(crate::types::Type::int()));
         let value = builder.add_temp(crate::types::Type::int());
-        builder.assign(
-            value,
-            mir::RValue::Const(crate::bytecode::Constant::Nil),
-        );
+        builder.assign(value, mir::RValue::Const(crate::bytecode::Constant::Nil));
         builder.terminate(mir::Terminator::Return(Some(value)));
         let func = builder.build();
 
