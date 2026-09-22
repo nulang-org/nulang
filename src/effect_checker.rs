@@ -1236,7 +1236,6 @@ impl EffectChecker {
             let _ = body_span; // reserved for future line/column diagnostics
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
