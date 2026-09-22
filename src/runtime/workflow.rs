@@ -98,11 +98,12 @@ pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::
         crdt_field_map,
         authority_tokens,
     };
-    // RFC 0014 §3: re-spawn-opted actors replicate the snapshot to their
-    // deterministic shadow node before the local save, so the replica is a
-    // byte-identical copy of exactly what the local store will hold.
+    // The local persistence store is authoritative. Publish a shadow replica
+    // only after the local snapshot commit succeeds; otherwise a failed local
+    // checkpoint could leave a remote replica for an actor/transition that was
+    // never durably committed at home.
+    rt.persistence.save_snapshot(snapshot.clone())?;
     rt.maybe_shadow_replicate(actor_id, &snapshot);
-    rt.persistence.save_snapshot(snapshot)?;
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.sequence = seq;
         actor.dirty_fields.clear();
