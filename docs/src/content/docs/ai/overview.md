@@ -4,9 +4,16 @@ description: Build LLM-powered agents using the nulang-ai library — spawning, 
 ---
 
 ## AI Agents
-Nulang's AI capabilities live in the optional nulang-ai library crate. An `agent` is a named record of configuration — model, system prompt, tools, memory, pricing — that the runtime spawns like an actor through the generic PerformAsync effect mechanism. No special AI bytecodes or language extensions are needed. You interact with an agent through the `ask` operator, which is a synchronous request/reply call.
 
-## Declaring an Agent
+Nulang's AI capabilities live primarily in the optional `nulang-ai` library/runtime. New application architecture should compose ordinary actors/entities with AI effects and libraries.
+
+:::caution[Legacy declaration surface]
+The `agent` declaration shown below is still implemented for compatibility, but RFC 0004 deprecates it as an application-specific language surface. Treat these examples as compatibility documentation, not the recommended long-term architecture.
+:::
+
+An `agent` declaration is a named record of configuration — model, system prompt, tools, memory, pricing — that the current compatibility runtime can spawn through the generic async-effect path. You interact with that legacy agent instance through request/reply behavior.
+
+## Declaring a Legacy Agent
 
 ```nulang
 agent Assistant = {
@@ -85,4 +92,4 @@ Pipeline orchestration is available via the Rust `nulang-ai` crate (`Pipeline::n
 - [Memory](/ai/memory/) — episodic, semantic, and procedural memory subsystems
 - [Multi-Agent Patterns](/ai/multi-agent/) — pipelines, debates, and supervisor teams
 
-> **Note**: The `agent` keyword is currently Experimental and is proposed for deprecation in favor of plain `actor` declarations that import `nlc.ai` (RFC 0004). The keyword remains functional and will continue to work through at least two major language versions.
+> **Status**: The `agent` keyword is Experimental/deprecated under RFC 0004. It remains functional during the compatibility window; new code should prefer ordinary actors/entities plus AI libraries/effects.
