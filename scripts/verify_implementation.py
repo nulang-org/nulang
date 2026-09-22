@@ -96,6 +96,25 @@ def check_stdlib_manifest():
     return True
 
 
+def check_backend_profiles():
+    """Fail when backend semantic-profile metadata or generated docs drift."""
+    print("Checking canonical backend profile manifest and generated documentation...")
+    res = subprocess.run(
+        [sys.executable, "scripts/generate_backend_profiles.py", "--check"],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        print("Error: backend profile validation failed.")
+        if res.stdout:
+            print(res.stdout)
+        if res.stderr:
+            print(res.stderr)
+        return False
+    print(res.stdout.strip())
+    return True
+
+
 def verify_files():
     # 1. (compiler.rs has been removed; MIR pipeline is now exclusive.)
     # 2. Check vm.rs for Frame caller and leaked SConcat
@@ -202,6 +221,9 @@ def verify_files():
         return False
 
     if not check_stdlib_manifest():
+        return False
+
+    if not check_backend_profiles():
         return False
 
     print("Success: All files passed implementation checks!")
