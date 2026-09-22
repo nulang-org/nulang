@@ -40,14 +40,14 @@ This document is the design target for Nulang 2.0. The implementation in this re
 
 - Triple-quoted multi-line strings (`\"\"\"...\"\"\"`) and `\u{...}` unicode escapes: standard escapes processed inside triple-quoted strings; interpolation not supported inside them; surrogate/out-of-range code points rejected with a `LexError` — `src/lexer.rs`. (Stable)
 - The core expression language: literals (`Int`, `Float`, `String`, `Bool`, `Unit`, `Nil`), `let` / `let rec` bindings with `in`, `fn` lambdas, tuples, records, arrays, `if`/`then`/`else`, `match` (wildcard, variable, literal, tuple, record, variant, and `@` alias patterns), blocks, the pipe operator `|>`, and the operator set of Chapter 2.
-- Top-level declarations: `fn` (with `[T]` type parameters, `->` return types, `!` effect rows, `: cap` capability annotations, and `@tool` annotations), `type` (alias, record, and variant forms), `effect`, `actor` / `persistent actor`, `entity`, `organization`, `module`, `import`, and `extern` FFI blocks. Legacy `agent`, `workflow`, and `database` declarations still parse for compatibility but emit deprecation diagnostics and are not the recommended application model.
+- Top-level declarations: `fn` (with `[T]` type parameters, `->` return types, `!` effect rows, `: cap` capability annotations, and `@tool` annotations), `type` (alias, record, and variant forms), `effect`, `actor` / `persistent actor`, `entity`, `organization`, `agent`, `workflow`, `database`, `module`, `import`, and `extern` FFI blocks. Under accepted RFC 0017, `agent` and `workflow` are Experimental ergonomic forms that must lower to the canonical actor/state/effect runtime model rather than defining independent execution species; `database` remains Experimental.
 - Hindley-Milner type inference (Algorithm W) over tuples, records, variants, arrays, function types carrying effect rows and capabilities, and `&cap T` reference types.
 - Algebraic effects: `perform Effect.op(args)`, `handle body { | Effect.op(x) => value }`, closed and open effect rows written `{IO, FS}` and `{IO, | row}`, enforced `!` annotations on `fn` and `behavior` bodies, and runtime handlers with resume semantics.
 - Reference capabilities `iso`, `trn`, `ref`, `val`, `box`, `tag`, plus `lineariso` with exactly-once consumption tracking. Capabilities are checked at compile time and erased at runtime. Sendability (`lineariso`, `iso`, `val`, `tag`) is enforced for message arguments.
 - Actors and entities: `actor`, `persistent actor`, `organization` (desugars to `entity`), and `entity` (desugars to `persistent actor` with `event_sourced` as the default state model); `spawn Actor { field = value }`, `spawn Actor {} as "name"` for stable identity, `send actor behavior(args)` and `actor ! behavior(args)`, `ask actor behavior(args)`, `receive { | Behavior(x) => expr }`, `self.field` state access, and the four state models (`local`, `durable`, `event_sourced`, `crdt`).
 - Persistence for `persistent actor`s: durable snapshot/journal recovery and event-sourced replay behind `PersistenceStore`. `MemoryStore` and `JsonFileStore` are built in; the default `sqlite` feature provides `LibsqlStore` (local SQLite/libSQL and remote Turso support), while optional `rocksdb` and `postgres` features provide `RocksDbStore` and `PostgresStore`. Durable programs can select storage with `--store <uri>` or `NULANG_STORE_PATH`.
-- Legacy workflow runtime: `workflow Name { step name { body } compensate { expr } ... }` still implements parallel step groups, reverse-order saga compensation, signals, and durable timers/recovery. The declaration surface is deprecated; new code should express workflow behavior through ordinary actors/entities plus libraries.
-- The optional AI runtime provides LLM providers, episodic/semantic/procedural memory, pipelines, debates, supervisors, tool schemas, usage/cost accounting, and async effect dispatch behind the `ai-runtime` feature. The pure AI types live in the `nulang-ai` workspace crate. The legacy `agent` declaration remains implemented for compatibility but is deprecated in favor of ordinary actors/entities using AI libraries/effects.
+- Workflow surface: `workflow Name { step name { body } compensate { expr } ... }` implements parallel step groups, reverse-order saga compensation, signals, and durable timers/recovery. RFC 0017 keeps `workflow` as Experimental ergonomic syntax provided it lowers to the same canonical actor/state/effect runtime model.
+- The optional AI runtime provides LLM providers, episodic/semantic/procedural memory, pipelines, debates, supervisors, tool schemas, usage/cost accounting, and async effect dispatch behind the `ai-runtime` feature. The pure AI types live in the `nulang-ai` workspace crate. RFC 0017 keeps `agent` as Experimental ergonomic syntax that lowers to ordinary actor/effect primitives.
 - A register-based bytecode VM with a Cranelift JIT tiering path; an OTP-style supervision runtime (restart strategies and policies, links, monitors, exit signals); a distributed runtime (TCP wire protocol, gossip membership, location-transparent addressing — Experimental; the eight CRDT types exist and are tested only at the Rust embedder level, with no `.nula`-level surface — see §9.10); a REPL; and an LSP server.
 - Typeclass declarations: `class`/`impl` with dictionary-passing transform for method calls on concrete types (Phase 4, Experimental). See `CHANGELOG.md`. **Verified 2026-08-02, constrained-generic crash fixed 2026-08-13:** literal-receiver dispatch works end-to-end (minimal declarations, two-concrete-type dispatch, missing-impl rejection, superclass syntax all confirmed against the real binary). The canonical constrained-generic case — a typeclass bound on a type-variable receiver (`fn eq_check[T: Eq](a: T, b: T) -> Bool { a.eq(b) }`) — used to type-check and then **crash at runtime** ("Not a function: nil"): the dictionary transform only resolved literal receivers, not type-variable ones. Fixed at the HIR level (`DictKind::Param`); the call site now passes the concrete dictionary argument (`infer_type_arg` → `_impl_Eq_Int`). Pinned by `conformance/behavior/typeclass_06_constrained_generic_runtime_crash.nula` (now passes, exit 0).
 - Generics (`fn f[T](...)`, `type T[A] = ...`, §7.8): basic generics — one or more independent type parameters, per-callsite type inference, return-only type parameters — work end-to-end. **Verified 2026-08-02, both gaps fixed 2026-08-13:** (1) recursive generic ADTs can now be constructed — §7.8's `type Tree[T] = Leaf | Node((Tree[T], T, Tree[T]))` type-checks its own constructor call, pinned for two independent recursive shapes (`generics_03` accept, `generics_07` accept); (2) declared type parameters are now skolemized inside the function body — a generic function that pins its type parameter to a concrete type via an internal literal (`fn fresh[T]() -> T { 0 - 1 }`) is rejected AT THE DEFINITION (rigid placeholder cannot unify with `Int`), not at a later mismatched call site (`generics_08` expects the type error, exit 4). See `conformance/behavior/generics_03/07/08_*.nula`.
@@ -2321,15 +2321,13 @@ leaves `state_data["count"]` unchanged).
 
 # Chapter 10: Workflows
 
-**Deprecated (RFC 0004, Draft).** `workflow` is on a path out of the
-language surface entirely, toward an ordinary `actor` + Cloud SDK
-(`nlc.workflow`) library pattern. The keyword remains functional today
-(the CLI emits a deprecation warning on `workflow` declarations) and
-this chapter still describes its current behavior, but treat everything
-below as a snapshot of a feature being phased out, not a design target
-to invest deeply against. `conformance/behavior/workflow_*.nula` pins
-the current, verified behavior precisely — treat it as more current
-than this prose for edge cases.
+**Experimental unified-runtime surface (RFC 0017).** RFC 0004's proposed
+removal/deprecation path was never accepted and is superseded by accepted
+RFC 0017. `workflow` remains valid ergonomic syntax, but it is not a separate
+runtime species: its semantics must lower to the canonical actor/state/effect/
+supervision/time primitives. `conformance/behavior/workflow_*.nula` pins the
+current verified behavior; treat it as more current than this prose for edge
+cases.
 
 **Known issues, current implementation (verified 2026-08-02, not fixed
 in this pass beyond the first):**
@@ -2561,8 +2559,10 @@ The runtime-backed `Signal.wait(name)` operation (performed as `perform Signal.w
   dispatches all AI effects (`Inference.ask`, `Pipeline.run`, etc.) through
   the generic effect mechanism. The monolithic AI opcode range (`LlmAsk`,
   `PipelineNew`…`DebateRun`, 0x9D–0xC5) has been removed.
-- `agent`/`workflow`/`database` declarations are deprecated (RFC 0004);
-  new code should use `actor` with Cloud SDK imports.
+- `agent` and `workflow` are Experimental ergonomic declarations under
+  RFC 0017 and lower to the canonical actor/effect runtime model. RFC 0004's
+  proposed removal direction was not accepted. `database` remains
+  Experimental and is not part of the canonical runtime primitive set.
 ## 11.2 Agent Declarations
 
 An `agent` declaration defines an LLM-backed actor. The `model` field is required; all other fields are optional:
@@ -4069,15 +4069,14 @@ config cluster {
 | `prompt` | `perform llm.complete()` | Effects replace direct LLM calls |
 | `agent.llm` | `perform llm` | Effect syntax replaces agent method calls |
 
-## D.7 Deprecation Timeline
+## D.7 Historical Migration Sketch
 
-| Version | Action |
-|---------|--------|
-| v1.6 | Deprecation warnings for v1 keywords |
-| v1.7 | Migration tool provided (`nulang migrate`) |
-| v1.8 | v1 keywords deprecated, opt-out via flag |
-| v1.9 | v1 keywords removed |
-| v2.0 | Only v2 syntax supported |
+The versioned keyword-removal timeline in earlier drafts is **not current
+policy**. RFC 0004 was never accepted, and accepted RFC 0017 supersedes its
+removal direction for `agent` and `workflow`: those forms may remain as
+Experimental ergonomic syntax when they lower to the canonical runtime
+primitives. Any future source removal requires a new accepted RFC and the
+compatibility process in `GOVERNANCE.md`.
 
 ## D.8 Migration Tool
 
