@@ -3065,6 +3065,15 @@ impl VM {
             .unwrap_or(0)
     }
 
+    /// Number of straight-line leaf functions compiled as native-to-native
+    /// thunks for folded direct calls.
+    pub fn jit_native_leaf_compiled_count(&self) -> usize {
+        self.jit_session
+            .as_ref()
+            .map(|j| j.native_leaf_compiled_count())
+            .unwrap_or(0)
+    }
+
     /// Discard all closure capture environments.
     ///
     /// Only call this when no live value can reference an existing
@@ -3565,63 +3574,86 @@ impl VM {
             return false;
         }
 
-        // Raw pointer to self for the re-entrant direct-call helper, computed
-        // BEFORE the `&mut self.jit_session` borrow below (the VM is stable
-        // and single-threaded for the duration of this region execution).
-        let self_ptr = self as *mut VM;
-        let jit = match &mut self.jit_session {
-            Some(j) => j.as_mut(),
+
+        // Keep the cold interpreter path minimal: probe through the backend
+        // while it is still stored in the VM, and only move it out when native
+        // execution is actually possible.
+        let should_enter_jit = match self.jit_session.as_mut() {
+            Some(jit) => jit.probe_and_maybe_hot(module_idx, pc),
             None => return false,
         };
-
-        // Check cheap: already compiled, or newly hot? Single probe call so
-        // the per-step cost is one vtable dispatch into inlined logic (a
-        // flat-array increment for cold code), not two dyn calls. The
-        // module/constants fetch below is deferred until AFTER the probe so
-        // a cold step (probe returns false) doesn't pay it at all.
-        if !jit.probe_and_maybe_hot(module_idx, pc) {
+        if !should_enter_jit {
             return false;
         }
 
-        let module = match self.modules.get(module_idx) {
-            Some(m) => m,
-            None => return false,
+        // Move the backend out of the VM before any native code can run.
+        // Re-entrant direct calls invoke VM::step() through JIT_VM; while this
+        // backend is local, those nested steps see jit_session=None and stay
+        // entirely in the interpreter instead of aliasing this mutable backend.
+        let mut jit = self
+            .jit_session
+            .take()
+            .expect("JIT backend disappeared after successful probe");
+
+        // Compilation/promotion is the only phase that needs a CodeModule
+        // reference. Keep that borrow in this scope so it is definitely gone
+        // before native execution (which may re-enter &mut VM).
+        let prepared = {
+            let Some(module) = self.modules.get(module_idx) else {
+                self.jit_session = Some(jit);
+                return false;
+            };
+            jit.prepare_tiered_step(module_idx, pc, module)
         };
-        let constants = self
-            .jit_constants
-            .get(module_idx)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
+        if !prepared {
+            self.jit_session = Some(jit);
+            return false;
+        }
+
+        // Move the raw-bit constant pool out as well. A slice borrowed from
+        // self.jit_constants must not survive a re-entrant &mut VM call. The
+        // nested interpreter does not need this cache because jit_session is
+        // absent for the duration of native execution.
+        let constants = if module_idx < self.jit_constants.len() {
+            std::mem::take(&mut self.jit_constants[module_idx])
+        } else {
+            Vec::new()
+        };
 
         // Snapshot registers into a flat array for the JIT ABI.
         let mut regs: [u64; 256] = [0; 256];
         for (i, r) in self.frames[frame_idx].regs.iter().enumerate() {
             regs[i] = r.to_bits();
         }
-        // SAFETY: The `&mut dyn ActorVmCallbacks` reference is valid for the
-        // duration of this function call. `set_jit_callbacks` stores it in a
-        // thread-local; `with_callbacks` restores `&mut` provenance before use.
-        // The VM is single-threaded, so no concurrent access.
+
+        // No Rust borrow into VM-owned storage survives beyond this point.
+        // Runtime helpers receive raw pointers whose validity is scoped to the
+        // synchronous native call below.
+        let self_ptr = self as *mut VM;
         unsafe {
             crate::jit::runtime::set_jit_callbacks(
                 self.actor_callbacks.as_mut() as *mut dyn ActorVmCallbacks
             );
+            crate::jit::runtime::set_jit_vm(self_ptr, module_idx);
         }
-        // Thread the current module's constant pool so the JIT runtime can
-        // resolve interned (TAG_STRING) values for string comparison.
-        unsafe {
-            crate::jit::runtime::set_jit_constants(&module.constants);
-        }
-        // Thread the VM itself so the re-entrant direct-call helper can run a
-        // callee on the interpreter frame stack from within a compiled region.
-        // The VM is single-threaded, so a raw pointer in a thread-local is sound.
-        unsafe {
-            crate::jit::runtime::set_jit_vm(self_ptr);
-        }
-        let action = jit.tiered_execute_step_typed(module_idx, pc, module, &mut regs, constants);
+
+        let action = jit.execute_compiled(module_idx, pc, &mut regs, &constants);
+
         crate::jit::runtime::clear_jit_vm();
-        crate::jit::runtime::clear_jit_constants();
         crate::jit::runtime::clear_jit_callbacks();
+
+        // Query backend metadata while it is still local, then restore every
+        // moved VM field before interpreting the native result.
+        let region_len = jit.compiled_region_len(module_idx, pc);
+        self.jit_session = Some(jit);
+        if module_idx < self.jit_constants.len() {
+            self.jit_constants[module_idx] = constants;
+        } else {
+            debug_assert!(
+                false,
+                "JIT constants missing for loaded module {module_idx}"
+            );
+        }
 
         if action != TieredAction::Interpret {
             for (i, bits) in regs.iter().enumerate() {
@@ -3656,13 +3688,13 @@ impl VM {
                 return true;
             }
 
-            if let Some(region_len) = jit.compiled_region_len(module_idx, pc) {
+            if let Some(region_len) = region_len {
                 self.frames[frame_idx].pc += region_len;
                 return true;
             }
             // JIT executed but region not tracked — fall back to interpretation.
         }
-        // JIT fell back to interpretation — continue in the interpreter.
+
         false
     }
 
@@ -3820,9 +3852,24 @@ impl VM {
                 return 1;
             }
         };
+        // Re-entrant native calls are only sound when the outer JIT backend
+        // and its borrowed execution cache have been detached from the VM.
+        // These debug invariants turn any future ownership regression into an
+        // immediate test/debug failure instead of latent aliasing UB.
+        debug_assert!(
+            self.jit_session.is_none(),
+            "re-entrant JIT direct call entered while VM still owns the JIT backend"
+        );
+
         // The callee lives in the same module as the caller (function_table
         // is per-module; direct calls are within-module).
         let module_idx = self.frames[caller_idx].module_idx;
+        debug_assert!(
+            self.jit_constants
+                .get(module_idx)
+                .map_or(true, |constants| constants.is_empty()),
+            "re-entrant JIT direct call entered while VM still owns JIT constants"
+        );
         let code_offset = match self
             .modules
             .get(module_idx)

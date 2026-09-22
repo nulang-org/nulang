@@ -119,6 +119,13 @@ pub struct JitSession {
     /// recursion cycle (so it must NOT go through the re-entrant direct-call
     /// helper, which consumes native stack per recursion level).
     recursive: FxHashMap<usize, Vec<bool>>,
+    /// Separately compiled native thunks for straight-line pure leaf
+    /// functions. They are intentionally not inserted into `compiled`: tiny
+    /// callees should not make ordinary interpreter entry pay a JIT boundary.
+    native_leafs: FxHashMap<(usize, usize), compiler::NativeLeafCall>,
+    /// Static leaf analyses/compilations that failed; retrying them cannot
+    /// become useful until the module changes.
+    native_leaf_rejected: FxHashSet<(usize, usize)>,
     /// Reusable function builder context.
     builder_context: FunctionBuilderContext,
     /// Reusable codegen context.
@@ -169,6 +176,8 @@ impl JitSession {
             typed_regions: FxHashSet::default(),
             may_suspend: FxHashMap::default(),
             recursive: FxHashMap::default(),
+            native_leafs: FxHashMap::default(),
+            native_leaf_rejected: FxHashSet::default(),
             builder_context: FunctionBuilderContext::new(),
             tier2_counters: FxHashMap::default(),
             ctx,
@@ -264,6 +273,72 @@ impl JitSession {
         &self.recursive[&module_idx]
     }
 
+    fn native_leaf_for(
+        &mut self,
+        module_idx: usize,
+        func_idx: usize,
+        module: &crate::bytecode::CodeModule,
+    ) -> Option<compiler::NativeLeafCall> {
+        let key = (module_idx, func_idx);
+        if let Some(existing) = self.native_leafs.get(&key) {
+            return Some(existing.clone());
+        }
+        if self.native_leaf_rejected.contains(&key) {
+            return None;
+        }
+
+        let Some((start, body_len, ret_reg, clobbers)) = analyze_native_leaf(module, func_idx)
+        else {
+            self.native_leaf_rejected.insert(key);
+            return None;
+        };
+
+        let func_name = format!("nulang_leaf_{}_{}", module_idx, func_idx);
+        let no_calls = std::collections::HashMap::new();
+        let no_leaf_calls = std::collections::HashMap::new();
+        let ptr = match compiler::compile_bytecode_region_with_options(
+            &mut self.module,
+            &mut self.builder_context,
+            &mut self.ctx,
+            &func_name,
+            start,
+            body_len,
+            &module.instructions,
+            &no_calls,
+            &no_leaf_calls,
+            false,
+        ) {
+            Ok(ptr) => ptr,
+            Err(_) => {
+                self.native_leaf_rejected.insert(key);
+                return None;
+            }
+        };
+
+        let leaf = compiler::NativeLeafCall {
+            ptr,
+            ret_reg,
+            clobbers,
+        };
+        self.native_leafs.insert(key, leaf.clone());
+        Some(leaf)
+    }
+
+    fn native_leaf_calls_for_region(
+        &mut self,
+        module_idx: usize,
+        module: &crate::bytecode::CodeModule,
+        native_calls: &std::collections::HashMap<usize, usize>,
+    ) -> std::collections::HashMap<usize, compiler::NativeLeafCall> {
+        let mut result = std::collections::HashMap::new();
+        for (&pc, &func_idx) in native_calls {
+            if let Some(leaf) = self.native_leaf_for(module_idx, func_idx, module) {
+                result.insert(pc, leaf);
+            }
+        }
+        result
+    }
+
     /// Record one execution of an already-compiled region and attempt
     /// tier-2 promotion when the threshold is crossed.
     ///
@@ -329,15 +404,31 @@ impl JitSession {
         instructions: &[crate::bytecode::Instruction],
         native_calls: &std::collections::HashMap<usize, usize>,
     ) -> Option<JitFunctionPtr> {
-        // Check if already compiled
+        self.compile_region_with_leaf_calls(
+            module_idx,
+            start_offset,
+            num_instrs,
+            instructions,
+            native_calls,
+            &std::collections::HashMap::new(),
+        )
+    }
+
+    unsafe fn compile_region_with_leaf_calls(
+        &mut self,
+        module_idx: usize,
+        start_offset: usize,
+        num_instrs: usize,
+        instructions: &[crate::bytecode::Instruction],
+        native_calls: &std::collections::HashMap<usize, usize>,
+        native_leaf_calls: &std::collections::HashMap<usize, compiler::NativeLeafCall>,
+    ) -> Option<JitFunctionPtr> {
         if let Some((ptr, _)) = self.compiled_entry(module_idx, start_offset) {
             return Some(std::mem::transmute(ptr));
         }
 
-        // Build the function
         let func_name = format!("nulang_jit_{}_{}", module_idx, start_offset);
-
-        match compiler::compile_bytecode_region(
+        match compiler::compile_bytecode_region_with_options(
             &mut self.module,
             &mut self.builder_context,
             &mut self.ctx,
@@ -346,6 +437,8 @@ impl JitSession {
             num_instrs,
             instructions,
             native_calls,
+            native_leaf_calls,
+            true,
         ) {
             Ok(ptr) => {
                 self.store_compiled(module_idx, start_offset, ptr, num_instrs);
@@ -376,7 +469,27 @@ impl JitSession {
         type_metadata: Option<&crate::jit::typed_compiler::TypeMetadata>,
         native_calls: &std::collections::HashMap<usize, usize>,
     ) -> Option<JitFunctionPtr> {
-        // Check if already compiled
+        self.compile_region_typed_with_leaf_calls(
+            module_idx,
+            start_offset,
+            num_instrs,
+            instructions,
+            type_metadata,
+            native_calls,
+            &std::collections::HashMap::new(),
+        )
+    }
+
+    unsafe fn compile_region_typed_with_leaf_calls(
+        &mut self,
+        module_idx: usize,
+        start_offset: usize,
+        num_instrs: usize,
+        instructions: &[crate::bytecode::Instruction],
+        type_metadata: Option<&crate::jit::typed_compiler::TypeMetadata>,
+        native_calls: &std::collections::HashMap<usize, usize>,
+        native_leaf_calls: &std::collections::HashMap<usize, compiler::NativeLeafCall>,
+    ) -> Option<JitFunctionPtr> {
         if let Some((ptr, _)) = self.compiled_entry(module_idx, start_offset) {
             return Some(std::mem::transmute(ptr));
         }
@@ -390,9 +503,6 @@ impl JitSession {
             .unwrap_or(false);
 
         if has_known_types && native_calls.is_empty() {
-            // The typed compiler does not understand `Call`; a region
-            // containing a native direct call (non-empty map) must go through
-            // the scalar compiler, which handles `nulang_jit_direct_call`.
             let func_name = format!("nulang_tjit_{}_{}", module_idx, start_offset);
             if let Ok(ptr) = typed_compiler::compile_bytecode_region_typed(
                 &mut self.module,
@@ -408,15 +518,15 @@ impl JitSession {
                 self.typed_regions.insert((module_idx, start_offset));
                 return Some(std::mem::transmute(ptr));
             }
-            // Typed compilation failed: fall through to the scalar compiler.
         }
 
-        self.compile_region(
+        self.compile_region_with_leaf_calls(
             module_idx,
             start_offset,
             num_instrs,
             instructions,
             native_calls,
+            native_leaf_calls,
         )
     }
 
@@ -591,11 +701,31 @@ pub(crate) fn direct_call_target(
 ) -> Option<usize> {
     use crate::bytecode::{Constant, OpCode};
     const FUNC_VALUE_REG: u8 = 254;
+    const SPILL_TEMP_MIN: u8 = 12;
+    const SPILL_TEMP_MAX: u8 = 14;
+
+    let call = *module.instructions.get(pc)?;
+    if call.opcode != OpCode::Call {
+        return None;
+    }
+    let argc = call.op2;
+
+    // MIR emits one exact staging shape:
+    //   load direct callee -> r254
+    //   [optional SpillLoad -> r12..r14]*
+    //   [optional Move -> r0..r(argc-1)]*
+    //   Call r254, argc, dst
+    //
+    // Only scan through those argument-staging instructions. Stopping at the
+    // first unrelated opcode prevents a stale earlier r254 definition from
+    // making hand-built/malformed bytecode look like a direct call.
     let mut p = pc;
     while p > func_start {
         p -= 1;
         let instr = module.instructions[p];
         match instr.opcode {
+            OpCode::Move if instr.op2 < argc => continue,
+            OpCode::SpillLoad if (SPILL_TEMP_MIN..=SPILL_TEMP_MAX).contains(&instr.op3) => continue,
             OpCode::Const0 | OpCode::Const1 | OpCode::Const2 if instr.op1 == FUNC_VALUE_REG => {
                 let idx = match instr.opcode {
                     OpCode::Const0 => 0,
@@ -613,7 +743,7 @@ pub(crate) fn direct_call_target(
                 };
             }
             OpCode::Move if instr.op2 == FUNC_VALUE_REG => return None, // indirect
-            _ => {}
+            _ => return None,
         }
     }
     None
@@ -882,6 +1012,139 @@ pub(crate) fn find_compilable_region(
     }
 }
 
+const NATIVE_LEAF_MAX_INSTRS: usize = 32;
+
+/// Prove that a named function can execute as an isolated native leaf thunk.
+///
+/// This first native-to-native slice is intentionally strict: one straight-line
+/// body, no calls, branches, heap/container operations, effects, or suspension,
+/// and at most NATIVE_LEAF_MAX_INSTRS instructions before the terminal return.
+/// The result includes the exact register write-set needed to recreate the
+/// interpreter's separate callee frame around an in-place register-ABI call.
+fn analyze_native_leaf(
+    module: &crate::bytecode::CodeModule,
+    func_idx: usize,
+) -> Option<(usize, usize, u8, Vec<u8>)> {
+    use crate::bytecode::OpCode;
+
+    let start = *module.function_table.get(func_idx)?;
+    let mut end = module.instructions.len();
+
+    // Prefer compiler-owned debug range metadata when available, then clamp to
+    // every other known executable entry point so malformed/legacy metadata
+    // cannot make the analysis spill into a neighboring function/behavior.
+    if let Some(info) = module
+        .debug_functions
+        .iter()
+        .find(|info| info.code_offset == start)
+    {
+        end = end.min(start.saturating_add(info.code_len));
+    }
+    for &offset in &module.function_table {
+        if offset > start {
+            end = end.min(offset);
+        }
+    }
+    for behavior in &module.behaviors {
+        if behavior.code_offset > start {
+            end = end.min(behavior.code_offset);
+        }
+    }
+    if let Some(entry) = module.entry_point {
+        if entry > start {
+            end = end.min(entry);
+        }
+    }
+    if end <= start {
+        return None;
+    }
+
+    let terminal_pc = end - 1;
+    let terminal = *module.instructions.get(terminal_pc)?;
+    let ret_reg = match terminal.opcode {
+        OpCode::Ret => 0,
+        OpCode::RetVal => terminal.op1,
+        _ => return None,
+    };
+
+    let body_len = terminal_pc - start;
+    if body_len > NATIVE_LEAF_MAX_INSTRS {
+        return None;
+    }
+
+    let mut writes = FxHashSet::default();
+    for instr in &module.instructions[start..terminal_pc] {
+        match instr.opcode {
+            OpCode::Nop => {}
+            OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
+                writes.insert(instr.op1);
+            }
+            OpCode::ConstU => {
+                writes.insert(instr.op3);
+            }
+            OpCode::Load | OpCode::Store | OpCode::Move | OpCode::Dup => {
+                writes.insert(instr.op2);
+            }
+            OpCode::Swap => {
+                writes.insert(instr.op1);
+                writes.insert(instr.op2);
+            }
+            OpCode::IAdd
+            | OpCode::ISub
+            | OpCode::IMul
+            | OpCode::IDiv
+            | OpCode::IMod
+            | OpCode::IPow
+            | OpCode::FPow
+            | OpCode::Xor
+            | OpCode::Shl
+            | OpCode::Shr
+            | OpCode::BitAnd
+            | OpCode::BitOr
+            | OpCode::FAdd
+            | OpCode::FSub
+            | OpCode::FMul
+            | OpCode::FDiv
+            | OpCode::ICmpEq
+            | OpCode::ICmpLt
+            | OpCode::ICmpGt
+            | OpCode::ICmpLe
+            | OpCode::ICmpGe
+            | OpCode::FCmpEq
+            | OpCode::FCmpLt
+            | OpCode::FCmpGt
+            | OpCode::And
+            | OpCode::Or => {
+                writes.insert(instr.op3);
+            }
+            // INeg can raise overflow/type errors. The tiered JIT helper
+            // currently records those only in the AOT error slot, so running
+            // it inside a native direct-call thunk would change interpreted
+            // callee error semantics. Keep it on the interpreter helper path.
+            OpCode::INeg => return None,
+            OpCode::Not | OpCode::IToF | OpCode::FToI => {
+                writes.insert(instr.op2);
+            }
+            // FNeg is the one unary opcode whose bytecode destination is op3.
+            OpCode::FNeg => {
+                writes.insert(instr.op3);
+            }
+            OpCode::IInc | OpCode::IDec => {
+                writes.insert(instr.op1);
+            }
+            // Anything with control flow, nested calls, heap/container access,
+            // effects, capability/closure state, or debugging side effects is
+            // outside the first native-leaf proof and uses the existing
+            // re-entrant interpreter helper instead.
+            _ => return None,
+        }
+    }
+
+    let mut clobbers: Vec<u8> = writes.into_iter().collect();
+    clobbers.sort_unstable();
+    Some((start, body_len, ret_reg, clobbers))
+}
+
 /// The code offset of the function containing `pc` (largest
 /// `function_table[i] <= pc`), bounding `direct_call_target`'s backward walk.
 pub(crate) fn func_start_for(module: &crate::bytecode::CodeModule, pc: usize) -> usize {
@@ -1056,61 +1319,75 @@ impl crate::backends::JitBackend for JitSession {
         self.typed_regions.len()
     }
 
+    fn native_leaf_compiled_count(&self) -> usize {
+        self.native_leafs.len()
+    }
+
     fn reset_hot_counters(&mut self) {
         self.hot_counts.clear();
     }
 
-    fn tiered_execute_step_typed(
+    fn prepare_tiered_step(
         &mut self,
         module_idx: usize,
         pc: usize,
         module: &crate::bytecode::CodeModule,
+    ) -> bool {
+        let instructions = &module.instructions;
+
+        // The VM has already performed the hot/compiled probe. For an
+        // existing native region, do any tier-2 bookkeeping while the module
+        // is borrowed, before native execution begins.
+        if self.compiled_entry(module_idx, pc).is_some() {
+            self.record_tier2_and_maybe_promote(module_idx, pc, instructions);
+            return true;
+        }
+
+        let ms = self.may_suspend_for(module_idx, module).to_vec();
+        let rc = self.recursive_for(module_idx, module).to_vec();
+        let (region_len, native_calls) =
+            find_compilable_region_with_calls(pc, instructions, module, Some(&ms), Some(&rc));
+        if region_len >= 3 {
+            let native_leaf_calls =
+                self.native_leaf_calls_for_region(module_idx, module, &native_calls);
+            let meta = typed_compiler::infer_reg_types(module, pc);
+            let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
+            if unsafe {
+                self.compile_region_typed_with_leaf_calls(
+                    module_idx,
+                    pc,
+                    region_len,
+                    instructions,
+                    meta_ref,
+                    &native_calls,
+                    &native_leaf_calls,
+                )
+            }
+            .is_some()
+            {
+                return true;
+            }
+        }
+
+        // Rejected (too small / fragmented) or compile failed. Reset the hot
+        // counter so the next interpreted step does not immediately rescan.
+        if module_idx < self.hot_counts.len() && pc < self.hot_counts[module_idx].len() {
+            self.hot_counts[module_idx][pc] = 0;
+        }
+        false
+    }
+
+    fn execute_compiled(
+        &mut self,
+        module_idx: usize,
+        pc: usize,
         regs: &mut [u64; 256],
         constants: &[u64],
     ) -> crate::backends::TieredAction {
-        let instructions = &module.instructions;
-
-        // Check if already compiled
-        if let Some(func) = unsafe { self.get_compiled(module_idx, pc) } {
-            func(regs.as_mut_ptr(), constants.as_ptr());
-            // Track post-compilation hotness for tier-2 promotion.
-            self.record_tier2_and_maybe_promote(module_idx, pc, instructions);
-            return crate::backends::TieredAction::RanJit;
-        }
-
-        // Record execution for hotness
-        if self.record_and_check_hot(module_idx, pc) {
-            let ms = self.may_suspend_for(module_idx, module).to_vec();
-            let rc = self.recursive_for(module_idx, module).to_vec();
-            let (region_len, native_calls) =
-                find_compilable_region_with_calls(pc, instructions, module, Some(&ms), Some(&rc));
-            if region_len >= 3 {
-                let meta = typed_compiler::infer_reg_types(module, pc);
-                let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
-                if let Some(func) = unsafe {
-                    self.compile_region_typed(
-                        module_idx,
-                        pc,
-                        region_len,
-                        instructions,
-                        meta_ref,
-                        &native_calls,
-                    )
-                } {
-                    func(regs.as_mut_ptr(), constants.as_ptr());
-                    return crate::backends::TieredAction::RanJit;
-                }
-            }
-            // Rejected (too small / fragmented) or compile failed. Reset the
-            // hot counter so the per-step `record_and_check_hot` doesn't keep
-            // returning true and re-scanning every step — a rejected pc would
-            // otherwise call `find_compilable_region` on every execution,
-            // regressing call-heavy loops ~5x.
-            if module_idx < self.hot_counts.len() && pc < self.hot_counts[module_idx].len() {
-                self.hot_counts[module_idx][pc] = 0;
-            }
-        }
-
-        crate::backends::TieredAction::Interpret
+        let Some(func) = (unsafe { self.get_compiled(module_idx, pc) }) else {
+            return crate::backends::TieredAction::Interpret;
+        };
+        func(regs.as_mut_ptr(), constants.as_ptr());
+        crate::backends::TieredAction::RanJit
     }
 }
