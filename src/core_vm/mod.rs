@@ -723,7 +723,22 @@ mod tests {
 
     #[test]
     fn test_core_ineg_int48_min_overflow() {
-        let err = run_core("-(-140737488355328)")
+        let mut module = CodeModule::new("checked_ineg");
+        let idx = module.add_constant(Constant::Int(value_layout::INT48_MIN));
+        module.emit(Instruction::new3(
+            OpCode::ConstU,
+            ((idx >> 8) & 0xFF) as u8,
+            (idx & 0xFF) as u8,
+            0,
+        ));
+        module.emit(Instruction::new2(OpCode::INeg, 0, 1));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+
+        let mut vm = CoreVM::new();
+        let module_idx = vm.load_module_from_code(&module).unwrap();
+        let err = vm
+            .run(module_idx, 0)
             .expect_err("negating INT48_MIN must raise instead of wrapping");
         assert!(
             err.contains("integer overflow"),
