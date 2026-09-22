@@ -3423,6 +3423,207 @@ mod typed_tests {
     }
 
     // ------------------------------------------------------------------
+    // Test 6c: Simple loop-carried native SSA
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_simple_loop_ssa_plan_selects_stable_numeric_regs() {
+        let instructions = vec![
+            Instruction::new3(OpCode::IAdd, 0, 1, 0),
+            Instruction::new1(OpCode::IInc, 1),
+            Instruction::new3(OpCode::ICmpLt, 1, 6, 5),
+            Instruction::new3(OpCode::JmpT, 5, 0xFF, 0xFD), // pc3 -> pc0
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Int);
+        meta.set_type(1, KnownType::Int);
+        meta.set_type(6, KnownType::Int);
+
+        let plan = simple_loop_ssa_plan(
+            &instructions,
+            0,
+            instructions.len(),
+            Some(&meta),
+        )
+        .expect("simple numeric loop should get an SSA plan");
+
+        assert_eq!(plan.backedge_pc, 3);
+        assert!(plan.carried.contains(&(0, KnownType::Int)));
+        assert!(plan.carried.contains(&(1, KnownType::Int)));
+        assert!(plan.carried.contains(&(6, KnownType::Int)));
+    }
+
+    #[test]
+    fn test_simple_loop_ssa_excludes_nullable_division_result() {
+        let instructions = vec![
+            Instruction::new3(OpCode::IDiv, 0, 2, 0),
+            Instruction::new1(OpCode::IInc, 1),
+            Instruction::new3(OpCode::ICmpLt, 1, 6, 5),
+            Instruction::new3(OpCode::JmpT, 5, 0xFF, 0xFD),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        for reg in [0usize, 1, 2, 6] {
+            meta.set_type(reg, KnownType::Int);
+        }
+
+        let plan = simple_loop_ssa_plan(
+            &instructions,
+            0,
+            instructions.len(),
+            Some(&meta),
+        )
+        .expect("other stable numeric registers should still be threadable");
+
+        assert!(
+            !plan.carried.iter().any(|&(reg, _)| reg == 0),
+            "IDiv can produce nil, so its destination must not be carried as native Int"
+        );
+    }
+
+    #[test]
+    fn test_loop_ssa_executes_int_backedge() {
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            Instruction::new3(OpCode::IAdd, 0, 1, 0),
+            Instruction::new1(OpCode::IInc, 1),
+            Instruction::new3(OpCode::ICmpLt, 1, 6, 5),
+            Instruction::new3(OpCode::JmpT, 5, 0xFF, 0xFD),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Int);
+        meta.set_type(1, KnownType::Int);
+        meta.set_type(6, KnownType::Int);
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_loop_ssa_int",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("Int loop SSA should compile");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+        let mut regs = [0u64; 256];
+        regs[0] = Value::int(0).as_raw();
+        regs[1] = Value::int(0).as_raw();
+        regs[6] = Value::int(100).as_raw();
+
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(unsafe { Value::from_bits(regs[0]) }.as_int(), Some(4950));
+        assert_eq!(unsafe { Value::from_bits(regs[1]) }.as_int(), Some(100));
+    }
+
+    #[test]
+    fn test_loop_ssa_executes_float_backedge() {
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            Instruction::new3(OpCode::FAdd, 0, 1, 0),
+            Instruction::new3(OpCode::FAdd, 1, 7, 1),
+            Instruction::new3(OpCode::FCmpLt, 1, 6, 5),
+            Instruction::new3(OpCode::JmpT, 5, 0xFF, 0xFD),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        for reg in [0usize, 1, 6, 7] {
+            meta.set_type(reg, KnownType::Float);
+        }
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_loop_ssa_float",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("Float loop SSA should compile");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+        let mut regs = [0u64; 256];
+        regs[0] = Value::float(0.0).as_raw();
+        regs[1] = Value::float(0.0).as_raw();
+        regs[6] = Value::float(100.0).as_raw();
+        regs[7] = Value::float(1.0).as_raw();
+
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(
+            unsafe { Value::from_bits(regs[0]) }.as_float(),
+            Some(4950.0)
+        );
+        assert_eq!(
+            unsafe { Value::from_bits(regs[1]) }.as_float(),
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    fn test_loop_ssa_materializes_noncarried_temporary() {
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            // r8 is deliberately Unknown at the header, so this first op uses
+            // the runtime helper. Its value must still reflect the prior loop
+            // iteration.
+            Instruction::new3(OpCode::FAdd, 0, 8, 0),
+            // r8 becomes a typed cached Float inside the loop but cannot be a
+            // header phi because its entry type is Unknown.
+            Instruction::new3(OpCode::FAdd, 9, 9, 8),
+            Instruction::new1(OpCode::IInc, 1),
+            Instruction::new3(OpCode::ICmpLt, 1, 6, 5),
+            Instruction::new3(OpCode::JmpT, 5, 0xFF, 0xFC), // pc4 -> pc0
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Float);
+        meta.set_type(1, KnownType::Int);
+        meta.set_type(6, KnownType::Int);
+        meta.set_type(9, KnownType::Float);
+        // r8 stays Unknown at loop entry.
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_loop_ssa_noncarried_temp",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("mixed carried/non-carried loop should compile");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+        let mut regs = [0u64; 256];
+        regs[0] = Value::float(0.0).as_raw();
+        regs[1] = Value::int(0).as_raw();
+        regs[6] = Value::int(4).as_raw();
+        regs[8] = Value::float(1.0).as_raw();
+        regs[9] = Value::float(1.0).as_raw();
+
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        // Iteration inputs for r8 are 1, 2, 2, 2.
+        assert_eq!(unsafe { Value::from_bits(regs[0]) }.as_float(), Some(7.0));
+        assert_eq!(unsafe { Value::from_bits(regs[8]) }.as_float(), Some(2.0));
+    }
+
+    // ------------------------------------------------------------------
     // Test 7: sext48 inline extraction correctness
     // ------------------------------------------------------------------
 
