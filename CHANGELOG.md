@@ -1570,9 +1570,10 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
-### Conservative finite match coverage diagnostics — 2026-09-22
-- **W0201 detects provably missing finite cases during type checking.** Boolean and closed-variant matches, including recursively finite payloads, are analyzed after type inference; guarded arms do not count toward totality because their guards may fail.
-- **The first phase is compatibility-preserving.** Ordinary execution keeps the runtime non-exhaustive fallback. `nulang --check` surfaces W0201, and `--deny-warnings` can enforce it in CI. Infinite/structural pattern matrices remain deliberately undecided until the full usefulness algorithm is implemented.
+### Pattern usefulness and exhaustiveness diagnostics — 2026-09-22
+- **Typed Maranget-style usefulness analysis replaces the finite-case heuristic.** W0201 now emits uncovered witness patterns across nested variants, tuples, records, booleans, Nil/Unit, and literal patterns over infinite primitive domains.
+- **W0202 reports unreachable/subsumed match arms.** Each arm is checked against previous unguarded coverage; guarded arms can be unreachable but never shadow later arms because their guard may fail.
+- **The compatibility phase is preserved.** Ordinary execution keeps the runtime non-exhaustive fallback. `nulang --check` surfaces pattern warnings, and `--deny-warnings` makes them CI-enforceable without silently changing existing runtime behavior.
 
 ### Single-pass LSP diagnostics parsing — 2026-09-21
 - **LSP diagnostics reuse their parsed AST.** Document open and debounced changes now populate `DocumentState.ast` from the frontend pass that already produced diagnostics, removing a guaranteed second lex+parse of the same source while preserving diagnostics and editor semantics.
