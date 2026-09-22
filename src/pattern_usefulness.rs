@@ -114,7 +114,8 @@ fn normalize_pattern(pattern: &Pattern, ty: &Type) -> CorePat {
         Pattern::Lit(lit) => normalize_literal(lit, ty),
         Pattern::Variant(name, payload) => match ty {
             Type::Variant(variants) => {
-                let Some((_, expected_payload)) = variants.iter().find(|(variant, _)| variant == name)
+                let Some((_, expected_payload)) =
+                    variants.iter().find(|(variant, _)| variant == name)
                 else {
                     return CorePat::Ctor(
                         Constructor::Opaque(format!("variant:{name}")),
@@ -122,9 +123,7 @@ fn normalize_pattern(pattern: &Pattern, ty: &Type) -> CorePat {
                     );
                 };
                 match (expected_payload, payload.as_deref()) {
-                    (None, None) => {
-                        CorePat::Ctor(Constructor::Variant(name.clone()), Vec::new())
-                    }
+                    (None, None) => CorePat::Ctor(Constructor::Variant(name.clone()), Vec::new()),
                     (Some(payload_ty), Some(inner)) => CorePat::Ctor(
                         Constructor::Variant(name.clone()),
                         vec![normalize_pattern(inner, payload_ty)],
@@ -135,10 +134,7 @@ fn normalize_pattern(pattern: &Pattern, ty: &Type) -> CorePat {
                     _ => CorePat::Impossible,
                 }
             }
-            _ => CorePat::Ctor(
-                Constructor::Opaque(format!("variant:{name}")),
-                Vec::new(),
-            ),
+            _ => CorePat::Ctor(Constructor::Opaque(format!("variant:{name}")), Vec::new()),
         },
         Pattern::Tuple(items) => match ty {
             Type::Tuple(types) if items.len() == types.len() => CorePat::Ctor(
@@ -149,10 +145,7 @@ fn normalize_pattern(pattern: &Pattern, ty: &Type) -> CorePat {
                     .map(|(pattern, ty)| normalize_pattern(pattern, ty))
                     .collect(),
             ),
-            _ => CorePat::Ctor(
-                Constructor::Opaque(format!("tuple:{items:?}")),
-                Vec::new(),
-            ),
+            _ => CorePat::Ctor(Constructor::Opaque(format!("tuple:{items:?}")), Vec::new()),
         },
         Pattern::Record(pattern_fields) => match ty {
             Type::Record(type_fields) => {
@@ -272,15 +265,9 @@ fn constructor_universe(ty: &Type) -> Option<Vec<ConstructorInfo>> {
                 .collect::<Vec<_>>();
             Some(vec![ConstructorInfo {
                 ctor: Constructor::Record(
-                    real_fields
-                        .iter()
-                        .map(|(name, _)| name.clone())
-                        .collect(),
+                    real_fields.iter().map(|(name, _)| name.clone()).collect(),
                 ),
-                arg_types: real_fields
-                    .iter()
-                    .map(|(_, ty)| (*ty).clone())
-                    .collect(),
+                arg_types: real_fields.iter().map(|(_, ty)| (*ty).clone()).collect(),
             }])
         }
         // Int/Float/String and the remaining runtime domains have an open or
@@ -394,11 +381,7 @@ fn is_useful(matrix: &Matrix, query: &[CorePat], types: &[Type]) -> bool {
                 }
             }
 
-            is_useful(
-                &default_matrix(matrix),
-                &query[1..],
-                &types[1..],
-            )
+            is_useful(&default_matrix(matrix), &query[1..], &types[1..])
         }
     }
 }
@@ -459,11 +442,11 @@ fn find_witness(matrix: &Matrix, query: &[CorePat], types: &[Type]) -> Option<Ve
                     return None;
                 }
 
-                if let Some(tail) =
-                    find_witness(&default_matrix(matrix), &query[1..], &types[1..])
+                if let Some(tail) = find_witness(&default_matrix(matrix), &query[1..], &types[1..])
                 {
-                    if let Some(info) =
-                        universe.into_iter().find(|info| !present.contains(&info.ctor))
+                    if let Some(info) = universe
+                        .into_iter()
+                        .find(|info| !present.contains(&info.ctor))
                     {
                         let mut rebuilt = vec![CorePat::Ctor(
                             info.ctor,
@@ -546,7 +529,10 @@ mod tests {
             Pattern::Variant("Some".to_string(), Some(Box::new(lit_bool(false)))),
             Pattern::Variant("None".to_string(), None),
         ];
-        let arms = patterns.iter().map(|pattern| (pattern, false)).collect::<Vec<_>>();
+        let arms = patterns
+            .iter()
+            .map(|pattern| (pattern, false))
+            .collect::<Vec<_>>();
         let report = analyze_match(&ty, &arms);
         assert!(report.missing.is_empty());
         assert!(report.unreachable_arms.is_empty());
@@ -562,7 +548,10 @@ mod tests {
             Pattern::Variant("Some".to_string(), Some(Box::new(lit_bool(true)))),
             Pattern::Variant("None".to_string(), None),
         ];
-        let arms = patterns.iter().map(|pattern| (pattern, false)).collect::<Vec<_>>();
+        let arms = patterns
+            .iter()
+            .map(|pattern| (pattern, false))
+            .collect::<Vec<_>>();
         let report = analyze_match(&ty, &arms);
         assert_eq!(report.missing, vec!["Some(false)"]);
     }
@@ -570,7 +559,10 @@ mod tests {
     #[test]
     fn duplicate_literal_on_infinite_domain_is_unreachable() {
         let patterns = [lit_int(1), lit_int(1)];
-        let arms = patterns.iter().map(|pattern| (pattern, false)).collect::<Vec<_>>();
+        let arms = patterns
+            .iter()
+            .map(|pattern| (pattern, false))
+            .collect::<Vec<_>>();
         let report = analyze_match(&Type::int(), &arms);
         assert_eq!(report.unreachable_arms, vec![1]);
         assert_eq!(report.missing, vec!["_"]);
@@ -579,7 +571,10 @@ mod tests {
     #[test]
     fn finite_complete_match_makes_fallback_unreachable() {
         let patterns = [lit_bool(true), lit_bool(false), Pattern::Wild];
-        let arms = patterns.iter().map(|pattern| (pattern, false)).collect::<Vec<_>>();
+        let arms = patterns
+            .iter()
+            .map(|pattern| (pattern, false))
+            .collect::<Vec<_>>();
         let report = analyze_match(&Type::bool(), &arms);
         assert!(report.missing.is_empty());
         assert_eq!(report.unreachable_arms, vec![2]);
@@ -606,7 +601,10 @@ mod tests {
             Pattern::Tuple(vec![lit_bool(false), lit_bool(true)]),
             Pattern::Tuple(vec![lit_bool(false), lit_bool(false)]),
         ];
-        let arms = patterns.iter().map(|pattern| (pattern, false)).collect::<Vec<_>>();
+        let arms = patterns
+            .iter()
+            .map(|pattern| (pattern, false))
+            .collect::<Vec<_>>();
         let report = analyze_match(&ty, &arms);
         assert!(report.missing.is_empty());
         assert!(report.unreachable_arms.is_empty());
@@ -619,7 +617,10 @@ mod tests {
             Pattern::Tuple(vec![lit_bool(true), Pattern::Wild]),
             Pattern::Tuple(vec![lit_bool(true), lit_bool(false)]),
         ];
-        let arms = patterns.iter().map(|pattern| (pattern, false)).collect::<Vec<_>>();
+        let arms = patterns
+            .iter()
+            .map(|pattern| (pattern, false))
+            .collect::<Vec<_>>();
         let report = analyze_match(&ty, &arms);
         assert_eq!(report.unreachable_arms, vec![1]);
         assert!(report.missing.contains(&"(false, true)".to_string()));
@@ -643,7 +644,10 @@ mod tests {
                 ("b".to_string(), lit_bool(false)),
             ]),
         ];
-        let arms = patterns.iter().map(|pattern| (pattern, false)).collect::<Vec<_>>();
+        let arms = patterns
+            .iter()
+            .map(|pattern| (pattern, false))
+            .collect::<Vec<_>>();
         let report = analyze_match(&ty, &arms);
         assert!(report.missing.is_empty());
         assert!(report.unreachable_arms.is_empty());
