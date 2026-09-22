@@ -360,6 +360,20 @@ pub(crate) fn store_reg(builder: &mut FunctionBuilder, regs_ptr: Value, idx: usi
     builder.ins().store(MemFlags::new(), val, addr, 0);
 }
 
+
+/// Normalize an unboxed integer to Nulang's signed 48-bit Int domain.
+///
+/// The boxed VM masks every integer result to 48 payload bits before the next
+/// instruction observes it. Native SSA must preserve that per-instruction
+/// wraparound, not merely mask when eventually spilling back to the register
+/// file. Shifting left 16 and arithmetic-shifting right 16 is the compact
+/// sign-extending truncation from i64 to signed i48.
+#[inline]
+fn emit_wrap_i48(builder: &mut FunctionBuilder, value: Value) -> Value {
+    let shifted = builder.ins().ishl_imm(value, 16);
+    builder.ins().sshr_imm(shifted, 16)
+}
+
 /// One unboxed integer value carried in native SSA form.
 ///
 /// The dirty flag means the VM register file has not yet been synchronized
@@ -541,6 +555,7 @@ fn emit_typed_ibinop(
         TypedIntOp::Sub => builder.ins().isub(a, b),
         TypedIntOp::Mul => builder.ins().imul(a, b),
     };
+    let result = emit_wrap_i48(builder, result);
 
     cache.set_dirty(dst, result);
 }
@@ -681,6 +696,7 @@ fn emit_typed_iunary(
             builder.ins().isub(val, one)
         }
     };
+    let result = emit_wrap_i48(builder, result);
 
     cache.set_dirty(dst, result);
 }
