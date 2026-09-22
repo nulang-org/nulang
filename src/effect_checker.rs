@@ -1789,8 +1789,7 @@ impl LinearFlow {
     /// for handler arms/guards that may execute: they can make later reuse
     /// unsafe, but cannot by themselves satisfy an exactly-once obligation.
     fn absorb_may_delta(&mut self, base: &Self, branch: &Self) {
-        self.may
-            .extend(branch.may.difference(&base.may).cloned());
+        self.may.extend(branch.may.difference(&base.may).cloned());
     }
 
     fn newly_may_consumed<'a>(&'a self, base: &'a Self) -> Option<&'a String> {
@@ -1891,9 +1890,7 @@ impl CapabilityAnalyzer {
                 "linear/lineariso bindings are moved on first use and may not be referenced again on the same path",
             ));
         }
-        self.first_consumed
-            .entry(name.to_string())
-            .or_insert(span);
+        self.first_consumed.entry(name.to_string()).or_insert(span);
         Ok(())
     }
 
@@ -1929,9 +1926,7 @@ impl CapabilityAnalyzer {
                 "an `iso` value has exactly one owner; after ownership transfer, accessing the original binding would create a second alias to actor-isolated mutable state",
             ));
         }
-        self.first_consumed
-            .entry(name.to_string())
-            .or_insert(span);
+        self.first_consumed.entry(name.to_string()).or_insert(span);
         Ok(())
     }
 
@@ -2513,8 +2508,7 @@ impl CapabilityAnalyzer {
                         Capability::Tag
                     };
 
-                    let body_cap =
-                        self.infer_cap_tracked(&arm_ctx, body_expr, &mut arm_flow)?;
+                    let body_cap = self.infer_cap_tracked(&arm_ctx, body_expr, &mut arm_flow)?;
                     for (name, state) in saved {
                         arm_flow.clear_binding(&name);
                         arm_flow.restore_binding(name, state);
