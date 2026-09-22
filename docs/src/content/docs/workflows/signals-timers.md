@@ -5,8 +5,8 @@ description: Workflow suspension and resume primitives — signals, durable time
 
 ## Suspension and Resume
 
-:::caution[Compatibility documentation]
-These examples use the deprecated Experimental `workflow` declaration. The signal/timer/effect concepts remain relevant, but new application architecture should compose ordinary actors/entities with workflow libraries rather than depend on this declaration remaining permanent.
+:::note[Experimental workflow syntax]
+These examples use the Experimental `workflow` declaration retained by RFC 0017 as ergonomic syntax over the canonical actor/effect/time runtime model. The signal, timer, query, and replay semantics are the important primitives; the declaration does not define a separate runtime species.
 :::
 
 Workflow steps can suspend waiting for external events. When a durable workflow step suspends, the runtime records suspension metadata in its journal and frees the actor to run other work. On compatible recovery with the same durable store, the runtime can reconstruct and re-arm supported suspension state. Exact crash/replay guarantees depend on the primitive and external effect involved.
