@@ -250,9 +250,7 @@ impl<'a> MigrationPurityChecker<'a> {
                 }
                 Ok(())
             }
-            Expr::Handle {
-                body, handlers, ..
-            } => {
+            Expr::Handle { body, handlers, .. } => {
                 // Handling does not launder a forbidden `perform`: recurse into
                 // both the handled body and handler arms without exemptions.
                 self.walk(scope, body, bound)?;
