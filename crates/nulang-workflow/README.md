@@ -20,7 +20,8 @@ The first slice implements durable activity execution:
 - one idempotency key reused across retries and crash recovery;
 - durable worker leases with heartbeat renewal and monotonic fencing tokens;
 - plan-pinned sagas with reverse-order, crash-resumable compensation;
-- idempotent signal notification/delivery and persisted, re-armable timers.
+- idempotent signal notification/delivery and persisted, re-armable timers;
+- synchronous and executor-neutral async host contracts sharing one history format.
 
 It deliberately does **not** claim arbitrary exactly-once delivery. If an
 external system commits and the host crashes before recording completion, the
