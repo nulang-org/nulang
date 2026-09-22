@@ -502,16 +502,41 @@ impl PersistenceStore for MemoryStore {
 /// File-backed persistence store using JSON.
 /// Each actor gets `<base_dir>/<actor_id>/snapshot.json`, `journal.jsonl`,
 /// and `workflow_events.jsonl`.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct JsonFileStore {
     base_dir: PathBuf,
+    /// Open append handles keyed by actor. Keeping these descriptors alive
+    /// avoids repeated directory traversal + open/close syscalls on every
+    /// durable journal write. Each append still syncs before returning.
+    journal_files: HashMap<u64, fs::File>,
+    workflow_event_files: HashMap<u64, fs::File>,
+    event_files: HashMap<u64, fs::File>,
+}
+
+impl Clone for JsonFileStore {
+    fn clone(&self) -> Self {
+        // File descriptors are intentionally not shared across clones. A clone
+        // reopens its append handles lazily, preserving independent ownership
+        // and append offsets while keeping Clone's historical API contract.
+        JsonFileStore {
+            base_dir: self.base_dir.clone(),
+            journal_files: HashMap::new(),
+            workflow_event_files: HashMap::new(),
+            event_files: HashMap::new(),
+        }
+    }
 }
 
 impl JsonFileStore {
     pub fn new<P: AsRef<Path>>(base_dir: P) -> io::Result<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
         fs::create_dir_all(&base_dir)?;
-        Ok(JsonFileStore { base_dir })
+        Ok(JsonFileStore {
+            base_dir,
+            journal_files: HashMap::new(),
+            workflow_event_files: HashMap::new(),
+            event_files: HashMap::new(),
+        })
     }
 
     fn actor_dir(&self, actor_id: u64) -> PathBuf {
@@ -532,6 +557,35 @@ impl JsonFileStore {
 
     fn events_path(&self, actor_id: u64) -> PathBuf {
         self.actor_dir(actor_id).join("events.jsonl")
+    }
+
+    fn append_json_line_cached(
+        files: &mut HashMap<u64, fs::File>,
+        actor_id: u64,
+        path: PathBuf,
+        json: &str,
+    ) -> io::Result<()> {
+        use std::collections::hash_map::Entry;
+
+        let file = match files.entry(actor_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let file = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                entry.insert(file)
+            }
+        };
+
+        writeln!(file, "{}", json)?;
+        // Preserve the existing durability contract: each append reaches
+        // stable storage before the call returns. The optimization here is
+        // descriptor/directory reuse, not weaker persistence semantics.
+        file.sync_all()
     }
 }
 
@@ -577,20 +631,10 @@ impl PersistenceStore for JsonFileStore {
     }
 
     fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {
-        let dir = self.actor_dir(actor_id);
-        fs::create_dir_all(&dir)?;
         let path = self.journal_path(actor_id);
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
         let json = serde_json::to_string(&entry)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        writeln!(file, "{}", json)?;
-        // fsync before returning so the append is durable, not just in
-        // the page cache (same discipline as save_snapshot's temp file).
-        file.sync_all()?;
-        Ok(())
+        Self::append_json_line_cached(&mut self.journal_files, actor_id, path, &json)
     }
 
     fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
@@ -605,20 +649,10 @@ impl PersistenceStore for JsonFileStore {
     }
 
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
-        let dir = self.actor_dir(actor_id);
-        fs::create_dir_all(&dir)?;
         let path = self.workflow_events_path(actor_id);
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
         let json = serde_json::to_string(&event)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        writeln!(file, "{}", json)?;
-        // fsync before returning so the append is durable, not just in
-        // the page cache (same discipline as save_snapshot's temp file).
-        file.sync_all()?;
-        Ok(())
+        Self::append_json_line_cached(&mut self.workflow_event_files, actor_id, path, &json)
     }
 
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
@@ -633,22 +667,10 @@ impl PersistenceStore for JsonFileStore {
     }
 
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
-        let dir = self.actor_dir(actor_id);
-        fs::create_dir_all(&dir)?;
         let path = self.events_path(actor_id);
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
         let json = serde_json::to_string(&entry)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        writeln!(file, "{}", json)?;
-        // fsync before returning so the event is durable, not just in the
-        // page cache (same discipline as append_journal/append_workflow_event
-        // and save_snapshot's temp file). EventSourced state reconstructs
-        // from this log on recovery, so a lost append is a lost commit.
-        file.sync_all()?;
-        Ok(())
+        Self::append_json_line_cached(&mut self.event_files, actor_id, path, &json)
     }
 
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
@@ -689,6 +711,13 @@ impl PersistenceStore for JsonFileStore {
     }
 
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
+        // Drop cached descriptors before removing the actor directory. This is
+        // required on platforms that do not permit deleting open files and
+        // prevents later appends from targeting an unlinked inode on Unix.
+        self.journal_files.remove(&actor_id);
+        self.workflow_event_files.remove(&actor_id);
+        self.event_files.remove(&actor_id);
+
         let dir = self.actor_dir(actor_id);
         if dir.exists() {
             fs::remove_dir_all(dir)?;
@@ -2077,6 +2106,39 @@ mod json_file_store_tests {
         assert_eq!(journal[0].sequence, 1);
         assert_eq!(journal[1].behavior_id, 1);
         assert_eq!(journal[1].payload, vec![PersistedValue::Int(20)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_json_file_store_reuses_append_handles() {
+        let dir = fresh_dir("cached_handles");
+        let mut store = JsonFileStore::new(&dir).unwrap();
+
+        for sequence in 1..=3 {
+            store
+                .append_journal(
+                    7,
+                    JournalEntry {
+                        sequence,
+                        behavior_id: 1,
+                        payload: vec![PersistedValue::Int(sequence as i64)],
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.journal_files.len(), 1);
+        assert_eq!(store.read_journal(7).len(), 3);
+
+        let cloned = store.clone();
+        assert!(
+            cloned.journal_files.is_empty(),
+            "clones must reopen append handles independently"
+        );
+
+        store.clear(7).unwrap();
+        assert!(store.journal_files.is_empty());
+        assert!(!store.actor_dir(7).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
