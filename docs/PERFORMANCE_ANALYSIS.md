@@ -40,7 +40,7 @@
 | 3.4 | Native Raft | Deferred | No Raft code |
 | 3.5 | Content-addressable bytecode | Deferred | Not present |
 | 4.1 | Evidence-passing style | Not started | Effects remain runtime handler-stack based (`Handle`/`Perform`/`Resume`/`Unwind`) |
-| 4.2 | Linear moves for iso | **Partial** | `LinearIso` capability in `src/types.rs` with at-most-once consumption enforcement wired into `CapabilityAnalyzer` (`src/effect_checker.rs`, 2026-07-12): second use of a consumed binding is a `CapError`, sends/captures consume, conservative branch merge; exactly-once must-use is a documented follow-up. Capabilities are still erased at runtime, so no runtime move mechanism as proposed |
+| 4.2 | Linear moves for iso | **Partial** | `LinearIso`/`Linear` exactly-once tracking is wired into `CapabilityAnalyzer`: ownership flow is split into `may` (union across branches, preventing post-join reuse if any path moved the binding) and `must` (intersection, discharging must-use only when every path consumes it); sends/captures transfer ownership, and loop/receive-guard repeat hazards are rejected. The split-flow branch laws are machine-checked in `spec/formal/capabilities.lean`. Capabilities are still erased at runtime, so no runtime move mechanism as originally proposed |
 | 4.3 | Typestate analysis | Not started | Not present |
 | 4.4 | Implicit effect returns | Not found | No corresponding transform in the current effect checker / HIR lowering |
 | 5.1 | Unify actor/agent primitives | **Partial** | v0.9 AI runtime exists (`src/ai/`: OpenAI/Ollama providers, memory, pipelines, debates, supervisor) but agents are not actors with `capability llm` |

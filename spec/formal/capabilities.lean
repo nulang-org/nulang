@@ -306,45 +306,87 @@ inductive HasTypeCap : CapContext → Expr → Ty → Cap → Prop where
     HasTypeCap Γ e τ .Tag
 
 -- ==================================================================
--- LINEAR-ISO CONSUMPTION TRACKING
+-- SPLIT-CONTEXT LINEAR CONSUMPTION
 -- ==================================================================
 
 /--
-  `consumed Γ x` holds iff `x` is not present in the capability
-  context `Γ`.  In the full linear typing discipline (which refines
-  `HasTypeCap` to track input *and output* contexts), a linear
-  binding (`LinearIso` or `Linear`) is removed from the output
-  context after its single use.  `consumed` checks that removal.
+  The capability checker needs two independent path facts for a linear
+  binding. A single "consumed" bit is insufficient at control-flow joins:
 
-  At merge points (if/else branches), both paths must produce the
-  same output context — i.e., both consume the same linear bindings.
+  * `may = true` means at least one reaching path has consumed/moved it.
+    A later use is unsafe when this bit is true.
+  * `must = true` means every reaching path has consumed/moved it.
+    Exactly-once obligations are discharged only when this bit is true.
+
+  This is the one-binding projection of the compiler's split ownership
+  context in `CapabilityAnalyzer`. The full context is a pointwise map from
+  variable names to this product lattice.
 -/
-def consumed (Γ : CapContext) (x : Name) : Bool :=
-  Γ.lookup x == none
+structure LinearFlow where
+  may : Bool
+  must : Bool
+deriving BEq, Repr, Inhabited
+
+namespace LinearFlow
+
+def empty : LinearFlow := ⟨false, false⟩
+
+/-- Sequential consumption happens on every path represented by the flow. -/
+def consume (_s : LinearFlow) : LinearFlow := ⟨true, true⟩
 
 /--
-  **Theorem: Linear bindings are consumed at most once.**
-
-  **Honesty note (2026-08-14):** the statement below is *false* under the
-  single-context `HasTypeCap` judgment.  Counterexample: take
-  `Γ = [(x, τ₀, .Val)]` (already binds `x`) and `e = .litInt 0`; then
-  `HasTypeCap ((x, τ, .LinearIso) :: Γ) e .int .Val` holds by `tLitInt`
-  for *any* context, but `consumed Γ x = (Γ.lookup x == none) = false`.
-  The property is therefore not a theorem of the single-context judgment:
-  that judgment is a static environment with no *output* context, so it
-  cannot express "`x` was consumed and does not persist for further use".
-
-  The correct statement requires context-splitting semantics — a judgment
-  `Γ ⊢ e : τ / Γ'` carrying input *and* output contexts, where a
-  `LinearIso` binding is removed from `Γ'` after its single use.  This is
-  the RFC 0003 Item 2 contingency: the split-context refinement is stated
-  as a conjecture with a documented proof plan rather than silently
-  asserted against a judgment that cannot express it.
+  Join two alternative fall-through paths. Possible consumption is unioned;
+  guaranteed consumption is intersected.
 -/
-theorem linear_at_most_once : ∀ (Γ : CapContext) (x : Name) (τ : Ty) (e : Expr) (τ' : Ty) (cap : Cap),
-    HasTypeCap ((x, τ, .LinearIso) :: Γ) e τ' cap →
-    consumed Γ x = true := by
-  intro Γ x τ e τ' cap h
-  sorry
+def merge (a b : LinearFlow) : LinearFlow :=
+  ⟨a.may || b.may, a.must && b.must⟩
+
+theorem consume_sets_may (s : LinearFlow) :
+    (consume s).may = true := by
+  rfl
+
+theorem consume_sets_must (s : LinearFlow) :
+    (consume s).must = true := by
+  rfl
+
+/-- A move on the left branch can never be forgotten by the join. -/
+theorem merge_preserves_left_may (a b : LinearFlow) :
+    a.may = true → (merge a b).may = true := by
+  intro h
+  simp [merge, h]
+
+/-- A move on the right branch can never be forgotten by the join. -/
+theorem merge_preserves_right_may (a b : LinearFlow) :
+    b.may = true → (merge a b).may = true := by
+  intro h
+  simp [merge, h]
+
+/-- Exactly-once discharge after a branch requires both branches to discharge. -/
+theorem merge_must_iff (a b : LinearFlow) :
+    (merge a b).must = true ↔ a.must = true ∧ b.must = true := by
+  simp [merge]
+
+/--
+  Regression theorem for the compiler bug that motivated the split context:
+  consumption on only one branch must make a later use unsafe.
+-/
+theorem one_branch_consumed_blocks_reuse :
+    (merge (consume empty) empty).may = true := by
+  rfl
+
+/--
+  The same one-branch consumption must *not* satisfy an exactly-once
+  obligation at the join.
+-/
+theorem one_branch_consumed_does_not_discharge :
+    (merge (consume empty) empty).must = false := by
+  rfl
+
+/-- If both alternatives consume, the exactly-once obligation is discharged. -/
+theorem both_branches_consumed_discharge :
+    (merge (consume empty) (consume empty)).must = true := by
+  rfl
+
+end LinearFlow
 
 end Nulang

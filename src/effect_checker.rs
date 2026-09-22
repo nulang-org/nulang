@@ -1702,6 +1702,102 @@ impl Default for CapContext {
 }
 
 // ---------------------------------------------------------------------------
+// Linear consumption flow
+// ---------------------------------------------------------------------------
+
+/// Path-sensitive ownership facts carried through capability analysis.
+///
+/// `may` is the union fact: the binding has been consumed/moved on at least
+/// one path reaching this point. A later use is therefore unsafe because that
+/// path would use an already-moved value.
+///
+/// `must` is the intersection fact: the binding has been consumed on every
+/// path reaching this point. Exactly-once obligations are discharged only by
+/// this stronger fact.
+#[derive(Debug, Clone, Default)]
+struct LinearFlow {
+    may: FxHashSet<String>,
+    must: FxHashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SavedBindingFlow {
+    may: bool,
+    must: bool,
+}
+
+impl LinearFlow {
+    fn may_contain(&self, name: &str) -> bool {
+        self.may.contains(name)
+    }
+
+    fn must_contain(&self, name: &str) -> bool {
+        self.must.contains(name)
+    }
+
+    /// Sequential consumption happens on every path represented by this flow.
+    /// Returns false when some reaching path had already consumed the binding.
+    fn consume(&mut self, name: &str) -> bool {
+        let fresh = self.may.insert(name.to_string());
+        self.must.insert(name.to_string());
+        fresh
+    }
+
+    fn take_binding(&mut self, name: &str) -> SavedBindingFlow {
+        SavedBindingFlow {
+            may: self.may.remove(name),
+            must: self.must.remove(name),
+        }
+    }
+
+    fn clear_binding(&mut self, name: &str) {
+        self.may.remove(name);
+        self.must.remove(name);
+    }
+
+    fn restore_binding(&mut self, name: String, saved: SavedBindingFlow) {
+        self.clear_binding(&name);
+        if saved.may {
+            self.may.insert(name.clone());
+        }
+        if saved.must {
+            self.must.insert(name);
+        }
+    }
+
+    /// Join alternative fall-through paths: unsafe-after-move information is
+    /// a union, while exactly-once discharge information is an intersection.
+    fn merge_alternatives(base: &Self, branches: &[Self]) -> Self {
+        if branches.is_empty() {
+            return base.clone();
+        }
+
+        let mut may = base.may.clone();
+        for branch in branches {
+            may.extend(branch.may.iter().cloned());
+        }
+
+        let mut must = branches[0].must.clone();
+        for branch in &branches[1..] {
+            must.retain(|name| branch.must.contains(name));
+        }
+
+        LinearFlow { may, must }
+    }
+
+    /// Import only possible consumption from an optional path. This is used
+    /// for handler arms/guards that may execute: they can make later reuse
+    /// unsafe, but cannot by themselves satisfy an exactly-once obligation.
+    fn absorb_may_delta(&mut self, base: &Self, branch: &Self) {
+        self.may.extend(branch.may.difference(&base.may).cloned());
+    }
+
+    fn newly_may_consumed<'a>(&'a self, base: &'a Self) -> Option<&'a String> {
+        self.may.difference(&base.may).next()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Capability Analyzer
 // ---------------------------------------------------------------------------
 
@@ -1737,14 +1833,14 @@ impl CapabilityAnalyzer {
     /// linear-consumption set, so consumption state never leaks between
     /// top-level calls (the frontend reuses one analyzer across declarations).
     pub fn infer_cap(&mut self, ctx: &CapContext, expr: &Expr) -> NuResult<Capability> {
-        let mut consumed = FxHashSet::default();
+        let mut consumed = LinearFlow::default();
         let cap = self.infer_cap_tracked(ctx, expr, &mut consumed)?;
 
-        // Ensure all linear bindings in the initial context were consumed.
+        // Exactly-once obligations require consumption on every path.
         for (name, binding_cap) in &ctx.bindings {
-            if binding_cap.is_linear() && !consumed.contains(name) {
+            if binding_cap.is_linear() && !consumed.must_contain(name) {
                 let msg = format!(
-                    "linear value `{}` is never used ({} bindings must be consumed exactly once — pass it to a function, `send` it, or `consume {}` it explicitly)",
+                    "linear value `{}` is not consumed on every path (it is never used on at least one path; {} bindings must be consumed exactly once — pass it to a function, `send` it, or `consume {}` it explicitly)",
                     name, binding_cap, name
                 );
                 self.diagnostics.push(msg.clone());
@@ -1772,11 +1868,11 @@ impl CapabilityAnalyzer {
         &mut self,
         name: &str,
         span: Span,
-        consumed: &mut FxHashSet<String>,
+        consumed: &mut LinearFlow,
     ) -> NuResult<()> {
         // Record the span for LSP visualization regardless of error.
         self.consumed_spans.push(span);
-        if !consumed.insert(name.to_string()) {
+        if !consumed.consume(name) {
             let first_span = self.first_consumed.get(name);
             let mut msg = format!("linear value `{}` used after being consumed", name);
             if let Some(fs) = first_span {
@@ -1794,7 +1890,7 @@ impl CapabilityAnalyzer {
                 "linear/lineariso bindings are moved on first use and may not be referenced again on the same path",
             ));
         }
-        self.first_consumed.insert(name.to_string(), span);
+        self.first_consumed.entry(name.to_string()).or_insert(span);
         Ok(())
     }
 
@@ -1804,16 +1900,16 @@ impl CapabilityAnalyzer {
     ///
     /// Unlike `LinearIso`/`Linear` (which are consumed on every variable
     /// reference via `Expr::Var`), plain `Iso` is consumed only at explicit
-    /// ownership-transfer points.  The same `consumed` set is used so that
-    /// branch merge, loop rejection, and shadowing work identically.
+    /// ownership-transfer points. The split flow tracks a move on any path
+    /// separately from moves guaranteed on every path.
     fn consume_if_iso(
         &mut self,
         name: &str,
         span: Span,
-        consumed: &mut FxHashSet<String>,
+        consumed: &mut LinearFlow,
     ) -> NuResult<()> {
         self.consumed_spans.push(span);
-        if !consumed.insert(name.to_string()) {
+        if !consumed.consume(name) {
             let first_span = self.first_consumed.get(name);
             let mut msg = format!("iso value `{}` used after being moved", name);
             if let Some(fs) = first_span {
@@ -1830,28 +1926,25 @@ impl CapabilityAnalyzer {
                 "an `iso` value has exactly one owner; after ownership transfer, accessing the original binding would create a second alias to actor-isolated mutable state",
             ));
         }
-        self.first_consumed.insert(name.to_string(), span);
+        self.first_consumed.entry(name.to_string()).or_insert(span);
         Ok(())
     }
 
     /// Recursive worker for [`infer_cap`] that tracks which `LinearIso`
     /// bindings have already been consumed along the current path.
     ///
-    /// Linearity rules (conservative MVP — at-most-once use):
-    /// - Referencing a variable whose capability is `LinearIso` consumes the
-    ///   binding; a second reference on the same path is a `CapError`.
-    /// - Branches merge conservatively: a binding is consumed after an
-    ///   `if`/`match`/`receive` only if *every* fall-through path consumes
-    ///   it, so a use in one branch never poisons a sibling branch.
-    /// - Consuming an outer linear binding inside a `for` body errors, since
-    ///   the loop may iterate more than once.
-    /// - A binding that is never used is NOT an error: exactly-once
-    ///   (must-use on all paths) analysis is a documented follow-up.
+    /// Linearity rules use a split flow:
+    /// - `may` consumption is unioned across alternatives; any later use is
+    ///   rejected if a reaching path may already have moved the value.
+    /// - `must` consumption is intersected across alternatives; linear
+    ///   exactly-once obligations are discharged only when every path moves it.
+    /// - loop bodies/while conditions cannot move outer ownership values
+    ///   because those regions may execute repeatedly.
     fn infer_cap_tracked(
         &mut self,
         ctx: &CapContext,
         expr: &Expr,
-        consumed: &mut FxHashSet<String>,
+        consumed: &mut LinearFlow,
     ) -> NuResult<Capability> {
         match expr {
             // Literals are immutable values.
@@ -1871,7 +1964,7 @@ impl CapabilityAnalyzer {
                 let cap = ctx.lookup(name);
                 if cap.is_linear() {
                     self.consume_linear(name, *span, consumed)?;
-                } else if cap == Capability::Iso && consumed.contains(name) {
+                } else if cap == Capability::Iso && consumed.may_contain(name) {
                     let first_span = self.first_consumed.get(name);
                     let mut msg = format!("iso value `{}` used after being moved", name);
                     if let Some(fs) = first_span {
@@ -1952,7 +2045,7 @@ impl CapabilityAnalyzer {
                 // same name. Hide the outer consumption state while analyzing
                 // the body, then restore it; the inner binding's own
                 // consumption is scope-local and never leaks out.
-                let outer_consumed = consumed.remove(name);
+                let outer_consumed = consumed.take_binding(name);
                 let result = self.infer_cap_tracked(&body_ctx, body, consumed);
                 // A bare rebind (`let a = x` or `let a = consume x`) is
                 // transparent: evaluating `value` already discharged the
@@ -1970,23 +2063,26 @@ impl CapabilityAnalyzer {
                 if result.is_ok()
                     && val_cap.is_linear()
                     && !is_transparent_rebind
-                    && !consumed.contains(name)
+                    && !consumed.must_contain(name)
                 {
                     let msg = format!(
-                        "linear value `{}` is never used ({} bindings must be consumed exactly once — pass it to a function, `send` it, or `consume {}` it explicitly)",
+                        "linear value `{}` is not consumed on every path (it is never used on at least one path; {} bindings must be consumed exactly once — pass it to a function, `send` it, or `consume {}` it explicitly)",
                         name, val_cap, name
                     );
                     self.diagnostics.push(msg.clone());
-                    consumed.remove(name);
-                    if outer_consumed {
-                        consumed.insert(name.clone());
-                    }
-                    return Err(NuError::cap_error(msg, *span));
+                    consumed.clear_binding(name);
+                    consumed.restore_binding(name.clone(), outer_consumed);
+                    return Err(NuError::cap_error_explained(
+                        msg,
+                        *span,
+                        format!(
+                            "linear binding `{}` must be consumed on every path through its scope",
+                            name
+                        ),
+                    ));
                 }
-                consumed.remove(name);
-                if outer_consumed {
-                    consumed.insert(name.clone());
-                }
+                consumed.clear_binding(name);
+                consumed.restore_binding(name.clone(), outer_consumed);
                 result
             }
 
@@ -2006,7 +2102,7 @@ impl CapabilityAnalyzer {
                 }
                 // `name` is bound in both the value and the body; apply the
                 // same shadowing discipline as `let`.
-                let outer_consumed = consumed.remove(name);
+                let outer_consumed = consumed.take_binding(name);
                 let val_ctx = ctx.with_binding(name.clone(), rec_cap);
                 let result = match self.infer_cap_tracked(&val_ctx, value, consumed) {
                     Ok(val_cap) => {
@@ -2015,10 +2111,8 @@ impl CapabilityAnalyzer {
                     }
                     Err(e) => Err(e),
                 };
-                consumed.remove(name);
-                if outer_consumed {
-                    consumed.insert(name.clone());
-                }
+                consumed.clear_binding(name);
+                consumed.restore_binding(name.clone(), outer_consumed);
                 result
             }
 
@@ -2029,20 +2123,32 @@ impl CapabilityAnalyzer {
                 else_branch,
                 ..
             } => {
-                let _ = self.infer_cap_tracked(ctx, cond, consumed)?; // cond cap not part of result
-                                                                      // Branch merge: analyze each branch from the same base set,
-                                                                      // then keep only the bindings consumed on *every* fall-through
-                                                                      // path (a use in one branch must not poison a sibling branch;
-                                                                      // a missing else branch consumes nothing).
+                let _ = self.infer_cap_tracked(ctx, cond, consumed)?;
+
+                // Both branches start from the same post-condition flow.
+                // `may` is unioned at the join (a later use must be safe on
+                // every reaching path), while `must` is intersected (a
+                // linear obligation is discharged only on every path).
                 let base = consumed.clone();
-                let then_cap = self.infer_cap_tracked(ctx, then_branch, consumed)?;
-                let then_set = std::mem::replace(consumed, base);
+
+                let mut then_flow = base.clone();
+                let then_cap = self.infer_cap_tracked(ctx, then_branch, &mut then_flow)?;
+
+                let mut branches = vec![then_flow];
                 let else_cap = match else_branch {
-                    Some(else_b) => self.infer_cap_tracked(ctx, else_b, consumed)?,
-                    None => then_cap,
+                    Some(else_b) => {
+                        let mut else_flow = base.clone();
+                        let cap = self.infer_cap_tracked(ctx, else_b, &mut else_flow)?;
+                        branches.push(else_flow);
+                        cap
+                    }
+                    None => {
+                        branches.push(base.clone());
+                        then_cap
+                    }
                 };
-                let else_set = std::mem::take(consumed);
-                *consumed = then_set.intersection(&else_set).cloned().collect();
+
+                *consumed = LinearFlow::merge_alternatives(&base, &branches);
                 Ok(then_cap.join(else_cap))
             }
 
@@ -2054,43 +2160,55 @@ impl CapabilityAnalyzer {
                 if arms.is_empty() {
                     return Ok(Capability::Tag);
                 }
-                // Branch merge (same rule as `if`): a binding counts as
-                // consumed after the match only if every arm consumes it.
+
                 let base = consumed.clone();
+                let mut fallthrough = base.clone();
+                let mut branches = Vec::with_capacity(arms.len());
                 let mut cap = Capability::Tag;
-                let mut merged: Option<FxHashSet<String>> = None;
+
                 for (pat, guard, arm_expr) in arms {
-                    *consumed = base.clone();
+                    let mut arm_flow = fallthrough.clone();
                     let mut arm_ctx = ctx.clone();
                     add_pat_bindings(pat, &mut arm_ctx, Capability::Val);
-                    // Pattern-bound names shadow outer bindings inside the
-                    // arm; hide (and restore) their outer consumption state.
+
                     let mut pat_names = Vec::new();
                     pat_binding_names(pat, &mut pat_names);
-                    let saved: Vec<(String, bool)> = pat_names
+                    let saved: Vec<(String, SavedBindingFlow)> = pat_names
                         .iter()
-                        .map(|n| (n.clone(), consumed.remove(n)))
+                        .map(|name| (name.clone(), arm_flow.take_binding(name)))
                         .collect();
-                    // A guard runs under the same condition as the arm body,
-                    // so its capability and consumption fold into the arm.
-                    let guard_result = match guard {
-                        Some(guard_expr) => self.infer_cap_tracked(&arm_ctx, guard_expr, consumed),
-                        None => Ok(Capability::Tag),
-                    };
-                    let arm_result = self.infer_cap_tracked(&arm_ctx, arm_expr, consumed);
-                    for (n, was_consumed) in saved {
-                        consumed.remove(&n);
-                        if was_consumed {
-                            consumed.insert(n);
+
+                    let guard_cap = if let Some(guard_expr) = guard {
+                        let guard_cap =
+                            self.infer_cap_tracked(&arm_ctx, guard_expr, &mut arm_flow)?;
+
+                        // A false guard may continue to a later arm. Any
+                        // ownership consumed while evaluating it therefore
+                        // becomes a possible consumption on later paths, but
+                        // never a must-consumption.
+                        let mut guard_outer = arm_flow.clone();
+                        for (name, state) in &saved {
+                            guard_outer.clear_binding(name);
+                            guard_outer.restore_binding(name.clone(), *state);
                         }
+                        let previous_fallthrough = fallthrough.clone();
+                        fallthrough.absorb_may_delta(&previous_fallthrough, &guard_outer);
+                        guard_cap
+                    } else {
+                        Capability::Tag
+                    };
+
+                    let arm_cap = self.infer_cap_tracked(&arm_ctx, arm_expr, &mut arm_flow)?;
+                    for (name, state) in saved {
+                        arm_flow.clear_binding(&name);
+                        arm_flow.restore_binding(name, state);
                     }
-                    cap = cap.join(guard_result?.join(arm_result?));
-                    merged = Some(match merged {
-                        None => consumed.clone(),
-                        Some(m) => m.intersection(consumed).cloned().collect(),
-                    });
+
+                    cap = cap.join(guard_cap.join(arm_cap));
+                    branches.push(arm_flow);
                 }
-                *consumed = merged.unwrap_or(base);
+
+                *consumed = LinearFlow::merge_alternatives(&base, &branches);
                 Ok(cap)
             }
 
@@ -2330,67 +2448,84 @@ impl CapabilityAnalyzer {
             }
 
             // Receive: the capability of a receive block is the join of all
-            // arm capabilities. An `after ms => body` clause evaluates `ms`
-            // eagerly (outside the branch merge) and merges `body` like an
-            // additional arm.
+            // arm capabilities. A receive guard can be retried, so consuming
+            // an outer ownership binding in a guard is rejected.
             Expr::Receive { arms, after, .. } => {
                 if arms.is_empty() && after.is_none() {
                     return Ok(Capability::Tag);
                 }
-                // The timeout expression runs before the wait, so its
-                // consumption is unconditional and part of the base state.
+
+                // The timeout expression is evaluated once before waiting.
                 if let Some((ms, _)) = after {
                     let _ = self.infer_cap_tracked(ctx, ms, consumed)?;
                 }
-                // Branch merge (same rule as `match`): consumed-after only if
-                // every arm consumes the binding.
+
                 let base = consumed.clone();
+                let mut branches = Vec::with_capacity(arms.len() + usize::from(after.is_some()));
                 let mut cap = Capability::Tag;
-                let mut merged: Option<FxHashSet<String>> = None;
+
                 for (_, patterns, guard, body_expr) in arms {
-                    *consumed = base.clone();
+                    let mut arm_flow = base.clone();
                     let mut arm_ctx = ctx.clone();
-                    // Pattern-bound names shadow outer bindings inside the
-                    // arm; hide (and restore) their outer consumption state.
-                    let mut pat_names: Vec<String> = Vec::new();
+
+                    let mut pat_names = Vec::new();
                     for pat in patterns {
                         add_pat_bindings(pat, &mut arm_ctx, Capability::Val);
                         pat_binding_names(pat, &mut pat_names);
                     }
-                    let saved: Vec<(String, bool)> = pat_names
+                    let saved: Vec<(String, SavedBindingFlow)> = pat_names
                         .iter()
-                        .map(|n| (n.clone(), consumed.remove(n)))
+                        .map(|name| (name.clone(), arm_flow.take_binding(name)))
                         .collect();
-                    // A guard runs under the same condition as the arm body,
-                    // so its capability and consumption fold into the arm.
-                    let guard_result = match guard {
-                        Some(guard_expr) => self.infer_cap_tracked(&arm_ctx, guard_expr, consumed),
-                        None => Ok(Capability::Tag),
-                    };
-                    let arm_result = self.infer_cap_tracked(&arm_ctx, body_expr, consumed);
-                    for (n, was_consumed) in saved {
-                        consumed.remove(&n);
-                        if was_consumed {
-                            consumed.insert(n);
+
+                    let guard_cap = if let Some(guard_expr) = guard {
+                        let before_guard = arm_flow.clone();
+                        let guard_cap =
+                            self.infer_cap_tracked(&arm_ctx, guard_expr, &mut arm_flow)?;
+
+                        let mut guard_outer = arm_flow.clone();
+                        let mut before_outer = before_guard.clone();
+                        for (name, state) in &saved {
+                            guard_outer.clear_binding(name);
+                            guard_outer.restore_binding(name.clone(), *state);
+                            before_outer.clear_binding(name);
+                            before_outer.restore_binding(name.clone(), *state);
                         }
+                        if let Some(name) = guard_outer.newly_may_consumed(&before_outer) {
+                            let msg = format!(
+                                "ownership value `{}` consumed in a receive guard may be consumed more than once because the guard can be retried",
+                                name
+                            );
+                            self.diagnostics.push(msg.clone());
+                            return Err(NuError::cap_error_explained(
+                                msg,
+                                expr_span(guard_expr),
+                                "receive guards may execute repeatedly while scanning/retrying mailbox messages; they cannot move an outer linear/iso binding",
+                            ));
+                        }
+                        guard_cap
+                    } else {
+                        Capability::Tag
+                    };
+
+                    let body_cap = self.infer_cap_tracked(&arm_ctx, body_expr, &mut arm_flow)?;
+                    for (name, state) in saved {
+                        arm_flow.clear_binding(&name);
+                        arm_flow.restore_binding(name, state);
                     }
-                    cap = cap.join(guard_result?.join(arm_result?));
-                    merged = Some(match merged {
-                        None => consumed.clone(),
-                        Some(m) => m.intersection(consumed).cloned().collect(),
-                    });
+
+                    cap = cap.join(guard_cap.join(body_cap));
+                    branches.push(arm_flow);
                 }
-                // Timeout arm: no pattern bindings.
+
                 if let Some((_, body)) = after {
-                    *consumed = base.clone();
-                    let arm_result = self.infer_cap_tracked(ctx, body, consumed);
-                    cap = cap.join(arm_result?);
-                    merged = Some(match merged {
-                        None => consumed.clone(),
-                        Some(m) => m.intersection(consumed).cloned().collect(),
-                    });
+                    let mut timeout_flow = base.clone();
+                    let timeout_cap = self.infer_cap_tracked(ctx, body, &mut timeout_flow)?;
+                    cap = cap.join(timeout_cap);
+                    branches.push(timeout_flow);
                 }
-                *consumed = merged.unwrap_or(base);
+
+                *consumed = LinearFlow::merge_alternatives(&base, &branches);
                 Ok(cap)
             }
 
@@ -2422,36 +2557,41 @@ impl CapabilityAnalyzer {
                 Ok(cap)
             }
 
-            // Handle: the body determines the value capability, but handler
-            // arms execute in the performer's scope *before* a resuming arm
-            // returns control to the body — so an arm may consume an outer
-            // linear binding that the resumed body then uses after move (and
-            // the deep-cloned continuation keeps the pre-perform registers
-            // alive across all of it). Analyze each arm as an alternative
-            // path from the incoming consumption set (arm params shadow outer
-            // bindings, bound as `Ref`), then union every arm's consumptions
-            // into the body's set: after `handle`, any binding an arm may
-            // have consumed is treated as moved. This also satisfies the
-            // exactly-once obligation for bindings used only inside arms —
-            // previously arms were never walked, so a `g(x)` in an arm plus a
-            // `g(x)` after `resume` both passed.
+            // Handle: handler arms are optional control-flow paths. A move in
+            // an arm makes later reuse unsafe (`may`) but cannot by itself
+            // discharge an exactly-once obligation (`must`), because the
+            // effect may never be performed.
             Expr::Handle { body, handlers, .. } => {
                 let base = consumed.clone();
-                for h in handlers {
-                    let mut arm_consumed = base.clone();
+
+                for handler in handlers {
+                    let mut arm_flow = base.clone();
                     let arm_ctx = ctx.with_bindings(
-                        &h.params
+                        &handler
+                            .params
                             .iter()
-                            .map(|p| (p.clone(), Capability::Ref))
+                            .map(|param| (param.clone(), Capability::Ref))
                             .collect::<Vec<_>>(),
                     );
-                    self.infer_cap_tracked(&arm_ctx, &h.body, &mut arm_consumed)?;
-                    for name in arm_consumed {
-                        if !base.contains(&name) {
-                            consumed.insert(name);
-                        }
+
+                    // Handler parameters shadow same-named outer ownership
+                    // bindings while the arm runs.
+                    let saved: Vec<(String, SavedBindingFlow)> = handler
+                        .params
+                        .iter()
+                        .map(|name| (name.clone(), arm_flow.take_binding(name)))
+                        .collect();
+
+                    self.infer_cap_tracked(&arm_ctx, &handler.body, &mut arm_flow)?;
+
+                    for (name, state) in saved {
+                        arm_flow.clear_binding(&name);
+                        arm_flow.restore_binding(name, state);
                     }
+
+                    consumed.absorb_may_delta(&base, &arm_flow);
                 }
+
                 self.infer_cap_tracked(ctx, body, consumed)
             }
 
@@ -2503,7 +2643,9 @@ impl CapabilityAnalyzer {
                 self.infer_cap_tracked(ctx, right, consumed)
             }
 
-            // For comprehension: capability of the body.
+            // For comprehension: the iterable is evaluated once, but the
+            // body may execute zero or many times. Moving an outer ownership
+            // binding in the body is therefore illegal.
             Expr::For {
                 var,
                 iterable,
@@ -2513,48 +2655,67 @@ impl CapabilityAnalyzer {
                 let _ = self.infer_cap_tracked(ctx, iterable, consumed)?;
                 let body_ctx = ctx.with_binding(var.clone(), Capability::Val);
                 let base = consumed.clone();
-                // The loop variable shadows any outer binding of the same name.
-                let outer_var = consumed.remove(var);
-                let body_result = self.infer_cap_tracked(&body_ctx, body, consumed);
-                consumed.remove(var);
-                if outer_var {
-                    consumed.insert(var.clone());
-                }
+                let mut body_flow = base.clone();
+
+                let outer_var = body_flow.take_binding(var);
+                let body_result = self.infer_cap_tracked(&body_ctx, body, &mut body_flow);
+                body_flow.clear_binding(var);
+                body_flow.restore_binding(var.clone(), outer_var);
                 let body_cap = body_result?;
-                // A loop body may execute more than once, so consuming an
-                // outer linear binding inside the body could use it multiple
-                // times along a single path — reject it outright.
-                if let Some(name) = consumed.difference(&base).next() {
-                    let name = name.clone();
+
+                if let Some(name) = body_flow.newly_may_consumed(&base) {
                     let msg = format!(
-                        "linear value `{}` consumed in loop body may be used more than once",
+                        "ownership value `{}` consumed in loop body may be used more than once",
                         name
                     );
                     self.diagnostics.push(msg.clone());
-                    return Err(NuError::cap_error(msg, *span));
+                    return Err(NuError::cap_error_explained(
+                        msg,
+                        *span,
+                        "a for-loop body may execute multiple times and therefore cannot move an outer linear/iso binding",
+                    ));
                 }
-                // The loop may also execute zero times, so body consumption
-                // does not propagate past the loop.
+
                 *consumed = base;
                 Ok(body_cap)
             }
 
-            // While loop: capability of body; cond is read-only.
+            // While loops may evaluate both the condition and body more than
+            // once. Neither region may move an outer ownership binding.
             Expr::While { cond, body, span } => {
-                let _ = self.infer_cap_tracked(ctx, cond, consumed)?;
-                let base = consumed.clone();
-                let body_result = self.infer_cap_tracked(ctx, body, consumed);
-                let body_cap = body_result?;
-                if let Some(name) = consumed.difference(&base).next() {
-                    let name = name.clone();
+                let entry = consumed.clone();
+
+                let mut cond_flow = entry.clone();
+                let _ = self.infer_cap_tracked(ctx, cond, &mut cond_flow)?;
+                if let Some(name) = cond_flow.newly_may_consumed(&entry) {
                     let msg = format!(
-                        "linear value `{}` consumed in loop body may be used more than once",
+                        "ownership value `{}` consumed in while condition may be used more than once",
                         name
                     );
                     self.diagnostics.push(msg.clone());
-                    return Err(NuError::cap_error(msg, *span));
+                    return Err(NuError::cap_error_explained(
+                        msg,
+                        *span,
+                        "a while condition may be evaluated repeatedly and therefore cannot move an outer linear/iso binding",
+                    ));
                 }
-                *consumed = base;
+
+                let mut body_flow = entry.clone();
+                let body_cap = self.infer_cap_tracked(ctx, body, &mut body_flow)?;
+                if let Some(name) = body_flow.newly_may_consumed(&entry) {
+                    let msg = format!(
+                        "ownership value `{}` consumed in loop body may be used more than once",
+                        name
+                    );
+                    self.diagnostics.push(msg.clone());
+                    return Err(NuError::cap_error_explained(
+                        msg,
+                        *span,
+                        "a while-loop body may execute multiple times and therefore cannot move an outer linear/iso binding",
+                    ));
+                }
+
+                *consumed = entry;
                 Ok(body_cap)
             }
             // Return: capability of returned value.
@@ -4201,10 +4362,11 @@ mod tests {
     }
 
     #[test]
-    fn test_lineariso_consumed_on_one_branch_then_used_ok() {
-        // Conservative merge: a binding is consumed after an if only if ALL
-        // fall-through paths consume it. The else branch here does not, so
-        // the later use is fine.
+    fn test_lineariso_consumed_on_one_branch_then_used_errors() {
+        // The later use is reachable from both branches. Since the then path
+        // already consumed x, reusing x after the join is unsafe even though
+        // the else path did not consume it. This is the split-context
+        // may-consumption regression.
         let mut analyzer = CapabilityAnalyzer::new();
         let ctx = CapContext::new().with_binding("x", Capability::LinearIso);
         let expr = Expr::Block {
@@ -4219,7 +4381,40 @@ mod tests {
             ],
             span: s(),
         };
-        assert!(analyzer.infer_cap(&ctx, &expr).is_ok());
+        assert!(analyzer.infer_cap(&ctx, &expr).is_err());
+    }
+
+    #[test]
+    fn test_iso_moved_on_one_branch_then_used_errors() {
+        let mut analyzer = CapabilityAnalyzer::new();
+        let ctx = CapContext::new()
+            .with_binding("a", Capability::Iso)
+            .with_binding("x", Capability::Iso);
+        let expr = Expr::Block {
+            exprs: vec![
+                Expr::If {
+                    cond: Box::new(Expr::Literal(Literal::Bool(true), s())),
+                    then_branch: Box::new(send_m(lvar("x"))),
+                    else_branch: Some(Box::new(Expr::Literal(Literal::Int(0), s()))),
+                    span: s(),
+                },
+                call1("h", lvar("x")),
+            ],
+            span: s(),
+        };
+        assert!(analyzer.infer_cap(&ctx, &expr).is_err());
+    }
+
+    #[test]
+    fn test_lineariso_consumed_in_while_condition_errors() {
+        let mut analyzer = CapabilityAnalyzer::new();
+        let ctx = CapContext::new().with_binding("x", Capability::LinearIso);
+        let expr = Expr::While {
+            cond: Box::new(call1("predicate", lvar("x"))),
+            body: Box::new(Expr::Literal(Literal::Unit, s())),
+            span: s(),
+        };
+        assert!(analyzer.infer_cap(&ctx, &expr).is_err());
     }
 
     #[test]

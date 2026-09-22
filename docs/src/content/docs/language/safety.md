@@ -18,13 +18,13 @@ Nulang's capability system (inspired by Pony) prevents data races and use-after-
 | `val` | No | Yes | Yes | Immutable, shareable |
 | `box` | Yes | No | No | Read-only |
 | `tag` | Yes | Yes | Yes | Opaque, identity-only |
-| `lineariso` | Yes | Yes | Yes | Linear isolated (at-most-once use) |
+| `lineariso` | Yes | Yes | Yes | Linear isolated (exactly-once ownership use) |
 
 **Key guarantees**:
 
 - **No data races**: only `iso` and `val` are sendable between actors. Mutable `ref` and `trn` cannot cross actor boundaries.
 - **Compile-time only**: capabilities are erased at runtime. There is zero overhead for capability checks — they are proved by the type checker and then discarded.
-- **LinearIso enforcement**: `lineariso` is tracked per binding along every control-flow path. Sending or capturing a `lineariso` value consumes it; branch-merge analysis ensures at-most-once use conservatively.
+- **LinearIso enforcement**: `lineariso` is tracked with split control-flow facts. `may` consumption is unioned across alternative paths so a value moved on any reaching path cannot be reused after the join; `must` consumption is intersected so exactly-once obligations are discharged only when every path consumes the binding. Repeating loop conditions/bodies and receive guards cannot move outer ownership values.
 
 ## Type System
 
