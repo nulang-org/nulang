@@ -305,8 +305,11 @@ pub(crate) fn spawn_from_module(
         actor.bytecode_offsets = offsets.clone();
         actor.compensation_offsets = compensation_offsets.clone();
         if let Some(meta) = meta {
-            let mut declared_fields: Vec<String> =
-                meta.state_models.iter().map(|(name, _)| name.clone()).collect();
+            let mut declared_fields: Vec<String> = meta
+                .state_models
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect();
             for (name, _) in &meta.state_defaults {
                 if !declared_fields.contains(name) {
                     declared_fields.push(name.clone());
