@@ -436,6 +436,28 @@ impl NativeIntCache {
         self.values.clear();
     }
 
+    fn flush_except(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        regs_ptr: Value,
+        keep: &HashSet<usize>,
+    ) {
+        let dirty: Vec<usize> = self
+            .dirty
+            .iter()
+            .copied()
+            .filter(|reg| !keep.contains(reg))
+            .collect();
+        for reg in dirty {
+            self.dirty.remove(&reg);
+            if let Some(value) = self.values.remove(&reg) {
+                let tagged = emit_tag_int(builder, value);
+                store_reg(builder, regs_ptr, reg, tagged);
+            }
+        }
+        self.values.retain(|reg, _| keep.contains(reg));
+    }
+
     fn clear(&mut self) {
         self.values.clear();
         self.dirty.clear();
@@ -483,6 +505,28 @@ impl NativeFloatCache {
             }
         }
         self.values.clear();
+    }
+
+    fn flush_except(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        regs_ptr: Value,
+        keep: &HashSet<usize>,
+    ) {
+        let dirty: Vec<usize> = self
+            .dirty
+            .iter()
+            .copied()
+            .filter(|reg| !keep.contains(reg))
+            .collect();
+        for reg in dirty {
+            self.dirty.remove(&reg);
+            if let Some(value) = self.values.remove(&reg) {
+                let bits = emit_bitcast_f64_to_i64_canonicalized(builder, value);
+                store_reg(builder, regs_ptr, reg, bits);
+            }
+        }
+        self.values.retain(|reg, _| keep.contains(reg));
     }
 
     fn clear(&mut self) {
@@ -720,6 +764,18 @@ fn simple_loop_ssa_plan(
         backedge_pc,
         carried,
     })
+}
+
+fn flush_non_carried_native_caches(
+    builder: &mut FunctionBuilder,
+    regs_ptr: Value,
+    int_cache: &mut NativeIntCache,
+    float_cache: &mut NativeFloatCache,
+    carried: &[(usize, KnownType)],
+) {
+    let keep: HashSet<usize> = carried.iter().map(|&(reg, _)| reg).collect();
+    int_cache.flush_except(builder, regs_ptr, &keep);
+    float_cache.flush_except(builder, regs_ptr, &keep);
 }
 
 fn native_value_from_vm(
