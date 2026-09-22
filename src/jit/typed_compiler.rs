@@ -2673,7 +2673,7 @@ mod typed_tests {
         let result = unsafe { Value::from_bits(regs[2]) };
         assert!(result.is_float());
         assert!(result.as_float().unwrap().is_nan());
-        assert_eq!(regs[2], Value::float(f64::NAN).as_raw());
+        assert_eq!(regs[2], crate::value_layout::CANONICAL_NAN_BITS);
     }
 
     // ------------------------------------------------------------------
