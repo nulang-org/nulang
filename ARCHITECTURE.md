@@ -12,6 +12,14 @@
 > already diverges in a verified way, §1 carries the corrections. Treat
 > uncaveated numbers and diagrams in Sections 3–5 as design goals, not
 > as-built fact.
+>
+> **Semantic-model correction (September 2026):** RFC 0024 supersedes the
+> earlier language-wide "everything is an actor" framing. The five layers below
+> remain an implementation/component map. They are not the language ontology:
+> local computation, scoped tasks, and actors are distinct execution domains,
+> while durability and identity are orthogonal properties. Current workflow
+> lowering may still use actors as a host without making actor identity part of
+> workflow semantics.
 
 ---
 
@@ -33,7 +41,11 @@
 
 ## 1. System Overview
 
-Nulang is organized into five strictly layered subsystems. Each layer communicates only with adjacent layers. This constraint ensures independent testability, replaceability, and evolution.
+The current Nulang implementation is organized into five layered subsystems. This
+diagram describes component ownership and dependency direction, not a requirement
+that every computation semantically pass through the actor abstraction. Each layer
+communicates only with adjacent layers where the current architecture enforces that
+boundary, supporting independent testability, replaceability, and evolution.
 
 ```
 +==========================================================================+
