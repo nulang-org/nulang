@@ -1,13 +1,15 @@
 # Nulang: Plan to Production-Ready, World-Class
 
-> **Status:** Draft, unratified.
-> **Author:** planning artifact, not a governance document.
-> **Scope:** the sequence of work to move Nulang from `0.1.0` alpha to a
-> language a serious team can run in production and that stands up to
-> comparison with Erlang/OTP, Rust, Elixir, and Pony on the axes each of
-> those languages already owns.
-> **Relationship to governance:** this file is descriptive. Each Frozen or
-> Stable-tier change it names still requires an RFC per `GOVERNANCE.md` §4.
+> **Status:** Historical draft planning artifact; not a governance document.
+> **Last broad snapshot:** August 2026. Many implementation-status rows and
+> counts below are intentionally preserved as dated planning evidence and are
+> not current-main facts.
+> **Scope:** the sequence of work originally proposed to move Nulang from
+> `0.1.0` alpha toward production readiness.
+> **Current execution policy:** use `docs/SEMANTIC_STABILIZATION_CONTRACT.md`,
+> `GOVERNANCE.md`, accepted RFCs, and `CHANGELOG.md` for current priorities
+> and compatibility policy. RFC 0021 supersedes older assumptions in this file
+> about permanently Frozen pre-adoption source semantics.
 
 ---
 
@@ -63,7 +65,12 @@ among Phases 1-4's broader production-readiness work.
 
 ---
 
-## Current state (verified 2026-08-01)
+## Historical state snapshot (August 2026)
+
+> The table below is a dated snapshot, not a live dashboard. Do not copy its
+> test counts, dependency counts, platform status, transport-security status,
+> or backend gaps into current documentation without re-verifying them against
+> the present source tree and CI.
 
 | Signal | Value |
 |---|---|
