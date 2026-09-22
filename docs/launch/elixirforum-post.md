@@ -36,17 +36,16 @@ The two big departures from the BEAM:
    algebraic effects so side effects are tracked in signatures. Messages are
    checked for sendability at compile time.
 
-2. **Durability (in progress — honestly).** On the BEAM, a restarted process
-   comes back with *fresh* state — recovery is your problem (ETS, DETS,
-   Mnesia, Postgres…). Nulang's design makes recovery the runtime's job:
-   persistent actors checkpoint and journal their state after every behavior,
-   and `entity` declarations are event-sourced by default. Status check,
-   because this crowd will test it: journaling and the storage backends
-   (in-memory / JSON-file / SQLite) are implemented and tested, and
-   state-rebuild recovery is pinned by integration tests at the runtime level
-   — but it is **not yet wired to supervised restarts on the CLI path**, so a
-   restarted actor currently starts fresh. That wiring is the top pre-1.0
-   milestone. The entity surface itself works today:
+2. **Durability (still being stabilized).** On the BEAM, recovery
+   state is normally an application/storage concern. Nulang makes durable
+   actor state a runtime concern: persistent actors checkpoint/journal state,
+   and `entity` declarations are event-sourced by default. Durable stores are
+   now selectable with `--store` / `NULANG_STORE_PATH`, and persistent
+   supervised children hydrate a saved snapshot when restarted. That is real
+   wiring, but not a claim of production-grade zero-loss recovery under every
+   crash: backend durability settings, crash ordering, schema/artifact
+   compatibility, and fencing still need destructive validation. The entity
+   surface works today:
 
    ```nulang
    entity ChatRoom {
@@ -65,11 +64,13 @@ The two big departures from the BEAM:
 ### What it is not
 
 - It is not on the BEAM — it's a separate Rust runtime (bytecode VM +
-  Cranelift JIT, work-stealing scheduler, ORCA GC). No interop with Erlang/Elixir.
+  Cranelift JIT, sharded cooperative actor scheduling, ORCA GC). No interop
+  with Erlang/Elixir.
 - It is not mature. Alpha, no users, breaking changes expected pre-1.0.
   Distribution (multi-node messaging over TCP) is experimental.
-- It is not claiming to beat OTP at what OTP does. OTP has 40 years of
-  production scar tissue; Nulang has ~1,680 tests and a spec.
+- It is not claiming to beat OTP at what OTP does. OTP has decades of
+  production scar tissue; Nulang is alpha with a large test/conformance suite
+  and a specification, but no comparable production history.
 
 ### What I'd love from this community
 
@@ -91,9 +92,7 @@ BEAM-primitive notes in BEAM_PRIMITIVES.md, 17 verified examples in
 - Expect (and welcome) "just use Elixir + typed_behaviour / Gleam / Mnesia."
   Answer per faq.md: acknowledge the maturity gap first, then explain the
   mechanism difference.
-- Do not oversell durability: supervised restarts currently come back with
-  fresh state on the CLI path (verified by execution — see
-  docs/launch/demo-script.md); journal-based state rebuild is implemented and
-  integration-tested at the Rust runtime level but not yet wired to
-  supervisor restarts or a CLI flag. Say so if asked — before being asked,
-  ideally.
+- Do not oversell durability: the old fresh-state restart gap has been fixed,
+  but that does not turn the alpha runtime into a zero-loss database. State
+  the exact store/configuration and point to destructive recovery evidence
+  when making crash-safety claims.
