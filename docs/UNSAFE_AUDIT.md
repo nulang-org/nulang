@@ -133,13 +133,15 @@ commented "should never happen".
 **Fix applied:** `debug_assert!` added so header corruption is caught in
 debug/test builds.
 
-### F9 — LOW — `'static` constant pool for JIT helpers
-`src/jit/runtime.rs:432-467` (`ConstantsPtr::as_slice` returns
-`&'static [Constant]` from a thread-local raw pointer).
-Sound by the documented "valid until `clear_jit_constants`" convention;
-a missed clear + pool deallocation would dangle. Consider scoping the
-helpers to a guard type (`set` returns a `Guard` whose `Drop` clears) so
-the lifetime is enforced by RAII.
+### F9 — CLOSED — borrowed constant pool across JIT execution
+The JIT no longer stores a `&'static [Constant]`-like raw slice in thread-local
+state. Interned-string helpers resolve through the active VM pointer plus an
+explicit module index, creating only a short-lived shared borrow for the
+lookup. `VM::try_jit_execute` also prepares code first, then moves the JIT
+backend and raw-bit constant cache out of `VM` before native execution, so a
+re-entrant `nulang_jit_direct_call` cannot alias the same mutable JIT backend
+through `VM::step()`. Debug assertions at `VM::jit_direct_call` enforce
+that ownership invariant in tests/debug builds.
 
 ## Fixes applied in this branch
 
