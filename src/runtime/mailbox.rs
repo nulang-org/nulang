@@ -127,11 +127,6 @@ impl Mailbox {
         }
     }
 
-    fn release_slot(&self) {
-        let previous = self.queued_count.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "mailbox logical count underflow");
-    }
-
     /// Scheduler-owner reservation. Because callers hold &mut Mailbox, Rust's
     /// aliasing rules guarantee there is no safe concurrent producer holding a
     /// shared reference to this mailbox at the same instant. Update the atomic
