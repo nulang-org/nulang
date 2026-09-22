@@ -3907,16 +3907,13 @@ mod optimize_tests {
         optimize_function(&mut func, &mut consts);
 
         assert!(
-            func.blocks[0]
-                .stmts
-                .iter()
-                .any(|stmt| matches!(
-                    stmt,
-                    mir::Stmt::Assign {
-                        dst,
-                        op: mir::RValue::Const(Constant::Int(7)),
-                    } if *dst == value
-                )),
+            func.blocks[0].stmts.iter().any(|stmt| matches!(
+                stmt,
+                mir::Stmt::Assign {
+                    dst,
+                    op: mir::RValue::Const(Constant::Int(7)),
+                } if *dst == value
+            )),
             "a definition live on either successor path must survive join-aware DCE"
         );
     }
@@ -3953,13 +3950,10 @@ mod optimize_tests {
         optimize_function(&mut func, &mut consts);
 
         assert!(
-            func.blocks[0]
-                .stmts
-                .iter()
-                .any(|stmt| matches!(
-                    stmt,
-                    mir::Stmt::Assign { dst, .. } if *dst == value
-                )),
+            func.blocks[0].stmts.iter().any(|stmt| matches!(
+                stmt,
+                mir::Stmt::Assign { dst, .. } if *dst == value
+            )),
             "the loop's initial carried value must stay live across the entry edge"
         );
         assert!(
