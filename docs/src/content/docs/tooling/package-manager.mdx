@@ -285,19 +285,34 @@ If a test file defines `fn test_*` functions, each one is discovered and run
 as an independent test case (the file's `fn main`, if any, is stripped from
 the per-function wrappers); otherwise the whole file runs as a single test.
 
-## WASM builds — `nula build-wasm`
+## WASM builds
+
+Use the package build command when another runtime or deployment platform needs a portable artifact:
+
+```bash
+nulang nula build --target wasm
+# .nula/dist/<name>.wasm
+```
+
+This is the canonical **portable package artifact** path. It performs the same dependency resolution, language-version checks, module-path setup, and declared-capability forwarding as the normal package build before invoking the WASM backend.
+
+For a Wasmtime-precompiled sidecar:
+
+```bash
+nulang nula build --target cwasm
+# .nula/dist/<name>.wasm
+# .nula/dist/<name>.cwasm
+```
+
+The historical command remains a compatibility alias:
 
 ```bash
 nulang nula build-wasm
+# equivalent to: nulang nula build --target cwasm
 ```
 
-`nula build-wasm` compiles the entry point with the WASM backend and emits
-`<name>.wasm` plus an AOT-compiled `<name>.cwasm` into `.nula/dist/`.
-
 :::caution
-This requires a `nulang` binary built with the `wasm-backend` cargo feature
-(not enabled by default). Without it the command fails with
-`wasm backend not compiled in (enable 'wasm-backend' feature)`.
+The WASM targets require a `nulang` binary built with the `wasm-backend` cargo feature. Without it the command fails with `wasm backend not compiled in (enable 'wasm-backend' feature)`.
 :::
 
 ## Publishing
