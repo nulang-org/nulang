@@ -125,12 +125,7 @@ pub trait JitBackend {
     ///
     /// Returning true guarantees that `execute_compiled` can immediately run
     /// the region without needing to borrow the module again.
-    fn prepare_tiered_step(
-        &mut self,
-        module_idx: usize,
-        pc: usize,
-        module: &CodeModule,
-    ) -> bool;
+    fn prepare_tiered_step(&mut self, module_idx: usize, pc: usize, module: &CodeModule) -> bool;
 
     /// Execute a region prepared by `prepare_tiered_step`.
     ///
