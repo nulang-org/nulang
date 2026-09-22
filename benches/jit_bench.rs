@@ -116,4 +116,65 @@ fn bench_jit_function_call_loop(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_jit_hot_loop, bench_jit_function_call_loop);
+fn bench_jit_branchy_function_loop(c: &mut Criterion) {
+    // The branch at the top of `branchy` makes its first basic block much
+    // shorter than STRAIGHT_LINE_MIN. The whole-function promotion path can
+    // still compile the complete non-suspending CFG after the function itself
+    // becomes hot.
+    let source = r#"
+        fn branchy(x: Int) -> Int {
+            if x % 2 == 0 then {
+                let a = x + 1;
+                let b = a + 2;
+                let c = b + 3;
+                let d = c + 4;
+                d + 5
+            } else {
+                let a = x - 1;
+                let b = a - 2;
+                let c = b - 3;
+                let d = c - 4;
+                d - 5
+            }
+        };
+        var sum = 0;
+        var i = 0;
+        while i < 100000 {
+            sum = sum + branchy(i);
+            i = i + 1
+        };
+        sum
+    "#;
+    let module = compile(source);
+
+    c.bench_function("jit/branchy_function_loop_warm", |b| {
+        b.iter_batched(
+            || {
+                let mut vm = fresh_vm(&module);
+                let _ = vm.run();
+                vm
+            },
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+
+    c.bench_function("jit/branchy_function_loop_interp", |b| {
+        b.iter_batched(
+            || {
+                let mut vm = VM::new_without_jit();
+                vm.load_module(module.clone());
+                vm
+            },
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_jit_hot_loop,
+    bench_jit_function_call_loop,
+    bench_jit_branchy_function_loop
+);
