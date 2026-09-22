@@ -3550,8 +3550,7 @@ mod tests {
 
     #[test]
     fn test_is_all_int_false_with_checked_neg() {
-        let mut builder =
-            mir::FunctionBuilder::new("checked_neg", Some(crate::types::Type::int()));
+        let mut builder = mir::FunctionBuilder::new("checked_neg", Some(crate::types::Type::int()));
         let x = builder.add_param("x", crate::types::Type::int());
         let neg = builder.add_temp(crate::types::Type::int());
         builder.assign(neg, mir::RValue::Unary(crate::ast::UnOp::Neg, x));
