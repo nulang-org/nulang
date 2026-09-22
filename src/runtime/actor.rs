@@ -696,7 +696,16 @@ impl Actor {
     }
 
     /// Get a named state field.
+    ///
+    /// Dense-slot schema membership is not the same thing as value presence:
+    /// a declared field may have a slot before its default or recovered value
+    /// has been installed. Preserve the legacy Option contract by consulting
+    /// the canonical state_data mirror for presence first, then use the slot
+    /// as the fast value source once the field is initialized.
     pub fn get_state_field(&self, name: &str) -> Option<Value> {
+        if !self.state_data.contains_key(name) {
+            return None;
+        }
         if let Some(&slot) = self.state_name_slots.get(name) {
             return self.state_slot_values.get(slot as usize).copied();
         }
@@ -831,6 +840,35 @@ mod tests {
         assert_eq!(
             actor.get_state_field_by_constant(count),
             Some(Value::int(3))
+        );
+    }
+
+    #[test]
+    fn test_dense_schema_does_not_make_uninitialized_field_present() {
+        use crate::bytecode::{CodeModule, Constant};
+
+        let mut actor = Actor::new(1, "test", 0);
+        actor
+            .state_models
+            .insert("count".to_string(), StateModel::Local);
+
+        let mut module = CodeModule::new("state-presence");
+        let count = module.add_constant(Constant::String("count".to_string()));
+        actor.install_state_schema(&module, &["count".to_string()]);
+
+        // Installing schema metadata must not make an absent state value look
+        // initialized to recovery/default-fill code.
+        assert_eq!(actor.get_state_field("count"), None);
+        assert_eq!(
+            actor.get_state_field_by_constant(count),
+            Some(Value::nil())
+        );
+
+        actor.set_state_field("count", Value::int(7));
+        assert_eq!(actor.get_state_field("count"), Some(Value::int(7)));
+        assert_eq!(
+            actor.get_state_field_by_constant(count),
+            Some(Value::int(7))
         );
     }
 
