@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Cross-shard runtime channel — 2026-09-22
+- **The bounded shard bus now uses Crossbeam channels** (`src/runtime/mod.rs`) instead of `std::sync::mpsc::sync_channel`. Capacity remains 1024 messages per shard, non-blocking admission/backpressure semantics are unchanged, and the change reuses Nulang's existing `crossbeam` dependency. The deterministic and production drain paths keep the same FIFO channel semantics.
+
 ### Canonical compiler semantic identity — 2026-09-21
 - **Compiler-owned `SemanticId` now derives from canonical backend-independent MIR plus typed actor-state schemas** (Experimental, `src/semantic_identity.rs`, `src/semantic_schema.rs`, `src/compiler_identity.rs`). The encoding alpha-normalizes compiler-generated IDs, excludes presentation/debug metadata and backend selection, includes executable/effect/authority/durable semantics, and folds dependency semantic identities deterministically. `ArtifactIdentityManifest` assembly now has a typed-program entry point that keeps exact `SourceId`, semantic identity, and backend-specific `ArtifactId` distinct without changing frozen NBC v1.
 
