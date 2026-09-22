@@ -2303,6 +2303,13 @@ pub fn compile_bytecode_region_typed(
 
                 if is_loop_backedge {
                     let plan = loop_ssa.as_ref().unwrap();
+                    flush_non_carried_native_caches(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
+                    );
                     let args = loop_carried_args(
                         &mut builder,
                         regs_ptr,
@@ -2344,6 +2351,15 @@ pub fn compile_bytecode_region_typed(
                     .is_some_and(|plan| plan.backedge_pc == pc && target == start_offset);
 
                 if is_loop_backedge {
+                    let plan = loop_ssa.as_ref().unwrap();
+                    flush_non_carried_native_caches(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
+                    );
+
                     // The simple-loop plan proves this condition is Bool, so it
                     // is already materialized by the comparison/logic opcode.
                     let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
@@ -2352,7 +2368,6 @@ pub fn compile_bytecode_region_typed(
                     let zero = builder.ins().iconst(types::I64, 0);
                     let is_true = builder.ins().icmp(IntCC::NotEqual, cond_bit, zero);
 
-                    let plan = loop_ssa.as_ref().unwrap();
                     let args = loop_carried_args(
                         &mut builder,
                         regs_ptr,
@@ -2419,13 +2434,20 @@ pub fn compile_bytecode_region_typed(
                     .is_some_and(|plan| plan.backedge_pc == pc && target == start_offset);
 
                 if is_loop_backedge {
+                    let plan = loop_ssa.as_ref().unwrap();
+                    flush_non_carried_native_caches(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
+                    );
                     let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
                     let one = builder.ins().iconst(types::I64, 1);
                     let cond_bit = builder.ins().band(cond_val, one);
                     let zero = builder.ins().iconst(types::I64, 0);
                     let is_false = builder.ins().icmp(IntCC::Equal, cond_bit, zero);
 
-                    let plan = loop_ssa.as_ref().unwrap();
                     let args = loop_carried_args(
                         &mut builder,
                         regs_ptr,
