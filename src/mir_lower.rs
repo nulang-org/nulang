@@ -23,7 +23,7 @@ use crate::hir;
 use crate::mir;
 use crate::types::{NuError, NuResult, Span, Type};
 use rustc_hash::FxHashMap;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 fn compile_err(msg: impl Into<String>, span: Span) -> NuError {
     NuError::VMError {
@@ -51,6 +51,9 @@ pub fn lower_module(hir: &hir::Module) -> NuResult<mir::Module> {
     }
 
     let mut module = ctx.finish()?;
+    for function in module.functions.iter().chain(module.behaviors.iter()) {
+        validate_parallel_regions(function)?;
+    }
     crate::mir_inline::inline_local_closures(&mut module);
     Ok(module)
 }
