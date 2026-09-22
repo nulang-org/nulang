@@ -80,11 +80,7 @@ pub enum WorkflowEvent {
         attempt: u32,
         error: String,
         retryable: bool,
-    },
-    ActivityRetryScheduled {
-        invocation_id: ActivityInvocationId,
-        next_attempt: u32,
-        ready_at_millis: u64,
+        next_retry_at_millis: Option<u64>,
     },
     ActivityCompleted {
         invocation_id: ActivityInvocationId,
