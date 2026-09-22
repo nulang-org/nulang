@@ -1684,7 +1684,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
         }
         Expr::Par { exprs, span } => {
             body.push(hir::Stmt::ParallelMarker {
-                marker: crate::primitives::ParallelRegionMarker::Begin {
+                marker: crate::parallel_marker::ParallelRegionMarker::Begin {
                     branches: exprs.len() as u32,
                 },
                 span: *span,
@@ -1696,7 +1696,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
                     break;
                 }
                 body.push(hir::Stmt::ParallelMarker {
-                    marker: crate::primitives::ParallelRegionMarker::Branch {
+                    marker: crate::parallel_marker::ParallelRegionMarker::Branch {
                         index: index as u32,
                     },
                     span: *span,
@@ -1719,7 +1719,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
                     let _ = lower_expr(&expr, body);
                 }
                 body.push(hir::Stmt::ParallelMarker {
-                    marker: crate::primitives::ParallelRegionMarker::End,
+                    marker: crate::parallel_marker::ParallelRegionMarker::End,
                     span: *span,
                 });
             } else {
