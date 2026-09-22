@@ -470,6 +470,30 @@ mod tests {
     }
 
     #[test]
+    fn small_payloads_inline_and_large_payloads_spill() {
+        let four = [
+            Value::int(1),
+            Value::int(2),
+            Value::int(3),
+            Value::int(4),
+        ];
+        let inline = MessagePayload::from_slice(&four);
+        assert!(inline.is_inline());
+        assert_eq!(inline.as_slice(), &four);
+
+        let five = [
+            Value::int(1),
+            Value::int(2),
+            Value::int(3),
+            Value::int(4),
+            Value::int(5),
+        ];
+        let shared = MessagePayload::from_slice(&five);
+        assert!(!shared.is_inline());
+        assert_eq!(shared.as_slice(), &five);
+    }
+
+    #[test]
     fn test_push_and_pop() {
         let mut mb = Mailbox::new(4);
         let msg = make_msg(1, 100);
