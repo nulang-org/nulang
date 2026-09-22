@@ -1525,48 +1525,109 @@ fn test_compute_recursive_classifies_cycles() {
 }
 
 #[test]
-fn test_tier2_counter_increments() {
-    let mut jit = make_jit();
-    let dummy_ptr: *const u8 = std::ptr::null();
-    jit.store_compiled(0, 100, dummy_ptr, 5);
+fn test_tier2_dense_counter_tracks_only_typed_regions() {
+    use crate::jit::typed_compiler::infer_reg_types;
 
-    // Counter starts at 0 (not yet in map), increments each call.
-    for i in 0..TIER2_THRESHOLD - 1 {
-        jit.record_tier2_and_maybe_promote(0, 100, &[]);
-        assert_eq!(
-            jit.tier2_counters.get(&(0, 100)).copied(),
-            Some(i + 1),
-            "counter should be {} after {} calls",
-            i + 1,
-            i + 1
-        );
+    let module = make_int_loop_module(2000);
+
+    // A scalar compile is terminal for the current tiering model: tier-1
+    // already attempted static type inference, so counting it forever cannot
+    // discover new type facts.
+    let mut scalar = make_jit();
+    unsafe {
+        scalar
+            .compile_region(
+                0,
+                5,
+                7,
+                &module.instructions,
+                &std::collections::HashMap::new(),
+            )
+            .expect("scalar region should compile");
     }
-    // Crossing threshold resets counter to 0.
-    jit.record_tier2_and_maybe_promote(0, 100, &[]);
-    assert_eq!(jit.tier2_counters.get(&(0, 100)).copied(), Some(0));
+    assert_eq!(scalar.tier2_state(0, 5), TIER2_DISABLED);
+    scalar.record_tier2_and_maybe_promote(0, 5, &module);
+    assert_eq!(scalar.tier2_state(0, 5), TIER2_DISABLED);
 
-    // Reset clears all.
-    jit.reset_tier2_counters();
-    assert!(jit.tier2_counters.is_empty());
+    // A typed region uses a dense counter and can later attempt SIMD
+    // replacement. One entry advances exactly one count.
+    let meta = infer_reg_types(&module, 5);
+    let mut typed = make_jit();
+    unsafe {
+        typed
+            .compile_region_typed(
+                0,
+                5,
+                7,
+                &module.instructions,
+                Some(&meta),
+                &std::collections::HashMap::new(),
+            )
+            .expect("typed region should compile");
+    }
+    assert_eq!(typed.tier2_state(0, 5), 0);
+    typed.record_tier2_and_maybe_promote(0, 5, &module);
+    assert_eq!(typed.tier2_state(0, 5), 1);
+
+    typed.reset_tier2_counters();
+    assert_eq!(typed.tier2_state(0, 5), 0);
+}
+
+#[test]
+fn test_tier2_failed_static_promotion_is_terminal() {
+    use crate::jit::typed_compiler::infer_reg_types;
+
+    // This arithmetic loop is typed but has no array pattern for the SIMD
+    // analyzer. Force the counter to the promotion boundary and verify one
+    // failed static analysis disables future tier-2 bookkeeping.
+    let module = make_int_loop_module(2000);
+    let meta = infer_reg_types(&module, 5);
+    let mut jit = make_jit();
+    unsafe {
+        jit.compile_region_typed(
+            0,
+            5,
+            7,
+            &module.instructions,
+            Some(&meta),
+            &std::collections::HashMap::new(),
+        )
+        .expect("typed region should compile");
+    }
+    jit.set_tier2_state(0, 5, (TIER2_THRESHOLD - 1) as u32);
+    jit.record_tier2_and_maybe_promote(0, 5, &module);
+    assert_eq!(jit.tier2_state(0, 5), TIER2_DISABLED);
 }
 
 #[test]
 fn test_tier2_counters_are_per_session() {
+    use crate::jit::typed_compiler::infer_reg_types;
+
+    let module = make_int_loop_module(2000);
+    let meta = infer_reg_types(&module, 5);
     let mut jit_a = make_jit();
     let mut jit_b = make_jit();
-    let dummy_ptr: *const u8 = std::ptr::null();
-    jit_a.store_compiled(0, 200, dummy_ptr, 3);
-    jit_b.store_compiled(0, 200, dummy_ptr, 3);
 
-    // Heat session A to threshold.
-    for _ in 0..TIER2_THRESHOLD {
-        jit_a.record_tier2_and_maybe_promote(0, 200, &[]);
+    for jit in [&mut jit_a, &mut jit_b] {
+        unsafe {
+            jit.compile_region_typed(
+                0,
+                5,
+                7,
+                &module.instructions,
+                Some(&meta),
+                &std::collections::HashMap::new(),
+            )
+            .expect("typed region should compile");
+        }
     }
-    assert_eq!(jit_a.tier2_counters.get(&(0, 200)).copied(), Some(0));
-    // Session B is untouched — no counter entry.
-    assert!(
-        jit_b.tier2_counters.get(&(0, 200)).is_none(),
-        "session B should have no counter since we never called record_tier2 on it"
+
+    jit_a.record_tier2_and_maybe_promote(0, 5, &module);
+    assert_eq!(jit_a.tier2_state(0, 5), 1);
+    assert_eq!(
+        jit_b.tier2_state(0, 5),
+        0,
+        "session B must keep an independent dense tier-2 counter"
     );
 }
 
