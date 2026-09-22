@@ -60,8 +60,10 @@ bootstrap path; current CI is the source of truth for counts.
 Honest status: alpha. No users. Distribution (multi-node send/ask over TCP),
 WASM/AOT backends, and the AI-agent runtime are experimental and
 feature-gated. Some documented rough edges remain: typed actor-protocol admission is still
-an experimental hardening area, and `.nula` `state crdt` fields are not yet
-wired to the Rust CRDT engine and currently behave as durable state. The full spec (SPEC2.md) annotates what is verified vs. planned.
+an experimental hardening area. Source-level typed CRDT fields and `Crdt.*`
+operations are implemented and conformance-tested, but recovered actors still
+have a field-name→CRDT-id re-registration gap before CRDT operations become
+fully usable. The full spec (SPEC2.md) annotates what is verified vs. planned.
 
 Repo: https://github.com/nulang-org/nulang — spec, examples (17 verified
 programs), and the conformance suite are in-tree.
