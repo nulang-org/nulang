@@ -7,7 +7,15 @@
 > `LANGUAGE_VERSION` in `src/format/constants.rs`) is what this changelog
 > tracks — it moves only on RFC-ratified change.
 
-**Language version:** `1.0.0-frozen` (since 2026-07-19; RFCs 0001, 0002).
+**Published v1 artifact language metadata:** `1.0.0-frozen` (since
+2026-07-19; RFCs 0001, 0002). This historical identifier remains readable and
+is not rewritten.
+
+**Current compatibility policy:** RFC 0021 (accepted 2026-09-21) reclassifies
+pre-adoption Nulang Core source semantics as Stable until an evidence-bearing
+external-adoption freeze RFC is accepted. Published format/protocol/ABI
+versions remain archival compatibility obligations; future representations may
+evolve only behind explicit version boundaries and readers/migrations.
 
 ---
 
@@ -32,15 +40,20 @@ version + migration.*
   - `FormatError` enum: `Truncated`, `BadMagic`, `UnsupportedVersion`,
     `IncompatibleLanguage`, `LengthMismatch`, `UnknownOpcode`, `BodyDecode`,
     `BadConstant`.
-- **RFC 0002 — Frozen Core.** Defined Nulang Core, the minimal frozen subset:
-  `fn`/`let`/`if`/`match`/closures, `Int`/`Bool`/`String`/`Unit`/`Nil`/
-  `Vec`/`Map`/tuples/records/`enum`, HM inference over this subset, `IO.print`
-  and `IO.read` only, `val` capability only. Every Core program valid today is
-  valid in every future version.
+- **RFC 0002 — historical Frozen Core definition.** Defined the original Core
+  subset. RFC 0021 (accepted 2026-09-21) supersedes the *permanent
+  source-semantic freeze* portion of RFC 0002: Core remains the portability
+  kernel but is Stable until the external-adoption freeze gate is met.
+  Historical artifacts emitted under the old metadata remain compatibility
+  obligations.
 - Stability contract published as `SPEC2.md` §"Format Stability" and
   `GOVERNANCE.md`.
 
 ## Stable tier
+
+### Production host-authority boundary — 2026-09-20
+- **Test effect handlers no longer exist in production runtime builds** (`src/runtime/mod.rs`, `src/runtime/callbacks.rs`). Mock effect interception is now `#[cfg(test)]` and crate-private, so actor-backed host effects in production cannot take the test-handler path before external-authority enforcement.
+- **Actor-backed `Process.run` remains non-dispatched until a real process sandbox exists** (`src/runtime/callbacks.rs`, `src/stdlib.rs`). A regression test proves that even an actor holding an exact `Process::Run(...)` grant cannot turn that grant into host shell execution; docs now mark the existing `/bin/sh -c` implementation as trusted/standalone-only.
 
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
@@ -1559,6 +1572,14 @@ everything before it is implicitly Experimental.
 
 ### Single-pass LSP diagnostics parsing — 2026-09-21
 - **LSP diagnostics reuse their parsed AST.** Document open and debounced changes now populate `DocumentState.ast` from the frontend pass that already produced diagnostics, removing a guaranteed second lex+parse of the same source while preserving diagnostics and editor semantics.
+
+### Canonical stdlib module manifest — 2026-09-21
+- **Stdlib module metadata is now generated from one manifest.** `spec/stdlib/v0alpha1.json` owns module names, imports, source paths, stability tiers, descriptions, and declared official package mirrors. `scripts/generate_stdlib.py` materializes Rust descriptors and the docs module index from that file.
+- **Official package mirrors fail closed on drift.** The `json` seed package is generated from `src/stdlib/json.nula` with only its package-specific import preamble substituted; `scripts/verify_implementation.py` runs the generator in `--check` mode so stale package copies or generated metadata fail CI.
+- **Built-in effects remain executable registry data.** `src/stdlib.rs` still owns the compiler/runtime built-in operation registry used by effect docs; module metadata is no longer duplicated in its comments. This intentionally separates executable effect semantics from higher-level Nulang-authored module metadata while exposing both through `nulang::stdlib`.
+
+
+## Experimental tier
 
 ### Standard-library Option lookup contracts — 2026-09-21
 - **Collection absence is explicit.** Experimental `stdlib::map.get`, `stdlib::list.index_of`, and `stdlib::list.find` now return `Option` instead of sentinel `-1` values. `max_of`, `min_of`, `min_by`, and `max_by` now return `None` for empty inputs. Conformance fixtures and stdlib tests pin the new contracts. This is source-breaking for Experimental stdlib callers that compared missing results with integer sentinels.
