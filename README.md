@@ -3,7 +3,7 @@
 </p>
 <h1 align="center">Nulang</h1>
 <p align="center">
-  An actor-based language with algebraic effects, capability-based types, durable actors, and experimental distribution for building resilient software.
+  A typed language for concurrent, durable, and distributed software with algebraic effects, reference capabilities, actors, and durable execution.
 </p>
 <p align="center">
   <a href="https://nulang.org">Website</a> •
@@ -24,10 +24,13 @@
 
 ## What is Nulang?
 
-Nulang is an actor-based programming language with algebraic effects and
-capability-based types. It fuses Erlang-style fault-tolerant actors with a
-Hindley-Milner type system, reference capabilities (`iso`/`trn`/`ref`/`val`/`box`/`tag`/`lineariso`),
-and row-polymorphic algebraic effects. The compiler pipeline (AST → HIR → MIR)
+Nulang is a programming language for concurrent, durable, and distributed
+software. Its semantic core combines a Hindley-Milner type system, reference
+capabilities (`iso`/`trn`/`ref`/`val`/`box`/`tag`/`lineariso`), and
+row-polymorphic algebraic effects. Erlang-style fault-tolerant actors are the
+first-class abstraction for independently addressable isolated state; ordinary
+local computation remains ordinary computation rather than being modeled as an
+actor. The compiler pipeline (AST → HIR → MIR)
 uses the register-based bytecode VM as the semantic reference implementation.
 Hot regions can tier into a Cranelift JIT; WASM is the canonical portable/cloud
 execution target; and native AOT remains a secondary backend until full semantic
