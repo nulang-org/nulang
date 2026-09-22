@@ -706,9 +706,7 @@ fn simple_loop_ssa_plan(
         let instr = instructions[pc];
         let target = match instr.opcode {
             OpCode::Jmp => Some((pc as i64 + instr.simm16() as i64) as usize),
-            OpCode::JmpT | OpCode::JmpF => {
-                Some((pc as i64 + instr.offset16() as i64) as usize)
-            }
+            OpCode::JmpT | OpCode::JmpF => Some((pc as i64 + instr.offset16() as i64) as usize),
             _ => None,
         };
         if target == Some(start_offset) {
@@ -1406,12 +1404,7 @@ pub fn compile_bytecode_region_typed(
         }
     }
 
-    let loop_ssa = simple_loop_ssa_plan(
-        instructions,
-        start_offset,
-        end_offset,
-        type_metadata,
-    );
+    let loop_ssa = simple_loop_ssa_plan(instructions, start_offset, end_offset, type_metadata);
 
     // Clear the codegen context
     ctx.clear();
@@ -2325,12 +2318,7 @@ pub fn compile_bytecode_region_typed(
                     int_cache.clear();
                     float_cache.clear();
                 } else {
-                    flush_native_caches(
-                        &mut builder,
-                        regs_ptr,
-                        &mut int_cache,
-                        &mut float_cache,
-                    );
+                    flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                     if let Some(&target_block) = blocks.get(&target) {
                         builder.ins().jump(target_block, &[]);
                     } else {
@@ -2377,29 +2365,17 @@ pub fn compile_bytecode_region_typed(
                     );
                     let header = blocks[&start_offset];
                     let exit_block = builder.create_block();
-                    builder
-                        .ins()
-                        .brif(is_true, header, &args, exit_block, &[]);
+                    builder.ins().brif(is_true, header, &args, exit_block, &[]);
 
                     // Only the exit path materializes loop-carried native
                     // values. The taken backedge stays entirely in SSA form.
                     builder.switch_to_block(exit_block);
-                    flush_native_caches(
-                        &mut builder,
-                        regs_ptr,
-                        &mut int_cache,
-                        &mut float_cache,
-                    );
+                    flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                     let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
                     builder.ins().jump(fallthrough, &[]);
                     builder.seal_block(exit_block);
                 } else {
-                    flush_native_caches(
-                        &mut builder,
-                        regs_ptr,
-                        &mut int_cache,
-                        &mut float_cache,
-                    );
+                    flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                     let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
                     // Branch conditions are NaN-tagged bools; truthiness is the low
                     // payload bit (matches `Value::as_bool`), not the whole value.
@@ -2457,27 +2433,15 @@ pub fn compile_bytecode_region_typed(
                     );
                     let header = blocks[&start_offset];
                     let exit_block = builder.create_block();
-                    builder
-                        .ins()
-                        .brif(is_false, header, &args, exit_block, &[]);
+                    builder.ins().brif(is_false, header, &args, exit_block, &[]);
 
                     builder.switch_to_block(exit_block);
-                    flush_native_caches(
-                        &mut builder,
-                        regs_ptr,
-                        &mut int_cache,
-                        &mut float_cache,
-                    );
+                    flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                     let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
                     builder.ins().jump(fallthrough, &[]);
                     builder.seal_block(exit_block);
                 } else {
-                    flush_native_caches(
-                        &mut builder,
-                        regs_ptr,
-                        &mut int_cache,
-                        &mut float_cache,
-                    );
+                    flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                     let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
                     let one = builder.ins().iconst(types::I64, 1);
                     let cond_bit = builder.ins().band(cond_val, one);
@@ -3440,13 +3404,8 @@ mod typed_tests {
         meta.set_type(1, KnownType::Int);
         meta.set_type(6, KnownType::Int);
 
-        let plan = simple_loop_ssa_plan(
-            &instructions,
-            0,
-            instructions.len(),
-            Some(&meta),
-        )
-        .expect("simple numeric loop should get an SSA plan");
+        let plan = simple_loop_ssa_plan(&instructions, 0, instructions.len(), Some(&meta))
+            .expect("simple numeric loop should get an SSA plan");
 
         assert_eq!(plan.backedge_pc, 3);
         assert!(plan.carried.contains(&(0, KnownType::Int)));
@@ -3468,13 +3427,8 @@ mod typed_tests {
             meta.set_type(reg, KnownType::Int);
         }
 
-        let plan = simple_loop_ssa_plan(
-            &instructions,
-            0,
-            instructions.len(),
-            Some(&meta),
-        )
-        .expect("other stable numeric registers should still be threadable");
+        let plan = simple_loop_ssa_plan(&instructions, 0, instructions.len(), Some(&meta))
+            .expect("other stable numeric registers should still be threadable");
 
         assert!(
             !plan.carried.iter().any(|&(reg, _)| reg == 0),
@@ -3565,10 +3519,7 @@ mod typed_tests {
             unsafe { Value::from_bits(regs[0]) }.as_float(),
             Some(4950.0)
         );
-        assert_eq!(
-            unsafe { Value::from_bits(regs[1]) }.as_float(),
-            Some(100.0)
-        );
+        assert_eq!(unsafe { Value::from_bits(regs[1]) }.as_float(), Some(100.0));
     }
 
     #[test]
