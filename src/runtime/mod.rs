@@ -1281,12 +1281,12 @@ impl Runtime {
 
     /// Enqueue an actor on the scheduler at its current priority. All
     /// scheduler enqueue paths go through here so a priority set via
-    /// `perform Actor.set_priority` takes effect on the next (re)queue;
-    /// unknown actors (e.g. already exited) enqueue at the Normal default.
-    pub(crate) fn enqueue_actor(&self, actor_id: u64) {
+    /// `perform Actor.set_priority` takes effect on the next (re)queue.
+    /// Unknown or already-exited local actors are ignored.
+    pub(crate) fn enqueue_actor(&mut self, actor_id: u64) {
         // Cross-shard routing: if the actor lives on another shard, send
-        // an EnqueueActor message. The receiving shard's drain loop enqueues
-        // it locally.
+        // an EnqueueActor message. The receiving shard's drain loop performs
+        // the destination-side deduplication.
         if self.shard_count > 1 {
             let target_shard = (actor_id % self.shard_count as u64) as u16;
             if target_shard != self.shard_idx {
@@ -1297,11 +1297,24 @@ impl Runtime {
                 return;
             }
         }
-        let priority = self
-            .actors
-            .get(&actor_id)
-            .map(|a| a.priority)
-            .unwrap_or_default();
+
+        // A local actor that is executing will be reconsidered once its
+        // scheduler turn ends. Enqueuing it from a self-send would only leave
+        // a stale task behind after the current micro-batch drains the mail.
+        if self.current_actor == Some(actor_id) {
+            return;
+        }
+
+        let priority = match self.actors.get_mut(&actor_id) {
+            Some(actor) => {
+                if actor.scheduled {
+                    return;
+                }
+                actor.scheduled = true;
+                actor.priority
+            }
+            None => return,
+        };
         self.scheduler.enqueue_with_priority(actor_id, priority);
     }
 
@@ -1536,8 +1549,11 @@ impl Runtime {
                         None,
                     );
                 }
-                CrossShardMsg::EnqueueActor { actor_id, priority } => {
-                    self.scheduler.enqueue_with_priority(actor_id, priority);
+                CrossShardMsg::EnqueueActor {
+                    actor_id,
+                    priority: _,
+                } => {
+                    self.enqueue_actor(actor_id);
                 }
             }
         }
@@ -2888,7 +2904,17 @@ impl Runtime {
             // actors into the local scheduler.
             self.drain_cross_shard_messages();
             let actor_id = match self.scheduler.dequeue() {
-                Some(actor_id) => actor_id,
+                Some(actor_id) => {
+                    // The unique queued task has been claimed. A message that
+                    // arrives after this point may schedule the actor again;
+                    // duplicate arrivals before this point were coalesced.
+                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+                        actor.scheduled = false;
+                    } else {
+                        continue;
+                    }
+                    actor_id
+                }
                 None => {
                     if self.llm_inflight_count() == 0 && self.timer_wheel.is_empty() {
                         if let Some(ref mut cb) = self.idle_callback {
@@ -2928,7 +2954,7 @@ impl Runtime {
             #[cfg(feature = "ai-runtime")]
             self.poll_llm_completions();
             self.tick_timers();
-            self.step_actor(actor_id);
+            self.step_actor_impl(actor_id, false);
             // Micro-batch: continue processing the same actor for a few more
             // messages to maximize L1 instruction-cache retention.  The
             // per-turn reduction budget (checked by should_yield) acts as
@@ -2948,8 +2974,11 @@ impl Runtime {
                 if !should_continue {
                     break;
                 }
-                self.step_actor(actor_id);
+                self.step_actor_impl(actor_id, false);
             }
+            // Exactly one requeue is allowed per completed scheduler turn,
+            // regardless of how many messages arrived while the actor ran.
+            self.requeue_if_mail_pending(actor_id);
             ticks += 1;
             if ticks % GC_PUMP_INTERVAL == 0 {
                 // Safe at any cadence: process_deferred only frees objects
@@ -3527,6 +3556,16 @@ impl Runtime {
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn step_actor(&mut self, actor_id: u64) {
+        // Public/manual stepping commonly follows a direct scheduler dequeue.
+        // Claim that queued turn here as run_scheduler does internally so a
+        // partially drained mailbox can schedule exactly one follow-up turn.
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.scheduled = false;
+        }
+        self.step_actor_impl(actor_id, true);
+    }
+
+    fn step_actor_impl(&mut self, actor_id: u64, requeue: bool) {
         self.current_actor = Some(actor_id);
 
         // If the actor yielded at a JIT safepoint, resume it inline before
@@ -3588,21 +3627,20 @@ impl Runtime {
             // owner heap) stay alive until this actor exits.
             self.hold_payload_refs(actor_id, &msg.payload);
 
-            // Establish the W3C trace context for this message: a child of
-            // the sender's span when the message carries a traceparent (so
-            // causal chains continue), otherwise a fresh root. The context is
-            // recorded on the runtime so sends performed by the handler below
-            // stamp their outgoing traceparent as children of it. `_span_guard`
-            // keeps the `tracing` span alive for the rest of this dispatch.
+            // Establish W3C trace context only when there is incoming context
+            // to propagate or a TRACE subscriber actually needs a new root.
+            // This keeps ordinary local actor traffic free of trace-id
+            // generation and traceparent formatting. `_span_guard` keeps an
+            // enabled tracing span alive for the rest of this dispatch.
             let trace_ctx = match &msg.trace_id {
-                Some(tp) => match TraceContext::from_traceparent(tp) {
-                    Some(incoming) => incoming.child(),
-                    None => TraceContext::root(),
-                },
-                None => TraceContext::root(),
+                Some(tp) => TraceContext::from_traceparent(tp)
+                    .map(|incoming| incoming.child())
+                    .or_else(|| tracing::enabled!(tracing::Level::TRACE).then(TraceContext::root)),
+                None => tracing::enabled!(tracing::Level::TRACE).then(TraceContext::root),
             };
-            self.current_trace = Some(trace_ctx);
-            let _span_guard = trace_ctx.enter_dispatch_span(actor_id, behavior_idx);
+            self.current_trace = trace_ctx;
+            let _span_guard =
+                trace_ctx.and_then(|ctx| ctx.enter_dispatch_span(actor_id, behavior_idx));
 
             // Intercept semantic-memory behaviors generated by compile_agent.
             // They are bytecode behaviors but are implemented directly by the
@@ -3973,10 +4011,13 @@ impl Runtime {
             }
             false
         };
-        if should_requeue {
+        // Clear current_actor before an optional direct-call requeue so
+        // enqueue_actor can distinguish a real next turn from a self-send
+        // during the turn that just completed.
+        self.current_actor = None;
+        if should_requeue && requeue {
             self.enqueue_actor(actor_id);
         }
-        self.current_actor = None;
     }
 
     fn actor_is_persistent(&self, actor_id: u64) -> bool {

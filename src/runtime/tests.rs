@@ -387,7 +387,9 @@ fn test_actor_set_priority_changes_scheduling() {
     declare_test_behavior(&mut rt, b, "noop");
     // Drain the spawn-time queue entries (both enqueued at Normal).
     assert_eq!(rt.scheduler.dequeue(), Some(a));
+    rt.actors.get_mut(&a).unwrap().scheduled = false;
     assert_eq!(rt.scheduler.dequeue(), Some(b));
+    rt.actors.get_mut(&b).unwrap().scheduled = false;
     // Boost b via the builtin-effect path, then send to a before b.
     assert_eq!(
         rt.perform_actor_builtin(Some(b), Some("set_priority"), &[], &[Value::int(0)]),
@@ -410,6 +412,7 @@ fn test_anonymous_actor_accepts_untyped_mailbox_delivery_without_handler_alias()
     assert!(rt.actors[&actor_id].behavior_table.is_empty());
     assert!(rt.actors[&actor_id].bytecode_module.is_none());
     assert_eq!(rt.scheduler.dequeue(), Some(actor_id));
+    rt.actors.get_mut(&actor_id).unwrap().scheduled = false;
 
     rt.send_message(actor_id, "opaque-runtime-tag", &[Value::int(7)]);
 
@@ -429,6 +432,7 @@ fn test_named_actor_still_rejects_unknown_behavior_without_aliasing_zero() {
         .unwrap()
         .register_behavior("known", |_actor, _args| {});
     assert_eq!(rt.scheduler.dequeue(), Some(actor_id));
+    rt.actors.get_mut(&actor_id).unwrap().scheduled = false;
 
     rt.send_message(actor_id, "typo", &[]);
     assert!(
@@ -2880,8 +2884,8 @@ fn test_runtime_scheduler_stats() {
 
     let stats = rt.scheduler_stats();
     assert_eq!(
-        stats.total_tasks_processed, 4,
-        "spawn + send should produce four actor tasks"
+        stats.total_tasks_processed, 2,
+        "spawn + send should coalesce to one scheduler task per actor"
     );
     assert_eq!(
         stats.empty_polls, 1,
@@ -7279,4 +7283,58 @@ fn p0_cross_shard_named_send_resolves_only_on_owner() {
         Some(1),
         "unknown cross-shard behavior must not execute behavior zero"
     );
+}
+
+#[test]
+fn perf_scheduler_coalesces_repeated_actor_wakeups() {
+    fn increment(actor: &mut Actor, _args: &[Value]) {
+        let count = actor
+            .get_state_field("count")
+            .and_then(|v| v.as_int())
+            .unwrap_or(0);
+        actor.set_state_field("count", Value::int(count + 1));
+    }
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("inc", increment);
+
+    // Drain the spawn-time scheduler entry so the measurement below contains
+    // only wakeups created by the message flood.
+    rt.run_scheduler();
+    let before = rt.scheduler_stats().total_tasks_processed;
+
+    for _ in 0..1_000 {
+        rt.send_message_by_id(actor_id, 0, &[]);
+    }
+
+    assert!(
+        rt.actors.get(&actor_id).unwrap().scheduled,
+        "a flood should leave exactly one outstanding actor wakeup"
+    );
+
+    rt.run_scheduler();
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(
+        actor.get_state_field("count").and_then(|v| v.as_int()),
+        Some(1_000)
+    );
+    assert!(!actor.scheduled, "drained actors must not remain scheduled");
+
+    let dequeues = rt.scheduler_stats().total_tasks_processed - before;
+    assert!(
+        dequeues <= 64,
+        "1,000 queued messages should be micro-batched into <=64 scheduler turns, got {dequeues}"
+    );
+}
+
+#[test]
+fn perf_disabled_flight_recorder_is_a_noop() {
+    let mut recorder = super::actor::FlightRecorder::new(0);
+    recorder.record(7, 3, &[Value::int(42), Value::bool(true)]);
+    assert!(recorder.is_empty());
 }
