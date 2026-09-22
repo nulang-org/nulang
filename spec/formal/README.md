@@ -5,12 +5,13 @@
 >
 > **Status:** The Core soundness chain — `progress`, `preservation`,
 > `type_soundness` — is machine-checked (2026-08-14). The capability
-> lattice laws (`join` assoc/comm/idem) and `cap_sendable`/
-> `discharge_sendable` are proved. Two items remain open:
-> `linear_at_most_once` (requires the split-context refinement of
-> `HasTypeCap`, documented in `capabilities.lean`) and the effect-safety
-> theorems (`effects.lean`), which are still vacuous `True` stubs, not
-> proofs (deferred to the `combined.lean` handler-stack model).
+> lattice laws (`join` assoc/comm/idem), `cap_sendable`, and
+> `discharge_sendable` are proved. The linear checker now has a formal
+> split-flow model whose `may`/union and `must`/intersection branch laws
+> are proved in `capabilities.lean`; the former single-context
+> `linear_at_most_once` conjecture and its `sorry` were removed because
+> that statement was known false. Effect-safety theorems (`effects.lean`)
+> remain vacuous `True` stubs pending the handler-stack proof.
 
 ## Purpose
 
@@ -29,7 +30,7 @@ Two layers are formalized:
 | `Nulang/Capabilities.lean` | Capability lattice, `subtype`, `join`, `isSendable` | Formalized |
 | `Nulang/Effects.lean` | Effect rows, `subrow`, `union` | Formalized |
 | `types.lean` | HM `HasType`, small-step semantics, `progress`/`preservation`/`type_soundness` | **Proved** |
-| `capabilities.lean` | Capability lattice laws, `cap_sendable`, `discharge_sendable` | Proved (`linear_at_most_once` open) |
+| `capabilities.lean` | Capability lattice laws, sendability, split linear-flow branch laws | **Proved for the modeled laws; no `sorry`** |
 | `effects.lean` | Effect rows, `effect_safety`, `effect_safety_static` | `True` stubs (not proved) |
 
 ## Theorems
@@ -54,14 +55,19 @@ Theorem cap_sendable:
 Values with `iso`, `val`, `tag`, `lineariso`, or `linear` capabilities
 are safe to send between actors.
 
-### Linear at-most-once — open conjecture
-`linear_at_most_once` states that a `LinearIso` binding is consumed after its
-single use.  This property is **not** a theorem of the single-context
-`HasTypeCap` judgment (it is false there — see the counterexample in
-`capabilities.lean`), because that judgment carries no *output* context.  It
-requires the split-context refinement `Γ ⊢ e : τ / Γ'`, which is out of scope
-for the current formalization and stated as a conjecture per the RFC 0003
-Item 2 contingency.
+### Split linear consumption flow — proved branch laws
+The capability checker carries two output-flow facts per ownership binding:
+`may` means a reaching path has consumed/moved the binding, while `must`
+means every reaching path has consumed/moved it. Branch joins union `may`
+and intersect `must`. The formal model proves that one-branch consumption
+cannot be forgotten (so later reuse is rejected), cannot falsely discharge an
+exactly-once obligation, and that consumption on both branches does discharge
+that obligation.
+
+This replaces the old `linear_at_most_once` theorem, which was intentionally
+left as a `sorry` because it was false under the single-context
+`HasTypeCap` judgment. A future full input/output-context typing judgment can
+lift these proved flow laws over the complete Core expression relation.
 
 ### Effect Safety — stubbed (not proved)
 ```
