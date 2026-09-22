@@ -116,6 +116,20 @@ fn test_find_region_stops_at_unsupported() {
         STRAIGHT_LINE_MIN,
         "large straight-line region ending at unsupported op is compiled"
     );
+
+    // INeg is deliberately interpreter-only: unlike wrapping arithmetic it
+    // raises on INT48_MIN, and compiled regions do not yet have a first-class
+    // exceptional exit at an arbitrary opcode.
+    let mut checked_neg = Vec::new();
+    for _ in 0..STRAIGHT_LINE_MIN {
+        checked_neg.push(Instruction::new3(OpCode::IAdd, 0, 1, 2));
+    }
+    checked_neg.push(Instruction::new2(OpCode::INeg, 0, 3));
+    assert_eq!(
+        find_compilable_region(0, &checked_neg),
+        STRAIGHT_LINE_MIN,
+        "JIT region must stop before checked INeg"
+    );
 }
 
 /// Regions must stop before branches and Halt: after a region runs, the VM
@@ -384,7 +398,6 @@ fn test_jit_compile_all_mvp_opcodes() {
         Instruction::new3(OpCode::IMul, 2, 3, 12),
         Instruction::new3(OpCode::IDiv, 10, 11, 13),
         Instruction::new3(OpCode::IMod, 11, 12, 14),
-        Instruction::new2(OpCode::INeg, 0, 15),
         Instruction::new1(OpCode::IInc, 0),
         Instruction::new1(OpCode::IDec, 1),
         Instruction::new3(OpCode::FAdd, 0, 1, 20),
