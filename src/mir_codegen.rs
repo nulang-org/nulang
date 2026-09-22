@@ -3853,6 +3853,131 @@ mod optimize_tests {
     }
 
     #[test]
+    fn test_cfg_dce_removes_overwritten_scalar_definition() {
+        let mut b = mir::FunctionBuilder::new("overwrite_dce", Some(crate::types::Type::int()));
+        let value = b.add_temp(crate::types::Type::int());
+        b.assign(value, mir::RValue::Const(Constant::Int(1)));
+        b.assign(value, mir::RValue::Const(Constant::Int(2)));
+        b.terminate(mir::Terminator::Return(Some(value)));
+
+        let mut func = b.build();
+        let mut consts = Vec::new();
+        optimize_function(&mut func, &mut consts);
+
+        let defs: Vec<&mir::RValue> = func.blocks[0]
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                mir::Stmt::Assign { dst, op } if *dst == value => Some(op),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            defs,
+            vec![&mir::RValue::Const(Constant::Int(2))],
+            "the first definition is dead before the overwrite and should be removed"
+        );
+    }
+
+    #[test]
+    fn test_cfg_dce_preserves_value_live_on_one_join_arm() {
+        let mut b = mir::FunctionBuilder::new("join_liveness", Some(crate::types::Type::int()));
+        let cond = b.add_param("cond", crate::types::Type::bool());
+        let value = b.add_temp(crate::types::Type::int());
+        let other = b.add_temp(crate::types::Type::int());
+        let then_block = b.create_block();
+        let else_block = b.create_block();
+
+        b.assign(value, mir::RValue::Const(Constant::Int(7)));
+        b.assign(other, mir::RValue::Const(Constant::Int(9)));
+        b.terminate(mir::Terminator::Branch {
+            cond,
+            then_: then_block,
+            else_: else_block,
+        });
+
+        b.switch_to(then_block);
+        b.terminate(mir::Terminator::Return(Some(value)));
+
+        b.switch_to(else_block);
+        b.terminate(mir::Terminator::Return(Some(other)));
+
+        let mut func = b.build();
+        let mut consts = Vec::new();
+        optimize_function(&mut func, &mut consts);
+
+        assert!(
+            func.blocks[0]
+                .stmts
+                .iter()
+                .any(|stmt| matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        dst,
+                        op: mir::RValue::Const(Constant::Int(7)),
+                    } if *dst == value
+                )),
+            "a definition live on either successor path must survive join-aware DCE"
+        );
+    }
+
+    #[test]
+    fn test_cfg_dce_preserves_loop_carried_definition() {
+        let mut b = mir::FunctionBuilder::new("loop_liveness", Some(crate::types::Type::int()));
+        let cond = b.add_param("cond", crate::types::Type::bool());
+        let value = b.add_temp(crate::types::Type::int());
+        let one = b.add_temp(crate::types::Type::int());
+        let loop_block = b.create_block();
+        let exit_block = b.create_block();
+
+        b.assign(value, mir::RValue::Const(Constant::Int(0)));
+        b.assign(one, mir::RValue::Const(Constant::Int(1)));
+        b.terminate(mir::Terminator::Jump(loop_block));
+
+        b.switch_to(loop_block);
+        b.assign(
+            value,
+            mir::RValue::Binary(crate::ast::BinOp::Add, value, one),
+        );
+        b.terminate(mir::Terminator::Branch {
+            cond,
+            then_: loop_block,
+            else_: exit_block,
+        });
+
+        b.switch_to(exit_block);
+        b.terminate(mir::Terminator::Return(Some(value)));
+
+        let mut func = b.build();
+        let mut consts = Vec::new();
+        optimize_function(&mut func, &mut consts);
+
+        assert!(
+            func.blocks[0]
+                .stmts
+                .iter()
+                .any(|stmt| matches!(
+                    stmt,
+                    mir::Stmt::Assign { dst, .. } if *dst == value
+                )),
+            "the loop's initial carried value must stay live across the entry edge"
+        );
+        assert!(
+            func.blocks[loop_block.0 as usize]
+                .stmts
+                .iter()
+                .any(|stmt| matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        dst,
+                        op: mir::RValue::Binary(crate::ast::BinOp::Add, lhs, _),
+                    } if *dst == value && *lhs == value
+                )),
+            "the loop-carried update must remain live across the backedge/exit"
+        );
+    }
+
+    #[test]
     fn test_dce_preserves_reachable_panic() {
         let mut b = mir::FunctionBuilder::new("panic_dce", None);
         let dst = b.add_temp(crate::types::Type::unit());
