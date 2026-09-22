@@ -1918,8 +1918,12 @@ impl TypeChecker {
             // Block: sequence of expressions
             Expr::Block { exprs, span } => self.infer_block(ctx, exprs, *span),
 
-            // Par: independence annotation, sequential block semantics.
-            Expr::Par { exprs, span } => self.infer_block(ctx, exprs, *span),
+            // Par: validate independence now, even though execution remains
+            // sequential until RFC 0024's scoped-concurrency backend lands.
+            Expr::Par { exprs, span } => {
+                crate::parallel_analysis::validate_parallel_branches(exprs, *span)?;
+                self.infer_block(ctx, exprs, *span)
+            }
 
             // Spawn actor
             Expr::Spawn {
