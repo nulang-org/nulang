@@ -36,9 +36,10 @@ Experimental (feature-gated or marked): multi-node distribution over TCP,
 WASM/WASM Component Model/WasmFX backends, the secondary native AOT backend
 (restricted semantics), AI runtime, Fabric, RESP cache serving, typed
 actor-protocol hardening, the deprecated `agent`/`workflow`/`database`
-declaration surfaces, and CRDT state fields (implemented and tested at the
-Rust level; the `.nula` surface parses but behaves as `durable` — SPEC2
-§9.10).
+declaration surfaces, source-level CRDT state/replication, and the
+remaining CRDT recovery hardening. `.nula` CRDT fields and `Crdt.*`
+operations are implemented; a recovered actor currently needs its field-name
+mapping re-registered before CRDT operations are fully usable.
 
 Actor protocol checking now rejects unknown behaviors and wrong arity when the
 receiver is statically known, and explicit `ActorRef[P]` values enforce their
@@ -53,9 +54,9 @@ the status/conformance material.
 If the BEAM works for you, use it — it's battle-tested in ways Nulang won't
 be for years. Nulang's differences: static typing with full inference,
 compile-time data-race freedom via capabilities, effects tracked in types,
-and journaled, event-sourced actor state — with the caveat, verified by
-execution, that automatic state rebuild on restart is not yet wired to the
-CLI path (see the kill -9 answer below). Nulang is a small native runtime,
+and journaled, event-sourced actor state. Durable-store selection and
+supervisor snapshot hydration are now wired, while stronger crash-safety
+claims still require store-specific destructive validation. Nulang is a small native runtime,
 not a VM with OTP's operational tooling — that trade cuts both ways.
 
 ## Why not Gleam?
