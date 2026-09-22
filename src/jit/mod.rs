@@ -358,12 +358,14 @@ impl JitSession {
         }
     }
 
-    /// Reset post-compilation tiering state (used by tests).
+    /// Reset post-compilation execution counters without changing tier state.
+    ///
+    /// Terminal is deliberately preserved: clearing it would retry a static
+    /// SIMD decision and can attempt to redeclare the same JIT symbol.
     pub fn reset_tier2_counters(&mut self) {
         for row in &mut self.compiled {
             for region in row.iter_mut().flatten() {
                 region.tier2_executions = 0;
-                region.tier2_terminal = false;
             }
         }
     }
