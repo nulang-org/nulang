@@ -1557,11 +1557,12 @@ fn test_tier2_counter_increments_and_becomes_terminal() {
     assert_eq!(still_terminal.tier2_executions, 0);
     assert!(still_terminal.tier2_terminal);
 
-    // Tests can reset the embedded state without rebuilding the JIT session.
+    // Counter reset must not demote a terminal region or trigger another
+    // static specialization attempt.
     jit.reset_tier2_counters();
     let reset = jit.compiled_entry(0, 100).expect("compiled region");
     assert_eq!(reset.tier2_executions, 0);
-    assert!(!reset.tier2_terminal);
+    assert!(reset.tier2_terminal);
 }
 
 #[test]
