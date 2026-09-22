@@ -51,6 +51,17 @@ version + migration.*
 
 ## Stable tier
 
+### Match coverage diagnostics — 2026-09-21
+- **Finite-domain match coverage warnings** (#332, `src/pattern_coverage.rs`).
+  After successful ordinary type inference, matches over closed variants and
+  `Bool` emit `W0201` for missing constructors/values and `W0202` for
+  redundant arms. Guarded arms do not prove exhaustiveness.
+- Current 1.x program validity and the runtime non-exhaustive fallback remain
+  unchanged; `--deny-warnings` provides strict enforcement. Any future
+  promotion to default hard errors requires the explicit semantic-version
+  transition permitted by RFC 0021 rather than an implicit diagnostic change.
+- CLI and LSP consume the same typechecker-owned warning stream.
+
 ### Production host-authority boundary — 2026-09-20
 - **Test effect handlers no longer exist in production runtime builds** (`src/runtime/mod.rs`, `src/runtime/callbacks.rs`). Mock effect interception is now `#[cfg(test)]` and crate-private, so actor-backed host effects in production cannot take the test-handler path before external-authority enforcement.
 - **Actor-backed `Process.run` remains non-dispatched until a real process sandbox exists** (`src/runtime/callbacks.rs`, `src/stdlib.rs`). A regression test proves that even an actor holding an exact `Process::Run(...)` grant cannot turn that grant into host shell execution; docs now mark the existing `/bin/sh -c` implementation as trusted/standalone-only.
