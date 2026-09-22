@@ -728,6 +728,11 @@ impl MirCodegen {
                     args.len() as u8,
                 ));
             }
+            mir::Stmt::ParallelMarker { .. } => {
+                // Compile-time structured-concurrency metadata only. The
+                // bytecode path remains sequential until RFC 0024 Phase 2
+                // scheduling semantics are implemented.
+            }
         }
         Ok(())
     }
@@ -1953,6 +1958,7 @@ fn stmt_reads(stmt: &mir::Stmt, out: &mut HashSet<mir::LocalId>) {
     use mir::Stmt;
     match stmt {
         Stmt::Assign { op, .. } => rvalue_reads(op, out),
+        Stmt::ParallelMarker { .. } => {}
         Stmt::StoreFieldNamed { obj, src, .. } => {
             out.insert(*obj);
             out.insert(*src);
