@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Native straight-line JIT calls — 2026-09-22
+- **Hot compiled callers can invoke proven straight-line, non-suspending, non-recursive leaf functions natively** (Experimental, `src/jit/`, `src/vm.rs`). Eligible leaves are compiled as bounded native thunks outside the ordinary hot-region cache; the caller preserves the callee's exact register clobber set and captures the return value before restoration. Native execution detaches the JIT backend and raw constant cache from `VM` before entering re-entrant code, eliminating mutable-backend aliasing across direct-call fallback. Branchy, nested-call, recursive, effectful, heap/refcount-sensitive, or otherwise unproven callees retain the interpreter-helper fallback.
+
 ### Candidate-only JIT hotness probing — 2026-09-22
 - **Cold interpreted execution now probes JIT hotness only at candidate compiled-region entries** (`src/vm.rs`). The VM precomputes per-module candidates for execution/function/behavior entries, source-statement starts, branch targets/fallthroughs, and successors of compilation boundaries, avoiding JIT backend dispatch and hot-counter mutation at ordinary straight-line bytecode PCs without changing language semantics.
 
