@@ -24,7 +24,7 @@
 //! SIGN_EXT     = 0xFFFF_0000_0000_0000
 //! ```
 
-use cranelift::codegen::ir::FuncRef;
+use cranelift::codegen::ir::{BlockArg, FuncRef};
 use cranelift::prelude::*;
 use cranelift_frontend::FunctionBuilder;
 use cranelift_jit::JITModule;
@@ -435,6 +435,11 @@ impl NativeIntCache {
         }
         self.values.clear();
     }
+
+    fn clear(&mut self) {
+        self.values.clear();
+        self.dirty.clear();
+    }
 }
 
 /// Region-local cache for proven Float registers.
@@ -478,6 +483,11 @@ impl NativeFloatCache {
             }
         }
         self.values.clear();
+    }
+
+    fn clear(&mut self) {
+        self.values.clear();
+        self.dirty.clear();
     }
 }
 
@@ -541,6 +551,209 @@ fn region_predecessor_counts(
     }
 
     counts
+}
+
+/// Conservative first wave of loop-carried SSA.
+///
+/// We only thread native values around a loop when the compiled region starts
+/// at the loop header, contains exactly one backedge to that header, and has
+/// no other branch inside the loop body. This matches the hot-loop regions
+/// produced by the tiering scanner while avoiding general CFG phi placement.
+#[derive(Debug, Clone)]
+struct SimpleLoopSsaPlan {
+    backedge_pc: usize,
+    carried: Vec<(usize, KnownType)>,
+}
+
+fn register_write_type(instr: &Instruction, reg: usize) -> Option<Option<KnownType>> {
+    let op1 = instr.op1 as usize;
+    let op2 = instr.op2 as usize;
+    let op3 = instr.op3 as usize;
+
+    let typed_write = |dst: usize, ty: KnownType| {
+        if dst == reg {
+            Some(Some(ty))
+        } else {
+            None
+        }
+    };
+    let unknown_write = |dst: usize| {
+        if dst == reg {
+            Some(None)
+        } else {
+            None
+        }
+    };
+
+    match instr.opcode {
+        OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
+            typed_write(op1, KnownType::Int)
+        }
+        OpCode::ConstU => unknown_write(op3),
+        OpCode::Load | OpCode::Store | OpCode::Move | OpCode::Dup => unknown_write(op2),
+        OpCode::Swap => {
+            if reg == op1 || reg == op2 {
+                Some(None)
+            } else {
+                None
+            }
+        }
+        OpCode::IAdd
+        | OpCode::ISub
+        | OpCode::IMul
+        | OpCode::Xor
+        | OpCode::Shl
+        | OpCode::Shr
+        | OpCode::BitAnd
+        | OpCode::BitOr => typed_write(op3, KnownType::Int),
+        OpCode::IDiv | OpCode::IMod => unknown_write(op3),
+        OpCode::INeg => typed_write(op2, KnownType::Int),
+        OpCode::IInc | OpCode::IDec => typed_write(op1, KnownType::Int),
+        OpCode::FAdd | OpCode::FSub | OpCode::FMul | OpCode::FNeg => {
+            typed_write(op3, KnownType::Float)
+        }
+        OpCode::FDiv => unknown_write(op3),
+        OpCode::ICmpEq
+        | OpCode::ICmpLt
+        | OpCode::ICmpGt
+        | OpCode::ICmpLe
+        | OpCode::ICmpGe
+        | OpCode::FCmpEq
+        | OpCode::FCmpLt
+        | OpCode::FCmpGt => typed_write(op3, KnownType::Bool),
+        OpCode::Not => typed_write(op2, KnownType::Bool),
+        OpCode::And | OpCode::Or => typed_write(op3, KnownType::Bool),
+        OpCode::IToF => typed_write(op2, KnownType::Float),
+        OpCode::FToI => typed_write(op2, KnownType::Int),
+        OpCode::ArrLoad => unknown_write(op3),
+        _ => None,
+    }
+}
+
+fn type_at_simple_loop_backedge(
+    instructions: &[Instruction],
+    start_offset: usize,
+    backedge_pc: usize,
+    meta: &TypeMetadata,
+    reg: usize,
+) -> KnownType {
+    let mut ty = meta.get_type(reg);
+    for instr in &instructions[start_offset..backedge_pc] {
+        if let Some(write) = register_write_type(instr, reg) {
+            ty = write.unwrap_or(KnownType::Unknown);
+        }
+    }
+    ty
+}
+
+fn simple_loop_ssa_plan(
+    instructions: &[Instruction],
+    start_offset: usize,
+    end_offset: usize,
+    type_metadata: Option<&TypeMetadata>,
+) -> Option<SimpleLoopSsaPlan> {
+    let meta = type_metadata?;
+    if start_offset >= end_offset {
+        return None;
+    }
+
+    let mut backedge_pc = None;
+    for pc in start_offset..end_offset {
+        let instr = instructions[pc];
+        let target = match instr.opcode {
+            OpCode::Jmp => Some((pc as i64 + instr.simm16() as i64) as usize),
+            OpCode::JmpT | OpCode::JmpF => {
+                Some((pc as i64 + instr.offset16() as i64) as usize)
+            }
+            _ => None,
+        };
+        if target == Some(start_offset) {
+            if backedge_pc.replace(pc).is_some() {
+                return None;
+            }
+        }
+    }
+    let backedge_pc = backedge_pc?;
+
+    // The body from header to backedge must be linear. The backedge itself is
+    // the only control-flow split we thread native values through.
+    if instructions[start_offset..backedge_pc]
+        .iter()
+        .any(|instr| matches!(instr.opcode, OpCode::Jmp | OpCode::JmpT | OpCode::JmpF))
+    {
+        return None;
+    }
+
+    if matches!(
+        instructions[backedge_pc].opcode,
+        OpCode::JmpT | OpCode::JmpF
+    ) {
+        let cond = instructions[backedge_pc].op1 as usize;
+        if type_at_simple_loop_backedge(instructions, start_offset, backedge_pc, meta, cond)
+            != KnownType::Bool
+        {
+            return None;
+        }
+    }
+
+    let mut carried = Vec::new();
+    for reg in 0..256 {
+        let ty = meta.get_type(reg);
+        if !matches!(ty, KnownType::Int | KnownType::Float) {
+            continue;
+        }
+
+        // Thread only registers whose representation remains stable for the
+        // entire loop body. Nullable division, dynamic copies, swaps, and
+        // other representation-changing writes are deliberately excluded.
+        if type_at_simple_loop_backedge(instructions, start_offset, backedge_pc, meta, reg) == ty {
+            carried.push((reg, ty));
+        }
+    }
+
+    // Avoid bloating CLIF block signatures in unusually large inferred states.
+    if carried.is_empty() || carried.len() > 32 {
+        return None;
+    }
+
+    Some(SimpleLoopSsaPlan {
+        backedge_pc,
+        carried,
+    })
+}
+
+fn native_value_from_vm(
+    builder: &mut FunctionBuilder,
+    regs_ptr: Value,
+    reg: usize,
+    ty: KnownType,
+) -> Value {
+    let raw = load_reg(builder, regs_ptr, reg);
+    match ty {
+        KnownType::Int => emit_sext48(builder, raw),
+        KnownType::Float => emit_bitcast_i64_to_f64(builder, raw),
+        _ => unreachable!("loop SSA only threads Int/Float registers"),
+    }
+}
+
+fn loop_carried_args(
+    builder: &mut FunctionBuilder,
+    regs_ptr: Value,
+    int_cache: &mut NativeIntCache,
+    float_cache: &mut NativeFloatCache,
+    carried: &[(usize, KnownType)],
+) -> Vec<BlockArg> {
+    carried
+        .iter()
+        .map(|&(reg, ty)| {
+            let value = match ty {
+                KnownType::Int => int_cache.load(builder, regs_ptr, reg),
+                KnownType::Float => float_cache.load(builder, regs_ptr, reg),
+                _ => unreachable!("loop SSA only threads Int/Float registers"),
+            };
+            BlockArg::from(value)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
