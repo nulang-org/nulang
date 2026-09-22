@@ -254,14 +254,14 @@ fn append<R: WorkflowRuntime>(
 }
 
 #[derive(Debug)]
-struct ActivityState {
-    prepared: bool,
-    retry: RetryPolicy,
-    completed: Option<Vec<u8>>,
-    last_failure: Option<(u32, String, bool, Option<u64>)>,
+pub(crate) struct ActivityState {
+    pub(crate) prepared: bool,
+    pub(crate) retry: RetryPolicy,
+    pub(crate) completed: Option<Vec<u8>>,
+    pub(crate) last_failure: Option<(u32, String, bool, Option<u64>)>,
 }
 
-fn inspect_activity<E>(
+pub(crate) fn inspect_activity<E>(
     history: &WorkflowHistory,
     invocation_id: &ActivityInvocationId,
     spec: &ActivitySpec,
