@@ -353,6 +353,15 @@ impl Supervisor {
         }
 
         new_actor.state_models = template.state_models.clone();
+        if let Some(module) = &template.bytecode_module {
+            let mut declared_fields: Vec<String> = template.state_models.keys().cloned().collect();
+            for (name, _) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
+                if !declared_fields.contains(name) {
+                    declared_fields.push(name.clone());
+                }
+            }
+            new_actor.install_state_schema(module, &declared_fields);
+        }
         for (name, handler) in &template.behaviors {
             new_actor.register_behavior(name.clone(), *handler);
         }

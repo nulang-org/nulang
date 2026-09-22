@@ -716,6 +716,48 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         crate::vm::Value::nil()
     }
 
+    fn get_state_field_indexed(&self, field_constant_idx: usize) -> Option<crate::vm::Value> {
+        let rt = self.runtime.borrow();
+        let actor_id = rt.current_actor?;
+        rt.actors
+            .get(&actor_id)?
+            .get_state_field_by_constant(field_constant_idx)
+    }
+
+    fn set_state_field_indexed(
+        &mut self,
+        field_constant_idx: usize,
+        value: crate::vm::Value,
+    ) -> bool {
+        let mut rt = self.runtime.borrow_mut();
+        let Some(actor_id) = rt.current_actor else {
+            return false;
+        };
+        let Some(actor) = rt.actors.get_mut(&actor_id) else {
+            return false;
+        };
+        let Some(field) = actor
+            .state_field_name_by_constant(field_constant_idx)
+            .map(str::to_owned)
+        else {
+            return false;
+        };
+        if actor
+            .state_model_by_constant(field_constant_idx)
+            .map(|m| m.is_crdt())
+            .unwrap_or(false)
+        {
+            tracing::warn!(
+                "nulang-crdt: ignoring raw assignment to CRDT field '{}' on actor {}; \
+                 use the Crdt.* effect module instead",
+                field,
+                actor.id
+            );
+            return true;
+        }
+        actor.set_state_field_by_constant(field_constant_idx, value)
+    }
+
     fn get_state_field(&self, field: &str) -> crate::vm::Value {
         let rt = self.runtime.borrow();
         if let Some(actor_id) = rt.current_actor {
@@ -1512,6 +1554,47 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             // target; the receive-wait wake is deferred while the shared
             // VM is executing (see `Runtime::pending_receive_wakes`).
             unsafe { (*self.runtime).send_message_by_id(target_id, behavior_id, args) }
+        }
+    }
+
+    fn get_state_field_indexed(&self, field_constant_idx: usize) -> Option<crate::vm::Value> {
+        unsafe {
+            (*self.runtime)
+                .actors
+                .get(&self.actor_id)?
+                .get_state_field_by_constant(field_constant_idx)
+        }
+    }
+
+    fn set_state_field_indexed(
+        &mut self,
+        field_constant_idx: usize,
+        value: crate::vm::Value,
+    ) -> bool {
+        unsafe {
+            let Some(actor) = (*self.runtime).actors.get_mut(&self.actor_id) else {
+                return false;
+            };
+            let Some(field) = actor
+                .state_field_name_by_constant(field_constant_idx)
+                .map(str::to_owned)
+            else {
+                return false;
+            };
+            if actor
+                .state_model_by_constant(field_constant_idx)
+                .map(|m| m.is_crdt())
+                .unwrap_or(false)
+            {
+                tracing::warn!(
+                    "nulang-crdt: ignoring raw assignment to CRDT field '{}' on actor {}; \
+                     use the Crdt.* effect module instead",
+                    field,
+                    actor.id
+                );
+                return true;
+            }
+            actor.set_state_field_by_constant(field_constant_idx, value)
         }
     }
 
