@@ -372,8 +372,14 @@ ordinary actor behavior/message semantics still apply.
 entity Counter {
     state count: Int = 0
 
+    events
+        | Incremented(by: Int)
+
+    apply
+        | Incremented(by) => self.count = self.count + by
+
     behavior increment(by: Int) {
-        self.count = self.count + by
+        emit Incremented(by)
     }
 
     behavior value() {
