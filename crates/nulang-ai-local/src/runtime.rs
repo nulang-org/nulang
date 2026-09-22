@@ -13,7 +13,8 @@ use nulang_ai_manager::{EngineeringManager, Manager};
 use nulang_ai_protocol::format_event_line;
 use nulang_ai_worker::{LocalWorker, Worker};
 use nulang_workflow::{
-    ActivityProgress, ActivitySpec, DurableWorkflowExecutor, RetryPolicy, WorkflowId,
+    ActivityProgress, ActivitySpec, DurableWorkflowExecutor, LeaseAcquireOutcome,
+    LeaseReleaseOutcome, RetryPolicy, WorkerLease, WorkerLeaseStore, WorkflowId,
 };
 use std::collections::HashSet;
 use std::io::Write;
@@ -47,6 +48,7 @@ pub struct LocalRuntime {
     director: LocalDirector,
     engineering: EngineeringManager,
     worker: LocalWorker,
+    worker_session_id: String,
 }
 
 enum TaskExecutionOutcome {
@@ -88,6 +90,7 @@ impl LocalRuntime {
             director: LocalDirector::new("director-local"),
             engineering: EngineeringManager,
             worker: LocalWorker::new("worker-local"),
+            worker_session_id: format!("worker-session:{}", Uuid::new_v4()),
         })
     }
 
@@ -196,6 +199,22 @@ impl LocalRuntime {
         task: Task,
         out: &mut dyn Write,
     ) -> Result<TaskExecutionOutcome, RuntimeError> {
+        let resource_id = format!("agent-task:{}", task.id);
+        let lease_duration_millis = task_lease_duration_millis(&task);
+        let now_millis = unix_millis();
+        let lease = match self.store.try_acquire(
+            &resource_id,
+            &self.worker_session_id,
+            now_millis,
+            lease_duration_millis,
+        )? {
+            LeaseAcquireOutcome::Acquired(lease)
+            | LeaseAcquireOutcome::AlreadyHeldByCaller(lease) => lease,
+            LeaseAcquireOutcome::HeldByOther { .. } => {
+                return Ok(TaskExecutionOutcome::Deferred);
+            }
+        };
+
         let agent_id = task
             .assigned_agent_id
             .clone()
@@ -205,7 +224,12 @@ impl LocalRuntime {
         if running.status != TaskStatus::Running {
             running.status = TaskStatus::Running;
             running.updated_at = Utc::now();
-            self.store.upsert_task(&running)?;
+            if !self
+                .store
+                .upsert_task_if_lease_current(&running, &lease, unix_millis())?
+            {
+                return Ok(TaskExecutionOutcome::Deferred);
+            }
             self.emit(
                 out,
                 SwarmEvent::TaskStarted {
@@ -215,7 +239,7 @@ impl LocalRuntime {
             )?;
         }
 
-        let workflow_id = WorkflowId::new(format!("agent-task:{}", running.id));
+        let workflow_id = WorkflowId::new(resource_id);
         let spec = ActivitySpec::new(
             "execute",
             "agent.worker.execute",
@@ -236,7 +260,13 @@ impl LocalRuntime {
                         running.id
                     )));
                 }
-                self.store.upsert_task(&completed)?;
+                if !self
+                    .store
+                    .upsert_task_if_lease_current(&completed, &lease, unix_millis())?
+                {
+                    return Ok(TaskExecutionOutcome::Deferred);
+                }
+                release_task_lease(&mut self.store, &lease)?;
                 self.emit(
                     out,
                     SwarmEvent::TaskCompleted {
@@ -246,11 +276,20 @@ impl LocalRuntime {
                 )?;
                 Ok(TaskExecutionOutcome::Completed)
             }
-            ActivityProgress::WaitingForRetry { .. } => Ok(TaskExecutionOutcome::Deferred),
+            ActivityProgress::WaitingForRetry { .. } => {
+                release_task_lease(&mut self.store, &lease)?;
+                Ok(TaskExecutionOutcome::Deferred)
+            }
             ActivityProgress::Failed { error, .. } => {
                 running.status = TaskStatus::Failed;
                 running.updated_at = Utc::now();
-                self.store.upsert_task(&running)?;
+                if !self
+                    .store
+                    .upsert_task_if_lease_current(&running, &lease, unix_millis())?
+                {
+                    return Ok(TaskExecutionOutcome::Deferred);
+                }
+                release_task_lease(&mut self.store, &lease)?;
                 Err(RuntimeError::TaskFailed {
                     task_id: running.id,
                     error,
@@ -288,6 +327,24 @@ impl LocalRuntime {
         writeln!(out, "{}", line)?;
         out.flush()?;
         Ok(())
+    }
+}
+
+fn unix_millis() -> u64 {
+    Utc::now().timestamp_millis().max(0) as u64
+}
+
+fn task_lease_duration_millis(task: &Task) -> u64 {
+    let timeout_millis = u64::try_from(task.timeout.as_millis()).unwrap_or(u64::MAX);
+    timeout_millis.max(30_000)
+}
+
+fn release_task_lease(
+    store: &mut SqliteStore,
+    lease: &WorkerLease,
+) -> Result<(), RuntimeError> {
+    match store.release(lease, unix_millis())? {
+        LeaseReleaseOutcome::Released | LeaseReleaseOutcome::Lost => Ok(()),
     }
 }
 

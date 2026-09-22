@@ -17,7 +17,8 @@ The first slice implements durable activity execution:
 - replay of recorded completions without redispatch;
 - optimistic history revisions so multiple orchestrators cannot silently race;
 - retry policy pinned into history, including durable retry deadlines;
-- one idempotency key reused across retries and crash recovery.
+- one idempotency key reused across retries and crash recovery;
+- durable worker leases with heartbeat renewal and monotonic fencing tokens.
 
 It deliberately does **not** claim arbitrary exactly-once delivery. If an
 external system commits and the host crashes before recording completion, the
@@ -34,5 +35,5 @@ A local VM adapter and Nulang Cloud adapter should implement
 3. dispatch an activity while forwarding the supplied idempotency key;
 4. provide the host clock used only to materialize durable retry deadlines.
 
-The next SDK slices are saga compensation, durable timers/signals, worker
-leasing/heartbeats, and higher-level workflow composition.
+The next SDK slices are saga compensation, durable timers/signals, a Nulang
+Cloud workflow adapter, and higher-level workflow composition.
