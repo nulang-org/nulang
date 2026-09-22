@@ -300,6 +300,12 @@ impl CoreVM {
             }
             OpCode::INeg => {
                 let a = value_layout::as_int_raw(self.frames[frame_idx].regs[op1 as usize]);
+                if a == value_layout::INT48_MIN {
+                    return Err(format!(
+                        "integer overflow: `neg` on {} exceeds the 48-bit range",
+                        a
+                    ));
+                }
                 self.frames[frame_idx].regs[op2 as usize] = value_layout::tag_int(-a);
             }
             OpCode::IInc => {
@@ -713,6 +719,16 @@ mod tests {
         assert_int("10 / 3", 3);
         assert_int("10 % 3", 1);
         assert_int("-5", -5);
+    }
+
+    #[test]
+    fn test_core_ineg_int48_min_overflow() {
+        let err = run_core("-(-140737488355328)")
+            .expect_err("negating INT48_MIN must raise instead of wrapping");
+        assert!(
+            err.contains("integer overflow"),
+            "unexpected Core VM error: {err}"
+        );
     }
 
     #[test]
