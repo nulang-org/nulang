@@ -2970,8 +2970,7 @@ mod tests {
         use crate::bytecode::Constant;
         use crate::mir::{self, RValue, Terminator};
 
-        let mut builder =
-            mir::FunctionBuilder::new("__main", Some(crate::types::Type::int()));
+        let mut builder = mir::FunctionBuilder::new("__main", Some(crate::types::Type::int()));
         let cond = builder.add_temp(crate::types::Type::bool());
         let result = builder.add_temp(crate::types::Type::int());
         let actor = builder.add_temp(crate::types::Type::int());
