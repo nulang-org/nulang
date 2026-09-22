@@ -2986,7 +2986,7 @@ impl Runtime {
 
             let other_ready = self.scheduler.has_ready_work();
             let turn_budget = self.actor_turn_budget(actor_id, other_ready);
-            for _ in 0..turn_budget {
+            for turn_index in 0..turn_budget {
                 self.step_actor(actor_id);
                 let should_continue = self
                     .actors
@@ -2998,6 +2998,13 @@ impl Runtime {
                     })
                     .unwrap_or(false);
                 if !should_continue {
+                    break;
+                }
+                // A solo actor may start with the large throughput budget and
+                // then wake another actor from inside a behavior. Re-check
+                // pressure once per old-style 16-message quantum so newly
+                // runnable work is not delayed for the full solo batch.
+                if (turn_index + 1) % 16 == 0 && self.scheduler.has_ready_work() {
                     break;
                 }
             }
