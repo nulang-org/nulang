@@ -2524,6 +2524,7 @@ dependencies = [
  "nulang-ai-manager",
  "nulang-ai-protocol",
  "nulang-ai-worker",
+ "nulang-workflow",
  "rusqlite",
  "serde",
  "serde_json",
