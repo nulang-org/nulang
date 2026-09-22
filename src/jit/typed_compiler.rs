@@ -437,6 +437,61 @@ impl IntRegCache {
         }
     }
 
+    #[inline]
+    fn set_with_dirty(&mut self, reg: usize, value: Value, dirty: bool) {
+        if reg < REG_COUNT {
+            self.regs[reg] = Some(CachedInt { value, dirty });
+        }
+    }
+
+    fn flush_except(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        regs_ptr: Value,
+        carried_regs: &[usize],
+    ) {
+        for (reg, slot) in self.regs.iter_mut().enumerate() {
+            let Some(entry) = *slot else {
+                continue;
+            };
+            if !entry.dirty || carried_regs.contains(&reg) {
+                continue;
+            }
+            let tagged = emit_tag_int(builder, entry.value);
+            store_reg(builder, regs_ptr, reg, tagged);
+            *slot = Some(CachedInt {
+                value: entry.value,
+                dirty: false,
+            });
+        }
+    }
+
+    fn carried_args(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        regs_ptr: Value,
+        carried_regs: &[usize],
+    ) -> Vec<BlockArg> {
+        let mut args = Vec::with_capacity(carried_regs.len());
+        for &reg in carried_regs {
+            let value = self.get_or_load(builder, regs_ptr, reg);
+            args.push(BlockArg::from(value));
+        }
+        args
+    }
+
+    fn load_block_params(
+        &mut self,
+        params: &[Value],
+        carried_regs: &[usize],
+        dirty: bool,
+    ) {
+        self.clear();
+        for (&reg, &value) in carried_regs.iter().zip(params.iter()) {
+            self.set_with_dirty(reg, value, dirty);
+        }
+    }
+
     fn flush(&mut self, builder: &mut FunctionBuilder, regs_ptr: Value) {
         for (reg, slot) in self.regs.iter_mut().enumerate() {
             let Some(entry) = *slot else {
@@ -959,6 +1014,150 @@ pub(crate) fn typed_basic_block_leaders(
     leaders
 }
 
+/// Return entry-typed Int registers that can stay native across every CFG edge
+/// in this region.
+///
+/// A register must already be proven Int at region entry, must be written
+/// somewhere in the region, and every write must preserve Int on every path.
+/// Copy/swap dependencies are solved to a small fixed point.
+pub(crate) fn stable_region_int_regs(
+    type_metadata: Option<&TypeMetadata>,
+    start_offset: usize,
+    end_offset: usize,
+    instructions: &[Instruction],
+) -> Vec<usize> {
+    let Some(meta) = type_metadata else {
+        return Vec::new();
+    };
+    if start_offset >= end_offset || start_offset >= instructions.len() {
+        return Vec::new();
+    }
+
+    let mut stable = [false; REG_COUNT];
+    let mut written = [false; REG_COUNT];
+    for (reg, ty) in meta.regs.iter().enumerate() {
+        stable[reg] = *ty == KnownType::Int;
+    }
+
+    let end = end_offset.min(instructions.len());
+    loop {
+        let before = stable;
+
+        for instr in &instructions[start_offset..end] {
+            let op1 = instr.op1 as usize;
+            let op2 = instr.op2 as usize;
+            let op3 = instr.op3 as usize;
+
+            let mark_written = |written: &mut [bool; REG_COUNT], reg: usize| {
+                if reg < REG_COUNT {
+                    written[reg] = true;
+                }
+            };
+            let eliminate = |
+                stable: &mut [bool; REG_COUNT],
+                written: &mut [bool; REG_COUNT],
+                reg: usize,
+            | {
+                if reg < REG_COUNT {
+                    stable[reg] = false;
+                    written[reg] = true;
+                }
+            };
+
+            match instr.opcode {
+                OpCode::Nop
+                | OpCode::Halt
+                | OpCode::DbgPrint
+                | OpCode::Jmp
+                | OpCode::JmpT
+                | OpCode::JmpF
+                | OpCode::Ret
+                | OpCode::RetVal
+                | OpCode::ArrStore => {}
+
+                OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
+                    mark_written(&mut written, op1);
+                }
+                OpCode::IAdd
+                | OpCode::ISub
+                | OpCode::IMul
+                | OpCode::Xor
+                | OpCode::Shl
+                | OpCode::Shr
+                | OpCode::BitAnd
+                | OpCode::BitOr => {
+                    mark_written(&mut written, op3);
+                }
+                OpCode::INeg | OpCode::FToI => {
+                    mark_written(&mut written, op2);
+                }
+                OpCode::IInc | OpCode::IDec => {
+                    mark_written(&mut written, op1);
+                }
+
+                OpCode::Load | OpCode::Store | OpCode::Move | OpCode::Dup => {
+                    mark_written(&mut written, op2);
+                    if op2 < REG_COUNT && !stable.get(op1).copied().unwrap_or(false) {
+                        stable[op2] = false;
+                    }
+                }
+                OpCode::Swap => {
+                    mark_written(&mut written, op1);
+                    mark_written(&mut written, op2);
+                    let a = stable.get(op1).copied().unwrap_or(false);
+                    let b = stable.get(op2).copied().unwrap_or(false);
+                    if a != b {
+                        if op1 < REG_COUNT {
+                            stable[op1] = false;
+                        }
+                        if op2 < REG_COUNT {
+                            stable[op2] = false;
+                        }
+                    }
+                }
+
+                OpCode::ConstU => eliminate(&mut stable, &mut written, op3),
+                OpCode::IDiv | OpCode::IMod => {
+                    eliminate(&mut stable, &mut written, op3)
+                }
+                OpCode::Drop => eliminate(&mut stable, &mut written, op1),
+                OpCode::FAdd | OpCode::FSub | OpCode::FMul | OpCode::FNeg | OpCode::FDiv => {
+                    eliminate(&mut stable, &mut written, op3);
+                }
+                OpCode::ICmpEq
+                | OpCode::ICmpLt
+                | OpCode::ICmpGt
+                | OpCode::ICmpLe
+                | OpCode::ICmpGe
+                | OpCode::FCmpEq
+                | OpCode::FCmpLt
+                | OpCode::FCmpGt
+                | OpCode::And
+                | OpCode::Or => eliminate(&mut stable, &mut written, op3),
+                OpCode::Not | OpCode::IToF => {
+                    eliminate(&mut stable, &mut written, op2)
+                }
+                OpCode::ArrLoad => eliminate(&mut stable, &mut written, op3),
+
+                _ => return Vec::new(),
+            }
+        }
+
+        if stable == before {
+            break;
+        }
+    }
+
+    stable
+        .iter()
+        .zip(written.iter())
+        .enumerate()
+        .filter_map(|(reg, (&is_stable, &was_written))| {
+            (is_stable && was_written).then_some(reg)
+        })
+        .collect()
+}
+
 pub fn compile_bytecode_region_typed(
     module: &mut JITModule,
     builder_context: &mut FunctionBuilderContext,
@@ -1014,11 +1213,18 @@ pub fn compile_bytecode_region_typed(
     // post-terminator fallthrough points. Straight-line bytecode is emitted
     // into one CLIF block, eliminating an unconditional jump per instruction.
     let basic_block_leaders = typed_basic_block_leaders(start_offset, end_offset, instructions);
+    let carried_int_regs =
+        stable_region_int_regs(type_metadata, start_offset, end_offset, instructions);
+
     let mut blocks: HashMap<usize, Block> = HashMap::new();
     let mut ordered_leaders: Vec<_> = basic_block_leaders.iter().copied().collect();
     ordered_leaders.sort_unstable();
     for leader in ordered_leaders {
-        blocks.insert(leader, builder.create_block());
+        let block = builder.create_block();
+        for _ in &carried_int_regs {
+            builder.append_block_param(block, types::I64);
+        }
+        blocks.insert(leader, block);
     }
     let return_block = builder.create_block();
     // Use a thread-local helper for the safepoint so concurrent VMs do not
@@ -1031,9 +1237,15 @@ pub fn compile_bytecode_region_typed(
     let exhausted = builder.ins().icmp(IntCC::NotEqual, safepoint_result, zero);
     let yield_block = builder.create_block();
     if let Some(&first_block) = blocks.get(&start_offset) {
+        let mut first_args = Vec::with_capacity(carried_int_regs.len());
+        for &reg in &carried_int_regs {
+            let raw = load_reg(&mut builder, regs_ptr, reg);
+            let native = emit_sext48(&mut builder, raw);
+            first_args.push(BlockArg::from(native));
+        }
         builder
             .ins()
-            .brif(exhausted, yield_block, &[], first_block, &[]);
+            .brif(exhausted, yield_block, &[], first_block, &first_args);
     } else {
         builder
             .ins()
@@ -1068,9 +1280,8 @@ pub fn compile_bytecode_region_typed(
                 .get(&pc)
                 .expect("basic block leader must have a Cranelift block");
             builder.switch_to_block(block);
-            if pc != start_offset {
-                int_cache.clear();
-            }
+            let params = builder.block_params(block).to_vec();
+            int_cache.load_block_params(&params, &carried_int_regs, pc != start_offset);
         }
 
         let cache_aware = match instr.opcode {
