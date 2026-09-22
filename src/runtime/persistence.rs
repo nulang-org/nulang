@@ -502,6 +502,11 @@ impl PersistenceStore for MemoryStore {
 /// File-backed persistence store using JSON.
 /// Each actor gets `<base_dir>/<actor_id>/snapshot.json`, `journal.jsonl`,
 /// and `workflow_events.jsonl`.
+///
+/// Append handles are cached, but deliberately bounded per log kind so a node
+/// with many durable actors cannot exhaust its process file-descriptor limit.
+const JSON_APPEND_FILE_CACHE_CAPACITY: usize = 64;
+
 #[derive(Debug)]
 pub struct JsonFileStore {
     base_dir: PathBuf,
@@ -566,6 +571,16 @@ impl JsonFileStore {
         value: &T,
     ) -> io::Result<()> {
         use std::collections::hash_map::Entry;
+
+        // Bound descriptor retention. Every append is sync_all()'d before this
+        // point can be reached again, so dropping an evicted handle cannot
+        // weaken the durability contract. Arbitrary eviction keeps the hot
+        // path simple; a later profile can justify LRU machinery if needed.
+        if !files.contains_key(&actor_id) && files.len() >= JSON_APPEND_FILE_CACHE_CAPACITY {
+            if let Some(evict_actor) = files.keys().next().copied() {
+                files.remove(&evict_actor);
+            }
+        }
 
         let file = match files.entry(actor_id) {
             Entry::Occupied(entry) => entry.into_mut(),
@@ -2141,6 +2156,38 @@ mod json_file_store_tests {
         store.clear(7).unwrap();
         assert!(store.journal_files.is_empty());
         assert!(!store.actor_dir(7).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_json_file_store_append_handle_cache_is_bounded() {
+        let dir = fresh_dir("bounded_handles");
+        let mut store = JsonFileStore::new(&dir).unwrap();
+
+        for actor_id in 1..=(JSON_APPEND_FILE_CACHE_CAPACITY as u64 + 5) {
+            store
+                .append_journal(
+                    actor_id,
+                    JournalEntry {
+                        sequence: 1,
+                        behavior_id: 0,
+                        payload: vec![],
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.journal_files.len(),
+            JSON_APPEND_FILE_CACHE_CAPACITY,
+            "writer cache must not grow with the durable actor population"
+        );
+        // Eviction closes only already-synced descriptors; every actor's data
+        // remains readable after its handle leaves the cache.
+        for actor_id in 1..=(JSON_APPEND_FILE_CACHE_CAPACITY as u64 + 5) {
+            assert_eq!(store.read_journal(actor_id).len(), 1);
+        }
+
         let _ = fs::remove_dir_all(&dir);
     }
 
