@@ -230,7 +230,7 @@ pub enum Stmt {
     /// Zero-cost structured-concurrency metadata emitted around `par`
     /// expressions. Preserved into MIR; current codegen ignores it.
     ParallelMarker {
-        marker: crate::primitives::ParallelRegionMarker,
+        marker: crate::parallel_marker::ParallelRegionMarker,
         span: Span,
     },
 }
