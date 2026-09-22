@@ -51,6 +51,25 @@ version + migration.*
 
 ## Stable tier
 
+### Durable workflow SDK foundation — 2026-09-22
+- **A standalone `nulang-workflow` crate now defines replay-safe durable activity
+  execution** (Experimental, `crates/nulang-workflow/`). The SDK records
+  prepare/complete/failure/retry events behind an optimistic history revision,
+  derives opaque stable activity/idempotency identities, replays recorded
+  completions without redispatch, persists retry deadlines, and fails closed on
+  incompatible history. External effects remain explicitly at-least-once unless
+  the provider honors the supplied idempotency key.
+
+### Durable local agent task recovery — 2026-09-22
+- **The local agent runtime now executes persisted tasks through durable workflow
+  history** (Experimental, `crates/nulang-ai-local/`,
+  `crates/nulang-ai-worker/`). SQLite history writes use transactional revision
+  comparison, workers receive replay-stable idempotency keys, Created/Ready/
+  Assigned/Running tasks can resume after restart, and `nulang agent resume`
+  plus the normal run/chat paths recover pending work before starting new work.
+  Recovery remains at-least-once for external effects; workers must propagate
+  the idempotency key when provider-level deduplication is required.
+
 ### Candidate-only JIT hotness probing — 2026-09-22
 - **Cold interpreted execution now probes JIT hotness only at candidate compiled-region entries** (`src/vm.rs`). The VM precomputes per-module candidates for execution/function/behavior entries, source-statement starts, branch targets/fallthroughs, and successors of compilation boundaries, avoiding JIT backend dispatch and hot-counter mutation at ordinary straight-line bytecode PCs without changing language semantics.
 
