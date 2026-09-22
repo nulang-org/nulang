@@ -155,11 +155,10 @@ fn normalize_pattern(pattern: &Pattern, ty: &Type) -> CorePat {
                     .cloned()
                     .collect();
 
-                if pattern_fields.iter().any(|(name, _)| {
-                    !real_fields
-                        .iter()
-                        .any(|(field_name, _)| field_name == name)
-                }) {
+                if pattern_fields
+                    .iter()
+                    .any(|(name, _)| !real_fields.iter().any(|(field_name, _)| field_name == name))
+                {
                     return CorePat::Ctor(
                         Constructor::Opaque(format!("record:{pattern_fields:?}")),
                         Vec::new(),
