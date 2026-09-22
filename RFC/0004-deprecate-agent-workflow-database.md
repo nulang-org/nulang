@@ -1,13 +1,13 @@
 # RFC 0004: Deprecate `agent`, `workflow`, and `database` as Language Keywords
 
-- **Status:** Draft
+- **Status:** Superseded by RFC 0017
 - **Tier:** Stable
 - **Author:** AI assistant review
 - **Created:** 2026-07-21
 - **Resolved:** (pending)
 - **Language-version at effect:** 1.0.0-frozen
 - **Supersedes:** none
-- **Superseded by:** none
+- **Superseded by:** RFC 0017 (accepted 2026-09-11)
 
 ## Summary
 
