@@ -2188,8 +2188,9 @@ fn thread_jumps(func: &mut mir::Function) -> bool {
 /// through edges that are not represented by ordinary MIR terminators, so
 /// treating only the visible CFG as complete would be unsound.
 ///
-/// Source-named locals remain materialized for debugger visibility; closure
-/// captures and heap-capable locals are also protected. Self-moves
+/// Source-named locals remain materialized for debugger visibility and closure
+/// captures are protected. Pure dead heap-producing expressions remain
+/// removable, matching the established optimizer behavior. Self-moves
 /// (`x = Load(x)`) are always removable because they do not change the
 /// observable register value.
 fn dead_store_elim(func: &mut mir::Function) -> bool {
@@ -2199,7 +2200,7 @@ fn dead_store_elim(func: &mut mir::Function) -> bool {
     dead_store_elim_cfg(func)
 }
 
-fn protected_dce_locals(func: &mir::Function) -> (Vec<bool>, Vec<bool>, HashSet<mir::LocalId>) {
+fn protected_dce_locals(func: &mir::Function) -> (Vec<bool>, HashSet<mir::LocalId>) {
     let named: Vec<bool> = func
         .locals
         .iter()
@@ -2211,25 +2212,17 @@ fn protected_dce_locals(func: &mir::Function) -> (Vec<bool>, Vec<bool>, HashSet<
                 .unwrap_or(false)
         })
         .collect();
-    let heap_capable: Vec<bool> = func
-        .locals
-        .iter()
-        .map(|local| may_hold_heap_ptr(&local.ty))
-        .collect();
     let captures = func.captures.iter().copied().collect();
-    (named, heap_capable, captures)
+    (named, captures)
 }
 
 fn dce_assignment_is_protected(
     dst: mir::LocalId,
     named: &[bool],
-    heap_capable: &[bool],
     captures: &HashSet<mir::LocalId>,
 ) -> bool {
     let idx = dst.0 as usize;
-    named.get(idx).copied().unwrap_or(true)
-        || heap_capable.get(idx).copied().unwrap_or(true)
-        || captures.contains(&dst)
+    named.get(idx).copied().unwrap_or(true) || captures.contains(&dst)
 }
 
 fn update_line_table_after_dce(
@@ -2247,7 +2240,10 @@ fn update_line_table_after_dce(
             if removed.contains(&stmt_idx) {
                 continue;
             }
-            let shifted = removed.iter().filter(|&&removed_idx| removed_idx < stmt_idx).count();
+            let shifted = removed
+                .iter()
+                .filter(|&&removed_idx| removed_idx < stmt_idx)
+                .count();
             new_line_table.push(((block, stmt_idx - shifted), line));
         } else {
             new_line_table.push(((block, stmt_idx), line));
@@ -2271,7 +2267,7 @@ fn dead_store_elim_function_wide(func: &mut mir::Function) -> bool {
         terminator_reads(&block.terminator, &mut reads);
     }
 
-    let (named, _heap_capable, captures) = protected_dce_locals(func);
+    let (named, captures) = protected_dce_locals(func);
     let mut changed = false;
     for block in &mut func.blocks {
         let block_id = block.id;
@@ -2307,9 +2303,7 @@ fn dead_store_elim_function_wide(func: &mut mir::Function) -> bool {
     changed
 }
 
-fn block_use_def(
-    block: &mir::Block,
-) -> (HashSet<mir::LocalId>, HashSet<mir::LocalId>) {
+fn block_use_def(block: &mir::Block) -> (HashSet<mir::LocalId>, HashSet<mir::LocalId>) {
     let mut uses = HashSet::new();
     let mut defs = HashSet::new();
 
@@ -2342,12 +2336,7 @@ fn block_use_def(
 ///
 /// The sets are monotone and finite, so the fixpoint terminates even with
 /// arbitrary loops. Block ids are dense indices in Function::blocks.
-fn cfg_liveness(
-    func: &mir::Function,
-) -> (
-    Vec<HashSet<mir::LocalId>>,
-    Vec<HashSet<mir::LocalId>>,
-) {
+fn cfg_liveness(func: &mir::Function) -> (Vec<HashSet<mir::LocalId>>, Vec<HashSet<mir::LocalId>>) {
     let n = func.blocks.len();
     let mut uses = Vec::with_capacity(n);
     let mut defs = Vec::with_capacity(n);
@@ -2398,7 +2387,7 @@ fn cfg_liveness(
 
 fn dead_store_elim_cfg(func: &mut mir::Function) -> bool {
     let (_live_in, live_out) = cfg_liveness(func);
-    let (named, heap_capable, captures) = protected_dce_locals(func);
+    let (named, captures) = protected_dce_locals(func);
 
     let mut changed = false;
     for (block_idx, block) in func.blocks.iter_mut().enumerate() {
@@ -2414,8 +2403,7 @@ fn dead_store_elim_cfg(func: &mut mir::Function) -> bool {
             match &stmt {
                 mir::Stmt::Assign { dst, op } => {
                     let self_move = matches!(op, mir::RValue::Load(src) if src == dst);
-                    let protected =
-                        dce_assignment_is_protected(*dst, &named, &heap_capable, &captures);
+                    let protected = dce_assignment_is_protected(*dst, &named, &captures);
                     let removable = self_move
                         || (!protected && !live.contains(dst) && !rvalue_side_effecting(op));
 
