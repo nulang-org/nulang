@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Formal accounted-effect obligations — 2026-09-22
+- **Effect-row accounting now decomposes through row union.** Lean proves that accounting a combined row is equivalent to accounting each constituent row.
+- **Higher-order and direct-effect obligations are connected to handler safety.** For typed applications, function-evaluation, argument-evaluation, and latent callee rows are each proved accounted; a typed direct `perform` with an accounted row is proved to dispatch handled rather than unhandled.
+
 ### Formal effect-row/handler-stack accounting — 2026-09-22
 - **Closed effect rows now have a formal runtime-accounting predicate.** `EffectRow.accountedBy` requires every statically named effect to be in the active handler stack and deliberately rejects open rows whose unknown tail cannot be proven handled.
 - **Handler discharge is connected to runtime scope.** Lean proves that `dischargedBy handled residual observed` plus an accounted outward row implies the observed body/handler row is accounted after pushing `handled`. A typed-handler corollary establishes this for both the protected computation and handler body.
