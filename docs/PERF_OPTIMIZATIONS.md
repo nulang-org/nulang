@@ -190,13 +190,25 @@ overhead exceeded the small native-block savings — the same trap the existing
 keeps the caller region resident and does NOT re-enter it per call) avoids
 that regression.
 
-**Next (for recursion / closures):** nested native calls — compile the
-callee's region and call it natively from the caller region sharing the regs
-buffer, with caller-save of live-across-call regs via a bounded liveness
-pass. This replaces the interpreter re-entry (and its per-level native stack)
-with ~2 native frames per level, making recursion JIT-compilable. The
-`may_suspend` + recursion-cycle analyses and the helper machinery are the
-foundation.
+**Native leaf slice (2026-09-22):** the first native-to-native path now
+specializes direct, non-suspending, non-recursive callees whose bytecode is a
+straight-line leaf of at most 32 instructions. Each leaf is compiled into a
+separate thunk that is deliberately not inserted into the ordinary hot-region
+cache. The caller statically saves only the leaf's exact register write-set,
+calls the thunk through the existing `(regs, constants)` ABI, captures the
+callee return register, restores caller registers, and stores the call
+destination. The leaf thunk omits its own safepoint because the containing hot
+region already owns scheduling. Branchy/nested/effectful callees keep the
+existing interpreter helper fallback.
+
+The compiled call site also validates the live function register against the
+recovered static function index; mismatch deopts to the exact `Call` PC
+instead of dispatching a stale target.
+
+**Next (for recursion / closures):** general nested native calls with bounded
+live-across-call liveness rather than whole leaf write-set restoration. This
+must extend the same suspension and target guards to branchy callees and then
+address recursive call cycles explicitly.
 
 ## Correctness fix landed on this branch
 
