@@ -437,6 +437,60 @@ impl NativeIntCache {
     }
 }
 
+/// Region-local cache for proven Float registers.
+///
+/// Cached values are native Cranelift F64 SSA values. NaNs are canonicalized
+/// only when a dirty value crosses back into the VM register file, eliminating
+/// repeated i64<->f64 bitcasts and register traffic inside linear hot paths.
+#[derive(Default)]
+struct NativeFloatCache {
+    values: HashMap<usize, Value>,
+    dirty: HashSet<usize>,
+}
+
+impl NativeFloatCache {
+    fn load(&mut self, builder: &mut FunctionBuilder, regs_ptr: Value, reg: usize) -> Value {
+        if let Some(&value) = self.values.get(&reg) {
+            return value;
+        }
+        let bits = load_reg(builder, regs_ptr, reg);
+        let value = emit_bitcast_i64_to_f64(builder, bits);
+        self.values.insert(reg, value);
+        value
+    }
+
+    fn set(&mut self, reg: usize, value: Value) {
+        self.values.insert(reg, value);
+        self.dirty.insert(reg);
+    }
+
+    fn invalidate(&mut self, reg: usize) {
+        self.values.remove(&reg);
+        self.dirty.remove(&reg);
+    }
+
+    fn flush(&mut self, builder: &mut FunctionBuilder, regs_ptr: Value) {
+        let dirty: Vec<usize> = self.dirty.drain().collect();
+        for reg in dirty {
+            if let Some(&value) = self.values.get(&reg) {
+                let bits = emit_bitcast_f64_to_i64_canonicalized(builder, value);
+                store_reg(builder, regs_ptr, reg, bits);
+            }
+        }
+        self.values.clear();
+    }
+}
+
+fn flush_native_caches(
+    builder: &mut FunctionBuilder,
+    regs_ptr: Value,
+    int_cache: &mut NativeIntCache,
+    float_cache: &mut NativeFloatCache,
+) {
+    int_cache.flush(builder, regs_ptr);
+    float_cache.flush(builder, regs_ptr);
+}
+
 /// Normalize an unboxed integer exactly as boxing + reloading would.
 ///
 /// Nulang Ints carry a signed 48-bit payload. Keeping a raw i64 across
@@ -563,16 +617,14 @@ fn emit_typed_ibinop(
 fn emit_typed_fbinop(
     builder: &mut FunctionBuilder,
     regs_ptr: Value,
+    cache: &mut NativeFloatCache,
     op1: usize,
     op2: usize,
     dst: usize,
     op: TypedFloatOp,
 ) {
-    let a_bits = load_reg(builder, regs_ptr, op1);
-    let b_bits = load_reg(builder, regs_ptr, op2);
-
-    let a = emit_bitcast_i64_to_f64(builder, a_bits);
-    let b = emit_bitcast_i64_to_f64(builder, b_bits);
+    let a = cache.load(builder, regs_ptr, op1);
+    let b = cache.load(builder, regs_ptr, op2);
 
     let result = match op {
         TypedFloatOp::Add => builder.ins().fadd(a, b),
@@ -580,8 +632,7 @@ fn emit_typed_fbinop(
         TypedFloatOp::Mul => builder.ins().fmul(a, b),
     };
 
-    let result_bits = emit_bitcast_f64_to_i64_canonicalized(builder, result);
-    store_reg(builder, regs_ptr, dst, result_bits);
+    cache.set(dst, result);
 }
 
 /// Emit typed floating-point division while preserving Nulang's
@@ -590,14 +641,14 @@ fn emit_typed_fbinop(
 fn emit_typed_fdiv(
     builder: &mut FunctionBuilder,
     regs_ptr: Value,
+    cache: &mut NativeFloatCache,
     op1: usize,
     op2: usize,
     dst: usize,
 ) {
-    let a_bits = load_reg(builder, regs_ptr, op1);
-    let b_bits = load_reg(builder, regs_ptr, op2);
-    let a = emit_bitcast_i64_to_f64(builder, a_bits);
-    let b = emit_bitcast_i64_to_f64(builder, b_bits);
+    let a = cache.load(builder, regs_ptr, op1);
+    let b = cache.load(builder, regs_ptr, op2);
+    let b_bits = emit_bitcast_f64_to_i64(builder, b);
 
     // Clear the sign bit so +0.0 and -0.0 both compare as zero.
     let abs_mask = builder.ins().iconst(types::I64, i64::MAX);
@@ -610,6 +661,7 @@ fn emit_typed_fdiv(
     let nil = builder.ins().iconst(types::I64, TAG_NIL_I64);
     let observable = builder.ins().select(is_zero, nil, result_bits);
     store_reg(builder, regs_ptr, dst, observable);
+    cache.invalidate(dst);
 }
 
 /// CLIF integer binary operations supported by the typed compiler.
@@ -746,20 +798,19 @@ fn emit_typed_icmp(
 fn emit_typed_fcmp(
     builder: &mut FunctionBuilder,
     regs_ptr: Value,
+    cache: &mut NativeFloatCache,
     op1: usize,
     op2: usize,
     dst: usize,
     cc: FloatCC,
 ) {
-    let a_bits = load_reg(builder, regs_ptr, op1);
-    let b_bits = load_reg(builder, regs_ptr, op2);
-
-    let a = emit_bitcast_i64_to_f64(builder, a_bits);
-    let b = emit_bitcast_i64_to_f64(builder, b_bits);
+    let a = cache.load(builder, regs_ptr, op1);
+    let b = cache.load(builder, regs_ptr, op2);
 
     let cond = builder.ins().fcmp(cc, a, b);
     let tagged_bool = emit_tag_bool(builder, cond);
     store_reg(builder, regs_ptr, dst, tagged_bool);
+    cache.invalidate(dst);
 }
 
 // ---------------------------------------------------------------------------
@@ -811,7 +862,8 @@ enum TypedIntUnaryOp {
 fn emit_typed_logic(
     builder: &mut FunctionBuilder,
     regs_ptr: Value,
-    cache: &mut NativeIntCache,
+    int_cache: &mut NativeIntCache,
+    float_cache: &mut NativeFloatCache,
     op1: usize,
     op2: usize,
     dst: usize,
@@ -861,14 +913,16 @@ fn emit_typed_logic(
             builder,
             _helpers,
             regs_ptr,
-            cache,
+            int_cache,
+            float_cache,
             op1,
             op2,
             dst,
             helper_name,
         );
     }
-    cache.invalidate(dst);
+    int_cache.invalidate(dst);
+    float_cache.invalidate(dst);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -885,30 +939,31 @@ enum TypedLogicOp {
 fn emit_typed_itof(
     builder: &mut FunctionBuilder,
     regs_ptr: Value,
-    cache: &mut NativeIntCache,
+    int_cache: &mut NativeIntCache,
+    float_cache: &mut NativeFloatCache,
     src: usize,
     dst: usize,
 ) {
-    let val = cache.load(builder, regs_ptr, src);
+    let val = int_cache.load(builder, regs_ptr, src);
     let float_val = builder.ins().fcvt_from_sint(types::F64, val);
-    let bits = emit_bitcast_f64_to_i64(builder, float_val);
-    store_reg(builder, regs_ptr, dst, bits);
-    cache.invalidate(dst);
+    float_cache.set(dst, float_val);
+    int_cache.invalidate(dst);
 }
 
 /// Emit typed float-to-int conversion with direct CLIF.
 fn emit_typed_ftoi(
     builder: &mut FunctionBuilder,
     regs_ptr: Value,
-    cache: &mut NativeIntCache,
+    int_cache: &mut NativeIntCache,
+    float_cache: &mut NativeFloatCache,
     src: usize,
     dst: usize,
 ) {
-    let bits = load_reg(builder, regs_ptr, src);
-    let float_val = emit_bitcast_i64_to_f64(builder, bits);
+    let float_val = float_cache.load(builder, regs_ptr, src);
     let int_val = builder.ins().fcvt_to_sint_sat(types::I64, float_val);
     let int_val = normalize_unboxed_int(builder, int_val);
-    cache.set(dst, int_val);
+    int_cache.set(dst, int_val);
+    float_cache.invalidate(dst);
 }
 
 // ---------------------------------------------------------------------------
@@ -920,13 +975,14 @@ fn emit_binop_runtime(
     builder: &mut FunctionBuilder,
     helpers: &HashMap<&str, FuncRef>,
     regs_ptr: Value,
-    cache: &mut NativeIntCache,
+    int_cache: &mut NativeIntCache,
+    float_cache: &mut NativeFloatCache,
     op1: usize,
     op2: usize,
     dst: usize,
     helper_name: &str,
 ) {
-    cache.flush(builder, regs_ptr);
+    flush_native_caches(builder, regs_ptr, int_cache, float_cache);
     let a = load_reg(builder, regs_ptr, op1);
     let b = load_reg(builder, regs_ptr, op2);
     let func_ref = *helpers.get(helper_name).unwrap();
@@ -940,12 +996,13 @@ fn emit_unary_runtime(
     builder: &mut FunctionBuilder,
     helpers: &HashMap<&str, FuncRef>,
     regs_ptr: Value,
-    cache: &mut NativeIntCache,
+    int_cache: &mut NativeIntCache,
+    float_cache: &mut NativeFloatCache,
     src: usize,
     dst: usize,
     helper_name: &str,
 ) {
-    cache.flush(builder, regs_ptr);
+    flush_native_caches(builder, regs_ptr, int_cache, float_cache);
     let a = load_reg(builder, regs_ptr, src);
     let func_ref = *helpers.get(helper_name).unwrap();
     let call = builder.ins().call(func_ref, &[a]);
@@ -1129,6 +1186,7 @@ pub fn compile_bytecode_region_typed(
     let mut meta = type_metadata.map(|m| m.clone()).unwrap_or_default();
     let predecessor_counts = region_predecessor_counts(instructions, start_offset, end_offset);
     let mut int_cache = NativeIntCache::default();
+    let mut float_cache = NativeFloatCache::default();
 
     // Compile each instruction
     for pc in start_offset..end_offset {
@@ -1140,7 +1198,7 @@ pub fn compile_bytecode_region_typed(
             // -- Special --
             OpCode::Nop => {}
             OpCode::Halt => {
-                int_cache.flush(&mut builder, regs_ptr);
+                flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                 builder.ins().jump(return_block, &[]);
             }
             OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
@@ -1152,8 +1210,10 @@ pub fn compile_bytecode_region_typed(
                     _ => unreachable!(),
                 };
                 let raw = builder.ins().iconst(types::I64, value);
-                int_cache.set(instr.op1 as usize, raw);
-                meta.set_type(instr.op1 as usize, KnownType::Int);
+                let dst = instr.op1 as usize;
+                int_cache.set(dst, raw);
+                float_cache.invalidate(dst);
+                meta.set_type(dst, KnownType::Int);
             }
             OpCode::ConstU => {
                 let idx = instr.imm16() as usize;
@@ -1169,6 +1229,7 @@ pub fn compile_bytecode_region_typed(
                 // compiler (op1/op2 hold the 16-bit constant index).
                 store_reg(&mut builder, regs_ptr, instr.op3 as usize, val);
                 int_cache.invalidate(instr.op3 as usize);
+                float_cache.invalidate(instr.op3 as usize);
                 meta.set_type(instr.op3 as usize, KnownType::Unknown);
             }
 
@@ -1181,10 +1242,16 @@ pub fn compile_bytecode_region_typed(
                 if meta.is_known(src, KnownType::Int) {
                     let val = int_cache.load(&mut builder, regs_ptr, src);
                     int_cache.set(dst, val);
+                    float_cache.invalidate(dst);
+                } else if meta.is_known(src, KnownType::Float) {
+                    let val = float_cache.load(&mut builder, regs_ptr, src);
+                    float_cache.set(dst, val);
+                    int_cache.invalidate(dst);
                 } else {
                     let val = load_reg(&mut builder, regs_ptr, src);
                     store_reg(&mut builder, regs_ptr, dst, val);
                     int_cache.invalidate(dst);
+                    float_cache.invalidate(dst);
                 }
                 meta.propagate_result(dst, src);
             }
@@ -1198,8 +1265,22 @@ pub fn compile_bytecode_region_typed(
                     let v2 = int_cache.load(&mut builder, regs_ptr, r2);
                     int_cache.set(r1, v2);
                     int_cache.set(r2, v1);
+                    float_cache.invalidate(r1);
+                    float_cache.invalidate(r2);
+                } else if ty1 == KnownType::Float && ty2 == KnownType::Float {
+                    let v1 = float_cache.load(&mut builder, regs_ptr, r1);
+                    let v2 = float_cache.load(&mut builder, regs_ptr, r2);
+                    float_cache.set(r1, v2);
+                    float_cache.set(r2, v1);
+                    int_cache.invalidate(r1);
+                    int_cache.invalidate(r2);
                 } else {
-                    int_cache.flush(&mut builder, regs_ptr);
+                    flush_native_caches(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                    );
                     let v1 = load_reg(&mut builder, regs_ptr, r1);
                     let v2 = load_reg(&mut builder, regs_ptr, r2);
                     store_reg(&mut builder, regs_ptr, r1, v2);
@@ -1217,6 +1298,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1228,6 +1310,7 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1238,6 +1321,7 @@ pub fn compile_bytecode_region_typed(
                 // it unboxed in the native cache; the fallback branch flushes
                 // the cache and stores a boxed result directly.
                 meta.set_type(dst, KnownType::Int);
+                float_cache.invalidate(dst);
             }
             OpCode::ISub => {
                 let dst = instr.op3 as usize;
@@ -1246,6 +1330,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1257,6 +1342,7 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1264,6 +1350,7 @@ pub fn compile_bytecode_region_typed(
                     );
                 }
                 meta.set_type(dst, KnownType::Int);
+                float_cache.invalidate(dst);
             }
             OpCode::IMul => {
                 let dst = instr.op3 as usize;
@@ -1272,6 +1359,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1283,6 +1371,7 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1290,6 +1379,7 @@ pub fn compile_bytecode_region_typed(
                     );
                 }
                 meta.set_type(dst, KnownType::Int);
+                float_cache.invalidate(dst);
             }
             OpCode::IDiv => {
                 let dst = instr.op3 as usize;
@@ -1298,6 +1388,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1309,6 +1400,7 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1318,6 +1410,7 @@ pub fn compile_bytecode_region_typed(
                 // Division by zero yields nil, so the result cannot be proven
                 // Int after this instruction even on the typed fast path.
                 meta.set_type(dst, KnownType::Unknown);
+                float_cache.invalidate(dst);
             }
             OpCode::IMod => {
                 let dst = instr.op3 as usize;
@@ -1326,6 +1419,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1337,6 +1431,7 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1344,6 +1439,7 @@ pub fn compile_bytecode_region_typed(
                     );
                 }
                 meta.set_type(dst, KnownType::Unknown);
+                float_cache.invalidate(dst);
             }
             OpCode::INeg => {
                 let dst = instr.op2 as usize;
@@ -1352,6 +1448,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         dst,
                         TypedIntUnaryOp::Neg,
@@ -1362,12 +1459,14 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         dst,
                         "nulang_ineg",
                     );
                 }
                 meta.set_type(dst, KnownType::Int);
+                float_cache.invalidate(dst);
             }
             OpCode::IInc => {
                 let reg = instr.op1 as usize;
@@ -1376,6 +1475,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         reg,
                         reg,
                         TypedIntUnaryOp::Inc,
@@ -1386,12 +1486,14 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         reg,
                         reg,
                         "nulang_iinc",
                     );
                 }
                 meta.set_type(reg, KnownType::Int);
+                float_cache.invalidate(reg);
             }
             OpCode::IDec => {
                 let reg = instr.op1 as usize;
@@ -1400,6 +1502,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         reg,
                         reg,
                         TypedIntUnaryOp::Dec,
@@ -1410,12 +1513,14 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         reg,
                         reg,
                         "nulang_idec",
                     );
                 }
                 meta.set_type(reg, KnownType::Int);
+                float_cache.invalidate(reg);
             }
             OpCode::Xor | OpCode::Shl | OpCode::Shr | OpCode::BitAnd | OpCode::BitOr => {
                 let dst = instr.op3 as usize;
@@ -1432,6 +1537,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1451,6 +1557,7 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1458,6 +1565,7 @@ pub fn compile_bytecode_region_typed(
                     );
                 }
                 meta.set_type(dst, KnownType::Int);
+                float_cache.invalidate(dst);
             }
 
             // -- Float Arithmetic (typed when both operands known Float) --
@@ -1467,6 +1575,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_fbinop(
                         &mut builder,
                         regs_ptr,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1478,6 +1587,7 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1493,6 +1603,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_fbinop(
                         &mut builder,
                         regs_ptr,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1504,6 +1615,7 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1519,6 +1631,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_fbinop(
                         &mut builder,
                         regs_ptr,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1530,6 +1643,7 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1545,6 +1659,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_fdiv(
                         &mut builder,
                         regs_ptr,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1555,6 +1670,7 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1563,6 +1679,7 @@ pub fn compile_bytecode_region_typed(
                 }
                 meta.set_type(dst, KnownType::Unknown);
                 int_cache.invalidate(dst);
+                float_cache.invalidate(dst);
             }
 
             // -- Typed Comparisons --
@@ -1573,6 +1690,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1584,6 +1702,7 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1592,6 +1711,7 @@ pub fn compile_bytecode_region_typed(
                 }
                 meta.set_bool_result(dst);
                 int_cache.invalidate(dst);
+                float_cache.invalidate(dst);
             }
             OpCode::ICmpLt => {
                 let dst = instr.op3 as usize;
@@ -1600,6 +1720,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1611,6 +1732,7 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1619,6 +1741,7 @@ pub fn compile_bytecode_region_typed(
                 }
                 meta.set_bool_result(dst);
                 int_cache.invalidate(dst);
+                float_cache.invalidate(dst);
             }
             OpCode::ICmpGt => {
                 let dst = instr.op3 as usize;
@@ -1627,6 +1750,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1638,6 +1762,7 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1646,6 +1771,7 @@ pub fn compile_bytecode_region_typed(
                 }
                 meta.set_bool_result(dst);
                 int_cache.invalidate(dst);
+                float_cache.invalidate(dst);
             }
             OpCode::ICmpLe => {
                 let dst = instr.op3 as usize;
@@ -1654,6 +1780,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1665,6 +1792,7 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1673,6 +1801,7 @@ pub fn compile_bytecode_region_typed(
                 }
                 meta.set_bool_result(dst);
                 int_cache.invalidate(dst);
+                float_cache.invalidate(dst);
             }
             OpCode::ICmpGe => {
                 let dst = instr.op3 as usize;
@@ -1681,6 +1810,7 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1692,6 +1822,7 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1700,6 +1831,7 @@ pub fn compile_bytecode_region_typed(
                 }
                 meta.set_bool_result(dst);
                 int_cache.invalidate(dst);
+                float_cache.invalidate(dst);
             }
             OpCode::FCmpEq => {
                 // Always use the runtime helper: `nulang_fcmp_eq` compares with
@@ -1711,6 +1843,7 @@ pub fn compile_bytecode_region_typed(
                     &helpers,
                     regs_ptr,
                     &mut int_cache,
+                    &mut float_cache,
                     instr.op1 as usize,
                     instr.op2 as usize,
                     dst,
@@ -1718,6 +1851,7 @@ pub fn compile_bytecode_region_typed(
                 );
                 meta.set_bool_result(dst);
                 int_cache.invalidate(dst);
+                float_cache.invalidate(dst);
             }
             OpCode::FCmpLt => {
                 let dst = instr.op3 as usize;
@@ -1725,6 +1859,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_fcmp(
                         &mut builder,
                         regs_ptr,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1736,6 +1871,7 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1744,6 +1880,7 @@ pub fn compile_bytecode_region_typed(
                 }
                 meta.set_bool_result(dst);
                 int_cache.invalidate(dst);
+                float_cache.invalidate(dst);
             }
             OpCode::FCmpGt => {
                 let dst = instr.op3 as usize;
@@ -1751,6 +1888,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_fcmp(
                         &mut builder,
                         regs_ptr,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1762,6 +1900,7 @@ pub fn compile_bytecode_region_typed(
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1770,6 +1909,7 @@ pub fn compile_bytecode_region_typed(
                 }
                 meta.set_bool_result(dst);
                 int_cache.invalidate(dst);
+                float_cache.invalidate(dst);
             }
 
             // -- Logic --
@@ -1779,18 +1919,21 @@ pub fn compile_bytecode_region_typed(
                     &helpers,
                     regs_ptr,
                     &mut int_cache,
+                    &mut float_cache,
                     instr.op1 as usize,
                     instr.op2 as usize,
                     "nulang_not",
                 );
                 meta.set_bool_result(instr.op2 as usize);
                 int_cache.invalidate(instr.op2 as usize);
+                float_cache.invalidate(instr.op2 as usize);
             }
             OpCode::And => {
                 emit_typed_logic(
                     &mut builder,
                     regs_ptr,
                     &mut int_cache,
+                    &mut float_cache,
                     instr.op1 as usize,
                     instr.op2 as usize,
                     instr.op3 as usize,
@@ -1800,12 +1943,14 @@ pub fn compile_bytecode_region_typed(
                 );
                 meta.set_bool_result(instr.op3 as usize);
                 int_cache.invalidate(instr.op3 as usize);
+                float_cache.invalidate(instr.op3 as usize);
             }
             OpCode::Or => {
                 emit_typed_logic(
                     &mut builder,
                     regs_ptr,
                     &mut int_cache,
+                    &mut float_cache,
                     instr.op1 as usize,
                     instr.op2 as usize,
                     instr.op3 as usize,
@@ -1815,11 +1960,17 @@ pub fn compile_bytecode_region_typed(
                 );
                 meta.set_bool_result(instr.op3 as usize);
                 int_cache.invalidate(instr.op3 as usize);
+                float_cache.invalidate(instr.op3 as usize);
             }
 
             // -- Control Flow --
             OpCode::Jmp => {
-                int_cache.flush(&mut builder, regs_ptr);
+                flush_native_caches(
+                    &mut builder,
+                    regs_ptr,
+                    &mut int_cache,
+                    &mut float_cache,
+                );
                 let target = (pc as i64 + instr.simm16() as i64) as usize;
                 if let Some(&target_block) = blocks.get(&target) {
                     builder.ins().jump(target_block, &[]);
@@ -1834,7 +1985,12 @@ pub fn compile_bytecode_region_typed(
                 }
             }
             OpCode::JmpT => {
-                int_cache.flush(&mut builder, regs_ptr);
+                flush_native_caches(
+                    &mut builder,
+                    regs_ptr,
+                    &mut int_cache,
+                    &mut float_cache,
+                );
                 let target = (pc as i64 + instr.offset16() as i64) as usize;
                 let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
                 // Branch conditions are NaN-tagged bools; truthiness is the low
@@ -1863,7 +2019,12 @@ pub fn compile_bytecode_region_typed(
                 }
             }
             OpCode::JmpF => {
-                int_cache.flush(&mut builder, regs_ptr);
+                flush_native_caches(
+                    &mut builder,
+                    regs_ptr,
+                    &mut int_cache,
+                    &mut float_cache,
+                );
                 let target = (pc as i64 + instr.offset16() as i64) as usize;
                 let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
                 let one = builder.ins().iconst(types::I64, 1);
@@ -1895,32 +2056,47 @@ pub fn compile_bytecode_region_typed(
                 let src = instr.op1 as usize;
                 let dst = instr.op2 as usize;
                 if meta.is_known(src, KnownType::Int) {
-                    emit_typed_itof(&mut builder, regs_ptr, &mut int_cache, src, dst);
+                    emit_typed_itof(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        src,
+                        dst,
+                    );
                 } else {
                     emit_unary_runtime(
                         &mut builder,
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         src,
                         dst,
                         "nulang_itof",
                     );
                 }
                 meta.set_type(dst, KnownType::Float);
-                int_cache.invalidate(dst);
             }
             OpCode::FToI => {
                 let src = instr.op1 as usize;
                 let dst = instr.op2 as usize;
                 if meta.is_known(src, KnownType::Float) {
-                    emit_typed_ftoi(&mut builder, regs_ptr, &mut int_cache, src, dst);
+                    emit_typed_ftoi(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        src,
+                        dst,
+                    );
                 } else {
                     emit_unary_runtime(
                         &mut builder,
                         &helpers,
                         regs_ptr,
                         &mut int_cache,
+                        &mut float_cache,
                         src,
                         dst,
                         "nulang_ftoi",
@@ -1931,7 +2107,7 @@ pub fn compile_bytecode_region_typed(
 
             // -- Return --
             OpCode::Ret | OpCode::RetVal => {
-                int_cache.flush(&mut builder, regs_ptr);
+                flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                 builder.ins().jump(return_block, &[]);
             }
 
@@ -1940,17 +2116,21 @@ pub fn compile_bytecode_region_typed(
 
             // -- Array operations (typed): same implementation as scalar --
             OpCode::ArrLoad => {
+                let dst = instr.op3 as usize;
                 emit_arr_load(
                     &mut builder,
                     regs_ptr,
                     instr.op1 as usize,
                     instr.op2 as usize,
-                    instr.op3 as usize,
+                    dst,
                 );
+                int_cache.invalidate(dst);
+                float_cache.invalidate(dst);
+                meta.set_type(dst, KnownType::Unknown);
             }
             // Everything else
             _ => {
-                int_cache.flush(&mut builder, regs_ptr);
+                flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                 builder.ins().jump(return_block, &[]);
             }
         }
@@ -1965,11 +2145,16 @@ pub fn compile_bytecode_region_typed(
             if let Some(&next_block) = blocks.get(&(pc + 1)) {
                 let next_preds = predecessor_counts[pc + 1 - start_offset];
                 if next_preds != 1 {
-                    int_cache.flush(&mut builder, regs_ptr);
+                    flush_native_caches(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                    );
                 }
                 builder.ins().jump(next_block, &[]);
             } else {
-                int_cache.flush(&mut builder, regs_ptr);
+                flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                 builder.ins().jump(return_block, &[]);
             }
         }
@@ -2368,6 +2553,166 @@ mod typed_tests {
             "typed float comparisons should compile: {:?}",
             ptr2.err()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Test 4b: Native Float SSA cache
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_native_float_cache_chains_arithmetic() {
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            Instruction::new3(OpCode::FAdd, 0, 1, 2),
+            Instruction::new3(OpCode::FMul, 2, 1, 3),
+            Instruction::new3(OpCode::FSub, 3, 0, 4),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Float);
+        meta.set_type(1, KnownType::Float);
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_native_float_cache_chain",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("cached Float chain should compile");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+        let mut regs = [0u64; 256];
+        regs[0] = Value::float(1.5).as_raw();
+        regs[1] = Value::float(2.0).as_raw();
+
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(unsafe { Value::from_bits(regs[2]) }.as_float(), Some(3.5));
+        assert_eq!(unsafe { Value::from_bits(regs[3]) }.as_float(), Some(7.0));
+        assert_eq!(unsafe { Value::from_bits(regs[4]) }.as_float(), Some(5.5));
+    }
+
+    #[test]
+    fn test_native_float_cache_flushes_before_helper() {
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            Instruction::new3(OpCode::FAdd, 0, 1, 2),
+            // FCmpEq intentionally uses the epsilon-aware runtime helper.
+            Instruction::new3(OpCode::FCmpEq, 2, 3, 4),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        for reg in [0usize, 1, 3] {
+            meta.set_type(reg, KnownType::Float);
+        }
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_native_float_cache_helper_boundary",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("cached Float/helper chain should compile");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+        let mut regs = [0u64; 256];
+        regs[0] = Value::float(1.0).as_raw();
+        regs[1] = Value::float(2.0).as_raw();
+        regs[3] = Value::float(3.0).as_raw();
+
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(unsafe { Value::from_bits(regs[2]) }.as_float(), Some(3.0));
+        assert_eq!(unsafe { Value::from_bits(regs[4]) }.as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_native_numeric_caches_handoff_conversions() {
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            Instruction::new2(OpCode::IToF, 0, 1),
+            Instruction::new3(OpCode::FAdd, 1, 2, 3),
+            Instruction::new2(OpCode::FToI, 3, 4),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Int);
+        meta.set_type(2, KnownType::Float);
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_native_numeric_cache_conversions",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("Int/Float cache handoff should compile");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+        let mut regs = [0u64; 256];
+        regs[0] = Value::int(40).as_raw();
+        regs[2] = Value::float(2.75).as_raw();
+
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(unsafe { Value::from_bits(regs[1]) }.as_float(), Some(40.0));
+        assert_eq!(unsafe { Value::from_bits(regs[3]) }.as_float(), Some(42.75));
+        assert_eq!(unsafe { Value::from_bits(regs[4]) }.as_int(), Some(42));
+    }
+
+    #[test]
+    fn test_native_float_cache_canonicalizes_nan_on_flush() {
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            Instruction::new3(OpCode::FMul, 0, 1, 2),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Float);
+        meta.set_type(1, KnownType::Float);
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_native_float_cache_nan",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("NaN-producing cached Float region should compile");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+        let mut regs = [0u64; 256];
+        regs[0] = Value::float(f64::INFINITY).as_raw();
+        regs[1] = Value::float(0.0).as_raw();
+
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        let result = unsafe { Value::from_bits(regs[2]) };
+        assert!(result.is_float());
+        assert!(result.as_float().unwrap().is_nan());
+        assert_eq!(regs[2], Value::float(f64::NAN).as_raw());
     }
 
     // ------------------------------------------------------------------
