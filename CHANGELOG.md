@@ -24,6 +24,9 @@ evolve only behind explicit version boundaries and readers/migrations.
 *Will never break. A change here is a new language and requires a new major
 version + migration.*
 
+### Behavior Manifest artifact binding — 2026-09-22
+- **RFC 0020 `nulang.behavior/v0alpha1` sidecars** (Experimental, `src/package/behavior_manifest.rs`) are emitted beside canonical package WASM artifacts. The first slice binds exact WASM bytes, package/language/compiler identity, compiler executable digest, host-effect ABI contract, source identity, dependency lock digest, and explicit semantic-inventory completeness. Package-declared capabilities remain advisory configuration rather than being promoted to compiler-proven authority.
+
 ### Canonical portable package WASM — 2026-09-22
 - **`nula build --target wasm|cwasm`** (Experimental package tooling) makes the package manager own the canonical portable-WASM artifact path. `wasm` emits `.nula/dist/<package>.wasm`; `cwasm` also emits the Wasmtime AOT sidecar. Both reuse package preparation, dependency/language checks, module paths, and manifest-declared capability forwarding. Historical `nula build-wasm` remains an alias for the AOT form, and CI now smoke-tests the portable artifact's WASM magic.
 
