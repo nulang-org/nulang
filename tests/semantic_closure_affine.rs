@@ -42,6 +42,51 @@ fn resume_without_live_continuation_traps_deterministically() {
 }
 
 #[test]
+fn second_resume_after_single_shot_fast_path_traps() {
+    let mut module = CodeModule::new("affine-second-resume-single-shot");
+    module.add_handler_table(HandlerTable {
+        bindings: vec![HandlerBinding {
+            effect_name: "GetOne".to_string(),
+            handler_offset: 7,
+            arg_count: 0,
+            result_reg: 0,
+            single_shot: true,
+        }],
+        fallback_offset: None,
+    });
+
+    let one = module.add_constant(Constant::Int(1));
+
+    // PC 0 installs handler table 0. PC 1 dispatches binding 0 directly,
+    // forcing the lightweight SingleShotState capture path.
+    module.emit(Instruction::new1(OpCode::Handle, 0));
+    module.emit(Instruction::new3(OpCode::PerformDirect, 0, 0, 1));
+    // After the handler's first Resume this is the continuation point.
+    // SingleShotState must already have been taken, so resuming again traps.
+    module.emit(Instruction::new1(OpCode::Resume, 1));
+    module.emit(Instruction::new0(OpCode::Unwind));
+    module.emit(Instruction::new0(OpCode::Halt));
+    module.emit(Instruction::new0(OpCode::Nop));
+    module.emit(Instruction::new0(OpCode::Nop));
+
+    module.emit(Instruction::new3(
+        OpCode::ConstU,
+        ((one >> 8) & 0xff) as u8,
+        (one & 0xff) as u8,
+        0,
+    ));
+    module.emit(Instruction::new1(OpCode::Resume, 0));
+    module.entry_point = Some(0);
+
+    let mut vm = VM::new();
+    vm.load_module(module);
+    let err = vm
+        .run()
+        .expect_err("single-shot continuation must be consumed by its first resume");
+    assert_missing_continuation(err);
+}
+
+#[test]
 fn second_resume_after_successful_resume_traps() {
     let mut module = CodeModule::new("affine-second-resume");
     module.add_handler_table(HandlerTable {
