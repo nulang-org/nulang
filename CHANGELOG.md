@@ -1570,6 +1570,10 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Typed JIT native arithmetic and unboxed Int SSA — 2026-09-22
+- **Typed hot regions keep proven Int values unboxed across instruction boundaries.** The Cranelift typed compiler caches normalized signed 48-bit integers as native SSA values and writes back only at control-flow/helper/region boundaries, eliminating repeated NaN-tag decode/encode traffic in linear arithmetic chains while preserving the frozen VM value representation.
+- **More typed arithmetic executes directly in Cranelift.** Integer division/remainder and floating-point division use explicit trap/zero handling that preserves Nulang's language-level nil-on-zero behavior without forcing the ordinary runtime-helper path where static types make native lowering safe. Regression tests cover arithmetic parity and cache materialization boundaries.
+
 ### Allocation-free protocol actor-ref decoding — 2026-09-21
 - **ProtocolId wire decode no longer hex-allocates.** The fixed 32-byte protocol digest is reconstructed directly with `ProtocolId::from_bytes` instead of expanding to a 64-character hex `String` and reparsing it. Wire bytes and compatibility semantics are unchanged.
 
