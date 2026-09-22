@@ -1,17 +1,19 @@
 # Nulang Architecture Reference
 
-**Document Version:** 1.1
-**Date:** July 2026
+**Document Version:** 1.2
+**Date:** September 22, 2026
 **Audience:** Core implementers, runtime engineers, language designers
 **Companion Documents:** design notes in `docs/archive/` (AI SDK, workflow SDK, cloud, package manager)
 
-> **Implementation status (v1.1):** Sections 2 and 6 (Language and AI Runtime)
-> have been re-verified against the current source tree and describe the
-> system as implemented. Sections 3–5 and the derived material in Sections
-> 7–10 still describe the *target* architecture; where the implementation
-> already diverges in a verified way, §1 carries the corrections. Treat
-> uncaveated numbers and diagrams in Sections 3–5 as design goals, not
-> as-built fact.
+> **Implementation status (v1.2):** This is a hybrid as-built/target
+> architecture document, not a promise that every diagram is live code.
+> Section 1 carries the highest-impact implementation corrections; Sections
+> 3–5 and derived material in Sections 7–10 still contain target architecture
+> where explicitly noted. For current semantic/backend policy, the active
+> `docs/SEMANTIC_STABILIZATION_CONTRACT.md` takes precedence over older target
+> prose in this document. Treat uncaveated throughput numbers, topology
+> diagrams, and future platform components as design goals unless backed by a
+> source path or executable validation.
 
 ---
 
@@ -33,7 +35,12 @@
 
 ## 1. System Overview
 
-Nulang is organized into five strictly layered subsystems. Each layer communicates only with adjacent layers. This constraint ensures independent testability, replaceability, and evolution.
+Nulang is usefully described as five conceptual layers. The diagram is an
+architecture model, not an enforced Rust module dependency graph: current
+implementation code has pragmatic cross-layer integration points where runtime,
+compiler metadata, persistence, and optional subsystems meet. The intended
+boundary is semantic ownership — compiler-derived language facts flow forward
+to runtimes/backends rather than being reinterpreted independently.
 
 ```
 +==========================================================================+
@@ -67,18 +74,26 @@ Nulang is organized into five strictly layered subsystems. Each layer communicat
 +==========================================================================+
 ```
 
-**Layer boundary rules:**
-- Layer N may call only Layer N-1 and Layer N+1
-- Cross-layer calls are forbidden (no Layer 5 → Layer 3 shortcuts)
-- Data passes across boundaries as plain structs; no shared mutable state
-- Each layer can be tested with mocked adjacent layers
+**Layer boundary design intent:**
+- Keep compiler-owned semantics authoritative and flow derived metadata forward.
+- Prefer narrow callback/data contracts between compiler, runtime, persistence,
+  distribution, and optional subsystems.
+- Avoid duplicating source-language interpretation in backends or Nulang Cloud.
+- Preserve independent testability even where the current Rust module graph is
+  not strictly adjacent-layer-only.
 
-**Implementation note (updated July 2026):** the compiler targets a
-register-VM bytecode by default. A WASM backend (`--backend wasm | wasm-run | wasm-aot`)
-exists behind the `wasm-backend` feature flag (src/mir_wasm.rs, src/wasm_runtime.rs).
-A native/AOT backend (`--backend native`) compiles via Cranelift ahead-of-time.
-Other verified divergences from the target design of Layers 2–4, to keep in
-mind while reading §3–§5:
+These are design constraints, not claims that every current module dependency
+already satisfies a strict five-layer DAG.
+
+**Implementation note (reviewed September 22, 2026):** the compiler targets a
+register-VM bytecode by default and uses that VM as the semantic reference.
+A WASM backend (`--backend wasm | wasm-run | wasm-aot`) exists behind the
+`wasm-backend` feature flag (`src/mir_wasm.rs`, `src/wasm_runtime.rs`).
+The experimental `--backend wasm-component` path emits WIT alongside WASM,
+and `src/wasm_component_runtime.rs` enables Wasmtime's Component Model.
+A native/AOT backend (`--backend native`) compiles via Cranelift ahead-of-time
+but remains secondary until parity is demonstrated. Other verified divergences
+from the target design of Layers 2–4, to keep in mind while reading §3–§5:
 
 - **Spawned actors currently default to unbounded mailboxes**, but the mailbox
   implementation is no longer an unbounded single FIFO. `Mailbox` has separate
@@ -104,6 +119,13 @@ mind while reading §3–§5:
   fixed header is 13 bytes (4-byte `NUL0` magic, 1-byte packet type, 8-byte
   sequence); the version/flags/MAC fields, TLS, QUIC, and Poly1305 drawn in
   §5.5 do not exist in `src/runtime/network.rs`.
+
+- **Application-specific declaration DSLs are no longer the strategic core.**
+  `agent`, `workflow`, and `database` declarations still parse for
+  compatibility, but the compiler emits deprecation diagnostics directing new
+  code toward ordinary actors/entities plus Cloud SDK libraries. The durable
+  `entity` surface is the preferred language-level abstraction for long-lived
+  domain state.
 
 ---
 
