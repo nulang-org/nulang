@@ -13,11 +13,12 @@ reference capabilities, algebraic effects, and durable event-sourced actors —
 ## Is it production-ready?
 
 No. It is alpha software with no external users, and says so in the README's
-Project Status section. GOVERNANCE.md defines three tiers — Frozen (bytecode
-format, NUL0 wire protocol, Nulang Core), Stable (type system, effects,
-capabilities, actor surface — breaking changes need an RFC + deprecation
-cycle), Experimental (everything else) — and the pre-1.0 disclaimer warns
-that any guarantee may be revised until the language sees real-world use.
+Project Status section. The current policy distinguishes Frozen published
+compatibility contracts (for example versioned artifact/wire/value-layout
+formats), Stable pre-adoption source semantics, and Experimental surfaces.
+RFC 0021 explicitly moved away from treating all pre-adoption source semantics
+as permanently Frozen. The pre-1.0 disclaimer still applies: expect breaking
+changes before external validation closes the freeze gate.
 
 ## What's actually implemented vs. planned?
 
@@ -25,16 +26,18 @@ Implemented and tested: the full compiler pipeline (AST → HIR → MIR),
 register-based bytecode VM, Cranelift JIT, supervision (one-for-one,
 one-for-all, rest-for-one, simple-one-for-one), links/monitors/process
 groups, algebraic effects with resume, HM inference, capabilities, persistent
-actors with checkpointing + journaling (in-memory, JSON-file, SQLite store
+actors with checkpointing + journaling (memory, JSON-file, and libsql store
 backends), `entity`/`events`/`apply`/`emit` event sourcing, the `nula`
 package manager, LSP server, REPL, test runner, an extensive Rust test suite,
 and a `.nula` conformance suite under `conformance/`.
 
 Experimental (feature-gated or marked): multi-node distribution over TCP,
-WASM/WasmFX backends, the secondary native AOT backend (restricted semantics),
-AI-agent runtime, Fabric, RESP cache serving, typed actor-protocol hardening,
-and CRDT state fields (implemented and tested at the Rust level; the `.nula`
-surface parses but behaves as `durable` — SPEC2 §9.10).
+WASM/WASM Component Model/WasmFX backends, the secondary native AOT backend
+(restricted semantics), AI runtime, Fabric, RESP cache serving, typed
+actor-protocol hardening, the deprecated `agent`/`workflow`/`database`
+declaration surfaces, and CRDT state fields (implemented and tested at the
+Rust level; the `.nula` surface parses but behaves as `durable` — SPEC2
+§9.10).
 
 Actor protocol checking now rejects unknown behaviors and wrong arity when the
 receiver is statically known, and explicit `ActorRef[P]` values enforce their
@@ -81,10 +84,11 @@ JVM/.NET libraries.
 
 LLM tools were used as development assistants; the repo's status docs and
 RFC trail are public. The design decisions and the implementation are the
-maintainer's. The verification story doesn't depend on trust: ~1,680 tests,
-a conformance suite with expected-output files, a stage-2-verified
-self-hosting bootstrap, and dated "implementation status" notes in the spec
-that explicitly separate verified behavior from plans.
+maintainer's. The verification story doesn't depend on trust: the repository carries a
+large Rust test suite, a conformance suite with expected-output files, a
+self-hosting bootstrap path, and dated implementation-status notes that
+separate verified behavior from plans. Test counts change quickly, so the
+current CI result is more meaningful than a number copied into this FAQ.
 
 ## Do durable actors really survive `kill -9`?
 
@@ -105,26 +109,30 @@ rather than discovered by you.
 
 ## What's the performance story?
 
-Register-based bytecode VM with a Cranelift JIT tier, a multi-threaded
-work-stealing scheduler, and ORCA garbage collection. Benchmarks and
-analysis are in `benches/` and PERFORMANCE_ANALYSIS.md. There are no
-published head-to-head numbers against BEAM or Pony, and none should be
-claimed until measured.
+Register-based bytecode VM with a Cranelift JIT tier, sharded multi-threaded
+execution, and ORCA garbage collection. Each live Runtime shard has one owning
+cooperative scheduler thread; `NULANG_SHARDS>1` runs shards in parallel over
+bounded cross-shard channels. Chase-Lev work-stealing APIs exist in the
+scheduler, but the current live per-shard `run_scheduler()` path uses one
+worker slot rather than peer stealing. Benchmarks and analysis are in
+`benches/` and `docs/PERFORMANCE_ANALYSIS.md`. There are no published
+head-to-head numbers against BEAM or Pony, and none should be claimed until
+measured.
 
 ## What platforms are supported?
 
-Linux and macOS (x86_64 and aarch64 release artifacts per
-docs/RELEASING.md). Windows is not supported yet — WSL works. Rust 1.95.0 is
-pinned via `rust-toolchain.toml`.
+The tagged release matrix currently validates Linux x86_64/aarch64, macOS
+aarch64, and Windows x86_64. Other platform/architecture combinations are not
+release-tested. Rust 1.95.0 is pinned via `rust-toolchain.toml`.
 
 ## What's the deal with "1.0.0-frozen" and "200-year horizon"?
 
-`1.0.0-frozen` is the *language* version: the bytecode format, wire
-protocol, and Nulang Core are designated Frozen (never break), per RFCs
-0001/0002 and GOVERNANCE.md. It is not a claim that the implementation is
-finished — see the alpha disclaimer. The long-horizon framing is a design
-discipline (freeze what must never change, iterate on the rest), not a
-prediction.
+`1.0.0-frozen` is historical language metadata, not a statement that the
+current source language is permanently frozen. RFC 0021 keeps already-published
+compatibility contracts as archival obligations while source semantics remain
+pre-adoption Stable until the external-validation freeze gate is satisfied.
+It is not a claim that the implementation is finished — see the alpha
+disclaimer.
 
 ## Is there a hosted platform? Is this open source?
 
@@ -135,10 +143,9 @@ actors — no lock-in is the stated intent.
 ## How do I try it?
 
 Build from source (`cargo build --release`, Rust 1.95.0), or download a
-release tarball once v0.1.0 is cut. Run the 17 verified programs in
-`examples/`, read docs/GETTING_STARTED.md and docs/TUTORIAL.md, or run the
-playground locally with `python3 playground/server.py`. The VS Code
-extension is in `editors/vscode/`.
+checksummed archive from GitHub Releases. Run the verified programs in
+`examples/`, read `docs/GETTING_STARTED.md` and `docs/TUTORIAL.md`, or use
+the browser playground. The VS Code extension is in `editors/vscode/`.
 
 ## How can I contribute?
 
