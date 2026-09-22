@@ -48,9 +48,15 @@ pub enum ActorPriority {
 
 // -- Flight recorder (deterministic replay support) ---------------------
 
-/// A single entry in an actor's flight-recorder trace.  Captures enough
-/// information to deterministically replay the message sequence that led
-/// to a crash or unexpected behavior.
+const FLIGHT_RECORDER_SAMPLE_VALUES: usize = 3;
+const DEFAULT_FLIGHT_RECORDER_ENTRIES: usize = 128;
+
+/// A single entry in an actor's flight-recorder trace.
+///
+/// The recorder deliberately stores raw value samples rather than a formatted
+/// String. Message delivery is a runtime hot path; formatting there used to
+/// allocate several temporary Strings plus a Vec for every delivered message.
+/// Human-readable rendering is deferred until a debugger actually asks for it.
 #[derive(Debug, Clone)]
 pub struct TraceEntry {
     /// Per-actor monotonic sequence number (arrival order).
@@ -61,13 +67,33 @@ pub struct TraceEntry {
     pub behavior_id: u16,
     /// Number of payload arguments.
     pub payload_len: usize,
-    /// Human-readable summary of the first few payload values.
-    pub payload_summary: String,
+    /// First few payload values, copied inline without allocation.
+    payload_sample: [Value; FLIGHT_RECORDER_SAMPLE_VALUES],
+    /// Number of initialized values in `payload_sample`.
+    payload_sample_len: u8,
+}
+
+impl TraceEntry {
+    /// Render the sampled payload values on demand for debugger/UI use.
+    ///
+    /// This is intentionally not performed in `FlightRecorder::record` so
+    /// ordinary actor messaging remains allocation-free at the recorder layer.
+    pub fn payload_summary(&self) -> String {
+        self.payload_sample[..self.payload_sample_len as usize]
+            .iter()
+            .map(Value::to_string_repr)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// A fixed-size ring buffer that records the most recent N messages
-/// delivered to an actor.  When the buffer is full, oldest entries are
+/// delivered to an actor. When the buffer is full, oldest entries are
 /// overwritten.
+///
+/// Storage is lazy: constructing an actor reserves no trace-entry backing
+/// buffer. This matters for actor density because the previous 1000-entry
+/// eager allocation consumed tens of KiB per actor before the first message.
 #[derive(Debug, Clone)]
 pub struct FlightRecorder {
     entries: Vec<TraceEntry>,
@@ -75,7 +101,7 @@ pub struct FlightRecorder {
     cursor: usize,
     /// Monotonic sequence counter for this actor.
     next_seq: u64,
-    /// Maximum number of entries to retain.
+    /// Maximum number of entries to retain. Zero disables recording.
     max_entries: usize,
 }
 
@@ -83,32 +109,34 @@ impl FlightRecorder {
     /// Create a new flight recorder retaining up to `max_entries` messages.
     pub fn new(max_entries: usize) -> Self {
         FlightRecorder {
-            entries: Vec::with_capacity(max_entries),
+            entries: Vec::new(),
             cursor: 0,
             next_seq: 0,
             max_entries,
         }
     }
 
-    /// Record a message delivery.
+    /// Record a message delivery without heap allocation once the backing
+    /// vector has reached its steady-state capacity.
     pub fn record(&mut self, sender: u64, behavior_id: u16, payload: &[Value]) {
+        if self.max_entries == 0 {
+            return;
+        }
+
         let seq = self.next_seq;
         self.next_seq += 1;
 
-        let payload_len = payload.len();
-        let payload_summary = payload
-            .iter()
-            .take(3)
-            .map(|v| v.to_string_repr())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let sample_len = payload.len().min(FLIGHT_RECORDER_SAMPLE_VALUES);
+        let mut payload_sample = [Value::nil(); FLIGHT_RECORDER_SAMPLE_VALUES];
+        payload_sample[..sample_len].copy_from_slice(&payload[..sample_len]);
 
         let entry = TraceEntry {
             seq,
             sender,
             behavior_id,
-            payload_len,
-            payload_summary,
+            payload_len: payload.len(),
+            payload_sample,
+            payload_sample_len: sample_len as u8,
         };
 
         if self.entries.len() < self.max_entries {
@@ -385,7 +413,7 @@ impl Actor {
             receive_wait: None,
             timer_sleep_fired: false,
             retry_config: None,
-            flight_recorder: FlightRecorder::new(1000),
+            flight_recorder: FlightRecorder::new(DEFAULT_FLIGHT_RECORDER_ENTRIES),
             fallback_config: Vec::new(),
             hibernation_state: None,
             idle_ms: 0,
@@ -633,6 +661,41 @@ mod tests {
         assert!(!actor.is_agent);
         assert_eq!(actor.max_reductions, 1000);
         assert_eq!(actor.reduction_count, 0);
+    }
+
+    #[test]
+    fn test_flight_recorder_is_lazy_and_formats_on_demand() {
+        let mut recorder = FlightRecorder::new(4);
+        assert_eq!(
+            recorder.entries.capacity(),
+            0,
+            "construction must not preallocate"
+        );
+
+        recorder.record(
+            7,
+            2,
+            &[
+                Value::int(11),
+                Value::bool(true),
+                Value::int(33),
+                Value::int(44),
+            ],
+        );
+
+        assert_eq!(recorder.entries.len(), 1);
+        let entry = &recorder.entries[0];
+        assert_eq!(entry.payload_len, 4);
+        assert_eq!(entry.payload_sample_len, 3);
+        assert_eq!(entry.payload_summary(), "11, true, 33");
+    }
+
+    #[test]
+    fn test_flight_recorder_zero_capacity_disables_recording() {
+        let mut recorder = FlightRecorder::new(0);
+        recorder.record(1, 1, &[Value::int(1)]);
+        assert!(recorder.is_empty());
+        assert_eq!(recorder.next_seq, 0);
     }
 
     #[test]
