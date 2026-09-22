@@ -92,6 +92,78 @@ fn test_find_compilable_region() {
 }
 
 #[test]
+fn test_whole_function_candidate_crosses_early_forward_branch() {
+    // The ordinary region policy rejects this function at pc0 because its
+    // first basic block begins with a forward branch before STRAIGHT_LINE_MIN.
+    // The whole-function path can safely keep the complete CFG resident
+    // because all targets remain inside one non-suspending, single-return
+    // function.
+    let mut module = CodeModule::new("whole_function_branch");
+    module.function_table.push(0);
+    module.function_local_counts.push(8);
+
+    module.emit(Instruction::new3(OpCode::JmpF, 0, 0, 5)); // 0 -> 5
+    module.emit(Instruction::new3(OpCode::IAdd, 1, 2, 3)); // 1
+    module.emit(Instruction::new3(OpCode::ISub, 3, 2, 3)); // 2
+    module.emit(Instruction::new3(OpCode::IMul, 3, 2, 3)); // 3
+    module.emit(Instruction::new2(OpCode::Jmp, 0, 5)); // 4 -> 9
+    module.emit(Instruction::new3(OpCode::IAdd, 1, 2, 3)); // 5
+    module.emit(Instruction::new3(OpCode::ISub, 3, 2, 3)); // 6
+    module.emit(Instruction::new3(OpCode::IMul, 3, 2, 3)); // 7
+    module.emit(Instruction::new3(OpCode::IAdd, 3, 2, 3)); // 8
+    module.emit(Instruction::new3(OpCode::IAdd, 3, 2, 3)); // 9
+    module.emit(Instruction::new3(OpCode::ISub, 3, 2, 3)); // 10
+    module.emit(Instruction::new3(OpCode::IMul, 3, 2, 3)); // 11
+    module.emit(Instruction::new1(OpCode::RetVal, 3)); // 12
+
+    let may_suspend = compute_may_suspend(&module);
+    let recursive = compute_recursive(&module);
+    assert_eq!(
+        find_compilable_region_with_calls(
+            0,
+            &module.instructions,
+            &module,
+            Some(&may_suspend),
+            Some(&recursive),
+        )
+        .0,
+        0,
+        "ordinary region policy should reject the tiny entry block"
+    );
+
+    let (len, calls) =
+        find_compilable_whole_function_with_calls(0, &module, &may_suspend, &recursive)
+            .expect("whole function should be eligible");
+    assert_eq!(len, 12, "terminal RetVal stays in the interpreter");
+    assert!(calls.is_empty());
+
+    let mut jit = make_jit();
+    let meta = typed_compiler::infer_reg_types(&module, 0);
+    let meta_ref = (!meta.is_empty()).then_some(&meta);
+    let ptr = unsafe {
+        jit.compile_region_typed(
+            0,
+            0,
+            len,
+            &module.instructions,
+            meta_ref,
+            &calls,
+        )
+    };
+    assert!(ptr.is_some(), "eligible whole function must compile");
+    assert_eq!(jit.compiled_region_len(0, 0), Some(12));
+
+    // A malformed/out-of-function branch must fail closed.
+    module.instructions[0] = Instruction::new3(OpCode::JmpF, 0, 0, 100);
+    let may_suspend = compute_may_suspend(&module);
+    let recursive = compute_recursive(&module);
+    assert!(
+        find_compilable_whole_function_with_calls(0, &module, &may_suspend, &recursive).is_none(),
+        "whole-function compilation must reject escaping branches"
+    );
+}
+
+#[test]
 fn test_find_region_stops_at_unsupported() {
     // A SMALL straight-line fragment ending at an unsupported opcode is
     // rejected (returns 0): it is a loop-head prefix that the interpreter
