@@ -71,6 +71,14 @@ version + migration.*
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
 
+### Actor-capable `.nbc` execution — 2026-09-22
+- **Precompiled actor/workflow artifacts execute through the real Runtime**
+  instead of standalone VM actor callbacks. Serialized modules carrying actor
+  metadata now use the same spawn/send/state/scheduler path as source
+  execution, while pure modules retain the lower-overhead standalone VM path.
+  Regression coverage verifies message delivery after NBC round-trip and
+  durable-store selection for persistent actors.
+
 ### Actor protocol rolling-upgrade compatibility — 2026-09-20
 - **Directional structural compatibility** (Experimental, `src/protocol.rs`).
   A receiver may serve an older required protocol when it preserves every
