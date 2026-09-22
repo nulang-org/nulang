@@ -305,6 +305,13 @@ fn validate_plan<E>(plan: &SagaPlan) -> Result<(), WorkflowEngineError<E>> {
         ));
     }
 
+    if plan.steps.len() > u32::MAX as usize {
+        return Err(WorkflowEngineError::HistoryConflict(format!(
+            "saga {} exceeds the durable u32 step-index limit",
+            plan.saga_id
+        )));
+    }
+
     let mut names = HashSet::with_capacity(plan.steps.len());
     for step in &plan.steps {
         if step.name.is_empty() {
