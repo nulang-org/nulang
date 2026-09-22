@@ -611,12 +611,10 @@ fn emit_typed_ibitop(
     store_reg(builder, regs_ptr, dst, tagged);
 }
 
-/// CLIF float binary operations supported by the typed compiler.
+/// CLIF float binary operations whose result is always a Float.
 ///
-/// Division is deliberately absent: direct `fdiv` produces inf/NaN on a
-/// zero divisor, but the interpreter and the `nulang_fdiv` runtime helper
-/// yield nil — so FDiv always goes through the helper, exactly like
-/// IDiv/IMod above.
+/// FDiv is emitted by `emit_typed_fdiv` instead because Nulang division can
+/// yield `nil` on a zero divisor, so its result is not statically always Float.
 #[derive(Debug, Clone, Copy)]
 enum TypedFloatOp {
     Add,
