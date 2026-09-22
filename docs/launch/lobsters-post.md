@@ -43,9 +43,10 @@ Things I expect lobste.rs to poke at, preemptively:
   (`conformance/`), a self-hosting bootstrap path, and partial formalization
   under `formal/`. CI is the source of truth for current test/proof counts.
 - **Known sharp edges are documented in-tree**: typed actor-protocol admission
-  remains experimental, and `state crdt` fields parse but currently behave as
-  `durable` because the Rust CRDT engine is not yet wired to that source-level
-  state model. SPEC2 separates implemented behavior from planned semantics.
+  remains experimental. Source-level typed CRDT fields and `Crdt.*` operations
+  are now wired and conformance-tested, but recovered actors still need the
+  field-name→CRDT-id mapping rebuilt/re-registered before CRDT operations are
+  fully usable. SPEC2 documents that recovery gap explicitly.
 - **Distribution**: multi-node `send`/`ask` over TCP (NUL0 wire protocol) and
   gossip membership work but are marked experimental.
 
