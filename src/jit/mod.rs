@@ -108,6 +108,10 @@ pub struct JitSession {
     /// Regions compiled through the type-directed (guard-stripped) path in
     /// `typed_compiler`, i.e. where inferred register types were available.
     typed_regions: FxHashSet<(usize, usize)>,
+    /// Regions that have successfully reached the SIMD tier. Once a region is
+    /// here it no longer accrues tier-2 hotness or attempts duplicate
+    /// recompilation under the same JIT symbol.
+    simd_regions: FxHashSet<(usize, usize)>,
     /// Per-module "may suspend" vectors (indexed by function-table index),
     /// computed lazily from each module's bytecode: true if the function
     /// transitively performs an effect that can suspend (or calls one).
@@ -167,6 +171,7 @@ impl JitSession {
             compiled_count: 0,
             hot_counts: Vec::new(),
             typed_regions: FxHashSet::default(),
+            simd_regions: FxHashSet::default(),
             may_suspend: FxHashMap::default(),
             recursive: FxHashMap::default(),
             builder_context: FunctionBuilderContext::new(),
@@ -277,6 +282,10 @@ impl JitSession {
         pc: usize,
         instructions: &[crate::bytecode::Instruction],
     ) {
+        if self.simd_regions.contains(&(module_idx, pc)) {
+            return;
+        }
+
         let count = self.tier2_counters.entry((module_idx, pc)).or_insert(0);
         *count += 1;
         if *count < TIER2_THRESHOLD {
@@ -463,10 +472,16 @@ impl JitSession {
         ) {
             Ok(ptr) => {
                 self.store_compiled(module_idx, start_offset, ptr, num_instrs);
+                self.simd_regions.insert((module_idx, start_offset));
                 Some(std::mem::transmute(ptr))
             }
             Err(_) => None,
         }
+    }
+
+    /// Return the number of regions that have reached the SIMD tier.
+    pub fn simd_compiled_count(&self) -> usize {
+        self.simd_regions.len()
     }
 
     /// Return the number of regions compiled through the type-directed path.
