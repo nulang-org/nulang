@@ -915,6 +915,50 @@ pub fn is_opcode_supported_typed(op: OpCode) -> bool {
 ///
 /// # Returns
 /// A raw function pointer to the compiled code, or an error if compilation fails.
+pub(crate) fn typed_basic_block_leaders(
+    start_offset: usize,
+    end_offset: usize,
+    instructions: &[Instruction],
+) -> HashSet<usize> {
+    let mut leaders = HashSet::new();
+    if start_offset >= end_offset {
+        return leaders;
+    }
+    leaders.insert(start_offset);
+
+    for pc in start_offset..end_offset {
+        let instr = instructions[pc];
+        match instr.opcode {
+            OpCode::Jmp => {
+                let target = (pc as i64 + instr.simm16() as i64) as usize;
+                if target >= start_offset && target < end_offset {
+                    leaders.insert(target);
+                }
+                if pc + 1 < end_offset {
+                    leaders.insert(pc + 1);
+                }
+            }
+            OpCode::JmpT | OpCode::JmpF => {
+                let target = (pc as i64 + instr.offset16() as i64) as usize;
+                if target >= start_offset && target < end_offset {
+                    leaders.insert(target);
+                }
+                if pc + 1 < end_offset {
+                    leaders.insert(pc + 1);
+                }
+            }
+            OpCode::Halt | OpCode::Ret | OpCode::RetVal => {
+                if pc + 1 < end_offset {
+                    leaders.insert(pc + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    leaders
+}
+
 pub fn compile_bytecode_region_typed(
     module: &mut JITModule,
     builder_context: &mut FunctionBuilderContext,
@@ -965,10 +1009,17 @@ pub fn compile_bytecode_region_typed(
     // Register runtime helpers (always needed for fallback)
     let helpers = register_runtime_helpers(module, &mut builder);
 
-    // Create blocks for each instruction offset
+    // Build a real bytecode CFG instead of creating one Cranelift block for
+    // every instruction. Leaders are the region entry, branch targets, and
+    // post-terminator fallthrough points. Straight-line bytecode is emitted
+    // into one CLIF block, eliminating an unconditional jump per instruction.
+    let basic_block_leaders =
+        typed_basic_block_leaders(start_offset, end_offset, instructions);
     let mut blocks: HashMap<usize, Block> = HashMap::new();
-    for i in start_offset..end_offset {
-        blocks.insert(i, builder.create_block());
+    let mut ordered_leaders: Vec<_> = basic_block_leaders.iter().copied().collect();
+    ordered_leaders.sort_unstable();
+    for leader in ordered_leaders {
+        blocks.insert(leader, builder.create_block());
     }
     let return_block = builder.create_block();
     // Use a thread-local helper for the safepoint so concurrent VMs do not
@@ -1003,38 +1054,24 @@ pub fn compile_bytecode_region_typed(
     // Mutable copy of type metadata so we can propagate result types
     let mut meta = type_metadata.map(|m| m.clone()).unwrap_or_default();
 
-    // Branch targets are native-SSA join points. Every incoming branch flushes
-    // the register file before the edge, and the target begins with no cached
-    // CLIF values so dominance is explicit and conservative.
-    let mut cache_entry_points = HashSet::new();
-    cache_entry_points.insert(start_offset);
-    for (pc, instr) in instructions
-        .iter()
-        .enumerate()
-        .take(end_offset)
-        .skip(start_offset)
-    {
-        let target = match instr.opcode {
-            OpCode::Jmp => Some((pc as i64 + instr.simm16() as i64) as usize),
-            OpCode::JmpT | OpCode::JmpF => Some((pc as i64 + instr.offset16() as i64) as usize),
-            _ => None,
-        };
-        if let Some(target) = target {
-            if target >= start_offset && target < end_offset {
-                cache_entry_points.insert(target);
-            }
-        }
-    }
+    // Basic-block entries are native-SSA join points for this conservative
+    // cache. Incoming edges synchronize the VM register file before the jump,
+    // then the destination begins with no cached CLIF values.
     let mut int_cache = IntRegCache::default();
 
-    // Compile each instruction
+    // Compile each instruction. Only switch Cranelift blocks at true bytecode
+    // leaders; all other instructions remain in the current straight-line
+    // block.
     for pc in start_offset..end_offset {
         let instr = instructions[pc];
-        let block = *blocks.get(&pc).unwrap();
-        builder.switch_to_block(block);
-
-        if pc != start_offset && cache_entry_points.contains(&pc) {
-            int_cache.clear();
+        if basic_block_leaders.contains(&pc) {
+            let block = *blocks
+                .get(&pc)
+                .expect("basic block leader must have a Cranelift block");
+            builder.switch_to_block(block);
+            if pc != start_offset {
+                int_cache.clear();
+            }
         }
 
         let cache_aware = match instr.opcode {
@@ -1751,14 +1788,15 @@ pub fn compile_bytecode_region_typed(
         );
 
         if !is_terminator {
-            if let Some(&next_block) = blocks.get(&(pc + 1)) {
-                if cache_entry_points.contains(&(pc + 1)) {
-                    int_cache.flush_and_clear(&mut builder, regs_ptr);
-                }
-                builder.ins().jump(next_block, &[]);
-            } else {
+            if pc + 1 >= end_offset {
                 int_cache.flush_and_clear(&mut builder, regs_ptr);
                 builder.ins().jump(return_block, &[]);
+            } else if basic_block_leaders.contains(&(pc + 1)) {
+                int_cache.flush_and_clear(&mut builder, regs_ptr);
+                let next_block = *blocks
+                    .get(&(pc + 1))
+                    .expect("fallthrough leader must have a Cranelift block");
+                builder.ins().jump(next_block, &[]);
             }
         }
     }
