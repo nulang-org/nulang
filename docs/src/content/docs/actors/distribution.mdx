@@ -95,6 +95,10 @@ CRDT types (`GCounter`, `PNCounter`, `GSet`, `ORSet`, `AWORSet`, `LWWRegister`, 
 
 Each op is rejected (returns `nil`) when the field's CRDT type doesn't match, and also returns `nil` outside an actor context. See [CRDT Stdlib Reference](/stdlib/crdt/) for details.
 
+:::caution[Recovery limitation]
+`recover_actor` restores materialized CRDT field values and the serialized CRDT snapshot, but it does not yet rebuild the persisted field-name→CRDT-id mapping automatically. After recovery, direct `self.field` reads still see the materialized value, while `perform Crdt.*` may return `nil` until the field is re-registered. This is an active stabilization gap, not a convergence guarantee.
+:::
+
 ## Persistence
 
 Actors can be persisted for durability:
