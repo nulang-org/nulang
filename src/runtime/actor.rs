@@ -205,7 +205,7 @@ pub struct Actor {
     /// Persistence/CRDT model parallel to `state_slot_values`.
     state_slot_models: Vec<StateModel>,
     pub state_models: HashMap<String, StateModel>, // Persistence model per field
-    pub event_log: Vec<(String, Vec<Value>)>, // Emitted events for event_sourced actors
+    pub event_log: Vec<(String, Vec<Value>)>,      // Emitted events for event_sourced actors
     /// Last persisted event sequence per EventSourced field, for compaction tracking.
     pub event_sourced_sequences: HashMap<String, u64>,
     /// How many events between compaction snapshots for EventSourced fields (default 100).
