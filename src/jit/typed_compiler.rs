@@ -492,17 +492,123 @@ fn emit_typed_fbinop(
     store_reg(builder, regs_ptr, dst, result_bits);
 }
 
+/// Emit typed floating-point division while preserving Nulang's
+/// nil-on-zero semantics. IEEE fdiv itself does not trap; we compute it,
+/// canonicalize the result, then select nil for both +0.0 and -0.0 divisors.
+fn emit_typed_fdiv(
+    builder: &mut FunctionBuilder,
+    regs_ptr: Value,
+    op1: usize,
+    op2: usize,
+    dst: usize,
+) {
+    let a_bits = load_reg(builder, regs_ptr, op1);
+    let b_bits = load_reg(builder, regs_ptr, op2);
+    let a = emit_bitcast_i64_to_f64(builder, a_bits);
+    let b = emit_bitcast_i64_to_f64(builder, b_bits);
+
+    // Clear the sign bit so +0.0 and -0.0 both compare as zero.
+    let abs_mask = builder.ins().iconst(types::I64, i64::MAX);
+    let abs_b_bits = builder.ins().band(b_bits, abs_mask);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let is_zero = builder.ins().icmp(IntCC::Equal, abs_b_bits, zero);
+
+    let result = builder.ins().fdiv(a, b);
+    let result_bits = emit_bitcast_f64_to_i64_canonicalized(builder, result);
+    let nil = builder.ins().iconst(types::I64, TAG_NIL_I64);
+    let observable = builder.ins().select(is_zero, nil, result_bits);
+    store_reg(builder, regs_ptr, dst, observable);
+}
+
 /// CLIF integer binary operations supported by the typed compiler.
-///
-/// Division and remainder are deliberately absent: direct `sdiv`/`srem`
-/// trap on a zero divisor, but the interpreter and the `nulang_idiv`/
-/// `nulang_imod` runtime helpers yield nil — so those always go through
-/// the helpers to keep typed code behaviorally identical to scalar code.
 #[derive(Debug, Clone, Copy)]
 enum TypedIntOp {
     Add,
     Sub,
     Mul,
+}
+
+/// Integer division/remainder operations. These use a trap-free divisor:
+/// when the real divisor is zero we divide by one internally, then select
+/// the language-level `nil` result. That preserves Nulang's nil-on-zero
+/// semantics without paying for a runtime helper call on statically-typed
+/// integer hot paths.
+#[derive(Debug, Clone, Copy)]
+enum TypedIntDivOp {
+    Div,
+    Mod,
+}
+
+fn emit_typed_idivmod(
+    builder: &mut FunctionBuilder,
+    regs_ptr: Value,
+    op1: usize,
+    op2: usize,
+    dst: usize,
+    op: TypedIntDivOp,
+) {
+    let a_raw = load_reg(builder, regs_ptr, op1);
+    let b_raw = load_reg(builder, regs_ptr, op2);
+    let a = emit_sext48(builder, a_raw);
+    let b = emit_sext48(builder, b_raw);
+
+    // Cranelift sdiv/srem trap on zero. Select a harmless divisor for the
+    // machine instruction, then select nil for the observable result.
+    let zero = builder.ins().iconst(types::I64, 0);
+    let one = builder.ins().iconst(types::I64, 1);
+    let is_zero = builder.ins().icmp(IntCC::Equal, b, zero);
+    let safe_b = builder.ins().select(is_zero, one, b);
+
+    let result = match op {
+        TypedIntDivOp::Div => builder.ins().sdiv(a, safe_b),
+        TypedIntDivOp::Mod => builder.ins().srem(a, safe_b),
+    };
+    let tagged = emit_tag_int(builder, result);
+    let nil = builder.ins().iconst(types::I64, TAG_NIL_I64);
+    let observable = builder.ins().select(is_zero, nil, tagged);
+    store_reg(builder, regs_ptr, dst, observable);
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TypedIntBitOp {
+    Xor,
+    Shl,
+    Shr,
+    And,
+    Or,
+}
+
+fn emit_typed_ibitop(
+    builder: &mut FunctionBuilder,
+    regs_ptr: Value,
+    op1: usize,
+    op2: usize,
+    dst: usize,
+    op: TypedIntBitOp,
+) {
+    let a_raw = load_reg(builder, regs_ptr, op1);
+    let b_raw = load_reg(builder, regs_ptr, op2);
+    let a = emit_sext48(builder, a_raw);
+    let b = emit_sext48(builder, b_raw);
+
+    let result = match op {
+        TypedIntBitOp::Xor => builder.ins().bxor(a, b),
+        TypedIntBitOp::And => builder.ins().band(a, b),
+        TypedIntBitOp::Or => builder.ins().bor(a, b),
+        TypedIntBitOp::Shl | TypedIntBitOp::Shr => {
+            // Match the VM/runtime helpers exactly: shifts use the low six
+            // bits of the RHS, so negative and oversized counts wrap mod 64.
+            let mask = builder.ins().iconst(types::I64, 0x3f);
+            let shift = builder.ins().band(b, mask);
+            match op {
+                TypedIntBitOp::Shl => builder.ins().ishl(a, shift),
+                TypedIntBitOp::Shr => builder.ins().sshr(a, shift),
+                _ => unreachable!(),
+            }
+        }
+    };
+    let tagged = emit_tag_int(builder, result);
+    store_reg(builder, regs_ptr, dst, tagged);
 }
 
 /// CLIF float binary operations supported by the typed compiler.
@@ -767,6 +873,11 @@ pub fn is_opcode_supported_typed(op: OpCode) -> bool {
             | OpCode::INeg
             | OpCode::IInc
             | OpCode::IDec
+            | OpCode::Xor
+            | OpCode::Shl
+            | OpCode::Shr
+            | OpCode::BitAnd
+            | OpCode::BitOr
             | OpCode::FAdd
             | OpCode::FSub
             | OpCode::FMul
@@ -1037,32 +1148,53 @@ pub fn compile_bytecode_region_typed(
                 meta.set_type(dst, KnownType::Int);
             }
             OpCode::IDiv => {
-                // Always use the runtime helper: direct CLIF `sdiv` traps on a
-                // zero divisor, while the interpreter and the helper yield nil.
                 let dst = instr.op3 as usize;
-                emit_binop_runtime(
-                    &mut builder,
-                    &helpers,
-                    regs_ptr,
-                    instr.op1 as usize,
-                    instr.op2 as usize,
-                    dst,
-                    "nulang_idiv",
-                );
+                if meta.both_known(instr.op1 as usize, instr.op2 as usize, KnownType::Int) {
+                    emit_typed_idivmod(
+                        &mut builder,
+                        regs_ptr,
+                        instr.op1 as usize,
+                        instr.op2 as usize,
+                        dst,
+                        TypedIntDivOp::Div,
+                    );
+                } else {
+                    emit_binop_runtime(
+                        &mut builder,
+                        &helpers,
+                        regs_ptr,
+                        instr.op1 as usize,
+                        instr.op2 as usize,
+                        dst,
+                        "nulang_idiv",
+                    );
+                }
+                // Division by zero yields nil, so the result cannot be proven
+                // Int after this instruction even on the typed fast path.
                 meta.set_type(dst, KnownType::Unknown);
             }
             OpCode::IMod => {
-                // Same reasoning as IDiv: keep the nil-on-zero semantics.
                 let dst = instr.op3 as usize;
-                emit_binop_runtime(
-                    &mut builder,
-                    &helpers,
-                    regs_ptr,
-                    instr.op1 as usize,
-                    instr.op2 as usize,
-                    dst,
-                    "nulang_imod",
-                );
+                if meta.both_known(instr.op1 as usize, instr.op2 as usize, KnownType::Int) {
+                    emit_typed_idivmod(
+                        &mut builder,
+                        regs_ptr,
+                        instr.op1 as usize,
+                        instr.op2 as usize,
+                        dst,
+                        TypedIntDivOp::Mod,
+                    );
+                } else {
+                    emit_binop_runtime(
+                        &mut builder,
+                        &helpers,
+                        regs_ptr,
+                        instr.op1 as usize,
+                        instr.op2 as usize,
+                        dst,
+                        "nulang_imod",
+                    );
+                }
                 meta.set_type(dst, KnownType::Unknown);
             }
             OpCode::INeg => {
@@ -1104,6 +1236,46 @@ pub fn compile_bytecode_region_typed(
                     emit_unary_runtime(&mut builder, &helpers, regs_ptr, reg, reg, "nulang_idec");
                 }
                 meta.set_type(reg, KnownType::Int);
+            }
+            OpCode::Xor | OpCode::Shl | OpCode::Shr | OpCode::BitAnd | OpCode::BitOr => {
+                let dst = instr.op3 as usize;
+                if meta.both_known(instr.op1 as usize, instr.op2 as usize, KnownType::Int) {
+                    let op = match instr.opcode {
+                        OpCode::Xor => TypedIntBitOp::Xor,
+                        OpCode::Shl => TypedIntBitOp::Shl,
+                        OpCode::Shr => TypedIntBitOp::Shr,
+                        OpCode::BitAnd => TypedIntBitOp::And,
+                        OpCode::BitOr => TypedIntBitOp::Or,
+                        _ => unreachable!(),
+                    };
+                    emit_typed_ibitop(
+                        &mut builder,
+                        regs_ptr,
+                        instr.op1 as usize,
+                        instr.op2 as usize,
+                        dst,
+                        op,
+                    );
+                } else {
+                    let helper = match instr.opcode {
+                        OpCode::Xor => "nulang_xor",
+                        OpCode::Shl => "nulang_shl",
+                        OpCode::Shr => "nulang_shr",
+                        OpCode::BitAnd => "nulang_bitand",
+                        OpCode::BitOr => "nulang_bitor",
+                        _ => unreachable!(),
+                    };
+                    emit_binop_runtime(
+                        &mut builder,
+                        &helpers,
+                        regs_ptr,
+                        instr.op1 as usize,
+                        instr.op2 as usize,
+                        dst,
+                        helper,
+                    );
+                }
+                meta.set_type(dst, KnownType::Int);
             }
 
             // -- Float Arithmetic (typed when both operands known Float) --
@@ -1180,20 +1352,26 @@ pub fn compile_bytecode_region_typed(
                 meta.set_type(dst, KnownType::Float);
             }
             OpCode::FDiv => {
-                // Always use the runtime helper: direct CLIF `fdiv` produces
-                // inf/NaN on a zero divisor, while the interpreter and the
-                // helper yield nil — same reasoning as IDiv/IMod. The result
-                // type is Unknown because it may be nil.
                 let dst = instr.op3 as usize;
-                emit_binop_runtime(
-                    &mut builder,
-                    &helpers,
-                    regs_ptr,
-                    instr.op1 as usize,
-                    instr.op2 as usize,
-                    dst,
-                    "nulang_fdiv",
-                );
+                if meta.both_known(instr.op1 as usize, instr.op2 as usize, KnownType::Float) {
+                    emit_typed_fdiv(
+                        &mut builder,
+                        regs_ptr,
+                        instr.op1 as usize,
+                        instr.op2 as usize,
+                        dst,
+                    );
+                } else {
+                    emit_binop_runtime(
+                        &mut builder,
+                        &helpers,
+                        regs_ptr,
+                        instr.op1 as usize,
+                        instr.op2 as usize,
+                        dst,
+                        "nulang_fdiv",
+                    );
+                }
                 meta.set_type(dst, KnownType::Unknown);
             }
 
@@ -1661,15 +1839,103 @@ mod typed_tests {
     }
 
     // ------------------------------------------------------------------
+    // Test 2b: Typed integer division/modulo avoid helpers safely
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_typed_idiv_imod_zero_and_nonzero() {
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            Instruction::new3(OpCode::IDiv, 0, 1, 2),
+            Instruction::new3(OpCode::IMod, 0, 1, 3),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Int);
+        meta.set_type(1, KnownType::Int);
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_typed_idiv_imod",
+            0,
+            3,
+            &instructions,
+            Some(&meta),
+        )
+        .expect("typed IDiv/IMod region should compile");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+        let mut regs = [0u64; 256];
+        regs[0] = Value::int(-7).as_raw();
+        regs[1] = Value::int(0).as_raw();
+
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(regs[2], Value::nil().as_raw());
+        assert_eq!(regs[3], Value::nil().as_raw());
+
+        regs[1] = Value::int(2).as_raw();
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(unsafe { Value::from_bits(regs[2]) }.as_int(), Some(-3));
+        assert_eq!(unsafe { Value::from_bits(regs[3]) }.as_int(), Some(-1));
+    }
+
+    #[test]
+    fn test_typed_bitwise_and_shift_matches_vm_semantics() {
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            Instruction::new3(OpCode::Xor, 0, 1, 2),
+            Instruction::new3(OpCode::BitAnd, 0, 1, 3),
+            Instruction::new3(OpCode::BitOr, 0, 1, 4),
+            Instruction::new3(OpCode::Shl, 0, 5, 6),
+            Instruction::new3(OpCode::Shr, 0, 5, 7),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        for reg in [0usize, 1, 5] {
+            meta.set_type(reg, KnownType::Int);
+        }
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_typed_bitwise",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("typed bitwise region should compile");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+        let mut regs = [0u64; 256];
+        regs[0] = Value::int(-8).as_raw();
+        regs[1] = Value::int(3).as_raw();
+        regs[5] = Value::int(65).as_raw(); // shift count masks to 1
+
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(unsafe { Value::from_bits(regs[2]) }.as_int(), Some(-8 ^ 3));
+        assert_eq!(unsafe { Value::from_bits(regs[3]) }.as_int(), Some(-8 & 3));
+        assert_eq!(unsafe { Value::from_bits(regs[4]) }.as_int(), Some(-8 | 3));
+        assert_eq!(unsafe { Value::from_bits(regs[6]) }.as_int(), Some(-16));
+        assert_eq!(unsafe { Value::from_bits(regs[7]) }.as_int(), Some(-4));
+    }
+
+    // ------------------------------------------------------------------
     // Test 3: Typed float operations emit direct CLIF
     // ------------------------------------------------------------------
 
-    /// When both operands are known Float, FAdd/FSub/FMul should emit
-    /// direct CLIF float ops (fadd/fsub/fmul) without runtime calls.
-    /// FDiv always goes through the `nulang_fdiv` runtime helper instead:
-    /// direct CLIF `fdiv` would produce inf/NaN on a zero divisor, while
-    /// the interpreter and the helper yield nil (same reasoning as
-    /// IDiv/IMod).
+    /// When both operands are known Float, FAdd/FSub/FMul/FDiv should emit
+    /// direct CLIF float ops without runtime calls. FDiv keeps language
+    /// semantics by selecting nil when the divisor is +0.0 or -0.0.
     #[test]
     fn test_typed_float_ops() {
         let mut jit = make_jit();
@@ -1706,10 +1972,9 @@ mod typed_tests {
     // Test 3b: FDiv yields nil on a zero divisor (both paths)
     // ------------------------------------------------------------------
 
-    /// The interpreter's FDiv yields nil on a zero divisor. The typed
-    /// compiler must never emit a raw CLIF `fdiv` (which would produce
-    /// inf/NaN): both the typed-metadata path and the unknown-type
-    /// fallback route through the zero-guarded `nulang_fdiv` helper.
+    /// The interpreter's FDiv yields nil on a zero divisor. The typed path
+    /// emits native fdiv plus a zero-result select, while the unknown-type
+    /// path keeps using the zero-guarded `nulang_fdiv` helper.
     /// Executes the compiled region directly, mirroring the execution
     /// tests in src/jit/tests.rs.
     #[test]
