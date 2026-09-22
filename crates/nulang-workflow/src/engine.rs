@@ -314,6 +314,22 @@ fn inspect_activity<E>(
                         invocation_id
                     )));
                 }
+                if completed.is_some() {
+                    return Err(WorkflowEngineError::HistoryConflict(format!(
+                        "activity {} has a failure after completion",
+                        invocation_id
+                    )));
+                }
+                if let Some((previous_attempt, _, previous_retryable, _)) =
+                    last_failure.as_ref()
+                {
+                    if !retry.should_retry(*previous_attempt, *previous_retryable) {
+                        return Err(WorkflowEngineError::HistoryConflict(format!(
+                            "activity {} has attempt {} after terminal attempt {}",
+                            invocation_id, attempt, previous_attempt
+                        )));
+                    }
+                }
 
                 let expected = last_failure
                     .as_ref()
@@ -351,6 +367,14 @@ fn inspect_activity<E>(
                         "activity {} completed before it was prepared",
                         invocation_id
                     )));
+                }
+                if let Some((attempt, _, retryable, _)) = last_failure.as_ref() {
+                    if !retry.should_retry(*attempt, *retryable) {
+                        return Err(WorkflowEngineError::HistoryConflict(format!(
+                            "activity {} completed after terminal attempt {}",
+                            invocation_id, attempt
+                        )));
+                    }
                 }
 
                 if completed.is_some() {
@@ -660,6 +684,44 @@ mod tests {
             }
         );
         assert_eq!(rt.dispatches.len(), 1);
+    }
+
+    #[test]
+    fn test_history_rejects_events_after_terminal_failure() {
+        let wf = workflow();
+        let spec = activity();
+        let id =
+            ActivityInvocationId::derive(&wf, &spec.step, spec.occurrence, &spec.operation);
+        let mut rt = MockRuntime::new(vec![]);
+        rt.history = WorkflowHistory::new(
+            3,
+            vec![
+                WorkflowEvent::ActivityPrepared {
+                    invocation_id: id,
+                    step: spec.step.clone(),
+                    operation: spec.operation.clone(),
+                    request: spec.request.clone(),
+                    retry: spec.retry,
+                },
+                WorkflowEvent::ActivityAttemptFailed {
+                    invocation_id: id,
+                    attempt: 1,
+                    error: "terminal".into(),
+                    retryable: false,
+                    next_retry_at_millis: None,
+                },
+                WorkflowEvent::ActivityCompleted {
+                    invocation_id: id,
+                    result: b"impossible".to_vec(),
+                },
+            ],
+        );
+
+        assert!(matches!(
+            DurableWorkflowExecutor.execute_activity(&mut rt, &wf, &spec),
+            Err(WorkflowEngineError::HistoryConflict(_))
+        ));
+        assert!(rt.dispatches.is_empty());
     }
 
     #[test]
