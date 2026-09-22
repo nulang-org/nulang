@@ -8,6 +8,32 @@ fn make_jit() -> JitSession {
 }
 
 #[test]
+fn test_typed_basic_block_leaders_coalesce_straight_line_code() {
+    use crate::jit::typed_compiler::typed_basic_block_leaders;
+
+    let instructions = vec![
+        Instruction::new1(OpCode::Const0, 0),              // 0
+        Instruction::new3(OpCode::IAdd, 0, 1, 0),          // 1
+        Instruction::new3(OpCode::JmpF, 2, 0, 4),          // 2 -> 6
+        Instruction::new3(OpCode::ISub, 0, 1, 0),          // 3
+        Instruction::new2(OpCode::Jmp, 0, 3),              // 4 -> 7
+        Instruction::new3(OpCode::IMul, 0, 1, 0),          // 5
+        Instruction::new3(OpCode::IAdd, 0, 1, 0),          // 6
+        Instruction::new0(OpCode::Halt),                    // 7
+        Instruction::new0(OpCode::Nop),                     // 8
+    ];
+
+    let leaders = typed_basic_block_leaders(0, instructions.len(), &instructions);
+    let expected: std::collections::HashSet<_> = [0, 3, 5, 6, 7, 8].into_iter().collect();
+
+    assert_eq!(leaders, expected);
+    assert!(
+        !leaders.contains(&1),
+        "ordinary straight-line instructions must share their predecessor's CLIF block"
+    );
+}
+
+#[test]
 fn test_jit_session_creation() {
     let jit = JitSession::new().expect("JIT must be available");
     assert_eq!(jit.compiled_count(), 0);
