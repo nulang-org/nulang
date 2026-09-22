@@ -63,6 +63,13 @@ impl AotModule {
 
     /// Compile a MIR module to native code for a specific target ISA.
     pub fn compile_for_target(mir_module: &mir::Module, target: &str) -> NuResult<Self> {
+        // Compile native code from the same canonical optimized MIR that feeds
+        // bytecode. Clone to preserve the public immutable-input contract and
+        // keep caller-owned MIR/debug state untouched.
+        let mut optimized_mir = (*mir_module).clone();
+        crate::mir_codegen::optimize_mir_module(&mut optimized_mir);
+        let mir_module = &optimized_mir;
+
         // Set up Cranelift with the target ISA.
         let mut flag_builder = settings::builder();
         let _ = flag_builder.set("enable_simd", "true");
@@ -283,11 +290,12 @@ impl AotModule {
             .collect();
 
         // Best-effort bytecode companion so native spawn can route through
-        // `Runtime::spawn_from_module`. The AOT JIT path borrows the MIR
-        // immutably throughout, so the companion compiles an optimized
-        // clone rather than mutating the shared module.
-        let mut optimized = mir_module.clone();
-        let code_module = crate::mir_codegen::compile_mir(&mut optimized, &mir_module.name).ok();
+        // `Runtime::spawn_from_module`. The native path above already uses
+        // canonical optimized MIR; compile_mir is idempotent and may run the
+        // bounded optimizer again on this private clone.
+        let mut bytecode_mir = optimized_mir.clone();
+        let code_module =
+            crate::mir_codegen::compile_mir(&mut bytecode_mir, &optimized_mir.name).ok();
 
         Ok(AotModule {
             jit_module,
@@ -1914,6 +1922,65 @@ mod tests {
     /// not fall through to integer arithmetic on the string's tag bits. Replicates
     /// `AotModule::run`'s heap + constants setup but keeps the heap alive so the
     /// result (a heap string) can be resolved back to its content.
+    #[test]
+    fn test_aot_optimizes_dead_unsupported_branch_without_mutating_input() {
+        use crate::bytecode::Constant;
+        use crate::mir::{self, RValue, Terminator};
+
+        let mut builder =
+            mir::FunctionBuilder::new("__main", Some(crate::types::Type::int()));
+        let cond = builder.add_temp(crate::types::Type::bool());
+        let result = builder.add_temp(crate::types::Type::int());
+        let dead = builder.add_temp(crate::types::Type::unit());
+        let then_block = builder.create_block();
+        let else_block = builder.create_block();
+
+        builder.assign(cond, RValue::Const(Constant::Bool(true)));
+        builder.terminate(Terminator::Branch {
+            cond,
+            then_: then_block,
+            else_: else_block,
+        });
+
+        builder.switch_to(then_block);
+        builder.assign(result, RValue::Const(Constant::Int(42)));
+        builder.terminate(Terminator::Return(Some(result)));
+
+        builder.switch_to(else_block);
+        // AOT intentionally does not support Panic. This branch is
+        // statically dead, so canonical MIR optimization must remove it
+        // before native lowering.
+        builder.assign(dead, RValue::Panic("dead branch".to_string()));
+        builder.terminate(Terminator::Return(Some(result)));
+
+        let mut module = mir::Module::new("aot_optimized_dead_branch");
+        module.functions.push(builder.build());
+        let original = module.clone();
+
+        let aot = super::AotModule::compile(&module)
+            .expect("dead unsupported branch should be pruned before AOT codegen");
+        let value = aot.run().expect("optimized AOT module should run");
+        assert_eq!(value.as_int(), Some(42));
+
+        assert_eq!(
+            module, original,
+            "AOT optimization must operate on a private clone, not caller-owned MIR"
+        );
+        assert!(
+            module.functions[0].blocks[else_block.0 as usize]
+                .stmts
+                .iter()
+                .any(|stmt| matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        op: RValue::Panic(_),
+                        ..
+                    }
+                )),
+            "original MIR should still contain the dead Panic after AOT compile"
+        );
+    }
+
     #[test]
     fn test_aot_str_concat_coercion_end_to_end() {
         let source = r#"
