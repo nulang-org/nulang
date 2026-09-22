@@ -2297,7 +2297,32 @@ fn check_source(
     with_capabilities: &[String],
     deny_warnings: bool,
 ) -> NuResult<()> {
-    let (_ast, _tc) = run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
+    let (_ast, mut tc) =
+        run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
+
+    // Type-directed warnings are emitted by --check first so stabilization
+    // diagnostics do not silently change ordinary program stderr/runtime
+    // conformance. --deny-warnings turns them into a CI-enforceable gate.
+    let warnings = tc.take_warnings();
+    if !warnings.is_empty() {
+        let use_color = std::io::stderr().is_terminal();
+        for warning in &warnings {
+            eprintln!("{}", nulang::diagnostic::format_warning(warning, use_color));
+        }
+        if deny_warnings {
+            return Err(NuError::TypeError {
+                msg: format!(
+                    "aborting due to {} type warning{} (--deny-warnings)",
+                    warnings.len(),
+                    if warnings.len() == 1 { "" } else { "s" }
+                ),
+                span: warnings[0].span,
+                expected_type: None,
+                found_type: None,
+                similar_names: None,
+            });
+        }
+    }
 
     if verbose {
         println!("Effect check passed.");
