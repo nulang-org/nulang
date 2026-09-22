@@ -428,14 +428,19 @@ fn validate_call(
     if protocol.ambiguous {
         return Ok(None);
     }
-    let Some(sig) = protocol.behaviors.get(behavior) else {
+    let qualified_prefix = format!("{}.", actor_name);
+    let behavior_key = behavior
+        .strip_prefix(&qualified_prefix)
+        .unwrap_or(behavior);
+
+    let Some(sig) = protocol.behaviors.get(behavior_key) else {
         let mut available: Vec<String> = protocol.behaviors.keys().cloned().collect();
         available.sort();
         return Err(NuError::TypeError {
             msg: format!(
                 "actor '{}' has no behavior '{}'; available behaviors: {}",
                 actor_name,
-                behavior,
+                behavior_key,
                 if available.is_empty() {
                     "(none)".to_string()
                 } else {
@@ -444,7 +449,7 @@ fn validate_call(
             ),
             span,
             expected_type: Some("declared actor behavior".to_string()),
-            found_type: Some(behavior.to_string()),
+            found_type: Some(behavior_key.to_string()),
             similar_names: (!available.is_empty()).then_some(available),
         });
     };
@@ -454,7 +459,7 @@ fn validate_call(
             msg: format!(
                 "behavior '{}.{}' expects {} argument(s), got {}",
                 actor_name,
-                behavior,
+                behavior_key,
                 sig.params.len(),
                 args.len()
             ),
@@ -480,6 +485,31 @@ fn validate_call(
     }
 
     Ok(sig.ret.clone())
+}
+
+fn qualify_known_behavior(
+    actor: &Expr,
+    behavior: &mut String,
+    env: &Env,
+    protocols: &FxHashMap<String, ActorProtocol>,
+) {
+    let Some(actor_name) = actor_name_for_expr(actor, env) else {
+        return;
+    };
+    let Some(protocol) = protocols.get(&actor_name) else {
+        return;
+    };
+    if protocol.ambiguous {
+        return;
+    }
+
+    let qualified_prefix = format!("{}.", actor_name);
+    if behavior.starts_with(&qualified_prefix) {
+        return;
+    }
+    if protocol.behaviors.contains_key(behavior.as_str()) {
+        *behavior = format!("{}.{}", actor_name, behavior);
+    }
 }
 
 fn annotate_expr(
@@ -639,6 +669,7 @@ fn annotate_expr(
                 annotate_expr(arg, env, protocols)?;
             }
             let _ = validate_call(actor, behavior, args, env, protocols, *span)?;
+            qualify_known_behavior(actor, behavior, env, protocols);
             Ok(())
         }
         Expr::Ask {
@@ -654,6 +685,7 @@ fn annotate_expr(
             }
             let ask_span = *span;
             let ret = validate_call(actor, behavior, args, env, protocols, ask_span)?;
+            qualify_known_behavior(actor, behavior, env, protocols);
             if let Some(ret) = ret {
                 let placeholder = Expr::Literal(Literal::Unit, ask_span);
                 let inner = std::mem::replace(expr, placeholder);

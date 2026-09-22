@@ -22,6 +22,14 @@ pub fn lower_module(
     ast: &ast::AstModule,
     inferred_decl_types: &FxHashMap<String, Type>,
 ) -> hir::Module {
+    // The canonical compiler pipeline type-checks before HIR lowering. Reuse
+    // the same RFC 0023 analysis here to preserve statically-known nominal
+    // actor identity in behavior names before actor protocol types are erased.
+    // If a caller bypasses type checking and annotation fails, retain the
+    // original AST; the MIR/runtime fail-closed guards remain authoritative.
+    let annotated_ast = crate::actor_protocol::annotate_module(ast).ok();
+    let ast = annotated_ast.as_ref().unwrap_or(ast);
+
     let mut module = hir::Module::new(&ast.name);
     let tools = collect_tool_schemas(&ast.decls);
 

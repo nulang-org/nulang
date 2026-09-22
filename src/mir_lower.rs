@@ -2895,28 +2895,45 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_short_behavior_name_fails_closed() {
-        let err = lower_source(
+    fn known_receiver_uses_nominal_behavior_identity_when_short_names_collide() {
+        let module = lower_source(
             r#"
             actor First {
                 state n: Int = 0
                 behavior hit() { self.n = self.n + 100 }
+                behavior get() { self.n }
             }
             actor Second {
                 state n: Int = 0
+                behavior get() { self.n }
                 behavior hit() { self.n = self.n + 1 }
             }
             fn main() {
                 let s = spawn Second {}
                 send s hit()
+                ask s get()
             }
             "#,
         )
-        .expect_err("ambiguous behavior dispatch must not select the first suffix match");
-        let msg = format!("{err}");
-        assert!(msg.contains("ambiguous actor behavior 'hit'"), "{msg}");
-        assert!(msg.contains("First.hit"), "{msg}");
-        assert!(msg.contains("Second.hit"), "{msg}");
+        .expect("known receiver identity should disambiguate colliding behavior names");
+        let main = find_fn(&module, "main");
+
+        let mut send_idx = None;
+        let mut ask_idx = None;
+        for block in &main.blocks {
+            for stmt in &block.stmts {
+                if let mir::Stmt::Assign { op, .. } = stmt {
+                    match op {
+                        mir::RValue::Send { behavior_idx, .. } => send_idx = Some(*behavior_idx),
+                        mir::RValue::Ask { behavior_idx, .. } => ask_idx = Some(*behavior_idx),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        assert_eq!(send_idx, Some(3), "send must resolve to Second.hit");
+        assert_eq!(ask_idx, Some(2), "ask must resolve to Second.get");
     }
 
     #[test]
