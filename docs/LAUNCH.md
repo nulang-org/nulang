@@ -48,14 +48,15 @@ out the rest.
 - **Capability-based types** — `iso`/`trn`/`ref`/`val`/`box`/`tag`/`lineariso`
   guarantee memory safety and data-race freedom without a borrow checker
 - **Durable entities** — `entity` declarations with event sourcing, versioned
-  migrations, and persistence that survives restarts
+  migrations, snapshot/journal recovery, and selectable durable stores
 - **Package manager** — `nula new/build/run/test/add/remove`; dependencies
   with lockfiles, templates for CLI/lib/full projects
 - **JIT compiler** — Cranelift-based tiered JIT with register-based bytecode VM
 - **WASM backend** — compile Nulang to WebAssembly (experimental)
 - **LSP server** — diagnostics, hover, goto-def, references, rename, completion
-- **AI runtime** — `agent` declarations with LLM providers, pipelines, debates,
-  memory subsystems (experimental, feature-gated)
+- **AI runtime** — optional LLM providers, pipelines, debates, and memory
+  subsystems (experimental, feature-gated). The legacy `agent` declaration
+  surface is deprecated in favor of ordinary actors/entities plus libraries
 
 ## Getting started
 
@@ -69,22 +70,26 @@ cargo build --release
 cd myapp && ../target/release/nulang nula run
 ```
 
-Requires Rust 1.93+, Linux or macOS.
+Source builds use Rust 1.95.0, pinned by `rust-toolchain.toml`. Tagged
+release CI currently validates Linux x86_64/aarch64, macOS aarch64, and
+Windows x86_64.
 
 ## Stability
 
-Nulang is alpha software. The language version is `1.0.0-frozen`: the bytecode
-format, wire protocol, and Nulang Core are frozen and will never break. The HM
-type system, effect system, capability lattice, and actor surface are Stable
-(breaking changes require an RFC and a deprecation cycle). Everything else is
-Experimental. See `GOVERNANCE.md` for the full stability contract.
+Nulang is alpha software. Existing artifacts still carry the historical
+`1.0.0-frozen` language metadata, but RFC 0021 no longer treats all
+pre-adoption source semantics as permanently Frozen. Published compatibility
+contracts remain versioned obligations; source semantics are Stable or
+Experimental according to `GOVERNANCE.md`. Expect breaking source-language
+changes before the external-adoption freeze gate closes.
 
 ## What's next?
 
-The roadmap (RFC 0003) targets a self-hosting bootstrap compiler, content-
-addressed code deployment, a formal conformance suite, and Windows support.
-The language was designed for a 200-year relevance horizon; the features
-landing now are the ones that need to be right the first time.
+The current priority is semantic stabilization rather than adding more
+language surface: exact-head CI, authority/capability enforcement, durable
+identity and migration correctness, replay-safe external effects, backend
+conformance, and destructive recovery testing. See
+`docs/SEMANTIC_STABILIZATION_CONTRACT.md` for the active gate.
 
 ## Links
 
