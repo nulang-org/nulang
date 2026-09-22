@@ -69,6 +69,7 @@ pub mod mir_wasm_simd;
 pub mod observability;
 pub mod package;
 pub mod parallel_analysis;
+pub mod parallel_marker;
 pub mod parser;
 pub mod prelude_source;
 pub mod primitives;
