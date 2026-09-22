@@ -8,6 +8,48 @@ fn make_jit() -> JitSession {
 }
 
 #[test]
+fn test_stable_region_int_regs_only_carries_int_preserving_writes() {
+    use crate::jit::typed_compiler::{stable_region_int_regs, KnownType, TypeMetadata};
+
+    let mut meta = TypeMetadata::new();
+    for reg in 0..4 {
+        meta.set_type(reg, KnownType::Int);
+    }
+
+    let instructions = vec![
+        Instruction::new3(OpCode::IAdd, 0, 1, 0),
+        Instruction::new2(OpCode::Move, 0, 1),
+        Instruction::new3(OpCode::IDiv, 0, 1, 2),
+        Instruction::new3(OpCode::ICmpLt, 0, 1, 3),
+    ];
+
+    assert_eq!(
+        stable_region_int_regs(Some(&meta), 0, instructions.len(), &instructions),
+        vec![0, 1],
+        "division and comparison destinations must not be threaded as native Ints"
+    );
+}
+
+#[test]
+fn test_stable_region_int_regs_propagates_copy_invalidation() {
+    use crate::jit::typed_compiler::{stable_region_int_regs, KnownType, TypeMetadata};
+
+    let mut meta = TypeMetadata::new();
+    meta.set_type(0, KnownType::Int);
+    meta.set_type(1, KnownType::Int);
+
+    let instructions = vec![
+        Instruction::new2(OpCode::Move, 2, 0),
+        Instruction::new2(OpCode::Move, 0, 1),
+    ];
+
+    assert!(
+        stable_region_int_regs(Some(&meta), 0, instructions.len(), &instructions).is_empty(),
+        "a copy from an unstable source must invalidate downstream carry candidates"
+    );
+}
+
+#[test]
 fn test_typed_basic_block_leaders_coalesce_straight_line_code() {
     use crate::jit::typed_compiler::typed_basic_block_leaders;
 
