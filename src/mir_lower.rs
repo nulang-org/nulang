@@ -380,6 +380,18 @@ impl ModuleCtx {
         }
     }
 
+    /// Legacy receive-arm resolver. Selective receive does not yet carry the
+    /// current actor's nominal identity into MIR lowering, so changing its
+    /// behavior-id mapping belongs to the nominal-identity follow-up rather
+    /// than the send/ask containment fix.
+    fn receive_behavior_idx(&self, behavior: &str) -> usize {
+        let suffix = format!(".{}", behavior);
+        self.behavior_names
+            .iter()
+            .position(|name| name == behavior || name.ends_with(&suffix))
+            .unwrap_or(self.behaviors.len())
+    }
+
     fn fresh_lambda_name(&mut self) -> String {
         let n = self.next_lambda;
         self.next_lambda += 1;
@@ -1677,12 +1689,8 @@ impl<'c> FnLowerer<'c> {
         }
         let behavior_ids: Vec<u16> = arms
             .iter()
-            .map(|(name, _, _, _)| {
-                self.ctx
-                    .send_behavior_idx("", name)
-                    .map(|idx| idx as u16)
-            })
-            .collect::<NuResult<Vec<_>>>()?;
+            .map(|(name, _, _, _)| self.ctx.receive_behavior_idx(name) as u16)
+            .collect();
         let max_params = arms.iter().map(|(_, p, _, _)| p.len()).max().unwrap_or(0);
         let timeout = match after {
             Some((ms_body, _)) => {
