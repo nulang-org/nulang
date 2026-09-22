@@ -1302,6 +1302,7 @@ pub fn compile_bytecode_region_typed(
             OpCode::ICmpEq | OpCode::ICmpLt | OpCode::ICmpGt | OpCode::ICmpLe | OpCode::ICmpGe => {
                 meta.both_known(instr.op1 as usize, instr.op2 as usize, KnownType::Int)
             }
+            OpCode::Jmp | OpCode::JmpT | OpCode::JmpF => true,
             _ => false,
         };
         if !cache_aware {
@@ -1879,8 +1880,12 @@ pub fn compile_bytecode_region_typed(
             OpCode::Jmp => {
                 let target = (pc as i64 + instr.simm16() as i64) as usize;
                 if let Some(&target_block) = blocks.get(&target) {
-                    builder.ins().jump(target_block, &[]);
+                    int_cache.flush_except(&mut builder, regs_ptr, &carried_int_regs);
+                    let args =
+                        int_cache.carried_args(&mut builder, regs_ptr, &carried_int_regs);
+                    builder.ins().jump(target_block, &args);
                 } else {
+                    int_cache.flush_and_clear(&mut builder, regs_ptr);
                     emit_yield_pc(
                         &mut builder,
                         helpers["nulang_jit_set_branch_exit_pc"],
@@ -1894,28 +1899,67 @@ pub fn compile_bytecode_region_typed(
                 let target = (pc as i64 + instr.offset16() as i64) as usize;
                 let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
                 // Branch conditions are NaN-tagged bools; truthiness is the low
-                // payload bit (matches `Value::as_bool`), not the whole value.
+                // payload bit, matching Value::as_bool.
                 let one = builder.ins().iconst(types::I64, 1);
                 let cond_bit = builder.ins().band(cond_val, one);
                 let zero = builder.ins().iconst(types::I64, 0);
                 let is_true = builder.ins().icmp(IntCC::NotEqual, cond_bit, zero);
-                let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
-                if let Some(&target_block) = blocks.get(&target) {
+
+                let target_block = blocks.get(&target).copied();
+                let fallthrough_block = blocks.get(&(pc + 1)).copied();
+
+                if let (Some(target_block), Some(fallthrough)) =
+                    (target_block, fallthrough_block)
+                {
+                    int_cache.flush_except(&mut builder, regs_ptr, &carried_int_regs);
+                    let args =
+                        int_cache.carried_args(&mut builder, regs_ptr, &carried_int_regs);
                     builder
                         .ins()
-                        .brif(is_true, target_block, &[], fallthrough, &[]);
+                        .brif(is_true, target_block, &args, fallthrough, &args);
                 } else {
-                    let outside = builder.create_block();
-                    builder.ins().brif(is_true, outside, &[], fallthrough, &[]);
-                    builder.switch_to_block(outside);
-                    emit_yield_pc(
-                        &mut builder,
-                        helpers["nulang_jit_set_branch_exit_pc"],
-                        start_offset,
-                        target,
-                    );
-                    builder.ins().jump(return_block, &[]);
-                    builder.seal_block(outside);
+                    int_cache.flush_and_clear(&mut builder, regs_ptr);
+                    let args =
+                        int_cache.carried_args(&mut builder, regs_ptr, &carried_int_regs);
+
+                    match (target_block, fallthrough_block) {
+                        (Some(target_block), None) => {
+                            builder
+                                .ins()
+                                .brif(is_true, target_block, &args, return_block, &[]);
+                        }
+                        (None, Some(fallthrough)) => {
+                            let outside = builder.create_block();
+                            builder
+                                .ins()
+                                .brif(is_true, outside, &[], fallthrough, &args);
+                            builder.switch_to_block(outside);
+                            emit_yield_pc(
+                                &mut builder,
+                                helpers["nulang_jit_set_branch_exit_pc"],
+                                start_offset,
+                                target,
+                            );
+                            builder.ins().jump(return_block, &[]);
+                            builder.seal_block(outside);
+                        }
+                        (None, None) => {
+                            let outside = builder.create_block();
+                            builder
+                                .ins()
+                                .brif(is_true, outside, &[], return_block, &[]);
+                            builder.switch_to_block(outside);
+                            emit_yield_pc(
+                                &mut builder,
+                                helpers["nulang_jit_set_branch_exit_pc"],
+                                start_offset,
+                                target,
+                            );
+                            builder.ins().jump(return_block, &[]);
+                            builder.seal_block(outside);
+                        }
+                        (Some(_), Some(_)) => unreachable!(),
+                    }
                 }
             }
             OpCode::JmpF => {
@@ -1925,23 +1969,62 @@ pub fn compile_bytecode_region_typed(
                 let cond_bit = builder.ins().band(cond_val, one);
                 let zero = builder.ins().iconst(types::I64, 0);
                 let is_false = builder.ins().icmp(IntCC::Equal, cond_bit, zero);
-                let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
-                if let Some(&target_block) = blocks.get(&target) {
+
+                let target_block = blocks.get(&target).copied();
+                let fallthrough_block = blocks.get(&(pc + 1)).copied();
+
+                if let (Some(target_block), Some(fallthrough)) =
+                    (target_block, fallthrough_block)
+                {
+                    int_cache.flush_except(&mut builder, regs_ptr, &carried_int_regs);
+                    let args =
+                        int_cache.carried_args(&mut builder, regs_ptr, &carried_int_regs);
                     builder
                         .ins()
-                        .brif(is_false, target_block, &[], fallthrough, &[]);
+                        .brif(is_false, target_block, &args, fallthrough, &args);
                 } else {
-                    let outside = builder.create_block();
-                    builder.ins().brif(is_false, outside, &[], fallthrough, &[]);
-                    builder.switch_to_block(outside);
-                    emit_yield_pc(
-                        &mut builder,
-                        helpers["nulang_jit_set_branch_exit_pc"],
-                        start_offset,
-                        target,
-                    );
-                    builder.ins().jump(return_block, &[]);
-                    builder.seal_block(outside);
+                    int_cache.flush_and_clear(&mut builder, regs_ptr);
+                    let args =
+                        int_cache.carried_args(&mut builder, regs_ptr, &carried_int_regs);
+
+                    match (target_block, fallthrough_block) {
+                        (Some(target_block), None) => {
+                            builder
+                                .ins()
+                                .brif(is_false, target_block, &args, return_block, &[]);
+                        }
+                        (None, Some(fallthrough)) => {
+                            let outside = builder.create_block();
+                            builder
+                                .ins()
+                                .brif(is_false, outside, &[], fallthrough, &args);
+                            builder.switch_to_block(outside);
+                            emit_yield_pc(
+                                &mut builder,
+                                helpers["nulang_jit_set_branch_exit_pc"],
+                                start_offset,
+                                target,
+                            );
+                            builder.ins().jump(return_block, &[]);
+                            builder.seal_block(outside);
+                        }
+                        (None, None) => {
+                            let outside = builder.create_block();
+                            builder
+                                .ins()
+                                .brif(is_false, outside, &[], return_block, &[]);
+                            builder.switch_to_block(outside);
+                            emit_yield_pc(
+                                &mut builder,
+                                helpers["nulang_jit_set_branch_exit_pc"],
+                                start_offset,
+                                target,
+                            );
+                            builder.ins().jump(return_block, &[]);
+                            builder.seal_block(outside);
+                        }
+                        (Some(_), Some(_)) => unreachable!(),
+                    }
                 }
             }
 
@@ -2002,11 +2085,12 @@ pub fn compile_bytecode_region_typed(
                 int_cache.flush_and_clear(&mut builder, regs_ptr);
                 builder.ins().jump(return_block, &[]);
             } else if basic_block_leaders.contains(&(pc + 1)) {
-                int_cache.flush_and_clear(&mut builder, regs_ptr);
+                int_cache.flush_except(&mut builder, regs_ptr, &carried_int_regs);
+                let args = int_cache.carried_args(&mut builder, regs_ptr, &carried_int_regs);
                 let next_block = *blocks
                     .get(&(pc + 1))
                     .expect("fallthrough leader must have a Cranelift block");
-                builder.ins().jump(next_block, &[]);
+                builder.ins().jump(next_block, &args);
             }
         }
     }
