@@ -2,14 +2,20 @@
 
 use crate::config::AgentConfigFile;
 use crate::store::{SqliteStore, StoreError};
+use crate::task_workflow::TaskWorkflowRuntime;
 use chrono::Utc;
 use nulang_ai_core::{
-    ConversationMessage, ConversationState, GoalStatus, SwarmEvent, SwarmEventEnvelope, TaskStatus,
+    ConversationMessage, ConversationState, GoalStatus, SwarmEvent, SwarmEventEnvelope, Task,
+    TaskStatus,
 };
 use nulang_ai_director::{Director, LocalDirector};
 use nulang_ai_manager::{EngineeringManager, Manager};
 use nulang_ai_protocol::format_event_line;
 use nulang_ai_worker::{LocalWorker, Worker};
+use nulang_workflow::{
+    ActivityProgress, ActivitySpec, DurableWorkflowExecutor, RetryPolicy, WorkflowId,
+};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -24,6 +30,10 @@ pub enum RuntimeError {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("workflow error: {0}")]
+    Workflow(String),
+    #[error("task {task_id} failed: {error}")]
+    TaskFailed { task_id: Uuid, error: String },
     #[error("missing agent.toml in {0}")]
     MissingConfig(PathBuf),
 }
@@ -37,6 +47,11 @@ pub struct LocalRuntime {
     director: LocalDirector,
     engineering: EngineeringManager,
     worker: LocalWorker,
+}
+
+enum TaskExecutionOutcome {
+    Completed,
+    Deferred,
 }
 
 impl LocalRuntime {
@@ -86,6 +101,36 @@ impl LocalRuntime {
 
     pub fn conversation_id(&self) -> Uuid {
         self.conversation_id
+    }
+
+    /// Resume tasks that were persisted before a previous process stopped.
+    ///
+    /// Each task reuses its original workflow/activity identity, so a worker
+    /// that propagates the supplied idempotency key can make external effects
+    /// replay-safe across crashes.
+    pub fn resume_pending_tasks(
+        &mut self,
+        out: &mut dyn Write,
+    ) -> Result<usize, RuntimeError> {
+        let tasks = self.store.list_resumable_tasks()?;
+        let mut completed = 0usize;
+        let mut touched_goals = HashSet::new();
+
+        for task in tasks {
+            touched_goals.insert(task.goal_id);
+            if matches!(
+                self.execute_task_durably(task, out)?,
+                TaskExecutionOutcome::Completed
+            ) {
+                completed += 1;
+            }
+        }
+
+        for goal_id in touched_goals {
+            self.complete_goal_if_ready(goal_id, out)?;
+        }
+
+        Ok(completed)
     }
 
     pub fn handle_user_message(
@@ -139,12 +184,25 @@ impl LocalRuntime {
                     goal_id,
                 },
             )?;
+            let _ = self.execute_task_durably(task, out)?;
+        }
 
-            let agent_id = task
-                .assigned_agent_id
-                .clone()
-                .unwrap_or_else(|| self.worker.agent_id().to_string());
-            let mut running = task;
+        self.complete_goal_if_ready(goal_id, out)?;
+        Ok(goal_id)
+    }
+
+    fn execute_task_durably(
+        &mut self,
+        task: Task,
+        out: &mut dyn Write,
+    ) -> Result<TaskExecutionOutcome, RuntimeError> {
+        let agent_id = task
+            .assigned_agent_id
+            .clone()
+            .unwrap_or_else(|| self.worker.agent_id().to_string());
+
+        let mut running = task;
+        if running.status != TaskStatus::Running {
             running.status = TaskStatus::Running;
             running.updated_at = Utc::now();
             self.store.upsert_task(&running)?;
@@ -155,24 +213,73 @@ impl LocalRuntime {
                     agent_id: agent_id.clone(),
                 },
             )?;
-
-            let completed = self.worker.execute(&running);
-            self.store.upsert_task(&completed)?;
-            self.emit(
-                out,
-                SwarmEvent::TaskCompleted {
-                    task_id: completed.id,
-                    agent_id,
-                },
-            )?;
         }
 
+        let workflow_id = WorkflowId::new(format!("agent-task:{}", running.id));
+        let spec = ActivitySpec::new(
+            "execute",
+            "agent.worker.execute",
+            serde_json::to_vec(&running)?,
+        )
+        .retry(RetryPolicy::exponential(3, 500, 5_000, 2));
+        let mut workflow_runtime = TaskWorkflowRuntime::new(&self.store, &self.worker);
+        let progress = DurableWorkflowExecutor
+            .execute_activity(&mut workflow_runtime, &workflow_id, &spec)
+            .map_err(|error| RuntimeError::Workflow(error.to_string()))?;
+
+        match progress {
+            ActivityProgress::Completed(payload) => {
+                let completed: Task = serde_json::from_slice(&payload)?;
+                if completed.id != running.id || completed.goal_id != running.goal_id {
+                    return Err(RuntimeError::Workflow(format!(
+                        "durable task result identity mismatch for {}",
+                        running.id
+                    )));
+                }
+                self.store.upsert_task(&completed)?;
+                self.emit(
+                    out,
+                    SwarmEvent::TaskCompleted {
+                        task_id: completed.id,
+                        agent_id,
+                    },
+                )?;
+                Ok(TaskExecutionOutcome::Completed)
+            }
+            ActivityProgress::WaitingForRetry { .. } => Ok(TaskExecutionOutcome::Deferred),
+            ActivityProgress::Failed { error, .. } => {
+                running.status = TaskStatus::Failed;
+                running.updated_at = Utc::now();
+                self.store.upsert_task(&running)?;
+                Err(RuntimeError::TaskFailed {
+                    task_id: running.id,
+                    error,
+                })
+            }
+        }
+    }
+
+    fn complete_goal_if_ready(
+        &mut self,
+        goal_id: Uuid,
+        out: &mut dyn Write,
+    ) -> Result<bool, RuntimeError> {
+        let graph = self.store.get_goal_graph(goal_id)?;
+        if graph.goal.status == GoalStatus::Completed
+            || !graph
+                .tasks
+                .iter()
+                .all(|task| task.status == TaskStatus::Completed)
+        {
+            return Ok(false);
+        }
+
+        let mut goal = graph.goal;
         goal.status = GoalStatus::Completed;
         goal.updated_at = Utc::now();
         self.store.upsert_goal(&goal)?;
         self.emit(out, SwarmEvent::GoalCompleted { goal_id })?;
-
-        Ok(goal_id)
+        Ok(true)
     }
 
     fn emit(&self, out: &mut dyn Write, event: SwarmEvent) -> Result<(), RuntimeError> {
@@ -192,6 +299,7 @@ pub fn init_project(dir: &Path) -> Result<(), RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nulang_ai_core::{Goal, ManagerKind, Task};
     use std::io::Cursor;
 
     #[test]
@@ -208,6 +316,41 @@ mod tests {
         assert!(text.contains("task_created"));
         let graph = rt.store().get_goal_graph(goal_id).unwrap();
         assert_eq!(graph.goal.status, GoalStatus::Completed);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn resume_pending_task_reuses_durable_history() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-resume-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        init_project(&tmp).unwrap();
+
+        let goal = Goal::new("resume-test", "finish persisted task", 1.0);
+        let goal_id = goal.id;
+        let task = Task::new(goal_id, "persist me", ManagerKind::Engineering);
+        let task_id = task.id;
+
+        {
+            let rt = LocalRuntime::open(tmp.clone()).unwrap();
+            rt.store().upsert_goal(&goal).unwrap();
+            rt.store().upsert_task(&task).unwrap();
+        }
+
+        let mut rt = LocalRuntime::open(tmp.clone()).unwrap();
+        let mut out = Cursor::new(Vec::new());
+        assert_eq!(rt.resume_pending_tasks(&mut out).unwrap(), 1);
+
+        let graph = rt.store().get_goal_graph(goal_id).unwrap();
+        assert_eq!(graph.goal.status, GoalStatus::Completed);
+        assert_eq!(
+            graph.tasks.iter().find(|task| task.id == task_id).unwrap().status,
+            TaskStatus::Completed
+        );
+
+        let workflow_id = WorkflowId::new(format!("agent-task:{}", task_id));
+        let history = rt.store().load_workflow_history(&workflow_id).unwrap();
+        assert_eq!(history.revision, 2);
+        assert_eq!(history.events.len(), 2);
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

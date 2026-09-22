@@ -11,6 +11,7 @@ nulang-ai-protocol = { path = "../nulang-ai-protocol" }
 nulang-ai-director = { path = "../nulang-ai-director" }
 nulang-ai-manager = { path = "../nulang-ai-manager" }
 nulang-ai-worker = { path = "../nulang-ai-worker" }
+nulang-workflow = { path = "../nulang-workflow" }
 chrono = { version = "0.4", features = ["serde"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
