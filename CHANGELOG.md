@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Protected-branch automation hygiene — 2026-09-22
+- **Benchmark history no longer self-pushes to protected `main`** (`.github/workflows/ci.yml`, `benchmarks/README.md`). Main-branch benchmark runs load and append rolling JSON telemetry on `automation/benchmarks`, while artifacts remain attached to the CI run. Regression detection still happens before the job reports success/failure, but telemetry persistence is now compatible with protected-branch policy.
+- **Docs sync preserves generated output when PR creation is restricted** (`.github/workflows/docs-sync.yml`). The generated-assets branch remains authoritative and the workflow emits an explicit warning instead of discarding successful generation/build work when the active token cannot create a pull request.
+
 ### Canonical compiler semantic identity — 2026-09-21
 - **Compiler-owned `SemanticId` now derives from canonical backend-independent MIR plus typed actor-state schemas** (Experimental, `src/semantic_identity.rs`, `src/semantic_schema.rs`, `src/compiler_identity.rs`). The encoding alpha-normalizes compiler-generated IDs, excludes presentation/debug metadata and backend selection, includes executable/effect/authority/durable semantics, and folds dependency semantic identities deterministically. `ArtifactIdentityManifest` assembly now has a typed-program entry point that keeps exact `SourceId`, semantic identity, and backend-specific `ArtifactId` distinct without changing frozen NBC v1.
 
