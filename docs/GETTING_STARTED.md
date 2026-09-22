@@ -1,6 +1,7 @@
 # Getting Started with Nulang
 
-> Verified against the example suite in `examples/` (commit `1fd62a5`).
+> Documentation review: 2026-09-22. The examples in `examples/` remain the
+> executable source of truth when tutorial prose and implementation diverge.
 
 ## 1. What is Nulang?
 
@@ -31,6 +32,11 @@ nulang --check hello.nula # type-check only, don't run
 nulang --eval '40 + 2'    # evaluate inline code
 nulang --repl             # start interactive REPL
 ```
+
+The bytecode VM is the semantic reference implementation. WASM is the canonical
+portable/cloud target, while native AOT is secondary until backend parity is
+demonstrated. The experimental `--backend wasm-component` path emits WIT
+alongside WASM for component-oriented interop.
 
 In the REPL, try `:help` for commands, `:type <expr>` to inspect a type,
 `:load <file>` to run a file, and use Tab for completion.
@@ -355,7 +361,43 @@ Spawn syntax: `spawn Actor { field = value }` (overrides state defaults).
 
 > Full example: `examples/08_actors.nula`
 
-## 11. Error Handling
+## 11. Durable Entities
+
+Use an `actor` for ephemeral concurrent workers. Use an `entity` when the
+state represents a long-lived domain identity that should participate in
+durability and recovery. Entity state defaults to the event-sourced model;
+ordinary actor behavior/message semantics still apply.
+
+```nula
+entity Counter {
+    state count: Int = 0
+
+    behavior increment(by: Int) {
+        self.count = self.count + by
+    }
+
+    behavior value() {
+        self.count
+    }
+}
+
+fn main() {
+    let counter = spawn Counter {}
+    counter ! increment(1)
+    counter ! increment(2)
+    0
+}
+```
+
+`persistent actor` remains available when you want actor syntax with durable
+state defaults rather than the entity-first event-sourced model.
+
+The older `agent`, `workflow`, and `database` declaration forms are still
+recognized, but the compiler marks them deprecated. New code should compose
+ordinary actors/entities with effect-based or Cloud SDK libraries instead of
+building around those declaration-specific runtimes.
+
+## 12. Error Handling
 
 Use `catch` to provide a fallback when a variant-producing computation returns
 an error variant, and `fail` to exit early from a function:
@@ -386,7 +428,7 @@ early_return(-5)    // → 0
 div(10, 2)?         // → 5
 ```
 
-## 12. The Package Manager
+## 13. The Package Manager
 
 Nulang ships with `nula`, a built-in package manager. All commands are invoked
 as `nulang nula <cmd>`:
@@ -419,7 +461,7 @@ my-project/
 Dependencies are stored in `Nulang.toml` under `[dependencies]` and resolved to
 `Nulang.lock`.
 
-## 13. Testing
+## 14. Testing
 
 Test files live under `tests/` with a `.nula` extension. Use the built-in `Test`
 effect for assertions:
@@ -454,11 +496,13 @@ nulang nula test --filter addition
 Available assertions: `perform Test.assert(cond, msg)`, `perform Test.assert_eq(actual, expected)`,
 `perform Test.assert_true(cond)`, `perform Test.fail_with(msg)`.
 
-## 14. Where to Go Next
+## 15. Where to Go Next
 
 - **`examples/`** — 17 verified, runnable examples from hello world through
   HTTP/JSON and actor-based URL fetching (see `examples/README.md`).
+- **`docs/README.md`** — documentation map and status guidance.
 - **`SPEC2.md`** — language specification with formal syntax and semantics.
+- **`docs/SEMANTIC_STABILIZATION_CONTRACT.md`** — current semantic-source-of-truth, backend, durability, and verification contract.
 - **`CHANGELOG.md`** — per-commit feature log.
 - **`src/stdlib/`** — standard library source (`fs.nula`, `test.nula`, …).
 - **REPL** — launch with `nulang --repl`; use `:help`, `:type`, `:load`.
