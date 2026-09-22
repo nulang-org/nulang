@@ -21,8 +21,9 @@ pub enum ActorState {
 /// The scheduler dequeues ready High-priority actors before Normal, and
 /// Normal before Low (strict per-level preference, FIFO within a level —
 /// see `Scheduler::enqueue_with_priority`). Priority affects scheduling
-/// order only; it does not touch message delivery order
-/// (`Mailbox::receive_match` stays FIFO and ignores `Message::priority`).
+/// order only; it does not select a mailbox lane. Message delivery follows
+/// the mailbox's independent System > Normal > Bulk QoS policy while preserving
+/// FIFO ordering within each lane.
 /// Set from Nulang via `perform Actor.set_priority(0|1|2)`.
 /// Execution backend for an actor.
 #[derive(Debug, Clone, PartialEq, Eq)]
