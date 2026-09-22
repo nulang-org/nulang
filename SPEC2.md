@@ -20,7 +20,7 @@ The specification is organized into five conceptual layers:
 
 3. **The Durable Execution Layer** (Chapter 9) extends the actor runtime with persistence. Persistent actors survive process restarts through automatic checkpointing, event journaling, deterministic replay, and snapshotting.
 
-4. **The Distributed Platform Layer** (Chapter 12) extends the durable actor runtime across machine boundaries. Virtual actors are transparently activated on any cluster node (**Planned**). Messages are routed across the network. CRDT state converges automatically (**Planned** — the CRDT replication machinery is implemented and tested at the Rust level, but `state crdt` fields are not yet wired to it and behave as `durable`; see §9.10 and §12.5). Faults are contained and recovered.
+4. **The Distributed Platform Layer** (Chapter 12) extends the durable actor runtime across machine boundaries. Remote messaging, gossip membership, typed source-level CRDT fields, `Crdt.*` operations, and CRDT replication are implemented but Experimental. Virtual-actor activation and several production hardening goals remain incomplete. CRDT recovery has a documented limitation: `recover_actor` restores materialized/snapshot state but does not yet rebuild the field-name→CRDT-id mapping automatically; see §9.10 and §12.5.
 
 5. **The AI Runtime Layer** (Chapter 11) provides language-integrated access to large language models, tool use, memory systems, and planning. AI capabilities are expressed through the same algebraic effect system used for IO and network effects, and are gated by the same capability-based security model.
 
