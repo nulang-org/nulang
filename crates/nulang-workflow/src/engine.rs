@@ -188,7 +188,7 @@ impl DurableWorkflowExecutor {
             step: spec.step.clone(),
             operation: spec.operation.clone(),
             attempt,
-            idempotency_key: invocation_id.idempotency_key().to_owned(),
+            idempotency_key: invocation_id.idempotency_key(),
             payload: spec.request.clone(),
         };
 
