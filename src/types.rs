@@ -1601,6 +1601,22 @@ impl NuWarning {
         }
     }
 
+    /// `W0202` — an arm is subsumed by earlier unguarded patterns.
+    pub fn unreachable_match_arm(span: Span, arm_index: usize) -> Self {
+        NuWarning {
+            code: "W0202",
+            msg: format!(
+                "unreachable match arm #{}; its pattern cannot match a value not already handled",
+                arm_index + 1
+            ),
+            span,
+            help: Some(
+                "remove the arm, reorder the match, or narrow an earlier unguarded pattern"
+                    .to_string(),
+            ),
+        }
+    }
+
     /// Plain-text one-line rendering, used when no SourceMap is installed.
     pub fn format_plain(&self) -> String {
         let mut out = format!("warning[{}]: {}", self.code, self.msg);
