@@ -525,12 +525,9 @@ pub(crate) fn register_runtime_helpers<M: Module>(
 
 /// Emit an integer binary operation with direct CLIF (no runtime call).
 ///
-/// Only called when both operands are known to be `Int`. The sequence is:
-/// 1. Load raw NaN-tagged values from registers
-/// 2. Sign-extend payloads inline (`emit_sext48`)
-/// 3. Perform the CLIF integer operation
-/// 4. Re-tag the result as a NaN-tagged integer
-/// 5. Store back to the destination register
+/// Proven Int operands are loaded into the region-local unboxed cache at most
+/// once per linear chain. Results stay as normalized signed 48-bit SSA values
+/// until a helper, CFG boundary, or region exit requires VM materialization.
 fn emit_typed_ibinop(
     builder: &mut FunctionBuilder,
     regs_ptr: Value,
@@ -2494,7 +2491,10 @@ mod typed_tests {
         regs[1] = Value::int(1).as_raw();
 
         func(regs.as_mut_ptr(), consts.as_ptr());
-        assert_eq!(unsafe { Value::from_bits(regs[2]) }.as_int(), Some(INT48_MIN));
+        assert_eq!(
+            unsafe { Value::from_bits(regs[2]) }.as_int(),
+            Some(INT48_MIN)
+        );
         assert_eq!(
             unsafe { Value::from_bits(regs[3]) }.as_int(),
             Some(INT48_MIN + 1)
@@ -2578,28 +2578,16 @@ mod typed_tests {
         regs_true[1] = Value::int(1).as_raw();
         regs_true[4] = Value::bool(true).as_raw();
         func(regs_true.as_mut_ptr(), consts.as_ptr());
-        assert_eq!(
-            unsafe { Value::from_bits(regs_true[2]) }.as_int(),
-            Some(3)
-        );
-        assert_eq!(
-            unsafe { Value::from_bits(regs_true[3]) }.as_int(),
-            Some(4)
-        );
+        assert_eq!(unsafe { Value::from_bits(regs_true[2]) }.as_int(), Some(3));
+        assert_eq!(unsafe { Value::from_bits(regs_true[3]) }.as_int(), Some(4));
 
         let mut regs_false = [0u64; 256];
         regs_false[0] = Value::int(2).as_raw();
         regs_false[1] = Value::int(1).as_raw();
         regs_false[4] = Value::bool(false).as_raw();
         func(regs_false.as_mut_ptr(), consts.as_ptr());
-        assert_eq!(
-            unsafe { Value::from_bits(regs_false[2]) }.as_int(),
-            Some(4)
-        );
-        assert_eq!(
-            unsafe { Value::from_bits(regs_false[3]) }.as_int(),
-            Some(5)
-        );
+        assert_eq!(unsafe { Value::from_bits(regs_false[2]) }.as_int(), Some(4));
+        assert_eq!(unsafe { Value::from_bits(regs_false[3]) }.as_int(), Some(5));
     }
 
     // ------------------------------------------------------------------
