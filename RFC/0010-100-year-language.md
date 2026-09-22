@@ -7,7 +7,7 @@
 - **Resolved:** TBD
 - **Language-version at effect:** N/A
 - **Supersedes:** none
-- **Superseded by:** none
+- **Superseded by:** RFC 0017 for unified-runtime/agent-workflow direction; RFC 0021 for pre-adoption source-freeze policy
 
 ## Summary
 
@@ -52,11 +52,11 @@ conforming Nulang implementation must support. Its longevity properties:
   variable-width tags without breaking the frozen Core semantics — only the
   runtime encoding changes.
 
-- **Wire protocol versioning:** The NUL0 wire protocol (magic `NUL0`, 8-byte
-  node-id handshake, versioned `Packet` enum) carries a protocol version that
-  gates compatibility. All distribution primitives are behind the frozen
-  `Actor.*` and `Otp.*` built-in effect interfaces — the transport can evolve
-  independently.
+- **Wire protocol versioning:** NUL0 v1 now begins with a 16-byte versioned
+  handshake (`NUL0` magic + `version:u32` + `node_id:u64`) before framed
+  packets. Published NUL0 v1 bytes are a Frozen compatibility obligation;
+  higher-level actor/distribution source surfaces follow their own
+  Stable/Experimental classifications.
 
 **Recommendation:** These mechanisms already exist. No change required; this
 section documents them as the longevity contract.
@@ -72,7 +72,7 @@ Current AI surface couples the language to the LLM paradigm:
 | `Pipeline` module | Hardcoded orchestration pattern | Move to standard library; language should not hardcode orchestration |
 | `Supervisor` module | Same | Move to standard library |
 | `Debate` module | Same | Move to standard library |
-| `agent` keyword | Already unified with `actor` in v2.0 design (SPEC2.md Forward) | Complete the migration: `agent` → `actor` alias, deprecate `agent` |
+| `agent` keyword | Higher-level AI syntax can drift from the canonical runtime model | Per accepted RFC 0017, retain it only as Experimental ergonomic syntax that lowers to canonical actor/effect primitives |
 
 **Migration path:**
 1. `LLM` → `Inference`: Add `Inference` as an alias; deprecate `LLM` over one
@@ -80,8 +80,10 @@ Current AI surface couples the language to the LLM paradigm:
 2. `Pipeline`, `Supervisor`, `Debate`: Extract from built-in modules to a
    `nulang-ai` standard library package. The language surface should expose
    only `actor`, `perform Inference.ask(...)`, and `@tool`.
-3. `agent` → `actor`: Already aligned in SPEC2.md v2.0. Complete the parser
-   desugaring so `agent` becomes a deprecated alias for `actor`.
+3. `agent` runtime unification: accepted RFC 0017 supersedes the removal
+   recommendation. Keep `agent` Experimental and ensure its executable
+   semantics lower to the canonical actor/effect model rather than a separate
+   runtime species.
 
 ### C.3 Architecture-Independent Value Representation
 
