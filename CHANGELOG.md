@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Runtime actor behavior ownership — 2026-09-22
+- **Actor behavior lookup and numeric delivery are now constrained to the target runtime schema** (`src/runtime/behavior_ownership.rs`, `src/runtime/mod.rs`). Ordinary actor ids remain module-global but are accepted only when owned by the target `ActorMeta`; workflow ids remain actor-local and translate through owning metadata; virtual actors resolve through their `Type@key` schema. Name lookup, wire-name serialization, grain routing, synchronous ask, local send, and cross-shard ingress now fail closed for foreign-schema behavior identities.
+
+
 ### Runtime actor schema identity — 2026-09-22
 - **Module-spawned actors now retain their canonical owning `ActorMeta.name` at runtime** (`src/runtime/spawn.rs`). This preserves the target actor schema needed for subsequent fail-closed behavior ownership checks without changing manually spawned/native actor instance names. Regression coverage pins both paths.
 
