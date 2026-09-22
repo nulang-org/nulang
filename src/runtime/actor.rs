@@ -859,10 +859,7 @@ mod tests {
         // Installing schema metadata must not make an absent state value look
         // initialized to recovery/default-fill code.
         assert_eq!(actor.get_state_field("count"), None);
-        assert_eq!(
-            actor.get_state_field_by_constant(count),
-            Some(Value::nil())
-        );
+        assert_eq!(actor.get_state_field_by_constant(count), Some(Value::nil()));
 
         actor.set_state_field("count", Value::int(7));
         assert_eq!(actor.get_state_field("count"), Some(Value::int(7)));
