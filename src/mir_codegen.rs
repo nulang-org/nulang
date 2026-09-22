@@ -225,16 +225,10 @@ impl MirCodegen {
     }
 
     pub fn compile_module(&mut self, mir: &mut mir::Module) -> NuResult<&CodeModule> {
-        // MIR optimization pass: constant folding, identity simplification,
-        // jump threading, and dead-store elimination. Runs on every
-        // function and behavior before codegen.
-        let mut module_consts = Vec::new();
-        for func in &mut mir.functions {
-            optimize_function(func, &mut module_consts);
-        }
-        for func in &mut mir.behaviors {
-            optimize_function(func, &mut module_consts);
-        }
+        // Canonical backend-independent MIR optimization. Keeping this before
+        // bytecode lowering means the interpreter/tiered JIT see the same
+        // simplified control/data flow that native backends can consume.
+        optimize_mir_module(mir);
 
         // Register foreign functions first so FFICall indices line up.
         for ff in &mir.foreign_functions {
@@ -1498,6 +1492,21 @@ fn float_locals(func: &mir::Function) -> Vec<bool> {
 //     disagree with any truthiness interpretation of non-bool values.
 
 const MAX_OPT_ITERATIONS: usize = 10;
+
+/// Run the canonical MIR optimization pipeline for every executable body.
+///
+/// This is intentionally backend-neutral: bytecode codegen and native AOT
+/// both invoke the same pass so folding, copy propagation, CFG pruning, and
+/// DCE do not drift between execution modes.
+pub(crate) fn optimize_mir_module(module: &mut mir::Module) {
+    let mut module_consts = Vec::new();
+    for func in &mut module.functions {
+        optimize_function(func, &mut module_consts);
+    }
+    for func in &mut module.behaviors {
+        optimize_function(func, &mut module_consts);
+    }
+}
 
 /// Optimize one MIR function in place. `_module_consts` reserves space for
 /// module-level constant pooling; unused by the current transforms.

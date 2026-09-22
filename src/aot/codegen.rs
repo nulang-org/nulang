@@ -982,10 +982,14 @@ pub fn is_all_int(func: &mir::Function) -> bool {
             let nil_or_object = match stmt {
                 mir::Stmt::Assign { op, .. } => matches!(
                     op,
-                    mir::RValue::Binary(
-                        crate::ast::BinOp::Div | crate::ast::BinOp::Mod | crate::ast::BinOp::Pow,
-                        ..
-                    ) | mir::RValue::ArrayLit(_)
+                    mir::RValue::Const(crate::bytecode::Constant::Nil)
+                        | mir::RValue::Binary(
+                            crate::ast::BinOp::Div
+                                | crate::ast::BinOp::Mod
+                                | crate::ast::BinOp::Pow,
+                            ..
+                        )
+                        | mir::RValue::ArrayLit(_)
                         | mir::RValue::ArrayLoad { .. }
                         | mir::RValue::ArrayLen(_)
                         | mir::RValue::Record(_)
@@ -3543,6 +3547,20 @@ mod tests {
         let func = builder.build();
         assert!(!is_all_int(&func));
     }
+    #[test]
+    fn test_is_all_int_false_with_explicit_nil_const() {
+        let mut builder = mir::FunctionBuilder::new("nil_const", Some(crate::types::Type::int()));
+        let value = builder.add_temp(crate::types::Type::int());
+        builder.assign(value, mir::RValue::Const(crate::bytecode::Constant::Nil));
+        builder.terminate(mir::Terminator::Return(Some(value)));
+        let func = builder.build();
+
+        assert!(
+            !is_all_int(&func),
+            "explicit nil must stay boxed even when the declared return type is Int"
+        );
+    }
+
     #[test]
     fn test_is_all_int_false_with_void_return() {
         // void return is actually fine - is_all_int checks params only for non-Int,
