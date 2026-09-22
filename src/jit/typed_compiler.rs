@@ -2240,74 +2240,189 @@ pub fn compile_bytecode_region_typed(
 
             // -- Control Flow --
             OpCode::Jmp => {
-                flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                 let target = (pc as i64 + instr.simm16() as i64) as usize;
-                if let Some(&target_block) = blocks.get(&target) {
-                    builder.ins().jump(target_block, &[]);
-                } else {
-                    emit_yield_pc(
+                let is_loop_backedge = loop_ssa
+                    .as_ref()
+                    .is_some_and(|plan| plan.backedge_pc == pc && target == start_offset);
+
+                if is_loop_backedge {
+                    let plan = loop_ssa.as_ref().unwrap();
+                    let args = loop_carried_args(
                         &mut builder,
-                        helpers["nulang_jit_set_branch_exit_pc"],
-                        start_offset,
-                        target,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
                     );
-                    builder.ins().jump(return_block, &[]);
+                    let header = blocks[&start_offset];
+                    builder.ins().jump(header, &args);
+                    // The next bytecode block is not reachable through this
+                    // edge. Drop codegen-time mappings without materializing:
+                    // the live values are carried by the header block params.
+                    int_cache.clear();
+                    float_cache.clear();
+                } else {
+                    flush_native_caches(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                    );
+                    if let Some(&target_block) = blocks.get(&target) {
+                        builder.ins().jump(target_block, &[]);
+                    } else {
+                        emit_yield_pc(
+                            &mut builder,
+                            helpers["nulang_jit_set_branch_exit_pc"],
+                            start_offset,
+                            target,
+                        );
+                        builder.ins().jump(return_block, &[]);
+                    }
                 }
             }
             OpCode::JmpT => {
-                flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                 let target = (pc as i64 + instr.offset16() as i64) as usize;
-                let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
-                // Branch conditions are NaN-tagged bools; truthiness is the low
-                // payload bit (matches `Value::as_bool`), not the whole value.
-                let one = builder.ins().iconst(types::I64, 1);
-                let cond_bit = builder.ins().band(cond_val, one);
-                let zero = builder.ins().iconst(types::I64, 0);
-                let is_true = builder.ins().icmp(IntCC::NotEqual, cond_bit, zero);
-                let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
-                if let Some(&target_block) = blocks.get(&target) {
+                let is_loop_backedge = loop_ssa
+                    .as_ref()
+                    .is_some_and(|plan| plan.backedge_pc == pc && target == start_offset);
+
+                if is_loop_backedge {
+                    // The simple-loop plan proves this condition is Bool, so it
+                    // is already materialized by the comparison/logic opcode.
+                    let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
+                    let one = builder.ins().iconst(types::I64, 1);
+                    let cond_bit = builder.ins().band(cond_val, one);
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_true = builder.ins().icmp(IntCC::NotEqual, cond_bit, zero);
+
+                    let plan = loop_ssa.as_ref().unwrap();
+                    let args = loop_carried_args(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
+                    );
+                    let header = blocks[&start_offset];
+                    let exit_block = builder.create_block();
                     builder
                         .ins()
-                        .brif(is_true, target_block, &[], fallthrough, &[]);
-                } else {
-                    let outside = builder.create_block();
-                    builder.ins().brif(is_true, outside, &[], fallthrough, &[]);
-                    builder.switch_to_block(outside);
-                    emit_yield_pc(
+                        .brif(is_true, header, &args, exit_block, &[]);
+
+                    // Only the exit path materializes loop-carried native
+                    // values. The taken backedge stays entirely in SSA form.
+                    builder.switch_to_block(exit_block);
+                    flush_native_caches(
                         &mut builder,
-                        helpers["nulang_jit_set_branch_exit_pc"],
-                        start_offset,
-                        target,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
                     );
-                    builder.ins().jump(return_block, &[]);
-                    builder.seal_block(outside);
+                    let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
+                    builder.ins().jump(fallthrough, &[]);
+                    builder.seal_block(exit_block);
+                } else {
+                    flush_native_caches(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                    );
+                    let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
+                    // Branch conditions are NaN-tagged bools; truthiness is the low
+                    // payload bit (matches `Value::as_bool`), not the whole value.
+                    let one = builder.ins().iconst(types::I64, 1);
+                    let cond_bit = builder.ins().band(cond_val, one);
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_true = builder.ins().icmp(IntCC::NotEqual, cond_bit, zero);
+                    let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
+                    if let Some(&target_block) = blocks.get(&target) {
+                        builder
+                            .ins()
+                            .brif(is_true, target_block, &[], fallthrough, &[]);
+                    } else {
+                        let outside = builder.create_block();
+                        builder.ins().brif(is_true, outside, &[], fallthrough, &[]);
+                        builder.switch_to_block(outside);
+                        emit_yield_pc(
+                            &mut builder,
+                            helpers["nulang_jit_set_branch_exit_pc"],
+                            start_offset,
+                            target,
+                        );
+                        builder.ins().jump(return_block, &[]);
+                        builder.seal_block(outside);
+                    }
                 }
             }
             OpCode::JmpF => {
-                flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                 let target = (pc as i64 + instr.offset16() as i64) as usize;
-                let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
-                let one = builder.ins().iconst(types::I64, 1);
-                let cond_bit = builder.ins().band(cond_val, one);
-                let zero = builder.ins().iconst(types::I64, 0);
-                let is_false = builder.ins().icmp(IntCC::Equal, cond_bit, zero);
-                let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
-                if let Some(&target_block) = blocks.get(&target) {
+                let is_loop_backedge = loop_ssa
+                    .as_ref()
+                    .is_some_and(|plan| plan.backedge_pc == pc && target == start_offset);
+
+                if is_loop_backedge {
+                    let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
+                    let one = builder.ins().iconst(types::I64, 1);
+                    let cond_bit = builder.ins().band(cond_val, one);
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_false = builder.ins().icmp(IntCC::Equal, cond_bit, zero);
+
+                    let plan = loop_ssa.as_ref().unwrap();
+                    let args = loop_carried_args(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
+                    );
+                    let header = blocks[&start_offset];
+                    let exit_block = builder.create_block();
                     builder
                         .ins()
-                        .brif(is_false, target_block, &[], fallthrough, &[]);
-                } else {
-                    let outside = builder.create_block();
-                    builder.ins().brif(is_false, outside, &[], fallthrough, &[]);
-                    builder.switch_to_block(outside);
-                    emit_yield_pc(
+                        .brif(is_false, header, &args, exit_block, &[]);
+
+                    builder.switch_to_block(exit_block);
+                    flush_native_caches(
                         &mut builder,
-                        helpers["nulang_jit_set_branch_exit_pc"],
-                        start_offset,
-                        target,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
                     );
-                    builder.ins().jump(return_block, &[]);
-                    builder.seal_block(outside);
+                    let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
+                    builder.ins().jump(fallthrough, &[]);
+                    builder.seal_block(exit_block);
+                } else {
+                    flush_native_caches(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                    );
+                    let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
+                    let one = builder.ins().iconst(types::I64, 1);
+                    let cond_bit = builder.ins().band(cond_val, one);
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_false = builder.ins().icmp(IntCC::Equal, cond_bit, zero);
+                    let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
+                    if let Some(&target_block) = blocks.get(&target) {
+                        builder
+                            .ins()
+                            .brif(is_false, target_block, &[], fallthrough, &[]);
+                    } else {
+                        let outside = builder.create_block();
+                        builder.ins().brif(is_false, outside, &[], fallthrough, &[]);
+                        builder.switch_to_block(outside);
+                        emit_yield_pc(
+                            &mut builder,
+                            helpers["nulang_jit_set_branch_exit_pc"],
+                            start_offset,
+                            target,
+                        );
+                        builder.ins().jump(return_block, &[]);
+                        builder.seal_block(outside);
+                    }
                 }
             }
 
