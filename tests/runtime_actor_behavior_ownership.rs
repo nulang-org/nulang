@@ -39,7 +39,10 @@ fn duplicate_hit_module() -> (nulang::bytecode::CodeModule, usize, usize) {
         .expect("Second actor metadata");
     let first_hit = *first.behavior_indices.first().expect("First.hit index");
     let second_hit = *second.behavior_indices.first().expect("Second.hit index");
-    assert_ne!(first_hit, second_hit, "fixture requires distinct behavior ids");
+    assert_ne!(
+        first_hit, second_hit,
+        "fixture requires distinct behavior ids"
+    );
     (module, first_hit, second_hit)
 }
 
