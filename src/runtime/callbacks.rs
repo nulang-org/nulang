@@ -1557,10 +1557,7 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         }
     }
 
-    fn get_state_field_indexed(
-        &self,
-        field_constant_idx: usize,
-    ) -> Option<crate::vm::Value> {
+    fn get_state_field_indexed(&self, field_constant_idx: usize) -> Option<crate::vm::Value> {
         unsafe {
             (*self.runtime)
                 .actors
