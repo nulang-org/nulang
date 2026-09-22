@@ -414,6 +414,27 @@ inductive HandlerTrans : HandlerStack → HandlerStack → Prop where
 def HandlerScope (hs : HandlerStack) (eff : EffectLabel) : Prop :=
   hs.contains eff = true
 
+namespace EffectRow
+
+/--
+  A row is accounted for by a handler stack when it is closed and every effect
+  named by the row is currently in lexical handler scope.
+
+  Open rows are deliberately not considered fully accounted: the unknown tail
+  may later instantiate to an effect for which no handler exists.
+-/
+def accountedBy (hs : HandlerStack) : EffectRow → Prop
+| .Closed effects => ∀ eff, eff ∈ effects → HandlerScope hs eff
+| .Open _ _ => False
+
+/-- A singleton effect row is accounted exactly when its effect is in scope. -/
+theorem accountedBy_singleton_iff
+  (hs : HandlerStack) (eff : EffectLabel) :
+  accountedBy hs (singleton eff) ↔ HandlerScope hs eff := by
+  simp [accountedBy, singleton]
+
+end EffectRow
+
 -- ==================================================================
 -- HANDLER-STACK SAFETY LEMMAS
 -- ==================================================================
@@ -435,6 +456,43 @@ theorem handler_push_preserves_scope
     (decide (installed = eff) || hs.any (fun active => decide (active = eff))) = true
   rw [h_scope]
   simp
+
+namespace EffectRow
+
+/--
+  If a closed outward row is accounted by the current handler stack, then a
+  row accepted by `dischargedBy handled outward observed` is accounted after
+  pushing `handled`.
+
+  This is the static-to-runtime bridge used by handler safety: an effect may
+  disappear from the outward row only because the lexical handler being
+  entered accounts for it.
+-/
+theorem dischargedBy_preserves_accounting
+  (hs : HandlerStack) (handled : EffectLabel)
+  (residual observed : EffectRow)
+  (h_discharged : dischargedBy handled residual observed)
+  (h_residual : accountedBy hs residual) :
+  accountedBy (hs.push handled) observed := by
+  cases residual with
+  | Open keep region =>
+      exact False.elim h_residual
+  | Closed keep =>
+      cases observed with
+      | Open seen region =>
+          exact False.elim h_discharged
+      | Closed seen =>
+          intro eff h_seen
+          have h_account := h_discharged eff h_seen
+          cases h_account with
+          | inl h_handled =>
+              subst eff
+              exact handler_push_establishes_scope hs handled
+          | inr h_keep =>
+              exact handler_push_preserves_scope
+                hs handled eff (h_residual eff h_keep)
+
+end EffectRow
 
 /--
   **Local Effect Safety.** Any effect proven to be in the active handler scope
@@ -468,6 +526,33 @@ theorem typed_handle_has_typed_handler
   cases typed with
   | tHandle _ handlerTyped _ _ =>
       exact ⟨_, handlerTyped⟩
+
+/--
+  A well-typed handler whose outward row is already accounted by the current
+  stack has both its protected computation and handler body accounted after the
+  handled effect is pushed.
+
+  This is the key induction lemma needed by a future progress theorem over
+  expression + handler-stack machine state.
+-/
+theorem typed_handle_rows_accounted_after_push
+  {Γ : EffContext} {e h : EffExpr} {eff : EffectLabel}
+  {τ : EffTy} {residual : EffectRow}
+  (typed : HasTypeEff Γ (.handle e eff h) τ residual)
+  (hs : HandlerStack)
+  (h_residual : EffectRow.accountedBy hs residual) :
+  ∃ bodyRow handlerRow,
+    HasTypeEff Γ e τ bodyRow ∧
+    HasTypeEff Γ h τ handlerRow ∧
+    EffectRow.accountedBy (hs.push eff) bodyRow ∧
+    EffectRow.accountedBy (hs.push eff) handlerRow := by
+  cases typed with
+  | tHandle bodyTyped handlerTyped bodyDischarged handlerDischarged =>
+      exact ⟨_, _, bodyTyped, handlerTyped,
+        EffectRow.dischargedBy_preserves_accounting
+          hs eff _ _ bodyDischarged h_residual,
+        EffectRow.dischargedBy_preserves_accounting
+          hs eff _ _ handlerDischarged h_residual⟩
 
 /-
   The effect calculus now preserves latent function rows through variables and
