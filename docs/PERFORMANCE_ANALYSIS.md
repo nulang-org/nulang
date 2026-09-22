@@ -24,7 +24,7 @@
 | # | Proposal | Status | Where / notes |
 |---|----------|--------|---------------|
 | 1.1 | Cranelift JIT backend | **Shipped** | `src/jit/` (~7,900 lines, cranelift 0.132), tiered into `VM::step` at `src/vm.rs:1170-1216` |
-| 1.2 | Type guard stripping | **Shipped** | `src/jit/typed_compiler.rs` emits guard-stripped CLIF; the live tiering path (`jit::tiered_execute_step_typed`, called from `VM::step`) recovers register types at tier-up via `typed_compiler::infer_reg_types` (conservative bytecode must-analysis) and compiles hot regions through the typed path when types are provable, falling back to scalar otherwise. Typed `IDiv`/`IMod`/`FCmpEq` always use runtime helpers to match interpreter semantics exactly |
+| 1.2 | Type guard stripping | **Shipped** | `src/jit/typed_compiler.rs` emits guard-stripped CLIF; the live VM tiering path (`probe_and_maybe_hot` → `prepare_tiered_step` → `execute_compiled`) recovers register types at tier-up via `typed_compiler::infer_reg_types` (conservative bytecode must-analysis) and compiles hot regions through the typed path when types are provable, falling back to scalar otherwise. Typed `IDiv`/`IMod`/`FCmpEq` always use runtime helpers to match interpreter semantics exactly |
 | 1.3 | Linear scan regalloc | Deferred | Still correct — Cranelift's own regalloc is used |
 | 1.4 | MLIR dialect | Deferred | No MLIR in tree |
 | 1.5 | SIMD auto-vectorization | **Shipped** | `src/jit/simd_analyzer.rs` + `src/jit/simd_compiler.rs` (I64x2/F64x2/I32x4/F32x4) |
