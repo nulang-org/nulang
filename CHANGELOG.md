@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Runtime hot-path performance wave — 2026-09-21
+- **Actor recorder and JIT hot paths are leaner** (Experimental, `src/runtime/actor.rs`, `src/runtime/mod.rs`, `src/jit/mod.rs`). Flight recording now allocates lazily, stores three raw inline payload samples, and renders human-readable summaries only on demand; rejected mailbox admissions are not recorded as deliveries. Tier-2 JIT bookkeeping is dense per-PC state, scalar regions skip fruitless promotion counting, and typed regions can genuinely replace their cached tier-1 function with SIMD code; static SIMD rejection disables further retries. Message payload representation is intentionally unchanged here so the separate inline-small-payload experiment can be benchmarked and reviewed independently.
+
 ### Production host-authority boundary — 2026-09-20
 - **Test effect handlers no longer exist in production runtime builds** (`src/runtime/mod.rs`, `src/runtime/callbacks.rs`). Mock effect interception is now `#[cfg(test)]` and crate-private, so actor-backed host effects in production cannot take the test-handler path before external-authority enforcement.
 - **Actor-backed `Process.run` remains non-dispatched until a real process sandbox exists** (`src/runtime/callbacks.rs`, `src/stdlib.rs`). A regression test proves that even an actor holding an exact `Process::Run(...)` grant cannot turn that grant into host shell execution; docs now mark the existing `/bin/sh -c` implementation as trusted/standalone-only.
