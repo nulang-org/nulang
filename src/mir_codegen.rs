@@ -409,7 +409,7 @@ impl MirCodegen {
         // Collect tools from agent actors into module.tools so the runtime
         // can resolve @tool-annotated functions for agent LLM requests.
         for meta in &self.module.actor_metadata {
-            if meta.is_agent {
+            if meta.semantics().map(|s| s.is_agent()).unwrap_or(false) {
                 for tool in &meta.tools {
                     if !self.module.tools.iter().any(|t| t.name == tool.name) {
                         self.module.tools.push(tool.clone());

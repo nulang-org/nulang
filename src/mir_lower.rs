@@ -60,10 +60,6 @@ pub fn lower_module(hir: &hir::Module) -> NuResult<mir::Module> {
 /// `decls` in place, so this pass does the same instead of erroring.
 fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
     match decl {
-        hir::Decl::CrdtDecl { name, .. } => {
-            // CRDT declaration - reserve a placeholder
-            let _ = ctx.reserve_function(name); // placeholder
-        }
         hir::Decl::Function(f) => {
             if ctx.func_map.contains_key(&f.name) {
                 return Err(compile_err(
@@ -152,18 +148,6 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                 migrations: String::new(),
             });
         }
-        hir::Decl::Workflow { name, .. } => {
-            unreachable!(
-                "workflow '{}' should be desugared to an actor by HIR lowering (desugar_workflow)",
-                name
-            );
-        }
-        hir::Decl::Agent { name, .. } => {
-            unreachable!(
-                "agent '{}' should be desugared to an actor by HIR lowering (desugar_agent)",
-                name
-            );
-        }
         hir::Decl::Module { decls, .. } => {
             for d in decls {
                 reserve_decl(ctx, d)?;
@@ -189,8 +173,7 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
         hir::Decl::TypeAlias { .. }
         | hir::Decl::RecordType { .. }
         | hir::Decl::EffectDecl { .. }
-        | hir::Decl::Import { .. }
-        | hir::Decl::Database { .. } => {}
+        | hir::Decl::Import { .. } => {}
     }
     Ok(())
 }

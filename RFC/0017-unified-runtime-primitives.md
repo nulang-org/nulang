@@ -1,6 +1,6 @@
 # RFC 0017: Unified Runtime Primitives
 
-- **Status:** Accepted — Phase 2 underway
+- **Status:** Accepted — Phase 3 underway
 - **Tier:** Experimental
 - **Created:** 2026-09-11
 - **Supersedes:** RFC 0004 (Draft) where it proposed that agent/workflow ergonomics must be removed rather than lowered to actors
@@ -11,15 +11,18 @@ Nulang has one execution model: actors. Higher-level constructs such as `agent`,
 `workflow`, `entity`, `organization`, and virtual actors are compositions or
 specializations of actors, not independent runtime species.
 
-The canonical semantic model contains seven primitives:
+The canonical semantic model contains five primitives:
 
 1. **Actor** — identity plus computation.
 2. **State** — local, durable, event-sourced, or CRDT-backed state.
 3. **Message** — `send`, `ask`, `receive`, and signals.
-4. **Effect** — interaction with storage, HTTP, inference, queues, and other resources.
+4. **Effect** — interaction with storage, HTTP, inference, time, queues, and other resources.
 5. **Capability** — authority to perform effects or move references across boundaries.
-6. **Supervisor** — lifecycle, failure containment, restart policy, links, and monitors.
-7. **Time** — sleep, timer, deadline, and recurring schedule semantics.
+
+Supervision is a runtime composition built from actors, lifecycle relationships,
+failure messages, links, monitors, and restart policy. Time is expressed through the
+effect system. Implementations may optimize both aggressively without introducing
+additional semantic species.
 
 Everything else should lower to a composition of these primitives.
 
@@ -56,25 +59,30 @@ a virtual actor/entity -> actor identity + activation/placement policy
 
 A compiler implementation may preserve source-origin metadata for diagnostics and
 specialized optimizations, but executable behavior must be expressible through the
-seven primitives above.
+five primitives above.
 
-## Canonical actor role
+## Canonical actor semantics
 
-Phase 1 introduced `primitives::ActorRole` as the single compatibility view over
-legacy `is_agent`, `is_workflow`, `is_organization`, and virtual-role flags.
+Phase 1 introduced `primitives::ActorRole` as a compatibility view over legacy
+`is_agent`, `is_workflow`, `is_organization`, and virtual-role flags. That removed
+independent precedence rules, but it still modeled orthogonal properties as one
+mutually exclusive role.
 
-Phase 2 extends that same role interpretation to live runtime actors and migrates the
-workflow runtime subsystem to consume `Actor::role()` instead of reading
-`is_workflow` directly. HIR, serialized `ActorMeta`, and live runtime actors therefore
-share one conflict rule and one semantic vocabulary while the legacy fields remain in
-place for compatibility.
+Phase 3 supersedes that model for new semantic code with the runtime-neutral
+`actor_semantics::ActorSemantics` normalization:
 
-New compiler/runtime code should use the canonical role instead of inventing its
-own precedence rules over boolean metadata. Conflicting specialized roles are an
-error.
+- durability is transient or durable;
+- activation is eager or virtual;
+- source origin is actor, agent, workflow, or organization.
 
-A later phase may replace the booleans in HIR/MIR/bytecode/runtime metadata with a
-single serialized role enum once all consumers have migrated.
+This means, for example, virtual activation can compose with agent/workflow origin
+instead of becoming a competing runtime species. The portable bytecode layer exposes
+`ActorMeta::semantics()`, so native code and compiler-only targets such as the browser
+playground share the same interpretation.
+
+`ActorRole` remains only as a compatibility view for legacy persisted fields and
+format migration. New compiler/runtime code should consume normalized semantics rather
+than inventing precedence rules over boolean metadata.
 
 ## Workflows
 
@@ -114,9 +122,9 @@ actor identity, messaging, supervision, durability, and placement semantics.
 
 ## Time
 
-`Time` is one semantic primitive even though the timer wheel uses several internal
-wake-message variants. Phase 2 introduces `TimeOperation` to classify those runtime
-mechanisms as:
+`Time` is an effect family, not a separate semantic primitive. The timer wheel still
+uses several internal wake-message variants, and `TimeOperation` classifies those
+runtime mechanisms as:
 
 - `Sleep` — resume an explicitly sleeping computation;
 - `ScheduledDelivery` — delayed actor delivery, including durable workflow timers;
@@ -125,7 +133,7 @@ mechanisms as:
 
 This keeps workflow timers, actor timers, receive deadlines, and retry sleeps from
 evolving independent scheduling semantics. The timer wheel remains an implementation
-detail behind the `Time` primitive.
+detail behind the `Time` effect/runtime handler.
 
 ## Queues and mailboxes
 
@@ -172,13 +180,14 @@ These distinctions must be visible in platform documentation and observability.
 
 ## Supervisors
 
-Supervision remains a first-class primitive rather than being reduced to generic
-retries. Supervisors own failure relationships: restart strategy, escalation,
-restart intensity, links, monitors, and eventually cross-node restart/migration
-policy.
+Supervision remains a first-class runtime facility, but it is not an independent
+semantic primitive. A supervisor is an actor/lifecycle pattern built from links,
+monitors, failure messages, restart strategy, escalation, restart intensity, and
+eventually cross-node restart/migration policy.
 
-This is one of the principal differences between Nulang and serverless systems that
-only expose retry policies on individual functions or jobs.
+This keeps supervision explicit and optimizable while avoiding a second execution
+model. It remains one of the principal differences between Nulang and serverless
+systems that expose only per-function retry policies.
 
 ## Placement
 
@@ -188,13 +197,14 @@ customer VPC, or other backend while preserving actor identity and message seman
 
 ## Compatibility
 
-Phases 1 and 2 are additive:
+The normalization phases are additive:
 
 - no source syntax is removed;
-- `agent` and `workflow` continue to lower to actors;
+- `agent`, `workflow`, and `state_machine` lower to actors before MIR;
+- `agent` and `workflow` no longer have distinct HIR declaration variants;
+- compile-time-only database/signal/given metadata is filtered before HIR;
 - legacy role booleans remain serialized for compatibility;
-- HIR, bytecode metadata, and live runtime actors share `ActorRole` interpretation;
-- the workflow subsystem consumes canonical roles without changing persisted state;
+- bytecode metadata and live runtime actors expose normalized actor semantics;
 - timer-wheel wake variants map to `TimeOperation` without changing timer formats;
 - delivery/effect vocabulary is tightened without weakening existing execution APIs.
 
@@ -205,15 +215,30 @@ Phases 1 and 2 are additive:
 - workflow event, query, signal/timer eligibility paths now consume canonical role
   semantics rather than independently reading `is_workflow`;
 - internal timer wake variants map to `TimeOperation`, unifying sleep, scheduled
-  delivery, deadlines, and retry backoff under the `Time` primitive;
+  delivery, deadlines, and retry backoff behind the `Time` effect family;
 - tests reject conflicting live actor roles just as compiler metadata already does.
 
 ## Follow-up phases
 
-1. Continue migrating remaining direct role-boolean consumers (agent, supervisor,
-   recovery, and distribution paths) to `ActorRole`.
-2. Replace multiple serialized booleans with a versioned role enum in a future format
-   revision.
+Phase 3 introduces `ActorSemantics` as the preferred compatibility view for new
+compiler/runtime code. It separates three orthogonal dimensions that legacy role
+flags had conflated:
+
+- durability: transient vs durable;
+- activation: eager vs virtual;
+- surface origin: actor, agent, workflow, or organization.
+
+`ActorRole` remains as a persisted-format compatibility view until the format
+migration is safe. Runtime agent detection, VM callbacks, and MIR tool collection
+now consume normalized semantics rather than reading `is_agent` directly.
+
+Remaining work:
+
+1. Audit remaining direct role-boolean reads and keep them only where compatibility
+   fields are serialized or mechanically copied; semantic decisions should use
+   `ActorSemantics`.
+2. Replace multiple serialized booleans with versioned semantic fields in a future
+   format revision.
 3. Make effect-boundary metadata visible in tracing and replay inspection.
 4. Require stable operation IDs for replayable external effects at the Cloud/runtime
    boundary.

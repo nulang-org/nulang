@@ -7,6 +7,7 @@
 // replacing those values with mathematical constants would change test semantics.
 #![cfg_attr(test, allow(clippy::approx_constant))]
 
+pub mod actor_semantics;
 mod actor_protocol;
 pub mod agent;
 #[cfg(feature = "native-codegen")]

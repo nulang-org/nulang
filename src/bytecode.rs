@@ -588,6 +588,26 @@ fn default_version() -> u32 {
     1
 }
 impl ActorMeta {
+    /// Return orthogonal semantic dimensions encoded by compatibility metadata.
+    ///
+    /// This method intentionally lives with the portable bytecode type rather
+    /// than in the native runtime so compiler-only targets (including the
+    /// browser playground) can consume the same normalization contract.
+    pub fn semantics(
+        &self,
+    ) -> Result<
+        crate::actor_semantics::ActorSemantics,
+        crate::actor_semantics::ActorOriginConflict,
+    > {
+        crate::actor_semantics::ActorSemantics::from_legacy_flags(
+            self.persistent,
+            self.is_workflow,
+            self.is_agent,
+            self.is_organization,
+            self.is_virtual,
+        )
+    }
+
     pub fn new(name: impl Into<String>) -> Self {
         ActorMeta {
             name: name.into(),

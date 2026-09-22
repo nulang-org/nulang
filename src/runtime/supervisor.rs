@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::primitives::ActorRole;
 use crate::types::ExitReason;
 
 use tracing::warn;
@@ -372,8 +371,8 @@ impl Supervisor {
                 template.compensation_offsets.clone(),
             );
         }
-        let role = match new_actor.role() {
-            Ok(role) => role,
+        let semantics = match new_actor.semantics() {
+            Ok(semantics) => semantics,
             Err(error) => {
                 warn!(
                     supervisor = %self.name,
@@ -384,7 +383,7 @@ impl Supervisor {
                 return None;
             }
         };
-        let is_workflow = matches!(role, ActorRole::Workflow);
+        let is_workflow = semantics.is_workflow();
         runtime.actors.insert(new_id, new_actor);
         // Register CRDT-backed fields with the CrdtManager.
         if let Some(ref mut mgr) = runtime.crdt_manager {

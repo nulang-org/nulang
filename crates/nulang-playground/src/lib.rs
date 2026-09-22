@@ -19,6 +19,8 @@
 
 // -- Compiler front-end (shared sources) ------------------------------------
 
+#[path = "../../../src/actor_semantics.rs"]
+pub mod actor_semantics;
 #[path = "../../../src/types.rs"]
 pub mod types;
 #[path = "../../../src/type_ir.rs"]
