@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Linear-time JIT module call analysis — 2026-09-22
+- **Direct-call suspension and recursion gating now share one lazily cached per-module call graph** (`src/jit/mod.rs`). Suspension propagates to callers with a reverse worklist, and recursion uses iterative SCC traversal rather than an n×n reachability matrix plus Floyd–Warshall. Tier-up analysis is therefore O(functions + direct calls) after the bytecode scan, with no host-stack recursion and no duplicated module rescans for the two safety gates.
+
 ### Candidate-only JIT hotness probing — 2026-09-22
 - **Cold interpreted execution now probes JIT hotness only at candidate compiled-region entries** (`src/vm.rs`). The VM precomputes per-module candidates for execution/function/behavior entries, source-statement starts, branch targets/fallthroughs, and successors of compilation boundaries, avoiding JIT backend dispatch and hot-counter mutation at ordinary straight-line bytecode PCs without changing language semantics.
 
