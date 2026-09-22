@@ -640,7 +640,8 @@ impl<'c> FnLowerer<'c> {
             hir::Stmt::Let { span, .. }
             | hir::Stmt::Assign { span, .. }
             | hir::Stmt::StateSet { span, .. }
-            | hir::Stmt::Emit { span, .. } => span.line(),
+            | hir::Stmt::Emit { span, .. }
+            | hir::Stmt::ParallelMarker { span, .. } => span.line(),
         } as u32;
         if line != 0 {
             self.b.set_line(line);
@@ -672,6 +673,10 @@ impl<'c> FnLowerer<'c> {
                     event: event.clone(),
                     args: ids,
                 });
+                Ok(())
+            }
+            hir::Stmt::ParallelMarker { marker, .. } => {
+                self.b.emit(mir::Stmt::ParallelMarker { marker: *marker });
                 Ok(())
             }
         }
