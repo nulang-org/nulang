@@ -24,6 +24,9 @@ evolve only behind explicit version boundaries and readers/migrations.
 *Will never break. A change here is a new language and requires a new major
 version + migration.*
 
+### Canonical portable package WASM — 2026-09-22
+- **`nula build --target wasm|cwasm`** (Experimental package tooling) makes the package manager own the canonical portable-WASM artifact path. `wasm` emits `.nula/dist/<package>.wasm`; `cwasm` also emits the Wasmtime AOT sidecar. Both reuse package preparation, dependency/language checks, module paths, and manifest-declared capability forwarding. Historical `nula build-wasm` remains an alias for the AOT form, and CI now smoke-tests the portable artifact's WASM magic.
+
 ### Language version 1.0.0-frozen — 2026-07-19
 
 - **RFC 0001 — Format Stability.** Established versioned, frozen binary
