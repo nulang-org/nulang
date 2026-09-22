@@ -405,12 +405,7 @@ struct NativeIntCache {
 }
 
 impl NativeIntCache {
-    fn load(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        regs_ptr: Value,
-        reg: usize,
-    ) -> Value {
+    fn load(&mut self, builder: &mut FunctionBuilder, regs_ptr: Value, reg: usize) -> Value {
         if let Some(&value) = self.values.get(&reg) {
             return value;
         }
@@ -1135,8 +1130,7 @@ pub fn compile_bytecode_region_typed(
     builder.seal_block(yield_block);
     // Mutable copy of type metadata so we can propagate result types.
     let mut meta = type_metadata.map(|m| m.clone()).unwrap_or_default();
-    let predecessor_counts =
-        region_predecessor_counts(instructions, start_offset, end_offset);
+    let predecessor_counts = region_predecessor_counts(instructions, start_offset, end_offset);
     let mut int_cache = NativeIntCache::default();
 
     // Compile each instruction
@@ -2459,6 +2453,152 @@ mod typed_tests {
             ptr.is_ok(),
             "typed int loop should compile: {:?}",
             ptr.err()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test 6b: Native Int SSA cache semantic boundaries
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_native_int_cache_preserves_48bit_wrap() {
+        use crate::value_layout::{INT48_MAX, INT48_MIN};
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            Instruction::new3(OpCode::IAdd, 0, 1, 2),
+            Instruction::new3(OpCode::IAdd, 2, 1, 3),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Int);
+        meta.set_type(1, KnownType::Int);
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_native_int_cache_wrap",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("cached Int chain should compile");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+        let mut regs = [0u64; 256];
+        regs[0] = Value::int(INT48_MAX).as_raw();
+        regs[1] = Value::int(1).as_raw();
+
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(unsafe { Value::from_bits(regs[2]) }.as_int(), Some(INT48_MIN));
+        assert_eq!(
+            unsafe { Value::from_bits(regs[3]) }.as_int(),
+            Some(INT48_MIN + 1)
+        );
+    }
+
+    #[test]
+    fn test_native_int_cache_flushes_before_runtime_fallback() {
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            Instruction::new3(OpCode::IAdd, 0, 1, 2),
+            // R3 is deliberately unknown in metadata, forcing the helper path.
+            Instruction::new3(OpCode::IAdd, 2, 3, 4),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Int);
+        meta.set_type(1, KnownType::Int);
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_native_int_cache_helper_boundary",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("mixed cached/helper chain should compile");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+        let mut regs = [0u64; 256];
+        regs[0] = Value::int(4).as_raw();
+        regs[1] = Value::int(5).as_raw();
+        regs[3] = Value::int(6).as_raw();
+
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(unsafe { Value::from_bits(regs[2]) }.as_int(), Some(9));
+        assert_eq!(unsafe { Value::from_bits(regs[4]) }.as_int(), Some(15));
+    }
+
+    #[test]
+    fn test_native_int_cache_materializes_at_cfg_join() {
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            Instruction::new3(OpCode::IAdd, 0, 1, 2),
+            // If R4 is true, skip pc2 and join at pc3.
+            Instruction::new3(OpCode::JmpT, 4, 0, 2),
+            Instruction::new3(OpCode::IAdd, 2, 1, 2),
+            Instruction::new3(OpCode::IAdd, 2, 1, 3),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Int);
+        meta.set_type(1, KnownType::Int);
+        meta.set_type(4, KnownType::Bool);
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_native_int_cache_cfg_join",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("branching cached Int region should compile");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+
+        let mut regs_true = [0u64; 256];
+        regs_true[0] = Value::int(2).as_raw();
+        regs_true[1] = Value::int(1).as_raw();
+        regs_true[4] = Value::bool(true).as_raw();
+        func(regs_true.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(
+            unsafe { Value::from_bits(regs_true[2]) }.as_int(),
+            Some(3)
+        );
+        assert_eq!(
+            unsafe { Value::from_bits(regs_true[3]) }.as_int(),
+            Some(4)
+        );
+
+        let mut regs_false = [0u64; 256];
+        regs_false[0] = Value::int(2).as_raw();
+        regs_false[1] = Value::int(1).as_raw();
+        regs_false[4] = Value::bool(false).as_raw();
+        func(regs_false.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(
+            unsafe { Value::from_bits(regs_false[2]) }.as_int(),
+            Some(4)
+        );
+        assert_eq!(
+            unsafe { Value::from_bits(regs_false[3]) }.as_int(),
+            Some(5)
         );
     }
 
