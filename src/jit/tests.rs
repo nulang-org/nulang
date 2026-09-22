@@ -689,49 +689,117 @@ fn test_jit_direct_call_loop_tiers_up() {
 }
 
 #[test]
-fn test_native_leaf_analysis_tracks_exact_register_clobbers() {
-    let mut module = CodeModule::new("native_leaf_analysis");
+fn test_native_callee_analysis_tracks_exact_register_clobbers() {
+    let mut module = CodeModule::new("native_callee_analysis");
     module.function_table.push(0);
     module.emit(Instruction::new2(OpCode::Move, 0, 15));
     module.emit(Instruction::new1(OpCode::IInc, 15));
     module.emit(Instruction::new1(OpCode::RetVal, 15));
+    module.debug_functions.push(DebugFunctionInfo {
+        name: "leaf".into(),
+        code_offset: 0,
+        code_len: 3,
+        params: vec![15],
+        locals: vec![(15, Some("x".into()))],
+    });
 
-    let (start, body_len, ret_reg, clobbers) =
-        analyze_native_leaf(&module, 0).expect("straight-line leaf must be eligible");
+    let (start, body_len, argc, clobbers) =
+        analyze_native_callee(&module, 0).expect("straight-line callee must be eligible");
     assert_eq!(start, 0);
-    assert_eq!(body_len, 2);
-    assert_eq!(ret_reg, 15);
-    assert_eq!(clobbers, vec![15]);
+    assert_eq!(body_len, 3);
+    assert_eq!(argc, 1);
+    assert_eq!(clobbers, vec![15, 255]);
 }
 
 #[test]
-fn test_native_leaf_analysis_tracks_fneg_destination() {
-    let mut module = CodeModule::new("native_leaf_fneg");
+fn test_native_callee_analysis_tracks_fneg_destination() {
+    let mut module = CodeModule::new("native_callee_fneg");
     module.function_table.push(0);
     module.emit(Instruction::new3(OpCode::FNeg, 0, 0, 23));
     module.emit(Instruction::new1(OpCode::RetVal, 23));
+    module.debug_functions.push(DebugFunctionInfo {
+        name: "neg".into(),
+        code_offset: 0,
+        code_len: 2,
+        params: vec![15],
+        locals: vec![(23, Some("result".into()))],
+    });
 
-    let (_, _, ret_reg, clobbers) =
-        analyze_native_leaf(&module, 0).expect("FNeg leaf must be eligible");
-    assert_eq!(ret_reg, 23);
-    assert_eq!(clobbers, vec![23]);
+    let (_, body_len, argc, clobbers) =
+        analyze_native_callee(&module, 0).expect("FNeg callee must be eligible");
+    assert_eq!(body_len, 2);
+    assert_eq!(argc, 1);
+    assert_eq!(clobbers, vec![23, 255]);
 }
 
 #[test]
-fn test_native_leaf_rejects_erroring_ineg() {
-    let mut module = CodeModule::new("native_leaf_ineg_error");
+fn test_native_callee_rejects_erroring_ineg() {
+    let mut module = CodeModule::new("native_callee_ineg_error");
     module.function_table.push(0);
-    module.emit(Instruction::new2(OpCode::INeg, 0, 15));
-    module.emit(Instruction::new1(OpCode::RetVal, 15));
+    module.emit(Instruction::new2(OpCode::Move, 0, 15));
+    module.emit(Instruction::new2(OpCode::INeg, 15, 16));
+    module.emit(Instruction::new1(OpCode::RetVal, 16));
+    module.debug_functions.push(DebugFunctionInfo {
+        name: "neg".into(),
+        code_offset: 0,
+        code_len: 3,
+        params: vec![15],
+        locals: vec![(15, Some("x".into())), (16, Some("result".into()))],
+    });
 
     assert!(
-        analyze_native_leaf(&module, 0).is_none(),
+        analyze_native_callee(&module, 0).is_none(),
         "INeg can raise a VM error and must stay on the interpreter helper path"
     );
 }
 
 #[test]
-fn test_native_leaf_rejects_branchy_callee_and_keeps_helper_fallback() {
+fn test_native_callee_rejects_read_before_definition() {
+    let mut module = CodeModule::new("native_callee_undef");
+    module.function_table.push(0);
+    // A fresh VM frame would contain nil in r15. Sharing the caller register
+    // file must not make an arbitrary caller value observable here.
+    module.emit(Instruction::new1(OpCode::IInc, 15));
+    module.emit(Instruction::new1(OpCode::RetVal, 15));
+    module.debug_functions.push(DebugFunctionInfo {
+        name: "bad".into(),
+        code_offset: 0,
+        code_len: 2,
+        params: vec![16],
+        locals: vec![(15, Some("uninitialized".into()))],
+    });
+
+    assert!(
+        analyze_native_callee(&module, 0).is_none(),
+        "read-before-def must stay on the fresh interpreter frame path"
+    );
+}
+
+#[test]
+fn test_caller_liveness_is_bounded_to_values_used_after_call() {
+    let mut module = CodeModule::new("caller_liveness");
+    module.emit(Instruction::new3(OpCode::Call, 254, 1, 20));
+    module.emit(Instruction::new3(OpCode::IAdd, 20, 30, 31));
+    module.emit(Instruction::new1(OpCode::RetVal, 31));
+    module.debug_functions.push(DebugFunctionInfo {
+        name: "caller".into(),
+        code_offset: 0,
+        code_len: 3,
+        params: vec![],
+        locals: vec![],
+    });
+
+    let live = caller_live_after_call(&module, 0);
+    assert!(regset_contains(&live, 20), "call result is live");
+    assert!(regset_contains(&live, 30), "unrelated caller value is live");
+    assert!(
+        !regset_contains(&live, 40),
+        "dead caller registers should not be saved"
+    );
+}
+
+#[test]
+fn test_native_branchy_callee_uses_bounded_native_thunk() {
     use crate::hir_lower::lower_module;
     use crate::lexer::Lexer;
     use crate::mir_codegen::compile_mir;
@@ -774,12 +842,11 @@ fn test_native_leaf_rejects_branchy_callee_and_keeps_helper_fallback() {
     assert_eq!(expected.as_int(), Some(20001));
     assert!(
         jit_vm.jit_compiled_count() > 0,
-        "caller loop should still JIT around the safe direct call"
+        "caller loop should compile around the direct call"
     );
-    assert_eq!(
-        jit_vm.jit_native_leaf_compiled_count(),
-        0,
-        "branchy adjust() must use the re-entrant interpreter helper fallback"
+    assert!(
+        jit_vm.jit_native_leaf_compiled_count() > 0,
+        "forward-branching adjust() should compile as a bounded native callee"
     );
 }
 
@@ -1754,6 +1821,9 @@ fn test_direct_call_target_rejects_stale_r254_definition() {
     let mut module = CodeModule::new("direct_call_stale_target");
     module.function_table.push(0);
 
+    // Looks like a direct call at first, but r254 is overwritten by an
+    // unrelated arithmetic instruction before Call. Recovery must stop at
+    // that write instead of scanning back to the stale Const0.
     module.emit(Instruction::new1(OpCode::Const0, 254));
     module.emit(Instruction::new1(OpCode::Const1, 1));
     module.emit(Instruction::new3(OpCode::IAdd, 1, 1, 254));

@@ -80,11 +80,11 @@ fn bench_jit_hot_loop(c: &mut Criterion) {
 
 /// A hot loop that calls a tiny straight-line function each iteration.
 ///
-/// Direct, non-suspending calls fold into the caller region. Eligible
-/// straight-line leaves compile as native-to-native thunks; branchy or otherwise
-/// ineligible callees use the re-entrant interpreter helper. This benchmark is
-/// the steady-state signal for the native-leaf fast path against the identical
-/// JIT-disabled interpreter baseline.
+/// Direct, non-suspending calls fold into the caller region. Pure acyclic
+/// callees compile as native-to-native thunks; ineligible callees use the
+/// re-entrant interpreter helper. This benchmark is the steady-state signal
+/// for the smallest native-call fast path against the identical interpreter
+/// baseline.
 fn bench_jit_function_call_loop(c: &mut Criterion) {
     let source = "fn add(x: Int, y: Int) -> Int { x + y }; var sum = 0; var i = 0; while i < 100000 { sum = add(sum, i); i = i + 1; }; sum";
     let module = compile(source);
@@ -104,6 +104,38 @@ fn bench_jit_function_call_loop(c: &mut Criterion) {
     // JIT-disabled interp baseline for the IDENTICAL source, so the bench
     // directly shows whether the JIT helps or hurts call-heavy loops.
     c.bench_function("jit/function_call_loop_interp", |b| {
+        b.iter_batched(
+            || {
+                let mut vm = nulang::vm::VM::new_without_jit();
+                vm.load_module(module.clone());
+                vm
+            },
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+}
+
+/// A hot loop whose callee contains forward control-flow branches. This is the
+/// steady-state regression signal for bounded caller liveness + branchy native
+/// callee thunks, with an identical interpreter baseline.
+fn bench_jit_branchy_function_call_loop(c: &mut Criterion) {
+    let source = "fn adjust(x: Int) -> Int { if x > 0 then { x + 1 } else { x - 1 } }; var sum = 1; var i = 0; while i < 100000 { sum = adjust(sum); i = i + 1; }; sum";
+    let module = compile(source);
+
+    c.bench_function("jit/branchy_function_call_loop", |b| {
+        b.iter_batched(
+            || {
+                let mut vm = fresh_vm(&module);
+                let _ = vm.run();
+                vm
+            },
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+
+    c.bench_function("jit/branchy_function_call_loop_interp", |b| {
         b.iter_batched(
             || {
                 let mut vm = nulang::vm::VM::new_without_jit();
@@ -166,5 +198,6 @@ criterion_group!(
     benches,
     bench_jit_hot_loop,
     bench_jit_function_call_loop,
+    bench_jit_branchy_function_call_loop,
     bench_jit_tiering_profitability
 );

@@ -190,25 +190,41 @@ overhead exceeded the small native-block savings — the same trap the existing
 keeps the caller region resident and does NOT re-enter it per call) avoids
 that regression.
 
-**Native leaf slice (2026-09-22):** the first native-to-native path now
-specializes direct, non-suspending, non-recursive callees whose bytecode is a
-straight-line leaf of at most 32 instructions. Each leaf is compiled into a
-separate thunk that is deliberately not inserted into the ordinary hot-region
-cache. The caller statically saves only the leaf's exact register write-set,
-calls the thunk through the existing `(regs, constants)` ABI, captures the
-callee return register, restores caller registers, and stores the call
-destination. The leaf thunk omits its own safepoint because the containing hot
-region already owns scheduling. Branchy/nested/effectful callees keep the
-existing interpreter helper fallback.
+**Bounded native-call slice (2026-09-22):** the native-to-native path now
+handles direct, non-suspending, non-recursive **pure acyclic callees up to 96
+bytecode instructions**, including forward branches. Each eligible callee is
+compiled into a separate thunk that is deliberately not inserted into the
+ordinary hot-region cache. A backward bytecode liveness fixed point computes
+the caller registers live after each folded `Call`; the save set is
+`live_after(call) ∩ callee_clobbers`, with the call destination excluded.
+The live-out table is computed once per caller code range during region
+preparation and reused across all direct-call sites, avoiding an
+O(call-sites × function-size) tier-up analysis penalty. This replaces
+whole-write-set preservation with bounded caller-save.
+
+Native callee eligibility includes a forward definite-definition analysis.
+Only r0..argc begin initialized, exactly matching `VM::Call`'s fresh frame;
+any path that reads another register before a dominating definition is
+rejected. Backward branches/loops, nested calls, effects, heap/refcount
+operations, suspension, malformed control flow, and oversized callees retain
+the existing re-entrant interpreter helper fallback.
+
+Native thunks use the existing `(regs, constants)` ABI and write their tagged
+return value into r255 immediately before returning. The caller captures that
+mailbox before restoring live registers, so multiple `RetVal` paths can use
+different source registers without changing the region ABI. r255 itself is
+included in the callee clobber set and is restored when its previous value is
+live across the call.
 
 The compiled call site also validates the live function register against the
 recovered static function index; mismatch deopts to the exact `Call` PC
 instead of dispatching a stale target.
 
-**Next (for recursion / closures):** general nested native calls with bounded
-live-across-call liveness rather than whole leaf write-set restoration. This
-must extend the same suspension and target guards to branchy callees and then
-address recursive call cycles explicitly.
+**Next (for recursion / closures):** preserve the same liveness and fresh-frame
+invariants while introducing a native recursion strategy. Recursive SCCs stay
+on heap-backed interpreter frames until stack growth/overflow policy and
+safepoint semantics are explicit; closure calls additionally need environment
+ABI handling before they can share this path.
 
 ## Correctness fix landed on this branch
 
