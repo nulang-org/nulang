@@ -1570,6 +1570,12 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Split-context linear ownership flow — 2026-09-22
+- **Capability branch joins now distinguish possible from guaranteed consumption.** `CapabilityAnalyzer` tracks `may` consumption by union and `must` consumption by intersection. A value consumed on only one branch can no longer be reused after the join, while exactly-once discharge still requires every path to consume it.
+- **Loop and handler semantics are stricter.** Moving an outer ownership value from a repeating `while` condition or receive guard is rejected; optional effect-handler arms contribute possible consumption but cannot falsely satisfy a linear must-use obligation.
+- **The formal model now matches the implementation.** `spec/formal/capabilities.lean` replaces the known-false single-context `linear_at_most_once` conjecture with proved split-flow branch laws and removes that `sorry`.
+
+
 ### Pattern usefulness and exhaustiveness diagnostics — 2026-09-22
 - **Typed Maranget-style usefulness analysis replaces the finite-case heuristic.** W0201 now emits uncovered witness patterns across nested variants, tuples, records, booleans, Nil/Unit, and literal patterns over infinite primitive domains.
 - **W0202 reports unreachable/subsumed match arms.** Each arm is checked against previous unguarded coverage; guarded arms can be unreachable but never shadow later arms because their guard may fail.
