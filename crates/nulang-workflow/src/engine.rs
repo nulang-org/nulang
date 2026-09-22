@@ -137,9 +137,25 @@ impl DurableWorkflowExecutor {
             return Ok(ActivityProgress::Completed(result));
         }
 
-        if let Some((attempt, error, retryable)) = state.last_failure.clone() {
+        if let Some((attempt, error, retryable, next_retry_at_millis)) =
+            state.last_failure.clone()
+        {
             if !state.retry.should_retry(attempt, retryable) {
                 return Ok(ActivityProgress::Failed { attempt, error });
+            }
+
+            let ready_at_millis = next_retry_at_millis.ok_or_else(|| {
+                WorkflowEngineError::HistoryConflict(format!(
+                    "activity {} is retryable after attempt {} but has no retry deadline",
+                    invocation_id, attempt
+                ))
+            })?;
+            if runtime.now_millis() < ready_at_millis {
+                return Ok(ActivityProgress::WaitingForRetry {
+                    next_attempt: attempt.saturating_add(1),
+                    ready_at_millis,
+                    last_error: error,
+                });
             }
         }
 
@@ -161,26 +177,7 @@ impl DurableWorkflowExecutor {
         let attempt = state
             .last_failure
             .as_ref()
-            .map_or(1, |(attempt, _, _)| attempt.saturating_add(1));
-
-        if let Some((next_attempt, ready_at_millis)) = state.retry_schedule {
-            if next_attempt != attempt {
-                return Err(WorkflowEngineError::HistoryConflict(format!(
-                    "activity {} scheduled retry attempt {}, expected {}",
-                    invocation_id, next_attempt, attempt
-                )));
-            }
-            if runtime.now_millis() < ready_at_millis {
-                return Ok(ActivityProgress::WaitingForRetry {
-                    next_attempt,
-                    ready_at_millis,
-                    last_error: state
-                        .last_failure
-                        .map(|(_, error, _)| error)
-                        .unwrap_or_default(),
-                });
-            }
-        }
+            .map_or(1, |(attempt, _, _, _)| attempt.saturating_add(1));
 
         let dispatch = ActivityDispatchRequest {
             workflow_id: workflow_id.clone(),
@@ -209,39 +206,33 @@ impl DurableWorkflowExecutor {
                 Ok(ActivityProgress::Completed(result))
             }
             ActivityDispatchResult::Failed { error, retryable } => {
-                history.revision = append(
-                    runtime,
-                    workflow_id,
-                    history.revision,
-                    WorkflowEvent::ActivityAttemptFailed {
-                        invocation_id: invocation_id.clone(),
-                        attempt,
-                        error: error.clone(),
-                        retryable,
-                    },
-                )?;
+                let should_retry = state.retry.should_retry(attempt, retryable);
+                let next_retry_at_millis = should_retry.then(|| {
+                    let delay_ms = state.retry.delay_after_failure(attempt).unwrap_or(0);
+                    runtime.now_millis().saturating_add(delay_ms)
+                });
 
-                if !state.retry.should_retry(attempt, retryable) {
-                    return Ok(ActivityProgress::Failed { attempt, error });
-                }
-
-                let delay_ms = state.retry.delay_after_failure(attempt).unwrap_or(0);
-                let ready_at_millis = runtime.now_millis().saturating_add(delay_ms);
                 append(
                     runtime,
                     workflow_id,
                     history.revision,
-                    WorkflowEvent::ActivityRetryScheduled {
+                    WorkflowEvent::ActivityAttemptFailed {
                         invocation_id,
-                        next_attempt: attempt.saturating_add(1),
-                        ready_at_millis,
+                        attempt,
+                        error: error.clone(),
+                        retryable,
+                        next_retry_at_millis,
                     },
                 )?;
-                Ok(ActivityProgress::WaitingForRetry {
-                    next_attempt: attempt.saturating_add(1),
-                    ready_at_millis,
-                    last_error: error,
-                })
+
+                match next_retry_at_millis {
+                    Some(ready_at_millis) => Ok(ActivityProgress::WaitingForRetry {
+                        next_attempt: attempt.saturating_add(1),
+                        ready_at_millis,
+                        last_error: error,
+                    }),
+                    None => Ok(ActivityProgress::Failed { attempt, error }),
+                }
             }
         }
     }
@@ -267,8 +258,7 @@ struct ActivityState {
     prepared: bool,
     retry: RetryPolicy,
     completed: Option<Vec<u8>>,
-    last_failure: Option<(u32, String, bool)>,
-    retry_schedule: Option<(u32, u64)>,
+    last_failure: Option<(u32, String, bool, Option<u64>)>,
 }
 
 fn inspect_activity<E>(
@@ -279,8 +269,7 @@ fn inspect_activity<E>(
     let mut prepared = false;
     let mut retry = spec.retry;
     let mut completed = None;
-    let mut last_failure: Option<(u32, String, bool)> = None;
-    let mut retry_schedule = None;
+    let mut last_failure: Option<(u32, String, bool, Option<u64>)> = None;
 
     for event in &history.events {
         match event {
@@ -317,6 +306,7 @@ fn inspect_activity<E>(
                 attempt,
                 error,
                 retryable,
+                next_retry_at_millis,
             } if id == invocation_id => {
                 if !prepared {
                     return Err(WorkflowEngineError::HistoryConflict(format!(
@@ -327,7 +317,7 @@ fn inspect_activity<E>(
 
                 let expected = last_failure
                     .as_ref()
-                    .map_or(1, |(prev, _, _)| prev.saturating_add(1));
+                    .map_or(1, |(prev, _, _, _)| prev.saturating_add(1));
                 if *attempt != expected {
                     return Err(WorkflowEngineError::HistoryConflict(format!(
                         "activity {} failure attempt {} is not contiguous after {}",
@@ -337,32 +327,20 @@ fn inspect_activity<E>(
                     )));
                 }
 
-                last_failure = Some((*attempt, error.clone(), *retryable));
-                retry_schedule = None;
-            }
-            WorkflowEvent::ActivityRetryScheduled {
-                invocation_id: id,
-                next_attempt,
-                ready_at_millis,
-            } if id == invocation_id => {
-                let expected = last_failure
-                    .as_ref()
-                    .map(|(attempt, _, _)| attempt.saturating_add(1))
-                    .ok_or_else(|| {
-                        WorkflowEngineError::HistoryConflict(format!(
-                            "activity {} scheduled a retry without a failed attempt",
-                            invocation_id
-                        ))
-                    })?;
-
-                if *next_attempt != expected {
+                let retry_allowed = retry.should_retry(*attempt, *retryable);
+                if retry_allowed != next_retry_at_millis.is_some() {
                     return Err(WorkflowEngineError::HistoryConflict(format!(
-                        "activity {} scheduled retry attempt {}, expected {}",
-                        invocation_id, next_attempt, expected
+                        "activity {} attempt {} has an inconsistent retry deadline",
+                        invocation_id, attempt
                     )));
                 }
 
-                retry_schedule = Some((*next_attempt, *ready_at_millis));
+                last_failure = Some((
+                    *attempt,
+                    error.clone(),
+                    *retryable,
+                    *next_retry_at_millis,
+                ));
             }
             WorkflowEvent::ActivityCompleted {
                 invocation_id: id,
@@ -393,7 +371,6 @@ fn inspect_activity<E>(
         retry,
         completed,
         last_failure,
-        retry_schedule,
     })
 }
 
@@ -603,6 +580,59 @@ mod tests {
             rt.dispatches[1].idempotency_key
         );
         assert_eq!(rt.dispatches[1].attempt, 2);
+    }
+
+    #[test]
+    fn test_failure_history_pins_retry_deadline_across_recovery() {
+        let wf = workflow();
+        let spec = activity().retry(RetryPolicy::fixed(3, 500));
+        let id =
+            ActivityInvocationId::derive(&wf, &spec.step, spec.occurrence, &spec.operation);
+        let mut rt = MockRuntime::new(vec![ActivityDispatchResult::Completed(
+            b"ok".to_vec(),
+        )]);
+        rt.now = 1_400;
+        rt.history = WorkflowHistory::new(
+            2,
+            vec![
+                WorkflowEvent::ActivityPrepared {
+                    invocation_id: id,
+                    step: spec.step.clone(),
+                    operation: spec.operation.clone(),
+                    request: spec.request.clone(),
+                    retry: spec.retry,
+                },
+                WorkflowEvent::ActivityAttemptFailed {
+                    invocation_id: id,
+                    attempt: 1,
+                    error: "timeout".into(),
+                    retryable: true,
+                    next_retry_at_millis: Some(1_500),
+                },
+            ],
+        );
+
+        assert_eq!(
+            DurableWorkflowExecutor
+                .execute_activity(&mut rt, &wf, &spec)
+                .unwrap(),
+            ActivityProgress::WaitingForRetry {
+                next_attempt: 2,
+                ready_at_millis: 1_500,
+                last_error: "timeout".into(),
+            }
+        );
+        assert!(rt.dispatches.is_empty());
+
+        rt.now = 1_500;
+        assert_eq!(
+            DurableWorkflowExecutor
+                .execute_activity(&mut rt, &wf, &spec)
+                .unwrap(),
+            ActivityProgress::Completed(b"ok".to_vec())
+        );
+        assert_eq!(rt.dispatches.len(), 1);
+        assert_eq!(rt.dispatches[0].attempt, 2);
     }
 
     #[test]
