@@ -180,7 +180,7 @@ pub enum Stmt {
     },
     /// Zero-cost structured-concurrency metadata preserved from HIR.
     ParallelMarker {
-        marker: crate::primitives::ParallelRegionMarker,
+        marker: crate::parallel_marker::ParallelRegionMarker,
     },
 }
 
