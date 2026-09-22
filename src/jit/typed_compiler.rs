@@ -362,11 +362,11 @@ pub(crate) fn store_reg(builder: &mut FunctionBuilder, regs_ptr: Value, idx: usi
 
 /// Normalize an unboxed integer to Nulang's signed 48-bit Int domain.
 ///
-/// The boxed VM masks every integer result to 48 payload bits before the next
-/// instruction observes it. Native SSA must preserve that per-instruction
-/// wraparound, not merely mask when eventually spilling back to the register
-/// file. Shifting left 16 and arithmetic-shifting right 16 is the compact
-/// sign-extending truncation from i64 to signed i48.
+/// Cached add/sub/mul/neg values may remain in a wider modulo-2^64
+/// representation because projecting them to the low 48 bits commutes with
+/// those ring operations. Sign-sensitive consumers (comparisons today) must
+/// canonicalize before observing the value. Spills remain safe because
+/// `emit_tag_int` masks to the 48-bit payload.
 #[inline]
 fn emit_wrap_i48(builder: &mut FunctionBuilder, value: Value) -> Value {
     let shifted = builder.ins().ishl_imm(value, 16);
@@ -554,7 +554,6 @@ fn emit_typed_ibinop(
         TypedIntOp::Sub => builder.ins().isub(a, b),
         TypedIntOp::Mul => builder.ins().imul(a, b),
     };
-    let result = emit_wrap_i48(builder, result);
 
     cache.set_dirty(dst, result);
 }
@@ -639,6 +638,8 @@ fn emit_typed_icmp(
 ) {
     let a = cache.get_or_load(builder, regs_ptr, op1);
     let b = cache.get_or_load(builder, regs_ptr, op2);
+    let a = emit_wrap_i48(builder, a);
+    let b = emit_wrap_i48(builder, b);
 
     let cond = builder.ins().icmp(cc, a, b);
     let tagged_bool = emit_tag_bool(builder, cond);
@@ -695,7 +696,6 @@ fn emit_typed_iunary(
             builder.ins().isub(val, one)
         }
     };
-    let result = emit_wrap_i48(builder, result);
 
     cache.set_dirty(dst, result);
 }
