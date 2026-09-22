@@ -81,8 +81,8 @@ Every decade brings new AI models, new cloud providers, and new orchestration fr
 
 - **Actors** were meaningful in 1973 (Hewitt et al.) and will be meaningful in 2073.
 - **Algebraic effects** generalize exceptions, async/await, generators, and state — all in one mechanism.
-- **Reference capabilities** prevent data races without a GC or borrow checker.
-- **Durable state** means your program's execution survives the machine it runs on.
+- **Reference capabilities** provide compile-time aliasing/sendability constraints without Rust-style borrowing; the runtime still uses ORCA garbage collection.
+- **Durable state** gives actors/entities runtime-managed persistence and recovery mechanisms across failures, subject to the configured store and recovery semantics.
 
 Nulang keeps a small portability/core layer and evolves higher-level surfaces separately. Under [RFC 0021](https://github.com/nulang-org/nulang/blob/main/RFC/0021-compatibility-before-freeze.md), pre-adoption source semantics are currently Stable rather than permanently Frozen; published artifact/wire/ABI versions remain explicit compatibility obligations.
 
