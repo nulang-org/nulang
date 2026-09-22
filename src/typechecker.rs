@@ -3349,121 +3349,6 @@ impl TypeChecker {
         Ok((final_subst.clone(), apply_subst(&elem_var, &final_subst)))
     }
 
-    /// Return a conservative set of definitely-uncovered finite cases.
-    ///
-    /// This intentionally does not attempt to prove coverage for infinite
-    /// domains (Int/String/Float) or complex structural patterns yet. It only
-    /// reports a case when the checker can prove the match may miss it. Guarded
-    /// arms are excluded by the caller because a guard may evaluate to false.
-    fn finite_missing_match_cases(ty: &Type, patterns: &[&Pattern]) -> Option<Vec<String>> {
-        fn strip_alias<'a>(pattern: &'a Pattern) -> &'a Pattern {
-            match pattern {
-                Pattern::Alias(_, inner) => strip_alias(inner),
-                other => other,
-            }
-        }
-
-        fn irrefutable(pattern: &Pattern, ty: &Type) -> bool {
-            match strip_alias(pattern) {
-                Pattern::Wild | Pattern::Var(_) => true,
-                Pattern::Tuple(items) => match ty {
-                    Type::Tuple(types) if items.len() == types.len() => items
-                        .iter()
-                        .zip(types)
-                        .all(|(pattern, ty)| irrefutable(pattern, ty)),
-                    _ => false,
-                },
-                Pattern::Record(fields) => match ty {
-                    Type::Record(types) => fields.iter().all(|(name, pattern)| {
-                        types
-                            .iter()
-                            .find(|(field, _)| field == name)
-                            .is_some_and(|(_, ty)| irrefutable(pattern, ty))
-                    }),
-                    _ => false,
-                },
-                Pattern::Lit(Literal::Nil) => *ty == Type::nil(),
-                Pattern::Lit(Literal::Unit) => *ty == Type::unit(),
-                _ => false,
-            }
-        }
-
-        if patterns.iter().any(|pattern| irrefutable(pattern, ty)) {
-            return Some(Vec::new());
-        }
-
-        match ty {
-            Type::Primitive(PrimitiveType::Bool) => {
-                let mut seen_true = false;
-                let mut seen_false = false;
-                for pattern in patterns {
-                    match strip_alias(pattern) {
-                        Pattern::Lit(Literal::Bool(true)) => seen_true = true,
-                        Pattern::Lit(Literal::Bool(false)) => seen_false = true,
-                        _ => {}
-                    }
-                }
-                let mut missing = Vec::new();
-                if !seen_true {
-                    missing.push("true".to_string());
-                }
-                if !seen_false {
-                    missing.push("false".to_string());
-                }
-                Some(missing)
-            }
-            Type::Primitive(PrimitiveType::Nil) => Some(vec!["nil".to_string()]),
-            Type::Primitive(PrimitiveType::Unit) => Some(vec!["()".to_string()]),
-            Type::Variant(variants) => {
-                let mut missing = Vec::new();
-                for (name, payload_ty) in variants {
-                    let mut bare_constructor = false;
-                    let mut payload_patterns: Vec<&Pattern> = Vec::new();
-                    for pattern in patterns {
-                        if let Pattern::Variant(pattern_name, payload) = strip_alias(pattern) {
-                            if pattern_name == name {
-                                match payload.as_deref() {
-                                    Some(inner) => payload_patterns.push(inner),
-                                    None => bare_constructor = true,
-                                }
-                            }
-                        }
-                    }
-
-                    if bare_constructor {
-                        continue;
-                    }
-
-                    match payload_ty {
-                        None => {
-                            if payload_patterns.is_empty() {
-                                missing.push(name.clone());
-                            }
-                        }
-                        Some(payload_ty) => {
-                            if payload_patterns.is_empty() {
-                                missing.push(format!("{}(_)", name));
-                                continue;
-                            }
-                            if let Some(inner_missing) =
-                                Self::finite_missing_match_cases(payload_ty, &payload_patterns)
-                            {
-                                for inner in inner_missing {
-                                    missing.push(format!("{}({})", name, inner));
-                                }
-                            }
-                        }
-                    }
-                }
-                Some(missing)
-            }
-            Type::Nominal { underlying, .. } => {
-                Self::finite_missing_match_cases(underlying, patterns)
-            }
-            _ => None,
-        }
-    }
-
     /// Infer the type of a pattern match expression.
     fn infer_match(
         &mut self,
@@ -3507,23 +3392,32 @@ impl TypeChecker {
             });
         }
 
-        // Guards do not contribute to total coverage: even a wildcard guard
-        // can evaluate to false. For now we deliberately report only missing
-        // cases that can be proved from finite types; the runtime fallback is
-        // retained for compatibility while the full usefulness matrix lands.
+        // Use the typed Maranget-style usefulness matrix to find missing
+        // witnesses and arms subsumed by previous unguarded patterns. Guards
+        // are reachability-checked but never contribute to total coverage.
         let scrut_ty_now = apply_subst(&scrut_ty, &subst);
-        let unguarded_patterns: Vec<&Pattern> = arms
+        let coverage_arms: Vec<(&Pattern, bool)> = arms
             .iter()
-            .filter_map(|(pattern, guard, _)| guard.is_none().then_some(pattern))
+            .map(|(pattern, guard, _)| (pattern, guard.is_some()))
             .collect();
-        if let Some(missing) = Self::finite_missing_match_cases(&scrut_ty_now, &unguarded_patterns)
-        {
-            if !missing.is_empty() {
-                self.warnings
-                    .push(crate::types::NuWarning::non_exhaustive_match(
-                        span, &missing,
-                    ));
-            }
+        let coverage = crate::pattern_usefulness::analyze_match(&scrut_ty_now, &coverage_arms);
+        if !coverage.missing.is_empty() {
+            self.warnings
+                .push(crate::types::NuWarning::non_exhaustive_match(
+                    span,
+                    &coverage.missing,
+                ));
+        }
+        for arm_index in coverage.unreachable_arms {
+            let arm_span = arms
+                .get(arm_index)
+                .map(|(_, _, body)| body.span())
+                .unwrap_or(span);
+            self.warnings
+                .push(crate::types::NuWarning::unreachable_match_arm(
+                    arm_span,
+                    arm_index,
+                ));
         }
 
         // Unify all arm types
@@ -4940,6 +4834,61 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].msg.contains("true"));
         assert!(warnings[0].msg.contains("false"));
+    }
+
+    #[test]
+    fn test_match_usefulness_warns_on_unreachable_arm() {
+        let mut tc = TypeChecker::new();
+        let ctx = TypeContext::new();
+        let expr = Expr::Match {
+            scrutinee: Box::new(bool_lit(true)),
+            arms: vec![
+                (Pattern::Wild, None, int_lit(1)),
+                (Pattern::Lit(Literal::Bool(true)), None, int_lit(2)),
+            ],
+            span: sp(),
+        };
+        tc.infer_expr(&ctx, &expr).unwrap();
+        let warnings = tc.take_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "W0202");
+        assert!(warnings[0].msg.contains("arm #2"));
+    }
+
+    #[test]
+    fn test_match_usefulness_handles_nested_variant_payloads() {
+        let mut tc = TypeChecker::new();
+        let mut ctx = TypeContext::new();
+        let maybe_bool = Type::Variant(vec![
+            ("Some".to_string(), Some(Type::bool())),
+            ("None".to_string(), None),
+        ]);
+        ctx.bind(
+            "value".to_string(),
+            maybe_bool,
+            Capability::Ref,
+            false,
+        );
+        let expr = Expr::Match {
+            scrutinee: Box::new(var("value")),
+            arms: vec![
+                (
+                    Pattern::Variant(
+                        "Some".to_string(),
+                        Some(Box::new(Pattern::Lit(Literal::Bool(true)))),
+                    ),
+                    None,
+                    int_lit(1),
+                ),
+                (Pattern::Variant("None".to_string(), None), None, int_lit(0)),
+            ],
+            span: sp(),
+        };
+        tc.infer_expr(&ctx, &expr).unwrap();
+        let warnings = tc.take_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "W0201");
+        assert!(warnings[0].msg.contains("Some(false)"));
     }
 
     // -----------------------------------------------------------------------
