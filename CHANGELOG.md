@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Bounded-liveness native JIT calls — 2026-09-22
+- **Native direct-call specialization now extends beyond straight-line leaves to bounded pure acyclic callees with forward control flow** (Experimental, `src/jit/`). Bytecode liveness saves only caller registers that are both live after the call and clobbered by the callee; definite-definition analysis rejects callees that could observe stale shared-register values. Loops, recursion, nested calls, effects, heap/refcount operations, malformed control flow, oversized callees, and error-sensitive operations outside the native error ABI remain on the interpreter-helper fallback.
+
 ### Native straight-line JIT calls — 2026-09-22
 - **Hot compiled callers can invoke proven straight-line, non-suspending, non-recursive leaf functions natively** (Experimental, `src/jit/`, `src/vm.rs`). Eligible leaves are compiled as bounded native thunks outside the ordinary hot-region cache; the caller preserves the callee's exact register clobber set and captures the return value before restoration. Native execution detaches the JIT backend and raw constant cache from `VM` before entering re-entrant code, eliminating mutable-backend aliasing across direct-call fallback. Branchy, nested-call, recursive, effectful, heap/refcount-sensitive, or otherwise unproven callees retain the interpreter-helper fallback.
 
