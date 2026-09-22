@@ -790,7 +790,7 @@ fn native_value_from_vm(
     }
 }
 
-fn loop_carried_args(
+fn native_carried_args(
     builder: &mut FunctionBuilder,
     regs_ptr: Value,
     int_cache: &mut NativeIntCache,
@@ -808,6 +808,252 @@ fn loop_carried_args(
             BlockArg::from(value)
         })
         .collect()
+}
+
+/// Conservative native SSA threading for a single forward branch join.
+///
+/// This covers the two common acyclic shapes emitted for `if` expressions:
+///
+/// ```text
+///            +---- body -----+
+/// branch ----+               +---- join
+///            +--------------------^
+///
+///            +---- then -----jmp--+
+/// branch ----+                    +---- join
+///            +---- else ----------+
+/// ```
+///
+/// The plan only carries Int/Float registers whose representation is proven
+/// stable on every path. General CFG SSA remains a follow-up.
+#[derive(Debug, Clone)]
+struct SimpleCfgSsaPlan {
+    branch_pc: usize,
+    target_pc: usize,
+    fallthrough_pc: usize,
+    join_pc: usize,
+    then_jump_pc: Option<usize>,
+    carried: Vec<(usize, KnownType)>,
+    branch_state: [KnownType; 256],
+    join_state: [KnownType; 256],
+}
+
+impl SimpleCfgSsaPlan {
+    fn param_blocks(&self) -> Vec<usize> {
+        let mut blocks = vec![self.fallthrough_pc, self.target_pc, self.join_pc];
+        blocks.sort_unstable();
+        blocks.dedup();
+        blocks
+    }
+
+    fn metadata_state(&self, pc: usize) -> Option<&[KnownType; 256]> {
+        if pc == self.join_pc {
+            Some(&self.join_state)
+        } else if pc == self.branch_pc
+            || pc == self.fallthrough_pc
+            || (pc == self.target_pc && self.target_pc != self.join_pc)
+        {
+            Some(&self.branch_state)
+        } else {
+            None
+        }
+    }
+}
+
+fn apply_local_type_transfer(instr: &Instruction, state: &mut [KnownType; 256]) {
+    let op1 = instr.op1 as usize;
+    let op2 = instr.op2 as usize;
+    let op3 = instr.op3 as usize;
+
+    match instr.opcode {
+        OpCode::Nop
+        | OpCode::Halt
+        | OpCode::DbgPrint
+        | OpCode::Jmp
+        | OpCode::JmpT
+        | OpCode::JmpF
+        | OpCode::Ret
+        | OpCode::RetVal => {}
+        OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
+            state[op1] = KnownType::Int;
+        }
+        // The typed-region compiler does not receive the constant pool, so a
+        // ConstU write is intentionally treated as unknown here.
+        OpCode::ConstU => state[op3] = KnownType::Unknown,
+        OpCode::Load | OpCode::Store | OpCode::Move | OpCode::Dup => {
+            state[op2] = state[op1];
+        }
+        OpCode::Swap => state.swap(op1, op2),
+        OpCode::IAdd
+        | OpCode::ISub
+        | OpCode::IMul
+        | OpCode::Xor
+        | OpCode::Shl
+        | OpCode::Shr
+        | OpCode::BitAnd
+        | OpCode::BitOr => state[op3] = KnownType::Int,
+        OpCode::IDiv | OpCode::IMod => state[op3] = KnownType::Unknown,
+        OpCode::INeg => state[op2] = KnownType::Int,
+        OpCode::IInc | OpCode::IDec => state[op1] = KnownType::Int,
+        OpCode::FAdd | OpCode::FSub | OpCode::FMul | OpCode::FNeg => {
+            state[op3] = KnownType::Float;
+        }
+        OpCode::FDiv => state[op3] = KnownType::Unknown,
+        OpCode::ICmpEq
+        | OpCode::ICmpLt
+        | OpCode::ICmpGt
+        | OpCode::ICmpLe
+        | OpCode::ICmpGe
+        | OpCode::FCmpEq
+        | OpCode::FCmpLt
+        | OpCode::FCmpGt => state[op3] = KnownType::Bool,
+        OpCode::Not => state[op2] = KnownType::Bool,
+        OpCode::And | OpCode::Or => state[op3] = KnownType::Bool,
+        OpCode::IToF => state[op2] = KnownType::Float,
+        OpCode::FToI => state[op2] = KnownType::Int,
+        OpCode::ArrLoad => state[op3] = KnownType::Unknown,
+        OpCode::ArrStore => {}
+        _ => state.fill(KnownType::Unknown),
+    }
+}
+
+fn simulate_local_types(
+    instructions: &[Instruction],
+    start: usize,
+    end: usize,
+    initial: &[KnownType; 256],
+) -> [KnownType; 256] {
+    let mut state = *initial;
+    for instr in &instructions[start..end] {
+        apply_local_type_transfer(instr, &mut state);
+    }
+    state
+}
+
+fn meet_type_states(a: &[KnownType; 256], b: &[KnownType; 256]) -> [KnownType; 256] {
+    let mut out = [KnownType::Unknown; 256];
+    for reg in 0..256 {
+        if a[reg] == b[reg] {
+            out[reg] = a[reg];
+        }
+    }
+    out
+}
+
+fn simple_cfg_ssa_plan(
+    instructions: &[Instruction],
+    start_offset: usize,
+    end_offset: usize,
+    type_metadata: Option<&TypeMetadata>,
+) -> Option<SimpleCfgSsaPlan> {
+    let meta = type_metadata?;
+    if start_offset >= end_offset {
+        return None;
+    }
+
+    // Keep the prefix linear. The first control-flow split must be a forward
+    // conditional branch; arbitrary incoming edges are left to the general
+    // boxed CFG path.
+    let mut branch_state = meta.regs;
+    let mut branch_pc = None;
+    for pc in start_offset..end_offset {
+        match instructions[pc].opcode {
+            OpCode::JmpT | OpCode::JmpF => {
+                branch_pc = Some(pc);
+                break;
+            }
+            OpCode::Jmp | OpCode::Halt | OpCode::Ret | OpCode::RetVal => return None,
+            _ => apply_local_type_transfer(&instructions[pc], &mut branch_state),
+        }
+    }
+    let branch_pc = branch_pc?;
+    let branch = instructions[branch_pc];
+    if branch_state[branch.op1 as usize] != KnownType::Bool {
+        return None;
+    }
+
+    let target_pc = (branch_pc as i64 + branch.offset16() as i64) as usize;
+    let fallthrough_pc = branch_pc + 1;
+    if target_pc <= fallthrough_pc || target_pc >= end_offset {
+        return None;
+    }
+
+    let is_linear = |start: usize, end: usize| {
+        instructions[start..end].iter().all(|instr| {
+            !matches!(
+                instr.opcode,
+                OpCode::Jmp
+                    | OpCode::JmpT
+                    | OpCode::JmpF
+                    | OpCode::Halt
+                    | OpCode::Ret
+                    | OpCode::RetVal
+            )
+        })
+    };
+
+    let predecessor_counts = region_predecessor_counts(instructions, start_offset, end_offset);
+
+    // First try the canonical if/else layout: the instruction immediately
+    // before the taken target is an unconditional jump over the else arm.
+    let then_jump_pc = target_pc
+        .checked_sub(1)
+        .filter(|&pc| pc >= fallthrough_pc && instructions[pc].opcode == OpCode::Jmp);
+
+    let (join_pc, then_end_state, else_end_state, then_jump_pc) = if let Some(then_jump_pc) =
+        then_jump_pc
+    {
+        if !is_linear(fallthrough_pc, then_jump_pc) {
+            return None;
+        }
+        let join_pc = (then_jump_pc as i64 + instructions[then_jump_pc].simm16() as i64) as usize;
+        if join_pc <= target_pc || join_pc >= end_offset || !is_linear(target_pc, join_pc) {
+            return None;
+        }
+        if predecessor_counts[target_pc - start_offset] != 1
+            || predecessor_counts[join_pc - start_offset] != 2
+        {
+            return None;
+        }
+
+        let then_state =
+            simulate_local_types(instructions, fallthrough_pc, then_jump_pc, &branch_state);
+        let else_state = simulate_local_types(instructions, target_pc, join_pc, &branch_state);
+        (join_pc, then_state, else_state, Some(then_jump_pc))
+    } else {
+        // If-without-else: the taken edge jumps directly to the join while
+        // the fallthrough body reaches it linearly.
+        let join_pc = target_pc;
+        if !is_linear(fallthrough_pc, join_pc) || predecessor_counts[join_pc - start_offset] != 2 {
+            return None;
+        }
+        let body_state = simulate_local_types(instructions, fallthrough_pc, join_pc, &branch_state);
+        (join_pc, body_state, branch_state, None)
+    };
+
+    let join_state = meet_type_states(&then_end_state, &else_end_state);
+    let mut carried = Vec::new();
+    for reg in 0..256 {
+        let ty = branch_state[reg];
+        if matches!(ty, KnownType::Int | KnownType::Float) && join_state[reg] == ty {
+            carried.push((reg, ty));
+        }
+    }
+
+    if carried.is_empty() || carried.len() > 32 {
+        return None;
+    }
+
+    Some(SimpleCfgSsaPlan {
+        branch_pc,
+        target_pc,
+        fallthrough_pc,
+        join_pc,
+        then_jump_pc,
+        carried,
+        branch_state,
+        join_state,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1405,6 +1651,11 @@ pub fn compile_bytecode_region_typed(
     }
 
     let loop_ssa = simple_loop_ssa_plan(instructions, start_offset, end_offset, type_metadata);
+    let cfg_ssa = if loop_ssa.is_none() {
+        simple_cfg_ssa_plan(instructions, start_offset, end_offset, type_metadata)
+    } else {
+        None
+    };
 
     // Clear the codegen context
     ctx.clear();
@@ -1443,6 +1694,19 @@ pub fn compile_bytecode_region_typed(
                 _ => unreachable!("loop SSA only threads Int/Float registers"),
             };
             builder.append_block_param(header, clif_ty);
+        }
+    }
+    if let Some(plan) = &cfg_ssa {
+        for pc in plan.param_blocks() {
+            let block = blocks[&pc];
+            for &(_, ty) in &plan.carried {
+                let clif_ty = match ty {
+                    KnownType::Int => types::I64,
+                    KnownType::Float => types::F64,
+                    _ => unreachable!("CFG SSA only threads Int/Float registers"),
+                };
+                builder.append_block_param(block, clif_ty);
+            }
         }
     }
     let return_block = builder.create_block();
@@ -1512,6 +1776,30 @@ pub fn compile_bytecode_region_typed(
                             int_cache.invalidate(reg);
                         }
                         _ => unreachable!("loop SSA only threads Int/Float registers"),
+                    }
+                }
+            }
+        }
+
+        if let Some(plan) = &cfg_ssa {
+            if let Some(state) = plan.metadata_state(pc) {
+                meta.regs = *state;
+            }
+            if plan.param_blocks().contains(&pc) {
+                int_cache.clear();
+                float_cache.clear();
+                let params = builder.block_params(block).to_vec();
+                for (&(reg, ty), &value) in plan.carried.iter().zip(params.iter()) {
+                    match ty {
+                        KnownType::Int => {
+                            int_cache.set(reg, value);
+                            float_cache.invalidate(reg);
+                        }
+                        KnownType::Float => {
+                            float_cache.set(reg, value);
+                            int_cache.invalidate(reg);
+                        }
+                        _ => unreachable!("CFG SSA only threads Int/Float registers"),
                     }
                 }
             }
@@ -2303,7 +2591,7 @@ pub fn compile_bytecode_region_typed(
                         &mut float_cache,
                         &plan.carried,
                     );
-                    let args = loop_carried_args(
+                    let args = native_carried_args(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
@@ -2315,6 +2603,28 @@ pub fn compile_bytecode_region_typed(
                     // The next bytecode block is not reachable through this
                     // edge. Drop codegen-time mappings without materializing:
                     // the live values are carried by the header block params.
+                    int_cache.clear();
+                    float_cache.clear();
+                } else if cfg_ssa
+                    .as_ref()
+                    .is_some_and(|plan| plan.then_jump_pc == Some(pc) && target == plan.join_pc)
+                {
+                    let plan = cfg_ssa.as_ref().unwrap();
+                    flush_non_carried_native_caches(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
+                    );
+                    let args = native_carried_args(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
+                    );
+                    builder.ins().jump(blocks[&plan.join_pc], &args);
                     int_cache.clear();
                     float_cache.clear();
                 } else {
@@ -2356,7 +2666,7 @@ pub fn compile_bytecode_region_typed(
                     let zero = builder.ins().iconst(types::I64, 0);
                     let is_true = builder.ins().icmp(IntCC::NotEqual, cond_bit, zero);
 
-                    let args = loop_carried_args(
+                    let args = native_carried_args(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
@@ -2374,6 +2684,46 @@ pub fn compile_bytecode_region_typed(
                     let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
                     builder.ins().jump(fallthrough, &[]);
                     builder.seal_block(exit_block);
+                } else if cfg_ssa
+                    .as_ref()
+                    .is_some_and(|plan| plan.branch_pc == pc && plan.target_pc == target)
+                {
+                    let plan = cfg_ssa.as_ref().unwrap();
+                    flush_non_carried_native_caches(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
+                    );
+                    let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
+                    let one = builder.ins().iconst(types::I64, 1);
+                    let cond_bit = builder.ins().band(cond_val, one);
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_true = builder.ins().icmp(IntCC::NotEqual, cond_bit, zero);
+                    let target_args = native_carried_args(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
+                    );
+                    let fallthrough_args = native_carried_args(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
+                    );
+                    builder.ins().brif(
+                        is_true,
+                        blocks[&plan.target_pc],
+                        &target_args,
+                        blocks[&plan.fallthrough_pc],
+                        &fallthrough_args,
+                    );
+                    int_cache.clear();
+                    float_cache.clear();
                 } else {
                     flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                     let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
@@ -2424,7 +2774,7 @@ pub fn compile_bytecode_region_typed(
                     let zero = builder.ins().iconst(types::I64, 0);
                     let is_false = builder.ins().icmp(IntCC::Equal, cond_bit, zero);
 
-                    let args = loop_carried_args(
+                    let args = native_carried_args(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
@@ -2440,6 +2790,46 @@ pub fn compile_bytecode_region_typed(
                     let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
                     builder.ins().jump(fallthrough, &[]);
                     builder.seal_block(exit_block);
+                } else if cfg_ssa
+                    .as_ref()
+                    .is_some_and(|plan| plan.branch_pc == pc && plan.target_pc == target)
+                {
+                    let plan = cfg_ssa.as_ref().unwrap();
+                    flush_non_carried_native_caches(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
+                    );
+                    let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
+                    let one = builder.ins().iconst(types::I64, 1);
+                    let cond_bit = builder.ins().band(cond_val, one);
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_false = builder.ins().icmp(IntCC::Equal, cond_bit, zero);
+                    let target_args = native_carried_args(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
+                    );
+                    let fallthrough_args = native_carried_args(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
+                    );
+                    builder.ins().brif(
+                        is_false,
+                        blocks[&plan.target_pc],
+                        &target_args,
+                        blocks[&plan.fallthrough_pc],
+                        &fallthrough_args,
+                    );
+                    int_cache.clear();
+                    float_cache.clear();
                 } else {
                     flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                     let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
@@ -2559,6 +2949,29 @@ pub fn compile_bytecode_region_typed(
         );
 
         if !is_terminator {
+            if let Some(plan) = &cfg_ssa {
+                if pc + 1 == plan.join_pc {
+                    flush_non_carried_native_caches(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
+                    );
+                    let args = native_carried_args(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
+                    );
+                    builder.ins().jump(blocks[&plan.join_pc], &args);
+                    int_cache.clear();
+                    float_cache.clear();
+                    continue;
+                }
+            }
+
             if let Some(&next_block) = blocks.get(&(pc + 1)) {
                 let next_preds = predecessor_counts[pc + 1 - start_offset];
                 if next_preds != 1 {
@@ -3572,6 +3985,172 @@ mod typed_tests {
         // Iteration inputs for r8 are 1, 2, 2, 2.
         assert_eq!(unsafe { Value::from_bits(regs[0]) }.as_float(), Some(7.0));
         assert_eq!(unsafe { Value::from_bits(regs[8]) }.as_float(), Some(2.0));
+    }
+
+    // ------------------------------------------------------------------
+    // Test 6d: Native SSA through simple forward CFG joins
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_simple_cfg_ssa_plan_if_else() {
+        let instructions = vec![
+            Instruction::new3(OpCode::JmpT, 4, 0, 3), // pc0 -> pc3
+            Instruction::new3(OpCode::IAdd, 0, 1, 0),
+            Instruction::new2(OpCode::Jmp, 0, 2), // pc2 -> pc4
+            Instruction::new3(OpCode::ISub, 0, 1, 0),
+            Instruction::new3(OpCode::IMul, 0, 1, 2),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Int);
+        meta.set_type(1, KnownType::Int);
+        meta.set_type(4, KnownType::Bool);
+
+        let plan = simple_cfg_ssa_plan(&instructions, 0, instructions.len(), Some(&meta))
+            .expect("canonical if/else should receive a CFG SSA plan");
+
+        assert_eq!(plan.branch_pc, 0);
+        assert_eq!(plan.target_pc, 3);
+        assert_eq!(plan.join_pc, 4);
+        assert_eq!(plan.then_jump_pc, Some(2));
+        assert!(plan.carried.contains(&(0, KnownType::Int)));
+        assert!(plan.carried.contains(&(1, KnownType::Int)));
+    }
+
+    #[test]
+    fn test_cfg_ssa_executes_int_if_else_join() {
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            Instruction::new3(OpCode::JmpT, 4, 0, 3),
+            Instruction::new3(OpCode::IAdd, 0, 1, 0),
+            Instruction::new2(OpCode::Jmp, 0, 2),
+            Instruction::new3(OpCode::ISub, 0, 1, 0),
+            Instruction::new3(OpCode::IMul, 0, 1, 2),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Int);
+        meta.set_type(1, KnownType::Int);
+        meta.set_type(4, KnownType::Bool);
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_cfg_ssa_int_if_else",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("if/else CFG SSA should compile");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+
+        let mut false_regs = [0u64; 256];
+        false_regs[0] = Value::int(10).as_raw();
+        false_regs[1] = Value::int(3).as_raw();
+        false_regs[4] = Value::bool(false).as_raw();
+        func(false_regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(
+            unsafe { Value::from_bits(false_regs[0]) }.as_int(),
+            Some(13)
+        );
+        assert_eq!(
+            unsafe { Value::from_bits(false_regs[2]) }.as_int(),
+            Some(39)
+        );
+
+        let mut true_regs = [0u64; 256];
+        true_regs[0] = Value::int(10).as_raw();
+        true_regs[1] = Value::int(3).as_raw();
+        true_regs[4] = Value::bool(true).as_raw();
+        func(true_regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(unsafe { Value::from_bits(true_regs[0]) }.as_int(), Some(7));
+        assert_eq!(unsafe { Value::from_bits(true_regs[2]) }.as_int(), Some(21));
+    }
+
+    #[test]
+    fn test_cfg_ssa_executes_float_if_without_else() {
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            Instruction::new3(OpCode::JmpF, 4, 0, 3), // pc0 -> pc3 join
+            Instruction::new3(OpCode::FAdd, 0, 1, 0),
+            Instruction::new3(OpCode::FMul, 0, 1, 0),
+            Instruction::new3(OpCode::FSub, 0, 1, 2),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Float);
+        meta.set_type(1, KnownType::Float);
+        meta.set_type(4, KnownType::Bool);
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_cfg_ssa_float_if",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("if-without-else CFG SSA should compile");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+
+        let mut skip_regs = [0u64; 256];
+        skip_regs[0] = Value::float(8.0).as_raw();
+        skip_regs[1] = Value::float(2.0).as_raw();
+        skip_regs[4] = Value::bool(false).as_raw();
+        func(skip_regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(
+            unsafe { Value::from_bits(skip_regs[2]) }.as_float(),
+            Some(6.0)
+        );
+
+        let mut body_regs = [0u64; 256];
+        body_regs[0] = Value::float(8.0).as_raw();
+        body_regs[1] = Value::float(2.0).as_raw();
+        body_regs[4] = Value::bool(true).as_raw();
+        func(body_regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(
+            unsafe { Value::from_bits(body_regs[0]) }.as_float(),
+            Some(20.0)
+        );
+        assert_eq!(
+            unsafe { Value::from_bits(body_regs[2]) }.as_float(),
+            Some(18.0)
+        );
+    }
+
+    #[test]
+    fn test_cfg_ssa_drops_representation_divergence_at_join() {
+        let instructions = vec![
+            Instruction::new3(OpCode::JmpT, 4, 0, 2), // pc0 -> pc2 join
+            Instruction::new2(OpCode::IToF, 0, 0),    // Int -> Float on one path
+            Instruction::new3(OpCode::IAdd, 1, 1, 2),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Int);
+        meta.set_type(1, KnownType::Int);
+        meta.set_type(4, KnownType::Bool);
+
+        let plan = simple_cfg_ssa_plan(&instructions, 0, instructions.len(), Some(&meta))
+            .expect("stable r1 should keep the CFG plan alive");
+        assert!(
+            !plan.carried.iter().any(|&(reg, _)| reg == 0),
+            "r0 changes Int -> Float on only one path and must not be native at the join"
+        );
+        assert!(plan.carried.contains(&(1, KnownType::Int)));
+        assert_eq!(plan.join_state[0], KnownType::Unknown);
     }
 
     // ------------------------------------------------------------------
