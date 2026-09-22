@@ -161,9 +161,7 @@ fn burst_send_has_single_ready_queue_entry() {
 #[test]
 fn adaptive_actor_turn_drains_burst_without_duplicate_wakeups() {
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_actor(Box::new(|| {
-        vec![("count".to_string(), Value::int(0))]
-    }));
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
     rt.actors
         .get_mut(&actor_id)
         .unwrap()
