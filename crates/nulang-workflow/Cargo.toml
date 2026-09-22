@@ -5,6 +5,9 @@ edition = "2021"
 license = "Apache-2.0"
 description = "Durable workflow orchestration primitives for Nulang"
 
+[dependencies]
+blake3 = "1.8"
+
 [lib]
 name = "nulang_workflow"
 path = "src/lib.rs"
