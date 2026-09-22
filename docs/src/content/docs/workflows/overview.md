@@ -4,7 +4,11 @@ description: Workflow declarations with steps, parallel branches, event emission
 ---
 ## Workflows
 
-A workflow is a persistent actor with checkpointed state that progresses through named steps. Workflows survive node restarts: each step completion is journaled, so a crashed workflow resumes from its last completed step rather than restarting from scratch.
+:::caution[Legacy declaration surface]
+The `workflow` declaration remains implemented for compatibility but is Experimental/deprecated under RFC 0004. New code should prefer ordinary actors/entities plus workflow libraries/effects. This page documents the existing runtime so older programs remain understandable and maintainable.
+:::
+
+A legacy workflow declaration lowers to a persistent actor with checkpointed state that progresses through named steps. With a configured durable store, the runtime journals workflow progress and can reconstruct persisted state after restart. Recovery guarantees depend on the persistence backend, crash boundary, and compatibility/migration checks; do not treat the syntax alone as a zero-loss guarantee.
 
 ## Declaring a Workflow
 
@@ -82,13 +86,13 @@ let w = spawn PurchaseOrder {} in { w }
 
 ## Crash Recovery
 
-Workflows are durable: a node restart does not lose progress. The runtime:
+For a workflow using a durable persistence backend, the recovery path is designed to restore committed progress. The runtime:
 
 1. **Checkpoints** after each step completion (state + `step_index` written to the persistence store).
 2. **Journals** emitted events and suspension markers (signal waits, timer waits, LLM calls).
 3. **Replays** the journal on recovery, restoring the workflow to its last checkpointed state.
 
-After recovery, the workflow resumes from its last completed step. Any in-flight suspension (signal wait, timer, LLM call) is re-armed from the journal and re-driven when the awaited event arrives.
+After successful compatible recovery, the workflow resumes from its persisted progress. In-flight suspension markers can be re-armed from the journal; external effects still require the replay/idempotency guarantees described by the semantic stabilization contract.
 
 ### Example: survive a restart
 
@@ -115,4 +119,4 @@ The `progress` function, returned from the program entry, becomes a query handle
 - [Signals, Timers & Queries](/workflows/signals-timers/) — suspension/resume primitives for workflow steps
 - [AI Agents Overview](/ai/overview/) — agents that workflows can orchestrate
 
-> **Note**: The `workflow` keyword is currently Experimental and is proposed for deprecation in favor of plain `actor` declarations that import `nlc.workflow` (RFC 0004). The keyword remains functional and will continue to work through at least two major language versions.
+> **Status**: The `workflow` keyword is Experimental/deprecated under RFC 0004. It remains functional during the compatibility window; new applications should compose actors/entities with workflow libraries/effects.
