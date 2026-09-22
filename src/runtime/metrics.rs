@@ -82,15 +82,41 @@ impl MetricsSnapshot {
         out.push_str("# TYPE nulang_dlq_depth gauge\n");
         out.push_str(&format!("nulang_dlq_depth {}\n", self.dlq_depth));
 
-        // Gauge: per-actor mailbox depths (top 50 by depth)
+        // Per-actor mailbox pressure (top 50 by current depth).
         out.push_str("# HELP nulang_actor_mailbox_depth Per-actor mailbox depth\n");
         out.push_str("# TYPE nulang_actor_mailbox_depth gauge\n");
+        out.push_str("# HELP nulang_actor_mailbox_capacity Configured mailbox capacity (0 = unbounded)\n");
+        out.push_str("# TYPE nulang_actor_mailbox_capacity gauge\n");
+        out.push_str("# HELP nulang_actor_mailbox_high_watermark Highest observed mailbox depth\n");
+        out.push_str("# TYPE nulang_actor_mailbox_high_watermark gauge\n");
+        out.push_str("# HELP nulang_actor_mailbox_utilization Current mailbox utilization ratio for bounded mailboxes\n");
+        out.push_str("# TYPE nulang_actor_mailbox_utilization gauge\n");
+        out.push_str("# HELP nulang_actor_mailbox_backpressured_total Messages rejected because the mailbox was full\n");
+        out.push_str("# TYPE nulang_actor_mailbox_backpressured_total counter\n");
         let mut sorted: Vec<_> = self.actors_mailboxes.clone();
         sorted.sort_by_key(|m| -(m.depth as i64));
         for m in sorted.iter().take(50) {
             out.push_str(&format!(
                 "nulang_actor_mailbox_depth{{actor_id=\"{}\"}} {}\n",
                 m.actor_id, m.depth
+            ));
+            out.push_str(&format!(
+                "nulang_actor_mailbox_capacity{{actor_id=\"{}\"}} {}\n",
+                m.actor_id, m.capacity
+            ));
+            out.push_str(&format!(
+                "nulang_actor_mailbox_high_watermark{{actor_id=\"{}\"}} {}\n",
+                m.actor_id, m.high_watermark
+            ));
+            if let Some(utilization) = m.utilization {
+                out.push_str(&format!(
+                    "nulang_actor_mailbox_utilization{{actor_id=\"{}\"}} {}\n",
+                    m.actor_id, utilization
+                ));
+            }
+            out.push_str(&format!(
+                "nulang_actor_mailbox_backpressured_total{{actor_id=\"{}\"}} {}\n",
+                m.actor_id, m.backpressured_total
             ));
         }
 

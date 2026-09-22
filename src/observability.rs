@@ -175,6 +175,10 @@ pub struct MetricsExporter {
     actors_live: opentelemetry::metrics::Gauge<u64>,
     dlq_depth: opentelemetry::metrics::Gauge<u64>,
     mailbox_depth: opentelemetry::metrics::Gauge<u64>,
+    mailbox_capacity: opentelemetry::metrics::Gauge<u64>,
+    mailbox_high_watermark: opentelemetry::metrics::Gauge<u64>,
+    mailbox_utilization: opentelemetry::metrics::Gauge<f64>,
+    mailbox_backpressured: opentelemetry::metrics::Counter<u64>,
     scheduler_total: opentelemetry::metrics::Counter<u64>,
     scheduler_local: opentelemetry::metrics::Counter<u64>,
     scheduler_global: opentelemetry::metrics::Counter<u64>,
@@ -208,6 +212,10 @@ impl MetricsExporter {
             actors_live: meter.u64_gauge("nulang.actors.live").init(),
             dlq_depth: meter.u64_gauge("nulang.dlq.depth").init(),
             mailbox_depth: meter.u64_gauge("nulang.actor.mailbox.depth").init(),
+            mailbox_capacity: meter.u64_gauge("nulang.actor.mailbox.capacity").init(),
+            mailbox_high_watermark: meter.u64_gauge("nulang.actor.mailbox.high_watermark").init(),
+            mailbox_utilization: meter.f64_gauge("nulang.actor.mailbox.utilization").init(),
+            mailbox_backpressured: meter.u64_counter("nulang.actor.mailbox.backpressured").init(),
             scheduler_total: meter.u64_counter("nulang.scheduler.tasks.total").init(),
             scheduler_local: meter.u64_counter("nulang.scheduler.tasks.local").init(),
             scheduler_global: meter.u64_counter("nulang.scheduler.tasks.global").init(),
@@ -243,11 +251,33 @@ impl MetricsExporter {
         self.actors_live.record(snap.actors_live, &[]);
         self.dlq_depth.record(snap.dlq_depth, &[]);
 
+        let previous_mailbox_backpressure: std::collections::HashMap<u64, u64> = prev_ref
+            .map(|previous| {
+                previous
+                    .actors_mailboxes
+                    .iter()
+                    .map(|m| (m.actor_id, m.backpressured_total))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         for m in &snap.actors_mailboxes {
-            self.mailbox_depth.record(
-                m.depth as u64,
-                &[opentelemetry::KeyValue::new("actor_id", m.actor_id as i64)],
-            );
+            let attrs = [opentelemetry::KeyValue::new("actor_id", m.actor_id as i64)];
+            self.mailbox_depth.record(m.depth as u64, &attrs);
+            self.mailbox_capacity.record(m.capacity as u64, &attrs);
+            self.mailbox_high_watermark
+                .record(m.high_watermark as u64, &attrs);
+            if let Some(utilization) = m.utilization {
+                self.mailbox_utilization.record(utilization, &attrs);
+            }
+            let previous = previous_mailbox_backpressure
+                .get(&m.actor_id)
+                .copied()
+                .unwrap_or(0);
+            let delta = m.backpressured_total.saturating_sub(previous);
+            if delta > 0 {
+                self.mailbox_backpressured.add(delta, &attrs);
+            }
         }
 
         let s = &snap.scheduler;
