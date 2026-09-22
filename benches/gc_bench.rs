@@ -1,9 +1,32 @@
 //! GC benchmarks: ORCA throughput, cycle detection.
 
 use criterion::{black_box, criterion_group, Criterion};
-use nulang::runtime::Runtime;
+use nulang::runtime::{ActorHeap, Runtime, TypeTag};
 use nulang::types::ExitReason;
 use nulang::vm::Value;
+
+fn bench_idle_heap_construction(c: &mut Criterion) {
+    c.bench_function("gc/idle_heap_construct_1000", |b| {
+        b.iter(|| {
+            for _ in 0..1_000 {
+                black_box(ActorHeap::new(16 * 1024));
+            }
+        })
+    });
+}
+
+fn bench_first_heap_allocation(c: &mut Criterion) {
+    c.bench_function("gc/heap_first_alloc_1000", |b| {
+        b.iter(|| {
+            for _ in 0..1_000 {
+                let mut heap = ActorHeap::new(16 * 1024);
+                heap.set_actor_id(1);
+                let ptr = heap.alloc(8, TypeTag::Raw).expect("heap allocation");
+                black_box(ptr);
+            }
+        })
+    });
+}
 
 fn bench_orca_throughput(c: &mut Criterion) {
     c.bench_function("gc/orca_throughput", |b| {
@@ -60,4 +83,10 @@ fn bench_cycle_detection(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_orca_throughput, bench_cycle_detection);
+criterion_group!(
+    benches,
+    bench_idle_heap_construction,
+    bench_first_heap_allocation,
+    bench_orca_throughput,
+    bench_cycle_detection
+);
