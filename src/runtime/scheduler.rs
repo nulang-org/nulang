@@ -573,7 +573,10 @@ impl Scheduler {
             ActorPriority::Low,
         ] {
             if !self.global_for(priority).is_empty()
-                || self.workers_for(priority).iter().any(|worker| !worker.is_empty())
+                || self
+                    .workers_for(priority)
+                    .iter()
+                    .any(|worker| !worker.is_empty())
             {
                 return true;
             }
