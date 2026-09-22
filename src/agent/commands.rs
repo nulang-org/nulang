@@ -40,6 +40,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
         Some("init") => cmd_init(args.get(1..).unwrap_or(&[])),
         Some("run") => cmd_run(args.get(1..).unwrap_or(&[])),
         Some("chat") => cmd_chat(args.get(1..).unwrap_or(&[])),
+        Some("resume") => cmd_resume(args.get(1..).unwrap_or(&[])),
         Some("goals") => cmd_goals(args.get(1..).unwrap_or(&[])),
         Some("graph") => cmd_graph(args.get(1..).unwrap_or(&[])),
         Some("mcp") => cmd_mcp(args.get(1..).unwrap_or(&[])),
@@ -48,7 +49,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
             Ok(())
         }
         Some(other) => Err(agent_err(format!(
-            "unknown agent subcommand '{}'; try: init, run, chat, goals, graph",
+            "unknown agent subcommand '{}'; try: init, run, chat, resume, goals, graph",
             other
         ))),
     }
@@ -61,6 +62,7 @@ fn print_help() {
            nulang agent init [--project <dir>]\n\
            nulang agent run  [--project <dir>] [--message <text>]\n\
            nulang agent chat [--project <dir>]\n\
+           nulang agent resume [--project <dir>]\n\
            nulang agent goals [--project <dir>]\n\
            nulang agent graph --goal <uuid> [--project <dir>]\n           nulang agent mcp serve [--port <n>]\n"
     );
@@ -95,6 +97,8 @@ fn cmd_run(args: &[String]) -> NuResult<()> {
         message.unwrap_or_else(|| "Explore the repository and summarize architecture".into());
     let mut rt = LocalRuntime::open(dir).map_err(|e| agent_err(e.to_string()))?;
     let mut out = io::stdout();
+    rt.resume_pending_tasks(&mut out)
+        .map_err(|e| agent_err(e.to_string()))?;
     rt.handle_user_message(&text, &mut out)
         .map_err(|e| agent_err(e.to_string()))?;
     Ok(())
@@ -105,6 +109,8 @@ fn cmd_chat(args: &[String]) -> NuResult<()> {
     let mut rt = LocalRuntime::open(dir).map_err(|e| agent_err(e.to_string()))?;
     let stdin = io::stdin();
     let mut out = io::stdout();
+    rt.resume_pending_tasks(&mut out)
+        .map_err(|e| agent_err(e.to_string()))?;
     eprintln!("NuLang Agent chat (Ctrl-D to exit)");
     loop {
         eprint!("> ");
@@ -123,6 +129,17 @@ fn cmd_chat(args: &[String]) -> NuResult<()> {
         rt.handle_user_message(trimmed, &mut out)
             .map_err(|e| agent_err(e.to_string()))?;
     }
+    Ok(())
+}
+
+fn cmd_resume(args: &[String]) -> NuResult<()> {
+    let dir = project_dir_from(args)?;
+    let mut rt = LocalRuntime::open(dir).map_err(|e| agent_err(e.to_string()))?;
+    let mut out = io::stdout();
+    let completed = rt
+        .resume_pending_tasks(&mut out)
+        .map_err(|e| agent_err(e.to_string()))?;
+    eprintln!("Resumed {} task(s).", completed);
     Ok(())
 }
 
