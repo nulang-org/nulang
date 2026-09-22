@@ -3880,8 +3880,9 @@ mod optimize_tests {
 
     #[test]
     fn test_self_move_eliminated() {
-        // `x = Load(x)` is a no-op and must be removed even though x is
-        // live (the surrounding load/store remain).
+        // `x = Load(x)` is a no-op. Scalar copy propagation can now go
+        // further and bypass the preceding anonymous copy as well, leaving
+        // the return to read the original source directly.
         let mut b = mir::FunctionBuilder::new("t", Some(crate::types::Type::int()));
         let a = b.add_temp(crate::types::Type::int());
         let x = b.add_temp(crate::types::Type::int());
@@ -3891,19 +3892,16 @@ mod optimize_tests {
         let mut func = b.build();
         let mut consts = Vec::new();
         optimize_function(&mut func, &mut consts);
-        let stmts = &func.blocks[0].stmts;
-        assert_eq!(
-            stmts.len(),
-            1,
-            "the self-move must be removed, leaving one store, got {:?}",
-            stmts
+
+        assert!(
+            func.blocks[0].stmts.is_empty(),
+            "anonymous copy chain should collapse completely, got {:?}",
+            func.blocks[0].stmts
         );
         assert_eq!(
-            stmts[0],
-            mir::Stmt::Assign {
-                dst: x,
-                op: mir::RValue::Load(a)
-            }
+            func.blocks[0].terminator,
+            mir::Terminator::Return(Some(a)),
+            "return should consume the original scalar source directly"
         );
     }
 
