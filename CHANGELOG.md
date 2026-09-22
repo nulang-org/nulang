@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### MIR scalar copy propagation and constant-branch pruning — 2026-09-22
+- **Canonical MIR optimization now removes redundant definitely-scalar block-local copies and folds locally-proven constant branches before bytecode lowering** (`src/mir_codegen.rs`). The pass remains conservative across CFG boundaries and excludes heap-capable locals so ownership/drop semantics are unchanged. Unreachable pruning preserves effect-handler roots, and reachable `Panic` is explicitly treated as observable/divergent so DCE cannot erase contract failures.
+
 ### Canonical compiler semantic identity — 2026-09-21
 - **Compiler-owned `SemanticId` now derives from canonical backend-independent MIR plus typed actor-state schemas** (Experimental, `src/semantic_identity.rs`, `src/semantic_schema.rs`, `src/compiler_identity.rs`). The encoding alpha-normalizes compiler-generated IDs, excludes presentation/debug metadata and backend selection, includes executable/effect/authority/durable semantics, and folds dependency semantic identities deterministically. `ArtifactIdentityManifest` assembly now has a typed-program entry point that keeps exact `SourceId`, semantic identity, and backend-specific `ArtifactId` distinct without changing frozen NBC v1.
 
