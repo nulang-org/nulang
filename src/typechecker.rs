@@ -3415,8 +3415,7 @@ impl TypeChecker {
                 .unwrap_or(span);
             self.warnings
                 .push(crate::types::NuWarning::unreachable_match_arm(
-                    arm_span,
-                    arm_index,
+                    arm_span, arm_index,
                 ));
         }
 
@@ -4863,12 +4862,7 @@ mod tests {
             ("Some".to_string(), Some(Type::bool())),
             ("None".to_string(), None),
         ]);
-        ctx.bind(
-            "value".to_string(),
-            maybe_bool,
-            Capability::Ref,
-            false,
-        );
+        ctx.bind("value".to_string(), maybe_bool, Capability::Ref, false);
         let expr = Expr::Match {
             scrutinee: Box::new(var("value")),
             arms: vec![
