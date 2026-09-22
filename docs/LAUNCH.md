@@ -55,8 +55,9 @@ out the rest.
 - **WASM backend** — compile Nulang to WebAssembly (experimental)
 - **LSP server** — diagnostics, hover, goto-def, references, rename, completion
 - **AI runtime** — optional LLM providers, pipelines, debates, and memory
-  subsystems (experimental, feature-gated). The legacy `agent` declaration
-  surface is deprecated in favor of ordinary actors/entities plus libraries
+  subsystems (experimental, feature-gated). Under accepted RFC 0017, `agent`
+  remains Experimental ergonomic syntax that lowers to the canonical
+  actor/effect runtime model
 
 ## Getting started
 
