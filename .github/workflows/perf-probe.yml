@@ -1,0 +1,47 @@
+name: Performance Probe
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/perf-probe.yml"
+      - "src/**"
+      - "benches/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+jobs:
+  perf-probe:
+    name: Targeted performance probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Run targeted Criterion probes
+        run: |
+          set -o pipefail
+          cargo bench --bench bench_main -- interp --sample-size 20 --warm-up-time 1 --measurement-time 2 | tee interp.log
+          cargo bench --bench bench_main -- jit --sample-size 20 --warm-up-time 1 --measurement-time 2 | tee jit.log
+          cargo bench --bench bench_main -- scheduler --sample-size 20 --warm-up-time 1 --measurement-time 2 | tee scheduler.log
+          cargo bench --bench bench_main -- actor --sample-size 20 --warm-up-time 1 --measurement-time 2 | tee actor.log
+      - name: Collect compact results
+        run: |
+          python3 scripts/collect_bench_results.py --out perf-probe.json
+          cat perf-probe.json
+      - name: Upload probe artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: perf-probe-${{ github.sha }}
+          path: |
+            perf-probe.json
+            interp.log
+            jit.log
+            scheduler.log
+            actor.log
+          retention-days: 7
