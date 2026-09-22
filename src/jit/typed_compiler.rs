@@ -1275,12 +1275,7 @@ pub fn compile_bytecode_region_typed(
                     int_cache.invalidate(r1);
                     int_cache.invalidate(r2);
                 } else {
-                    flush_native_caches(
-                        &mut builder,
-                        regs_ptr,
-                        &mut int_cache,
-                        &mut float_cache,
-                    );
+                    flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                     let v1 = load_reg(&mut builder, regs_ptr, r1);
                     let v2 = load_reg(&mut builder, regs_ptr, r2);
                     store_reg(&mut builder, regs_ptr, r1, v2);
@@ -1298,7 +1293,6 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
-                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1330,7 +1324,6 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
-                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1359,7 +1352,6 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
-                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1388,7 +1380,6 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
-                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1419,7 +1410,6 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
-                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1448,7 +1438,6 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
-                        &mut float_cache,
                         instr.op1 as usize,
                         dst,
                         TypedIntUnaryOp::Neg,
@@ -1475,7 +1464,6 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
-                        &mut float_cache,
                         reg,
                         reg,
                         TypedIntUnaryOp::Inc,
@@ -1502,7 +1490,6 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
-                        &mut float_cache,
                         reg,
                         reg,
                         TypedIntUnaryOp::Dec,
@@ -1537,7 +1524,6 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
-                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1690,7 +1676,6 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
-                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1720,7 +1705,6 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
-                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1750,7 +1734,6 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
-                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1780,7 +1763,6 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
-                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1810,7 +1792,6 @@ pub fn compile_bytecode_region_typed(
                         &mut builder,
                         regs_ptr,
                         &mut int_cache,
-                        &mut float_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1965,12 +1946,7 @@ pub fn compile_bytecode_region_typed(
 
             // -- Control Flow --
             OpCode::Jmp => {
-                flush_native_caches(
-                    &mut builder,
-                    regs_ptr,
-                    &mut int_cache,
-                    &mut float_cache,
-                );
+                flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                 let target = (pc as i64 + instr.simm16() as i64) as usize;
                 if let Some(&target_block) = blocks.get(&target) {
                     builder.ins().jump(target_block, &[]);
@@ -1985,12 +1961,7 @@ pub fn compile_bytecode_region_typed(
                 }
             }
             OpCode::JmpT => {
-                flush_native_caches(
-                    &mut builder,
-                    regs_ptr,
-                    &mut int_cache,
-                    &mut float_cache,
-                );
+                flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                 let target = (pc as i64 + instr.offset16() as i64) as usize;
                 let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
                 // Branch conditions are NaN-tagged bools; truthiness is the low
@@ -2019,12 +1990,7 @@ pub fn compile_bytecode_region_typed(
                 }
             }
             OpCode::JmpF => {
-                flush_native_caches(
-                    &mut builder,
-                    regs_ptr,
-                    &mut int_cache,
-                    &mut float_cache,
-                );
+                flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                 let target = (pc as i64 + instr.offset16() as i64) as usize;
                 let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
                 let one = builder.ins().iconst(types::I64, 1);
@@ -2145,12 +2111,7 @@ pub fn compile_bytecode_region_typed(
             if let Some(&next_block) = blocks.get(&(pc + 1)) {
                 let next_preds = predecessor_counts[pc + 1 - start_offset];
                 if next_preds != 1 {
-                    flush_native_caches(
-                        &mut builder,
-                        regs_ptr,
-                        &mut int_cache,
-                        &mut float_cache,
-                    );
+                    flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                 }
                 builder.ins().jump(next_block, &[]);
             } else {
