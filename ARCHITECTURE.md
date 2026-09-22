@@ -118,10 +118,13 @@ from the target design of Layers 2–4, to keep in mind while reading §3–§5:
   optional `rocksdb` / `postgres` features provide `RocksDbStore` and
   `PostgresStore`. The CLI accepts `--store <uri>` and
   `NULANG_STORE_PATH` for durable programs.
-- **The NUL0 transport** is a hand-rolled, length-prefixed TCP protocol whose
-  fixed header is 13 bytes (4-byte `NUL0` magic, 1-byte packet type, 8-byte
-  sequence); the version/flags/MAC fields, TLS, QUIC, and Poly1305 drawn in
-  §5.5 do not exist in `src/runtime/network.rs`.
+- **The NUL0 transport** uses length-prefixed TCP packet frames whose
+  packet payload begins with `NUL0`, a 1-byte packet discriminant, and an
+  8-byte sequence number. Connections first exchange a separate 16-byte
+  versioned handshake `{magic, version:u32, node_id:u64}`; incompatible wire
+  versions fail closed. The TCP transport also has an mTLS mode via
+  `TlsConfig::MutualTls`. QUIC and the older diagram's bespoke per-packet
+  Poly1305/MAC layout are not the current implementation.
 
 - **Application-specific declaration DSLs are no longer the strategic core.**
   `agent`, `workflow`, and `database` declarations still parse for
