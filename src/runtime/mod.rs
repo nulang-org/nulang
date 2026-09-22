@@ -4704,7 +4704,13 @@ impl Runtime {
                 .bytecode_offsets
                 .get(behavior_idx)
                 .copied()
-                .unwrap_or(0)
+                .ok_or_else(|| NuError::RuntimeError {
+                    msg: format!(
+                        "actor {} has no bytecode behavior id {}",
+                        actor_id, behavior_idx
+                    ),
+                    span: Span::default(),
+                })?
         };
         let result = self.run_bytecode_at_offset(actor_id, code_offset, args);
         // If the step suspended waiting for a signal or a background LLM
