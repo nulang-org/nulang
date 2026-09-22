@@ -229,6 +229,20 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
         Value::nil()
     }
 
+    /// Read a schema-known actor state field by the bytecode constant-pool
+    /// index that names it. Returning `None` asks the VM to resolve the
+    /// constant to a string and use `get_state_field` for compatibility.
+    fn get_state_field_indexed(&self, _field_constant_idx: usize) -> Option<Value> {
+        None
+    }
+
+    /// Write a schema-known actor state field by bytecode constant-pool index.
+    /// Return true when handled; false asks the VM to use the legacy
+    /// string-based callback.
+    fn set_state_field_indexed(&mut self, _field_constant_idx: usize, _value: Value) -> bool {
+        false
+    }
+
     /// Read a field from the current actor's state.  Default returns nil.
     fn get_state_field(&self, _field: &str) -> Value {
         Value::nil()
@@ -5028,14 +5042,21 @@ impl VM {
             }
             OpCode::StateGet => {
                 let field_idx = instr.imm16() as usize;
-                let field = self.module_const_string(module_idx, field_idx);
-                frame.regs[instr.op3 as usize] = self.actor_callbacks.get_state_field(&field);
+                frame.regs[instr.op3 as usize] =
+                    if let Some(value) = self.actor_callbacks.get_state_field_indexed(field_idx) {
+                        value
+                    } else {
+                        let field = self.module_const_string(module_idx, field_idx);
+                        self.actor_callbacks.get_state_field(&field)
+                    };
             }
             OpCode::StateSet => {
                 let field_idx = instr.imm16() as usize;
-                let field = self.module_const_string(module_idx, field_idx);
                 let val = frame.regs[instr.op3 as usize];
-                self.actor_callbacks.set_state_field(&field, val);
+                if !self.actor_callbacks.set_state_field_indexed(field_idx, val) {
+                    let field = self.module_const_string(module_idx, field_idx);
+                    self.actor_callbacks.set_state_field(&field, val);
+                }
             }
             OpCode::Emit => {
                 let event_idx = instr.imm16() as usize;
