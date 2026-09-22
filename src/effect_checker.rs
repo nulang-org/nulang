@@ -4811,6 +4811,26 @@ mod tests {
     }
 
     #[test]
+    fn test_database_declaration_has_no_unaccepted_rfc_0004_deprecation() {
+        let ast = parse_module(
+            r#"
+            database Users = {
+                table accounts {}
+            }
+            "#,
+        );
+        let mut checker = EffectChecker::new();
+        assert!(checker.check_module(&ast.decls).is_ok());
+        assert!(
+            checker
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.contains("deprecated")),
+            "a Draft RFC must not create an executable deprecation policy"
+        );
+    }
+
+    #[test]
     fn test_durable_step_rejects_ambient_time() {
         // A step suspended on a signal/LLM wait is re-run from its start
         // after a crash; ambient Time.now* would yield a different value on
