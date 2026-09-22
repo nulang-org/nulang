@@ -157,8 +157,11 @@ Core surface forms (`src/ast.rs`, `src/parser.rs`):
   §6.3).
 
 There is no `switch` and no `case` keyword — `match` arms are introduced by
-`|`. Pattern matching is typed but **not** exhaustiveness-checked today: a
-non-exhaustive `match` compiles and may fail at runtime.
+`|`. Pattern matching is typed. The type checker now emits conservative `W0201`
+diagnostics for provably missing finite cases (booleans and closed variants,
+including recursively finite payloads); guarded arms do not count toward total
+coverage. The full usefulness/exhaustiveness matrix is not implemented yet, so
+complex or infinite-domain matches may still compile and fail at runtime.
 
 ### 2.2 HM Type Inference
 
@@ -191,9 +194,8 @@ Pony-style lattice (`iso`, `lineariso`, `trn`, `ref`, `val`, `box`, `tag`;
 subtyping computed via `join`). `LinearIso` adds exactly-once linear
 consumption tracking. Capabilities are compile-time only — see §2.4.
 
-**What does not exist:** no type classes or constrained types
-(`fn f[T: Serializable]` is not valid Nulang), no `protocol` construct, and
-no exhaustiveness checking for `match`. Type inference deliberately does not
+**What does not exist:** no complete Maranget-style usefulness matrix for
+`match`; current checking is the conservative finite-case `W0201` phase. Type inference deliberately does not
 cross actor boundaries — behavior signatures are explicit annotations — so
 actors remain separately checkable units.
 
