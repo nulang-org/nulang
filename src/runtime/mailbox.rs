@@ -180,7 +180,11 @@ impl Mailbox {
             return Err(msg);
         }
         match msg.priority {
-            MessagePriority::System | MessagePriority::Normal => self.local_queue.push_back(msg),
+            // System traffic joins the dedicated concurrent System lane even
+            // when produced by the scheduler thread. This preserves the
+            // System > Normal > Bulk contract without another local queue.
+            MessagePriority::System => self.system_queue.push(msg),
+            MessagePriority::Normal => self.local_queue.push_back(msg),
             MessagePriority::Bulk => self.local_bulk_queue.push_back(msg),
         }
         Ok(())
@@ -212,14 +216,12 @@ impl Mailbox {
     }
 
     fn stage_arrivals(&mut self) {
-        // Scheduler-local system messages join the system lane; other local
-        // traffic stays in its own lane so its FIFO position is stable.
+        // Scheduler-local normal traffic stays in its own lane so its FIFO
+        // position is stable. Local System traffic is inserted directly into
+        // system_queue by push_local().
         while let Some(msg) = self.local_queue.pop_front() {
-            if msg.priority == MessagePriority::System {
-                self.system_skip_buffer.push_back((msg, false));
-            } else {
-                self.local_skip_buffer.push_back((msg, false));
-            }
+            debug_assert_eq!(msg.priority, MessagePriority::Normal);
+            self.local_skip_buffer.push_back((msg, false));
         }
         while let Some(msg) = self.local_bulk_queue.pop_front() {
             self.local_bulk_skip_buffer.push_back((msg, false));
@@ -600,6 +602,20 @@ mod tests {
 
         assert_eq!(mb.pop().unwrap().priority, MessagePriority::Normal);
         assert_eq!(mb.pop().unwrap().priority, MessagePriority::Bulk);
+    }
+
+    #[test]
+    fn local_system_traffic_preempts_local_normal_traffic() {
+        let mut mb = Mailbox::new(8);
+        let normal = make_msg(1, 10);
+        let mut system = make_msg(2, 20);
+        system.priority = MessagePriority::System;
+
+        mb.push_local(normal).unwrap();
+        mb.push_local(system).unwrap();
+
+        assert_eq!(mb.pop().unwrap().priority, MessagePriority::System);
+        assert_eq!(mb.pop().unwrap().priority, MessagePriority::Normal);
     }
 
     #[test]
