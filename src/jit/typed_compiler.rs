@@ -635,6 +635,19 @@ fn emit_typed_fbinop(
     cache.set(dst, result);
 }
 
+/// Emit a typed floating-point negation while keeping the value in native
+/// F64 SSA form. NaN canonicalization is deferred until cache materialization.
+fn emit_typed_fneg(
+    builder: &mut FunctionBuilder,
+    regs_ptr: Value,
+    cache: &mut NativeFloatCache,
+    src: usize,
+    dst: usize,
+) {
+    let value = cache.load(builder, regs_ptr, src);
+    cache.set(dst, builder.ins().fneg(value));
+}
+
 /// Emit typed floating-point division while preserving Nulang's
 /// nil-on-zero semantics. IEEE fdiv itself does not trap; we compute it,
 /// canonicalize the result, then select nil for both +0.0 and -0.0 divisors.
@@ -1054,6 +1067,7 @@ pub fn is_opcode_supported_typed(op: OpCode) -> bool {
             | OpCode::FSub
             | OpCode::FMul
             | OpCode::FDiv
+            | OpCode::FNeg
             | OpCode::ICmpEq
             | OpCode::ICmpLt
             | OpCode::ICmpGt
@@ -1634,6 +1648,26 @@ pub fn compile_bytecode_region_typed(
                         instr.op2 as usize,
                         dst,
                         "nulang_fmul",
+                    );
+                }
+                meta.set_type(dst, KnownType::Float);
+                int_cache.invalidate(dst);
+            }
+            OpCode::FNeg => {
+                let src = instr.op1 as usize;
+                let dst = instr.op3 as usize;
+                if meta.is_known(src, KnownType::Float) {
+                    emit_typed_fneg(&mut builder, regs_ptr, &mut float_cache, src, dst);
+                } else {
+                    emit_unary_runtime(
+                        &mut builder,
+                        &helpers,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        src,
+                        dst,
+                        "nulang_fneg",
                     );
                 }
                 meta.set_type(dst, KnownType::Float);
@@ -2557,6 +2591,45 @@ mod typed_tests {
         assert_eq!(unsafe { Value::from_bits(regs[2]) }.as_float(), Some(3.5));
         assert_eq!(unsafe { Value::from_bits(regs[3]) }.as_float(), Some(7.0));
         assert_eq!(unsafe { Value::from_bits(regs[4]) }.as_float(), Some(5.5));
+    }
+
+    #[test]
+    fn test_native_float_cache_handles_fneg_without_scalar_fallback() {
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            Instruction::new3(OpCode::FAdd, 0, 1, 2),
+            Instruction::new3(OpCode::FNeg, 2, 0, 3),
+            Instruction::new3(OpCode::FAdd, 3, 1, 4),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Float);
+        meta.set_type(1, KnownType::Float);
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_native_float_cache_fneg",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("cached Float FNeg chain should compile through typed JIT");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+        let mut regs = [0u64; 256];
+        regs[0] = Value::float(1.5).as_raw();
+        regs[1] = Value::float(2.0).as_raw();
+
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(unsafe { Value::from_bits(regs[2]) }.as_float(), Some(3.5));
+        assert_eq!(unsafe { Value::from_bits(regs[3]) }.as_float(), Some(-3.5));
+        assert_eq!(unsafe { Value::from_bits(regs[4]) }.as_float(), Some(-1.5));
     }
 
     #[test]
