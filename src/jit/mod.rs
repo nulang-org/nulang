@@ -965,9 +965,11 @@ pub(crate) fn find_compilable_whole_function_with_calls(
 ) -> Option<(usize, std::collections::HashMap<usize, usize>)> {
     use crate::bytecode::OpCode;
 
-    let function_idx = module.function_table.iter().position(|&pc| pc == start_pc)?;
-    if may_suspend.get(function_idx) != Some(&false)
-        || recursive.get(function_idx) != Some(&false)
+    let function_idx = module
+        .function_table
+        .iter()
+        .position(|&pc| pc == start_pc)?;
+    if may_suspend.get(function_idx) != Some(&false) || recursive.get(function_idx) != Some(&false)
     {
         return None;
     }
@@ -1180,17 +1182,12 @@ impl crate::backends::JitBackend for JitSession {
             // Prefer a complete non-suspending function at its entry. This can
             // cross early forward branches that the generic hot-region policy
             // intentionally rejects when the first basic block is tiny.
-            let (region_len, native_calls) =
-                find_compilable_whole_function_with_calls(pc, module, &ms, &rc)
-                    .unwrap_or_else(|| {
-                        find_compilable_region_with_calls(
-                            pc,
-                            instructions,
-                            module,
-                            Some(&ms),
-                            Some(&rc),
-                        )
-                    });
+            let (region_len, native_calls) = find_compilable_whole_function_with_calls(
+                pc, module, &ms, &rc,
+            )
+            .unwrap_or_else(|| {
+                find_compilable_region_with_calls(pc, instructions, module, Some(&ms), Some(&rc))
+            });
             if region_len >= 3 {
                 let meta = typed_compiler::infer_reg_types(module, pc);
                 let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
