@@ -341,13 +341,7 @@ impl JitSession {
         let meta = typed_compiler::infer_reg_types(module, pc);
         let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
         let _ = unsafe {
-            self.promote_region_simd(
-                module_idx,
-                pc,
-                region_len,
-                &module.instructions,
-                meta_ref,
-            )
+            self.promote_region_simd(module_idx, pc, region_len, &module.instructions, meta_ref)
         };
 
         // SIMD eligibility is a static property of this region and target.
@@ -508,7 +502,8 @@ impl JitSession {
     /// to advance pc after a JIT run instead of re-scanning the
     /// instruction stream.
     pub fn compiled_region_len(&self, module_idx: usize, offset: usize) -> Option<usize> {
-        self.compiled_entry(module_idx, offset).map(|region| region.len)
+        self.compiled_entry(module_idx, offset)
+            .map(|region| region.len)
     }
 
     /// Return the number of compiled regions.
