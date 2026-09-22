@@ -39,6 +39,8 @@ pub mod effect_checker;
 pub mod prelude_source;
 #[path = "../../../src/parser.rs"]
 pub mod parser;
+#[path = "../../../src/pattern_usefulness.rs"]
+mod pattern_usefulness;
 #[path = "../../../src/stdlib.rs"]
 pub mod stdlib;
 #[path = "../../../src/typechecker.rs"]
