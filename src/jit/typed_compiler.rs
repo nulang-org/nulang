@@ -24,7 +24,7 @@
 //! SIGN_EXT     = 0xFFFF_0000_0000_0000
 //! ```
 
-use cranelift::codegen::ir::FuncRef;
+use cranelift::codegen::ir::{BlockArg, FuncRef};
 use cranelift::prelude::*;
 use cranelift_frontend::FunctionBuilder;
 use cranelift_jit::JITModule;
@@ -435,6 +435,33 @@ impl NativeIntCache {
         }
         self.values.clear();
     }
+
+    fn flush_except(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        regs_ptr: Value,
+        keep: &HashSet<usize>,
+    ) {
+        let dirty: Vec<usize> = self
+            .dirty
+            .iter()
+            .copied()
+            .filter(|reg| !keep.contains(reg))
+            .collect();
+        for reg in dirty {
+            self.dirty.remove(&reg);
+            if let Some(value) = self.values.remove(&reg) {
+                let tagged = emit_tag_int(builder, value);
+                store_reg(builder, regs_ptr, reg, tagged);
+            }
+        }
+        self.values.retain(|reg, _| keep.contains(reg));
+    }
+
+    fn clear(&mut self) {
+        self.values.clear();
+        self.dirty.clear();
+    }
 }
 
 /// Region-local cache for proven Float registers.
@@ -478,6 +505,33 @@ impl NativeFloatCache {
             }
         }
         self.values.clear();
+    }
+
+    fn flush_except(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        regs_ptr: Value,
+        keep: &HashSet<usize>,
+    ) {
+        let dirty: Vec<usize> = self
+            .dirty
+            .iter()
+            .copied()
+            .filter(|reg| !keep.contains(reg))
+            .collect();
+        for reg in dirty {
+            self.dirty.remove(&reg);
+            if let Some(value) = self.values.remove(&reg) {
+                let bits = emit_bitcast_f64_to_i64_canonicalized(builder, value);
+                store_reg(builder, regs_ptr, reg, bits);
+            }
+        }
+        self.values.retain(|reg, _| keep.contains(reg));
+    }
+
+    fn clear(&mut self) {
+        self.values.clear();
+        self.dirty.clear();
     }
 }
 
@@ -541,6 +595,219 @@ fn region_predecessor_counts(
     }
 
     counts
+}
+
+/// Conservative first wave of loop-carried SSA.
+///
+/// We only thread native values around a loop when the compiled region starts
+/// at the loop header, contains exactly one backedge to that header, and has
+/// no other branch inside the loop body. This matches the hot-loop regions
+/// produced by the tiering scanner while avoiding general CFG phi placement.
+#[derive(Debug, Clone)]
+struct SimpleLoopSsaPlan {
+    backedge_pc: usize,
+    carried: Vec<(usize, KnownType)>,
+}
+
+fn register_write_type(instr: &Instruction, reg: usize) -> Option<Option<KnownType>> {
+    let op1 = instr.op1 as usize;
+    let op2 = instr.op2 as usize;
+    let op3 = instr.op3 as usize;
+
+    let typed_write = |dst: usize, ty: KnownType| {
+        if dst == reg {
+            Some(Some(ty))
+        } else {
+            None
+        }
+    };
+    let unknown_write = |dst: usize| {
+        if dst == reg {
+            Some(None)
+        } else {
+            None
+        }
+    };
+
+    match instr.opcode {
+        OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
+            typed_write(op1, KnownType::Int)
+        }
+        OpCode::ConstU => unknown_write(op3),
+        OpCode::Load | OpCode::Store | OpCode::Move | OpCode::Dup => unknown_write(op2),
+        OpCode::Swap => {
+            if reg == op1 || reg == op2 {
+                Some(None)
+            } else {
+                None
+            }
+        }
+        OpCode::IAdd
+        | OpCode::ISub
+        | OpCode::IMul
+        | OpCode::Xor
+        | OpCode::Shl
+        | OpCode::Shr
+        | OpCode::BitAnd
+        | OpCode::BitOr => typed_write(op3, KnownType::Int),
+        OpCode::IDiv | OpCode::IMod => unknown_write(op3),
+        OpCode::INeg => typed_write(op2, KnownType::Int),
+        OpCode::IInc | OpCode::IDec => typed_write(op1, KnownType::Int),
+        OpCode::FAdd | OpCode::FSub | OpCode::FMul | OpCode::FNeg => {
+            typed_write(op3, KnownType::Float)
+        }
+        OpCode::FDiv => unknown_write(op3),
+        OpCode::ICmpEq
+        | OpCode::ICmpLt
+        | OpCode::ICmpGt
+        | OpCode::ICmpLe
+        | OpCode::ICmpGe
+        | OpCode::FCmpEq
+        | OpCode::FCmpLt
+        | OpCode::FCmpGt => typed_write(op3, KnownType::Bool),
+        OpCode::Not => typed_write(op2, KnownType::Bool),
+        OpCode::And | OpCode::Or => typed_write(op3, KnownType::Bool),
+        OpCode::IToF => typed_write(op2, KnownType::Float),
+        OpCode::FToI => typed_write(op2, KnownType::Int),
+        OpCode::ArrLoad => unknown_write(op3),
+        _ => None,
+    }
+}
+
+fn type_at_simple_loop_backedge(
+    instructions: &[Instruction],
+    start_offset: usize,
+    backedge_pc: usize,
+    meta: &TypeMetadata,
+    reg: usize,
+) -> KnownType {
+    let mut ty = meta.get_type(reg);
+    for instr in &instructions[start_offset..backedge_pc] {
+        if let Some(write) = register_write_type(instr, reg) {
+            ty = write.unwrap_or(KnownType::Unknown);
+        }
+    }
+    ty
+}
+
+fn simple_loop_ssa_plan(
+    instructions: &[Instruction],
+    start_offset: usize,
+    end_offset: usize,
+    type_metadata: Option<&TypeMetadata>,
+) -> Option<SimpleLoopSsaPlan> {
+    let meta = type_metadata?;
+    if start_offset >= end_offset {
+        return None;
+    }
+
+    let mut backedge_pc = None;
+    for pc in start_offset..end_offset {
+        let instr = instructions[pc];
+        let target = match instr.opcode {
+            OpCode::Jmp => Some((pc as i64 + instr.simm16() as i64) as usize),
+            OpCode::JmpT | OpCode::JmpF => Some((pc as i64 + instr.offset16() as i64) as usize),
+            _ => None,
+        };
+        if target == Some(start_offset) {
+            if backedge_pc.replace(pc).is_some() {
+                return None;
+            }
+        }
+    }
+    let backedge_pc = backedge_pc?;
+
+    // The body from header to backedge must be linear. The backedge itself is
+    // the only control-flow split we thread native values through.
+    if instructions[start_offset..backedge_pc]
+        .iter()
+        .any(|instr| matches!(instr.opcode, OpCode::Jmp | OpCode::JmpT | OpCode::JmpF))
+    {
+        return None;
+    }
+
+    if matches!(
+        instructions[backedge_pc].opcode,
+        OpCode::JmpT | OpCode::JmpF
+    ) {
+        let cond = instructions[backedge_pc].op1 as usize;
+        if type_at_simple_loop_backedge(instructions, start_offset, backedge_pc, meta, cond)
+            != KnownType::Bool
+        {
+            return None;
+        }
+    }
+
+    let mut carried = Vec::new();
+    for reg in 0..256 {
+        let ty = meta.get_type(reg);
+        if !matches!(ty, KnownType::Int | KnownType::Float) {
+            continue;
+        }
+
+        // Thread only registers whose representation remains stable for the
+        // entire loop body. Nullable division, dynamic copies, swaps, and
+        // other representation-changing writes are deliberately excluded.
+        if type_at_simple_loop_backedge(instructions, start_offset, backedge_pc, meta, reg) == ty {
+            carried.push((reg, ty));
+        }
+    }
+
+    // Avoid bloating CLIF block signatures in unusually large inferred states.
+    if carried.is_empty() || carried.len() > 32 {
+        return None;
+    }
+
+    Some(SimpleLoopSsaPlan {
+        backedge_pc,
+        carried,
+    })
+}
+
+fn flush_non_carried_native_caches(
+    builder: &mut FunctionBuilder,
+    regs_ptr: Value,
+    int_cache: &mut NativeIntCache,
+    float_cache: &mut NativeFloatCache,
+    carried: &[(usize, KnownType)],
+) {
+    let keep: HashSet<usize> = carried.iter().map(|&(reg, _)| reg).collect();
+    int_cache.flush_except(builder, regs_ptr, &keep);
+    float_cache.flush_except(builder, regs_ptr, &keep);
+}
+
+fn native_value_from_vm(
+    builder: &mut FunctionBuilder,
+    regs_ptr: Value,
+    reg: usize,
+    ty: KnownType,
+) -> Value {
+    let raw = load_reg(builder, regs_ptr, reg);
+    match ty {
+        KnownType::Int => emit_sext48(builder, raw),
+        KnownType::Float => emit_bitcast_i64_to_f64(builder, raw),
+        _ => unreachable!("loop SSA only threads Int/Float registers"),
+    }
+}
+
+fn loop_carried_args(
+    builder: &mut FunctionBuilder,
+    regs_ptr: Value,
+    int_cache: &mut NativeIntCache,
+    float_cache: &mut NativeFloatCache,
+    carried: &[(usize, KnownType)],
+) -> Vec<BlockArg> {
+    carried
+        .iter()
+        .map(|&(reg, ty)| {
+            let value = match ty {
+                KnownType::Int => int_cache.load(builder, regs_ptr, reg),
+                KnownType::Float => float_cache.load(builder, regs_ptr, reg),
+                _ => unreachable!("loop SSA only threads Int/Float registers"),
+            };
+            BlockArg::from(value)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,6 +1404,8 @@ pub fn compile_bytecode_region_typed(
         }
     }
 
+    let loop_ssa = simple_loop_ssa_plan(instructions, start_offset, end_offset, type_metadata);
+
     // Clear the codegen context
     ctx.clear();
 
@@ -1166,6 +1435,16 @@ pub fn compile_bytecode_region_typed(
     for i in start_offset..end_offset {
         blocks.insert(i, builder.create_block());
     }
+    if let (Some(plan), Some(&header)) = (&loop_ssa, blocks.get(&start_offset)) {
+        for &(_, ty) in &plan.carried {
+            let clif_ty = match ty {
+                KnownType::Int => types::I64,
+                KnownType::Float => types::F64,
+                _ => unreachable!("loop SSA only threads Int/Float registers"),
+            };
+            builder.append_block_param(header, clif_ty);
+        }
+    }
     let return_block = builder.create_block();
     // Use a thread-local helper for the safepoint so concurrent VMs do not
     // share a process-global actor reduction counter.
@@ -1177,9 +1456,20 @@ pub fn compile_bytecode_region_typed(
     let exhausted = builder.ins().icmp(IntCC::NotEqual, safepoint_result, zero);
     let yield_block = builder.create_block();
     if let Some(&first_block) = blocks.get(&start_offset) {
+        let entry_args: Vec<BlockArg> = loop_ssa
+            .as_ref()
+            .map(|plan| {
+                plan.carried
+                    .iter()
+                    .map(|&(reg, ty)| {
+                        BlockArg::from(native_value_from_vm(&mut builder, regs_ptr, reg, ty))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         builder
             .ins()
-            .brif(exhausted, yield_block, &[], first_block, &[]);
+            .brif(exhausted, yield_block, &[], first_block, &entry_args);
     } else {
         builder
             .ins()
@@ -1207,6 +1497,25 @@ pub fn compile_bytecode_region_typed(
         let instr = instructions[pc];
         let block = *blocks.get(&pc).unwrap();
         builder.switch_to_block(block);
+
+        if pc == start_offset {
+            if let Some(plan) = &loop_ssa {
+                let params = builder.block_params(block).to_vec();
+                for (&(reg, ty), &value) in plan.carried.iter().zip(params.iter()) {
+                    match ty {
+                        KnownType::Int => {
+                            int_cache.set(reg, value);
+                            float_cache.invalidate(reg);
+                        }
+                        KnownType::Float => {
+                            float_cache.set(reg, value);
+                            int_cache.invalidate(reg);
+                        }
+                        _ => unreachable!("loop SSA only threads Int/Float registers"),
+                    }
+                }
+            }
+        }
 
         match instr.opcode {
             // -- Special --
@@ -1980,74 +2289,182 @@ pub fn compile_bytecode_region_typed(
 
             // -- Control Flow --
             OpCode::Jmp => {
-                flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                 let target = (pc as i64 + instr.simm16() as i64) as usize;
-                if let Some(&target_block) = blocks.get(&target) {
-                    builder.ins().jump(target_block, &[]);
-                } else {
-                    emit_yield_pc(
+                let is_loop_backedge = loop_ssa
+                    .as_ref()
+                    .is_some_and(|plan| plan.backedge_pc == pc && target == start_offset);
+
+                if is_loop_backedge {
+                    let plan = loop_ssa.as_ref().unwrap();
+                    flush_non_carried_native_caches(
                         &mut builder,
-                        helpers["nulang_jit_set_branch_exit_pc"],
-                        start_offset,
-                        target,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
                     );
-                    builder.ins().jump(return_block, &[]);
+                    let args = loop_carried_args(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
+                    );
+                    let header = blocks[&start_offset];
+                    builder.ins().jump(header, &args);
+                    // The next bytecode block is not reachable through this
+                    // edge. Drop codegen-time mappings without materializing:
+                    // the live values are carried by the header block params.
+                    int_cache.clear();
+                    float_cache.clear();
+                } else {
+                    flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
+                    if let Some(&target_block) = blocks.get(&target) {
+                        builder.ins().jump(target_block, &[]);
+                    } else {
+                        emit_yield_pc(
+                            &mut builder,
+                            helpers["nulang_jit_set_branch_exit_pc"],
+                            start_offset,
+                            target,
+                        );
+                        builder.ins().jump(return_block, &[]);
+                    }
                 }
             }
             OpCode::JmpT => {
-                flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                 let target = (pc as i64 + instr.offset16() as i64) as usize;
-                let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
-                // Branch conditions are NaN-tagged bools; truthiness is the low
-                // payload bit (matches `Value::as_bool`), not the whole value.
-                let one = builder.ins().iconst(types::I64, 1);
-                let cond_bit = builder.ins().band(cond_val, one);
-                let zero = builder.ins().iconst(types::I64, 0);
-                let is_true = builder.ins().icmp(IntCC::NotEqual, cond_bit, zero);
-                let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
-                if let Some(&target_block) = blocks.get(&target) {
-                    builder
-                        .ins()
-                        .brif(is_true, target_block, &[], fallthrough, &[]);
-                } else {
-                    let outside = builder.create_block();
-                    builder.ins().brif(is_true, outside, &[], fallthrough, &[]);
-                    builder.switch_to_block(outside);
-                    emit_yield_pc(
+                let is_loop_backedge = loop_ssa
+                    .as_ref()
+                    .is_some_and(|plan| plan.backedge_pc == pc && target == start_offset);
+
+                if is_loop_backedge {
+                    let plan = loop_ssa.as_ref().unwrap();
+                    flush_non_carried_native_caches(
                         &mut builder,
-                        helpers["nulang_jit_set_branch_exit_pc"],
-                        start_offset,
-                        target,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
                     );
-                    builder.ins().jump(return_block, &[]);
-                    builder.seal_block(outside);
+
+                    // The simple-loop plan proves this condition is Bool, so it
+                    // is already materialized by the comparison/logic opcode.
+                    let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
+                    let one = builder.ins().iconst(types::I64, 1);
+                    let cond_bit = builder.ins().band(cond_val, one);
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_true = builder.ins().icmp(IntCC::NotEqual, cond_bit, zero);
+
+                    let args = loop_carried_args(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
+                    );
+                    let header = blocks[&start_offset];
+                    let exit_block = builder.create_block();
+                    builder.ins().brif(is_true, header, &args, exit_block, &[]);
+
+                    // Only the exit path materializes loop-carried native
+                    // values. The taken backedge stays entirely in SSA form.
+                    builder.switch_to_block(exit_block);
+                    flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
+                    let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
+                    builder.ins().jump(fallthrough, &[]);
+                    builder.seal_block(exit_block);
+                } else {
+                    flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
+                    let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
+                    // Branch conditions are NaN-tagged bools; truthiness is the low
+                    // payload bit (matches `Value::as_bool`), not the whole value.
+                    let one = builder.ins().iconst(types::I64, 1);
+                    let cond_bit = builder.ins().band(cond_val, one);
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_true = builder.ins().icmp(IntCC::NotEqual, cond_bit, zero);
+                    let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
+                    if let Some(&target_block) = blocks.get(&target) {
+                        builder
+                            .ins()
+                            .brif(is_true, target_block, &[], fallthrough, &[]);
+                    } else {
+                        let outside = builder.create_block();
+                        builder.ins().brif(is_true, outside, &[], fallthrough, &[]);
+                        builder.switch_to_block(outside);
+                        emit_yield_pc(
+                            &mut builder,
+                            helpers["nulang_jit_set_branch_exit_pc"],
+                            start_offset,
+                            target,
+                        );
+                        builder.ins().jump(return_block, &[]);
+                        builder.seal_block(outside);
+                    }
                 }
             }
             OpCode::JmpF => {
-                flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                 let target = (pc as i64 + instr.offset16() as i64) as usize;
-                let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
-                let one = builder.ins().iconst(types::I64, 1);
-                let cond_bit = builder.ins().band(cond_val, one);
-                let zero = builder.ins().iconst(types::I64, 0);
-                let is_false = builder.ins().icmp(IntCC::Equal, cond_bit, zero);
-                let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
-                if let Some(&target_block) = blocks.get(&target) {
-                    builder
-                        .ins()
-                        .brif(is_false, target_block, &[], fallthrough, &[]);
-                } else {
-                    let outside = builder.create_block();
-                    builder.ins().brif(is_false, outside, &[], fallthrough, &[]);
-                    builder.switch_to_block(outside);
-                    emit_yield_pc(
+                let is_loop_backedge = loop_ssa
+                    .as_ref()
+                    .is_some_and(|plan| plan.backedge_pc == pc && target == start_offset);
+
+                if is_loop_backedge {
+                    let plan = loop_ssa.as_ref().unwrap();
+                    flush_non_carried_native_caches(
                         &mut builder,
-                        helpers["nulang_jit_set_branch_exit_pc"],
-                        start_offset,
-                        target,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
                     );
-                    builder.ins().jump(return_block, &[]);
-                    builder.seal_block(outside);
+                    let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
+                    let one = builder.ins().iconst(types::I64, 1);
+                    let cond_bit = builder.ins().band(cond_val, one);
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_false = builder.ins().icmp(IntCC::Equal, cond_bit, zero);
+
+                    let args = loop_carried_args(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                        &plan.carried,
+                    );
+                    let header = blocks[&start_offset];
+                    let exit_block = builder.create_block();
+                    builder.ins().brif(is_false, header, &args, exit_block, &[]);
+
+                    builder.switch_to_block(exit_block);
+                    flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
+                    let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
+                    builder.ins().jump(fallthrough, &[]);
+                    builder.seal_block(exit_block);
+                } else {
+                    flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
+                    let cond_val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
+                    let one = builder.ins().iconst(types::I64, 1);
+                    let cond_bit = builder.ins().band(cond_val, one);
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_false = builder.ins().icmp(IntCC::Equal, cond_bit, zero);
+                    let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
+                    if let Some(&target_block) = blocks.get(&target) {
+                        builder
+                            .ins()
+                            .brif(is_false, target_block, &[], fallthrough, &[]);
+                    } else {
+                        let outside = builder.create_block();
+                        builder.ins().brif(is_false, outside, &[], fallthrough, &[]);
+                        builder.switch_to_block(outside);
+                        emit_yield_pc(
+                            &mut builder,
+                            helpers["nulang_jit_set_branch_exit_pc"],
+                            start_offset,
+                            target,
+                        );
+                        builder.ins().jump(return_block, &[]);
+                        builder.seal_block(outside);
+                    }
                 }
             }
 
@@ -2967,6 +3384,194 @@ mod typed_tests {
         func(regs_false.as_mut_ptr(), consts.as_ptr());
         assert_eq!(unsafe { Value::from_bits(regs_false[2]) }.as_int(), Some(4));
         assert_eq!(unsafe { Value::from_bits(regs_false[3]) }.as_int(), Some(5));
+    }
+
+    // ------------------------------------------------------------------
+    // Test 6c: Simple loop-carried native SSA
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_simple_loop_ssa_plan_selects_stable_numeric_regs() {
+        let instructions = vec![
+            Instruction::new3(OpCode::IAdd, 0, 1, 0),
+            Instruction::new1(OpCode::IInc, 1),
+            Instruction::new3(OpCode::ICmpLt, 1, 6, 5),
+            Instruction::new3(OpCode::JmpT, 5, 0xFF, 0xFD), // pc3 -> pc0
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Int);
+        meta.set_type(1, KnownType::Int);
+        meta.set_type(6, KnownType::Int);
+
+        let plan = simple_loop_ssa_plan(&instructions, 0, instructions.len(), Some(&meta))
+            .expect("simple numeric loop should get an SSA plan");
+
+        assert_eq!(plan.backedge_pc, 3);
+        assert!(plan.carried.contains(&(0, KnownType::Int)));
+        assert!(plan.carried.contains(&(1, KnownType::Int)));
+        assert!(plan.carried.contains(&(6, KnownType::Int)));
+    }
+
+    #[test]
+    fn test_simple_loop_ssa_excludes_nullable_division_result() {
+        let instructions = vec![
+            Instruction::new3(OpCode::IDiv, 0, 2, 0),
+            Instruction::new1(OpCode::IInc, 1),
+            Instruction::new3(OpCode::ICmpLt, 1, 6, 5),
+            Instruction::new3(OpCode::JmpT, 5, 0xFF, 0xFD),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        for reg in [0usize, 1, 2, 6] {
+            meta.set_type(reg, KnownType::Int);
+        }
+
+        let plan = simple_loop_ssa_plan(&instructions, 0, instructions.len(), Some(&meta))
+            .expect("other stable numeric registers should still be threadable");
+
+        assert!(
+            !plan.carried.iter().any(|&(reg, _)| reg == 0),
+            "IDiv can produce nil, so its destination must not be carried as native Int"
+        );
+    }
+
+    #[test]
+    fn test_loop_ssa_executes_int_backedge() {
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            Instruction::new3(OpCode::IAdd, 0, 1, 0),
+            Instruction::new1(OpCode::IInc, 1),
+            Instruction::new3(OpCode::ICmpLt, 1, 6, 5),
+            Instruction::new3(OpCode::JmpT, 5, 0xFF, 0xFD),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Int);
+        meta.set_type(1, KnownType::Int);
+        meta.set_type(6, KnownType::Int);
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_loop_ssa_int",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("Int loop SSA should compile");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+        let mut regs = [0u64; 256];
+        regs[0] = Value::int(0).as_raw();
+        regs[1] = Value::int(0).as_raw();
+        regs[6] = Value::int(100).as_raw();
+
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(unsafe { Value::from_bits(regs[0]) }.as_int(), Some(4950));
+        assert_eq!(unsafe { Value::from_bits(regs[1]) }.as_int(), Some(100));
+    }
+
+    #[test]
+    fn test_loop_ssa_executes_float_backedge() {
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            Instruction::new3(OpCode::FAdd, 0, 1, 0),
+            Instruction::new3(OpCode::FAdd, 1, 7, 1),
+            Instruction::new3(OpCode::FCmpLt, 1, 6, 5),
+            Instruction::new3(OpCode::JmpT, 5, 0xFF, 0xFD),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        for reg in [0usize, 1, 6, 7] {
+            meta.set_type(reg, KnownType::Float);
+        }
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_loop_ssa_float",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("Float loop SSA should compile");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+        let mut regs = [0u64; 256];
+        regs[0] = Value::float(0.0).as_raw();
+        regs[1] = Value::float(0.0).as_raw();
+        regs[6] = Value::float(100.0).as_raw();
+        regs[7] = Value::float(1.0).as_raw();
+
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        assert_eq!(
+            unsafe { Value::from_bits(regs[0]) }.as_float(),
+            Some(4950.0)
+        );
+        assert_eq!(unsafe { Value::from_bits(regs[1]) }.as_float(), Some(100.0));
+    }
+
+    #[test]
+    fn test_loop_ssa_materializes_noncarried_temporary() {
+        use crate::vm::Value;
+
+        let mut jit = make_jit();
+        let instructions = vec![
+            // r8 is deliberately Unknown at the header, so this first op uses
+            // the runtime helper. Its value must still reflect the prior loop
+            // iteration.
+            Instruction::new3(OpCode::FAdd, 0, 8, 0),
+            // r8 becomes a typed cached Float inside the loop but cannot be a
+            // header phi because its entry type is Unknown.
+            Instruction::new3(OpCode::FAdd, 9, 9, 8),
+            Instruction::new1(OpCode::IInc, 1),
+            Instruction::new3(OpCode::ICmpLt, 1, 6, 5),
+            Instruction::new3(OpCode::JmpT, 5, 0xFF, 0xFC), // pc4 -> pc0
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Float);
+        meta.set_type(1, KnownType::Int);
+        meta.set_type(6, KnownType::Int);
+        meta.set_type(9, KnownType::Float);
+        // r8 stays Unknown at loop entry.
+
+        let ptr = compile_bytecode_region_typed(
+            &mut jit.module,
+            &mut jit.builder_context,
+            &mut jit.ctx,
+            "test_loop_ssa_noncarried_temp",
+            0,
+            instructions.len(),
+            &instructions,
+            Some(&meta),
+        )
+        .expect("mixed carried/non-carried loop should compile");
+
+        let func: extern "C" fn(*mut u64, *const u64) = unsafe { std::mem::transmute(ptr) };
+        let consts: [u64; 0] = [];
+        let mut regs = [0u64; 256];
+        regs[0] = Value::float(0.0).as_raw();
+        regs[1] = Value::int(0).as_raw();
+        regs[6] = Value::int(4).as_raw();
+        regs[8] = Value::float(1.0).as_raw();
+        regs[9] = Value::float(1.0).as_raw();
+
+        func(regs.as_mut_ptr(), consts.as_ptr());
+        // Iteration inputs for r8 are 1, 2, 2, 2.
+        assert_eq!(unsafe { Value::from_bits(regs[0]) }.as_float(), Some(7.0));
+        assert_eq!(unsafe { Value::from_bits(regs[8]) }.as_float(), Some(2.0));
     }
 
     // ------------------------------------------------------------------
