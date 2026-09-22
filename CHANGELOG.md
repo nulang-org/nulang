@@ -51,6 +51,14 @@ version + migration.*
 
 ## Stable tier
 
+### Async durable workflow host boundary — 2026-09-22
+- **The workflow SDK now exposes an executor-neutral async host contract**
+  (Experimental, `crates/nulang-workflow/src/async_engine.rs`). Cloud/runtime
+  adapters can load and append history and dispatch activities without blocking
+  an async executor. The async executor reuses the same replay validator,
+  event format, retry deadlines, and idempotency identities as the synchronous
+  local path, preventing local and hosted durability semantics from diverging.
+
 ### Durable workflow signals and timers — 2026-09-22
 - **`nulang-workflow` now provides crash-replayable signal delivery and durable
   timer waits** (Experimental, `crates/nulang-workflow/src/coordination.rs`).
