@@ -135,6 +135,28 @@ pub struct HandlerRef {
     pub binding_index: u32,
 }
 
+/// Static access/effect summary for one source-level `par` branch.
+///
+/// This is compiler metadata only; it is not serialized into bytecode.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ParallelBranchSummary {
+    pub index: u32,
+    pub reads: std::collections::BTreeSet<LocalId>,
+    pub writes: std::collections::BTreeSet<LocalId>,
+    pub heap_mutations: std::collections::BTreeSet<LocalId>,
+    pub state_reads: std::collections::BTreeSet<String>,
+    pub state_writes: std::collections::BTreeSet<String>,
+    pub effects: std::collections::BTreeSet<String>,
+    pub authorities: std::collections::BTreeSet<String>,
+}
+
+/// Static summary for one source-level `par` region.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ParallelRegionSummary {
+    pub expected_branches: u32,
+    pub branches: Vec<ParallelBranchSummary>,
+}
+
 // ---------------------------------------------------------------------------
 // Blocks and statements
 // ---------------------------------------------------------------------------
