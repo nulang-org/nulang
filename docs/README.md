@@ -42,10 +42,10 @@ behavior.
   status.
 
 Durable application code should prefer ordinary actors plus `entity` for
-long-lived domain state. The legacy `agent`, `workflow`, and `database`
-declaration forms remain compatibility surfaces but are deprecated by compiler
-diagnostics; new application-specific behavior should move into libraries/Cloud
-SDKs rather than expanding dedicated core syntax.
+long-lived domain state. RFC 0017 keeps `agent` and `workflow` as
+Experimental ergonomic source forms, but requires them to lower to the same
+canonical actor/state/effect runtime model. `database` remains Experimental.
+Do not treat these higher-level declarations as independent runtime species.
 
 ## Backends
 
