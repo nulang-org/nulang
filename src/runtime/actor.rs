@@ -188,6 +188,22 @@ pub struct Actor {
     /// flag is on (`NULANG_ISO_ARENA=1` / `--iso-arena`).
     pub iso_arena: crate::iso_arena::IsoArena,
     pub state_data: HashMap<String, Value>, // Named actor state fields
+    /// Dense values for schema-known actor state. The public `state_data`
+    /// map remains the canonical compatibility/persistence mirror, while
+    /// bytecode `StateGet` can bypass string hashing through
+    /// `state_constant_slots`.
+    state_slot_values: Vec<Value>,
+    /// Slot -> canonical field name, stable for the lifetime of the actor's
+    /// installed bytecode schema.
+    state_slot_names: Vec<String>,
+    /// Field name -> dense slot. Used to keep direct/native state writes in
+    /// sync with the bytecode fast path.
+    state_name_slots: HashMap<String, u16>,
+    /// Constant-pool index -> dense slot. `None` means the constant is not a
+    /// declared state field and the VM must use the legacy string callback.
+    state_constant_slots: Vec<Option<u16>>,
+    /// Persistence/CRDT model parallel to `state_slot_values`.
+    state_slot_models: Vec<StateModel>,
     pub state_models: HashMap<String, StateModel>, // Persistence model per field
     pub event_log: Vec<(String, Vec<Value>)>, // Emitted events for event_sourced actors
     /// Last persisted event sequence per EventSourced field, for compaction tracking.
@@ -341,6 +357,11 @@ impl Actor {
             orca_gc: OrcaGc::new(id), // ORCA GC engine
             iso_arena: crate::iso_arena::IsoArena::new(),
             state_data: HashMap::new(),
+            state_slot_values: Vec::new(),
+            state_slot_names: Vec::new(),
+            state_name_slots: HashMap::new(),
+            state_constant_slots: Vec::new(),
+            state_slot_models: Vec::new(),
             state_models: HashMap::new(),
             event_log: Vec::new(),
             event_sourced_sequences: HashMap::new(),
@@ -522,12 +543,150 @@ impl Actor {
         self.mailbox.push_local(msg)
     }
 
+    /// Install dense state slots for the currently attached bytecode module.
+    ///
+    /// The frozen v1 bytecode still encodes `StateGet` / `StateSet` with a
+    /// string constant-pool index.  We keep that representation intact and
+    /// build a runtime-only table from constant index -> dense actor slot.
+    /// This lets the VM skip constant-string materialization and string-keyed
+    /// state lookup on schema-known fields without changing NBC v1.
+    pub fn install_state_schema(
+        &mut self,
+        module: &crate::bytecode::CodeModule,
+        declared_fields: &[String],
+    ) {
+        self.state_slot_values.clear();
+        self.state_slot_names.clear();
+        self.state_name_slots.clear();
+        self.state_slot_models.clear();
+
+        for name in declared_fields {
+            if self.state_name_slots.contains_key(name) {
+                continue;
+            }
+            if self.state_slot_names.len() >= u16::MAX as usize {
+                break;
+            }
+            let slot = self.state_slot_names.len() as u16;
+            self.state_name_slots.insert(name.clone(), slot);
+            self.state_slot_names.push(name.clone());
+            self.state_slot_values
+                .push(self.state_data.get(name).copied().unwrap_or(Value::nil()));
+            self.state_slot_models.push(
+                self.state_models
+                    .get(name)
+                    .copied()
+                    .unwrap_or(StateModel::Local),
+            );
+        }
+
+        // Spawn-site init can introduce fields not present in older metadata.
+        // Give those fields slots too so bytecode constants referring to them
+        // can still take the indexed path.
+        let extra_fields: Vec<String> = self
+            .state_data
+            .keys()
+            .filter(|name| !self.state_name_slots.contains_key(*name))
+            .cloned()
+            .collect();
+        for name in extra_fields {
+            if self.state_slot_names.len() >= u16::MAX as usize {
+                break;
+            }
+            let slot = self.state_slot_names.len() as u16;
+            self.state_name_slots.insert(name.clone(), slot);
+            self.state_slot_names.push(name.clone());
+            self.state_slot_values
+                .push(self.state_data.get(&name).copied().unwrap_or(Value::nil()));
+            self.state_slot_models.push(
+                self.state_models
+                    .get(&name)
+                    .copied()
+                    .unwrap_or(StateModel::Local),
+            );
+        }
+
+        self.state_constant_slots = vec![None; module.constants.len()];
+        for (constant_idx, constant) in module.constants.iter().enumerate() {
+            if let crate::bytecode::Constant::String(name) = constant {
+                if let Some(&slot) = self.state_name_slots.get(name) {
+                    self.state_constant_slots[constant_idx] = Some(slot);
+                }
+            }
+        }
+    }
+
+    /// Read a schema-known field directly from its constant-pool indexed slot.
+    /// Returns `None` when this constant is not mapped to actor state so the
+    /// VM can fall back to the legacy string callback.
+    #[inline]
+    pub fn get_state_field_by_constant(&self, constant_idx: usize) -> Option<Value> {
+        let slot = self
+            .state_constant_slots
+            .get(constant_idx)
+            .and_then(|slot| *slot)? as usize;
+        self.state_slot_values.get(slot).copied()
+    }
+
+    /// Return the persistence model for a constant-pool indexed state field.
+    #[inline]
+    pub fn state_model_by_constant(&self, constant_idx: usize) -> Option<StateModel> {
+        let slot = self
+            .state_constant_slots
+            .get(constant_idx)
+            .and_then(|slot| *slot)? as usize;
+        self.state_slot_models.get(slot).copied()
+    }
+
+    /// Return the canonical name for a constant-pool indexed state field.
+    #[inline]
+    pub fn state_field_name_by_constant(&self, constant_idx: usize) -> Option<&str> {
+        let slot = self
+            .state_constant_slots
+            .get(constant_idx)
+            .and_then(|slot| *slot)? as usize;
+        self.state_slot_names.get(slot).map(String::as_str)
+    }
+
+    /// Write a schema-known field through its constant-pool indexed slot.
+    ///
+    /// The `state_data` map is deliberately kept in sync because it is part
+    /// of the current runtime compatibility surface and is consumed by
+    /// persistence, CRDT, migration, debugging, and embedder code.
+    #[inline]
+    pub fn set_state_field_by_constant(&mut self, constant_idx: usize, value: Value) -> bool {
+        let Some(slot) = self
+            .state_constant_slots
+            .get(constant_idx)
+            .and_then(|slot| *slot)
+            .map(usize::from)
+        else {
+            return false;
+        };
+        let Some(name) = self.state_slot_names.get(slot).cloned() else {
+            return false;
+        };
+        if let Some(target) = self.state_slot_values.get_mut(slot) {
+            *target = value;
+        } else {
+            return false;
+        }
+        self.dirty_fields.insert(name.clone());
+        self.state_data.insert(name, value);
+        true
+    }
+
     /// Set or update a named state field.  Marks the field dirty for
     /// incremental persistence (only dirty fields are re-serialized on
     /// the next checkpoint).
     pub fn set_state_field(&mut self, name: impl Into<String>, value: Value) {
         let name_str = name.into();
         self.dirty_fields.insert(name_str.clone());
+        if let Some(&slot) = self.state_name_slots.get(&name_str) {
+            if let Some(target) = self.state_slot_values.get_mut(slot as usize) {
+                *target = value;
+            }
+        }
         self.state_data.insert(name_str.clone(), value);
 
         // Auto-sync CRDT fields on mutation
@@ -538,6 +697,9 @@ impl Actor {
 
     /// Get a named state field.
     pub fn get_state_field(&self, name: &str) -> Option<Value> {
+        if let Some(&slot) = self.state_name_slots.get(name) {
+            return self.state_slot_values.get(slot as usize).copied();
+        }
         self.state_data.get(name).copied()
     }
 
@@ -640,6 +802,36 @@ mod tests {
         let mut actor = Actor::new(1, "test", 0);
         actor.set_state_field("key", Value::int(42));
         assert_eq!(actor.get_state_field("key"), Some(Value::int(42)));
+    }
+
+    #[test]
+    fn test_dense_state_slots_follow_constant_indices_and_direct_writes() {
+        use crate::bytecode::{CodeModule, Constant};
+
+        let mut actor = Actor::new(1, "test", 0);
+        actor.state_models.insert("count".into(), StateModel::Local);
+        actor.set_state_field("count", Value::int(1));
+
+        let mut module = CodeModule::new("state-slots");
+        let unrelated = module.add_constant(Constant::String("other".into()));
+        let count = module.add_constant(Constant::String("count".into()));
+        actor.install_state_schema(&module, &["count".into()]);
+
+        assert_eq!(actor.get_state_field_by_constant(unrelated), None);
+        assert_eq!(
+            actor.get_state_field_by_constant(count),
+            Some(Value::int(1))
+        );
+
+        assert!(actor.set_state_field_by_constant(count, Value::int(2)));
+        assert_eq!(actor.get_state_field("count"), Some(Value::int(2)));
+        assert_eq!(actor.state_data.get("count"), Some(&Value::int(2)));
+
+        actor.set_state_field("count", Value::int(3));
+        assert_eq!(
+            actor.get_state_field_by_constant(count),
+            Some(Value::int(3))
+        );
     }
 
     #[test]
