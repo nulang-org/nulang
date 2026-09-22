@@ -480,12 +480,7 @@ impl IntRegCache {
         args
     }
 
-    fn load_block_params(
-        &mut self,
-        params: &[Value],
-        carried_regs: &[usize],
-        dirty: bool,
-    ) {
+    fn load_block_params(&mut self, params: &[Value], carried_regs: &[usize], dirty: bool) {
         self.clear();
         for (&reg, &value) in carried_regs.iter().zip(params.iter()) {
             self.set_with_dirty(reg, value, dirty);
@@ -1053,16 +1048,13 @@ pub(crate) fn stable_region_int_regs(
                     written[reg] = true;
                 }
             };
-            let eliminate = |
-                stable: &mut [bool; REG_COUNT],
-                written: &mut [bool; REG_COUNT],
-                reg: usize,
-            | {
-                if reg < REG_COUNT {
-                    stable[reg] = false;
-                    written[reg] = true;
-                }
-            };
+            let eliminate =
+                |stable: &mut [bool; REG_COUNT], written: &mut [bool; REG_COUNT], reg: usize| {
+                    if reg < REG_COUNT {
+                        stable[reg] = false;
+                        written[reg] = true;
+                    }
+                };
 
             match instr.opcode {
                 OpCode::Nop
@@ -1117,9 +1109,7 @@ pub(crate) fn stable_region_int_regs(
                 }
 
                 OpCode::ConstU => eliminate(&mut stable, &mut written, op3),
-                OpCode::IDiv | OpCode::IMod => {
-                    eliminate(&mut stable, &mut written, op3)
-                }
+                OpCode::IDiv | OpCode::IMod => eliminate(&mut stable, &mut written, op3),
                 OpCode::Drop => eliminate(&mut stable, &mut written, op1),
                 OpCode::FAdd | OpCode::FSub | OpCode::FMul | OpCode::FNeg | OpCode::FDiv => {
                     eliminate(&mut stable, &mut written, op3);
@@ -1134,9 +1124,7 @@ pub(crate) fn stable_region_int_regs(
                 | OpCode::FCmpGt
                 | OpCode::And
                 | OpCode::Or => eliminate(&mut stable, &mut written, op3),
-                OpCode::Not | OpCode::IToF => {
-                    eliminate(&mut stable, &mut written, op2)
-                }
+                OpCode::Not | OpCode::IToF => eliminate(&mut stable, &mut written, op2),
                 OpCode::ArrLoad => eliminate(&mut stable, &mut written, op3),
 
                 _ => return Vec::new(),
@@ -1152,9 +1140,7 @@ pub(crate) fn stable_region_int_regs(
         .iter()
         .zip(written.iter())
         .enumerate()
-        .filter_map(|(reg, (&is_stable, &was_written))| {
-            (is_stable && was_written).then_some(reg)
-        })
+        .filter_map(|(reg, (&is_stable, &was_written))| (is_stable && was_written).then_some(reg))
         .collect()
 }
 
@@ -1881,8 +1867,7 @@ pub fn compile_bytecode_region_typed(
                 let target = (pc as i64 + instr.simm16() as i64) as usize;
                 if let Some(&target_block) = blocks.get(&target) {
                     int_cache.flush_except(&mut builder, regs_ptr, &carried_int_regs);
-                    let args =
-                        int_cache.carried_args(&mut builder, regs_ptr, &carried_int_regs);
+                    let args = int_cache.carried_args(&mut builder, regs_ptr, &carried_int_regs);
                     builder.ins().jump(target_block, &args);
                 } else {
                     int_cache.flush_and_clear(&mut builder, regs_ptr);
@@ -1908,19 +1893,15 @@ pub fn compile_bytecode_region_typed(
                 let target_block = blocks.get(&target).copied();
                 let fallthrough_block = blocks.get(&(pc + 1)).copied();
 
-                if let (Some(target_block), Some(fallthrough)) =
-                    (target_block, fallthrough_block)
-                {
+                if let (Some(target_block), Some(fallthrough)) = (target_block, fallthrough_block) {
                     int_cache.flush_except(&mut builder, regs_ptr, &carried_int_regs);
-                    let args =
-                        int_cache.carried_args(&mut builder, regs_ptr, &carried_int_regs);
+                    let args = int_cache.carried_args(&mut builder, regs_ptr, &carried_int_regs);
                     builder
                         .ins()
                         .brif(is_true, target_block, &args, fallthrough, &args);
                 } else {
                     int_cache.flush_and_clear(&mut builder, regs_ptr);
-                    let args =
-                        int_cache.carried_args(&mut builder, regs_ptr, &carried_int_regs);
+                    let args = int_cache.carried_args(&mut builder, regs_ptr, &carried_int_regs);
 
                     match (target_block, fallthrough_block) {
                         (Some(target_block), None) => {
@@ -1945,9 +1926,7 @@ pub fn compile_bytecode_region_typed(
                         }
                         (None, None) => {
                             let outside = builder.create_block();
-                            builder
-                                .ins()
-                                .brif(is_true, outside, &[], return_block, &[]);
+                            builder.ins().brif(is_true, outside, &[], return_block, &[]);
                             builder.switch_to_block(outside);
                             emit_yield_pc(
                                 &mut builder,
@@ -1973,19 +1952,15 @@ pub fn compile_bytecode_region_typed(
                 let target_block = blocks.get(&target).copied();
                 let fallthrough_block = blocks.get(&(pc + 1)).copied();
 
-                if let (Some(target_block), Some(fallthrough)) =
-                    (target_block, fallthrough_block)
-                {
+                if let (Some(target_block), Some(fallthrough)) = (target_block, fallthrough_block) {
                     int_cache.flush_except(&mut builder, regs_ptr, &carried_int_regs);
-                    let args =
-                        int_cache.carried_args(&mut builder, regs_ptr, &carried_int_regs);
+                    let args = int_cache.carried_args(&mut builder, regs_ptr, &carried_int_regs);
                     builder
                         .ins()
                         .brif(is_false, target_block, &args, fallthrough, &args);
                 } else {
                     int_cache.flush_and_clear(&mut builder, regs_ptr);
-                    let args =
-                        int_cache.carried_args(&mut builder, regs_ptr, &carried_int_regs);
+                    let args = int_cache.carried_args(&mut builder, regs_ptr, &carried_int_regs);
 
                     match (target_block, fallthrough_block) {
                         (Some(target_block), None) => {
