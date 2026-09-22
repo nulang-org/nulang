@@ -64,6 +64,19 @@ pub enum ActorActivation {
     Virtual,
 }
 
+/// Compile-time markers delimiting a structured `par` region.
+///
+/// These markers intentionally survive HIR -> MIR while code generation treats
+/// them as zero-cost metadata. They make branch boundaries explicit for future
+/// capture/effect/authority analysis without changing current sequential
+/// execution semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ParallelRegionMarker {
+    Begin { branches: u32 },
+    Branch { index: u32 },
+    End,
+}
+
 /// Minimal orthogonal execution profile.
 ///
 /// This type is intentionally representation-agnostic and is not serialized in
