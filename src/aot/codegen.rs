@@ -973,6 +973,23 @@ pub fn is_all_int(func: &mir::Function) -> bool {
             }
         }
     }
+    // Checked integer negation can raise on INT48_MIN. The checked runtime
+    // helper consumes/returns boxed values, so keep any function containing
+    // unary Neg out of the all-Int unboxed calling convention.
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            if matches!(
+                stmt,
+                mir::Stmt::Assign {
+                    op: mir::RValue::Unary(crate::ast::UnOp::Neg, _),
+                    ..
+                }
+            ) {
+                return false;
+            }
+        }
+    }
+
     // Nil-producing / heap-object operations must stay boxed. An unboxed
     // function tags its raw result, so a nil (div-by-zero, negative int-pow
     // exponent, out-of-bounds array access) would be re-tagged as int 0, and
@@ -3425,12 +3442,11 @@ fn compile_unary(
         UnOp::Neg => {
             if type_meta.is_known(reg as usize, KnownType::Int) {
                 if mode == CompileMode::Unboxed {
-                    Ok(builder.ins().ineg(val))
-                } else {
-                    let payload = emit_sext48(builder, val);
-                    let neg = builder.ins().ineg(payload);
-                    Ok(emit_tag_int(builder, neg))
+                    return Err(AotCompileError::Internal(
+                        "checked integer Neg reached unboxed AOT codegen".into(),
+                    ));
                 }
+                call_helper(builder, helpers, "nulang_ineg", &[val])
             } else if type_meta.is_known(reg as usize, KnownType::Float) {
                 let f = builder.ins().bitcast(types::F64, MemFlags::new(), val);
                 let neg = builder.ins().fneg(f);
@@ -3530,6 +3546,21 @@ mod tests {
         builder.terminate(mir::Terminator::Return(Some(tmp)));
         let func = builder.build();
         assert!(is_all_int(&func));
+    }
+
+    #[test]
+    fn test_is_all_int_false_with_checked_neg() {
+        let mut builder =
+            mir::FunctionBuilder::new("checked_neg", Some(crate::types::Type::int()));
+        let x = builder.add_param("x", crate::types::Type::int());
+        let neg = builder.add_temp(crate::types::Type::int());
+        builder.assign(neg, mir::RValue::Unary(crate::ast::UnOp::Neg, x));
+        builder.terminate(mir::Terminator::Return(Some(neg)));
+        let func = builder.build();
+        assert!(
+            !is_all_int(&func),
+            "integer Neg must use boxed checked arithmetic, not unboxed AOT"
+        );
     }
 
     #[test]
