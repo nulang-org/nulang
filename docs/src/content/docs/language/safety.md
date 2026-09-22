@@ -30,7 +30,7 @@ Nulang's capability system (inspired by Pony) prevents data races and use-after-
 
 - **Hindley-Milner inference** (Algorithm W): full type inference with polymorphism. The compiler infers types globally — you write annotations only for public APIs.
 - **No `any` / `dynamic`**: every expression has a known type. There are no implicit coercions or runtime type checks.
-- **Match coverage diagnostics**: the compiler reports `W0201` when it can prove a finite boolean/variant match is missing cases; `--deny-warnings` promotes that diagnostic to a build failure. Full structural usefulness checking is still being stabilized, so complex non-exhaustive matches retain the runtime fallback for now.
+- **Pattern usefulness diagnostics**: a typed Maranget-style matrix reports uncovered witness patterns (`W0201`) and unreachable/subsumed arms (`W0202`) across variants, tuples, records, booleans and literal domains. `--deny-warnings` promotes these diagnostics to build failures while the compatibility-phase runtime fallback remains available.
 - **No null**: `nil` is an explicit tagged value with its own type (`Nil`). You cannot dereference nil — the type system tracks where `nil` may flow.
 - **Row polymorphism**: records are structurally typed. A function accepting `{ x: Int, y: Int }` works with any record containing those fields (and any others) — no type-level casting needed.
 
@@ -96,7 +96,7 @@ Nulang inherits BEAM/OTP fault-tolerance patterns:
 |---|---|---|
 | **Type safety** | Static types catch bugs at compile time | Dynamic types — errors surface at runtime |
 | **Effect documentation** | Effect rows in type signatures | No effect tracking — any function can do I/O |
-| **Pattern matching** | Conservative finite coverage diagnostics (`W0201`); full usefulness checking in progress | Non-exhaustive by default |
+| **Pattern matching** | Typed usefulness/exhaustiveness diagnostics with unreachable-arm detection | Non-exhaustive by default |
 | **Fault tolerance** | Same OTP supervision primitives | Same OTP supervision primitives |
 
 ### vs C/C++
