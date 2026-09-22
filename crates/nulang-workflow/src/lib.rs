@@ -7,6 +7,7 @@
 
 mod engine;
 mod history;
+mod lease;
 mod retry;
 
 pub use engine::{
@@ -14,4 +15,8 @@ pub use engine::{
     DurableWorkflowExecutor, WorkflowEngineError, WorkflowRuntime,
 };
 pub use history::{ActivityInvocationId, WorkflowEvent, WorkflowHistory, WorkflowId};
+pub use lease::{
+    FenceCheck, LeaseAcquireOutcome, LeaseReleaseOutcome, LeaseRenewOutcome, WorkerLease,
+    WorkerLeaseStore,
+};
 pub use retry::{Backoff, RetryPolicy};
