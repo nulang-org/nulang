@@ -4,7 +4,7 @@
 //! snapshot of durable actor state and an append-only journal of messages.
 //! On recovery the runtime loads the latest snapshot and replays the journal.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -516,9 +516,13 @@ pub struct JsonFileStore {
     journal_files: HashMap<u64, fs::File>,
     workflow_event_files: HashMap<u64, fs::File>,
     event_files: HashMap<u64, fs::File>,
+    /// Actor directories already created by this store instance. The runtime
+    /// repeatedly checkpoints the same actors, so this avoids a create_dir_all
+    /// path walk on every snapshot/append after the first write.
+    known_actor_dirs: HashSet<u64>,
     /// Reused serialization scratch space. A record is fully encoded here
-    /// before any bytes reach an append log, preserving the old all-or-error
-    /// serialization behavior without allocating a new String per append.
+    /// before any bytes reach durable storage, preserving all-or-error
+    /// serialization without allocating a new String per write.
     append_buffer: Vec<u8>,
 }
 
@@ -532,6 +536,7 @@ impl Clone for JsonFileStore {
             journal_files: HashMap::new(),
             workflow_event_files: HashMap::new(),
             event_files: HashMap::new(),
+            known_actor_dirs: HashSet::new(),
             append_buffer: Vec::new(),
         }
     }
@@ -546,6 +551,7 @@ impl JsonFileStore {
             journal_files: HashMap::new(),
             workflow_event_files: HashMap::new(),
             event_files: HashMap::new(),
+            known_actor_dirs: HashSet::new(),
             append_buffer: Vec::new(),
         })
     }
@@ -570,8 +576,18 @@ impl JsonFileStore {
         self.actor_dir(actor_id).join("events.jsonl")
     }
 
+    fn ensure_actor_dir(&mut self, actor_id: u64) -> io::Result<()> {
+        if self.known_actor_dirs.contains(&actor_id) {
+            return Ok(());
+        }
+        fs::create_dir_all(self.actor_dir(actor_id))?;
+        self.known_actor_dirs.insert(actor_id);
+        Ok(())
+    }
+
     fn append_json_line_cached<T: serde::Serialize>(
         files: &mut HashMap<u64, fs::File>,
+        known_actor_dirs: &mut HashSet<u64>,
         buffer: &mut Vec<u8>,
         actor_id: u64,
         path: PathBuf,
@@ -600,8 +616,11 @@ impl JsonFileStore {
         let file = match files.entry(actor_id) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
+                if !known_actor_dirs.contains(&actor_id) {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    known_actor_dirs.insert(actor_id);
                 }
                 let file = fs::OpenOptions::new()
                     .create(true)
@@ -622,18 +641,24 @@ impl JsonFileStore {
 
 impl PersistenceStore for JsonFileStore {
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
-        let dir = self.actor_dir(snapshot.actor_id);
-        fs::create_dir_all(&dir)?;
-        let path = self.snapshot_path(snapshot.actor_id);
-        let json = serde_json::to_string_pretty(&snapshot)
+        // Fully serialize before touching the on-disk snapshot. Reusing the
+        // store scratch buffer avoids a fresh pretty-JSON String allocation
+        // on every checkpoint while preserving the old serialization failure
+        // semantics.
+        self.append_buffer.clear();
+        serde_json::to_writer_pretty(&mut self.append_buffer, &snapshot)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        self.ensure_actor_dir(snapshot.actor_id)?;
+        let dir = self.actor_dir(snapshot.actor_id);
+        let path = self.snapshot_path(snapshot.actor_id);
         // Write to a temp file in the same directory, then atomically rename
         // it into place: a crash mid-write can no longer leave a truncated
         // snapshot.json that recovery would silently treat as "no state".
         let tmp_path = dir.join("snapshot.json.tmp");
         {
             let mut file = fs::File::create(&tmp_path)?;
-            file.write_all(json.as_bytes())?;
+            file.write_all(&self.append_buffer)?;
             file.sync_all()?;
         }
         fs::rename(&tmp_path, &path)?;
@@ -665,6 +690,7 @@ impl PersistenceStore for JsonFileStore {
         let path = self.journal_path(actor_id);
         Self::append_json_line_cached(
             &mut self.journal_files,
+            &mut self.known_actor_dirs,
             &mut self.append_buffer,
             actor_id,
             path,
@@ -687,6 +713,7 @@ impl PersistenceStore for JsonFileStore {
         let path = self.workflow_events_path(actor_id);
         Self::append_json_line_cached(
             &mut self.workflow_event_files,
+            &mut self.known_actor_dirs,
             &mut self.append_buffer,
             actor_id,
             path,
@@ -709,6 +736,7 @@ impl PersistenceStore for JsonFileStore {
         let path = self.events_path(actor_id);
         Self::append_json_line_cached(
             &mut self.event_files,
+            &mut self.known_actor_dirs,
             &mut self.append_buffer,
             actor_id,
             path,
@@ -760,6 +788,7 @@ impl PersistenceStore for JsonFileStore {
         self.journal_files.remove(&actor_id);
         self.workflow_event_files.remove(&actor_id);
         self.event_files.remove(&actor_id);
+        self.known_actor_dirs.remove(&actor_id);
 
         let dir = self.actor_dir(actor_id);
         if dir.exists() {
@@ -2181,6 +2210,7 @@ mod json_file_store_tests {
 
         store.clear(7).unwrap();
         assert!(store.journal_files.is_empty());
+        assert!(!store.known_actor_dirs.contains(&7));
         assert!(!store.actor_dir(7).exists());
         let _ = fs::remove_dir_all(&dir);
     }
