@@ -388,7 +388,7 @@ impl Supervisor {
         runtime.actors.insert(new_id, new_actor);
         // Register CRDT-backed fields with the CrdtManager.
         if let Some(ref mut mgr) = runtime.crdt_manager {
-            let actor = runtime.actors.get(&new_id).unwrap();
+            let actor = runtime.kernel.actors.get(&new_id).unwrap();
             mgr.register_actor_fields(new_id, actor);
         }
         if is_workflow {

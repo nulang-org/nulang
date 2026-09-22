@@ -21,6 +21,7 @@ pub mod cache_server;
 mod gc;
 pub mod heap;
 pub(crate) mod heap_serialize;
+mod kernel;
 mod mailbox;
 mod scheduler;
 pub use heap_serialize::*;
@@ -106,6 +107,7 @@ pub use gc::{ForeignRefOp, GcStats, OrcaCoordinator, OrcaGc, OrcaHeap};
 pub use grain::*;
 pub use heap::*;
 pub use http_server::{render_route_handler, HttpMethod, HttpServerState, WebDevServer, WebRoute};
+pub use kernel::RuntimeKernel;
 pub use mailbox::*;
 pub use network::NetworkTransport;
 pub use network::*;
@@ -301,31 +303,12 @@ pub(crate) enum MessageAdmission {
 }
 
 pub struct Runtime {
-    pub actors: HashMap<u64, Actor>,
-    pub supervisors: HashMap<u64, Supervisor>,
-    pub scheduler: Scheduler,
-    pub current_actor: Option<u64>,
-    /// W3C trace context of the message currently being handled on this
-    /// shard's scheduler thread. Sends performed while handling a message
-    /// stamp their outgoing `traceparent` as a child of this context, so
-    /// causal chains span actor, shard, and node boundaries.
-    pub current_trace: Option<TraceContext>,
-    // Fallback heap/GC for allocation performed OUTSIDE any actor's
-    // behavior (e.g. `main()`'s own top-level bytecode: string
-    // concatenation, `Int.to_string`, and similar). See
-    // `RuntimeVmCallbacks::alloc`'s doc comment for why this exists.
-    pub main_heap: ActorHeap,
-    pub main_gc: OrcaGc,
-    pub next_reductions: u32,
-    pub coordinator: OrcaCoordinator,
-    pub cycle_detector: CycleDetector,
-
-    // Heaps of exited actors that still have outstanding foreign
-    // references.  Dropping a heap while another actor holds a pointer
-    // into it would dangle, so such heaps are retired here instead and
-    // reclaimed by `reclaim_retired_heaps` once every foreign reference
-    // (in-flight op or receiver hold) has drained.
-    retired_heaps: Vec<ActorHeap>,
+    /// Actor execution state shared by every runtime configuration.
+    ///
+    /// Platform subsystems are intentionally kept outside this kernel. The
+    /// temporary Deref bridge below preserves existing field access while
+    /// callers migrate toward narrower subsystem boundaries.
+    pub kernel: RuntimeKernel,
 
     // Distributed actor system (v0.5)
     pub distributed: DistributedContext,
@@ -536,6 +519,26 @@ pub struct Runtime {
     cross_shard_rx: Option<mpsc::Receiver<CrossShardMsg>>,
 }
 
+/// Transitional compatibility bridge for the kernel extraction.
+///
+/// Existing runtime code can continue using `runtime.actors`,
+/// `runtime.scheduler`, and related fields while subsystem APIs are moved to
+/// narrower interfaces. New fields must not be added to `RuntimeKernel`
+/// unless they are required for actor execution itself.
+impl std::ops::Deref for Runtime {
+    type Target = RuntimeKernel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.kernel
+    }
+}
+
+impl std::ops::DerefMut for Runtime {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.kernel
+    }
+}
+
 // SAFETY: in sharded mode each Runtime runs on exactly one thread (shard
 // ownership by actor_id % shard_count). Cross-shard communication uses
 // mpsc channels; no two threads access the same Runtime's internal state.
@@ -574,23 +577,9 @@ impl crate::backends::ForeignInterop for NoOpForeignInterop {
 impl Runtime {
     pub fn new() -> Self {
         Runtime {
-            actors: HashMap::new(),
-            supervisors: HashMap::new(),
-            scheduler: Scheduler::new(4),
-            current_actor: None,
-            current_trace: None,
-            main_heap: {
-                let mut heap = ActorHeap::new(64 * 1024);
-                heap.set_actor_id(MAIN_HEAP_ACTOR_ID);
-                heap
-            },
-            main_gc: OrcaGc::new(MAIN_HEAP_ACTOR_ID),
-            next_reductions: 1000,
-            coordinator: OrcaCoordinator::new(),
-            cycle_detector: CycleDetector::new(),
+            kernel: RuntimeKernel::new(),
             vm_execution_depth: 0,
             suspend_enabled: false,
-            retired_heaps: Vec::new(),
             distributed: DistributedContext::new(),
             cluster_config: ClusterConfig::default(),
             acked_packets: HashSet::new(),
@@ -2514,7 +2503,7 @@ impl Runtime {
         // Grain hydration: a resident grain actor that is hibernated should be
         // woken before the new message is delivered.
         if self.actor_grain_id.contains_key(&target_id) {
-            if let Some(actor) = self.actors.get_mut(&target_id) {
+            if let Some(actor) = self.kernel.actors.get_mut(&target_id) {
                 if actor.is_hibernated() {
                     if let Some(vm) = self.vm.as_mut() {
                         if let Err(e) = actor.wake_from_hibernation(vm) {
@@ -2592,10 +2581,10 @@ impl Runtime {
             priority: MessagePriority::Normal,
             trace_id: out_trace.clone(),
         };
-        let admission = if let Some(actor) = self.actors.get_mut(&target_id) {
+        let admission = if let Some(actor) = self.kernel.actors.get_mut(&target_id) {
             actor
                 .flight_recorder
-                .record(self.current_actor.unwrap_or(0), behavior_id, args);
+                .record(self.kernel.current_actor.unwrap_or(0), behavior_id, args);
             if actor.mailbox.push_local(msg).is_ok() {
                 // Activity resets the dehydration idle timer.
                 actor.idle_ms = 0;
@@ -3298,7 +3287,7 @@ impl Runtime {
                 self.vm = Some(crate::vm::VM::new());
             }
             let vm = self.vm.as_mut().unwrap();
-            let hibernated = if let Some(actor) = self.actors.get_mut(&actor_id) {
+            let hibernated = if let Some(actor) = self.kernel.actors.get_mut(&actor_id) {
                 match actor.hibernate(vm, &module_hash) {
                     Ok(_) => true,
                     Err(ref e) if e == "No active frame" => {
@@ -5167,7 +5156,7 @@ impl Runtime {
         // not covered by the snapshot get fresh replicas while recovered fields
         // reuse their restored CrdtIds.
         if let Some(ref mut mgr) = self.crdt_manager {
-            if let Some(actor) = self.actors.get(&actor_id) {
+            if let Some(actor) = self.kernel.actors.get(&actor_id) {
                 mgr.register_actor_fields(actor_id, actor);
             }
         }
@@ -5594,7 +5583,7 @@ impl Runtime {
         }
         self.actors.insert(actor_id, actor);
         if let Some(ref mut mgr) = self.crdt_manager {
-            if let Some(actor) = self.actors.get(&actor_id) {
+            if let Some(actor) = self.kernel.actors.get(&actor_id) {
                 mgr.register_actor_fields(actor_id, actor);
             }
         }
