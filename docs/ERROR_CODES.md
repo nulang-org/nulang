@@ -102,11 +102,21 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 | Range   | Category                                  |
 |---------|-------------------------------------------|
 | `W01xx` | Deprecations                              |
+| `W02xx` | Type-directed semantic diagnostics         |
 
 | Code    | Meaning                                   | Replacement (RFC)        |
 |---------|-------------------------------------------|--------------------------|
 | `W0101` | Deprecated `catch` expression (all forms) | `match` on `Ok`/`Error`, `?` under `T ! E` (RFC 0015) |
 | `W0102` | Deprecated `fail` expression              | `return Error(...)` under `T ! E` (RFC 0015) |
+| `W0201` | Provably non-exhaustive finite `match`     | Add the missing finite case(s) or an unguarded `| _ => ...` fallback |
+
+### W0201 scope
+
+The initial W0201 implementation is deliberately conservative. It proves
+coverage for booleans and closed variants, including recursively finite variant
+payloads. Guarded arms do not contribute to totality because the guard may be
+false. Infinite domains and structural pattern matrices are left undecided
+rather than diagnosed until the full usefulness algorithm is implemented.
 
 See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 
