@@ -4,8 +4,8 @@ description: Workflow declarations with steps, parallel branches, event emission
 ---
 ## Workflows
 
-:::caution[Legacy declaration surface]
-The `workflow` declaration remains implemented for compatibility but is Experimental/deprecated under RFC 0004. New code should prefer ordinary actors/entities plus workflow libraries/effects. This page documents the existing runtime so older programs remain understandable and maintainable.
+:::note[Experimental ergonomic surface]
+Accepted RFC 0017 keeps `workflow` as valid Experimental syntax provided it lowers to the canonical actor/state/effect/supervision/time model. RFC 0004's proposed removal path was never accepted. This page documents the current ergonomic workflow layer and its runtime behavior.
 :::
 
 A legacy workflow declaration lowers to a persistent actor with checkpointed state that progresses through named steps. With a configured durable store, the runtime journals workflow progress and can reconstruct persisted state after restart. Recovery guarantees depend on the persistence backend, crash boundary, and compatibility/migration checks; do not treat the syntax alone as a zero-loss guarantee.
@@ -119,4 +119,4 @@ The `progress` function, returned from the program entry, becomes a query handle
 - [Signals, Timers & Queries](/workflows/signals-timers/) — suspension/resume primitives for workflow steps
 - [AI Agents Overview](/ai/overview/) — agents that workflows can orchestrate
 
-> **Status**: The `workflow` keyword is Experimental/deprecated under RFC 0004. It remains functional during the compatibility window; new applications should compose actors/entities with workflow libraries/effects.
+> **Status**: The `workflow` keyword is Experimental under RFC 0017. Its semantics must remain expressible through the canonical runtime primitives rather than a separate execution engine.
