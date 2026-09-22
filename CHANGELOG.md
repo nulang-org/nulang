@@ -1570,6 +1570,12 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Affine continuation and effect-safety formal closure — 2026-09-22
+- **The optimized single-shot continuation path is now regression-tested for affine consumption.** A hand-built `PerformDirect` program proves the lightweight `SingleShotState` is consumed by the first `Resume` and a second resume traps exactly like the heap-captured continuation path.
+- **Vacuous effect-safety theorems were removed.** `spec/formal/effects.lean` now proves pushed-handler dispatch, rejects a bare `perform` from the empty effect row, and models affine continuation consumption explicitly.
+- **Handler-body effects now participate in the formal typing rule.** `tHandle` propagates effects from the handler body rather than treating it as an unchecked orthogonal term. The stronger whole-program operational effect-safety theorem remains explicitly open.
+
+
 ### Split-context linear ownership flow — 2026-09-22
 - **Capability branch joins now distinguish possible from guaranteed consumption.** `CapabilityAnalyzer` tracks `may` consumption by union and `must` consumption by intersection. A value consumed on only one branch can no longer be reused after the join, while exactly-once discharge still requires every path to consume it.
 - **Loop and handler semantics are stricter.** Moving an outer ownership value from a repeating `while` condition or receive guard is rejected; optional effect-handler arms contribute possible consumption but cannot falsely satisfy a linear must-use obligation.

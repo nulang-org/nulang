@@ -949,9 +949,10 @@ runtime withstands adversarial operational review. Both hold up as
      with `may`/union and `must`/intersection facts; the branch laws are
      proved with no admitted theorem in this rooted file. A full expression-
      level input/output-context typing judgment remains future strengthening.
-   - `effects.lean`: `effect_safety` (closed row `{}` cannot perform an
-     unhandled effect) — still a `True` stub, not proved; progress+
-     preservation for handler dispatch — open.
+   - `effects.lean`: vacuous `True` stubs are removed. Pushed-handler
+     dispatch, rejection of a bare `perform` from the empty row, and affine
+     continuation consumption are proved; the stronger whole-program
+     handler-stack progress/preservation theorem remains open.
    - `combined.lean`: type + capability + effect judgment soundness —
      open.
    - CI gate on `lake build` blocks any PR that touches
