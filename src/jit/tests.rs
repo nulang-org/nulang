@@ -1686,6 +1686,39 @@ fn test_arrlen_scalar_register_destination() {
     );
 }
 
+#[test]
+fn test_function_analyses_stop_at_debug_code_range() {
+    // Compiler output places actor behaviors and the entry prologue after
+    // named functions. The final named function must not inherit a later
+    // behavior's suspending opcode merely because there is no next
+    // function_table entry to bound it.
+    let mut module = CodeModule::new("function_bounds");
+    module.function_table.push(0);
+    module.function_local_counts.push(4);
+    module.emit(Instruction::new3(OpCode::IAdd, 0, 1, 2)); // named function
+    module.emit(Instruction::new1(OpCode::RetVal, 2));
+    module.debug_functions.push(DebugFunctionInfo {
+        name: "pure".into(),
+        code_offset: 0,
+        code_len: 2,
+        params: vec![],
+        locals: vec![],
+    });
+
+    // Simulate a later actor behavior that can suspend. It is intentionally
+    // outside the named function's debug code range.
+    module.emit(Instruction::new0(OpCode::PerformDirect));
+    module.emit(Instruction::new0(OpCode::Ret));
+
+    assert_eq!(function_end_for(&module, 0), 2);
+    assert_eq!(
+        compute_may_suspend(&module),
+        vec![false],
+        "later behavior bytecode must not taint the final named function"
+    );
+    assert_eq!(compute_recursive(&module), vec![false]);
+}
+
 /// `compute_may_suspend` and `direct_call_target`: a pure recursive function
 /// is non-suspending and its direct calls are recovered; a function that
 /// performs an effect (PerformDirect) is conservatively suspending.
