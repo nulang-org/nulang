@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Compiler-latency benchmark baseline — 2026-09-22
+- **Criterion now measures Nulang compilation itself separately from execution** (`benches/compiler_bench.rs`): frontend-to-MIR and source-to-bytecode at 20/100/500 generated functions, plus source-to-Cranelift-AOT at bounded sizes. These results are the evidence base for compile-time optimization and prevent runtime benchmarks from being misused as compiler-latency claims.
+
 ### Candidate-only JIT hotness probing — 2026-09-22
 - **Cold interpreted execution now probes JIT hotness only at candidate compiled-region entries** (`src/vm.rs`). The VM precomputes per-module candidates for execution/function/behavior entries, source-statement starts, branch targets/fallthroughs, and successors of compilation boundaries, avoiding JIT backend dispatch and hot-counter mutation at ordinary straight-line bytecode PCs without changing language semantics.
 
