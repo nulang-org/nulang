@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Canonical effect-site identity — 2026-09-22
+- **Compiler-owned `EffectSiteId` analysis** (Experimental, `src/effect_site_identity.rs`). Explicit performed effects are assigned domain-separated BLAKE3 identities from stable semantic owner names, normalized MIR block/statement coordinates, nested-rvalue paths, and qualified effect operations. Source spans, line tables, bytecode PCs, and declaration-vector positions are excluded. This is an additive analysis surface only; durable invocation identity must still combine the site locator with the owning `SemanticId` and durable execution context.
+
 ### Production host-authority boundary — 2026-09-20
 - **Test effect handlers no longer exist in production runtime builds** (`src/runtime/mod.rs`, `src/runtime/callbacks.rs`). Mock effect interception is now `#[cfg(test)]` and crate-private, so actor-backed host effects in production cannot take the test-handler path before external-authority enforcement.
 - **Actor-backed `Process.run` remains non-dispatched until a real process sandbox exists** (`src/runtime/callbacks.rs`, `src/stdlib.rs`). A regression test proves that even an actor holding an exact `Process::Run(...)` grant cannot turn that grant into host shell execution; docs now mark the existing `/bin/sh -c` implementation as trusted/standalone-only.
