@@ -1,5 +1,13 @@
 # Spec Reconciliation Audit Trail
 
+> **Historical audit note:** This file records an earlier reconciliation pass
+> and intentionally preserves the findings that were true at that time. It is
+> not a live implementation-status dashboard. In particular, the CRDT finding
+> in item 7 was superseded by later source-level `state crdt <type>` and
+> `Crdt.*` implementations/conformance coverage. For current status use
+> `SPEC2.md`, `CHANGELOG.md`, `GOVERNANCE.md`, and
+> `docs/SEMANTIC_STABILIZATION_CONTRACT.md`.
+
 Reconciliation pass over the normative documents (`SPEC2.md`,
 `spec/grammar.ebnf`, `docs/PITFALLS.md`, `README.md`) against the
 reference implementation. Ground truth for every item below was
