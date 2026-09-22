@@ -1542,7 +1542,7 @@ impl std::fmt::Display for ErrorCode {
 /// A non-fatal compiler warning with a stable, category-scoped code.
 ///
 /// Warnings use the `Wxxxx` scheme documented in `docs/ERROR_CODES.md`
-/// (`W01xx` — deprecations). They never fail compilation on their own;
+/// (`W01xx` — deprecations, `W02xx` — type-directed semantic checks). They never fail compilation on their own;
 /// the CLI `--deny-warnings` flag escalates them to an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NuWarning {
@@ -1584,6 +1584,20 @@ impl NuWarning {
                  `T ! E` signature"
                     .to_string(),
             ),
+        }
+    }
+
+    /// `W0201` — a finite match is provably missing one or more cases.
+    pub fn non_exhaustive_match(span: Span, missing: &[String]) -> Self {
+        let rendered = missing.join(", ");
+        NuWarning {
+            code: "W0201",
+            msg: format!("non-exhaustive match; missing: {rendered}"),
+            span,
+            help: Some(format!(
+                "add arm{} for {rendered}, or add an unguarded `| _ => ...` fallback",
+                if missing.len() == 1 { "" } else { "s" }
+            )),
         }
     }
 
