@@ -36,7 +36,7 @@ Rust and Nulang share a focus on safety and performance, but their domains diffe
 | **Concurrency model** | Actors + messages | async/await, channels, Arc&lt;Mutex&lt;T&gt;&gt; |
 | **Distribution** | Built-in clustering, CRDTs | Manual (gRPC, custom protocols) |
 | **Fault tolerance** | Supervision trees, cascading restart | Manual error handling, panic=abort |
-| **Durable orchestration** | Durable actor/entity primitives; legacy workflow DSL remains Experimental/deprecated | External workflow engines/libraries such as Temporal |
+| **Durable orchestration** | Durable actor/entity primitives; `workflow` is Experimental ergonomic sugar under RFC 0017 | External workflow engines/libraries such as Temporal |
 | **Type safety** | HM inference + capabilities | Ownership + borrows + lifetimes |
 
 **Takeaway**: Rust gives you fine-grained memory control. Nulang gives you fault-tolerant distribution out of the box. Use Rust for systems programming; use Nulang for distributed applications.
@@ -65,7 +65,7 @@ The AI ecosystem has converged on Python and TypeScript, but both languages were
 
 | | Nulang | Python/TypeScript |
 |---|---|---|
-| **AI integration** | Optional `nulang-ai` runtime/library; legacy `agent` declaration remains compatible but deprecated | Large library ecosystems and SDKs |
+| **AI integration** | Optional `nulang-ai` runtime/library; `agent` is Experimental ergonomic sugar under RFC 0017 | Large library ecosystems and SDKs |
 | **Memory** | Episodic, semantic, and procedural memory support | Commonly library/vector-store based |
 | **Multi-agent** | Pipeline, debate, and supervisor abstractions in `nulang-ai` | Framework-dependent orchestration |
 | **Effects** | AI calls can participate in the language effect model | Side effects are library/runtime conventions |
