@@ -1,10 +1,11 @@
 use crate::RetryPolicy;
 use blake3::Hasher;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 const ACTIVITY_INVOCATION_DOMAIN: &[u8] = b"nulang.workflow.activity.v1\0";
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WorkflowId(String);
 
 impl WorkflowId {
@@ -23,7 +24,7 @@ impl fmt::Display for WorkflowId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ActivityInvocationId([u8; 32]);
 
 impl ActivityInvocationId {
@@ -65,7 +66,7 @@ fn hash_len_prefixed(hasher: &mut Hasher, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkflowEvent {
     ActivityPrepared {
         invocation_id: ActivityInvocationId,
@@ -103,7 +104,7 @@ pub enum WorkflowEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WorkflowHistory {
     pub revision: u64,
     pub events: Vec<WorkflowEvent>,
