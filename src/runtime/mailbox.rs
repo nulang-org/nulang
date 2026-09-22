@@ -15,16 +15,125 @@
 use crate::vm::Value;
 use crossbeam::queue::SegQueue;
 use std::collections::VecDeque;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+const INLINE_PAYLOAD_VALUES: usize = 4;
+
+/// Actor-message payload optimized for the overwhelmingly common small-message
+/// case. Up to four NaN-boxed Values live directly inside the envelope, so a
+/// normal local send does not allocate a Vec or Arc. Larger payloads keep the
+/// existing shared representation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MessagePayload {
+    Inline {
+        len: u8,
+        values: [Value; INLINE_PAYLOAD_VALUES],
+    },
+    Shared(Arc<Vec<Value>>),
+}
+
+impl MessagePayload {
+    #[inline]
+    pub fn from_slice(values: &[Value]) -> Self {
+        if values.len() <= INLINE_PAYLOAD_VALUES {
+            let mut inline = [Value::nil(); INLINE_PAYLOAD_VALUES];
+            inline[..values.len()].copy_from_slice(values);
+            Self::Inline {
+                len: values.len() as u8,
+                values: inline,
+            }
+        } else {
+            Self::Shared(Arc::new(values.to_vec()))
+        }
+    }
+
+    #[inline]
+    pub fn from_vec(values: Vec<Value>) -> Self {
+        if values.len() <= INLINE_PAYLOAD_VALUES {
+            let len = values.len();
+            let mut inline = [Value::nil(); INLINE_PAYLOAD_VALUES];
+            inline[..len].copy_from_slice(&values);
+            Self::Inline {
+                len: len as u8,
+                values: inline,
+            }
+        } else {
+            Self::Shared(Arc::new(values))
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[Value] {
+        match self {
+            Self::Inline { len, values } => &values[..*len as usize],
+            Self::Shared(values) => values.as_slice(),
+        }
+    }
+
+    #[inline]
+    pub fn to_vec(&self) -> Vec<Value> {
+        self.as_slice().to_vec()
+    }
+
+    /// Materialize the payload in the legacy shared form only when an API
+    /// actually needs ownership independent of the mailbox envelope (notably
+    /// transactional selective receive).
+    #[inline]
+    pub fn to_shared(&self) -> Arc<Vec<Value>> {
+        match self {
+            Self::Inline { .. } => Arc::new(self.as_slice().to_vec()),
+            Self::Shared(values) => Arc::clone(values),
+        }
+    }
+
+    #[inline]
+    pub fn is_inline(&self) -> bool {
+        matches!(self, Self::Inline { .. })
+    }
+}
+
+impl Deref for MessagePayload {
+    type Target = [Value];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[Value]> for MessagePayload {
+    #[inline]
+    fn as_ref(&self) -> &[Value] {
+        self.as_slice()
+    }
+}
+
+impl From<Vec<Value>> for MessagePayload {
+    #[inline]
+    fn from(values: Vec<Value>) -> Self {
+        Self::from_vec(values)
+    }
+}
+
+impl From<Arc<Vec<Value>>> for MessagePayload {
+    #[inline]
+    fn from(values: Arc<Vec<Value>>) -> Self {
+        if values.len() <= INLINE_PAYLOAD_VALUES {
+            Self::from_slice(values.as_slice())
+        } else {
+            Self::Shared(values)
+        }
+    }
+}
 
 /// Message sent between actors.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
     pub behavior_id: u16,
-    /// Payload values, shared via `Arc` to avoid cloning on every
-    /// `receive_match` scan. The VM never mutates incoming payloads.
-    pub payload: Arc<Vec<Value>>,
+    /// Payload values. 0-4 values are inline; larger payloads are Arc-backed.
+    pub payload: MessagePayload,
     pub sender: u64,
     pub priority: MessagePriority,
     /// W3C traceparent for distributed tracing.
@@ -77,7 +186,7 @@ pub struct Mailbox {
     /// The most recently returned candidate. A second `receive_match` call
     /// means the previous candidate's guard rejected it; only this active
     /// candidate may be consumed by `commit_receive_match`.
-    active_match: Option<(MatchLane, usize)>,
+    active_match: Option<(MatchLane, usize, Arc<Vec<Value>>)>,
 }
 
 impl Mailbox {
@@ -222,7 +331,7 @@ impl Mailbox {
             }
             if let Some(pos) = behavior_ids.iter().position(|&id| id == msg.behavior_id) {
                 *tried = true;
-                return Some((pos, idx, Arc::clone(&msg.payload)));
+                return Some((pos, idx, msg.payload.to_shared()));
             }
         }
         None
@@ -242,17 +351,17 @@ impl Mailbox {
         if let Some((pos, idx, payload)) =
             Self::scan_staged(&mut self.system_skip_buffer, behavior_ids)
         {
-            self.active_match = Some((MatchLane::System, idx));
+            self.active_match = Some((MatchLane::System, idx, Arc::clone(&payload)));
             return Some((pos, payload));
         }
         if let Some((pos, idx, payload)) =
             Self::scan_staged(&mut self.local_skip_buffer, behavior_ids)
         {
-            self.active_match = Some((MatchLane::Local, idx));
+            self.active_match = Some((MatchLane::Local, idx, Arc::clone(&payload)));
             return Some((pos, payload));
         }
         if let Some((pos, idx, payload)) = Self::scan_staged(&mut self.skip_buffer, behavior_ids) {
-            self.active_match = Some((MatchLane::Normal, idx));
+            self.active_match = Some((MatchLane::Normal, idx, Arc::clone(&payload)));
             return Some((pos, payload));
         }
         None
@@ -325,7 +434,7 @@ impl Mailbox {
     /// payload so the runtime can establish receiver-side ORCA ownership only
     /// after the pattern+guard succeeds.
     pub fn commit_receive_match(&mut self) -> Option<Arc<Vec<Value>>> {
-        let (lane, idx) = self.active_match.take()?;
+        let (lane, idx, payload) = self.active_match.take()?;
         let removed = match lane {
             MatchLane::System => self.system_skip_buffer.remove(idx),
             MatchLane::Local => self.local_skip_buffer.remove(idx),
@@ -333,7 +442,8 @@ impl Mailbox {
         }?;
         self.release_slot_local();
         self.clear_tried_flags();
-        Some(removed.0.payload)
+        let _ = removed;
+        Some(payload)
     }
 
     /// Abort a selective-receive scan. No message is consumed and ownership
@@ -352,7 +462,7 @@ mod tests {
     fn make_msg(behavior_id: u16, sender: u64) -> Message {
         Message {
             behavior_id,
-            payload: Arc::new(vec![Value::int(42)]),
+            payload: MessagePayload::from_slice(&[Value::int(42)]),
             sender,
             priority: MessagePriority::Normal,
             trace_id: None,
@@ -371,7 +481,7 @@ mod tests {
         let popped = mb.pop().unwrap();
         assert_eq!(popped.behavior_id, 1);
         assert_eq!(popped.sender, 100);
-        assert_eq!(*popped.payload, vec![Value::int(42)]);
+        assert_eq!(popped.payload.as_slice(), &[Value::int(42)]);
         assert!(mb.is_empty());
         assert_eq!(mb.pop(), None);
     }
@@ -419,7 +529,7 @@ mod tests {
         for i in 0..1000 {
             mb.push(Message {
                 behavior_id: 0,
-                payload: Arc::new(vec![Value::int(i)]),
+                payload: MessagePayload::from_slice(&[Value::int(i)]),
                 sender: i as u64,
                 priority: MessagePriority::System,
                 trace_id: None,
@@ -517,7 +627,7 @@ mod transactional_receive_tests {
     fn msg(behavior_id: u16, sender: u64, priority: MessagePriority) -> Message {
         Message {
             behavior_id,
-            payload: Arc::new(vec![Value::int(sender as i64)]),
+            payload: MessagePayload::from_slice(&[Value::int(sender as i64)]),
             sender,
             priority,
             trace_id: None,
