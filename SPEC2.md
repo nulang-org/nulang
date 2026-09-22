@@ -1426,7 +1426,7 @@ The effect system guarantees several safety properties:
 
 **No implicit effects.** Functions whose inferred row is empty perform no effects; any `perform` in their body would appear in the inferred row. Annotating such a function with an empty or narrower row than it needs is a compile-time `EffectError`.
 
-**Runtime handler resolution.** Whether an enclosing handler exists for a performed effect is decided dynamically. An unhandled effect is a runtime `EffectError` (`Unhandled effect: 'Name'`), so programs that perform effects must install handlers (or use the runtime-backed operations) to avoid failing at runtime. Static exhaustiveness checking of handlers is planned.
+**Runtime handler resolution.** Whether an enclosing handler exists for a performed effect is decided dynamically. An unhandled effect is a runtime `EffectError` (`Unhandled effect: 'Name'`), so programs that perform effects must install handlers (or use the runtime-backed operations) to avoid failing at runtime. Static exhaustiveness checking of effect handlers is still planned. Pattern `match` coverage separately has a conservative finite-case `W0201` diagnostic; this does not yet constitute a complete usefulness algorithm.
 
 ---
 
