@@ -764,7 +764,6 @@ struct SimpleCfgSsaPlan {
     then_jump_pc: Option<usize>,
     arm_carried: Vec<(usize, KnownType)>,
     join_carried: Vec<(usize, KnownType)>,
-    branch_state: [KnownType; 256],
     join_state: [KnownType; 256],
 }
 
@@ -808,19 +807,6 @@ impl SimpleCfgSsaPlan {
             }
         }
         carried
-    }
-
-    fn metadata_state(&self, pc: usize) -> Option<&[KnownType; 256]> {
-        if pc == self.join_pc {
-            Some(&self.join_state)
-        } else if pc == self.branch_pc
-            || pc == self.fallthrough_pc
-            || (pc == self.target_pc && self.target_pc != self.join_pc)
-        {
-            Some(&self.branch_state)
-        } else {
-            None
-        }
     }
 }
 
@@ -902,6 +888,74 @@ fn meet_type_states(a: &[KnownType; 256], b: &[KnownType; 256]) -> [KnownType; 2
         }
     }
     out
+}
+
+fn region_type_states(
+    instructions: &[Instruction],
+    start_offset: usize,
+    end_offset: usize,
+    initial: Option<&TypeMetadata>,
+) -> Vec<Option<[KnownType; 256]>> {
+    let n = end_offset.saturating_sub(start_offset);
+    let mut states = vec![None; n];
+    if n == 0 {
+        return states;
+    }
+
+    let mut queue = std::collections::VecDeque::new();
+    let mut in_queue = vec![false; n];
+    states[0] = Some(initial.map(|m| m.regs).unwrap_or([KnownType::Unknown; 256]));
+    queue.push_back(start_offset);
+    in_queue[0] = true;
+
+    while let Some(pc) = queue.pop_front() {
+        in_queue[pc - start_offset] = false;
+        let Some(mut next) = states[pc - start_offset] else {
+            continue;
+        };
+        apply_local_type_transfer(&instructions[pc], &mut next);
+
+        let mut push = |succ: usize| {
+            if succ < start_offset || succ >= end_offset {
+                return;
+            }
+            let idx = succ - start_offset;
+            let changed = match &mut states[idx] {
+                None => {
+                    states[idx] = Some(next);
+                    true
+                }
+                Some(cur) => {
+                    let mut changed = false;
+                    for reg in 0..256 {
+                        if cur[reg] != next[reg] && cur[reg] != KnownType::Unknown {
+                            cur[reg] = KnownType::Unknown;
+                            changed = true;
+                        }
+                    }
+                    changed
+                }
+            };
+            if changed && !in_queue[idx] {
+                in_queue[idx] = true;
+                queue.push_back(succ);
+            }
+        };
+
+        match instructions[pc].opcode {
+            OpCode::Jmp => {
+                push((pc as i64 + instructions[pc].simm16() as i64) as usize);
+            }
+            OpCode::JmpT | OpCode::JmpF => {
+                push((pc as i64 + instructions[pc].offset16() as i64) as usize);
+                push(pc + 1);
+            }
+            OpCode::Halt | OpCode::Ret | OpCode::RetVal => {}
+            _ => push(pc + 1),
+        }
+    }
+
+    states
 }
 
 fn simple_cfg_ssa_plan(
@@ -1026,7 +1080,6 @@ fn simple_cfg_ssa_plan(
         then_jump_pc,
         arm_carried,
         join_carried,
-        branch_state,
         join_state,
     })
 }
@@ -1724,7 +1777,12 @@ pub fn compile_bytecode_region_typed(
 
     // Seal all new blocks.
     builder.seal_block(yield_block);
-    // Mutable copy of type metadata so we can propagate result types.
+    // Precompute must-type state at every bytecode block. Code generation is
+    // intentionally independent of source/bytecode layout order: a mutually
+    // exclusive arm cannot leak type facts into the next arm simply because
+    // it is emitted first.
+    let block_type_states =
+        region_type_states(instructions, start_offset, end_offset, type_metadata);
     let mut meta = type_metadata.map(|m| m.clone()).unwrap_or_default();
     let predecessor_counts = region_predecessor_counts(instructions, start_offset, end_offset);
     let mut int_cache = NativeIntCache::default();
@@ -1735,6 +1793,8 @@ pub fn compile_bytecode_region_typed(
         let instr = instructions[pc];
         let block = *blocks.get(&pc).unwrap();
         builder.switch_to_block(block);
+
+        meta.regs = block_type_states[pc - start_offset].unwrap_or([KnownType::Unknown; 256]);
 
         if pc == start_offset {
             if let Some(plan) = &loop_ssa {
@@ -1756,9 +1816,6 @@ pub fn compile_bytecode_region_typed(
         }
 
         if let Some(plan) = &cfg_ssa {
-            if let Some(state) = plan.metadata_state(pc) {
-                meta.regs = *state;
-            }
             if let Some(carried) = plan.carried_for_block(pc) {
                 int_cache.clear();
                 float_cache.clear();
@@ -3970,7 +4027,63 @@ mod typed_tests {
     }
 
     // ------------------------------------------------------------------
-    // Test 6d: Native SSA through simple forward CFG joins
+    // Test 6d: Per-block must-type dataflow
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_region_type_states_keep_mutually_exclusive_arms_path_local() {
+        let instructions = vec![
+            Instruction::new3(OpCode::JmpT, 4, 0, 3), // pc0 -> pc3
+            Instruction::new2(OpCode::IToF, 0, 0),    // pc1: r0 Int -> Float
+            Instruction::new2(OpCode::Jmp, 0, 2),     // pc2 -> pc4
+            Instruction::new3(OpCode::IAdd, 0, 1, 0), // pc3 still sees r0 Int
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Int);
+        meta.set_type(1, KnownType::Int);
+        meta.set_type(4, KnownType::Bool);
+
+        let states = region_type_states(&instructions, 0, instructions.len(), Some(&meta));
+
+        assert_eq!(states[1].unwrap()[0], KnownType::Int);
+        assert_eq!(
+            states[3].unwrap()[0],
+            KnownType::Int,
+            "the Float conversion in the other arm must not leak into pc3"
+        );
+        assert_eq!(
+            states[4].unwrap()[0],
+            KnownType::Unknown,
+            "Int/Float disagreement at the join must conservatively meet to Unknown"
+        );
+    }
+
+    #[test]
+    fn test_region_type_states_preserve_same_numeric_result_at_join() {
+        let instructions = vec![
+            Instruction::new3(OpCode::JmpT, 4, 0, 3), // pc0 -> pc3
+            Instruction::new3(OpCode::IAdd, 0, 1, 2),
+            Instruction::new2(OpCode::Jmp, 0, 2), // pc2 -> pc4
+            Instruction::new3(OpCode::ISub, 0, 1, 2),
+            Instruction::new3(OpCode::IMul, 2, 1, 3),
+            Instruction::new0(OpCode::Halt),
+        ];
+        let mut meta = TypeMetadata::new();
+        meta.set_type(0, KnownType::Int);
+        meta.set_type(1, KnownType::Int);
+        meta.set_type(4, KnownType::Bool);
+
+        let states = region_type_states(&instructions, 0, instructions.len(), Some(&meta));
+        assert_eq!(
+            states[4].unwrap()[2],
+            KnownType::Int,
+            "matching Int results from both arms should remain proven at the join"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test 6e: Native SSA through simple forward CFG joins
     // ------------------------------------------------------------------
 
     #[test]
