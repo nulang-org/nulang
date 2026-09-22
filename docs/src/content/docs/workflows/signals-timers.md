@@ -5,7 +5,11 @@ description: Workflow suspension and resume primitives — signals, durable time
 
 ## Suspension and Resume
 
-Workflow steps can suspend waiting for external events. When a step suspends, the runtime persists the suspension marker to the journal and frees the actor. On resume, the runtime restores the step's execution state and continues. All four primitives below are durable — they survive node restarts.
+:::caution[Compatibility documentation]
+These examples use the deprecated Experimental `workflow` declaration. The signal/timer/effect concepts remain relevant, but new application architecture should compose ordinary actors/entities with workflow libraries rather than depend on this declaration remaining permanent.
+:::
+
+Workflow steps can suspend waiting for external events. When a durable workflow step suspends, the runtime records suspension metadata in its journal and frees the actor to run other work. On compatible recovery with the same durable store, the runtime can reconstruct and re-arm supported suspension state. Exact crash/replay guarantees depend on the primitive and external effect involved.
 
 ## Signals
 
@@ -53,7 +57,7 @@ The timer is journaled with its name and duration. The actor suspends. When the 
 
 ### Timer replay on restart
 
-On recovery, durable timers are re-armed from the journal. If the timer should have already fired (the duration elapsed during the downtime), it fires immediately on recovery. This guarantees a workflow never gets stuck waiting for a timer that already expired.
+On recovery, durable timers are re-armed from the journal. If the timer should have already fired (the duration elapsed during the downtime), it fires immediately on recovery. This is intended to prevent a recovered workflow from remaining indefinitely blocked on a timer whose persisted deadline has already elapsed.
 
 ## LLM Calls
 
@@ -79,7 +83,7 @@ workflow SignalThenLlm {
 }
 ```
 
-The step suspends on the signal, resumes when it arrives, then suspends again on the LLM call. Both suspension markers are journaled. If the node restarts between the signal and the LLM call, the recovered step re-issues the LLM call and completes normally.
+The step suspends on the signal, resumes when it arrives, then suspends again on the LLM call. Both suspension markers are journaled. If recovery occurs between the signal and the LLM call, the runtime may need to re-drive the external call. Because arbitrary providers do not offer transactionally exactly-once execution, production code should use stable invocation identities/idempotency where available and treat indeterminate crash windows explicitly.
 
 ### Cost tracking
 
