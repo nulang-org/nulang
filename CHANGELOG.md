@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### MIR scalar copy propagation and constant-branch pruning — 2026-09-22
+- **Canonical MIR optimization now removes redundant definitely-scalar block-local copies and folds locally-proven constant branches before bytecode lowering** (`src/mir_codegen.rs`). The pass remains conservative across CFG boundaries and excludes heap-capable locals so ownership/drop semantics are unchanged. Unreachable pruning preserves effect-handler roots, and reachable `Panic` is explicitly treated as observable/divergent so DCE cannot erase contract failures.
+
 ### Candidate-only JIT hotness probing — 2026-09-22
 - **Cold interpreted execution now probes JIT hotness only at candidate compiled-region entries** (`src/vm.rs`). The VM precomputes per-module candidates for execution/function/behavior entries, source-statement starts, branch targets/fallthroughs, and successors of compilation boundaries, avoiding JIT backend dispatch and hot-counter mutation at ordinary straight-line bytecode PCs without changing language semantics.
 
