@@ -3994,7 +3994,12 @@ impl Runtime {
     fn actor_is_agent(&self, actor_id: u64) -> bool {
         self.actors
             .get(&actor_id)
-            .map(|a| a.is_agent)
+            .map(|actor| {
+                matches!(
+                    actor.role(),
+                    Ok(crate::primitives::ActorRole::Agent)
+                )
+            })
             .unwrap_or(false)
     }
 
