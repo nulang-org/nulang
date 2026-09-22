@@ -348,7 +348,10 @@ mod tests {
 
     #[test]
     fn scoped_tasks_are_not_actor_roles() {
-        assert_eq!(ExecutionSemantics::SCOPED_TASK.domain, ExecutionDomain::ScopedTask);
+        assert_eq!(
+            ExecutionSemantics::SCOPED_TASK.domain,
+            ExecutionDomain::ScopedTask
+        );
         assert_eq!(
             ExecutionSemantics::SCOPED_TASK.persistence,
             PersistenceSemantics::Ephemeral
