@@ -2919,7 +2919,7 @@ impl Runtime {
             return 1;
         };
         let depth = actor.mailbox.len().max(1);
-        let fairness_cap = if other_ready { 32 } else { 256 };
+        let fairness_cap = if other_ready { 16 } else { 256 };
         depth
             .min(fairness_cap)
             .min(actor.max_reductions.max(1) as usize)
