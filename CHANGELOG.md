@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Bounded JIT register marshaling — 2026-09-22
+- **JIT transitions now reuse stable per-frame-depth scratch buffers and marshal only the compiler-known active register prefix for MIR-produced functions** (`src/vm.rs`). Actor/legacy bytecode without trustworthy local-count metadata keeps the full 256-register path, and reserved direct-call staging state remains explicit. This avoids a fresh 2 KiB scratch initialization plus two full-register copies on every hot-region entry without exposing new language syntax or optimizer flags.
+
 ### Candidate-only JIT hotness probing — 2026-09-22
 - **Cold interpreted execution now probes JIT hotness only at candidate compiled-region entries** (`src/vm.rs`). The VM precomputes per-module candidates for execution/function/behavior entries, source-statement starts, branch targets/fallthroughs, and successors of compilation boundaries, avoiding JIT backend dispatch and hot-counter mutation at ordinary straight-line bytecode PCs without changing language semantics.
 
