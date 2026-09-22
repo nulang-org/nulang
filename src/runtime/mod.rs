@@ -1301,14 +1301,15 @@ impl Runtime {
         self.requeue_if_mail_pending(actor_id);
     }
 
-    /// Enqueue an actor on the scheduler at its current priority. All
-    /// scheduler enqueue paths go through here so a priority set via
-    /// `perform Actor.set_priority` takes effect on the next (re)queue;
-    /// unknown actors (e.g. already exited) enqueue at the Normal default.
-    pub(crate) fn enqueue_actor(&self, actor_id: u64) {
+    /// Enqueue an actor on the scheduler at its current priority.
+    ///
+    /// The owning shard keeps at most one runnable entry per actor. Queued
+    /// actors are already represented in the ready queue and Running actors
+    /// are re-evaluated once at the end of their turn, so sends to either
+    /// state do not inject duplicate scheduler work.
+    pub(crate) fn enqueue_actor(&mut self, actor_id: u64) {
         // Cross-shard routing: if the actor lives on another shard, send
-        // an EnqueueActor message. The receiving shard's drain loop enqueues
-        // it locally.
+        // an EnqueueActor message. The destination shard owns run_state.
         if self.shard_count > 1 {
             let target_shard = (actor_id % self.shard_count as u64) as u16;
             if target_shard != self.shard_idx {
@@ -1319,11 +1320,15 @@ impl Runtime {
                 return;
             }
         }
-        let priority = self
-            .actors
-            .get(&actor_id)
-            .map(|a| a.priority)
-            .unwrap_or_default();
+
+        let Some(actor) = self.actors.get_mut(&actor_id) else {
+            return;
+        };
+        if actor.run_state != ActorRunState::Idle {
+            return;
+        }
+        actor.run_state = ActorRunState::Queued;
+        let priority = actor.priority;
         self.scheduler.enqueue_with_priority(actor_id, priority);
     }
 
@@ -1558,8 +1563,11 @@ impl Runtime {
                         None,
                     );
                 }
-                CrossShardMsg::EnqueueActor { actor_id, priority } => {
-                    self.scheduler.enqueue_with_priority(actor_id, priority);
+                CrossShardMsg::EnqueueActor {
+                    actor_id,
+                    priority: _,
+                } => {
+                    self.enqueue_actor(actor_id);
                 }
             }
         }
@@ -2901,13 +2909,29 @@ impl Runtime {
         0
     }
 
+    /// Choose a mailbox-run budget once per actor turn. When other actors are
+    /// ready we cap the run aggressively for fairness; when this actor is the
+    /// only runnable work we amortize scheduler/lookup overhead across a much
+    /// larger batch. The actor's reduction budget remains the hard preemption
+    /// ceiling in either case.
+    fn actor_turn_budget(&self, actor_id: u64, other_ready: bool) -> usize {
+        let Some(actor) = self.actors.get(&actor_id) else {
+            return 1;
+        };
+        let depth = actor.mailbox.len().max(1);
+        let fairness_cap = if other_ready { 32 } else { 256 };
+        depth
+            .min(fairness_cap)
+            .min(actor.max_reductions.max(1) as usize)
+            .max(1)
+    }
+
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn run_scheduler(&mut self) {
         let mut ticks: u64 = 0;
         loop {
-            // Drain any cross-shard messages before checking the local
-            // scheduler queue. In-flight messages from other shards inject
-            // actors into the local scheduler.
+            // Drain cross-shard ingress before selecting local work. Ingress
+            // uses the same deduplicating enqueue_actor path as local sends.
             self.drain_cross_shard_messages();
             let actor_id = match self.scheduler.dequeue() {
                 Some(actor_id) => actor_id,
@@ -2918,12 +2942,6 @@ impl Runtime {
                         }
                         break;
                     }
-                    // The run queue is drained but background LLM calls are
-                    // still in flight or timers are pending: block briefly
-                    // for the next completion or timer deadline so
-                    // run_scheduler keeps its "run until quiescent"
-                    // semantics - an actor whose last turn armed a timer
-                    // must still receive the fired message.
                     let wait = match self.timer_wheel.next_deadline() {
                         Some(deadline) => deadline
                             .saturating_duration_since(self.now())
@@ -2940,62 +2958,89 @@ impl Runtime {
                     }
                     #[cfg(not(feature = "ai-runtime"))]
                     std::thread::sleep(wait);
-                    // Deliver any timers that matured while waiting; fired
-                    // messages re-enqueue their target actors, so the next
-                    // dequeue resumes work.
                     self.tick_timers();
                     continue;
                 }
             };
+
+            // Queued and running are a single ownership token: leave the actor
+            // marked non-idle for the whole mailbox run so self-sends and
+            // concurrent ingress cannot create duplicate ready entries.
+            let can_run = match self.actors.get_mut(&actor_id) {
+                Some(actor) if actor.run_state == ActorRunState::Queued => {
+                    actor.run_state = ActorRunState::Running;
+                    actor.reset_reductions();
+                    true
+                }
+                // A stale queue entry is harmless: discard it instead of
+                // executing an actor that no longer owns this scheduler slot.
+                Some(_) | None => false,
+            };
+            if !can_run {
+                continue;
+            }
+
             #[cfg(feature = "ai-runtime")]
             self.poll_llm_completions();
             self.tick_timers();
-            self.step_actor(actor_id);
-            // Micro-batch: continue processing the same actor for a few more
-            // messages to maximize L1 instruction-cache retention.  The
-            // per-turn reduction budget (checked by should_yield) acts as
-            // the safety limit - a hot actor that exhausts its budget will
-            // be requeued behind other actors.
-            const BATCH_SIZE: usize = 16;
-            for _ in 1..BATCH_SIZE {
+
+            let other_ready = self.scheduler.has_ready_work();
+            let turn_budget = self.actor_turn_budget(actor_id, other_ready);
+            for _ in 0..turn_budget {
+                self.step_actor(actor_id);
                 let should_continue = self
                     .actors
                     .get(&actor_id)
-                    .map(|a| {
-                        !a.mailbox.is_empty()
-                            && !a.should_yield()
-                            && a.suspended_execution.is_none()
+                    .map(|actor| {
+                        !actor.mailbox.is_empty()
+                            && !actor.should_yield()
+                            && actor.suspended_execution.is_none()
                     })
                     .unwrap_or(false);
                 if !should_continue {
                     break;
                 }
-                self.step_actor(actor_id);
             }
+
+            let should_requeue = self
+                .actors
+                .get(&actor_id)
+                .map(|actor| {
+                    !actor.mailbox.is_empty()
+                        && actor.suspended_execution.is_none()
+                        && matches!(
+                            actor.state,
+                            ActorState::Running | ActorState::Created | ActorState::Waiting
+                        )
+                })
+                .unwrap_or(false);
+
+            if let Some(actor) = self.actors.get_mut(&actor_id) {
+                actor.run_state = ActorRunState::Idle;
+                actor.reset_reductions();
+                if actor.mailbox.is_empty()
+                    && actor.suspended_execution.is_none()
+                    && actor.state == ActorState::Running
+                {
+                    actor.state = ActorState::Waiting;
+                }
+            }
+            if should_requeue {
+                self.enqueue_actor(actor_id);
+            }
+
             ticks += 1;
             if ticks % GC_PUMP_INTERVAL == 0 {
-                // Safe at any cadence: process_deferred only frees objects
-                // whose local and foreign counts have already reached zero.
                 self.process_deferred_all();
             }
             if ticks % DEHYDRATE_CHECK_INTERVAL == 0 {
                 self.dehydrate_idle_grains();
             }
             if ticks % CRDT_SYNC_INTERVAL_TICKS == 0 {
-                // Cheap no-op when distribution is disabled: only local
-                // tombstone GC runs. When clustered, this ships delta-state
-                // syncs to healthy peers on the scheduler cadence.
                 self.sync_crdts();
             }
         }
-        // Deliver pending foreign-ref decrements and run cycle detection only
-        // once the run queue has drained. Receiver-side holds now keep
-        // `foreign_count` elevated for as long as a receiving actor holds a
-        // pointer, so the -1 ops only release the *in-flight* count; applying
-        // them mid-run is still deferred to keep mailbox pointers counted by
-        // the in-flight bump until they are received (and held). Note: an
-        // actor that yielded with a non-empty mailbox is re-enqueued, so a
-        // drained queue implies drained mailboxes for terminating programs.
+
         self.process_gc_ops();
         self.process_deferred_all();
     }
@@ -3617,14 +3662,18 @@ impl Runtime {
             // stamp their outgoing traceparent as children of it. `_span_guard`
             // keeps the `tracing` span alive for the rest of this dispatch.
             let trace_ctx = match &msg.trace_id {
-                Some(tp) => match TraceContext::from_traceparent(tp) {
+                Some(tp) => Some(match TraceContext::from_traceparent(tp) {
                     Some(incoming) => incoming.child(),
                     None => TraceContext::root(),
-                },
-                None => TraceContext::root(),
+                }),
+                None if tracing::enabled!(tracing::Level::TRACE) => Some(TraceContext::root()),
+                None => None,
             };
-            self.current_trace = Some(trace_ctx);
-            let _span_guard = trace_ctx.enter_dispatch_span(actor_id, behavior_idx);
+            self.current_trace = trace_ctx;
+            let _span_guard = self
+                .current_trace
+                .as_ref()
+                .map(|ctx| ctx.enter_dispatch_span(actor_id, behavior_idx));
 
             // Intercept semantic-memory behaviors generated by compile_agent.
             // They are bytecode behaviors but are implemented directly by the
@@ -3968,30 +4017,18 @@ impl Runtime {
                 }
             };
             actor.increment_reductions(1);
-            // Flush the selective-receive skip-buffer back to the normal
-            // queue so the next turn starts clean and is_empty() correctly
-            // reflects pending messages.
+            // Keep the reduction count live until the scheduler closes the
+            // whole actor turn. The outer turn loop decides whether to keep
+            // draining or yield; resetting here would make the next
+            // should_yield() check observe a fresh counter and defeat
+            // preemption.
             actor.mailbox.flush_skip_buffer();
-            if actor.mailbox.is_empty() {
-                // Turn over: next scheduling starts with a fresh budget.
-                actor.reset_reductions();
-                false
-            } else if actor.should_yield() {
-                // Reduction budget exhausted with mail pending: yield -
-                // reset the counter and requeue at the back of the
-                // scheduler queue so other actors get a turn first.
-                actor.reset_reductions();
-                true
-            } else {
-                true
-            }
+            !actor.mailbox.is_empty()
         } else {
             if let Some(actor) = self.actors.get_mut(&actor_id) {
                 if actor.state == ActorState::Running {
                     actor.state = ActorState::Waiting;
                 }
-                // Waiting actors start their next turn with a fresh budget.
-                actor.reset_reductions();
             }
             false
         };
@@ -4439,7 +4476,7 @@ impl Runtime {
             if let Some(actor) = self.actors.get_mut(&actor_id) {
                 actor.suspended_execution = Some(suspended);
             }
-            self.scheduler.enqueue(actor_id);
+            self.enqueue_actor(actor_id);
             return;
         }
         let self_ptr: *mut Runtime = self;
@@ -4510,7 +4547,7 @@ impl Runtime {
             (*self_ptr).vm_exec_end();
         }
         // Re-enqueue so the scheduler can continue processing the actor.
-        self.scheduler.enqueue(actor_id);
+        self.enqueue_actor(actor_id);
     }
 
     /// Resume an actor whose bytecode behavior suspended on a timed
