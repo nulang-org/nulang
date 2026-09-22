@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Formal effect-handler safety foundation — 2026-09-22
+- **Lean effect handlers now require typed handler bodies** (`spec/formal/effects.lean`). The formal `tHandle` rule no longer permits an arbitrary untyped handler expression: body and handler effect rows must be discharged by the installed handler or preserved in the outward residual row.
+- **Vacuous effect-safety placeholders were replaced with checked dispatch lemmas.** `effect_safety` and `effect_safety_static` now conclude concrete handled-dispatch properties; entering a handler scope is proved to establish dispatch safety. The stronger whole-language progress/preservation theorem remains explicitly open until latent function effect rows are represented in the formal function type.
+
 ### Production host-authority boundary — 2026-09-20
 - **Test effect handlers no longer exist in production runtime builds** (`src/runtime/mod.rs`, `src/runtime/callbacks.rs`). Mock effect interception is now `#[cfg(test)]` and crate-private, so actor-backed host effects in production cannot take the test-handler path before external-authority enforcement.
 - **Actor-backed `Process.run` remains non-dispatched until a real process sandbox exists** (`src/runtime/callbacks.rs`, `src/stdlib.rs`). A regression test proves that even an actor holding an exact `Process::Run(...)` grant cannot turn that grant into host shell execution; docs now mark the existing `/bin/sh -c` implementation as trusted/standalone-only.

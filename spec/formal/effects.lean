@@ -11,7 +11,9 @@
   item 5 non-breaking phase).  `LLM` is deprecated but still listed for
   backward compatibility.
 
-  Theorem `effect_safety` stated; proof open.
+  Local handler dispatch safety is machine-checked. Whole-language effect
+  progress/preservation remains open until latent function effect rows are
+  represented in the formal function type.
 -/
 
 import types
@@ -32,7 +34,7 @@ inductive EffectLabel where
 | LLM       | Cost      | Event     | FFI
 | Provider
 | UserDefined : String → EffectLabel
-deriving BEq, Repr, Inhabited
+deriving BEq, DecidableEq, Repr, Inhabited
 
 -- ------------------------------------------------------------------
 -- Row variables (regions)
@@ -99,6 +101,27 @@ def union (r₁ r₂ : EffectRow) : EffectRow :=
   -- Lehel's `scoped labels` approach is the target; this
   -- simplification defers unification to the checker.
 
+
+/--
+  `dischargedBy handled residual observed` means every statically-known effect
+  in `observed` is either the effect handled by the surrounding handler or is
+  preserved in the outward `residual` row.
+
+  Open rows are accepted only when their row-variable provenance is preserved;
+  an unknown open tail may not be silently discharged by a handler.  This is a
+  conservative formal counterpart to the compiler's row-unification rule.
+-/
+def dischargedBy (handled : EffectLabel) (residual observed : EffectRow) : Prop :=
+  match residual, observed with
+  | .Closed keep, .Closed seen =>
+      ∀ eff, eff ∈ seen → eff = handled ∨ eff ∈ keep
+  | .Open keep _, .Closed seen =>
+      ∀ eff, eff ∈ seen → eff = handled ∨ eff ∈ keep
+  | .Open keep residualRegion, .Open seen observedRegion =>
+      residualRegion = observedRegion ∧
+      ∀ eff, eff ∈ seen → eff = handled ∨ eff ∈ keep
+  | .Closed _, .Open _ _ => False
+
 /--
   Check whether `eff` is a member of row `r`.
   For closed rows: direct set membership.  For open rows:
@@ -145,33 +168,30 @@ inductive DispatchResult where
 deriving BEq, Repr
 
 def dispatch (handlers : List Handler) (eff : EffectLabel) : DispatchResult :=
-  if handlers.any (·.label == eff) then .handled else .unhandled
+  if ∃ handler ∈ handlers, handler.label = eff then .handled else .unhandled
 
 -- ------------------------------------------------------------------
--- Soundness theorem (open proof)
+-- Dispatch safety
 -- ------------------------------------------------------------------
 
 /--
-  **Theorem: Effect Safety**
-  If `Δ ⊢ e : τ ! r` and `r` is closed (no regions) and `r` has
-  no unhandled effects, then the computation `e` cannot perform
-  an unhandled effect at runtime.
-
-  Formally: for all closed `r`, if dispatch returns `.handled` for
-  every label in `r`, then the computation is safe.
-
-  Proof follows Koka's handler soundness model.  The obstacle is
-  integrating the handler stack dynamics (push/pop on `Handle`/`Unwind`)
-  which are runtime state, not purely static.
+  A concrete handler list safely dispatches `eff` whenever the list contains
+  at least one matching handler.  This is the local runtime fact used by the
+  handler-stack model below; unlike the previous placeholder theorem, the
+  conclusion is an actual dispatch property rather than `True`.
 -/
 theorem effect_safety
-  (handlers : List Handler) (_r : EffectRow)
-  (_h_closed : ∀ (h : Handler), dispatch handlers h.label = .handled) :
-  True := by
-  trivial
-  -- Full proof requires modeling the operational semantics of
-  -- handler-stack push/pop, which is deferred to the combined
-  -- formalization (spec/formal/combined.lean, planned).
+  (handlers : List Handler) (eff : EffectLabel)
+  (h_present : ∃ handler ∈ handlers, handler.label = eff) :
+  dispatch handlers eff = .handled := by
+  simp [dispatch, h_present]
+
+/-- The nearest freshly-installed handler always handles its own label. -/
+theorem dispatch_fresh_handler
+  (handler : Handler) (rest : List Handler) :
+  dispatch (handler :: rest) handler.label = .handled := by
+  apply effect_safety
+  exact ⟨handler, by simp, rfl⟩
 
 end EffectRow
 
@@ -273,10 +293,16 @@ inductive HasTypeEff : Context → EffExpr → Ty → EffectRow → Prop where
     HasTypeEff Γ e τ EffectRow.empty →
     HasTypeEff Γ (.perform eff e) τ (EffectRow.singleton eff)
 
--- Handle: the handled effect is removed from the row.
--- The handler body `h` is assumed well-formed (its typing is orthogonal).
-| tHandle : ∀ {Γ e eff h τ r},
-    HasTypeEff Γ e τ (EffectRow.union (EffectRow.singleton eff) r) →
+-- Handle: both the protected computation and the handler body are typed.
+-- Every statically-known effect they may perform must either be the handled
+-- effect itself or remain visible in the outward residual row.  This closes the
+-- previous formal hole where an arbitrary, completely untyped handler body
+-- could be attached to a well-typed protected computation.
+| tHandle : ∀ {Γ e eff h τ r bodyRow handlerRow},
+    HasTypeEff Γ e τ bodyRow →
+    HasTypeEff Γ h τ handlerRow →
+    EffectRow.dischargedBy eff r bodyRow →
+    EffectRow.dischargedBy eff r handlerRow →
     HasTypeEff Γ (.handle e eff h) τ r
 
 -- ==================================================================
@@ -301,6 +327,19 @@ def pop (hs : HandlerStack) (eff : EffectLabel) : HandlerStack :=
 
 /-- The empty handler stack — no effects are currently handled. -/
 def empty : HandlerStack := []
+
+/--
+  Boolean scope test using propositional equality via `decide`, avoiding any
+  dependence on a separate `LawfulBEq` assumption for the formal label type.
+-/
+def contains (hs : HandlerStack) (eff : EffectLabel) : Bool :=
+  hs.any (fun active => decide (active = eff))
+
+/-- Runtime dispatch against the active lexical handler stack. -/
+def dispatch (hs : HandlerStack) (eff : EffectLabel) : EffectRow.DispatchResult :=
+  match contains hs eff with
+  | true => EffectRow.DispatchResult.handled
+  | false => EffectRow.DispatchResult.unhandled
 
 end HandlerStack
 
@@ -335,39 +374,71 @@ inductive HandlerTrans : HandlerStack → HandlerStack → Prop where
   - `Unwind` pops `eff` from the stack (exiting scope).
 -/
 def HandlerScope (hs : HandlerStack) (eff : EffectLabel) : Prop :=
-  eff ∈ hs
+  hs.contains eff = true
 
 -- ==================================================================
--- STATIC EFFECT SAFETY
+-- HANDLER-STACK SAFETY LEMMAS
 -- ==================================================================
+
+/-- Installing a handler establishes lexical scope for its own effect. -/
+theorem handler_push_establishes_scope
+  (hs : HandlerStack) (eff : EffectLabel) :
+  HandlerScope (hs.push eff) eff := by
+  change (decide (eff = eff) || hs.any (fun active => decide (active = eff))) = true
+  simp
+
+/-- Existing handler scopes are preserved when another handler is pushed. -/
+theorem handler_push_preserves_scope
+  (hs : HandlerStack) (installed eff : EffectLabel)
+  (h_scope : HandlerScope hs eff) :
+  HandlerScope (hs.push installed) eff := by
+  change hs.any (fun active => decide (active = eff)) = true at h_scope
+  change
+    (decide (installed = eff) || hs.any (fun active => decide (active = eff))) = true
+  rw [h_scope]
+  simp
 
 /--
-  **Theorem: Static Effect Safety**
-
-  If a closed program `e` types with an empty effect row, then the
-  computation is pure — it performs no effects and requires no
-  handlers at runtime.
-
-  Formally: `HasTypeEff · e τ {}` implies that no effect label ever
-  needs to be on the handler stack.  The typing derivation contains
-  no `tPerform` or `tHandle` rule applications, only the pure fragment
-  (`tVar`, `tLit*`, `tUnit`, `tLambda`, `tApp`, `tLet`, `tIf`).
-
-  Proof sketch: by induction on the typing derivation `h`.
-  - Every pure rule propagates `EffectRow.empty`.
-  - `tPerform` requires a non-empty row (`singleton eff`), so it
-    cannot appear in a derivation ending in `EffectRow.empty`.
-  - `tHandle` requires `EffectRow.union (singleton eff) r` in the
-    premise, which is non-empty when the premise is `tPerform`; for
-    the row to be empty, the derivation cannot reach `tHandle`.
-  Therefore the derivation uses only pure rules.  ∎
+  **Local Effect Safety.** Any effect proven to be in the active handler scope
+  dispatches to a handler rather than producing an unhandled-effect result.
 -/
 theorem effect_safety_static
-  (e : EffExpr) (τ : Ty)
-  (_h : HasTypeEff Context.empty e τ EffectRow.empty) :
-  True := by
-  trivial
-  -- Full proof: induction on h, showing that no tPerform/tHandle
-  -- can appear when the row is EffectRow.empty.
+  (hs : HandlerStack) (eff : EffectLabel)
+  (h_scope : HandlerScope hs eff) :
+  HandlerStack.dispatch hs eff = EffectRow.DispatchResult.handled := by
+  change hs.contains eff = true at h_scope
+  simp [HandlerStack.dispatch, h_scope]
+
+/--
+  Corollary for entering a `handle` scope: the handled effect is immediately
+  safe to dispatch while the protected computation/handler body executes.
+-/
+theorem entered_handler_dispatches
+  (hs : HandlerStack) (eff : EffectLabel) :
+  HandlerStack.dispatch (hs.push eff) eff = EffectRow.DispatchResult.handled :=
+  effect_safety_static (hs.push eff) eff (handler_push_establishes_scope hs eff)
+
+/--
+  Inversion for typed handlers: a typed `handle` expression necessarily has a
+  typed handler body.  The previous model could not state this property because
+  `tHandle` carried no typing premise for the handler body at all.
+-/
+theorem typed_handle_has_typed_handler
+  {Γ : Context} {e h : EffExpr} {eff : EffectLabel} {τ : Ty} {r : EffectRow}
+  (typed : HasTypeEff Γ (.handle e eff h) τ r) :
+  ∃ handlerRow, HasTypeEff Γ h τ handlerRow := by
+  cases typed with
+  | tHandle _ handlerTyped _ _ =>
+      exact ⟨_, handlerTyped⟩
+
+/-
+  The remaining whole-language theorem is intentionally NOT stated as
+  `HasTypeEff Γ e τ {} -> no runtime unhandled effect` yet.  The current
+  simplified formal `Ty.fn` does not carry latent effect rows, while the Rust
+  compiler's function type does.  Proving application safety before modeling
+  those latent rows would therefore overclaim.  The next formalization step is
+  an effect-aware function type plus progress/preservation over the handler
+  stack; these local lemmas are the sound foundation for that proof.
+-/
 
 end Nulang
