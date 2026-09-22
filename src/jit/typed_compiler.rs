@@ -30,7 +30,7 @@ use cranelift_frontend::FunctionBuilder;
 use cranelift_jit::JITModule;
 use cranelift_module::{Linkage, Module};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::{CodeModule, Constant, Instruction, OpCode};
 use crate::jit::compiler::{emit_arr_load, emit_yield_pc, CompileError};
@@ -41,9 +41,10 @@ use crate::jit::compiler::{emit_arr_load, emit_yield_pc, CompileError};
 
 use crate::cranelift_utils::{
     emit_bitcast_f64_to_i64_canonicalized, emit_sext48, emit_tag_bool, emit_tag_int,
-    PAYLOAD_MASK_I64, TAG_BOOL_I64, TAG_INT_I64, TAG_NIL_I64,
+    PAYLOAD_MASK_I64, SIGN_BIT_I64, SIGN_EXTEND, TAG_BOOL_I64, TAG_INT_I64, TAG_NIL_I64,
 };
 pub use crate::type_metadata::{KnownType, TypeMetadata};
+use crate::type_metadata::REG_COUNT;
 // Bytecode-level type inference
 // ---------------------------------------------------------------------------
 
@@ -357,6 +358,110 @@ pub(crate) fn store_reg(builder: &mut FunctionBuilder, regs_ptr: Value, idx: usi
     builder.ins().store(MemFlags::new(), val, addr, 0);
 }
 
+
+/// One unboxed integer value carried in native SSA form.
+///
+/// The dirty flag means the VM register file has not yet been synchronized
+/// with this value. Dirty entries are flushed before control-flow joins,
+/// helper calls, region exits, or opcodes that are not cache-aware.
+#[derive(Clone, Copy)]
+struct CachedInt {
+    value: Value,
+    dirty: bool,
+}
+
+/// Conservative per-basic-block cache for statically-proven Int registers.
+///
+/// This only carries unboxed integers across straight-line bytecode where the
+/// generated CLIF value dominates every use. Branch targets start with an
+/// empty cache and incoming edges synchronize the VM register file first.
+struct IntRegCache {
+    regs: [Option<CachedInt>; REG_COUNT],
+}
+
+impl Default for IntRegCache {
+    fn default() -> Self {
+        Self {
+            regs: [None; REG_COUNT],
+        }
+    }
+}
+
+impl IntRegCache {
+    #[inline]
+    fn clear(&mut self) {
+        self.regs.fill(None);
+    }
+
+    #[inline]
+    fn invalidate(&mut self, reg: usize) {
+        if reg < REG_COUNT {
+            self.regs[reg] = None;
+        }
+    }
+
+    #[inline]
+    fn get_or_load(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        regs_ptr: Value,
+        reg: usize,
+    ) -> Value {
+        if let Some(entry) = self.regs.get(reg).and_then(|entry| *entry) {
+            return entry.value;
+        }
+        let raw = load_reg(builder, regs_ptr, reg);
+        let value = emit_sext48(builder, raw);
+        if reg < REG_COUNT {
+            self.regs[reg] = Some(CachedInt {
+                value,
+                dirty: false,
+            });
+        }
+        value
+    }
+
+    #[inline]
+    fn set_dirty(&mut self, reg: usize, value: Value) {
+        if reg < REG_COUNT {
+            self.regs[reg] = Some(CachedInt { value, dirty: true });
+        }
+    }
+
+    fn flush(&mut self, builder: &mut FunctionBuilder, regs_ptr: Value) {
+        for (reg, slot) in self.regs.iter_mut().enumerate() {
+            let Some(entry) = *slot else {
+                continue;
+            };
+            if !entry.dirty {
+                continue;
+            }
+            let tagged = emit_tag_int(builder, entry.value);
+            store_reg(builder, regs_ptr, reg, tagged);
+            *slot = Some(CachedInt {
+                value: entry.value,
+                dirty: false,
+            });
+        }
+    }
+
+    #[inline]
+    fn flush_and_clear(&mut self, builder: &mut FunctionBuilder, regs_ptr: Value) {
+        self.flush(builder, regs_ptr);
+        self.clear();
+    }
+}
+
+#[inline]
+fn normalize_i48(value: i64) -> i64 {
+    let payload = value & PAYLOAD_MASK_I64;
+    if payload & SIGN_BIT_I64 != 0 {
+        payload | SIGN_EXTEND
+    } else {
+        payload
+    }
+}
+
 fn make_bin_sig<M: Module>(module: &M) -> Signature {
     let mut sig = module.make_signature();
     sig.params.push(AbiParam::new(types::I64));
@@ -436,16 +541,14 @@ pub(crate) fn register_runtime_helpers<M: Module>(
 fn emit_typed_ibinop(
     builder: &mut FunctionBuilder,
     regs_ptr: Value,
+    cache: &mut IntRegCache,
     op1: usize,
     op2: usize,
     dst: usize,
     op: TypedIntOp,
 ) {
-    let a_raw = load_reg(builder, regs_ptr, op1);
-    let b_raw = load_reg(builder, regs_ptr, op2);
-
-    let a = emit_sext48(builder, a_raw);
-    let b = emit_sext48(builder, b_raw);
+    let a = cache.get_or_load(builder, regs_ptr, op1);
+    let b = cache.get_or_load(builder, regs_ptr, op2);
 
     let result = match op {
         TypedIntOp::Add => builder.ins().iadd(a, b),
@@ -453,8 +556,7 @@ fn emit_typed_ibinop(
         TypedIntOp::Mul => builder.ins().imul(a, b),
     };
 
-    let tagged = emit_tag_int(builder, result);
-    store_reg(builder, regs_ptr, dst, tagged);
+    cache.set_dirty(dst, result);
 }
 
 /// Emit a float binary operation with direct CLIF (no runtime call).
@@ -529,20 +631,19 @@ enum TypedFloatOp {
 fn emit_typed_icmp(
     builder: &mut FunctionBuilder,
     regs_ptr: Value,
+    cache: &mut IntRegCache,
     op1: usize,
     op2: usize,
     dst: usize,
     cc: IntCC,
 ) {
-    let a_raw = load_reg(builder, regs_ptr, op1);
-    let b_raw = load_reg(builder, regs_ptr, op2);
-
-    let a = emit_sext48(builder, a_raw);
-    let b = emit_sext48(builder, b_raw);
+    let a = cache.get_or_load(builder, regs_ptr, op1);
+    let b = cache.get_or_load(builder, regs_ptr, op2);
 
     let cond = builder.ins().icmp(cc, a, b);
     let tagged_bool = emit_tag_bool(builder, cond);
     store_reg(builder, regs_ptr, dst, tagged_bool);
+    cache.invalidate(dst);
 }
 
 /// Emit a typed float comparison with direct CLIF.
@@ -576,12 +677,12 @@ fn emit_typed_fcmp(
 fn emit_typed_iunary(
     builder: &mut FunctionBuilder,
     regs_ptr: Value,
+    cache: &mut IntRegCache,
     src: usize,
     dst: usize,
     op: TypedIntUnaryOp,
 ) {
-    let raw = load_reg(builder, regs_ptr, src);
-    let val = emit_sext48(builder, raw);
+    let val = cache.get_or_load(builder, regs_ptr, src);
 
     let result = match op {
         TypedIntUnaryOp::Neg => builder.ins().ineg(val),
@@ -595,8 +696,7 @@ fn emit_typed_iunary(
         }
     };
 
-    let tagged = emit_tag_int(builder, result);
-    store_reg(builder, regs_ptr, dst, tagged);
+    cache.set_dirty(dst, result);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -902,11 +1002,82 @@ pub fn compile_bytecode_region_typed(
     // Mutable copy of type metadata so we can propagate result types
     let mut meta = type_metadata.map(|m| m.clone()).unwrap_or_default();
 
+    // Branch targets are native-SSA join points. Every incoming branch flushes
+    // the register file before the edge, and the target begins with no cached
+    // CLIF values so dominance is explicit and conservative.
+    let mut cache_entry_points = HashSet::new();
+    cache_entry_points.insert(start_offset);
+    for (pc, instr) in instructions
+        .iter()
+        .enumerate()
+        .take(end_offset)
+        .skip(start_offset)
+    {
+        let target = match instr.opcode {
+            OpCode::Jmp => Some((pc as i64 + instr.simm16() as i64) as usize),
+            OpCode::JmpT | OpCode::JmpF => {
+                Some((pc as i64 + instr.offset16() as i64) as usize)
+            }
+            _ => None,
+        };
+        if let Some(target) = target {
+            if target >= start_offset && target < end_offset {
+                cache_entry_points.insert(target);
+            }
+        }
+    }
+    let mut int_cache = IntRegCache::default();
+
     // Compile each instruction
     for pc in start_offset..end_offset {
         let instr = instructions[pc];
         let block = *blocks.get(&pc).unwrap();
         builder.switch_to_block(block);
+
+        if pc != start_offset && cache_entry_points.contains(&pc) {
+            int_cache.clear();
+        }
+
+        let cache_aware = match instr.opcode {
+            OpCode::Nop
+            | OpCode::Const0
+            | OpCode::Const1
+            | OpCode::Const2
+            | OpCode::ConstM1 => true,
+            OpCode::ConstU => matches!(
+                module.constants.get(instr.imm16() as usize),
+                Some(Constant::Int(_))
+            ),
+            OpCode::Load | OpCode::Store | OpCode::Move | OpCode::Dup => {
+                meta.is_known(instr.op1 as usize, KnownType::Int)
+            }
+            OpCode::Swap => meta.both_known(
+                instr.op1 as usize,
+                instr.op2 as usize,
+                KnownType::Int,
+            ),
+            OpCode::IAdd | OpCode::ISub | OpCode::IMul => meta.both_known(
+                instr.op1 as usize,
+                instr.op2 as usize,
+                KnownType::Int,
+            ),
+            OpCode::INeg | OpCode::IInc | OpCode::IDec => {
+                meta.is_known(instr.op1 as usize, KnownType::Int)
+            }
+            OpCode::ICmpEq
+            | OpCode::ICmpLt
+            | OpCode::ICmpGt
+            | OpCode::ICmpLe
+            | OpCode::ICmpGe => meta.both_known(
+                instr.op1 as usize,
+                instr.op2 as usize,
+                KnownType::Int,
+            ),
+            _ => false,
+        };
+        if !cache_aware {
+            int_cache.flush_and_clear(&mut builder, regs_ptr);
+        }
 
         match instr.opcode {
             // -- Special --
@@ -915,50 +1086,89 @@ pub fn compile_bytecode_region_typed(
                 builder.ins().jump(return_block, &[]);
             }
             OpCode::Const0 => {
-                emit_const(&mut builder, regs_ptr, instr.op1 as usize, 0);
+                let value = builder.ins().iconst(types::I64, 0);
+                int_cache.set_dirty(instr.op1 as usize, value);
+                meta.set_type(instr.op1 as usize, KnownType::Int);
             }
             OpCode::Const1 => {
-                emit_const(&mut builder, regs_ptr, instr.op1 as usize, 1);
+                let value = builder.ins().iconst(types::I64, 1);
+                int_cache.set_dirty(instr.op1 as usize, value);
+                meta.set_type(instr.op1 as usize, KnownType::Int);
             }
             OpCode::Const2 => {
-                emit_const(&mut builder, regs_ptr, instr.op1 as usize, 2);
+                let value = builder.ins().iconst(types::I64, 2);
+                int_cache.set_dirty(instr.op1 as usize, value);
+                meta.set_type(instr.op1 as usize, KnownType::Int);
             }
             OpCode::ConstM1 => {
-                emit_const(&mut builder, regs_ptr, instr.op1 as usize, -1);
+                let value = builder.ins().iconst(types::I64, -1);
+                int_cache.set_dirty(instr.op1 as usize, value);
+                meta.set_type(instr.op1 as usize, KnownType::Int);
             }
             OpCode::ConstU => {
                 let idx = instr.imm16() as usize;
-                let offset = (idx * 8) as i32;
-                let addr = if offset == 0 {
-                    consts_ptr
+                let dst = instr.op3 as usize;
+                if let Some(Constant::Int(value)) = module.constants.get(idx) {
+                    let value = builder.ins().iconst(types::I64, normalize_i48(*value));
+                    int_cache.set_dirty(dst, value);
+                    meta.set_type(dst, KnownType::Int);
                 } else {
-                    let off = builder.ins().iconst(types::I64, offset as i64);
-                    builder.ins().iadd(consts_ptr, off)
-                };
-                let val = builder.ins().load(types::I64, MemFlags::new(), addr, 0);
-                // Destination is op3, matching the interpreter and the scalar
-                // compiler (op1/op2 hold the 16-bit constant index).
-                store_reg(&mut builder, regs_ptr, instr.op3 as usize, val);
-                meta.set_type(instr.op3 as usize, KnownType::Unknown);
+                    let offset = (idx * 8) as i32;
+                    let addr = if offset == 0 {
+                        consts_ptr
+                    } else {
+                        let off = builder.ins().iconst(types::I64, offset as i64);
+                        builder.ins().iadd(consts_ptr, off)
+                    };
+                    let val = builder.ins().load(types::I64, MemFlags::new(), addr, 0);
+                    store_reg(&mut builder, regs_ptr, dst, val);
+                    meta.set_type(
+                        dst,
+                        match module.constants.get(idx) {
+                            Some(Constant::Float(_)) => KnownType::Float,
+                            Some(Constant::Bool(_)) => KnownType::Bool,
+                            _ => KnownType::Unknown,
+                        },
+                    );
+                }
             }
 
             // -- Register --
             // Load/Store are plain register copies in this pipeline, exactly
             // like Move/Dup (mirroring the scalar compiler).
             OpCode::Load | OpCode::Store | OpCode::Move | OpCode::Dup => {
-                let val = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
-                store_reg(&mut builder, regs_ptr, instr.op2 as usize, val);
-                meta.propagate_result(instr.op2 as usize, instr.op1 as usize);
+                let src = instr.op1 as usize;
+                let dst = instr.op2 as usize;
+                if meta.is_known(src, KnownType::Int) {
+                    let value = int_cache.get_or_load(&mut builder, regs_ptr, src);
+                    int_cache.set_dirty(dst, value);
+                } else {
+                    let val = load_reg(&mut builder, regs_ptr, src);
+                    store_reg(&mut builder, regs_ptr, dst, val);
+                    int_cache.invalidate(dst);
+                }
+                meta.propagate_result(dst, src);
             }
             OpCode::Swap => {
-                let v1 = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
-                let v2 = load_reg(&mut builder, regs_ptr, instr.op2 as usize);
-                store_reg(&mut builder, regs_ptr, instr.op1 as usize, v2);
-                store_reg(&mut builder, regs_ptr, instr.op2 as usize, v1);
-                let ty1 = meta.get_type(instr.op1 as usize);
-                let ty2 = meta.get_type(instr.op2 as usize);
-                meta.set_type(instr.op1 as usize, ty2);
-                meta.set_type(instr.op2 as usize, ty1);
+                let r1 = instr.op1 as usize;
+                let r2 = instr.op2 as usize;
+                let ty1 = meta.get_type(r1);
+                let ty2 = meta.get_type(r2);
+                if ty1 == KnownType::Int && ty2 == KnownType::Int {
+                    let v1 = int_cache.get_or_load(&mut builder, regs_ptr, r1);
+                    let v2 = int_cache.get_or_load(&mut builder, regs_ptr, r2);
+                    int_cache.set_dirty(r1, v2);
+                    int_cache.set_dirty(r2, v1);
+                } else {
+                    let v1 = load_reg(&mut builder, regs_ptr, r1);
+                    let v2 = load_reg(&mut builder, regs_ptr, r2);
+                    store_reg(&mut builder, regs_ptr, r1, v2);
+                    store_reg(&mut builder, regs_ptr, r2, v1);
+                    int_cache.invalidate(r1);
+                    int_cache.invalidate(r2);
+                }
+                meta.set_type(r1, ty2);
+                meta.set_type(r2, ty1);
             }
 
             // -- Integer Arithmetic (typed when both operands known Int) --
@@ -968,6 +1178,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_ibinop(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -994,6 +1205,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_ibinop(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1018,6 +1230,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_ibinop(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1071,6 +1284,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_iunary(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         dst,
                         TypedIntUnaryOp::Neg,
@@ -1204,6 +1418,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_icmp(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1228,6 +1443,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_icmp(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1252,6 +1468,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_icmp(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1276,6 +1493,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_icmp(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1300,6 +1518,7 @@ pub fn compile_bytecode_region_typed(
                     emit_typed_icmp(
                         &mut builder,
                         regs_ptr,
+                        &mut int_cache,
                         instr.op1 as usize,
                         instr.op2 as usize,
                         dst,
@@ -1546,8 +1765,12 @@ pub fn compile_bytecode_region_typed(
 
         if !is_terminator {
             if let Some(&next_block) = blocks.get(&(pc + 1)) {
+                if cache_entry_points.contains(&(pc + 1)) {
+                    int_cache.flush_and_clear(&mut builder, regs_ptr);
+                }
                 builder.ins().jump(next_block, &[]);
             } else {
+                int_cache.flush_and_clear(&mut builder, regs_ptr);
                 builder.ins().jump(return_block, &[]);
             }
         }
