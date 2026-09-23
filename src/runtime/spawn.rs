@@ -42,7 +42,7 @@ pub(crate) fn try_spawn_actor_with_models(
     workflow: Option<&str>,
     initial_authority: Option<&AuthorityManifest>,
 ) -> std::io::Result<u64> {
-    try_spawn_actor_with_id(
+    try_spawn_actor_with_id_schema(
         rt,
         fresh_actor_id(),
         init,
@@ -50,24 +50,106 @@ pub(crate) fn try_spawn_actor_with_models(
         persistent,
         workflow,
         initial_authority,
+        None,
     )
 }
 
-/// Load and validate legacy restart snapshot authority before actor initialization.
-///
-/// A malformed persisted manifest aborts activation before the init closure,
-/// CRDT registration, actor insertion, or scheduler enqueue. Pre-authority
-/// snapshots deserialize with an empty token set and therefore remain
-/// deny-by-default.
+fn try_spawn_actor_with_models_schema(
+    rt: &mut Runtime,
+    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+    state_models: HashMap<String, StateModel>,
+    persistent: bool,
+    workflow: Option<&str>,
+    initial_authority: Option<&AuthorityManifest>,
+    schema: Option<(&str, u32)>,
+) -> std::io::Result<u64> {
+    try_spawn_actor_with_id_schema(
+        rt,
+        fresh_actor_id(),
+        init,
+        state_models,
+        persistent,
+        workflow,
+        initial_authority,
+        schema,
+    )
+}
+
+fn validate_snapshot_schema(
+    snapshot: &ActorSnapshot,
+    expected: Option<(&str, u32)>,
+) -> std::io::Result<()> {
+    if snapshot.schema_version == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "durable snapshot schema version must be positive",
+        ));
+    }
+    match expected {
+        Some((owner, version)) => {
+            if version == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "current actor schema version must be positive",
+                ));
+            }
+            if let Some(persisted_owner) = snapshot.schema_owner.as_deref() {
+                if persisted_owner != owner {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "durable snapshot owner '{}' does not match current actor '{}'",
+                            persisted_owner, owner
+                        ),
+                    ));
+                }
+            } else if snapshot.schema_version != 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "owner-less durable snapshots are only valid as legacy schema v1",
+                ));
+            }
+            if snapshot.schema_version != version {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "durable snapshot schema {}@v{} cannot activate as {}@v{} without migration",
+                        snapshot.schema_owner.as_deref().unwrap_or("<legacy>"),
+                        snapshot.schema_version,
+                        owner,
+                        version
+                    ),
+                ));
+            }
+        }
+        None => {
+            if snapshot.schema_owner.is_some() || snapshot.schema_version != 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "versioned durable snapshot requires compiler-owned actor schema metadata",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Load and validate restart snapshot authority and schema before actor
+/// initialization. Legacy snapshots decode as v1 and remain deny-by-default
+/// for authority.
 fn preflight_persistent_snapshot(
     rt: &Runtime,
     actor_id: u64,
-) -> Result<Option<(ActorSnapshot, AuthorityManifest)>, RuntimeAuthorityError> {
+    expected_schema: Option<(&str, u32)>,
+) -> std::io::Result<Option<(ActorSnapshot, AuthorityManifest)>> {
     let Some(snapshot) = rt.persistence.load_snapshot(actor_id) else {
         return Ok(None);
     };
-    let manifest =
-        AuthorityManifest::from_tokens(snapshot.authority_tokens.iter().map(String::as_str))?;
+    validate_snapshot_schema(&snapshot, expected_schema)?;
+    let manifest = AuthorityManifest::from_tokens(
+        snapshot.authority_tokens.iter().map(String::as_str),
+    )
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
     Ok(Some((snapshot, manifest)))
 }
 
@@ -100,23 +182,45 @@ fn try_spawn_actor_with_id(
     workflow: Option<&str>,
     initial_authority: Option<&AuthorityManifest>,
 ) -> std::io::Result<u64> {
+    try_spawn_actor_with_id_schema(
+        rt,
+        id,
+        init,
+        state_models,
+        persistent,
+        workflow,
+        initial_authority,
+        None,
+    )
+}
+
+fn try_spawn_actor_with_id_schema(
+    rt: &mut Runtime,
+    id: u64,
+    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+    state_models: HashMap<String, StateModel>,
+    persistent: bool,
+    workflow: Option<&str>,
+    initial_authority: Option<&AuthorityManifest>,
+    schema: Option<(&str, u32)>,
+) -> std::io::Result<u64> {
     let restart_snapshot = if persistent && workflow.is_none() {
-        match preflight_persistent_snapshot(rt, id) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                tracing::warn!(
-                    actor_id = id,
-                    %error,
-                    "refusing to activate persistent actor with invalid authority snapshot"
-                );
-                return Ok(id);
-            }
-        }
+        preflight_persistent_snapshot(rt, id, schema)?
     } else {
         None
     };
 
     let mut actor = Actor::new(id, format!("actor_{}", id), 0);
+    if let Some((owner, version)) = schema {
+        if version == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "actor schema version must be positive",
+            ));
+        }
+        actor.schema_owner = Some(owner.to_string());
+        actor.schema_version = version;
+    }
     let state_fields = init();
     for (name, value) in state_fields {
         actor.set_state_field(name, value);
@@ -328,7 +432,7 @@ fn try_spawn_from_module(
             .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
             .collect();
         let defaults = meta.state_defaults.clone();
-        try_spawn_actor_with_models(
+        try_spawn_actor_with_models_schema(
             rt,
             Box::new(move || {
                 let mut fields: Vec<(String, Value)> = defaults
@@ -346,6 +450,7 @@ fn try_spawn_from_module(
                 None
             },
             initial_authority,
+            Some((meta.name.as_str(), meta.version)),
         )?
     } else {
         try_spawn_actor_with_models(
