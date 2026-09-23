@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### Finite-domain match coverage diagnostics — 2026-09-23
+- **Closed variant and `Bool` matches now receive conservative semantic coverage diagnostics** (`src/pattern_coverage.rs`, `src/typechecker.rs`). `W0201` reports provably missing constructor/value witnesses and `W0202` reports provably redundant arms; guarded arms never establish total coverage.
+- **Default source validity remains unchanged.** Unsupported or infinite domains keep the existing runtime non-exhaustive fallback, while `--deny-warnings` provides opt-in strict rejection.
+- **CLI, JSON check mode, and LSP consume the same typechecker-owned warning stream**, preserving stable codes and source spans rather than reimplementing coverage per frontend.
+- **Safety/specification documentation now matches the implementation** for match coverage, dynamic effect-handler resolution, mailbox backpressure, ORCA shard isolation, workflow compensation, and sendable reference capabilities.
+
 ### Actor runtime hot-path overhead reduction — 2026-09-23
 - **Per-actor flight recording is now opt-in for runtime-created actors** (`src/runtime/actor.rs`, `src/runtime/mod.rs`). `NULANG_FLIGHT_RECORDER=1` enables the existing recorder; disabled actors reserve no recorder ring storage and skip payload-summary formatting. Explicit `FlightRecorder::new(...)` callers retain enabled behavior, and accepted messages are recorded only after mailbox admission succeeds.
 - **Bytecode actor turns now reuse the cached VM module index without deep-cloning `CodeModule` on every dispatch** (`src/runtime/mod.rs`). The clone/load cost is paid only when an actor first installs its module into the runtime VM; subsequent turns execute directly against `bytecode_module_idx`. Bytecode format and execution semantics are unchanged.
