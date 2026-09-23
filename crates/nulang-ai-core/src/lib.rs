@@ -226,7 +226,8 @@ impl IntentionRevision {
     pub fn new(
         intention: &Intention,
         replacement_intention_id: Option<Uuid>,
-        trigger_task: &Task,
+        trigger_task_id: Uuid,
+        trigger_status: TaskStatus,
         decision: IntentionRevisionDecision,
         reason: impl Into<String>,
     ) -> Self {
@@ -236,8 +237,8 @@ impl IntentionRevision {
             commitment_id: intention.commitment_id,
             superseded_intention_id: intention.id,
             replacement_intention_id,
-            trigger_task_id: trigger_task.id,
-            trigger_status: trigger_task.status,
+            trigger_task_id,
+            trigger_status,
             decision,
             reason: reason.into(),
             created_at: Utc::now(),
@@ -505,12 +506,11 @@ mod tests {
             Vec::new(),
         );
         let task = Task::new(goal.id, "Implement feature", ManagerKind::Engineering);
-        let mut task = task;
-        task.status = TaskStatus::Blocked;
         let revision = IntentionRevision::new(
             &intention,
             None,
-            &task,
+            task.id,
+            TaskStatus::Blocked,
             IntentionRevisionDecision::Suspend,
             "waiting on external dependency",
         );
