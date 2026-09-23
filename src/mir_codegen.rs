@@ -82,6 +82,9 @@ pub struct MirCodegen {
     /// string every time (unlike record fields, `state` is string-keyed at
     /// runtime, not a positional slot `field_id` could cover).
     state_field_constants: FxHashMap<String, usize>,
+    /// Shared constant-pool slot used when a proven last-use ownership
+    /// transfer clears its dead source local to nil without touching RC.
+    nil_constant: Option<usize>,
     /// Per-function float-ness of MIR locals (see `float_locals`), used to
     /// pick float opcode variants for arithmetic and comparisons. Rebuilt
     /// at the start of every `compile_function`.
@@ -103,6 +106,7 @@ impl MirCodegen {
             field_map: FxHashMap::default(),
             next_field_id: 0,
             state_field_constants: FxHashMap::default(),
+            nil_constant: None,
             float_locals: Vec::new(),
             spill_map: FxHashMap::default(),
             spill_read_cycle: 0,
@@ -208,6 +212,42 @@ impl MirCodegen {
                 (slot >> 8) as u8,
                 (slot & 0xFF) as u8,
             ));
+        }
+    }
+
+    /// Clear a local to nil without releasing its pointer.
+    ///
+    /// Used only after a proven last-use `Load` ownership transfer: the
+    /// destination now carries the sole local ORCA ownership token, so
+    /// decrementing the dead source would free the transferred value.
+    fn clear_local_after_transfer(&mut self, id: mir::LocalId) {
+        let nil_idx = match self.nil_constant {
+            Some(idx) => idx,
+            None => {
+                let idx = self.module.add_constant(Constant::Nil);
+                self.nil_constant = Some(idx);
+                idx
+            }
+        };
+        let emit_nil = |this: &mut Self, dst: u8| {
+            this.emit(Instruction::new3(
+                OpCode::ConstU,
+                ((nil_idx >> 8) & 0xFF) as u8,
+                (nil_idx & 0xFF) as u8,
+                dst,
+            ));
+        };
+
+        if let Some(&slot) = self.spill_map.get(&id.0) {
+            emit_nil(self, SPILL_TEMP2);
+            self.emit(Instruction::new3(
+                OpCode::SpillStore,
+                SPILL_TEMP2,
+                (slot >> 8) as u8,
+                (slot & 0xFF) as u8,
+            ));
+        } else {
+            emit_nil(self, (LOCAL_BASE + id.0) as u8);
         }
     }
 
@@ -564,6 +604,9 @@ impl MirCodegen {
                     func_lines.push((self.module.instructions.len(), line));
                 }
                 self.compile_stmt(stmt, func, &mut handle_patches)?;
+                if let Some(src) = drop_plan.ownership_transfer.get(&(bi, si)) {
+                    self.clear_local_after_transfer(*src);
+                }
                 if let Some(ids) = drop_plan.after_stmt.get(&(bi, si)) {
                     for id in ids {
                         if self.is_spilled(*id) {
@@ -2114,6 +2157,10 @@ pub fn compile_mir(mir: &mut mir::Module, module_name: impl Into<String>) -> NuR
 //   - no use copies the value through an uncounted channel: Move/Load,
 //     `&`/`*`, call or effect arguments, closure captures, sends/asks,
 //     returns/resumes, `StateSet`, or the AI builtins' staging moves.
+//     The one exception is a single-definition local whose only use is
+//     `dst = Load(src)`: that edge is a provable ownership transfer. Codegen
+//     copies the bits, clears `src` to nil *without* decrementing RC, and the
+//     destination inherits the ownership proof.
 //
 // Uses through the retaining barriers (container element stores) and
 // read-only uses (container base/length, operands, branch conditions) do
@@ -2340,6 +2387,9 @@ struct DropPlan {
     block_entry: FxHashMap<usize, Vec<mir::LocalId>>,
     before_stmt: FxHashMap<(usize, usize), Vec<mir::LocalId>>,
     after_stmt: FxHashMap<(usize, usize), Vec<mir::LocalId>>,
+    /// `dst = Load(src)` sites proven to consume the source's final use.
+    /// Codegen clears `src` to nil after the copy without decrementing RC.
+    ownership_transfer: FxHashMap<(usize, usize), mir::LocalId>,
 }
 
 /// Compute conservative `Drop` placements for one function; see the section
@@ -2372,20 +2422,65 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
         }
     }
 
+    // First count definitions and uses. A Load can be treated as an
+    // ownership move only when its source has exactly one MIR definition and
+    // this Load is its only use in the whole function. That rules out later
+    // redefinitions (which would otherwise try to Drop the stale source
+    // alias) and every competing read/copy path.
+    let mut def_count = vec![0usize; nlocals];
+    let mut use_count = vec![0usize; nlocals];
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            for (u, _) in stmt_uses(stmt) {
+                use_count[u] += 1;
+            }
+            if let mir::Stmt::Assign { dst, .. } = stmt {
+                def_count[dst.0 as usize] += 1;
+            }
+        }
+        for (u, _) in terminator_uses(&block.terminator) {
+            use_count[u] += 1;
+        }
+    }
+
+    // Raw transfer candidates: (dst, src), keyed by statement location.
+    // Whether the transfer is *active* still depends on proving src owns its
+    // value; that is resolved by the candidate fixed point below.
+    let mut transfer_sites: FxHashMap<(usize, usize), (usize, usize)> = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (si, stmt) in block.stmts.iter().enumerate() {
+            if let mir::Stmt::Assign {
+                dst,
+                op: mir::RValue::Load(src),
+            } = stmt
+            {
+                let s = src.0 as usize;
+                let d = dst.0 as usize;
+                if s != d && def_count[s] == 1 && use_count[s] == 1 {
+                    transfer_sites.insert((bi, si), (d, s));
+                }
+            }
+        }
+    }
+
     // Scan defs and uses for the whole function.
     let mut has_def = vec![false; nlocals];
     let mut defs_owning = vec![true; nlocals];
     let mut no_copy_use = vec![true; nlocals];
+    // A destination defined by a transfer becomes owning only after every
+    // transfer source has itself been proven owning.
+    let mut transfer_inputs: Vec<Vec<usize>> = (0..nlocals).map(|_| Vec::new()).collect();
     let mut block_defs: Vec<HashSet<usize>> = (0..nblocks).map(|_| HashSet::new()).collect();
     let mut block_uses: Vec<HashSet<usize>> = (0..nblocks).map(|_| HashSet::new()).collect();
     // (dst, base) pairs of field/element loads, for escapee tracking.
     let mut loads: Vec<(usize, usize)> = Vec::new();
 
     for (bi, block) in func.blocks.iter().enumerate() {
-        for stmt in &block.stmts {
+        for (si, stmt) in block.stmts.iter().enumerate() {
+            let transfer_src = transfer_sites.get(&(bi, si)).map(|(_, src)| *src);
             for (u, kind) in stmt_uses(stmt) {
                 block_uses[bi].insert(u);
-                if kind == UseKind::Copy {
+                if kind == UseKind::Copy && transfer_src != Some(u) {
                     no_copy_use[u] = false;
                 }
             }
@@ -2393,9 +2488,19 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
                 let d = dst.0 as usize;
                 has_def[d] = true;
                 block_defs[bi].insert(d);
-                if !rvalue_is_owning(op) || rvalue_uses(op).iter().any(|(u, _)| *u == d) {
+
+                let self_read = rvalue_uses(op).iter().any(|(u, _)| *u == d);
+                if self_read {
+                    defs_owning[d] = false;
+                } else if rvalue_is_owning(op) {
+                    // Fresh allocation / non-aliasing value: owns directly.
+                } else if let Some(&(transfer_dst, src)) = transfer_sites.get(&(bi, si)) {
+                    debug_assert_eq!(transfer_dst, d);
+                    transfer_inputs[d].push(src);
+                } else {
                     defs_owning[d] = false;
                 }
+
                 match op {
                     mir::RValue::LoadFieldNamed { obj, .. }
                     | mir::RValue::LoadFieldPos { obj, .. } => loads.push((d, obj.0 as usize)),
@@ -2412,9 +2517,40 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
         }
     }
 
-    let candidate: Vec<bool> = (0..nlocals)
-        .map(|i| ptr_ty[i] && !excluded[i] && has_def[i] && defs_owning[i] && no_copy_use[i])
-        .collect();
+    // Ownership can flow through chains of last-use Loads, so solve
+    // candidates to a fixed point. Base owning definitions seed the graph;
+    // transfer-defined locals become candidates only after their source does.
+    let mut candidate = vec![false; nlocals];
+    loop {
+        let mut changed = false;
+        for i in 0..nlocals {
+            if candidate[i]
+                || !ptr_ty[i]
+                || excluded[i]
+                || !has_def[i]
+                || !defs_owning[i]
+                || !no_copy_use[i]
+                || !transfer_inputs[i].iter().all(|src| candidate[*src])
+            {
+                continue;
+            }
+            candidate[i] = true;
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Only proven owning sources become real transfers. Clearing the source
+    // is safe even if the destination later stops qualifying for early Drop:
+    // its register/spill now carries the ownership token and actor teardown
+    // remains the conservative fallback.
+    for (&site, &(_, src)) in &transfer_sites {
+        if candidate[src] {
+            plan.ownership_transfer.insert(site, func.locals[src].id);
+        }
+    }
 
     // Escapees: locals defined by field/element loads from a candidate or
     // another escapee (transitively).
@@ -2475,8 +2611,17 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
         }
         for (si, stmt) in block.stmts.iter().enumerate().rev() {
             let uses = stmt_uses(stmt);
-            // Last-use drops for candidates this statement reads.
+            let transfer_src = plan
+                .ownership_transfer
+                .get(&(bi, si))
+                .map(|id| id.0 as usize);
+            // Last-use drops for candidates this statement reads. A proven
+            // ownership-transfer source is cleared without an RC decrement
+            // after the copy, so it must not receive the ordinary Drop here.
             for (u, _) in &uses {
+                if transfer_src == Some(*u) {
+                    continue;
+                }
                 if candidate[*u] && !live.contains(u) && esc_clear(*u, &live) {
                     plan.after_stmt
                         .entry((bi, si))
@@ -3415,6 +3560,125 @@ mod optimize_tests {
                 .get(&(0, 1))
                 .is_some_and(|ids| ids.contains(&joined)),
             "fresh StrConcat result should be released after its last use"
+        );
+    }
+
+    #[test]
+    fn test_drop_plan_transfers_single_use_ownership_through_load_chain() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("move_chain", Some(Type::int()));
+        let root = b.add_temp(arr_ty.clone());
+        let mid = b.add_temp(arr_ty.clone());
+        let leaf = b.add_temp(arr_ty);
+        let len = b.add_temp(Type::int());
+
+        b.assign(root, mir::RValue::ArrayLit(vec![]));
+        b.assign(mid, mir::RValue::Load(root));
+        b.assign(leaf, mir::RValue::Load(mid));
+        b.assign(len, mir::RValue::ArrayLen(leaf));
+        b.terminate(mir::Terminator::Return(Some(len)));
+
+        let func = b.build();
+        let plan = plan_drops(&func);
+
+        assert_eq!(plan.ownership_transfer.get(&(0, 1)), Some(&root));
+        assert_eq!(plan.ownership_transfer.get(&(0, 2)), Some(&mid));
+        assert!(
+            !plan
+                .after_stmt
+                .get(&(0, 1))
+                .is_some_and(|ids| ids.contains(&root)),
+            "transfer source must not be RC-dropped after the move"
+        );
+        assert!(
+            !plan
+                .after_stmt
+                .get(&(0, 2))
+                .is_some_and(|ids| ids.contains(&mid)),
+            "chained transfer source must not be RC-dropped after the move"
+        );
+        assert!(
+            plan.after_stmt
+                .get(&(0, 3))
+                .is_some_and(|ids| ids.contains(&leaf)),
+            "final owner should be released after its last read-only use"
+        );
+    }
+
+    #[test]
+    fn test_drop_plan_does_not_transfer_when_source_has_another_use() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("not_a_move", Some(Type::int()));
+        let root = b.add_temp(arr_ty.clone());
+        let first_len = b.add_temp(Type::int());
+        let copied = b.add_temp(arr_ty);
+        let second_len = b.add_temp(Type::int());
+
+        b.assign(root, mir::RValue::ArrayLit(vec![]));
+        b.assign(first_len, mir::RValue::ArrayLen(root));
+        b.assign(copied, mir::RValue::Load(root));
+        b.assign(second_len, mir::RValue::ArrayLen(copied));
+        b.terminate(mir::Terminator::Return(Some(second_len)));
+
+        let func = b.build();
+        let plan = plan_drops(&func);
+        assert!(
+            !plan.ownership_transfer.contains_key(&(0, 2)),
+            "a source with another use is a copy, not an ownership move"
+        );
+    }
+
+    #[test]
+    fn test_drop_plan_does_not_transfer_when_source_is_redefined() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("redefined_source", Some(Type::int()));
+        let root = b.add_temp(arr_ty.clone());
+        let copied = b.add_temp(arr_ty);
+        let len = b.add_temp(Type::int());
+
+        b.assign(root, mir::RValue::ArrayLit(vec![]));
+        b.assign(copied, mir::RValue::Load(root));
+        b.assign(root, mir::RValue::ArrayLit(vec![]));
+        b.assign(len, mir::RValue::ArrayLen(copied));
+        b.terminate(mir::Terminator::Return(Some(len)));
+
+        let func = b.build();
+        let plan = plan_drops(&func);
+        assert!(
+            !plan.ownership_transfer.contains_key(&(0, 1)),
+            "a source with multiple definitions cannot be moved safely"
+        );
+    }
+
+    #[test]
+    fn test_codegen_clears_transfer_source_without_drop() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("main", Some(Type::int()));
+        let root = b.add_temp(arr_ty.clone());
+        let moved = b.add_temp(arr_ty);
+        let len = b.add_temp(Type::int());
+
+        b.assign(root, mir::RValue::ArrayLit(vec![]));
+        b.assign(moved, mir::RValue::Load(root));
+        b.assign(len, mir::RValue::ArrayLen(moved));
+        b.terminate(mir::Terminator::Return(Some(len)));
+
+        let mut module = mir::Module::new("move_codegen");
+        module.functions.push(b.build());
+        let code = compile_mir(&mut module, "move_codegen").unwrap();
+        let root_reg = (LOCAL_BASE + root.0) as u8;
+
+        let clears_root_to_nil = code.instructions.iter().any(|ins| {
+            ins.opcode == OpCode::ConstU
+                && ins.op3 == root_reg
+                && matches!(
+                    code.constants.get(ins.imm16() as usize),
+                    Some(Constant::Nil)
+                )
+        });
+        assert!(
+            clears_root_to_nil,
+            "ownership transfer must clear the dead source register to nil"
         );
     }
 
