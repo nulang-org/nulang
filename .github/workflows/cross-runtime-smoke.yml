@@ -1,0 +1,42 @@
+name: Cross-runtime benchmark smoke
+
+on:
+  push:
+    branches:
+      - bench/cross-runtime-20260923
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install benchmark runtimes
+        run: sudo apt-get update && sudo apt-get install -y golang-go erlang-base erlang-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Nulang core local-message benchmark
+        run: |
+          cargo bench --locked --no-default-features --bench bench_main actor/message_roundtrip_local -- \
+            --warm-up-time 1 --measurement-time 3 --sample-size 30
+
+      - name: Compare with Rust, Go, and BEAM
+        run: |
+          python3 scripts/cross_runtime_baseline.py \
+            --json-out /tmp/cross-runtime-baseline.json \
+            | tee /tmp/cross-runtime-baseline.txt
+
+      - name: Upload baseline
+        uses: actions/upload-artifact@v7
+        with:
+          name: cross-runtime-core-baseline-${{ github.sha }}
+          path: |
+            /tmp/cross-runtime-baseline.json
+            /tmp/cross-runtime-baseline.txt
+          retention-days: 7
