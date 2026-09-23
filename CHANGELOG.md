@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### Inline small actor message payloads — 2026-09-23
+- **Actor messages with 0–4 values now store their NaN-boxed payload directly in the message envelope** (`src/runtime/mailbox.rs`) instead of allocating a `Vec` plus `Arc`; larger payloads retain shared `Arc<Vec<Value>>` storage.
+- **Local runtime sends, AOT sends, supervision/system messages, cross-shard delivery, and decoded network delivery all use the small-message representation.**
+- **Selective receive keeps its transactional `Arc<Vec<Value>>` callback ABI** by materializing an inline candidate only when selected and retaining the same Arc through commit.
+- **The existing `actor/message_enqueue/by_id_100` benchmark keeps its name for rolling-history continuity**, while a new 5-argument shared-payload benchmark provides the allocation-backed comparison.
+
 ### Deduplicated actor ready queue and adaptive turns — 2026-09-23
 - **Actor scheduling now has explicit shard-owned `Idle → Queued → Running` ownership** (`src/runtime/actor.rs`, `src/runtime/mod.rs`), so bursts of sends append mailbox work without injecting duplicate ready tokens. Production, cross-shard delivery, timer wakeups, supervisor restarts, and internal manual pumps use the same claim/finish transition helpers.
 - **Mailbox turns adapt to runnable-peer pressure**: contended actors keep the existing 16-message quantum, while an effectively solo actor may drain up to 256 messages before returning to the scheduler; peer pressure is rechecked every 16 messages and the actor reduction budget remains the hard preemption ceiling.
