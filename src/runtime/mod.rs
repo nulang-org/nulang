@@ -3674,7 +3674,7 @@ impl Runtime {
                 }
             }
         };
-        let should_requeue = if let Some(msg) = msg_opt {
+        if let Some(msg) = msg_opt {
             // Message delivery counts as activity for dehydration.
             if let Some(actor) = self.actors.get_mut(&actor_id) {
                 actor.idle_ms = 0;
@@ -4048,16 +4048,13 @@ impl Runtime {
             // live across the whole batch so should_yield observes cumulative
             // work rather than a fresh per-message counter.
             actor.mailbox.flush_skip_buffer();
-            !actor.mailbox.is_empty()
         } else {
             if let Some(actor) = self.actors.get_mut(&actor_id) {
                 if actor.state == ActorState::Running {
                     actor.state = ActorState::Waiting;
                 }
             }
-            false
-        };
-        let _ = should_requeue;
+        }
         self.current_actor = None;
     }
 
