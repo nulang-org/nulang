@@ -22,6 +22,59 @@ fn declare_test_behavior(rt: &mut Runtime, actor_id: u64, name: &str) {
         .register_behavior(name, noop_test_behavior);
 }
 
+#[derive(Default)]
+struct RejectWorkflowEventStore {
+    inner: MemoryStore,
+}
+
+impl PersistenceStore for RejectWorkflowEventStore {
+    fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
+        self.inner.save_snapshot(snapshot)
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.inner.load_snapshot(actor_id)
+    }
+
+    fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> std::io::Result<()> {
+        self.inner.append_journal(actor_id, entry)
+    }
+
+    fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+        self.inner.read_journal(actor_id)
+    }
+
+    fn append_workflow_event(
+        &mut self,
+        _actor_id: u64,
+        _event: WorkflowEvent,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::other(
+            "injected workflow persistence failure",
+        ))
+    }
+
+    fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+        self.inner.read_workflow_events(actor_id)
+    }
+
+    fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> std::io::Result<()> {
+        self.inner.append_event(actor_id, entry)
+    }
+
+    fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+        self.inner.read_events(actor_id)
+    }
+
+    fn latest_sequence(&self, actor_id: u64) -> u64 {
+        self.inner.latest_sequence(actor_id)
+    }
+
+    fn clear(&mut self, actor_id: u64) -> std::io::Result<()> {
+        self.inner.clear(actor_id)
+    }
+}
+
 #[test]
 fn test_authority_snapshot_round_trip_recovery() {
     let mut rt = Runtime::new();
@@ -1912,6 +1965,13 @@ fn test_event_sourced_counter_replays_from_event_log() {
     );
 
     for i in 0..5 {
+        // Source-level apply handlers are lowered before emit. Model that
+        // explicitly here: domain state changes first, emit only journals
+        // the resulting post-apply value.
+        rt.actors
+            .get_mut(&actor_id)
+            .unwrap()
+            .set_state_field("counter", Value::int(i + 1));
         rt.emit_event(actor_id, "Incremented", &[Value::int(i)]);
     }
 
@@ -1919,7 +1979,7 @@ fn test_event_sourced_counter_replays_from_event_log() {
     assert_eq!(
         count,
         Some(Value::int(5)),
-        "counter should be 5 after 5 events"
+        "explicit state transitions should reach 5 after 5 events"
     );
 
     rt.checkpoint_actor(actor_id);
@@ -1945,6 +2005,42 @@ fn test_event_sourced_counter_replays_from_event_log() {
         Some(Value::int(5)),
         "recovered actor must have counter=5 from event replay"
     );
+}
+
+#[test]
+fn test_workflow_timer_is_not_armed_when_durable_commit_fails() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    rt.actors.get_mut(&actor_id).unwrap().is_workflow = true;
+    rt.persistence = Box::new(RejectWorkflowEventStore::default());
+
+    rt.schedule_workflow_timer(actor_id, "deadline", 1000);
+
+    assert!(
+        rt.timer_wheel.is_empty(),
+        "a durable workflow timer must not become observable before TimerSet commits"
+    );
+}
+
+#[test]
+fn test_workflow_signal_is_not_delivered_when_durable_commit_fails() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.is_workflow = true;
+        actor.waiting_signal = Some("approved".to_string());
+    }
+    rt.persistence = Box::new(RejectWorkflowEventStore::default());
+
+    rt.signal_workflow(actor_id, "approved", Some("ok".to_string()));
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert!(
+        actor.received_signals.is_empty(),
+        "a signal must not enter actor state before SignalReceived commits"
+    );
+    assert_eq!(actor.waiting_signal.as_deref(), Some("approved"));
 }
 
 #[test]
