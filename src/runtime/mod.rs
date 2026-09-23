@@ -4644,7 +4644,15 @@ impl Runtime {
                     context,
                 } => {
                     if self.actor_is_workflow(target_actor) {
-                        let _ = self.append_timer_fired(target_actor, &context);
+                        if let Err(error) = self.append_timer_fired(target_actor, &context) {
+                            warn!(
+                                target_actor,
+                                timer = %context,
+                                %error,
+                                "nulang-persist: refusing to deliver fired workflow timer without durable commit"
+                            );
+                            continue;
+                        }
                     }
                     self.send_message_by_id(target_actor, behavior_id, &payload);
                 }
@@ -4931,7 +4939,15 @@ impl Runtime {
                 // Compensation failed: do not record it as completed.
                 continue;
             }
-            let _ = self.append_saga_compensated(actor_id, &step_name);
+            if let Err(error) = self.append_saga_compensated(actor_id, &step_name) {
+                warn!(
+                    actor_id,
+                    step = %step_name,
+                    %error,
+                    "nulang-persist: compensation ran but completion could not be durably committed"
+                );
+                continue;
+            }
             if let Some(actor) = self.actors.get_mut(&actor_id) {
                 if !actor.compensated_steps.contains(&step_name) {
                     actor.compensated_steps.push(step_name);
@@ -5164,13 +5180,10 @@ impl Runtime {
             // EventSourced/Crdt), lost when `Actor::new` built a bare
             // actor above. Without this, `checkpoint_actor`'s
             // Durable/Crdt snapshot filter and `emit_event`'s
-            // EventSourced "+1" bump both silently fall back to
-            // treating every field as `Local` (via their
+            // EventSourced persistence selection both silently fall back
+            // to treating every field as `Local` (via their
             // `unwrap_or(StateModel::Local)`), breaking persistence for
-            // any field mutated after this recovery: a second crash
-            // would drop Durable fields from the snapshot entirely, and
-            // EventSourced fields would stop accumulating via emitted
-            // events.
+            // any field mutated after this recovery.
             actor.state_models = module
                 .actor_metadata
                 .iter()
