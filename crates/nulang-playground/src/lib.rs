@@ -35,6 +35,8 @@ pub mod authority;
 pub mod actor_protocol;
 #[path = "../../../src/effect_checker.rs"]
 pub mod effect_checker;
+#[path = "../../../src/effect_semantics.rs"]
+pub mod effect_semantics;
 #[path = "../../../src/prelude_source.rs"]
 pub mod prelude_source;
 #[path = "../../../src/parser.rs"]
