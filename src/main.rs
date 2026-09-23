@@ -2537,7 +2537,9 @@ fn compile_source_to_nbc(
         println!(
             "Wrote {manifest_path} ({}, {})",
             behavior_manifest.schema,
-            behavior_manifest.digest().unwrap_or_else(|_| "digest-unavailable".to_string())
+            behavior_manifest
+                .digest()
+                .unwrap_or_else(|_| "digest-unavailable".to_string())
         );
     }
     println!(
