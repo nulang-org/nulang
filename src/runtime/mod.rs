@@ -5042,6 +5042,54 @@ impl Runtime {
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
+
+        // Resolve the exact compiler-owned schema before any durable bytes are
+        // interpreted. New snapshots carry an owner; legacy owner-less v1
+        // snapshots are accepted only when the registered module has exactly
+        // one persistent actor, avoiding ambiguous reinterpretation.
+        let recovery_schema: Option<(String, u32)> =
+            if let Some((module, _, _)) = self.recovery_modules.get(&actor_id) {
+                if let Some(owner) = snapshot.schema_owner.as_deref() {
+                    let meta = match module.actor_metadata.iter().find(|meta| meta.name == owner) {
+                        Some(meta) => meta,
+                        None => {
+                            warn!(
+                                "nulang-recover: refusing actor {} because persisted schema owner '{}' is absent from the recovery module",
+                                actor_id, owner
+                            );
+                            return None;
+                        }
+                    };
+                    Some((meta.name.clone(), meta.version))
+                } else {
+                    let mut candidates =
+                        module.actor_metadata.iter().filter(|meta| meta.persistent);
+                    let first = candidates.next();
+                    if first.is_some() && candidates.next().is_some() {
+                        warn!(
+                            "nulang-recover: refusing legacy actor {} because its recovery module has multiple persistent schema owners",
+                            actor_id
+                        );
+                        return None;
+                    }
+                    first.map(|meta| (meta.name.clone(), meta.version))
+                }
+            } else {
+                None
+            };
+
+        let expected_schema = recovery_schema
+            .as_ref()
+            .map(|(owner, version)| (owner.as_str(), *version));
+        if let Err(error) = spawn::validate_snapshot_schema(&snapshot, expected_schema) {
+            warn!(
+                actor_id,
+                %error,
+                "nulang-recover: refusing incompatible durable snapshot"
+            );
+            return None;
+        }
+
         let authority_manifest =
             match crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens) {
                 Ok(manifest) => manifest,
@@ -5067,6 +5115,14 @@ impl Runtime {
 
         let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
         actor.persistent = true;
+        actor.schema_owner = recovery_schema
+            .as_ref()
+            .map(|(owner, _)| owner.clone())
+            .or_else(|| snapshot.schema_owner.clone());
+        actor.schema_version = recovery_schema
+            .as_ref()
+            .map(|(_, version)| *version)
+            .unwrap_or(snapshot.schema_version);
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
