@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Stable native actor entry ABI — 2026-09-23
+- **AOT actor dispatch now crosses one versioned C-ABI boundary** (`src/native_abi.rs`, `src/aot/codegen.rs`, `src/aot/mod.rs`). Generated Cranelift wrappers validate ABI version and payload arity, load boxed arguments, and call the behavior's optimized internal native function. The runtime no longer selects an arity-specific Rust function type from message length.
+- **Native actor entry status reserves explicit scheduler outcomes** (`Completed`, `Waiting`, `Yielded`, `Suspended`, `Faulted`) so continuation-aware preemption can be added without changing the runtime-facing calling convention. Mid-function AOT yielding is intentionally not enabled until continuation state can be preserved.
+
 ### Re-entrant JIT ownership boundary — 2026-09-23
 - **JIT preparation and native execution are now distinct backend phases** (`src/backends/mod.rs`, `src/jit/mod.rs`), so compilation and Tier-2 promotion finish before native code may call back into the interpreter.
 - **`VM::try_jit_execute` detaches the mutable JIT backend and raw-bit constant cache before native entry** (`src/vm.rs`). Re-entrant direct calls therefore see no VM-owned JIT backend to alias and execute nested frames in the interpreter.
