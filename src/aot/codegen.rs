@@ -168,6 +168,26 @@ fn compute_predecessors(func: &mir::Function) -> HashMap<mir::BlockId, Vec<mir::
     preds
 }
 
+/// Compute successors over normal control flow only.
+///
+/// Handler edges are added separately by `compute_successors`; keeping this
+/// helper separate prevents handler bodies from being mistaken for ordinary
+/// control-flow successors.
+fn compute_normal_successors(
+    func: &mir::Function,
+) -> HashMap<mir::BlockId, Vec<mir::BlockId>> {
+    let mut succs = HashMap::new();
+    for block in &func.blocks {
+        let targets = match &block.terminator {
+            mir::Terminator::Jump(target) => vec![*target],
+            mir::Terminator::Branch { then_, else_, .. } => vec![*then_, *else_],
+            _ => Vec::new(),
+        };
+        succs.insert(block.id, targets);
+    }
+    succs
+}
+
 /// Compute successors of each block for topological traversal.
 fn compute_successors(func: &mir::Function) -> HashMap<mir::BlockId, Vec<mir::BlockId>> {
     let mut succs = compute_normal_successors(func);
@@ -393,6 +413,7 @@ fn resuming_threading(
 fn stmt_rvalue_uses(op: &mir::RValue) -> Vec<mir::LocalId> {
     crate::continuation_analysis::rvalue_uses(op)
 }
+
 /// Per-block live-in sets (registers) over the normal + handler CFG, used by
 /// the cross-block resuming-perform guard. A register is live-in to a block if
 /// it may be read on some path from that block's entry before being redefined.
