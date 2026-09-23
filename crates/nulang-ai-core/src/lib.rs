@@ -19,7 +19,7 @@ mod duration_secs {
     }
 }
 
-pub const NLAP_VERSION: &str = "1.1.0";
+pub const NLAP_VERSION: &str = "1.2.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -29,6 +29,7 @@ pub enum GoalStatus {
     Blocked,
     Verifying,
     Completed,
+    Failed,
     Cancelled,
 }
 
@@ -76,6 +77,14 @@ pub enum IntentionStatus {
     Completed,
     Failed,
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentionRevisionDecision {
+    Replan,
+    Suspend,
+    Abandon,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +209,46 @@ impl Intention {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntentionRevision {
+    pub id: Uuid,
+    pub goal_id: Uuid,
+    pub commitment_id: Uuid,
+    pub superseded_intention_id: Uuid,
+    pub replacement_intention_id: Option<Uuid>,
+    pub trigger_task_id: Uuid,
+    pub trigger_status: TaskStatus,
+    pub decision: IntentionRevisionDecision,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl IntentionRevision {
+    pub fn new(
+        goal_id: Uuid,
+        commitment_id: Uuid,
+        superseded_intention_id: Uuid,
+        replacement_intention_id: Option<Uuid>,
+        trigger_task_id: Uuid,
+        trigger_status: TaskStatus,
+        decision: IntentionRevisionDecision,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            goal_id,
+            commitment_id,
+            superseded_intention_id,
+            replacement_intention_id,
+            trigger_task_id,
+            trigger_status,
+            decision,
+            reason: reason.into(),
+            created_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Task {
     pub id: Uuid,
     pub goal_id: Uuid,
@@ -278,6 +327,14 @@ pub enum SwarmEvent {
     GoalCompleted {
         goal_id: Uuid,
     },
+    GoalBlocked {
+        goal_id: Uuid,
+        reason: String,
+    },
+    GoalFailed {
+        goal_id: Uuid,
+        reason: String,
+    },
     CommitmentActivated {
         commitment_id: Uuid,
         goal_id: Uuid,
@@ -286,6 +343,16 @@ pub enum SwarmEvent {
     CommitmentFulfilled {
         commitment_id: Uuid,
         goal_id: Uuid,
+    },
+    CommitmentSuspended {
+        commitment_id: Uuid,
+        goal_id: Uuid,
+        reason: String,
+    },
+    CommitmentAbandoned {
+        commitment_id: Uuid,
+        goal_id: Uuid,
+        reason: String,
     },
     IntentionActivated {
         intention_id: Uuid,
@@ -297,6 +364,25 @@ pub enum SwarmEvent {
         intention_id: Uuid,
         commitment_id: Uuid,
         goal_id: Uuid,
+    },
+    IntentionBlocked {
+        intention_id: Uuid,
+        commitment_id: Uuid,
+        goal_id: Uuid,
+        reason: String,
+    },
+    IntentionFailed {
+        intention_id: Uuid,
+        commitment_id: Uuid,
+        goal_id: Uuid,
+        reason: String,
+    },
+    IntentionRevised {
+        revision_id: Uuid,
+        superseded_intention_id: Uuid,
+        replacement_intention_id: Option<Uuid>,
+        decision: IntentionRevisionDecision,
+        reason: String,
     },
     TaskCreated {
         task_id: Uuid,
@@ -315,6 +401,16 @@ pub enum SwarmEvent {
     TaskCompleted {
         task_id: Uuid,
         agent_id: String,
+    },
+    TaskBlocked {
+        task_id: Uuid,
+        agent_id: String,
+        reason: String,
+    },
+    TaskFailed {
+        task_id: Uuid,
+        agent_id: String,
+        reason: String,
     },
     DirectorThinking {
         conversation_id: Uuid,
@@ -352,6 +448,8 @@ pub struct GoalGraph {
     pub commitments: Vec<Commitment>,
     #[serde(default)]
     pub intentions: Vec<Intention>,
+    #[serde(default)]
+    pub intention_revisions: Vec<IntentionRevision>,
 }
 
 #[cfg(test)]
@@ -399,6 +497,33 @@ mod tests {
     }
 
     #[test]
+    fn intention_revision_roundtrip_json() {
+        let goal = Goal::new("demo", "Ship feature", 10.0);
+        let commitment = Commitment::new(goal.id, "director-local", "accepted");
+        let intention = Intention::new(
+            goal.id,
+            commitment.id,
+            "manager-engineering",
+            "attempt one",
+            Vec::new(),
+        );
+        let task = Task::new(goal.id, "Implement feature", ManagerKind::Engineering);
+        let revision = IntentionRevision::new(
+            goal.id,
+            commitment.id,
+            intention.id,
+            None,
+            task.id,
+            TaskStatus::Blocked,
+            IntentionRevisionDecision::Suspend,
+            "waiting on external dependency",
+        );
+        let json = serde_json::to_string(&revision).unwrap();
+        let back: IntentionRevision = serde_json::from_str(&json).unwrap();
+        assert_eq!(revision, back);
+    }
+
+    #[test]
     fn goal_graph_accepts_legacy_json_without_bdi_fields() {
         let goal = Goal::new("demo", "Optimize API", 25.0);
         let json = serde_json::json!({
@@ -409,6 +534,7 @@ mod tests {
         let graph: GoalGraph = serde_json::from_value(json).unwrap();
         assert!(graph.commitments.is_empty());
         assert!(graph.intentions.is_empty());
+        assert!(graph.intention_revisions.is_empty());
     }
 
     #[test]
@@ -422,7 +548,7 @@ mod tests {
             None,
         );
         let json = serde_json::to_string(&ev).unwrap();
-        assert!(json.contains("\"version\":\"1.1.0\""));
+        assert!(json.contains("\"version\":\"1.2.0\""));
         assert!(json.contains("goal_created"));
     }
 }
