@@ -36,11 +36,7 @@ impl PersistenceStore for RejectWorkflowEventStore {
         self.inner.load_snapshot(actor_id)
     }
 
-    fn append_journal(
-        &mut self,
-        actor_id: u64,
-        entry: JournalEntry,
-    ) -> std::io::Result<()> {
+    fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> std::io::Result<()> {
         self.inner.append_journal(actor_id, entry)
     }
 
@@ -53,7 +49,9 @@ impl PersistenceStore for RejectWorkflowEventStore {
         _actor_id: u64,
         _event: WorkflowEvent,
     ) -> std::io::Result<()> {
-        Err(std::io::Error::other("injected workflow persistence failure"))
+        Err(std::io::Error::other(
+            "injected workflow persistence failure",
+        ))
     }
 
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
@@ -1980,12 +1978,12 @@ fn test_event_sourced_emit_does_not_invent_state_mutations() {
 
     let events = rt.persistence.read_events(actor_id);
     assert_eq!(events.len(), 2);
-    assert!(events.iter().any(|entry| {
-        entry.field_name == "balance" && entry.value == PersistedValue::Int(100)
-    }));
-    assert!(events.iter().any(|entry| {
-        entry.field_name == "attempts" && entry.value == PersistedValue::Int(7)
-    }));
+    assert!(events
+        .iter()
+        .any(|entry| { entry.field_name == "balance" && entry.value == PersistedValue::Int(100) }));
+    assert!(events
+        .iter()
+        .any(|entry| { entry.field_name == "attempts" && entry.value == PersistedValue::Int(7) }));
 }
 
 #[test]
