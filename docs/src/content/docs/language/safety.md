@@ -8,7 +8,7 @@ import CapabilityDemo from '../../../components/animations/CapabilityDemo.astro'
 
 <CapabilityDemo />
 
-Nulang's capability system (inspired by Pony) prevents data races and use-after-free at compile time. There are seven capabilities:
+Nulang's capability system (inspired by Pony) prevents data races and use-after-free at compile time. There are eight capabilities:
 
 | Capability | Deny Read | Deny Write | Sendable | Description |
 |------------|-----------|------------|----------|-------------|
@@ -18,11 +18,12 @@ Nulang's capability system (inspired by Pony) prevents data races and use-after-
 | `val` | No | Yes | Yes | Immutable, shareable |
 | `box` | Yes | No | No | Read-only |
 | `tag` | Yes | Yes | Yes | Opaque, identity-only |
-| `lineariso` | Yes | Yes | Yes | Linear isolated (at-most-once use) |
+| `lineariso` | Yes | Yes | Yes | Linear isolated reference with consumption tracking |
+| `linear` | No | Yes | Yes | Immutable linear reference; remotely sendable |
 
 **Key guarantees**:
 
-- **No data races**: `lineariso`, `iso`, `val`, and `tag` are sendable between actors (the compiler also has an internal `linear` capability). Mutable `ref` and `trn` cannot cross actor boundaries.
+- **No data races**: `lineariso`, `linear`, `iso`, `val`, and `tag` are sendable between actors. Mutable `ref` and `trn` cannot cross actor boundaries.
 - **Compile-time only**: capabilities are erased at runtime. There is zero overhead for capability checks — they are proved by the type checker and then discarded.
 - **LinearIso enforcement**: `lineariso` is tracked per binding along every control-flow path. Sending or capturing a `lineariso` value consumes it; branch-merge analysis ensures at-most-once use conservatively.
 
