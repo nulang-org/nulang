@@ -728,6 +728,6 @@ mod tests {
         let received = actor.receive().expect("should receive a message");
         assert_eq!(received.behavior_id, 1);
         assert_eq!(received.sender, 99);
-        assert_eq!(*received.payload, vec![Value::int(42)]);
+        assert_eq!(received.payload.as_slice(), &[Value::int(42)]);
     }
 }
