@@ -1605,6 +1605,12 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Agent commitments and intentions — 2026-09-23
+- **The optional agent runtime now distinguishes desired state from accepted responsibility and selected execution plans** (`crates/nulang-ai-core/`): `Goal` remains the desired outcome, `Commitment` records an agent accepting responsibility for pursuing it, and `Intention` records the concrete ordered task plan selected for that commitment. These are library/runtime concepts, not new Nulang syntax.
+- **The local SQLite runtime persists commitment and intention lifecycles** (`crates/nulang-ai-local/`) and exposes them through `GoalGraph`; additive schema tables/indexes preserve existing goal/task rows, while serde defaults keep older serialized goal graphs readable.
+- **NLAP emits additive commitment/intention lifecycle events** for activation, completion, and fulfillment, and `nulang-ai-protocol` re-exports the new domain types. The local runtime test pins the goal → commitment → intention → tasks → completed intention → fulfilled commitment sequence.
+
+
 ### Atomic durable-transition storage contract — 2026-09-22
 - **Persistence backends now have a fail-closed atomic transition API** (Experimental, RFC 0022, `src/runtime/persistence.rs`). `DurableTransition` binds actor identity, activation epoch, sequence predecessor, command, snapshot, workflow/domain events, durable-effect records, and outbox messages to one canonical BLAKE3 digest. Unsupported backends return `Unsupported` rather than emulating atomicity with sequential writes. `MemoryStore` implements sequence/epoch fencing, idempotent exact retries, conflicting-retry rejection, and migration from existing legacy history.
 - **libSQL/SQLite commits durable transitions in one database transaction.** Additive transition/tail/event/effect/outbox tables preserve legacy readability while allowing multiple workflow/domain records at one logical sequence. The committed tail is compare-and-set under an IMMEDIATE transaction, so stale activations and sequence gaps fail before becoming visible. Rollback, stale-epoch, exact-retry, and legacy-history migration tests pin the no-sequential-fallback contract.
