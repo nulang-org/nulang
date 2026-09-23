@@ -3721,6 +3721,49 @@ fn test_fired_workflow_timer_retries_when_atomic_commit_fails() {
 }
 
 #[test]
+fn test_atomic_workflow_recovery_replays_metadata_older_than_latest_snapshot() {
+    let store = AtomicWorkflowTestStore::new();
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store.clone());
+
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "RecoveryMetadataWorkflow",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+
+    // These runtime metadata collections are not fields in ActorSnapshot.
+    // Commit another transition afterwards so both events are strictly older
+    // than the latest snapshot and therefore exercise full-journal replay.
+    rt.append_signal_received(actor_id, "approved", Some("yes".to_string()))
+        .unwrap();
+    rt.append_saga_compensated(actor_id, "reserve")
+        .unwrap();
+    rt.append_timer_set(actor_id, "later", 500).unwrap();
+
+    let latest_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(latest_snapshot.sequence, 4);
+
+    rt.actors.remove(&actor_id);
+    rt.recover_actor(actor_id).unwrap();
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(
+        actor.received_signals,
+        vec![("approved".to_string(), Some("yes".to_string()))],
+        "SignalReceived must survive a later co-committed snapshot"
+    );
+    assert!(
+        actor.compensated_steps.iter().any(|step| step == "reserve"),
+        "SagaCompensated must survive a later co-committed snapshot"
+    );
+}
+
+#[test]
 fn test_workflow_actor_step_event_and_checkpoint() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
