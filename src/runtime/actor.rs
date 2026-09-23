@@ -118,7 +118,7 @@ impl FlightRecorder {
     /// created by the runtime. Direct callers of `FlightRecorder::new` retain
     /// the historical always-enabled behavior.
     pub fn runtime_default(max_entries: usize) -> Self {
-        if runtime_flight_recorder_enabled() {
+        if cfg!(test) || runtime_flight_recorder_enabled() {
             Self::new(max_entries)
         } else {
             Self::new(0)
