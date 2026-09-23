@@ -1602,7 +1602,7 @@ everything before it is implicitly Experimental.
 ### Production release hardening — 2026-09-23
 - **Primary Rust build/test/check/bench commands in CI and tagged releases now resolve the checked-in dependency graph with `--locked`.** Tagged releases fail preflight when the Git tag, `Cargo.toml` version, and CLI `VERSION` disagree, and release checksum generation works on both GNU and macOS toolchains.
 - **Security disclosure policy is now explicit.** `SECURITY.md` documents private reporting, high-risk runtime/compiler surfaces, and the fact that entries in `.cargo/audit.toml` are accepted risks rather than an advisory-free dependency claim.
-- **Release/readiness documentation now matches the implementation.** The platform matrix is Linux x86_64/aarch64, macOS aarch64, and Windows x86_64; stale CRDT-recovery and launch-status claims were corrected.
+- **Release/readiness documentation now matches the implementation.** The platform matrix is Linux x86_64/aarch64, macOS aarch64, and Windows x86_64; stale CRDT-recovery, historical test-count, and launch-status claims were corrected. Release build jobs now use read-only repository permissions; only the publish job retains `contents: write`.
 
 ### Benchmark history branch isolation — 2026-09-23
 - **Regression-gated benchmark history no longer writes generated results directly to protected `main`** (`.github/workflows/ci.yml`). CI restores prior JSON history from `automation/benchmark-history`, uploads the current run as an artifact, and persists generated history only to that dedicated automation branch. This keeps protected-branch validation read-only while retaining rolling benchmark comparisons.
