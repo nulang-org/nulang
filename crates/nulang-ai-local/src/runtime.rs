@@ -689,31 +689,34 @@ mod tests {
             .unwrap()
     }
 
-    struct FailOnFlushWriter {
+    struct FailOnTerminalFlushWriter {
         bytes: Vec<u8>,
-        flushes: usize,
-        fail_on_flush: usize,
+        fail_next_flush: bool,
+        failed_once: bool,
     }
 
-    impl FailOnFlushWriter {
-        fn new(fail_on_flush: usize) -> Self {
+    impl FailOnTerminalFlushWriter {
+        fn new() -> Self {
             Self {
                 bytes: Vec::new(),
-                flushes: 0,
-                fail_on_flush,
+                fail_next_flush: false,
+                failed_once: false,
             }
         }
     }
 
-    impl std::io::Write for FailOnFlushWriter {
+    impl std::io::Write for FailOnTerminalFlushWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.bytes.extend_from_slice(buf);
+            if String::from_utf8_lossy(&self.bytes).contains("\"task_completed\"") {
+                self.fail_next_flush = true;
+            }
             Ok(buf.len())
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
-            self.flushes += 1;
-            if self.flushes == self.fail_on_flush {
+            if self.fail_next_flush && !self.failed_once {
+                self.failed_once = true;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "injected post-write flush failure",
@@ -835,11 +838,9 @@ mod tests {
         init_project(&tmp).unwrap();
         let mut rt = LocalRuntime::open(tmp.clone()).unwrap();
 
-        // Five direct events are flushed before the first terminal outbox event:
-        // goal_created, commitment_activated, intention_activated, task_created,
-        // and task_started. Fail the sixth flush after its bytes were written but
-        // before the outbox row can be acknowledged.
-        let mut failing = FailOnFlushWriter::new(6);
+        // Fail the flush immediately after the first durable terminal event was
+        // written, but before its outbox acknowledgement can be persisted.
+        let mut failing = FailOnTerminalFlushWriter::new();
         let err = rt
             .handle_user_message("ship feature X", &mut failing)
             .unwrap_err();
