@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Bounded JIT register marshaling — 2026-09-23
+- **JIT transitions now marshal only the compiler-known active register prefix for MIR-produced functions** (`src/vm.rs`) through reusable per-frame-depth boxed scratch. The active scratch Box is temporarily detached from `VM` during native execution, preserving the re-entry ownership boundary; actor/legacy bytecode without trustworthy local-count metadata keeps all 256 registers, and reserved direct-call register r254 remains explicit.
+
 ### Re-entrant JIT ownership boundary — 2026-09-23
 - **JIT preparation and native execution are now distinct backend phases** (`src/backends/mod.rs`, `src/jit/mod.rs`), so compilation and Tier-2 promotion finish before native code may call back into the interpreter.
 - **`VM::try_jit_execute` detaches the mutable JIT backend and raw-bit constant cache before native entry** (`src/vm.rs`). Re-entrant direct calls therefore see no VM-owned JIT backend to alias and execute nested frames in the interpreter.
