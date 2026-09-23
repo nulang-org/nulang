@@ -2523,7 +2523,8 @@ fn compute_jit_register_copy_lens(module: &CodeModule) -> Vec<u16> {
     // boundaries. A function's local-count metadata is valid only until the
     // next such boundary; behavior frames deliberately fall back to the full
     // register file because they do not yet carry equivalent local-count data.
-    let mut boundaries = Vec::with_capacity(module.function_table.len() + module.behaviors.len() + 1);
+    let mut boundaries =
+        Vec::with_capacity(module.function_table.len() + module.behaviors.len() + 1);
     boundaries.extend(module.function_table.iter().copied());
     boundaries.extend(module.behaviors.iter().map(|b| b.code_offset));
     boundaries.push(len);
@@ -3727,8 +3728,7 @@ impl VM {
                 *dst = unsafe { Value::from_bits(*bits) };
             }
             if copy_len <= 254 {
-                self.frames[frame_idx].regs[254] =
-                    unsafe { Value::from_bits(regs[254]) };
+                self.frames[frame_idx].regs[254] = unsafe { Value::from_bits(regs[254]) };
             }
 
             // A re-entrant callee raised a runtime error (e.g. step-limit
