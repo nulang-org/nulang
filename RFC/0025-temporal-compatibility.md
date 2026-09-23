@@ -152,6 +152,18 @@ Internally, Nulang remains free to recover from snapshots, transition journals,
 event-sourced state, or other future mechanisms as long as the adapter can
 produce behavior compatible with the supported Temporal surface.
 
+## Adapter contract versioning
+
+Managed adapters consume a small semantic compatibility contract rather than
+depending on Nulang compiler/runtime internals. The contract exposes
+`TEMPORAL_COMPATIBILITY_CONTRACT_VERSION`, initially version 1.
+
+Cloud or another managed gateway must compare its expected contract version
+with the runtime-provided version before accepting Temporal work. An
+incompatible change to adapter identity, replay, command planning, or durable
+effect semantics increments this version independently from Nulang artifact
+formats and independently from Temporal's upstream API version.
+
 ## Compatibility phases
 
 ### Phase 0 — semantic adapter
