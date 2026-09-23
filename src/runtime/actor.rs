@@ -46,6 +46,19 @@ pub enum ActorPriority {
     Low,
 }
 
+/// Scheduler ownership state for an actor.
+///
+/// This state is owned by the actor's runtime shard. Cross-shard producers
+/// enter through the destination shard's ingress path, so ordinary local
+/// scheduling does not need an atomic scheduled flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActorRunState {
+    #[default]
+    Idle,
+    Queued,
+    Running,
+}
+
 // -- Flight recorder (deterministic replay support) ---------------------
 
 /// A single entry in an actor's flight-recorder trace.  Captures enough
@@ -221,6 +234,8 @@ pub struct Actor {
     pub trap_exits: bool,    // If true, exit signals become messages instead of killing this actor
     /// Scheduling priority, consulted by the scheduler on every enqueue.
     pub priority: ActorPriority,
+    /// Idle/queued/running ownership used to deduplicate ready-queue entries.
+    pub run_state: ActorRunState,
     pub reduction_count: u32, // Lifetime messages handled (monotonic progress metric)
     turn_reductions: u32,     // Messages handled in the current scheduling turn
     pub max_reductions: u32,  // Max reductions per turn before yield (preemption)
@@ -361,6 +376,7 @@ impl Actor {
             links: Vec::new(),
             trap_exits: false,
             priority: ActorPriority::Normal,
+            run_state: ActorRunState::Idle,
             jit_safepoint_counter: crate::backends::JIT_SAFEPOINT_BUDGET,
             jit_yield_pending: false,
             reduction_count: 0,
