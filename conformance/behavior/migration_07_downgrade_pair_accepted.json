@@ -1,1 +1,1 @@
-{ "exit_code": 0, "stdout": "0", "proves": "RFC 0008 requires `W == V + 1` ('migration from V to W'); the real compiler silently accepts a downgrade pair `migration from 2 to 1` on a version-2 entity and runs normally. The W == V + 1 rule is not enforced anywhere in the compiler." }
+{ "exit_code": 4, "stdout": "", "stderr": "Error: Type error", "proves": "RFC 0008 migration pairs now enforce W == V + 1, so downgrade migrations such as 2 -> 1 are rejected at compile time." }

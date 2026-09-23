@@ -32,6 +32,45 @@ fn compile_err(msg: impl Into<String>, span: Span) -> NuError {
     }
 }
 
+/// Serialize the replay-relevant shape of RFC 0008 migration contracts into
+/// actor metadata. Migration bodies remain compiler IR, but runtime/tooling
+/// must at least retain the version topology and event surface instead of
+/// silently dropping every contract at the HIR -> MIR boundary.
+fn serialize_migration_metadata(migrations: &[crate::ast::MigrationDecl]) -> String {
+    let mut ordered: Vec<_> = migrations.iter().collect();
+    ordered.sort_by_key(|migration| migration.from_version);
+
+    let metadata: Vec<_> = ordered
+        .into_iter()
+        .map(|migration| {
+            let mut event_handlers: Vec<_> = migration
+                .event_migrations
+                .iter()
+                .map(|(name, params, _body)| (name.as_str(), params.len()))
+                .collect();
+            event_handlers.sort_unstable();
+
+            let events: Vec<_> = event_handlers
+                .into_iter()
+                .map(|(name, arity)| {
+                    serde_json::json!({
+                        "name": name,
+                        "arity": arity,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "from": migration.from_version,
+                "to": migration.to_version,
+                "state": migration.state_body.is_some(),
+                "events": events,
+            })
+        })
+        .collect();
+
+    serde_json::to_string(&metadata).expect("migration metadata is JSON-serializable")
+}
+
 pub fn lower_module(hir: &hir::Module) -> NuResult<mir::Module> {
     let mut ctx = ModuleCtx::new(&hir.name);
 
@@ -149,7 +188,7 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                 retry_config: a.retry_config.clone(),
                 type_hash: None,
                 version: a.version,
-                migrations: String::new(),
+                migrations: serialize_migration_metadata(&a.migrations),
             });
         }
         hir::Decl::Workflow { name, .. } => {
@@ -2878,6 +2917,38 @@ mod tests {
             .iter()
             .find(|f| f.name == name)
             .unwrap_or_else(|| panic!("function '{}' not lowered", name))
+    }
+
+    #[test]
+    fn test_entity_migration_metadata_survives_into_mir() {
+        let module = lower_source(
+            r#"
+            entity Counter {
+                version: 2
+                state count: Int = 0
+                behavior get() { self.count }
+                migration from 1 to 2 {
+                    state => { 0 }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let meta = module
+            .actor_metadata
+            .iter()
+            .find(|meta| meta.name == "Counter")
+            .expect("Counter actor metadata");
+        assert_eq!(meta.version, 2);
+
+        let migrations: serde_json::Value =
+            serde_json::from_str(&meta.migrations).expect("migration metadata JSON");
+        let steps = migrations.as_array().expect("migration metadata array");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0]["from"].as_u64(), Some(1));
+        assert_eq!(steps[0]["to"].as_u64(), Some(2));
+        assert_eq!(steps[0]["state"].as_bool(), Some(true));
     }
 
     #[test]

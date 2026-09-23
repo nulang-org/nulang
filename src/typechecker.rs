@@ -1636,6 +1636,7 @@ impl TypeChecker {
                 state_fields,
                 behaviors,
                 events,
+                version,
                 migrations,
                 span,
                 ..
@@ -1645,6 +1646,7 @@ impl TypeChecker {
                 state_fields,
                 behaviors,
                 events,
+                *version,
                 migrations,
                 *span,
             ),
@@ -3603,9 +3605,70 @@ impl TypeChecker {
         state_fields: &[(String, crate::ast::StateModel, Type, Expr)],
         behaviors: &[Behavior],
         events: &[crate::ast::EventDecl],
+        version: u32,
         migrations: &[crate::ast::MigrationDecl],
-        _span: Span,
+        span: Span,
     ) -> NuResult<(Substitution, Type)> {
+        // RFC 0008: durable schema evolution must be explicit and contiguous.
+        // Reject malformed migration graphs before any body is typechecked so
+        // every later compiler/runtime stage can rely on a canonical 1->N chain.
+        if version == 0 {
+            return Err(NuError::type_error(
+                format!(
+                    "entity '{}' schema version must be a positive integer",
+                    name
+                ),
+                span,
+            ));
+        }
+
+        let mut migration_from_versions = HashSet::new();
+        for migration in migrations {
+            let expected_to = migration.from_version.checked_add(1);
+            if migration.from_version == 0 || expected_to != Some(migration.to_version) {
+                return Err(NuError::type_error(
+                    format!(
+                        "entity '{}' migration must advance exactly one schema version; found {} -> {}",
+                        name, migration.from_version, migration.to_version
+                    ),
+                    migration.span,
+                ));
+            }
+            if migration.to_version > version {
+                return Err(NuError::type_error(
+                    format!(
+                        "entity '{}' migration {} -> {} targets schema version beyond current version {}",
+                        name, migration.from_version, migration.to_version, version
+                    ),
+                    migration.span,
+                ));
+            }
+            if !migration_from_versions.insert(migration.from_version) {
+                return Err(NuError::type_error(
+                    format!(
+                        "entity '{}' declares more than one migration from schema version {}",
+                        name, migration.from_version
+                    ),
+                    migration.span,
+                ));
+            }
+        }
+
+        for from_version in 1..version {
+            if !migration_from_versions.contains(&from_version) {
+                return Err(NuError::type_error(
+                    format!(
+                        "entity '{}' is missing migration {} -> {} required for schema version {}",
+                        name,
+                        from_version,
+                        from_version + 1,
+                        version
+                    ),
+                    span,
+                ));
+            }
+        }
+
         // The actor's own name must be in scope inside its behaviors so an
         // actor can `spawn`/`send`/`ask` its own type (recursive actor graphs,
         // e.g. skynet). A placeholder `Type::Actor` suffices: spawn/send/ask
@@ -5852,5 +5915,116 @@ mod tests {
         let expr = bin(BinOp::Range, int_lit(0), string_lit("hello"));
         let result = tc.infer_expr(&TypeContext::new(), &expr);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn migration_chain_accepts_contiguous_steps_to_current_version() {
+        let mut tc = TypeChecker::new();
+        let ctx = TypeContext::new();
+        let migrations = vec![
+            MigrationDecl {
+                from_version: 1,
+                to_version: 2,
+                state_body: None,
+                event_migrations: vec![],
+                span: sp(),
+            },
+            MigrationDecl {
+                from_version: 2,
+                to_version: 3,
+                state_body: None,
+                event_migrations: vec![],
+                span: sp(),
+            },
+        ];
+
+        assert!(tc
+            .infer_actor_decl(&ctx, "Account", &[], &[], &[], 3, &migrations, sp())
+            .is_ok());
+    }
+
+    #[test]
+    fn migration_chain_rejects_gaps_and_non_adjacent_steps() {
+        let mut tc = TypeChecker::new();
+        let ctx = TypeContext::new();
+        let gap = vec![MigrationDecl {
+            from_version: 1,
+            to_version: 2,
+            state_body: None,
+            event_migrations: vec![],
+            span: sp(),
+        }];
+        let err = tc
+            .infer_actor_decl(&ctx, "Account", &[], &[], &[], 3, &gap, sp())
+            .unwrap_err();
+        assert!(err.to_string().contains("missing migration 2 -> 3"));
+
+        let skipped = vec![MigrationDecl {
+            from_version: 1,
+            to_version: 3,
+            state_body: None,
+            event_migrations: vec![],
+            span: sp(),
+        }];
+        let err = tc
+            .infer_actor_decl(&ctx, "Account", &[], &[], &[], 3, &skipped, sp())
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("migration must advance exactly one schema version"));
+    }
+
+    #[test]
+    fn migration_chain_rejects_downgrades_duplicates_and_future_targets() {
+        let mut tc = TypeChecker::new();
+        let ctx = TypeContext::new();
+
+        let downgrade = vec![MigrationDecl {
+            from_version: 2,
+            to_version: 1,
+            state_body: None,
+            event_migrations: vec![],
+            span: sp(),
+        }];
+        assert!(tc
+            .infer_actor_decl(&ctx, "Account", &[], &[], &[], 2, &downgrade, sp())
+            .unwrap_err()
+            .to_string()
+            .contains("migration must advance exactly one schema version"));
+
+        let duplicates = vec![
+            MigrationDecl {
+                from_version: 1,
+                to_version: 2,
+                state_body: None,
+                event_migrations: vec![],
+                span: sp(),
+            },
+            MigrationDecl {
+                from_version: 1,
+                to_version: 2,
+                state_body: None,
+                event_migrations: vec![],
+                span: sp(),
+            },
+        ];
+        assert!(tc
+            .infer_actor_decl(&ctx, "Account", &[], &[], &[], 2, &duplicates, sp())
+            .unwrap_err()
+            .to_string()
+            .contains("more than one migration from schema version 1"));
+
+        let future = vec![MigrationDecl {
+            from_version: 1,
+            to_version: 2,
+            state_body: None,
+            event_migrations: vec![],
+            span: sp(),
+        }];
+        assert!(tc
+            .infer_actor_decl(&ctx, "Account", &[], &[], &[], 1, &future, sp())
+            .unwrap_err()
+            .to_string()
+            .contains("targets schema version beyond current version 1"));
     }
 }
