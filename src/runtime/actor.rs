@@ -19,8 +19,9 @@ pub enum ActorState {
 /// Scheduling priority of an actor (Erlang-style process priority).
 ///
 /// The scheduler dequeues ready High-priority actors before Normal, and
-/// Normal before Low (strict per-level preference, FIFO within a level —
-/// see `Scheduler::enqueue_with_priority`). Priority affects scheduling
+/// Normal before Low (strict per-level preference). Ordering within one
+/// priority level is unspecified because work-stealing queues may reorder
+/// equal-priority ready tokens. Priority affects scheduling
 /// order only; it does not touch message delivery order
 /// (`Mailbox::receive_match` stays FIFO and ignores `Message::priority`).
 /// Set from Nulang via `perform Actor.set_priority(0|1|2)`.
