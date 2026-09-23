@@ -78,13 +78,13 @@ fn bench_jit_hot_loop(c: &mut Criterion) {
     });
 }
 
-/// A hot loop that calls a function each iteration. `Call`/`TailCall` are not
-/// in the JIT compilable opcode set, so `find_compilable_region` fragments at
-/// the call: the loop's arithmetic around the call is JIT-compiled, but the
-/// call itself (frame push + dispatch) is interpreted every iteration. This
-/// quantifies the real-world JIT gap for call-heavy loops — the largest
-/// remaining coverage hole — against the pure-interpreter `interp/function_call`
-/// baseline and the no-call `jit/hot_loop_warm` ceiling.
+/// A hot loop that calls a tiny straight-line function each iteration.
+///
+/// Direct, non-suspending calls fold into the caller region. Eligible
+/// straight-line leaves compile as native-to-native thunks; branchy or otherwise
+/// ineligible callees use the re-entrant interpreter helper. This benchmark is
+/// the steady-state signal for the native-leaf fast path against the identical
+/// JIT-disabled interpreter baseline.
 fn bench_jit_function_call_loop(c: &mut Criterion) {
     let source = "fn add(x: Int, y: Int) -> Int { x + y }; var sum = 0; var i = 0; while i < 100000 { sum = add(sum, i); i = i + 1; }; sum";
     let module = compile(source);
