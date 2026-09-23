@@ -85,6 +85,7 @@ fn bench_message_enqueue(c: &mut Criterion) {
     let mut group = c.benchmark_group("actor/message_enqueue");
     group.throughput(Throughput::Elements(MESSAGE_BATCH as u64));
 
+    // Preserve the existing benchmark name for rolling-history continuity.
     group.bench_function("100", |b| {
         b.iter_batched(
             runtime_with_consumer,
@@ -92,6 +93,23 @@ fn bench_message_enqueue(c: &mut Criterion) {
                 let msg = Value::int(1);
                 for _ in 0..MESSAGE_BATCH {
                     rt.send_message(actor_id, "handle", &[msg]);
+                }
+                black_box(rt);
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    // Compiler-generated sends already carry numeric behavior ids. Keep a
+    // separate signal for the scheduler/mailbox hot path without behavior-name
+    // lookup so ready-token dedup is measurable independently.
+    group.bench_function("by_id_100", |b| {
+        b.iter_batched(
+            runtime_with_consumer,
+            |(mut rt, actor_id)| {
+                let msg = Value::int(1);
+                for _ in 0..MESSAGE_BATCH {
+                    rt.send_message_by_id(actor_id, 0, &[msg]);
                 }
                 black_box(rt);
             },
