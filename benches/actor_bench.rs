@@ -82,13 +82,33 @@ fn bench_message_enqueue(c: &mut Criterion) {
     // Numeric behavior ids are what compiler-generated Send opcodes already
     // carry. Keep this separate from name resolution so runtime hot-path
     // improvements are visible instead of being hidden by benchmark setup.
-    group.bench_function("by_id_100", |b| {
+    group.bench_function("by_id_inline_1arg_100", |b| {
         b.iter_batched(
             runtime_with_consumer,
             |(mut rt, actor_id)| {
                 let msg = Value::int(1);
                 for _ in 0..MESSAGE_BATCH {
                     rt.send_message_by_id(actor_id, 0, &[msg]);
+                }
+                black_box(rt);
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.bench_function("by_id_shared_5arg_100", |b| {
+        b.iter_batched(
+            runtime_with_consumer,
+            |(mut rt, actor_id)| {
+                let args = [
+                    Value::int(1),
+                    Value::int(2),
+                    Value::int(3),
+                    Value::int(4),
+                    Value::int(5),
+                ];
+                for _ in 0..MESSAGE_BATCH {
+                    rt.send_message_by_id(actor_id, 0, &args);
                 }
                 black_box(rt);
             },
