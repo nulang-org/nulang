@@ -5,7 +5,7 @@ use nulang_ai_core::{
     Commitment, CommitmentStatus, ConversationState, Goal, GoalGraph, GoalStatus, Intention,
     IntentionRevision, IntentionRevisionDecision, IntentionStatus, ManagerKind, Task, TaskStatus,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
@@ -22,6 +22,17 @@ pub enum StoreError {
     GoalNotFound(Uuid),
     #[error("conversation not found: {0}")]
     ConversationNotFound(Uuid),
+    #[error("invalid agent state transition: {0}")]
+    InvalidTransition(&'static str),
+}
+
+pub struct AgentStateTransition<'a> {
+    pub terminal_task: Option<&'a Task>,
+    pub intention: &'a Intention,
+    pub replacement_intention: Option<&'a Intention>,
+    pub revision: Option<&'a IntentionRevision>,
+    pub commitment: Option<&'a Commitment>,
+    pub goal: Option<&'a Goal>,
 }
 
 pub struct SqliteStore {
@@ -129,127 +140,22 @@ impl SqliteStore {
 
     pub fn upsert_goal(&self, goal: &Goal) -> Result<(), StoreError> {
         let conn = Connection::open(&self.path)?;
-        conn.execute(
-            r#"INSERT INTO goals (
-                id, project_id, conversation_id, intent, desired_state, constraints_json,
-                success_criteria, budget_usd, deadline, status, created_at, updated_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
-            ON CONFLICT(id) DO UPDATE SET
-                intent=excluded.intent,
-                desired_state=excluded.desired_state,
-                constraints_json=excluded.constraints_json,
-                success_criteria=excluded.success_criteria,
-                budget_usd=excluded.budget_usd,
-                deadline=excluded.deadline,
-                status=excluded.status,
-                updated_at=excluded.updated_at
-            "#,
-            params![
-                goal.id.to_string(),
-                goal.project_id,
-                goal.conversation_id.map(|u| u.to_string()),
-                goal.intent,
-                goal.desired_state.to_string(),
-                goal.constraints.to_string(),
-                serde_json::to_string(&goal.success_criteria)?,
-                goal.budget_usd,
-                goal.deadline.map(|d| d.to_rfc3339()),
-                goal_status_str(&goal.status),
-                goal.created_at.to_rfc3339(),
-                goal.updated_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
+        upsert_goal_conn(&conn, goal)
     }
 
     pub fn upsert_task(&self, task: &Task) -> Result<(), StoreError> {
         let conn = Connection::open(&self.path)?;
-        conn.execute(
-            r#"INSERT INTO tasks (
-                id, goal_id, parent_task_id, manager, description, dependencies,
-                required_capabilities, acceptance_criteria, budget_usd, timeout_secs,
-                status, assigned_agent_id, created_at, updated_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
-            ON CONFLICT(id) DO UPDATE SET
-                description=excluded.description,
-                status=excluded.status,
-                assigned_agent_id=excluded.assigned_agent_id,
-                updated_at=excluded.updated_at
-            "#,
-            params![
-                task.id.to_string(),
-                task.goal_id.to_string(),
-                task.parent_task_id.map(|u| u.to_string()),
-                manager_kind_str(&task.manager),
-                task.description,
-                serde_json::to_string(&task.dependencies)?,
-                serde_json::to_string(&task.required_capabilities)?,
-                serde_json::to_string(&task.acceptance_criteria)?,
-                task.budget_usd,
-                task.timeout.as_secs() as i64,
-                task_status_str(&task.status),
-                task.assigned_agent_id,
-                task.created_at.to_rfc3339(),
-                task.updated_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
+        upsert_task_conn(&conn, task)
     }
 
     pub fn upsert_commitment(&self, commitment: &Commitment) -> Result<(), StoreError> {
         let conn = Connection::open(&self.path)?;
-        conn.execute(
-            r#"INSERT INTO commitments (
-                id, goal_id, owner_agent_id, rationale, success_criteria, status, created_at, updated_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-            ON CONFLICT(id) DO UPDATE SET
-                owner_agent_id=excluded.owner_agent_id,
-                rationale=excluded.rationale,
-                success_criteria=excluded.success_criteria,
-                status=excluded.status,
-                updated_at=excluded.updated_at
-            "#,
-            params![
-                commitment.id.to_string(),
-                commitment.goal_id.to_string(),
-                commitment.owner_agent_id,
-                commitment.rationale,
-                serde_json::to_string(&commitment.success_criteria)?,
-                commitment_status_str(&commitment.status),
-                commitment.created_at.to_rfc3339(),
-                commitment.updated_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
+        upsert_commitment_conn(&conn, commitment)
     }
 
     pub fn upsert_intention(&self, intention: &Intention) -> Result<(), StoreError> {
         let conn = Connection::open(&self.path)?;
-        conn.execute(
-            r#"INSERT INTO intentions (
-                id, goal_id, commitment_id, owner_agent_id, description, planned_task_ids,
-                status, created_at, updated_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
-            ON CONFLICT(id) DO UPDATE SET
-                owner_agent_id=excluded.owner_agent_id,
-                description=excluded.description,
-                planned_task_ids=excluded.planned_task_ids,
-                status=excluded.status,
-                updated_at=excluded.updated_at
-            "#,
-            params![
-                intention.id.to_string(),
-                intention.goal_id.to_string(),
-                intention.commitment_id.to_string(),
-                intention.owner_agent_id,
-                intention.description,
-                serde_json::to_string(&intention.planned_task_ids)?,
-                intention_status_str(&intention.status),
-                intention.created_at.to_rfc3339(),
-                intention.updated_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
+        upsert_intention_conn(&conn, intention)
     }
 
     pub fn insert_intention_revision(
@@ -257,26 +163,36 @@ impl SqliteStore {
         revision: &IntentionRevision,
     ) -> Result<(), StoreError> {
         let conn = Connection::open(&self.path)?;
-        conn.execute(
-            r#"INSERT INTO intention_revisions (
-                id, goal_id, commitment_id, superseded_intention_id, replacement_intention_id,
-                trigger_task_id, trigger_status, decision, reason, created_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
-            ON CONFLICT(id) DO NOTHING
-            "#,
-            params![
-                revision.id.to_string(),
-                revision.goal_id.to_string(),
-                revision.commitment_id.to_string(),
-                revision.superseded_intention_id.to_string(),
-                revision.replacement_intention_id.map(|u| u.to_string()),
-                revision.trigger_task_id.to_string(),
-                task_status_str(&revision.trigger_status),
-                revision_decision_str(&revision.decision),
-                revision.reason,
-                revision.created_at.to_rfc3339(),
-            ],
-        )?;
+        insert_intention_revision_conn(&conn, revision)
+    }
+
+    pub fn commit_agent_state_transition(
+        &self,
+        transition: AgentStateTransition<'_>,
+    ) -> Result<(), StoreError> {
+        validate_agent_state_transition(&transition)?;
+
+        let mut conn = Connection::open(&self.path)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if let Some(task) = transition.terminal_task {
+            upsert_task_conn(&tx, task)?;
+        }
+        upsert_intention_conn(&tx, transition.intention)?;
+        if let Some(replacement) = transition.replacement_intention {
+            upsert_intention_conn(&tx, replacement)?;
+        }
+        if let Some(revision) = transition.revision {
+            insert_intention_revision_conn(&tx, revision)?;
+        }
+        if let Some(commitment) = transition.commitment {
+            upsert_commitment_conn(&tx, commitment)?;
+        }
+        if let Some(goal) = transition.goal {
+            upsert_goal_conn(&tx, goal)?;
+        }
+
+        tx.commit()?;
         Ok(())
     }
 
@@ -513,6 +429,224 @@ impl SqliteStore {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
+}
+
+fn validate_agent_state_transition(
+    transition: &AgentStateTransition<'_>,
+) -> Result<(), StoreError> {
+    let intention = transition.intention;
+
+    if let Some(task) = transition.terminal_task {
+        if task.goal_id != intention.goal_id {
+            return Err(StoreError::InvalidTransition(
+                "terminal task and intention belong to different goals",
+            ));
+        }
+        if !intention.planned_task_ids.contains(&task.id) {
+            return Err(StoreError::InvalidTransition(
+                "terminal task is not part of the intention plan",
+            ));
+        }
+    }
+
+    if let Some(revision) = transition.revision {
+        if revision.goal_id != intention.goal_id
+            || revision.commitment_id != intention.commitment_id
+            || revision.superseded_intention_id != intention.id
+        {
+            return Err(StoreError::InvalidTransition(
+                "revision does not describe the supplied intention",
+            ));
+        }
+
+        if let Some(replacement) = transition.replacement_intention {
+            if replacement.goal_id != intention.goal_id
+                || replacement.commitment_id != intention.commitment_id
+                || revision.replacement_intention_id != Some(replacement.id)
+            {
+                return Err(StoreError::InvalidTransition(
+                    "replacement intention does not match the revision",
+                ));
+            }
+        } else if revision.replacement_intention_id.is_some() {
+            return Err(StoreError::InvalidTransition(
+                "revision names a replacement intention that was not supplied",
+            ));
+        }
+    } else if transition.replacement_intention.is_some() {
+        return Err(StoreError::InvalidTransition(
+            "replacement intention requires a revision record",
+        ));
+    }
+
+    if let Some(commitment) = transition.commitment {
+        if commitment.id != intention.commitment_id || commitment.goal_id != intention.goal_id {
+            return Err(StoreError::InvalidTransition(
+                "commitment does not match the intention",
+            ));
+        }
+    }
+
+    if let Some(goal) = transition.goal {
+        if goal.id != intention.goal_id {
+            return Err(StoreError::InvalidTransition(
+                "goal does not match the intention",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn upsert_goal_conn(conn: &Connection, goal: &Goal) -> Result<(), StoreError> {
+    conn.execute(
+        r#"INSERT INTO goals (
+            id, project_id, conversation_id, intent, desired_state, constraints_json,
+            success_criteria, budget_usd, deadline, status, created_at, updated_at
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+        ON CONFLICT(id) DO UPDATE SET
+            intent=excluded.intent,
+            desired_state=excluded.desired_state,
+            constraints_json=excluded.constraints_json,
+            success_criteria=excluded.success_criteria,
+            budget_usd=excluded.budget_usd,
+            deadline=excluded.deadline,
+            status=excluded.status,
+            updated_at=excluded.updated_at
+        "#,
+        params![
+            goal.id.to_string(),
+            goal.project_id,
+            goal.conversation_id.map(|u| u.to_string()),
+            goal.intent,
+            goal.desired_state.to_string(),
+            goal.constraints.to_string(),
+            serde_json::to_string(&goal.success_criteria)?,
+            goal.budget_usd,
+            goal.deadline.map(|d| d.to_rfc3339()),
+            goal_status_str(&goal.status),
+            goal.created_at.to_rfc3339(),
+            goal.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_task_conn(conn: &Connection, task: &Task) -> Result<(), StoreError> {
+    conn.execute(
+        r#"INSERT INTO tasks (
+            id, goal_id, parent_task_id, manager, description, dependencies,
+            required_capabilities, acceptance_criteria, budget_usd, timeout_secs,
+            status, assigned_agent_id, created_at, updated_at
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+        ON CONFLICT(id) DO UPDATE SET
+            description=excluded.description,
+            status=excluded.status,
+            assigned_agent_id=excluded.assigned_agent_id,
+            updated_at=excluded.updated_at
+        "#,
+        params![
+            task.id.to_string(),
+            task.goal_id.to_string(),
+            task.parent_task_id.map(|u| u.to_string()),
+            manager_kind_str(&task.manager),
+            task.description,
+            serde_json::to_string(&task.dependencies)?,
+            serde_json::to_string(&task.required_capabilities)?,
+            serde_json::to_string(&task.acceptance_criteria)?,
+            task.budget_usd,
+            task.timeout.as_secs() as i64,
+            task_status_str(&task.status),
+            task.assigned_agent_id,
+            task.created_at.to_rfc3339(),
+            task.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_commitment_conn(
+    conn: &Connection,
+    commitment: &Commitment,
+) -> Result<(), StoreError> {
+    conn.execute(
+        r#"INSERT INTO commitments (
+            id, goal_id, owner_agent_id, rationale, success_criteria, status, created_at, updated_at
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+        ON CONFLICT(id) DO UPDATE SET
+            owner_agent_id=excluded.owner_agent_id,
+            rationale=excluded.rationale,
+            success_criteria=excluded.success_criteria,
+            status=excluded.status,
+            updated_at=excluded.updated_at
+        "#,
+        params![
+            commitment.id.to_string(),
+            commitment.goal_id.to_string(),
+            commitment.owner_agent_id,
+            commitment.rationale,
+            serde_json::to_string(&commitment.success_criteria)?,
+            commitment_status_str(&commitment.status),
+            commitment.created_at.to_rfc3339(),
+            commitment.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_intention_conn(conn: &Connection, intention: &Intention) -> Result<(), StoreError> {
+    conn.execute(
+        r#"INSERT INTO intentions (
+            id, goal_id, commitment_id, owner_agent_id, description, planned_task_ids,
+            status, created_at, updated_at
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+        ON CONFLICT(id) DO UPDATE SET
+            owner_agent_id=excluded.owner_agent_id,
+            description=excluded.description,
+            planned_task_ids=excluded.planned_task_ids,
+            status=excluded.status,
+            updated_at=excluded.updated_at
+        "#,
+        params![
+            intention.id.to_string(),
+            intention.goal_id.to_string(),
+            intention.commitment_id.to_string(),
+            intention.owner_agent_id,
+            intention.description,
+            serde_json::to_string(&intention.planned_task_ids)?,
+            intention_status_str(&intention.status),
+            intention.created_at.to_rfc3339(),
+            intention.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_intention_revision_conn(
+    conn: &Connection,
+    revision: &IntentionRevision,
+) -> Result<(), StoreError> {
+    conn.execute(
+        r#"INSERT INTO intention_revisions (
+            id, goal_id, commitment_id, superseded_intention_id, replacement_intention_id,
+            trigger_task_id, trigger_status, decision, reason, created_at
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+        ON CONFLICT(id) DO NOTHING
+        "#,
+        params![
+            revision.id.to_string(),
+            revision.goal_id.to_string(),
+            revision.commitment_id.to_string(),
+            revision.superseded_intention_id.to_string(),
+            revision.replacement_intention_id.map(|u| u.to_string()),
+            revision.trigger_task_id.to_string(),
+            task_status_str(&revision.trigger_status),
+            revision_decision_str(&revision.decision),
+            revision.reason,
+            revision.created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
 }
 
 fn parse_ts(raw: String) -> DateTime<Utc> {
