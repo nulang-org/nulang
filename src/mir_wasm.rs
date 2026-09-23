@@ -1107,10 +1107,9 @@ impl WasmBackend {
                 }));
                 body.instruction(&Instruction::End);
             }
-            Stmt::Emit { .. } => {
-                // Effect and actor-state statements without a WASM
-                // counterpart stay no-ops until the corresponding runtime
-                // machinery is implemented.
+            Stmt::Emit { .. } | Stmt::ParallelMarker { .. } => {
+                // Effect statements without a WASM counterpart and
+                // structured-concurrency metadata remain runtime no-ops.
                 body.instruction(&Instruction::I64Const(value_layout::TAG_NIL as i64));
                 body.instruction(&Instruction::Drop);
             }
