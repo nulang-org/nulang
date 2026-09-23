@@ -53,10 +53,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 /// before it becomes eligible for JIT compilation.
 pub const HOT_THRESHOLD: u64 = 1000;
 
-/// Threshold for tier-2 recompilation: after an already-compiled region
-/// has been executed this many additional times, a more aggressive
-/// compilation strategy is attempted (typed path if not already typed,
-/// or SIMD if the region is amenable).
+/// Threshold for the single Tier-2 specialization attempt after a compiled
+/// typed region has executed this many additional times. Tier-2 currently
+/// tests SIMD specialization once, then marks the region terminal so steady
+/// state native entries stop paying promotion bookkeeping.
 pub const TIER2_THRESHOLD: u64 = 10_000;
 
 /// Minimum length for a STRAIGHT-LINE region (no internal loop back-edge) to
