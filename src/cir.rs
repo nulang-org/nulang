@@ -170,7 +170,8 @@ pub enum CirTerminator {
 pub enum EffectKind {
     /// Non-blocking send to actor mailbox: RValue::Send
     ActorSend,
-    /// Blocking dequeue: RValue::ReceiveWait, ReceiveMatch
+    /// Blocking/timed mailbox wait: RValue::ReceiveWait.
+    /// Plain ReceiveMatch is non-blocking and does not use this effect.
     MailboxDequeue,
     /// RValue::SignalWait
     SignalWait,
