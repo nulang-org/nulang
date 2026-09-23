@@ -5091,9 +5091,9 @@ impl Runtime {
 
     /// Recover a persistent actor from the latest snapshot and replay the journal.
     ///
-    /// For workflow actors the durable workflow event journal is replayed
-    /// instead of the message journal, restoring the current step index and
-    /// any other state captured in workflow events.
+    /// For workflow actors, durable workflow metadata is rebuilt from the
+    /// workflow-event journal and atomically accepted commands newer than the
+    /// latest snapshot are replayed from the message journal.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
         let authority_manifest =
@@ -5303,6 +5303,43 @@ impl Runtime {
                     actor.sequence = event.sequence();
                 }
             }
+            // A workflow command is committed before its handler executes. If
+            // the process dies after that acceptance commit but before the
+            // handler completes, its sequence is newer than the latest
+            // snapshot. Replay exactly those accepted commands here without
+            // going through normal mailbox dispatch, which would journal them
+            // a second time and advance the durable tail again.
+            let accepted_commands: Vec<_> = self
+                .persistence
+                .read_journal(actor_id)
+                .into_iter()
+                .filter(|entry| entry.sequence > snapshot.sequence)
+                .collect();
+            for entry in accepted_commands {
+                let behavior_idx = entry.behavior_id as usize;
+                let payload: Vec<Value> =
+                    entry.payload.iter().map(|value| value.to_value()).collect();
+
+                if self.has_native_handler(actor_id, behavior_idx) {
+                    let handler = self
+                        .actors
+                        .get(&actor_id)
+                        .and_then(|actor| actor.behavior_table.get(behavior_idx))
+                        .map(|behavior| behavior.handler_fn)?;
+                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+                        handler(actor, &payload);
+                        actor.sequence = entry.sequence;
+                    }
+                } else if self.has_bytecode_handler(actor_id, behavior_idx) {
+                    self.current_actor = Some(actor_id);
+                    let _ = self.run_bytecode_behavior(actor_id, behavior_idx, &payload);
+                    self.current_actor = None;
+                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+                        actor.sequence = entry.sequence;
+                    }
+                }
+            }
+
             // Re-arm timers that were set before the snapshot/replay but have
             // not yet fired. Timers are reconstructed from the full durable
             // journal, not just events after the snapshot, because snapshots do
