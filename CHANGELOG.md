@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### RFC 0008 migration compatibility substrate — 2026-09-23
+- **Entity migration graphs are now validated before lowering** (`src/typechecker.rs`). Schema versions must be positive; migration steps must advance exactly one version, cannot duplicate an origin or target beyond the current schema, and must form a complete 1→current chain. Invalid skipped-version and downgrade conformance cases now fail compilation instead of silently running.
+- **Migration compatibility metadata now survives HIR→MIR lowering** (`src/mir_lower.rs`, `src/bytecode.rs`) instead of being replaced with an empty `ActorMeta.migrations` payload.
+- **Typed actor semantic identity now includes entity schema version and canonical migration topology/event surface** (`src/semantic_schema.rs`), so schema-evolution declarations participate in compatibility identity. Runtime execution of migration bodies and persisted snapshot/history schema-version fencing remain follow-up work; this entry does not claim RFC 0008 replay migration is complete.
+
 ### Stable native actor entry ABI — 2026-09-23
 - **AOT actor dispatch now crosses one versioned C-ABI boundary** (`src/native_abi.rs`, `src/aot/codegen.rs`, `src/aot/mod.rs`). Generated Cranelift wrappers validate ABI version and payload arity, load boxed arguments, and call the behavior's optimized internal native function. The runtime no longer selects an arity-specific Rust function type from message length.
 - **Native actor entry status reserves explicit scheduler outcomes** (`Completed`, `Waiting`, `Yielded`, `Suspended`, `Faulted`) so continuation-aware preemption can be added without changing the runtime-facing calling convention. Mid-function AOT yielding is intentionally not enabled until continuation state can be preserved.
