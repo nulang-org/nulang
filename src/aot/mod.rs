@@ -1096,11 +1096,12 @@ pub fn dispatch_aot_runtime_behavior(
 /// `Actor::register_behavior` handler that runs the actor's current message
 /// through AOT-compiled native code, bypassing the bytecode VM.
 ///
-/// Reads the armed `AOT_DISPATCH` target to find the native entry point and
-/// select callbacks: when dispatching inside the real actor `Runtime` (the
-/// target's `runtime` is non-null) it uses `AotRuntimeCallbacks`, which route
-/// state/send/receive/alloc through the runtime; otherwise it uses the
-/// standalone `AotActorCallbacks` over the raw actor.
+/// Compatibility adapter for standalone/legacy handler-table invocation.
+///
+/// Runtime-owned actor execution uses `dispatch_aot_runtime_behavior`
+/// directly and does not pay the `AOT_DISPATCH` thread-local handoff. This
+/// adapter remains for callers that only have the plain behavior-table
+/// function pointer.
 pub fn aot_behavior_adapter(actor: &mut crate::runtime::Actor, args: &[crate::vm::Value]) {
     let target = AOT_DISPATCH.with(|c| *c.borrow());
     let target =
