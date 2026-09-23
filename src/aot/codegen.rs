@@ -1895,7 +1895,6 @@ pub fn compile_boxing_wrapper(
     Ok(())
 }
 
-
 /// Generate the stable runtime-facing entry wrapper for an actor behavior.
 ///
 /// Internal behavior functions keep their ordinary optimized signature
@@ -1937,12 +1936,8 @@ pub fn compile_actor_entry_wrapper(
         types::I32,
         crate::native_abi::NATIVE_ACTOR_ABI_VERSION as i64,
     );
-    let abi_ok = builder
-        .ins()
-        .icmp(IntCC::Equal, abi_version, expected_abi);
-    builder
-        .ins()
-        .brif(abi_ok, arity_check, &[], bad_abi, &[]);
+    let abi_ok = builder.ins().icmp(IntCC::Equal, abi_version, expected_abi);
+    builder.ins().brif(abi_ok, arity_check, &[], bad_abi, &[]);
 
     builder.switch_to_block(arity_check);
     let payload_len_offset =
@@ -1951,20 +1946,15 @@ pub fn compile_actor_entry_wrapper(
         .ins()
         .load(types::I64, flags, ctx_ptr, payload_len_offset);
     let expected_len = builder.ins().iconst(types::I64, param_count as i64);
-    let arity_ok = builder
-        .ins()
-        .icmp(IntCC::Equal, payload_len, expected_len);
-    builder
-        .ins()
-        .brif(arity_ok, invoke, &[], bad_arity, &[]);
+    let arity_ok = builder.ins().icmp(IntCC::Equal, payload_len, expected_len);
+    builder.ins().brif(arity_ok, invoke, &[], bad_arity, &[]);
 
     builder.switch_to_block(invoke);
     let payload_ptr_offset =
         std::mem::offset_of!(crate::native_abi::NativeActorContext, payload_ptr) as i32;
-    let payload_ptr =
-        builder
-            .ins()
-            .load(pointer_type, flags, ctx_ptr, payload_ptr_offset);
+    let payload_ptr = builder
+        .ins()
+        .load(pointer_type, flags, ctx_ptr, payload_ptr_offset);
     let mut args = Vec::with_capacity(param_count);
     for idx in 0..param_count {
         args.push(
@@ -1977,11 +1967,8 @@ pub fn compile_actor_entry_wrapper(
     let behavior_ref = module.declare_func_in_func(behavior_fid, builder.func);
     let call = builder.ins().call(behavior_ref, &args);
     let result = builder.inst_results(call)[0];
-    let result_offset =
-        std::mem::offset_of!(crate::native_abi::NativeActorContext, result) as i32;
-    builder
-        .ins()
-        .store(flags, result, ctx_ptr, result_offset);
+    let result_offset = std::mem::offset_of!(crate::native_abi::NativeActorContext, result) as i32;
+    builder.ins().store(flags, result, ctx_ptr, result_offset);
     let completed = builder.ins().iconst(
         types::I32,
         crate::native_abi::NativeActorStatus::Completed as i64,
@@ -2008,7 +1995,10 @@ pub fn compile_actor_entry_wrapper(
     builder.finalize();
 
     if std::env::var("NULANG_DUMP_CLIF").is_ok() {
-        eprintln!("=== CLIF for native actor entry wrapper ({}) ===", param_count);
+        eprintln!(
+            "=== CLIF for native actor entry wrapper ({}) ===",
+            param_count
+        );
         eprintln!("{}", codegen_ctx.func.display());
     }
 
@@ -3758,8 +3748,7 @@ mod tests {
             .expect("behavior 'double' should be compiled");
         let payload = [crate::vm::Value::int(21).as_raw()];
         let mut ctx = crate::native_abi::NativeActorContext::new(0, &payload);
-        let entry: crate::native_abi::NativeActorEntry =
-            unsafe { std::mem::transmute(ptr) };
+        let entry: crate::native_abi::NativeActorEntry = unsafe { std::mem::transmute(ptr) };
         let status = unsafe { entry(&mut ctx) };
         assert_eq!(
             crate::native_abi::NativeActorStatus::from_raw(status),
