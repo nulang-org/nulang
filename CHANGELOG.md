@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### Re-entrant JIT ownership boundary — 2026-09-23
+- **JIT preparation and native execution are now distinct backend phases** (`src/backends/mod.rs`, `src/jit/mod.rs`), so compilation and Tier-2 promotion finish before native code may call back into the interpreter.
+- **`VM::try_jit_execute` detaches the mutable JIT backend and raw-bit constant cache before native entry** (`src/vm.rs`). Re-entrant direct calls therefore see no VM-owned JIT backend to alias and execute nested frames in the interpreter.
+- **JIT helpers no longer keep a borrowed constant-pool slice in thread-local state**; interned strings resolve through the active VM pointer plus an explicit module index (`src/jit/runtime.rs`).
+- **Debug assertions pin the re-entry invariant**: direct calls require both the backend to be detached and the active module's JIT constant cache slot to be empty.
+
 ### Backend differential oracle hardening — 2026-09-22
 - **WASM differential execution now fails closed after artifact emission** (`src/fuzz.rs`, `src/difffuzz.rs`). Restricted-profile rejection remains an expected compile-time skip, but malformed/invalid emitted WASM, instantiation failures, or a missing required `nulang_init` export are backend correctness failures. Differential campaigns now record WASM agreement coverage, and the `wasm-backend` test lane requires positive WASM participation so a silently-disabled backend cannot leave CI green.
 
