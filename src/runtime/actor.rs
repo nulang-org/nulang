@@ -367,7 +367,7 @@ impl Actor {
             state: ActorState::Created,
             mailbox: Mailbox::new(mailbox_cap),
             heap: {
-                let mut heap = ActorHeap::new(16 * 1024); // 16KB initial heap (density: ~64k actors/GB)
+                let mut heap = ActorHeap::new(16 * 1024); // 16 KiB first-block capacity, allocated on demand
                 heap.set_actor_id(id);
                 heap
             },
