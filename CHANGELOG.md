@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### Durable event and workflow semantic hardening — 2026-09-23
+- **Event emission no longer invents domain-state mutations.** Source-level `apply` handlers or explicit behavior code remain the sole authority for event-sourced state changes; recovery restores the persisted post-apply value.
+- **Workflow timer, signal, and saga progress fails closed at durability boundaries.** Runtime state is not advanced when the corresponding durable journal/checkpoint operation fails.
+- **Multi-field event-sourced state is preserved at one logical sequence.** libSQL uses an additive `events_v2` table keyed by `(actor_id, sequence, field_name)` while retaining RFC 0022 atomic-transition tables; RocksDB and PostgreSQL likewise include field identity in event storage. Legacy libSQL rows migrate forward, and clear removes both legacy and v2 rows to prevent resurrection on reopen.
+- **Regression coverage pins the invariants** across runtime recovery and libSQL/RocksDB/PostgreSQL persistence.
+
 ### Re-entrant JIT ownership boundary — 2026-09-23
 - **JIT preparation and native execution are now distinct backend phases** (`src/backends/mod.rs`, `src/jit/mod.rs`), so compilation and Tier-2 promotion finish before native code may call back into the interpreter.
 - **`VM::try_jit_execute` detaches the mutable JIT backend and raw-bit constant cache before native entry** (`src/vm.rs`). Re-entrant direct calls therefore see no VM-owned JIT backend to alias and execute nested frames in the interpreter.
