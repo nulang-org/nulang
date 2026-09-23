@@ -376,8 +376,8 @@ impl JitSession {
         native_calls: &std::collections::HashMap<usize, usize>,
     ) -> Option<JitFunctionPtr> {
         // Check if already compiled
-        if let Some((ptr, _)) = self.compiled_entry(module_idx, start_offset) {
-            return Some(std::mem::transmute(ptr));
+        if let Some(region) = self.compiled_entry(module_idx, start_offset) {
+            return Some(std::mem::transmute(region.ptr));
         }
 
         // Build the function
@@ -423,8 +423,8 @@ impl JitSession {
         native_calls: &std::collections::HashMap<usize, usize>,
     ) -> Option<JitFunctionPtr> {
         // Check if already compiled
-        if let Some((ptr, _)) = self.compiled_entry(module_idx, start_offset) {
-            return Some(std::mem::transmute(ptr));
+        if let Some(region) = self.compiled_entry(module_idx, start_offset) {
+            return Some(std::mem::transmute(region.ptr));
         }
 
         let has_known_types = type_metadata
@@ -489,7 +489,7 @@ impl JitSession {
     /// alive and the original bytecode has not been modified.
     pub unsafe fn get_compiled(&self, module_idx: usize, offset: usize) -> Option<JitFunctionPtr> {
         self.compiled_entry(module_idx, offset)
-            .map(|(ptr, _)| std::mem::transmute(ptr))
+            .map(|region| std::mem::transmute(region.ptr))
     }
 
     /// Number of bytecode instructions covered by the compiled region at
@@ -497,12 +497,55 @@ impl JitSession {
     /// to advance pc after a JIT run instead of re-scanning the
     /// instruction stream.
     pub fn compiled_region_len(&self, module_idx: usize, offset: usize) -> Option<usize> {
-        self.compiled_entry(module_idx, offset).map(|(_, len)| len)
+        self.compiled_entry(module_idx, offset).map(|region| region.len)
     }
 
     /// Return the number of compiled regions.
     pub fn compiled_count(&self) -> usize {
         self.compiled_count
+    }
+
+    /// Attempt to replace an existing typed region with SIMD code.
+    ///
+    /// Unlike compile_region_simd, this does not return the cached Tier-1
+    /// pointer before analysis: Tier 2 must be able to overwrite Tier 1 code.
+    /// Failure leaves the existing compiled region untouched.
+    unsafe fn promote_region_simd(
+        &mut self,
+        module_idx: usize,
+        start_offset: usize,
+        num_instrs: usize,
+        instructions: &[crate::bytecode::Instruction],
+        type_metadata: Option<&crate::jit::typed_compiler::TypeMetadata>,
+    ) -> bool {
+        use crate::jit::simd_analyzer::analyze_region;
+        use crate::jit::simd_compiler::{compile_simd_region, is_simd_supported};
+
+        if !is_simd_supported() {
+            return false;
+        }
+
+        let Some(simd_region) =
+            analyze_region(instructions, start_offset, num_instrs, type_metadata)
+        else {
+            return false;
+        };
+
+        let func_name = format!("nulang_simd_t2_{}_{}", module_idx, start_offset);
+        match compile_simd_region(
+            &mut self.module,
+            &mut self.builder_context,
+            &mut self.ctx,
+            &func_name,
+            instructions,
+            &simd_region,
+        ) {
+            Ok(ptr) => {
+                self.store_compiled(module_idx, start_offset, ptr, num_instrs);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Compile a SIMD-vectorizable bytecode region.
@@ -532,8 +575,8 @@ impl JitSession {
         use crate::jit::simd_compiler::{compile_simd_region, is_simd_supported};
 
         // Check if already compiled
-        if let Some((ptr, _)) = self.compiled_entry(module_idx, start_offset) {
-            return Some(std::mem::transmute(ptr));
+        if let Some(region) = self.compiled_entry(module_idx, start_offset) {
+            return Some(std::mem::transmute(region.ptr));
         }
 
         // Only attempt SIMD if host CPU supports it
@@ -1137,7 +1180,7 @@ impl crate::backends::JitBackend for JitSession {
     }
 
     fn compiled_region_len(&self, module_idx: usize, pc: usize) -> Option<usize> {
-        self.compiled_entry(module_idx, pc).map(|(_, len)| len)
+        self.compiled_entry(module_idx, pc).map(|region| region.len)
     }
 
     fn compiled_count(&self) -> usize {
@@ -1162,11 +1205,14 @@ impl crate::backends::JitBackend for JitSession {
     ) -> crate::backends::TieredAction {
         let instructions = &module.instructions;
 
-        // Check if already compiled
-        if let Some(func) = unsafe { self.get_compiled(module_idx, pc) } {
+        // Check if already compiled.
+        if let Some(region) = self.compiled_entry(module_idx, pc) {
+            let func: JitFunctionPtr = unsafe { std::mem::transmute(region.ptr) };
             func(regs.as_mut_ptr(), constants.as_ptr());
-            // Track post-compilation hotness for tier-2 promotion.
-            self.record_tier2_and_maybe_promote(module_idx, pc, instructions);
+            // Terminal regions pay no post-compilation counter update.
+            if !region.tier2_terminal {
+                self.record_tier2_and_maybe_promote(module_idx, pc, module);
+            }
             return crate::backends::TieredAction::RanJit;
         }
 
