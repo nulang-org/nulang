@@ -4818,8 +4818,7 @@ impl Runtime {
             } else {
                 let idx = vm.modules.len();
                 vm.load_module(
-                    module_to_load
-                        .expect("module must exist when bytecode_module_idx is absent"),
+                    module_to_load.expect("module must exist when bytecode_module_idx is absent"),
                 );
                 if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                     actor.bytecode_module_idx = Some(idx);
