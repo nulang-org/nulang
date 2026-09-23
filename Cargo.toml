@@ -37,6 +37,10 @@ language-version = "1.0.0-frozen"
 
 [features]
 default = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
+# Recommended standalone runtime profile: fast local execution and networking
+# without optional language-service, AI, foreign-runtime, or database SDKs.
+# Build with `--no-default-features --features standard-runtime`.
+standard-runtime = ["native-codegen", "tls", "tcp", "ureq"]
 # Cranelift-backed tiered JIT plus the current native/AOT backend.
 native-codegen = [
     "dep:cranelift",

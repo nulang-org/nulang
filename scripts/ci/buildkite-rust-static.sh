@@ -19,6 +19,8 @@ cargo fmt --all -- --check
 cargo check --locked --all-targets --no-default-features
 cargo clippy --locked --all-targets --no-default-features -- -D clippy::correctness
 
+bash scripts/check_standard_runtime_profile.sh
+
 cargo check --locked --all-targets
 cargo clippy --locked --all-targets -- -D clippy::correctness
 cargo check --locked --tests
