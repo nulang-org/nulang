@@ -375,30 +375,54 @@ jobs:
       - name: Collect results
         run: |
           python3 scripts/collect_bench_results.py \
-            --out "benchmarks/$(git rev-parse --short HEAD).json"
+            --out "benchmarks/${{ github.sha }}.json"
+
+      # Benchmark history is intentionally kept off protected main. Pulling the
+      # JSON files from a dedicated branch preserves the rolling comparison
+      # window without making CI mutate the branch it is validating.
+      - name: Load benchmark history
+        env:
+          BENCH_HISTORY_BRANCH: automation/benchmark-history
+        run: |
+          git fetch origin "${BENCH_HISTORY_BRANCH}" || true
+          if git rev-parse --verify "origin/${BENCH_HISTORY_BRANCH}" >/dev/null 2>&1; then
+            git ls-tree -r --name-only "origin/${BENCH_HISTORY_BRANCH}" benchmarks |
+              while read -r path; do
+                case "${path}" in
+                  *.json)
+                    if [ ! -e "${path}" ]; then
+                      mkdir -p "$(dirname "${path}")"
+                      git show "origin/${BENCH_HISTORY_BRANCH}:${path}" > "${path}"
+                    fi
+                    ;;
+                esac
+              done
+          fi
 
       - name: Check for regressions
         id: regression_check
         continue-on-error: true
         run: |
           python3 scripts/check_bench_regression.py \
-            --latest "benchmarks/$(git rev-parse --short HEAD).json" \
+            --latest "benchmarks/${{ github.sha }}.json" \
             --history-dir benchmarks
 
       - name: Upload results as build artifact
         uses: actions/upload-artifact@v7
         with:
           name: bench-results-${{ github.sha }}
-          path: benchmarks/*.json
+          path: benchmarks/${{ github.sha }}.json
           retention-days: 90
 
-      - name: Commit results to benchmarks/
+      - name: Persist benchmark history
+        env:
+          BENCH_HISTORY_BRANCH: automation/benchmark-history
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "benchmarks/$(git rev-parse --short HEAD).json"
+          git add benchmarks/*.json
           git diff --staged --quiet || git commit -m "bench: record results for $(git rev-parse --short HEAD) [skip ci]"
-          git push
+          git push --force-with-lease origin "HEAD:refs/heads/${BENCH_HISTORY_BRANCH}"
 
       # Separate from the check step itself so the commit above always
       # happens (preserving complete rolling-window history) even when
