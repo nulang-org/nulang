@@ -22,6 +22,61 @@ fn declare_test_behavior(rt: &mut Runtime, actor_id: u64, name: &str) {
         .register_behavior(name, noop_test_behavior);
 }
 
+#[derive(Default)]
+struct RejectWorkflowEventStore {
+    inner: MemoryStore,
+}
+
+impl PersistenceStore for RejectWorkflowEventStore {
+    fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
+        self.inner.save_snapshot(snapshot)
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.inner.load_snapshot(actor_id)
+    }
+
+    fn append_journal(
+        &mut self,
+        actor_id: u64,
+        entry: JournalEntry,
+    ) -> std::io::Result<()> {
+        self.inner.append_journal(actor_id, entry)
+    }
+
+    fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+        self.inner.read_journal(actor_id)
+    }
+
+    fn append_workflow_event(
+        &mut self,
+        _actor_id: u64,
+        _event: WorkflowEvent,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::other("injected workflow persistence failure"))
+    }
+
+    fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+        self.inner.read_workflow_events(actor_id)
+    }
+
+    fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> std::io::Result<()> {
+        self.inner.append_event(actor_id, entry)
+    }
+
+    fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+        self.inner.read_events(actor_id)
+    }
+
+    fn latest_sequence(&self, actor_id: u64) -> u64 {
+        self.inner.latest_sequence(actor_id)
+    }
+
+    fn clear(&mut self, actor_id: u64) -> std::io::Result<()> {
+        self.inner.clear(actor_id)
+    }
+}
+
 #[test]
 fn test_authority_snapshot_round_trip_recovery() {
     let mut rt = Runtime::new();
@@ -1900,7 +1955,41 @@ fn test_local_state_is_not_persisted() {
 }
 
 #[test]
-fn test_event_sourced_counter_replays_from_event_log() {
+fn test_event_sourced_emit_does_not_invent_state_mutations() {
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(MemoryStore::new());
+
+    let mut models = HashMap::new();
+    models.insert("balance".to_string(), StateModel::EventSourced);
+    models.insert("attempts".to_string(), StateModel::EventSourced);
+    let actor_id = rt.spawn_persistent_actor(
+        Box::new(|| {
+            vec![
+                ("balance".to_string(), Value::int(100)),
+                ("attempts".to_string(), Value::int(7)),
+            ]
+        }),
+        models,
+    );
+
+    rt.emit_event(actor_id, "Deposited", &[Value::int(25)]);
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(actor.get_state_field("balance"), Some(Value::int(100)));
+    assert_eq!(actor.get_state_field("attempts"), Some(Value::int(7)));
+
+    let events = rt.persistence.read_events(actor_id);
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().any(|entry| {
+        entry.field_name == "balance" && entry.value == PersistedValue::Int(100)
+    }));
+    assert!(events.iter().any(|entry| {
+        entry.field_name == "attempts" && entry.value == PersistedValue::Int(7)
+    }));
+}
+
+#[test]
+fn test_event_sourced_counter_replays_post_apply_state_from_event_log() {
     let mut rt = Runtime::new();
     rt.persistence = Box::new(MemoryStore::new());
 
@@ -1911,15 +2000,22 @@ fn test_event_sourced_counter_replays_from_event_log() {
         models,
     );
 
-    for i in 0..5 {
-        rt.emit_event(actor_id, "Incremented", &[Value::int(i)]);
+    // Source-level apply handlers run before Emit reaches the runtime. Model
+    // that ordering directly here: the runtime records the post-apply state,
+    // but event emission itself must not mutate the field.
+    for i in 1..=5 {
+        rt.actors
+            .get_mut(&actor_id)
+            .unwrap()
+            .set_state_field("counter", Value::int(i));
+        rt.emit_event(actor_id, "Incremented", &[Value::int(1)]);
     }
 
     let count = rt.actors.get(&actor_id).unwrap().get_state_field("counter");
     assert_eq!(
         count,
         Some(Value::int(5)),
-        "counter should be 5 after 5 events"
+        "counter should reflect source-level apply mutations only"
     );
 
     rt.checkpoint_actor(actor_id);
@@ -1934,6 +2030,7 @@ fn test_event_sourced_counter_replays_from_event_log() {
     assert_eq!(events.len(), 5, "5 events must be persisted");
     assert_eq!(events[0].field_name, "counter");
     assert_eq!(events[0].event_name, "Incremented");
+    assert_eq!(events[4].value, PersistedValue::Int(5));
 
     rt.actors.remove(&actor_id);
     let recovered_id = rt.recover_actor(actor_id).unwrap();
@@ -1943,8 +2040,44 @@ fn test_event_sourced_counter_replays_from_event_log() {
     assert_eq!(
         recovered_count,
         Some(Value::int(5)),
-        "recovered actor must have counter=5 from event replay"
+        "recovered actor must restore the last persisted post-apply value"
     );
+}
+
+#[test]
+fn test_workflow_timer_is_not_armed_when_durable_commit_fails() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    rt.actors.get_mut(&actor_id).unwrap().is_workflow = true;
+    rt.persistence = Box::new(RejectWorkflowEventStore::default());
+
+    rt.schedule_workflow_timer(actor_id, "deadline", 1000);
+
+    assert!(
+        rt.timer_wheel.is_empty(),
+        "a durable workflow timer must not become observable before TimerSet commits"
+    );
+}
+
+#[test]
+fn test_workflow_signal_is_not_delivered_when_durable_commit_fails() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.is_workflow = true;
+        actor.waiting_signal = Some("approved".to_string());
+    }
+    rt.persistence = Box::new(RejectWorkflowEventStore::default());
+
+    rt.signal_workflow(actor_id, "approved", Some("ok".to_string()));
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert!(
+        actor.received_signals.is_empty(),
+        "a signal must not enter actor state before SignalReceived commits"
+    );
+    assert_eq!(actor.waiting_signal.as_deref(), Some("approved"));
 }
 
 #[test]
