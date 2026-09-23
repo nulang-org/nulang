@@ -1605,6 +1605,12 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Transactional NLAP decision outbox — 2026-09-23
+- **Terminal/revision NLAP events now commit in the same SQLite transaction as the agent decision they describe** (`crates/nulang-ai-local/`). The ordered `nlap_outbox` persists complete event envelopes before commit, and runtime delivery drains pending rows only after state durability is established.
+- **NLAP 1.3.0 adds stable event identity.** New `SwarmEventEnvelope` values carry an `event_id`; the field is optional on deserialization so stored/received 1.2 envelopes remain readable. Outbox retries reuse the exact stored envelope and event id, giving downstream consumers a deduplication key under at-least-once delivery.
+- **Delivery acknowledgement is post-write and post-flush.** If stream output succeeds but acknowledgement fails or the process crashes, the event remains pending. Runtime entry drains any prior pending outbox before accepting new work, and `flush_pending_events` is public for explicit recovery.
+- **Crash-window tests pin both sides of the contract.** An injected database rollback queues no event; a successful transition queues its event; and an injected post-write flush failure leaves all terminal events pending so a later drain retries the first event with the same `event_id`.
+
 ### Atomic agent decision transitions — 2026-09-23
 - **Terminal agent decisions now commit as one SQLite transaction** (`crates/nulang-ai-local/`). The terminal task result, current intention state, optional replacement intention, immutable revision evidence, commitment state, and goal state are written through one `IMMEDIATE` transaction rather than a sequence of independently durable updates.
 - **NLAP terminal/revision events are emitted only after the durable transaction commits.** A failed database transition therefore cannot publish `task_failed`, `intention_revised`, `goal_blocked`, or related events for state that was rolled back.
