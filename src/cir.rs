@@ -170,8 +170,8 @@ pub enum CirTerminator {
 pub enum EffectKind {
     /// Non-blocking send to actor mailbox: RValue::Send
     ActorSend,
-    /// Blocking/timed mailbox wait: RValue::ReceiveWait.
-    /// Plain ReceiveMatch is non-blocking and does not use this effect.
+    /// Mailbox host boundary used by ReceiveWait and, in the current WasmFX
+    /// restricted profile, legacy ReceiveMatch lowering.
     MailboxDequeue,
     /// RValue::SignalWait
     SignalWait,
