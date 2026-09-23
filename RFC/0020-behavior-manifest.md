@@ -12,9 +12,10 @@
 An experimental v0alpha1 durability/admission subset is implemented in
 `src/behavior_manifest.rs`. Package bytecode builds emit
 `<package>.behavior.json` and deployment bundles include it. The current
-implementation covers artifact identity binding, durable actor persistence
-classification, state-schema semantic identity, schema versions, migration
-topology, deterministic manifest hashing, and structural upgrade preflight.
+implementation covers compiler artifact identity, an exact BLAKE3 digest binding
+to the emitted bytecode bytes, durable actor persistence classification,
+state-schema semantic identity, schema versions, migration topology,
+deterministic manifest hashing, and structural upgrade preflight.
 
 This does **not** resolve the RFC or complete its full proposed surface:
 effects, authority inventories, interfaces, resources, provenance attestations,
