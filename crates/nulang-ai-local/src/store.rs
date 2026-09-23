@@ -784,3 +784,171 @@ fn parse_manager_kind(raw: String) -> ManagerKind {
         _ => ManagerKind::Engineering,
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn active_fixture(store: &SqliteStore) -> (Goal, Commitment, Intention, Task) {
+        let mut goal = Goal::new("atomic-test", "ship feature", 10.0);
+        goal.status = GoalStatus::Running;
+        store.upsert_goal(&goal).unwrap();
+
+        let mut commitment = Commitment::new(goal.id, "director-test", "accepted");
+        commitment.status = CommitmentStatus::Active;
+        store.upsert_commitment(&commitment).unwrap();
+
+        let mut task = Task::new(goal.id, "execute plan", ManagerKind::Engineering);
+        task.status = TaskStatus::Running;
+        store.upsert_task(&task).unwrap();
+
+        let mut intention = Intention::new(
+            goal.id,
+            commitment.id,
+            "manager-test",
+            "execute plan",
+            vec![task.id],
+        );
+        intention.status = IntentionStatus::Active;
+        store.upsert_intention(&intention).unwrap();
+
+        (goal, commitment, intention, task)
+    }
+
+    #[test]
+    fn atomic_transition_rolls_back_every_record_when_final_write_fails() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-atomic-{}", Uuid::new_v4()));
+        let store = SqliteStore::open(&tmp).unwrap();
+        let (mut goal, mut commitment, mut intention, mut task) = active_fixture(&store);
+
+        task.status = TaskStatus::Blocked;
+        task.updated_at = Utc::now();
+        intention.status = IntentionStatus::Blocked;
+        intention.updated_at = Utc::now();
+        commitment.status = CommitmentStatus::Suspended;
+        commitment.updated_at = Utc::now();
+        goal.status = GoalStatus::Blocked;
+        goal.updated_at = Utc::now();
+
+        let revision = IntentionRevision::new(
+            goal.id,
+            commitment.id,
+            intention.id,
+            None,
+            task.id,
+            TaskStatus::Blocked,
+            IntentionRevisionDecision::Suspend,
+            "waiting on dependency",
+        );
+
+        let conn = Connection::open(store.db_path()).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TRIGGER fail_blocked_goal_update
+            BEFORE UPDATE ON goals
+            WHEN NEW.status = 'blocked'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected transition failure');
+            END;
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = store
+            .commit_agent_state_transition(AgentStateTransition {
+                terminal_task: Some(&task),
+                intention: &intention,
+                replacement_intention: None,
+                revision: Some(&revision),
+                commitment: Some(&commitment),
+                goal: Some(&goal),
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Sqlite(_)));
+
+        let graph = store.get_goal_graph(goal.id).unwrap();
+        assert_eq!(graph.goal.status, GoalStatus::Running);
+        assert_eq!(graph.tasks[0].status, TaskStatus::Running);
+        assert_eq!(graph.intentions[0].status, IntentionStatus::Active);
+        assert_eq!(graph.commitments[0].status, CommitmentStatus::Active);
+        assert!(graph.intention_revisions.is_empty());
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn atomic_transition_commits_terminal_decision_as_one_unit() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-atomic-ok-{}", Uuid::new_v4()));
+        let store = SqliteStore::open(&tmp).unwrap();
+        let (mut goal, mut commitment, mut intention, mut task) = active_fixture(&store);
+
+        task.status = TaskStatus::Failed;
+        task.updated_at = Utc::now();
+        intention.status = IntentionStatus::Failed;
+        intention.updated_at = Utc::now();
+        commitment.status = CommitmentStatus::Abandoned;
+        commitment.updated_at = Utc::now();
+        goal.status = GoalStatus::Failed;
+        goal.updated_at = Utc::now();
+
+        let revision = IntentionRevision::new(
+            goal.id,
+            commitment.id,
+            intention.id,
+            None,
+            task.id,
+            TaskStatus::Failed,
+            IntentionRevisionDecision::Abandon,
+            "bounded retry exhausted",
+        );
+
+        store
+            .commit_agent_state_transition(AgentStateTransition {
+                terminal_task: Some(&task),
+                intention: &intention,
+                replacement_intention: None,
+                revision: Some(&revision),
+                commitment: Some(&commitment),
+                goal: Some(&goal),
+            })
+            .unwrap();
+
+        let graph = store.get_goal_graph(goal.id).unwrap();
+        assert_eq!(graph.goal.status, GoalStatus::Failed);
+        assert_eq!(graph.tasks[0].status, TaskStatus::Failed);
+        assert_eq!(graph.intentions[0].status, IntentionStatus::Failed);
+        assert_eq!(graph.commitments[0].status, CommitmentStatus::Abandoned);
+        assert_eq!(graph.intention_revisions, vec![revision]);
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn atomic_transition_rejects_cross_goal_records_before_writing() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-invalid-{}", Uuid::new_v4()));
+        let store = SqliteStore::open(&tmp).unwrap();
+        let (goal, commitment, intention, mut task) = active_fixture(&store);
+        task.goal_id = Uuid::new_v4();
+        task.status = TaskStatus::Failed;
+
+        let err = store
+            .commit_agent_state_transition(AgentStateTransition {
+                terminal_task: Some(&task),
+                intention: &intention,
+                replacement_intention: None,
+                revision: None,
+                commitment: Some(&commitment),
+                goal: Some(&goal),
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidTransition(_)));
+
+        let graph = store.get_goal_graph(goal.id).unwrap();
+        assert_eq!(graph.tasks[0].status, TaskStatus::Running);
+        assert_eq!(graph.intentions[0].status, IntentionStatus::Active);
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+}
