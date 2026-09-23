@@ -126,11 +126,16 @@ impl PersistedValue {
 }
 
 /// A serializable snapshot of an actor's durable state.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ActorSnapshot {
     pub actor_id: u64,
     pub sequence: u64,
+    /// Compiler-owned durable schema owner. Legacy snapshots omit this field.
+    pub schema_owner: Option<String>,
+    /// Entity schema version that produced this snapshot. Missing legacy
+    /// metadata decodes as v1.
+    pub schema_version: u32,
     pub state: HashMap<String, PersistedValue>,
     /// For workflow actors, the name of the signal the current step is
     /// suspended waiting for, if any.  This is part of the snapshot so that
@@ -151,6 +156,22 @@ pub struct ActorSnapshot {
     /// typed manifest before any recovered actor becomes observable.
     #[serde(default)]
     pub authority_tokens: BTreeSet<String>,
+}
+
+impl Default for ActorSnapshot {
+    fn default() -> Self {
+        Self {
+            actor_id: 0,
+            sequence: 0,
+            schema_owner: None,
+            schema_version: 1,
+            state: HashMap::new(),
+            waiting_signal: None,
+            crdt_snapshot: None,
+            crdt_field_map: None,
+            authority_tokens: BTreeSet::new(),
+        }
+    }
 }
 
 /// A journal entry records a message delivered to an actor.
