@@ -19,6 +19,8 @@ fn snapshot_with_payload(payload_bytes: usize) -> ActorSnapshot {
     ActorSnapshot {
         actor_id: 1,
         sequence: 1,
+        schema_owner: None,
+        schema_version: 1,
         state,
         waiting_signal: None,
         crdt_snapshot: None,
@@ -31,6 +33,8 @@ fn empty_snapshot() -> ActorSnapshot {
     ActorSnapshot {
         actor_id: 1,
         sequence: 0,
+        schema_owner: None,
+        schema_version: 1,
         state: HashMap::new(),
         waiting_signal: None,
         crdt_snapshot: None,
