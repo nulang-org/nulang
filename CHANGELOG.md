@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Linear-time JIT module call analysis — 2026-09-23
+- **Direct-call suspension and recursion gating now share one lazily cached per-module call graph** (`src/jit/mod.rs`). Suspension propagates to callers with a reverse worklist, and recursion uses iterative SCC traversal rather than an n×n reachability matrix plus Floyd–Warshall, making tier-up analysis linear in functions plus direct-call edges after the bytecode scan and avoiding host-stack recursion.
+
 ### Bounded JIT register marshaling — 2026-09-23
 - **JIT transitions now marshal only the compiler-known active register prefix for MIR-produced functions** (`src/vm.rs`) through reusable per-frame-depth boxed scratch. The active scratch Box is temporarily detached from `VM` during native execution, preserving the re-entry ownership boundary; actor/legacy bytecode without trustworthy local-count metadata keeps all 256 registers, and reserved direct-call register r254 remains explicit.
 
