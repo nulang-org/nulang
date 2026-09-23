@@ -3606,7 +3606,10 @@ fn test_fired_workflow_timer_retries_when_atomic_commit_fails() {
         Some(1)
     );
     let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
-    assert_eq!(snapshot.state.get("step_index"), Some(&PersistedValue::Int(1)));
+    assert_eq!(
+        snapshot.state.get("step_index"),
+        Some(&PersistedValue::Int(1))
+    );
     assert!(rt.timer_wheel.is_empty());
 }
 
