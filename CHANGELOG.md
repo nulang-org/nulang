@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### Durable event and workflow semantic hardening — 2026-09-23
+- **Event emission no longer invents state mutations.** `emit` records the event and persists the post-apply value, while source-level `apply` handlers or explicit behavior code remain the sole authority for domain-state evolution. Recovery restores that persisted post-apply state.
+- **Workflow progress now fails closed on persistence errors.** Timer fires, signals, and saga compensation are not made externally observable when their corresponding durable journal/checkpoint operation fails.
+- **Event-sourced backends preserve multiple field records at one logical sequence.** libSQL, PostgreSQL, and RocksDB use multi-field event storage rather than a one-row-per-sequence layout.
+
 ### Durable event and workflow commit invariants — 2026-09-22
 - **Event emission no longer invents mutations for integer event-sourced fields** (`src/runtime/workflow.rs`). Source-level `apply` handlers or explicit behavior code are now the sole authority for domain-state evolution; the runtime records the resulting post-apply value for recovery.
 - **Durable workflow timers and signals now fail closed when their journal/checkpoint commit fails.** A timer is not armed until `TimerSet` commits, a fired workflow timer is not delivered until `TimerFired` commits, and a signal is not admitted/resumed until `SignalReceived` commits. Saga compensation completion is likewise not marked in memory unless `SagaCompensated` commits.
