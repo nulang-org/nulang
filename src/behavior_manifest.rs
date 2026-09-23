@@ -295,10 +295,26 @@ impl BehaviorManifest {
             ));
         }
 
-        validate_identity::<SemanticId>("artifact.semantic_id", &self.artifact.semantic_id)?;
-        validate_identity::<ArtifactId>("artifact.artifact_id", &self.artifact.artifact_id)?;
+        let semantic_id =
+            parse_identity::<SemanticId>("artifact.semantic_id", &self.artifact.semantic_id)?;
+        let artifact_id =
+            parse_identity::<ArtifactId>("artifact.artifact_id", &self.artifact.artifact_id)?;
         if let Some(source_id) = &self.artifact.source_id {
-            validate_identity::<SourceId>("artifact.source_id", source_id)?;
+            parse_identity::<SourceId>("artifact.source_id", source_id)?;
+        }
+        let expected_artifact_id = ArtifactId::from_semantic(
+            semantic_id,
+            &self.artifact.compiler_version,
+            &self.artifact.target,
+            &self.artifact.abi,
+            &self.artifact.backend,
+            self.artifact.flags.iter(),
+        );
+        if artifact_id != expected_artifact_id {
+            return Err(BehaviorManifestError::ArtifactIdentityMismatch {
+                expected: expected_artifact_id,
+                actual: artifact_id,
+            });
         }
 
         let mut actor_names = BTreeSet::new();
@@ -365,14 +381,13 @@ impl BehaviorManifest {
     }
 }
 
-fn validate_identity<T>(field: &'static str, value: &str) -> Result<(), BehaviorManifestError>
+fn parse_identity<T>(field: &'static str, value: &str) -> Result<T, BehaviorManifestError>
 where
     T: FromStr,
     T::Err: fmt::Display,
 {
     value
         .parse::<T>()
-        .map(|_| ())
         .map_err(|error| BehaviorManifestError::InvalidIdentity {
             field,
             message: error.to_string(),
@@ -426,7 +441,7 @@ fn classify_persistence(actor: &hir::ActorDef) -> BehaviorPersistence {
         }
     }
 
-    let classes = usize::from(durable) + usize::from(event_sourced) + usize::from(crdt);
+    let classes = durable as usize + event_sourced as usize + crdt as usize;
     match classes {
         0 if actor.persistent => BehaviorPersistence::Durable,
         0 => BehaviorPersistence::Ephemeral,
@@ -482,6 +497,10 @@ pub enum BehaviorManifestError {
         message: String,
     },
     DuplicateActor(String),
+    ArtifactIdentityMismatch {
+        expected: ArtifactId,
+        actual: ArtifactId,
+    },
     ActorSchemaMismatch {
         actor: String,
     },
@@ -506,6 +525,10 @@ impl fmt::Display for BehaviorManifestError {
             Self::DuplicateActor(actor) => {
                 write!(f, "behavior manifest contains duplicate actor '{actor}'")
             }
+            Self::ArtifactIdentityMismatch { expected, actual } => write!(
+                f,
+                "behavior manifest artifact identity mismatch: expected {expected}, got {actual}"
+            ),
             Self::ActorSchemaMismatch { actor } => {
                 write!(f, "typed actor schema '{actor}' has no matching HIR actor")
             }
@@ -810,6 +833,20 @@ mod tests {
         assert!(matches!(
             removed.validate_upgrade_from(&previous),
             Err(BehaviorAdmissionError::DurableOwnerRemoved { .. })
+        ));
+    }
+
+    #[test]
+    fn tampered_artifact_binding_fails_closed() {
+        let valid = base_manifest(actor(1, b"schema-v1"));
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&valid.to_json().unwrap()).unwrap();
+        value["artifact"]["target"] = serde_json::Value::from("different-target");
+        let bytes = serde_json::to_vec(&value).unwrap();
+
+        assert!(matches!(
+            BehaviorManifest::from_json(&bytes),
+            Err(BehaviorManifestError::ArtifactIdentityMismatch { .. })
         ));
     }
 
