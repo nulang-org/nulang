@@ -3414,7 +3414,7 @@ mod optimize_tests {
             plan.after_stmt
                 .get(&(0, 1))
                 .is_some_and(|ids| ids.contains(&joined)),
-            "fresh StrConcat result should be released after its last use: {plan:?}"
+            "fresh StrConcat result should be released after its last use"
         );
     }
 
