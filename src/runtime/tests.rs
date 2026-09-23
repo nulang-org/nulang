@@ -117,6 +117,34 @@ fn test_legacy_snapshot_without_authority_is_deny_by_default() {
 // Core Runtime Tests
 // ========================================================================
 
+fn run_ready_actor_turn(rt: &mut Runtime, actor_id: u64) {
+    loop {
+        let ready = rt
+            .claim_next_ready_actor()
+            .unwrap_or_else(|| panic!("expected actor {actor_id} to own a ready token"));
+        if ready == actor_id {
+            rt.step_actor(actor_id);
+            rt.finish_actor_turn(actor_id);
+            return;
+        }
+
+        // Spawn/restart paths may leave equal-priority empty actors ahead of
+        // the target. Their relative ordering is intentionally unspecified.
+        // Only skip tokens that carry no runnable mailbox work; silently
+        // bypassing a genuinely runnable peer would hide a scheduler bug.
+        let has_mail = rt
+            .actors
+            .get(&ready)
+            .map(|actor| !actor.mailbox.is_empty())
+            .unwrap_or(false);
+        assert!(
+            !has_mail,
+            "unexpected runnable actor {ready} ahead of target {actor_id}"
+        );
+        rt.finish_actor_turn(ready);
+    }
+}
+
 #[test]
 fn test_spawn_send_step_sequence() {
     let mut rt = Runtime::new();
@@ -133,8 +161,59 @@ fn test_spawn_send_step_sequence() {
         });
     }
     rt.send_message(actor_id, "inc", &[Value::int(1)]);
-    rt.step_actor(actor_id);
+    run_ready_actor_turn(&mut rt, actor_id);
     // Message processed
+}
+
+#[test]
+fn burst_send_has_single_ready_queue_entry() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("handle", |_actor, _args| {});
+
+    for _ in 0..1_000 {
+        rt.send_message_by_id(actor_id, 0, &[Value::int(1)]);
+    }
+
+    assert_eq!(rt.actors[&actor_id].mailbox.len(), 1_000);
+    assert_eq!(rt.actors[&actor_id].run_state, ActorRunState::Queued);
+
+    assert_eq!(rt.claim_next_ready_actor(), Some(actor_id));
+    assert!(
+        rt.scheduler.dequeue().is_none(),
+        "one actor burst must occupy only one ready-queue slot"
+    );
+    rt.finish_actor_turn(actor_id);
+}
+
+#[test]
+fn adaptive_actor_turn_drains_burst_without_duplicate_wakeups() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("inc", |actor, _args| {
+            let next = actor
+                .get_state_field("count")
+                .and_then(|value| value.as_int())
+                .unwrap_or(0)
+                + 1;
+            actor.set_state_field("count", Value::int(next));
+        });
+
+    for _ in 0..1_000 {
+        rt.send_message_by_id(actor_id, 0, &[]);
+    }
+    rt.run_scheduler();
+
+    let actor = &rt.actors[&actor_id];
+    assert_eq!(actor.get_state_field("count"), Some(Value::int(1_000)));
+    assert!(actor.mailbox.is_empty());
+    assert_eq!(actor.run_state, ActorRunState::Idle);
 }
 
 #[test]
@@ -192,7 +271,7 @@ fn test_delivery_establishes_child_context_and_inherits() {
             })
             .unwrap();
     }
-    rt.step_actor(a);
+    run_ready_actor_turn(&mut rt, a);
     let ctx = rt
         .current_trace
         .expect("delivery establishes a trace context");
@@ -385,18 +464,26 @@ fn test_actor_set_priority_changes_scheduling() {
     let b = rt.spawn_actor(Box::new(|| vec![]));
     declare_test_behavior(&mut rt, a, "noop");
     declare_test_behavior(&mut rt, b, "noop");
-    // Drain the spawn-time queue entries (both enqueued at Normal).
-    assert_eq!(rt.scheduler.dequeue(), Some(a));
-    assert_eq!(rt.scheduler.dequeue(), Some(b));
-    // Boost b via the builtin-effect path, then send to a before b.
+    // Drain the spawn-time Normal-priority tokens without assuming FIFO
+    // between equal-priority actors; the work-stealing scheduler does not
+    // promise that ordering.
+    let first = rt.claim_next_ready_actor().expect("first spawned actor");
+    rt.finish_actor_turn(first);
+    let second = rt.claim_next_ready_actor().expect("second spawned actor");
+    rt.finish_actor_turn(second);
+    let drained: std::collections::HashSet<u64> = [first, second].into_iter().collect();
+    assert_eq!(drained, [a, b].into_iter().collect());
+
+    // Boost b via the builtin-effect path, then send to a before b. Priority
+    // ordering across levels is the invariant we actually require.
     assert_eq!(
         rt.perform_actor_builtin(Some(b), Some("set_priority"), &[], &[Value::int(0)]),
         Some(Value::nil())
     );
     rt.send_message(a, "noop", &[]);
     rt.send_message(b, "noop", &[]);
-    assert_eq!(rt.scheduler.dequeue(), Some(b));
-    assert_eq!(rt.scheduler.dequeue(), Some(a));
+    run_ready_actor_turn(&mut rt, b);
+    run_ready_actor_turn(&mut rt, a);
 }
 
 #[test]
@@ -708,7 +795,7 @@ fn test_restarted_child_restores_behavior_and_state() {
     // The restarted child must handle messages (before the fix it was a
     // bare actor that silently dropped them).
     rt.send_message(new_id, "inc", &[Value::int(5)]);
-    rt.step_actor(new_id);
+    run_ready_actor_turn(&mut rt, new_id);
     let count = rt.actors.get(&new_id).unwrap().get_state_field("count");
     assert_eq!(count, Some(Value::int(5)));
 }
@@ -741,7 +828,7 @@ fn test_supervisor_restart_hydrates_from_persistence() {
 
     for _ in 0..3 {
         rt.send_message(child_id, "inc", &[Value::int(1)]);
-        rt.step_actor(child_id);
+        run_ready_actor_turn(&mut rt, child_id);
     }
     assert_eq!(
         rt.actors.get(&child_id).unwrap().get_state_field("count"),
@@ -1784,7 +1871,7 @@ fn test_persistent_actor_snapshots_durable_state() {
         });
 
     rt.send_message(actor_id, "inc", &[]);
-    rt.step_actor(actor_id);
+    run_ready_actor_turn(&mut rt, actor_id);
 
     let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
     assert_eq!(snapshot.state.get("count"), Some(&PersistedValue::Int(1)));
@@ -1812,7 +1899,7 @@ fn test_persistent_actor_recovers_from_snapshot() {
     // Process 3 increments.
     for _ in 0..3 {
         rt.send_message(actor_id, "inc", &[]);
-        rt.step_actor(actor_id);
+        run_ready_actor_turn(&mut rt, actor_id);
     }
 
     // Simulate node death: drop the actor from memory but keep the store.
@@ -1893,7 +1980,7 @@ fn test_local_state_is_not_persisted() {
         });
 
     rt.send_message(actor_id, "set", &[Value::int(99)]);
-    rt.step_actor(actor_id);
+    run_ready_actor_turn(&mut rt, actor_id);
 
     let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
     assert!(!snapshot.state.contains_key("temp"));
@@ -2283,7 +2370,7 @@ fn test_persistent_actor_with_libsql_store() {
 
     for _ in 0..3 {
         rt.send_message(actor_id, "inc", &[]);
-        rt.step_actor(actor_id);
+        run_ready_actor_turn(&mut rt, actor_id);
     }
 
     let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
@@ -2830,7 +2917,7 @@ fn test_persistent_counter_milestone_1000_messages() {
 
     // It should still be able to process new messages.
     rt.send_message(actor_id, "inc", &[]);
-    rt.step_actor(actor_id);
+    run_ready_actor_turn(&mut rt, actor_id);
     assert_eq!(
         rt.actors
             .get(&actor_id)
@@ -3360,7 +3447,7 @@ fn test_workflow_actor_step_event_and_checkpoint() {
         });
 
     rt.send_message(actor_id, "next", &[]);
-    rt.step_actor(actor_id);
+    run_ready_actor_turn(&mut rt, actor_id);
 
     let events = rt.persistence.read_workflow_events(actor_id);
     assert_eq!(events.len(), 2);
@@ -3395,7 +3482,7 @@ fn test_workflow_actor_recovery_replays_step_index() {
 
     for _ in 0..3 {
         rt.send_message(actor_id, "next", &[]);
-        rt.step_actor(actor_id);
+        run_ready_actor_turn(&mut rt, actor_id);
     }
 
     // Simulate node restart: drop the actor from memory but keep the store.
@@ -3422,7 +3509,7 @@ fn test_workflow_actor_recovery_replays_step_index() {
 
     // The actor should still be able to advance.
     rt.send_message(actor_id, "next", &[]);
-    rt.step_actor(actor_id);
+    run_ready_actor_turn(&mut rt, actor_id);
     let step_index = rt
         .actors
         .get(&actor_id)
@@ -6814,7 +6901,7 @@ fn test_object_ref_send_same_shard_records_hold() {
     let obj_id = rt.object_store.put(bytes);
 
     rt.send_message_by_id(receiver, 0, &[Value::object(obj_id)]);
-    rt.step_actor(receiver);
+    run_ready_actor_turn(&mut rt, receiver);
 
     let actor = rt.actors.get(&receiver).unwrap();
     assert!(
@@ -6833,7 +6920,7 @@ fn test_object_ref_released_on_actor_exit() {
     let obj_id = rt.object_store.put(bytes);
 
     rt.send_message_by_id(receiver, 0, &[Value::object(obj_id)]);
-    rt.step_actor(receiver);
+    run_ready_actor_turn(&mut rt, receiver);
     assert!(rt.object_store.get(obj_id).is_some());
 
     // Drop the unowned creator ref so that only the receiver's hold remains.
