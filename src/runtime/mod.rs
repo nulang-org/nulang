@@ -1358,7 +1358,7 @@ impl Runtime {
                     self.route_to_dlq(
                         &Message {
                             behavior_id,
-                            payload: Arc::new(Vec::new()),
+                            payload: MessagePayload::from_slice(&[]),
                             sender,
                             priority: MessagePriority::System,
                             trace_id: None,
@@ -1372,7 +1372,7 @@ impl Runtime {
 
         let msg = Message {
             behavior_id,
-            payload: Arc::new(payload),
+            payload: MessagePayload::from_vec(payload),
             sender,
             priority: MessagePriority::Normal,
             trace_id: trace_id.clone(),
@@ -1382,7 +1382,7 @@ impl Runtime {
                 self.route_to_dlq(
                     &Message {
                         behavior_id,
-                        payload: Arc::new(Vec::new()),
+                        payload: MessagePayload::from_slice(&[]),
                         sender,
                         priority: MessagePriority::System,
                         trace_id: None,
@@ -1394,7 +1394,7 @@ impl Runtime {
             self.route_to_dlq(
                 &Message {
                     behavior_id,
-                    payload: Arc::new(Vec::new()),
+                    payload: MessagePayload::from_slice(&[]),
                     sender,
                     priority: MessagePriority::System,
                     trace_id: None,
@@ -2571,7 +2571,7 @@ impl Runtime {
                     self.route_to_dlq(
                         &Message {
                             behavior_id,
-                            payload: Arc::new(args.to_vec()),
+                            payload: MessagePayload::from_slice(args),
                             sender: self.current_actor.unwrap_or(0),
                             priority: MessagePriority::System,
                             trace_id: out_trace.clone(),
@@ -2586,7 +2586,7 @@ impl Runtime {
                     self.route_to_dlq(
                         &Message {
                             behavior_id,
-                            payload: Arc::new(args.to_vec()),
+                            payload: MessagePayload::from_slice(args),
                             sender: self.current_actor.unwrap_or(0),
                             priority: MessagePriority::System,
                             trace_id: out_trace.clone(),
@@ -2613,7 +2613,7 @@ impl Runtime {
     ) -> MessageAdmission {
         let msg = Message {
             behavior_id,
-            payload: Arc::new(args.to_vec()),
+            payload: MessagePayload::from_slice(args),
             sender: self.current_actor.unwrap_or(0),
             priority: MessagePriority::Normal,
             trace_id: out_trace.clone(),
@@ -2634,7 +2634,7 @@ impl Runtime {
                 self.route_to_dlq(
                     &Message {
                         behavior_id,
-                        payload: Arc::new(args.to_vec()),
+                        payload: MessagePayload::from_slice(args),
                         sender: self.current_actor.unwrap_or(0),
                         priority: MessagePriority::System,
                         trace_id: out_trace.clone(),
@@ -2647,7 +2647,7 @@ impl Runtime {
             self.route_to_dlq(
                 &Message {
                     behavior_id,
-                    payload: Arc::new(args.to_vec()),
+                    payload: MessagePayload::from_slice(args),
                     sender: self.current_actor.unwrap_or(0),
                     priority: MessagePriority::System,
                     trace_id: out_trace.clone(),
@@ -2864,7 +2864,7 @@ impl Runtime {
         if let Some(actor) = self.actors.get_mut(&dlq_id) {
             let _ = actor.mailbox.push_local(Message {
                 behavior_id: 0,
-                payload: Arc::new(vec![Value::int(1)]),
+                payload: MessagePayload::from_slice(&[Value::int(1)]),
                 sender: 0, // DLQ system message has no sender
                 priority: MessagePriority::System,
                 trace_id: None,
