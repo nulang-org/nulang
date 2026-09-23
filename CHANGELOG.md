@@ -1605,6 +1605,11 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Failure-aware intention revision — 2026-09-23
+- **Agent execution now treats worker outcomes as control-flow decisions instead of assuming success** (`crates/nulang-ai-local/`). `Completed` fulfills the active intention, `Blocked` suspends the commitment and blocks the goal, and `Failed` triggers at most one automatic replan before the commitment is abandoned and the goal is marked failed.
+- **Every reconsideration is durable and explainable.** New `IntentionRevision` records persist the superseded/replacement intention IDs, triggering task and terminal status, decision (`replan`, `suspend`, or `abandon`), and reason. `GoalGraph` exposes the ordered revision history with serde defaults for older serialized graphs.
+- **NLAP 1.2.0 adds explicit failure-path events** for blocked/failed tasks and intentions, revised intentions, suspended/abandoned commitments, and blocked/failed goals. A scripted worker test suite pins successful recovery, blocked suspension, and bounded repeated-failure abandonment.
+
 ### Agent commitments and intentions — 2026-09-23
 - **The optional agent runtime now distinguishes desired state from accepted responsibility and selected execution plans** (`crates/nulang-ai-core/`): `Goal` remains the desired outcome, `Commitment` records an agent accepting responsibility for pursuing it, and `Intention` records the concrete ordered task plan selected for that commitment. These are library/runtime concepts, not new Nulang syntax.
 - **The local SQLite runtime persists commitment and intention lifecycles** (`crates/nulang-ai-local/`) and exposes them through `GoalGraph`; additive schema tables/indexes preserve existing goal/task rows, while serde defaults keep older serialized goal graphs readable.
