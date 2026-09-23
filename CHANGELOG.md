@@ -1609,6 +1609,10 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Temporal compatibility boundary — 2026-09-23
+- **Temporal compatibility now has an explicit adapter boundary** (Experimental, RFC 0025, `src/compat/temporal.rs`). Concrete Temporal workflow/run identity and workflow-task identity derive replay-stable Nulang `DurableEffectId` values for activities without introducing Temporal types into the runtime, persistence backends, compiler, or language syntax.
+- **Temporal activity preparation reuses Nulang's durable-effect contract.** Activities default to at-least-once recovery; deduplicated delivery is explicit, and the durable request digest binds activity id/type, task queue, and payload so divergent replay fails closed. Timer and signal translation reuse the existing atomic durable-transition workflow-event path.
+
 ### Production readiness hardening — 2026-09-23
 - **Benchmark validation no longer writes generated history to protected `main`.** CI restores rolling benchmark JSON from `automation/benchmark-history`, uploads only the current result artifact, and persists generated history to that dedicated branch.
 - **Primary Rust build/test/check/bench commands and tagged release builds now resolve the checked-in dependency graph with `--locked`.** Tagged releases also fail preflight when the Git tag, `Cargo.toml` version, and CLI `VERSION` disagree.
