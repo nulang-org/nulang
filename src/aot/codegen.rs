@@ -173,9 +173,7 @@ fn compute_predecessors(func: &mir::Function) -> HashMap<mir::BlockId, Vec<mir::
 /// Handler edges are added separately by `compute_successors`; keeping this
 /// helper separate prevents handler bodies from being mistaken for ordinary
 /// control-flow successors.
-fn compute_normal_successors(
-    func: &mir::Function,
-) -> HashMap<mir::BlockId, Vec<mir::BlockId>> {
+fn compute_normal_successors(func: &mir::Function) -> HashMap<mir::BlockId, Vec<mir::BlockId>> {
     let mut succs = HashMap::new();
     for block in &func.blocks {
         let targets = match &block.terminator {
