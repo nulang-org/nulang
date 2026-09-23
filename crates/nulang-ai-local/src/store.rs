@@ -3,7 +3,8 @@
 use chrono::{DateTime, Utc};
 use nulang_ai_core::{
     Commitment, CommitmentStatus, ConversationState, Goal, GoalGraph, GoalStatus, Intention,
-    IntentionRevision, IntentionRevisionDecision, IntentionStatus, ManagerKind, Task, TaskStatus,
+    IntentionRevision, IntentionRevisionDecision, IntentionStatus, ManagerKind, SwarmEventEnvelope,
+    Task, TaskStatus,
 };
 use rusqlite::{params, Connection, TransactionBehavior};
 use std::path::{Path, PathBuf};
@@ -33,6 +34,14 @@ pub struct AgentStateTransition<'a> {
     pub revision: Option<&'a IntentionRevision>,
     pub commitment: Option<&'a Commitment>,
     pub goal: Option<&'a Goal>,
+    pub outbox_events: &'a [SwarmEventEnvelope],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutboxEventRecord {
+    pub sequence: i64,
+    pub envelope: SwarmEventEnvelope,
+    pub delivered_at: Option<DateTime<Utc>>,
 }
 
 pub struct SqliteStore {
@@ -129,6 +138,15 @@ impl SqliteStore {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS nlap_outbox (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                envelope_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                delivered_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS nlap_outbox_pending_idx
+                ON nlap_outbox(delivered_at, sequence);
             "#,
         )?;
         Ok(())
@@ -191,8 +209,53 @@ impl SqliteStore {
         if let Some(goal) = transition.goal {
             upsert_goal_conn(&tx, goal)?;
         }
+        for envelope in transition.outbox_events {
+            insert_outbox_event_conn(&tx, envelope)?;
+        }
 
         tx.commit()?;
+        Ok(())
+    }
+
+    pub fn pending_outbox(&self, limit: usize) -> Result<Vec<OutboxEventRecord>, StoreError> {
+        let conn = Connection::open(&self.path)?;
+        let mut stmt = conn.prepare(
+            "SELECT sequence, envelope_json, delivered_at
+             FROM nlap_outbox
+             WHERE delivered_at IS NULL
+             ORDER BY sequence ASC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            let sequence: i64 = row.get(0)?;
+            let envelope_json: String = row.get(1)?;
+            let delivered_at = row
+                .get::<_, Option<String>>(2)?
+                .and_then(|raw| DateTime::parse_from_rfc3339(&raw).ok())
+                .map(|ts| ts.with_timezone(&Utc));
+            Ok((sequence, envelope_json, delivered_at))
+        })?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            let (sequence, envelope_json, delivered_at) = row?;
+            events.push(OutboxEventRecord {
+                sequence,
+                envelope: serde_json::from_str(&envelope_json)?,
+                delivered_at,
+            });
+        }
+        Ok(events)
+    }
+
+    pub fn mark_outbox_delivered(&self, event_id: Uuid) -> Result<(), StoreError> {
+        let conn = Connection::open(&self.path)?;
+        conn.execute(
+            "UPDATE nlap_outbox
+             SET delivered_at = COALESCE(delivered_at, ?2)
+             WHERE event_id = ?1",
+            params![event_id.to_string(), Utc::now().to_rfc3339()],
+        )?;
         Ok(())
     }
 
@@ -495,6 +558,16 @@ fn validate_agent_state_transition(
         }
     }
 
+    if transition
+        .outbox_events
+        .iter()
+        .any(|envelope| envelope.event_id.is_none())
+    {
+        return Err(StoreError::InvalidTransition(
+            "outbox event is missing a stable event id",
+        ));
+    }
+
     Ok(())
 }
 
@@ -646,6 +719,43 @@ fn insert_intention_revision_conn(
     Ok(())
 }
 
+fn insert_outbox_event_conn(
+    conn: &Connection,
+    envelope: &SwarmEventEnvelope,
+) -> Result<(), StoreError> {
+    let event_id = envelope.event_id.ok_or(StoreError::InvalidTransition(
+        "outbox event is missing a stable event id",
+    ))?;
+    let envelope_json = serde_json::to_string(envelope)?;
+    let inserted = conn.execute(
+        r#"INSERT INTO nlap_outbox (
+            event_id, envelope_json, created_at, delivered_at
+        ) VALUES (?1,?2,?3,NULL)
+        ON CONFLICT(event_id) DO NOTHING
+        "#,
+        params![
+            event_id.to_string(),
+            envelope_json,
+            envelope.ts.to_rfc3339(),
+        ],
+    )?;
+
+    if inserted == 0 {
+        let existing: String = conn.query_row(
+            "SELECT envelope_json FROM nlap_outbox WHERE event_id = ?1",
+            params![event_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if existing != envelope_json {
+            return Err(StoreError::InvalidTransition(
+                "outbox event id conflicts with different payload",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn parse_ts(raw: String) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(&raw)
         .map(|d| d.with_timezone(&Utc))
@@ -785,6 +895,7 @@ fn parse_manager_kind(raw: String) -> ManagerKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nulang_ai_core::SwarmEvent;
 
     fn active_fixture(store: &SqliteStore) -> (Goal, Commitment, Intention, Task) {
         let mut goal = Goal::new("atomic-test", "ship feature", 10.0);
@@ -836,6 +947,14 @@ mod tests {
             "waiting on dependency",
         );
 
+        let outbox = vec![SwarmEventEnvelope::new(
+            SwarmEvent::GoalBlocked {
+                goal_id: goal.id,
+                reason: "waiting on dependency".into(),
+            },
+            None,
+        )];
+
         let conn = Connection::open(store.db_path()).unwrap();
         conn.execute_batch(
             r#"
@@ -858,6 +977,7 @@ mod tests {
                 revision: Some(&revision),
                 commitment: Some(&commitment),
                 goal: Some(&goal),
+                outbox_events: &outbox,
             })
             .unwrap_err();
         assert!(matches!(err, StoreError::Sqlite(_)));
@@ -868,6 +988,7 @@ mod tests {
         assert_eq!(graph.intentions[0].status, IntentionStatus::Active);
         assert_eq!(graph.commitments[0].status, CommitmentStatus::Active);
         assert!(graph.intention_revisions.is_empty());
+        assert!(store.pending_outbox(10).unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(tmp);
     }
@@ -896,6 +1017,14 @@ mod tests {
             "bounded retry exhausted",
         );
 
+        let outbox = vec![SwarmEventEnvelope::new(
+            SwarmEvent::GoalFailed {
+                goal_id: goal.id,
+                reason: "bounded retry exhausted".into(),
+            },
+            None,
+        )];
+
         store
             .commit_agent_state_transition(AgentStateTransition {
                 terminal_task: Some(&task),
@@ -904,6 +1033,7 @@ mod tests {
                 revision: Some(&revision),
                 commitment: Some(&commitment),
                 goal: Some(&goal),
+                outbox_events: &outbox,
             })
             .unwrap();
 
@@ -912,7 +1042,47 @@ mod tests {
         assert_eq!(graph.tasks[0].status, TaskStatus::Failed);
         assert_eq!(graph.intentions[0].status, IntentionStatus::Failed);
         assert_eq!(graph.commitments[0].status, CommitmentStatus::Abandoned);
-        assert_eq!(graph.intention_revisions, vec![revision]);
+        assert_eq!(graph.intention_revisions, vec![revision.clone()]);
+
+        let pending = store.pending_outbox(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        let event_id = pending[0].envelope.event_id.unwrap();
+        assert_eq!(pending[0].envelope, outbox[0]);
+
+        store
+            .commit_agent_state_transition(AgentStateTransition {
+                terminal_task: Some(&task),
+                intention: &intention,
+                replacement_intention: None,
+                revision: Some(&revision),
+                commitment: Some(&commitment),
+                goal: Some(&goal),
+                outbox_events: &outbox,
+            })
+            .unwrap();
+        assert_eq!(store.pending_outbox(10).unwrap().len(), 1);
+
+        let mut conflicting = outbox[0].clone();
+        conflicting.event = SwarmEvent::GoalFailed {
+            goal_id: goal.id,
+            reason: "different payload".into(),
+        };
+        let err = store
+            .commit_agent_state_transition(AgentStateTransition {
+                terminal_task: Some(&task),
+                intention: &intention,
+                replacement_intention: None,
+                revision: Some(&revision),
+                commitment: Some(&commitment),
+                goal: Some(&goal),
+                outbox_events: &[conflicting],
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidTransition(_)));
+        assert_eq!(store.pending_outbox(10).unwrap()[0].envelope, outbox[0]);
+
+        store.mark_outbox_delivered(event_id).unwrap();
+        assert!(store.pending_outbox(10).unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(tmp);
     }
@@ -933,6 +1103,7 @@ mod tests {
                 revision: None,
                 commitment: Some(&commitment),
                 goal: Some(&goal),
+                outbox_events: &[],
             })
             .unwrap_err();
         assert!(matches!(err, StoreError::InvalidTransition(_)));
