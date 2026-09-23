@@ -22,6 +22,14 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
 
+/// Version of the semantic contract shared with managed compatibility
+/// adapters such as Nulang Cloud.
+///
+/// Increment this only when the meaning or encoding expected by an external
+/// adapter changes incompatibly. It is independent from Temporal's own API
+/// version and from Nulang bytecode/artifact versions.
+pub const TEMPORAL_COMPATIBILITY_CONTRACT_VERSION: u16 = 1;
+
 /// Identity of one concrete Temporal workflow execution.
 ///
 /// A concrete adapter should resolve an omitted Temporal run id before
@@ -805,6 +813,11 @@ mod tests {
             "payments",
             br#"{"amount":4200}"#.to_vec(),
         )
+    }
+
+    #[test]
+    fn compatibility_contract_version_is_explicit() {
+        assert_eq!(TEMPORAL_COMPATIBILITY_CONTRACT_VERSION, 1);
     }
 
     #[test]
