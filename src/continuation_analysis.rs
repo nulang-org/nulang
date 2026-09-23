@@ -118,49 +118,46 @@ pub fn analyze(func: &mir::Function) -> ContinuationAnalysis {
 /// Plain `ReceiveMatch` is intentionally absent: it is a non-blocking mailbox
 /// scan in the core runtime. Timed `ReceiveWait` is the suspending form.
 pub fn continuation_kind(func: &mir::Function, op: &RValue) -> Option<ContinuationKind> {
+    if let RValue::Perform {
+        resolved_handler: Some(href),
+        ..
+    } = op
+    {
+        if let Some(binding) = func
+            .handler_tables
+            .get(href.table_index as usize)
+            .and_then(|table| table.bindings.get(href.binding_index as usize))
+        {
+            if binding.resume {
+                return Some(ContinuationKind::ResumingEffect {
+                    handler_body: binding.body,
+                    single_shot: binding.single_shot,
+                });
+            }
+            // A statically resolved abortive handler does not resume the
+            // continuation and must not be reclassified as a host scheduler
+            // suspension.
+            return None;
+        }
+    }
+
+    scheduler_suspend_kind(op).map(ContinuationKind::Scheduler)
+}
+
+/// Classify runtime scheduler suspension without requiring function context.
+///
+/// Backends that reject user-defined handlers before lowering (such as the
+/// current WasmFX restricted profile) can use this directly.
+pub fn scheduler_suspend_kind(op: &RValue) -> Option<SchedulerSuspendKind> {
     match op {
         RValue::Perform {
-            effect,
-            op,
-            resolved_handler,
-            ..
-        } => {
-            if let Some(href) = resolved_handler {
-                if let Some(binding) = func
-                    .handler_tables
-                    .get(href.table_index as usize)
-                    .and_then(|table| table.bindings.get(href.binding_index as usize))
-                {
-                    if binding.resume {
-                        return Some(ContinuationKind::ResumingEffect {
-                            handler_body: binding.body,
-                            single_shot: binding.single_shot,
-                        });
-                    }
-                    // A statically resolved abortive handler does not resume
-                    // the continuation and must not be reclassified as a host
-                    // scheduler suspension.
-                    return None;
-                }
-            }
-
-            if effect == "LLM" && op == "ask" {
-                Some(ContinuationKind::Scheduler(
-                    SchedulerSuspendKind::LlmAsk,
-                ))
-            } else {
-                None
-            }
+            effect, op, args, ..
+        } if effect == "LLM" && op == "ask" && !args.is_empty() => {
+            Some(SchedulerSuspendKind::LlmAsk)
         }
-        RValue::PerformAsync { .. } => Some(ContinuationKind::Scheduler(
-            SchedulerSuspendKind::AsyncEffect,
-        )),
-        RValue::SignalWait { .. } => Some(ContinuationKind::Scheduler(
-            SchedulerSuspendKind::SignalWait,
-        )),
-        RValue::ReceiveWait { .. } => Some(ContinuationKind::Scheduler(
-            SchedulerSuspendKind::ReceiveWait,
-        )),
+        RValue::PerformAsync { .. } => Some(SchedulerSuspendKind::AsyncEffect),
+        RValue::SignalWait { .. } => Some(SchedulerSuspendKind::SignalWait),
+        RValue::ReceiveWait { .. } => Some(SchedulerSuspendKind::ReceiveWait),
         _ => None,
     }
 }
