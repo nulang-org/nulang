@@ -2422,6 +2422,33 @@ mod rocksdb_store_tests {
     }
 
     #[test]
+    fn test_rocksdb_store_preserves_multiple_event_fields_at_same_sequence() {
+        let dir = fresh_dir("multi_field_events");
+        let mut store = RocksDbStore::new(&dir).unwrap();
+        for (field_name, value) in [("balance", 125), ("attempts", 7)] {
+            store
+                .append_event(
+                    1,
+                    EventEntry {
+                        sequence: 1,
+                        field_name: field_name.to_string(),
+                        event_name: "Deposited".to_string(),
+                        args: vec![PersistedValue::Int(25)],
+                        value: PersistedValue::Int(value),
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut events = store.read_events(1);
+        events.sort_by(|a, b| a.field_name.cmp(&b.field_name));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].field_name, "attempts");
+        assert_eq!(events[1].field_name, "balance");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_rocksdb_store_latest_sequence() {
         let dir = fresh_dir("latest_seq");
         let mut store = RocksDbStore::new(&dir).unwrap();
@@ -2615,6 +2642,37 @@ mod postgres_store_tests {
         assert_eq!(journal[0].sequence, 1);
         assert_eq!(journal[1].behavior_id, 1);
         assert_eq!(journal[1].payload, vec![PersistedValue::Int(20)]);
+        store.clear(actor_id).unwrap();
+    }
+
+    #[test]
+    fn test_postgres_store_preserves_multiple_event_fields_at_same_sequence() {
+        let url = match pg_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let mut store = PostgresStore::new(&url).unwrap();
+        let actor_id = fresh_actor_id();
+        for (field_name, value) in [("balance", 125), ("attempts", 7)] {
+            store
+                .append_event(
+                    actor_id,
+                    EventEntry {
+                        sequence: 1,
+                        field_name: field_name.to_string(),
+                        event_name: "Deposited".to_string(),
+                        args: vec![PersistedValue::Int(25)],
+                        value: PersistedValue::Int(value),
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut events = store.read_events(actor_id);
+        events.sort_by(|a, b| a.field_name.cmp(&b.field_name));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].field_name, "attempts");
+        assert_eq!(events[1].field_name, "balance");
         store.clear(actor_id).unwrap();
     }
 
