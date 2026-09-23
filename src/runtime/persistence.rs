@@ -1688,6 +1688,27 @@ impl PostgresStore {
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS events_v2 (
+                actor_id BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                field_name TEXT NOT NULL,
+                event_name TEXT NOT NULL,
+                args TEXT NOT NULL,
+                value TEXT NOT NULL DEFAULT '1',
+                PRIMARY KEY (actor_id, sequence, field_name)
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "INSERT INTO events_v2
+             (actor_id, sequence, field_name, event_name, args, value)
+             SELECT actor_id, sequence, field_name, event_name, args, value FROM events
+             ON CONFLICT (actor_id, sequence, field_name) DO NOTHING",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         Ok(())
     }
 }
@@ -1864,10 +1885,9 @@ impl PersistenceStore for PostgresStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value)
+            "INSERT INTO events_v2 (actor_id, sequence, field_name, event_name, args, value)
              VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (actor_id, sequence) DO UPDATE SET
-               field_name = EXCLUDED.field_name,
+             ON CONFLICT (actor_id, sequence, field_name) DO UPDATE SET
                event_name = EXCLUDED.event_name,
                args = EXCLUDED.args,
                value = EXCLUDED.value",
@@ -1890,8 +1910,8 @@ impl PersistenceStore for PostgresStore {
             Err(_) => return Vec::new(),
         };
         let rows = match conn.query(
-            "SELECT sequence, field_name, event_name, args, value FROM events
-             WHERE actor_id = $1 ORDER BY sequence ASC",
+            "SELECT sequence, field_name, event_name, args, value FROM events_v2
+             WHERE actor_id = $1 ORDER BY sequence ASC, field_name ASC",
             &[&(actor_id as i64)],
         ) {
             Ok(r) => r,
@@ -1948,7 +1968,7 @@ impl PersistenceStore for PostgresStore {
             .map(|row| row.get(0));
         let event_seq: Option<i64> = conn
             .query_opt(
-                "SELECT sequence FROM events WHERE actor_id = $1 ORDER BY sequence DESC LIMIT 1",
+                "SELECT sequence FROM events_v2 WHERE actor_id = $1 ORDER BY sequence DESC LIMIT 1",
                 &[&(actor_id as i64)],
             )
             .ok()
@@ -1963,7 +1983,7 @@ impl PersistenceStore for PostgresStore {
 
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        for table in ["snapshots", "journal", "workflow_events", "events"] {
+        for table in ["snapshots", "journal", "workflow_events", "events", "events_v2"] {
             conn.execute(
                 &format!("DELETE FROM {} WHERE actor_id = $1", table),
                 &[&(actor_id as i64)],
