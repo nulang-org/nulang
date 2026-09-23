@@ -1690,7 +1690,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
                 span: *span,
             });
             push_defer_scope();
-            let mut last = hir::Operand::Unit;
+            let mut results = Vec::with_capacity(exprs.len());
             for (index, e) in exprs.iter().enumerate() {
                 if body.is_terminated() {
                     break;
@@ -1708,7 +1708,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
                     add_defer((**expr).clone(), *error_only);
                     continue;
                 }
-                last = lower_expr(e, body);
+                results.push(lower_expr(e, body));
             }
             if !body.is_terminated() {
                 let scope = pop_defer_scope();
@@ -1722,10 +1722,24 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
                     marker: crate::parallel_marker::ParallelRegionMarker::End,
                     span: *span,
                 });
+
+                if results.is_empty() {
+                    hir::Operand::Unit
+                } else {
+                    let ty = Type::Tuple(results.iter().map(|operand| operand.ty()).collect());
+                    let temp = fresh_temp_name();
+                    body.push(hir::Stmt::Let {
+                        name: temp.clone(),
+                        ty: ty.clone(),
+                        value: hir::RValue::Tuple(results, ty.clone()),
+                        span: *span,
+                    });
+                    hir::Operand::Var(temp, ty)
+                }
             } else {
                 let _ = pop_defer_scope();
+                hir::Operand::Unit
             }
-            last
         }
         Expr::Tuple(elems, span) => {
             let ops: Vec<_> = elems.iter().map(|e| lower_expr(e, body)).collect();

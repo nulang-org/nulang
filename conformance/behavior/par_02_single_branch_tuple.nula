@@ -1,0 +1,8 @@
+// par_02 — one branch remains a one-element tuple.
+let result = par {
+    7
+}
+let value = match result {
+    | (x,) => x
+}
+perform IO.print(value)

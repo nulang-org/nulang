@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Structured `par` source-ordered results — 2026-09-23
+- **Experimental `par { ... }` now returns every branch result in source order instead of inheriting block-style "last expression wins" behavior.** Non-empty regions infer and lower to tuples, a single branch remains a one-element tuple, and an empty region has `Unit` type. Execution is still sequential; this change freezes the result contract before scoped-task scheduling is enabled and supersedes the earlier experimental block-result behavior. Conformance coverage pins multi-branch ordering, one-branch tuple shape, and empty-region typing.
+
 ### Candidate-only JIT hotness probing — 2026-09-22
 - **Cold interpreted execution now probes JIT hotness only at candidate compiled-region entries** (`src/vm.rs`). The VM precomputes per-module candidates for execution/function/behavior entries, source-statement starts, branch targets/fallthroughs, and successors of compilation boundaries, avoiding JIT backend dispatch and hot-counter mutation at ordinary straight-line bytecode PCs without changing language semantics.
 
