@@ -471,27 +471,25 @@ impl WasmBackend {
             self.compile_function(func, mir.functions.len() + idx);
         }
 
-        if !mir.functions.is_empty() {
-            // Export the actual entry function as `nulang_init`. Lifted closure
-            // functions are appended after `__main`, so `len()-1` can point at
-            // a closure carrying parameters, which the host rejects when it
-            // looks for a `() -> i64` export.
-            if let Some(main_in_module) = mir
-                .functions
-                .iter()
-                .position(|f| f.name == "__main" || f.name == "main")
-            {
-                let main_idx = FUNC_IMPORT_COUNT + main_in_module as u32;
-                self.exports
-                    .export("nulang_init", ExportKind::Func, main_idx);
-            } else {
-                // Library module (no entry expression): export a synthetic
-                // `() -> i64` function returning nil, matching the interpreter
-                // (a program with only function definitions evaluates to nil).
-                // Falling back to the last module function could be a
-                // parameterized one, which the host can't call as `() -> i64`.
-                self.emit_nil_entry();
-            }
+        // Export the actual entry function as `nulang_init`. Lifted closure
+        // functions are appended after `__main`, so `len()-1` can point at
+        // a closure carrying parameters, which the host rejects when it
+        // looks for a `() -> i64` export.
+        if let Some(main_in_module) = mir
+            .functions
+            .iter()
+            .position(|f| f.name == "__main" || f.name == "main")
+        {
+            let main_idx = FUNC_IMPORT_COUNT + main_in_module as u32;
+            self.exports
+                .export("nulang_init", ExportKind::Func, main_idx);
+        } else {
+            // Library and empty modules have no entry expression. Export a
+            // synthetic `() -> i64` function returning nil, matching the
+            // interpreter. This is also required for the empty source program:
+            // emitting a valid module without the host ABI entrypoint makes a
+            // successful compilation unusable by every WASM runtime.
+            self.emit_nil_entry();
         }
 
         // Emit the actor-emulation globals (current actor + mailbox queue)
@@ -2957,6 +2955,17 @@ mod tests {
         let mir = crate::mir_lower::lower_module(&hir)?;
         let mut backend = WasmBackend::new();
         backend.compile(&mir, "test")
+    }
+
+    #[test]
+    #[cfg(all(test, feature = "wasm-backend"))]
+    fn test_empty_source_exports_runnable_nil_entry() {
+        let value = run_source("").expect("empty source should compile and run");
+        assert_eq!(
+            value.as_raw(),
+            crate::vm::Value::nil().as_raw(),
+            "empty source must match the interpreter's nil result"
+        );
     }
 
     #[test]
