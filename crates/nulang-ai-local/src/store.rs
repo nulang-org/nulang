@@ -1313,6 +1313,123 @@ mod tests {
     }
 
     #[test]
+    fn resume_request_race_reuses_first_plan_and_rejects_different_source() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-resume-race-{}", Uuid::new_v4()));
+        let store = SqliteStore::open(&tmp).unwrap();
+        let (mut goal, mut commitment, mut blocked, mut original_task) = active_fixture(&store);
+
+        original_task.status = TaskStatus::Blocked;
+        blocked.status = IntentionStatus::Blocked;
+        commitment.status = CommitmentStatus::Suspended;
+        goal.status = GoalStatus::Blocked;
+        store.upsert_task(&original_task).unwrap();
+        store.upsert_intention(&blocked).unwrap();
+        store.upsert_commitment(&commitment).unwrap();
+        store.upsert_goal(&goal).unwrap();
+
+        let request_id = Uuid::new_v4();
+        let first_task = Task::new(goal.id, "resume plan one", ManagerKind::Engineering);
+        let mut first_intention = Intention::new(
+            goal.id,
+            commitment.id,
+            "manager-test",
+            "resume plan one",
+            vec![first_task.id],
+        );
+        first_intention.status = IntentionStatus::Active;
+        let first_resumption =
+            CommitmentResumption::new(request_id, &blocked, first_intention.id, "dependency ready");
+
+        commitment.status = CommitmentStatus::Active;
+        goal.status = GoalStatus::Running;
+        let first = store
+            .commit_agent_resume_transition(AgentResumeTransition {
+                blocked_intention: &blocked,
+                replacement_intention: &first_intention,
+                replacement_tasks: std::slice::from_ref(&first_task),
+                resumption: &first_resumption,
+                commitment: &commitment,
+                goal: &goal,
+                outbox_events: &[],
+            })
+            .unwrap();
+        assert!(matches!(first, ResumeCommitResult::Applied(_)));
+
+        let second_task = Task::new(goal.id, "resume plan two", ManagerKind::Engineering);
+        let mut second_intention = Intention::new(
+            goal.id,
+            commitment.id,
+            "manager-test",
+            "resume plan two",
+            vec![second_task.id],
+        );
+        second_intention.status = IntentionStatus::Active;
+        let second_resumption =
+            CommitmentResumption::new(request_id, &blocked, second_intention.id, "dependency ready");
+        let second = store
+            .commit_agent_resume_transition(AgentResumeTransition {
+                blocked_intention: &blocked,
+                replacement_intention: &second_intention,
+                replacement_tasks: std::slice::from_ref(&second_task),
+                resumption: &second_resumption,
+                commitment: &commitment,
+                goal: &goal,
+                outbox_events: &[],
+            })
+            .unwrap();
+        let existing = match second {
+            ResumeCommitResult::AlreadyApplied(existing) => existing,
+            other => panic!("expected AlreadyApplied, got {other:?}"),
+        };
+        assert_eq!(
+            existing.replacement_intention_id,
+            first_intention.id,
+            "the first committed replacement plan owns the request id"
+        );
+
+        let graph = store.get_goal_graph(goal.id).unwrap();
+        assert_eq!(graph.resumptions.len(), 1);
+        assert_eq!(graph.intentions.len(), 2);
+        assert!(graph
+            .intentions
+            .iter()
+            .all(|intention| intention.id != second_intention.id));
+        assert!(graph.tasks.iter().all(|task| task.id != second_task.id));
+
+        let mut other_blocked = blocked.clone();
+        other_blocked.id = Uuid::new_v4();
+        let third_task = Task::new(goal.id, "conflicting resume", ManagerKind::Engineering);
+        let mut third_intention = Intention::new(
+            goal.id,
+            commitment.id,
+            "manager-test",
+            "conflicting resume",
+            vec![third_task.id],
+        );
+        third_intention.status = IntentionStatus::Active;
+        let conflicting = CommitmentResumption::new(
+            request_id,
+            &other_blocked,
+            third_intention.id,
+            "different blocked source",
+        );
+        let err = store
+            .commit_agent_resume_transition(AgentResumeTransition {
+                blocked_intention: &other_blocked,
+                replacement_intention: &third_intention,
+                replacement_tasks: std::slice::from_ref(&third_task),
+                resumption: &conflicting,
+                commitment: &commitment,
+                goal: &goal,
+                outbox_events: &[],
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidTransition(_)));
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn atomic_transition_rejects_cross_goal_records_before_writing() {
         let tmp = std::env::temp_dir().join(format!("nulang-agent-invalid-{}", Uuid::new_v4()));
         let store = SqliteStore::open(&tmp).unwrap();
