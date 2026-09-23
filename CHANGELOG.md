@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### Actor density and mailbox hot-path allocation — 2026-09-23
+- **Idle actors no longer materialize their 16 KiB ORCA bump block at spawn** (`src/runtime/heap.rs`). The configured first-block capacity is preserved, but allocation is deferred until the first small-object heap allocation; LOS-only actors also remain bump-block-free.
+- **Mailbox logical-count atomics use relaxed ordering** (`src/runtime/mailbox.rs`) because Crossbeam `SegQueue` owns message publication/synchronization; the atomic counter remains capacity/accounting state and its modification order still prevents bounded producers from over-reserving.
+- **Criterion now tracks `actor/spawn_idle/1000`** so actor-density allocation changes have a direct throughput regression signal.
+
 ### Actor runtime hot-path overhead reduction — 2026-09-23
 - **Per-actor flight recording is now opt-in for runtime-created actors** (`src/runtime/actor.rs`, `src/runtime/mod.rs`). `NULANG_FLIGHT_RECORDER=1` enables the existing recorder; disabled actors reserve no recorder ring storage and skip payload-summary formatting. Explicit `FlightRecorder::new(...)` callers retain enabled behavior, and accepted messages are recorded only after mailbox admission succeeds.
 - **Bytecode actor turns now reuse the cached VM module index without deep-cloning `CodeModule` on every dispatch** (`src/runtime/mod.rs`). The clone/load cost is paid only when an actor first installs its module into the runtime VM; subsequent turns execute directly against `bytecode_module_idx`. Bytecode format and execution semantics are unchanged.
