@@ -1605,6 +1605,13 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Durable blocked-goal resumption — 2026-09-23
+- **Blocked goals can now be resumed by an idempotent external request** (`crates/nulang-ai-local/`). `LocalRuntime::resume_goal(goal_id, request_id, reason, out)` reactivates the suspended commitment and blocked goal, creates a replacement intention plus task plan, records why execution resumed, and immediately drives the replacement through the same completion/block/failure/replan policy used for new work.
+- **Resume request identity is durable.** `CommitmentResumption` persists a unique external `request_id`, blocked/replacement intention IDs, commitment/goal identity, reason, and timestamp. Repeating the same request after a process restart returns the already-created replacement plan instead of creating a second intention or task set.
+- **Resume state, replacement tasks, resumption evidence, and NLAP events commit atomically.** `AgentResumeTransition` validates that the blocked source, active replacement, tasks, commitment, goal, and resumption record all agree before a single SQLite `IMMEDIATE` transaction writes them and the transactional outbox.
+- **Restart execution preserves the original goal conversation correlation and persisted task order.** Completed replacement tasks are skipped; a task left `Running` at crash time is retried at-least-once rather than assumed complete.
+- **NLAP 1.4.0 adds `goal_resumed` and `commitment_resumed` events** carrying the stable resume request ID and reason, while existing 1.3 envelope compatibility remains intact.
+
 ### Transactional NLAP decision outbox — 2026-09-23
 - **Terminal/revision NLAP events now commit in the same SQLite transaction as the agent decision they describe** (`crates/nulang-ai-local/`). The ordered `nlap_outbox` persists complete event envelopes before commit, and runtime delivery drains pending rows only after state durability is established.
 - **NLAP 1.3.0 adds stable event identity.** New `SwarmEventEnvelope` values carry an `event_id`; the field is optional on deserialization so stored/received 1.2 envelopes remain readable. Outbox retries reuse the exact stored envelope and event id, giving downstream consumers a deduplication key under at-least-once delivery.
