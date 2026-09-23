@@ -168,28 +168,29 @@ fn compute_predecessors(func: &mir::Function) -> HashMap<mir::BlockId, Vec<mir::
     preds
 }
 
+/// Compute successors over normal control flow only.
+///
+/// Handler edges are added separately by `compute_successors`; keeping this
+/// helper separate prevents handler bodies from being mistaken for ordinary
+/// control-flow successors.
+fn compute_normal_successors(func: &mir::Function) -> HashMap<mir::BlockId, Vec<mir::BlockId>> {
+    let mut succs = HashMap::new();
+    for block in &func.blocks {
+        let targets = match &block.terminator {
+            mir::Terminator::Jump(target) => vec![*target],
+            mir::Terminator::Branch { then_, else_, .. } => vec![*then_, *else_],
+            _ => Vec::new(),
+        };
+        succs.insert(block.id, targets);
+    }
+    succs
+}
+
 /// Compute successors of each block for topological traversal.
 fn compute_successors(func: &mir::Function) -> HashMap<mir::BlockId, Vec<mir::BlockId>> {
     let mut succs = compute_normal_successors(func);
     for (src, dst) in effect_handler_edges(func) {
         succs.entry(src).or_default().push(dst);
-    }
-    succs
-}
-
-/// Compute successors over NORMAL control flow only (Jump/Branch), excluding
-/// the effect-handler edges. Used for continuation-liveness: a handler body is
-/// not a normal flow successor, so its effect params must not count as live
-/// into the perform block.
-fn compute_normal_successors(func: &mir::Function) -> HashMap<mir::BlockId, Vec<mir::BlockId>> {
-    let mut succs: HashMap<mir::BlockId, Vec<mir::BlockId>> = HashMap::new();
-    for block in &func.blocks {
-        let targets = match &block.terminator {
-            mir::Terminator::Jump(target) => vec![*target],
-            mir::Terminator::Branch { then_, else_, .. } => vec![*then_, *else_],
-            _ => vec![],
-        };
-        succs.insert(block.id, targets);
     }
     succs
 }
@@ -302,80 +303,43 @@ fn resuming_sites(func: &mir::Function) -> Vec<ResumingSite> {
     out
 }
 
-/// For each resuming `perform` site (block, stmt index), the set of registers
-/// live at the point the perform's continuation begins — i.e. the values the
-/// post-perform code (or the block's successors) read that are NOT redefined
-/// after the perform. Computed by a backward liveness walk per block starting
-/// from each block's live-out set.
+/// For each resuming `perform` site (block, stmt index), return the
+/// registers that must survive across the continuation boundary.
+///
+/// The backend-neutral MIR analysis is the source of truth for continuation
+/// liveness; this adapter only converts LocalIds into AOT register indices.
 fn continuation_live_ins(
     func: &mir::Function,
     sites: &[ResumingSite],
 ) -> HashMap<(mir::BlockId, usize), HashSet<u32>> {
     let local_base = mir::FunctionBuilder::LOCAL_BASE as u32;
-    // NORMAL successors only — the handler body is not a real flow successor,
-    // so its effect params must not be treated as live into the perform block.
-    let succs = compute_normal_successors(func);
-    let live_ins = compute_live_ins(func, local_base, &succs);
-    let live_out = |b: mir::BlockId| -> HashSet<u32> {
-        let mut out = HashSet::new();
-        if let Some(ss) = succs.get(&b) {
-            for s in ss {
-                if let Some(si) = live_ins.get(s) {
-                    out.extend(si.iter().copied());
-                }
-            }
-        }
-        out
-    };
-    // Which (block, idx) are sites.
-    let site_set: HashSet<(mir::BlockId, usize)> = sites.iter().map(|s| (s.block, s.idx)).collect();
+    let wanted: HashSet<(mir::BlockId, usize)> =
+        sites.iter().map(|site| (site.block, site.idx)).collect();
+    let analysis = crate::continuation_analysis::analyze(func);
+    let mut out = HashMap::new();
 
-    let mut out: HashMap<(mir::BlockId, usize), HashSet<u32>> = HashMap::new();
-    for block in &func.blocks {
-        let mut live = live_out(block.id);
-        for i in (0..block.stmts.len()).rev() {
-            let stmt = &block.stmts[i];
-            let key = (block.id, i);
-            if site_set.contains(&key) {
-                // Record the continuation live-in (before this stmt's def).
-                out.insert(key, live.clone());
-            }
-            // Backward transfer: live = (live - defs) ∪ uses.
-            let mut defs: Vec<u32> = Vec::new();
-            let mut uses: Vec<u32> = Vec::new();
-            match stmt {
-                mir::Stmt::Assign { dst, op } => {
-                    defs.push(local_base + dst.0);
-                    uses.extend(stmt_rvalue_uses(op).iter().map(|l| local_base + l.0));
-                }
-                mir::Stmt::StoreFieldNamed { obj, src, .. } => {
-                    uses.push(local_base + obj.0);
-                    uses.push(local_base + src.0);
-                }
-                mir::Stmt::ArrayStore { arr, idx, src } => {
-                    uses.push(local_base + arr.0);
-                    uses.push(local_base + idx.0);
-                    uses.push(local_base + src.0);
-                }
-                mir::Stmt::StateSet { src, .. } => {
-                    uses.push(local_base + src.0);
-                }
-                mir::Stmt::Emit { args, .. } => {
-                    uses.extend(args.iter().map(|a| local_base + a.0));
-                }
-                _ => {}
-            }
-            for d in &defs {
-                live.remove(d);
-            }
-            for u in uses {
-                live.insert(u);
-            }
+    for site in analysis.sites {
+        let key = (site.block, site.stmt_index);
+        if !wanted.contains(&key)
+            || !matches!(
+                site.kind,
+                crate::continuation_analysis::ContinuationKind::ResumingEffect { .. }
+            )
+        {
+            continue;
         }
+
+        out.insert(
+            key,
+            site.live_across
+                .into_iter()
+                .map(|local| local_base + local.0)
+                .collect(),
+        );
     }
+
     out
 }
-
 /// Threaded-slot analysis for multi-site resuming handlers. Returns:
 /// - per-body uniform threaded width;
 /// - per-site "extra" threaded values (the continuation live-ins, minus the
@@ -443,76 +407,9 @@ fn resuming_threading(
     (width, site_extras)
 }
 
-/// Collect the MIR locals a statement's RValue reads (as registers).
+/// Collect the MIR locals an RValue reads.
 fn stmt_rvalue_uses(op: &mir::RValue) -> Vec<mir::LocalId> {
-    let mut out = Vec::new();
-    match op {
-        mir::RValue::Load(l) => out.push(*l),
-        mir::RValue::Panic(_) => {}
-        mir::RValue::LoadFieldNamed { obj, .. } => out.push(*obj),
-        mir::RValue::LoadFieldPos { obj, .. } => out.push(*obj),
-        mir::RValue::ArrayLoad { arr, idx } => {
-            out.push(*arr);
-            out.push(*idx);
-        }
-        mir::RValue::ArrayLen(a) => out.push(*a),
-        mir::RValue::ArrayLit(items) => out.extend_from_slice(items),
-        mir::RValue::Unary(_, l) => out.push(*l),
-        mir::RValue::Binary(_, a, b) => {
-            out.push(*a);
-            out.push(*b);
-        }
-        mir::RValue::StringEq(a, b) | mir::RValue::StrConcat(a, b) => {
-            out.push(*a);
-            out.push(*b);
-        }
-        mir::RValue::Call { args, .. }
-        | mir::RValue::FFICall { args, .. }
-        | mir::RValue::PerformAsync { args, .. } => out.extend_from_slice(args),
-        mir::RValue::Perform { args, .. } => out.extend_from_slice(args),
-        mir::RValue::Closure { captures, .. } => out.extend_from_slice(captures),
-        mir::RValue::Tuple(items) => out.extend_from_slice(items),
-        mir::RValue::Record(fields) => {
-            for (_, v) in fields {
-                out.push(*v);
-            }
-        }
-        mir::RValue::RecordUpdate { base, overrides } => {
-            out.push(*base);
-            for (_, v) in overrides {
-                out.push(*v);
-            }
-        }
-        mir::RValue::SignalWait { .. }
-        | mir::RValue::Receive
-        | mir::RValue::ReceiveMatch { .. }
-        | mir::RValue::ReceiveCommit
-        | mir::RValue::SelfRef
-        | mir::RValue::StateGet { .. } => {}
-        mir::RValue::ReceiveWait { timeout, .. } => out.push(*timeout),
-        mir::RValue::Migrate { actor, node } => {
-            out.push(*actor);
-            out.push(*node);
-        }
-        mir::RValue::CapabilityCheck { val } => out.push(*val),
-        mir::RValue::Spawn {
-            init, target_node, ..
-        } => {
-            if let Some(n) = target_node {
-                out.push(*n);
-            }
-            for (_, rv) in init {
-                out.extend(stmt_rvalue_uses(rv));
-            }
-        }
-        mir::RValue::Send { actor, args, .. } | mir::RValue::Ask { actor, args, .. } => {
-            out.push(*actor);
-            out.extend_from_slice(args);
-        }
-        mir::RValue::Resume(l) => out.push(*l),
-        mir::RValue::Const(_) => {}
-    }
-    out
+    crate::continuation_analysis::rvalue_uses(op)
 }
 
 /// Per-block live-in sets (registers) over the normal + handler CFG, used by

@@ -5,9 +5,10 @@
 //! Actor.send) or no effects stay on the existing `mir_wasm.rs` codegen path.
 //!
 //! Suspension points in MIR are implicit — they are `RValue::ReceiveWait`,
-//! `RValue::SignalWait`, `RValue::Perform("LLM", "ask")`,
-//! `RValue::PerformAsync`, and `RValue::ReceiveMatch` (blocking mailbox
-//! dequeue). CIR makes them explicit as `CirTerminator::SuspendAndYield`.
+//! `RValue::SignalWait`, `RValue::Perform("LLM", "ask")`, and
+//! `RValue::PerformAsync`. The current WasmFX restricted profile also keeps
+//! its pre-existing host-suspension lowering for `ReceiveMatch` until it has
+//! a dedicated non-blocking mailbox host operation.
 //!
 //! Variable mapping: MIR locals use a flat register model. CIR `VarId`s are
 //! the flat Wasm local indices, so `var(local) = pc + local.0` where
@@ -52,16 +53,8 @@ pub fn has_suspension(func: &mir::Function) -> bool {
 
 /// Returns true if this rvalue suspends (or may suspend) the computation.
 pub fn is_suspending_rvalue(op: &RValue) -> bool {
-    match op {
-        RValue::Perform {
-            effect, op, args, ..
-        } => effect == "LLM" && op == "ask" && !args.is_empty(),
-        RValue::SignalWait { .. } => true,
-        RValue::ReceiveWait { .. } => true,
-        RValue::ReceiveMatch { .. } => true,
-        RValue::PerformAsync { .. } => true,
-        _ => false,
-    }
+    crate::continuation_analysis::scheduler_suspend_kind(op).is_some()
+        || matches!(op, RValue::ReceiveMatch { .. })
 }
 
 /// Non-suspending functions produce a CIR with no `SuspendAndYield`
