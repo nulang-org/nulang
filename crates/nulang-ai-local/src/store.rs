@@ -3,8 +3,8 @@
 use chrono::{DateTime, Utc};
 use nulang_ai_core::{
     Commitment, CommitmentStatus, ConversationState, Goal, GoalGraph, GoalStatus, Intention,
-    IntentionRevision, IntentionRevisionDecision, IntentionStatus, ManagerKind, SwarmEventEnvelope,
-    Task, TaskStatus,
+    IntentionRevision, IntentionRevisionDecision, IntentionStatus, ManagerKind, SwarmEvent,
+    SwarmEventEnvelope, Task, TaskStatus,
 };
 use rusqlite::{params, Connection, TransactionBehavior};
 use std::path::{Path, PathBuf};
@@ -931,6 +931,14 @@ mod tests {
             "waiting on dependency",
         );
 
+        let outbox = vec![SwarmEventEnvelope::new(
+            SwarmEvent::GoalBlocked {
+                goal_id: goal.id,
+                reason: "waiting on dependency".into(),
+            },
+            None,
+        )];
+
         let conn = Connection::open(store.db_path()).unwrap();
         conn.execute_batch(
             r#"
@@ -953,7 +961,7 @@ mod tests {
                 revision: Some(&revision),
                 commitment: Some(&commitment),
                 goal: Some(&goal),
-                outbox_events: &[],
+                outbox_events: &outbox,
             })
             .unwrap_err();
         assert!(matches!(err, StoreError::Sqlite(_)));
@@ -964,6 +972,7 @@ mod tests {
         assert_eq!(graph.intentions[0].status, IntentionStatus::Active);
         assert_eq!(graph.commitments[0].status, CommitmentStatus::Active);
         assert!(graph.intention_revisions.is_empty());
+        assert!(store.pending_outbox(10).unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(tmp);
     }
@@ -992,6 +1001,14 @@ mod tests {
             "bounded retry exhausted",
         );
 
+        let outbox = vec![SwarmEventEnvelope::new(
+            SwarmEvent::GoalFailed {
+                goal_id: goal.id,
+                reason: "bounded retry exhausted".into(),
+            },
+            None,
+        )];
+
         store
             .commit_agent_state_transition(AgentStateTransition {
                 terminal_task: Some(&task),
@@ -1000,7 +1017,7 @@ mod tests {
                 revision: Some(&revision),
                 commitment: Some(&commitment),
                 goal: Some(&goal),
-                outbox_events: &[],
+                outbox_events: &outbox,
             })
             .unwrap();
 
@@ -1010,6 +1027,13 @@ mod tests {
         assert_eq!(graph.intentions[0].status, IntentionStatus::Failed);
         assert_eq!(graph.commitments[0].status, CommitmentStatus::Abandoned);
         assert_eq!(graph.intention_revisions, vec![revision]);
+
+        let pending = store.pending_outbox(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        let event_id = pending[0].envelope.event_id.unwrap();
+        assert_eq!(pending[0].envelope, outbox[0]);
+        store.mark_outbox_delivered(event_id).unwrap();
+        assert!(store.pending_outbox(10).unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(tmp);
     }
