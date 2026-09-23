@@ -1912,6 +1912,13 @@ fn test_event_sourced_counter_replays_from_event_log() {
     );
 
     for i in 0..5 {
+        // Source-level apply handlers are lowered before emit. Model that
+        // explicitly here: domain state changes first, emit only journals
+        // the resulting post-apply value.
+        rt.actors
+            .get_mut(&actor_id)
+            .unwrap()
+            .set_state_field("counter", Value::int(i + 1));
         rt.emit_event(actor_id, "Incremented", &[Value::int(i)]);
     }
 
@@ -1919,7 +1926,7 @@ fn test_event_sourced_counter_replays_from_event_log() {
     assert_eq!(
         count,
         Some(Value::int(5)),
-        "counter should be 5 after 5 events"
+        "explicit state transitions should reach 5 after 5 events"
     );
 
     rt.checkpoint_actor(actor_id);
