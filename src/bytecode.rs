@@ -704,6 +704,15 @@ pub struct CodeModule {
     /// installs the set on the new actor for runtime enforcement.
     #[serde(default)]
     pub spawn_capability_grants: Vec<(usize, Vec<String>)>,
+    /// Proven last-use ownership masks for local actor sends.
+    ///
+    /// Each entry maps the bytecode pc of a `Send` instruction to a bitmask
+    /// over its staged arguments (bit 0 = r0). A set bit means MIR proved that
+    /// argument is a fresh/non-aliasing owning value whose final use is this
+    /// send, so the VM may release the sender's local ORCA reference once the
+    /// runtime has established the message's in-flight protection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub send_ownership_masks: Vec<(usize, u16)>,
     #[serde(default)]
     pub remote_spawn_init_fields: Vec<(usize, Vec<String>)>,
     /// Sorted (bytecode pc -> 1-indexed source line) for the DAP server's
@@ -732,6 +741,7 @@ impl CodeModule {
             entry_point: None,
             spawn_init_overrides: Vec::new(),
             spawn_capability_grants: Vec::new(),
+            send_ownership_masks: Vec::new(),
             remote_spawn_init_fields: Vec::new(),
             handler_tables: Vec::new(),
             actor_metadata: Vec::new(),
@@ -826,6 +836,20 @@ impl CodeModule {
 
     pub fn current_offset(&self) -> usize {
         self.instructions.len()
+    }
+
+    /// Return the consuming-ownership mask attached to a local `Send` pc.
+    ///
+    /// Codegen appends entries in instruction order, so binary search keeps
+    /// the interpreter hot path allocation-free. Older .nbc artifacts omit
+    /// this optional metadata and therefore return zero.
+    #[inline]
+    pub fn send_ownership_mask_at(&self, pc: usize) -> u16 {
+        self.send_ownership_masks
+            .binary_search_by_key(&pc, |&(site, _)| site)
+            .ok()
+            .map(|idx| self.send_ownership_masks[idx].1)
+            .unwrap_or(0)
     }
 
     /// Build a CodeModule from bootstrap emitter JSON format.
