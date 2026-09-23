@@ -2884,7 +2884,7 @@ mod tests {
     fn test_par_region_markers_survive_into_mir() {
         let module = lower_source("par { 1; 2; 3 }").unwrap();
         let main = find_fn(&module, "__main");
-        let markers: Vec<crate::primitives::ParallelRegionMarker> = main
+        let markers: Vec<crate::parallel_marker::ParallelRegionMarker> = main
             .blocks
             .iter()
             .flat_map(|b| b.stmts.iter())
@@ -2897,11 +2897,11 @@ mod tests {
         assert_eq!(
             markers,
             vec![
-                crate::primitives::ParallelRegionMarker::Begin { branches: 3 },
-                crate::primitives::ParallelRegionMarker::Branch { index: 0 },
-                crate::primitives::ParallelRegionMarker::Branch { index: 1 },
-                crate::primitives::ParallelRegionMarker::Branch { index: 2 },
-                crate::primitives::ParallelRegionMarker::End,
+                crate::parallel_marker::ParallelRegionMarker::Begin { branches: 3 },
+                crate::parallel_marker::ParallelRegionMarker::Branch { index: 0 },
+                crate::parallel_marker::ParallelRegionMarker::Branch { index: 1 },
+                crate::parallel_marker::ParallelRegionMarker::Branch { index: 2 },
+                crate::parallel_marker::ParallelRegionMarker::End,
             ]
         );
     }
