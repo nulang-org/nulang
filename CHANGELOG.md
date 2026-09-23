@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### WASM component authority unification — 2026-09-23
+- **Wasmtime component host imports now use the typed runtime authority model** (Experimental, `src/wasm_component_runtime.rs`). The backend-specific `Capabilities { allow_log, allow_clock, allow_random }` policy is removed; `ComponentRuntime::new` is deny-by-default and `new_with_authority` accepts the same `AuthorityManifest` used by the actor runtime.
+- **WIT host operations require exact grants at both link and dispatch time.** `IO::Log`, `Time::Now`, and `Random::U64` use typed `AuthorityGrant::Other` entries; sibling grants do not authorize each other, and unauthorized imports are omitted from the linker so component instantiation fails closed.
+- This is a current-`main` replay of the security slice from #552 and introduces no second WASM-specific policy model.
+
+
 ### Actor density and mailbox hot-path allocation — 2026-09-23
 - **Idle actors no longer materialize their 16 KiB ORCA bump block at spawn** (`src/runtime/heap.rs`). The configured first-block capacity is preserved, but allocation is deferred until the first small-object heap allocation; LOS-only actors also remain bump-block-free.
 - **Mailbox logical-count atomics use relaxed ordering** (`src/runtime/mailbox.rs`) because Crossbeam `SegQueue` owns message publication/synchronization; the atomic counter remains capacity/accounting state and its modification order still prevents bounded producers from over-reserving.
