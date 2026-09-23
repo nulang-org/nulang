@@ -28,6 +28,7 @@
 //! returns via native `ret`. Control flow (jumps) is compiled to native
 //! branches.
 
+mod call_liveness;
 mod compiler;
 pub mod helpers;
 pub mod runtime;
@@ -38,6 +39,7 @@ pub mod typed_compiler;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use call_liveness::NativeCallSite;
 pub use compiler::*;
 
 use cranelift::prelude::*;
@@ -321,13 +323,13 @@ impl JitSession {
     /// The returned function pointer is valid for the lifetime of this
     /// `JitSession`. The bytecode must not be modified while JIT code is
     /// executing.
-    pub unsafe fn compile_region(
+    pub(crate) unsafe fn compile_region(
         &mut self,
         module_idx: usize,
         start_offset: usize,
         num_instrs: usize,
         instructions: &[crate::bytecode::Instruction],
-        native_calls: &std::collections::HashMap<usize, usize>,
+        native_calls: &std::collections::HashMap<usize, NativeCallSite>,
     ) -> Option<JitFunctionPtr> {
         // Check if already compiled
         if let Some((ptr, _)) = self.compiled_entry(module_idx, start_offset) {
@@ -367,14 +369,14 @@ impl JitSession {
     ///
     /// # Safety
     /// Same safety requirements as `compile_region`.
-    pub unsafe fn compile_region_typed(
+    pub(crate) unsafe fn compile_region_typed(
         &mut self,
         module_idx: usize,
         start_offset: usize,
         num_instrs: usize,
         instructions: &[crate::bytecode::Instruction],
         type_metadata: Option<&crate::jit::typed_compiler::TypeMetadata>,
-        native_calls: &std::collections::HashMap<usize, usize>,
+        native_calls: &std::collections::HashMap<usize, NativeCallSite>,
     ) -> Option<JitFunctionPtr> {
         // Check if already compiled
         if let Some((ptr, _)) = self.compiled_entry(module_idx, start_offset) {
@@ -929,17 +931,19 @@ pub(crate) fn native_direct_call(
 
 /// Like [`find_compilable_region`], but additionally continues past `Call`
 /// instructions whose direct callee is provably non-suspending, returning the
-/// region length and the map of (absolute pc -> direct callee func index) for
-/// the calls that were folded into the region. The caller passes this map to
-/// the scalar compiler so it can emit `nulang_jit_direct_call` at those pcs.
+/// region length and per-call metadata for calls folded into the region.
+/// Each entry records the direct callee and the caller registers live across
+/// that call. The current helper path consumes only the callee; the save set
+/// is the correctness input for the next native JIT-to-JIT call ABI slice.
 pub(crate) fn find_compilable_region_with_calls(
     offset: usize,
     instructions: &[crate::bytecode::Instruction],
     module: &crate::bytecode::CodeModule,
     may_suspend: Option<&[bool]>,
     recursive: Option<&[bool]>,
-) -> (usize, std::collections::HashMap<usize, usize>) {
+) -> (usize, std::collections::HashMap<usize, NativeCallSite>) {
     let mut native_calls = std::collections::HashMap::new();
+    let mut live_out = None;
     let mut len = 0;
     let mut first_branch: Option<usize> = None;
     let mut has_back_edge = false;
@@ -948,7 +952,16 @@ pub(crate) fn find_compilable_region_with_calls(
         if op == crate::bytecode::OpCode::Call {
             match native_direct_call(module, i, may_suspend, recursive) {
                 Some(idx) => {
-                    native_calls.insert(i, idx);
+                    let live = live_out
+                        .get_or_insert_with(|| call_liveness::compute_live_out(instructions));
+                    let caller_save = call_liveness::caller_save_set(instructions, live, i);
+                    native_calls.insert(
+                        i,
+                        NativeCallSite {
+                            callee: idx,
+                            caller_save,
+                        },
+                    );
                 }
                 None => break, // indirect / suspending / recursive call — stop
             }

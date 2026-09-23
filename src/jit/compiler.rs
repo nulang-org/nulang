@@ -30,6 +30,7 @@ use cranelift_jit::JITModule;
 use cranelift_module::{Linkage, Module};
 
 use crate::bytecode::{Instruction, OpCode};
+use crate::jit::NativeCallSite;
 use crate::runtime::heap::{ActorHeap, OrcaHeader, TypeTag};
 use crate::value_layout::{PAYLOAD_MASK, TAG_INT, TAG_MASK, TAG_NIL, TAG_PTR};
 
@@ -218,7 +219,7 @@ pub(crate) fn emit_yield_pc(
 /// runs on the interpreter frame stack). Any other `Call` in the region is a
 /// compile error — `find_compilable_region_with_calls` only accepts regions
 /// whose `Call` sites are all in this map.
-pub fn compile_bytecode_region(
+pub(crate) fn compile_bytecode_region(
     module: &mut JITModule,
     builder_context: &mut FunctionBuilderContext,
     ctx: &mut codegen::Context,
@@ -226,7 +227,7 @@ pub fn compile_bytecode_region(
     start_offset: usize,
     num_instrs: usize,
     instructions: &[Instruction],
-    native_calls: &HashMap<usize, usize>,
+    native_calls: &HashMap<usize, NativeCallSite>,
 ) -> Result<*const u8, CompileError> {
     ctx.clear();
 
@@ -706,7 +707,14 @@ pub fn compile_bytecode_region(
                 // completion via the re-entrant `nulang_jit_direct_call`
                 // helper while this region stays resident in native code.
                 let func_idx = match native_calls.get(&pc) {
-                    Some(&idx) => idx as i64,
+                    Some(site) => {
+                        // caller_save is intentionally metadata-only in this
+                        // slice. The helper-backed call below already preserves
+                        // caller state through an interpreter frame; the next
+                        // native JIT-to-JIT ABI consumes this save set.
+                        let _ = site.caller_save;
+                        site.callee as i64
+                    }
                     None => {
                         return Err(CompileError::Internal(
                             "Call in compiled region without a native-call entry".into(),
