@@ -726,7 +726,8 @@ fn insert_outbox_event_conn(
     let event_id = envelope.event_id.ok_or(StoreError::InvalidTransition(
         "outbox event is missing a stable event id",
     ))?;
-    conn.execute(
+    let envelope_json = serde_json::to_string(envelope)?;
+    let inserted = conn.execute(
         r#"INSERT INTO nlap_outbox (
             event_id, envelope_json, created_at, delivered_at
         ) VALUES (?1,?2,?3,NULL)
@@ -734,10 +735,24 @@ fn insert_outbox_event_conn(
         "#,
         params![
             event_id.to_string(),
-            serde_json::to_string(envelope)?,
+            envelope_json,
             envelope.ts.to_rfc3339(),
         ],
     )?;
+
+    if inserted == 0 {
+        let existing: String = conn.query_row(
+            "SELECT envelope_json FROM nlap_outbox WHERE event_id = ?1",
+            params![event_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if existing != envelope_json {
+            return Err(StoreError::InvalidTransition(
+                "outbox event id conflicts with different payload",
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -1033,6 +1048,39 @@ mod tests {
         assert_eq!(pending.len(), 1);
         let event_id = pending[0].envelope.event_id.unwrap();
         assert_eq!(pending[0].envelope, outbox[0]);
+
+        store
+            .commit_agent_state_transition(AgentStateTransition {
+                terminal_task: Some(&task),
+                intention: &intention,
+                replacement_intention: None,
+                revision: Some(&revision),
+                commitment: Some(&commitment),
+                goal: Some(&goal),
+                outbox_events: &outbox,
+            })
+            .unwrap();
+        assert_eq!(store.pending_outbox(10).unwrap().len(), 1);
+
+        let mut conflicting = outbox[0].clone();
+        conflicting.event = SwarmEvent::GoalFailed {
+            goal_id: goal.id,
+            reason: "different payload".into(),
+        };
+        let err = store
+            .commit_agent_state_transition(AgentStateTransition {
+                terminal_task: Some(&task),
+                intention: &intention,
+                replacement_intention: None,
+                revision: Some(&revision),
+                commitment: Some(&commitment),
+                goal: Some(&goal),
+                outbox_events: &[conflicting],
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidTransition(_)));
+        assert_eq!(store.pending_outbox(10).unwrap()[0].envelope, outbox[0]);
+
         store.mark_outbox_delivered(event_id).unwrap();
         assert!(store.pending_outbox(10).unwrap().is_empty());
 
