@@ -4644,7 +4644,15 @@ impl Runtime {
                     context,
                 } => {
                     if self.actor_is_workflow(target_actor) {
-                        let _ = self.append_timer_fired(target_actor, &context);
+                        if let Err(error) = self.append_timer_fired(target_actor, &context) {
+                            warn!(
+                                target_actor,
+                                timer = %context,
+                                %error,
+                                "nulang-persist: refusing to deliver fired workflow timer without durable commit"
+                            );
+                            continue;
+                        }
                     }
                     self.send_message_by_id(target_actor, behavior_id, &payload);
                 }
@@ -4931,7 +4939,15 @@ impl Runtime {
                 // Compensation failed: do not record it as completed.
                 continue;
             }
-            let _ = self.append_saga_compensated(actor_id, &step_name);
+            if let Err(error) = self.append_saga_compensated(actor_id, &step_name) {
+                warn!(
+                    actor_id,
+                    step = %step_name,
+                    %error,
+                    "nulang-persist: compensation ran but completion could not be durably committed"
+                );
+                continue;
+            }
             if let Some(actor) = self.actors.get_mut(&actor_id) {
                 if !actor.compensated_steps.contains(&step_name) {
                     actor.compensated_steps.push(step_name);
