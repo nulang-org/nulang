@@ -148,6 +148,57 @@ fn test_spawn_send_step_sequence() {
 }
 
 #[test]
+fn burst_send_has_single_ready_queue_entry() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("handle", |_actor, _args| {});
+
+    for _ in 0..1_000 {
+        rt.send_message_by_id(actor_id, 0, &[Value::int(1)]);
+    }
+
+    assert_eq!(rt.actors[&actor_id].mailbox.len(), 1_000);
+    assert_eq!(rt.actors[&actor_id].run_state, ActorRunState::Queued);
+
+    assert_eq!(rt.claim_next_ready_actor(), Some(actor_id));
+    assert!(
+        rt.scheduler.dequeue().is_none(),
+        "one actor burst must occupy only one ready-queue slot"
+    );
+    rt.finish_actor_turn(actor_id);
+}
+
+#[test]
+fn adaptive_actor_turn_drains_burst_without_duplicate_wakeups() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("inc", |actor, _args| {
+            let next = actor
+                .get_state_field("count")
+                .and_then(|value| value.as_int())
+                .unwrap_or(0)
+                + 1;
+            actor.set_state_field("count", Value::int(next));
+        });
+
+    for _ in 0..1_000 {
+        rt.send_message_by_id(actor_id, 0, &[]);
+    }
+    rt.run_scheduler();
+
+    let actor = &rt.actors[&actor_id];
+    assert_eq!(actor.get_state_field("count"), Some(Value::int(1_000)));
+    assert!(actor.mailbox.is_empty());
+    assert_eq!(actor.run_state, ActorRunState::Idle);
+}
+
+#[test]
 fn test_mailbox_push_pop() {
     let mut mb = Mailbox::new(4);
     let msg = Message {
