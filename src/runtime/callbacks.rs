@@ -2402,6 +2402,8 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                 let snapshot = crate::runtime::persistence::ActorSnapshot {
                     actor_id,
                     sequence: actor.sequence,
+                    schema_owner: actor.schema_owner.clone(),
+                    schema_version: actor.schema_version,
                     state,
                     waiting_signal: actor.waiting_signal.clone(),
                     crdt_snapshot,
