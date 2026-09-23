@@ -1016,13 +1016,30 @@ pub fn unregister_aot_actor(id: u64) {
     });
 }
 
-/// Invoke an AOT-compiled behavior with a boxed payload (arity-matched). The
-/// target is the `AOT_DISPATCH` thread-local armed by the driver/scheduler.
+/// Invoke an AOT-compiled behavior with a boxed payload.
+///
+/// Most actor messages carry at most four values. Pack those raw words into
+/// stack storage so native dispatch does not allocate just to cross the stable
+/// actor-entry ABI. Larger arities retain the allocation-backed fallback.
 fn call_aot_behavior(
     ptr: *const u8,
     actor_id: u64,
-    raw: &[u64],
+    args: &[crate::vm::Value],
 ) -> crate::native_abi::NativeActorStatus {
+    const INLINE_ARGS: usize = 4;
+
+    let mut inline = [0u64; INLINE_ARGS];
+    let owned;
+    let raw: &[u64] = if args.len() <= INLINE_ARGS {
+        for (slot, value) in inline.iter_mut().zip(args.iter()) {
+            *slot = value.as_raw();
+        }
+        &inline[..args.len()]
+    } else {
+        owned = args.iter().map(|value| value.as_raw()).collect::<Vec<_>>();
+        &owned
+    };
+
     let mut ctx = crate::native_abi::NativeActorContext::new(actor_id, raw);
     // SAFETY: `ptr` is a finalized wrapper produced by
     // `compile_actor_entry_wrapper` and therefore has exactly the
@@ -1031,6 +1048,49 @@ fn call_aot_behavior(
     let raw_status = unsafe { entry(&mut ctx) };
     crate::native_abi::NativeActorStatus::from_raw(raw_status)
         .unwrap_or(crate::native_abi::NativeActorStatus::Faulted)
+}
+
+/// Dispatch a runtime-owned AOT actor behavior directly through the stable
+/// native actor-entry ABI.
+///
+/// Unlike `aot_behavior_adapter`, this path does not use `AOT_DISPATCH`
+/// thread-local target handoff. The caller must hold the runtime's exclusive
+/// scheduler ownership and must not keep Rust borrows into the runtime across
+/// this call; native callbacks re-enter the runtime through `runtime`.
+pub fn dispatch_aot_runtime_behavior(
+    target: AotDispatchTarget,
+    runtime: *mut crate::runtime::Runtime,
+    actor_id: u64,
+    args: &[crate::vm::Value],
+) -> crate::native_abi::NativeActorStatus {
+    assert!(
+        !target.fn_ptr.is_null(),
+        "dispatch_aot_runtime_behavior: null fn ptr"
+    );
+    assert!(
+        !target.module.is_null(),
+        "dispatch_aot_runtime_behavior: null module ptr"
+    );
+    assert!(
+        !runtime.is_null(),
+        "dispatch_aot_runtime_behavior: null runtime ptr"
+    );
+
+    // SAFETY: AotDispatchTarget.module points into Runtime::aot_module_storage,
+    // whose boxed modules remain stable for the Runtime lifetime. The runtime
+    // pointer is the caller's live exclusive scheduler borrow.
+    unsafe {
+        crate::jit::runtime::aot_set_constants((*target.module).constants());
+        set_aot_module_ctx(&*target.module);
+    }
+
+    let mut callbacks = AotRuntimeCallbacks { runtime, actor_id };
+    unsafe { crate::jit::runtime::set_jit_callbacks(&mut callbacks) };
+    let status = call_aot_behavior(target.fn_ptr, actor_id, args);
+    crate::jit::runtime::clear_jit_callbacks();
+    crate::jit::runtime::aot_clear_constants();
+    clear_aot_module_ctx();
+    status
 }
 
 /// `Actor::register_behavior` handler that runs the actor's current message
@@ -1050,7 +1110,6 @@ pub fn aot_behavior_adapter(actor: &mut crate::runtime::Actor, args: &[crate::vm
         "aot_behavior_adapter: null fn ptr"
     );
 
-    let raw: Vec<u64> = args.iter().map(|v| v.as_raw()).collect();
     if target.runtime.is_null() {
         // SAFETY: `actor` outlives the native call; `cb` holds a raw pointer
         // to it (mirroring `BytecodeRuntimeCallbacks`) so the `dyn
@@ -1060,7 +1119,7 @@ pub fn aot_behavior_adapter(actor: &mut crate::runtime::Actor, args: &[crate::vm
             actor: actor as *mut crate::runtime::Actor,
         };
         unsafe { crate::jit::runtime::set_jit_callbacks(&mut cb) };
-        let status = call_aot_behavior(target.fn_ptr, actor.id, &raw);
+        let status = call_aot_behavior(target.fn_ptr, actor.id, args);
         if status != crate::native_abi::NativeActorStatus::Completed {
             tracing::warn!(
                 actor_id = actor.id,
@@ -1071,15 +1130,8 @@ pub fn aot_behavior_adapter(actor: &mut crate::runtime::Actor, args: &[crate::vm
         crate::jit::runtime::clear_jit_callbacks();
         crate::jit::runtime::aot_clear_constants();
     } else {
-        // SAFETY: the scheduler holds `&mut Runtime` while dispatching, so the
-        // raw pointer is a live, exclusively-borrowed handle; the callback is
-        // cleared before the borrow (and dispatch) ends.
-        let mut cb = AotRuntimeCallbacks {
-            runtime: target.runtime,
-            actor_id: actor.id,
-        };
-        unsafe { crate::jit::runtime::set_jit_callbacks(&mut cb) };
-        let status = call_aot_behavior(target.fn_ptr, actor.id, &raw);
+        let status =
+            dispatch_aot_runtime_behavior(target, target.runtime, actor.id, args);
         if status != crate::native_abi::NativeActorStatus::Completed {
             tracing::warn!(
                 actor_id = actor.id,
@@ -1087,8 +1139,6 @@ pub fn aot_behavior_adapter(actor: &mut crate::runtime::Actor, args: &[crate::vm
                 "native actor entry returned a non-completed status"
             );
         }
-        crate::jit::runtime::clear_jit_callbacks();
-        crate::jit::runtime::aot_clear_constants();
     }
 }
 
