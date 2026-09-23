@@ -451,9 +451,7 @@ fn add_row(out: &mut BTreeMap<String, Effect>, row: &crate::types::EffectRow) {
     }
 }
 
-fn actor_and_durability_declarations(
-    decls: &[Decl],
-) -> (Vec<ActorDecl>, Vec<DurabilityDecl>) {
+fn actor_and_durability_declarations(decls: &[Decl]) -> (Vec<ActorDecl>, Vec<DurabilityDecl>) {
     let mut actors = BTreeMap::new();
     let mut durability = BTreeMap::new();
 
@@ -487,7 +485,10 @@ fn actor_and_durability_declarations(
         }
     }
 
-    (actors.into_values().collect(), durability.into_values().collect())
+    (
+        actors.into_values().collect(),
+        durability.into_values().collect(),
+    )
 }
 
 fn replay_declarations(effects: &[EffectDecl]) -> Vec<ReplayDecl> {
@@ -499,9 +500,7 @@ fn replay_declarations(effects: &[EffectDecl]) -> Vec<ReplayDecl> {
                 EffectReplay::None => ReplayClass::Pure,
                 EffectReplay::Safe => ReplayClass::LocalReplaySafe,
                 EffectReplay::RequiresJournal => ReplayClass::JournalResult,
-                EffectReplay::RequiresIdempotencyKey => {
-                    ReplayClass::ExternalRequiresIdempotencyKey
-                }
+                EffectReplay::RequiresIdempotencyKey => ReplayClass::ExternalRequiresIdempotencyKey,
                 EffectReplay::Nonreplayable => ReplayClass::ExternalNonreplayable,
             },
         })
