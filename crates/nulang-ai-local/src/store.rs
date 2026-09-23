@@ -3,7 +3,8 @@
 use chrono::{DateTime, Utc};
 use nulang_ai_core::{
     Commitment, CommitmentStatus, ConversationState, Goal, GoalGraph, GoalStatus, Intention,
-    IntentionRevision, IntentionRevisionDecision, IntentionStatus, ManagerKind, Task, TaskStatus,
+    IntentionRevision, IntentionRevisionDecision, IntentionStatus, ManagerKind, SwarmEventEnvelope,
+    Task, TaskStatus,
 };
 use rusqlite::{params, Connection, TransactionBehavior};
 use std::path::{Path, PathBuf};
@@ -33,6 +34,14 @@ pub struct AgentStateTransition<'a> {
     pub revision: Option<&'a IntentionRevision>,
     pub commitment: Option<&'a Commitment>,
     pub goal: Option<&'a Goal>,
+    pub outbox_events: &'a [SwarmEventEnvelope],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutboxEventRecord {
+    pub sequence: i64,
+    pub envelope: SwarmEventEnvelope,
+    pub delivered_at: Option<DateTime<Utc>>,
 }
 
 pub struct SqliteStore {
@@ -129,6 +138,15 @@ impl SqliteStore {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS nlap_outbox (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                envelope_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                delivered_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS nlap_outbox_pending_idx
+                ON nlap_outbox(delivered_at, sequence);
             "#,
         )?;
         Ok(())
@@ -191,8 +209,53 @@ impl SqliteStore {
         if let Some(goal) = transition.goal {
             upsert_goal_conn(&tx, goal)?;
         }
+        for envelope in transition.outbox_events {
+            insert_outbox_event_conn(&tx, envelope)?;
+        }
 
         tx.commit()?;
+        Ok(())
+    }
+
+    pub fn pending_outbox(&self, limit: usize) -> Result<Vec<OutboxEventRecord>, StoreError> {
+        let conn = Connection::open(&self.path)?;
+        let mut stmt = conn.prepare(
+            "SELECT sequence, envelope_json, delivered_at
+             FROM nlap_outbox
+             WHERE delivered_at IS NULL
+             ORDER BY sequence ASC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            let sequence: i64 = row.get(0)?;
+            let envelope_json: String = row.get(1)?;
+            let delivered_at = row
+                .get::<_, Option<String>>(2)?
+                .and_then(|raw| DateTime::parse_from_rfc3339(&raw).ok())
+                .map(|ts| ts.with_timezone(&Utc));
+            Ok((sequence, envelope_json, delivered_at))
+        })?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            let (sequence, envelope_json, delivered_at) = row?;
+            events.push(OutboxEventRecord {
+                sequence,
+                envelope: serde_json::from_str(&envelope_json)?,
+                delivered_at,
+            });
+        }
+        Ok(events)
+    }
+
+    pub fn mark_outbox_delivered(&self, event_id: Uuid) -> Result<(), StoreError> {
+        let conn = Connection::open(&self.path)?;
+        conn.execute(
+            "UPDATE nlap_outbox
+             SET delivered_at = COALESCE(delivered_at, ?2)
+             WHERE event_id = ?1",
+            params![event_id.to_string(), Utc::now().to_rfc3339()],
+        )?;
         Ok(())
     }
 
@@ -495,6 +558,16 @@ fn validate_agent_state_transition(
         }
     }
 
+    if transition
+        .outbox_events
+        .iter()
+        .any(|envelope| envelope.event_id.is_none())
+    {
+        return Err(StoreError::InvalidTransition(
+            "outbox event is missing a stable event id",
+        ));
+    }
+
     Ok(())
 }
 
@@ -641,6 +714,28 @@ fn insert_intention_revision_conn(
             revision_decision_str(&revision.decision),
             revision.reason,
             revision.created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_outbox_event_conn(
+    conn: &Connection,
+    envelope: &SwarmEventEnvelope,
+) -> Result<(), StoreError> {
+    let event_id = envelope.event_id.ok_or(StoreError::InvalidTransition(
+        "outbox event is missing a stable event id",
+    ))?;
+    conn.execute(
+        r#"INSERT INTO nlap_outbox (
+            event_id, envelope_json, created_at, delivered_at
+        ) VALUES (?1,?2,?3,NULL)
+        ON CONFLICT(event_id) DO NOTHING
+        "#,
+        params![
+            event_id.to_string(),
+            serde_json::to_string(envelope)?,
+            envelope.ts.to_rfc3339(),
         ],
     )?;
     Ok(())
@@ -858,6 +953,7 @@ mod tests {
                 revision: Some(&revision),
                 commitment: Some(&commitment),
                 goal: Some(&goal),
+                outbox_events: &[],
             })
             .unwrap_err();
         assert!(matches!(err, StoreError::Sqlite(_)));
@@ -904,6 +1000,7 @@ mod tests {
                 revision: Some(&revision),
                 commitment: Some(&commitment),
                 goal: Some(&goal),
+                outbox_events: &[],
             })
             .unwrap();
 
@@ -933,6 +1030,7 @@ mod tests {
                 revision: None,
                 commitment: Some(&commitment),
                 goal: Some(&goal),
+                outbox_events: &[],
             })
             .unwrap_err();
         assert!(matches!(err, StoreError::InvalidTransition(_)));
