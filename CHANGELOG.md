@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### Effect-boundary observability metadata — 2026-09-23
+- **Effect durability semantics now have canonical low-cardinality observability labels** (`src/primitives.rs`) for runtime-owned, backend-owned, external, at-least-once, effectively-once-with-deduplication, and backend-defined execution.
+- **Trace contexts can create explicit effect spans** (`src/runtime/trace.rs`) carrying actor identity, effect name, boundary, delivery semantics, optional stable operation/idempotency identity, and the existing W3C trace hierarchy.
+- Call sites must provide the guarantee they actually enforce; tracing does not infer or strengthen semantics from an effect name. This is a current-`main` extraction of #350.
+
+
 ### Actor density and mailbox hot-path allocation — 2026-09-23
 - **Idle actors no longer materialize their 16 KiB ORCA bump block at spawn** (`src/runtime/heap.rs`). The configured first-block capacity is preserved, but allocation is deferred until the first small-object heap allocation; LOS-only actors also remain bump-block-free.
 - **Mailbox logical-count atomics use relaxed ordering** (`src/runtime/mailbox.rs`) because Crossbeam `SegQueue` owns message publication/synchronization; the atomic counter remains capacity/accounting state and its modification order still prevents bounded producers from over-reserving.
