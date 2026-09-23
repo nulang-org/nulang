@@ -3756,11 +3756,27 @@ mod tests {
         let ptr = aot
             .fn_ptr_for_behavior("Doubler.double")
             .expect("behavior 'double' should be compiled");
-        // Boxed calling convention: extern "C" fn(u64) -> u64.
-        let f: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(ptr) };
-        let result = f(crate::vm::Value::int(21).as_raw());
-        let got = unsafe { crate::vm::Value::from_bits(result) }.as_int();
+        let payload = [crate::vm::Value::int(21).as_raw()];
+        let mut ctx = crate::native_abi::NativeActorContext::new(0, &payload);
+        let entry: crate::native_abi::NativeActorEntry =
+            unsafe { std::mem::transmute(ptr) };
+        let status = unsafe { entry(&mut ctx) };
+        assert_eq!(
+            crate::native_abi::NativeActorStatus::from_raw(status),
+            Some(crate::native_abi::NativeActorStatus::Completed)
+        );
+        let got = unsafe { crate::vm::Value::from_bits(ctx.result) }.as_int();
         assert_eq!(got, Some(42));
+
+        // The wrapper rejects malformed deliveries before calling the
+        // arity-specific internal function, avoiding an ABI mismatch/UB.
+        let empty: [u64; 0] = [];
+        let mut bad_ctx = crate::native_abi::NativeActorContext::new(0, &empty);
+        let status = unsafe { entry(&mut bad_ctx) };
+        assert_eq!(
+            crate::native_abi::NativeActorStatus::from_raw(status),
+            Some(crate::native_abi::NativeActorStatus::BadArity)
+        );
     }
 
     #[test]
