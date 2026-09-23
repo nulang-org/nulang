@@ -3944,6 +3944,12 @@ impl VM {
             self.jit_session.is_none(),
             "re-entrant JIT direct call entered while VM still owns the JIT backend"
         );
+        debug_assert!(
+            self.jit_reg_scratch
+                .get(caller_idx)
+                .map_or(true, Option::is_none),
+            "re-entrant JIT direct call entered while VM still owns active register scratch"
+        );
 
         // The callee lives in the same module as the caller (function_table
         // is per-module; direct calls are within-module).
