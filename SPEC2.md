@@ -2309,14 +2309,12 @@ entry. `read` materializes the value back into `state_data`, so `self.field`
 reads stay consistent. `.nula`-level conformance coverage lives in
 `conformance/behavior/crdt_*.nula`.
 
-**Recovery limitation:** `recover_actor` restores the materialized
-`state_data` value and the `CrdtManager` entries from `crdt_snapshot`, but
-does not rebuild `CrdtManager.field_map` (the `(actor_id, field_name) →
-CrdtId` link is not persisted). On a recovered actor, `self.field` still
-reads the materialized value, but `perform Crdt.*` is a silent nil no-op
-until the field is re-registered. Pinned by
-`test_crdt_field_survives_recovery` (a post-recovery `Crdt.increment`
-leaves `state_data["count"]` unchanged).
+**Recovery status (fixed):** snapshots persist both CRDT replica state and
+the per-actor field-to-`CrdtId` mapping. `recover_actor` restores the CRDT
+entries, rebuilds `CrdtManager.field_map` and `field_reverse`, then
+idempotently re-registers declared CRDT fields after actor metadata is restored.
+As a result, `perform Crdt.*` continues to target the same recovered replica
+instead of degrading to a silent nil no-op after restart.
 ---
 
 # Chapter 10: Workflows
