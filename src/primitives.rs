@@ -291,6 +291,149 @@ impl crate::runtime::TimerMessage {
     }
 }
 
+/// Kind of durable suspension visible through the executor-neutral wait contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DurableWaitKind {
+    /// An externally supplied named signal may resume the computation.
+    Signal,
+    /// Runtime time/timer machinery owns the wake-up.
+    Timer,
+    /// A runtime-mediated external effect (for example an in-flight model call)
+    /// owns completion. Callers may observe but cannot manually wake it.
+    ExternalEffect,
+}
+
+/// Which subsystem is allowed to resolve a durable wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DurableWakeAuthority {
+    ExternalCaller,
+    RuntimeTime,
+    EffectCompletion,
+}
+
+impl DurableWaitKind {
+    pub const fn wake_authority(self) -> DurableWakeAuthority {
+        match self {
+            Self::Signal => DurableWakeAuthority::ExternalCaller,
+            Self::Timer => DurableWakeAuthority::RuntimeTime,
+            Self::ExternalEffect => DurableWakeAuthority::EffectCompletion,
+        }
+    }
+
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Signal => 1,
+            Self::Timer => 2,
+            Self::ExternalEffect => 3,
+        }
+    }
+}
+
+/// Stable semantic identity for one durable suspension.
+///
+/// The id is derived rather than persisted. Existing snapshot/journal formats
+/// therefore remain unchanged while independent hosts can refer to the same
+/// logical wait across restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DurableWaitId([u8; 16]);
+
+impl DurableWaitId {
+    pub fn derive(owner_id: u64, generation: u64, kind: DurableWaitKind, key: &str) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"nulang-durable-wait-v1\0");
+        hasher.update(&owner_id.to_le_bytes());
+        hasher.update(&generation.to_le_bytes());
+        hasher.update(&[kind.tag()]);
+        hasher.update(&(key.len() as u64).to_le_bytes());
+        hasher.update(key.as_bytes());
+        let digest = hasher.finalize();
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest.as_bytes()[..16]);
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    pub fn to_hex(self) -> String {
+        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
+impl std::fmt::Display for DurableWaitId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Representation-independent durable suspension.
+///
+/// `generation` is a semantic epoch selected by the host adapter: workflow
+/// signal/effect waits use the durable step index, while durable timers use
+/// the journal sequence of their `TimerSet` event. It is intentionally not
+/// named "sequence" because the underlying persistence sequence may advance
+/// for unrelated events without changing the logical wait.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DurableWait {
+    pub id: DurableWaitId,
+    pub owner_id: u64,
+    pub generation: u64,
+    pub kind: DurableWaitKind,
+    pub key: String,
+    pub duration_ms: Option<u64>,
+}
+
+impl DurableWait {
+    pub fn new(
+        owner_id: u64,
+        generation: u64,
+        kind: DurableWaitKind,
+        key: impl Into<String>,
+    ) -> Self {
+        let key = key.into();
+        Self {
+            id: DurableWaitId::derive(owner_id, generation, kind, &key),
+            owner_id,
+            generation,
+            kind,
+            key,
+            duration_ms: None,
+        }
+    }
+
+    pub fn timer(
+        owner_id: u64,
+        generation: u64,
+        key: impl Into<String>,
+        duration_ms: u64,
+    ) -> Self {
+        let mut wait = Self::new(owner_id, generation, DurableWaitKind::Timer, key);
+        wait.duration_ms = Some(duration_ms);
+        wait
+    }
+
+    pub const fn wake_authority(&self) -> DurableWakeAuthority {
+        self.kind.wake_authority()
+    }
+}
+
+/// Outcome of attempting to resolve a wait through the generic runtime API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableWakeResult {
+    /// The exact current wait was durably signaled and resumed.
+    Woken,
+    /// The owner exists but that wait is no longer current.
+    AlreadyResolved,
+    /// The wait kind is runtime/backend-owned and rejects manual waking.
+    NotExternallyWakeable,
+    /// The logical owner is not resident in this runtime.
+    OwnerMissing,
+}
+
 /// Durability boundary for a side effect.
 ///
 /// This is deliberately narrower than an "exactly once" claim. Nulang can
@@ -320,6 +463,27 @@ pub enum DeliverySemantics {
     /// The guarantee is delegated to a configured backend and must not be
     /// strengthened by the language/runtime documentation.
     BackendDefined,
+}
+
+#[cfg(test)]
+mod durable_wait_tests {
+    use super::*;
+
+    #[test]
+    fn durable_wait_identity_is_stable_and_semantic() {
+        let a = DurableWait::new(42, 7, DurableWaitKind::Signal, "approval");
+        let same = DurableWait::new(42, 7, DurableWaitKind::Signal, "approval");
+        let next_generation = DurableWait::new(42, 8, DurableWaitKind::Signal, "approval");
+        let timer = DurableWait::timer(42, 7, "approval", 1000);
+
+        assert_eq!(a.id, same.id);
+        assert_ne!(a.id, next_generation.id);
+        assert_ne!(a.id, timer.id);
+        assert_eq!(a.id.to_hex().len(), 32);
+        assert_eq!(a.wake_authority(), DurableWakeAuthority::ExternalCaller);
+        assert_eq!(timer.wake_authority(), DurableWakeAuthority::RuntimeTime);
+        assert_eq!(timer.duration_ms, Some(1000));
+    }
 }
 
 #[cfg(test)]
