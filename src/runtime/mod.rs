@@ -179,6 +179,11 @@ const LLM_SUSPEND_MARKER: &str = "__llm_ask_pending__";
 /// dehydration.
 const DEHYDRATE_CHECK_INTERVAL: u64 = 50;
 
+/// Backoff before retrying a durable workflow timer whose TimerFired commit
+/// could not be persisted. The durable TimerSet remains authoritative, so the
+/// live runtime must keep retrying rather than lose the timer until restart.
+const DURABLE_TIMER_COMMIT_RETRY_MS: u64 = 100;
+
 /// Choose the `waiting_signal` value for a freshly captured suspension:
 /// the awaited signal's name for a signal wait, or the reserved LLM
 /// marker for a workflow step suspended on a background LLM call (plain
@@ -4651,6 +4656,11 @@ impl Runtime {
                                 %error,
                                 "nulang-persist: refusing to deliver fired workflow timer without atomic durable commit"
                             );
+                            self.rearm_timer(
+                                target_actor,
+                                &context,
+                                DURABLE_TIMER_COMMIT_RETRY_MS,
+                            );
                             continue;
                         }
                     }
@@ -4946,7 +4956,7 @@ impl Runtime {
                     %error,
                     "nulang-persist: compensation executed but completion was not durably committed"
                 );
-                continue;
+                break;
             }
             if let Some(actor) = self.actors.get_mut(&actor_id) {
                 if !actor.compensated_steps.contains(&step_name) {
