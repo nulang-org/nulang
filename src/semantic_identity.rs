@@ -759,6 +759,22 @@ impl Encoder {
                 self.string(field);
                 self.u32(ids.local(*src));
             }
+            Stmt::ParallelMarker { marker } => {
+                self.byte(7);
+                match marker {
+                    crate::parallel_marker::ParallelRegionMarker::Begin { branches } => {
+                        self.byte(0);
+                        self.u32(*branches);
+                    }
+                    crate::parallel_marker::ParallelRegionMarker::Branch { index } => {
+                        self.byte(1);
+                        self.u32(*index);
+                    }
+                    crate::parallel_marker::ParallelRegionMarker::End => {
+                        self.byte(2);
+                    }
+                }
+            }
         }
     }
 
@@ -1319,6 +1335,16 @@ mod tests {
         assert_eq!(
             semantic_id_for_mir(&compact, []).unwrap(),
             semantic_id_for_mir(&formatted, []).unwrap()
+        );
+    }
+
+    #[test]
+    fn par_contract_changes_semantic_id_even_with_same_sequential_values() {
+        let sequential = lower("{ 1; 2; 3 }");
+        let parallel = lower("par { 1; 2; 3 }");
+        assert_ne!(
+            semantic_id_for_mir(&sequential, []).unwrap(),
+            semantic_id_for_mir(&parallel, []).unwrap()
         );
     }
 
