@@ -1612,6 +1612,8 @@ everything before it is implicitly Experimental.
 ### Temporal compatibility boundary — 2026-09-23
 - **Temporal compatibility now has an explicit adapter boundary** (Experimental, RFC 0025, `src/compat/temporal.rs`). Concrete Temporal workflow/run identity and workflow-task identity derive replay-stable Nulang `DurableEffectId` values for activities without introducing Temporal types into the runtime, persistence backends, compiler, or language syntax.
 - **Temporal activity preparation reuses Nulang's durable-effect contract.** Activities default to at-least-once recovery; deduplicated delivery is explicit, and the durable request digest binds activity id/type, task queue, and payload so divergent replay fails closed. Timer and signal translation reuse the existing atomic durable-transition workflow-event path.
+- **The compatibility adapter now includes a transport-neutral workflow-task core.** A supported Temporal history subset is projected with strict event-order/reference validation, then ordered Temporal commands are planned against the same Nulang durable primitives. This core is shared by future standalone worker transports and Nulang Cloud rather than reimplemented in each integration.
+- **Managed adapters negotiate Temporal compatibility contract version 1.** The adapter version is independent from Temporal's API version and Nulang artifact versions so runtime/gateway semantic skew can fail before processing durable work.
 
 ### Production readiness hardening — 2026-09-23
 - **Benchmark validation no longer writes generated history to protected `main`.** CI restores rolling benchmark JSON from `automation/benchmark-history`, uploads only the current result artifact, and persists generated history to that dedicated branch.
