@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Event-sourced emission semantics — 2026-09-23
+- **`emit` is state-neutral.** Event emission no longer increments every integer `event_sourced` field. Source-level `apply` handlers or explicit behavior code are the sole authority for domain-state changes; the event journal stores the resulting post-transition field value for exact recovery.
+
 ### Backend differential oracle hardening — 2026-09-22
 - **WASM differential execution now fails closed after artifact emission** (`src/fuzz.rs`, `src/difffuzz.rs`). Restricted-profile rejection remains an expected compile-time skip, but malformed/invalid emitted WASM, instantiation failures, or a missing required `nulang_init` export are backend correctness failures. Differential campaigns now record WASM agreement coverage, and the `wasm-backend` test lane requires positive WASM participation so a silently-disabled backend cannot leave CI green.
 
