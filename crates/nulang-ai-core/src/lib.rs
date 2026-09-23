@@ -19,7 +19,7 @@ mod duration_secs {
     }
 }
 
-pub const NLAP_VERSION: &str = "1.0.0";
+pub const NLAP_VERSION: &str = "1.1.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -422,6 +422,7 @@ mod tests {
             None,
         );
         let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"version\":\"1.1.0\""));
         assert!(json.contains("goal_created"));
     }
 }
