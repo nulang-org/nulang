@@ -258,7 +258,49 @@ pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::
         return Ok(());
     };
 
+    if actor_is_workflow(rt, actor_id) {
+        return commit_workflow_snapshot(rt, actor_id, snapshot);
+    }
+
     rt.persistence.save_snapshot(snapshot.clone())?;
+    rt.maybe_shadow_replicate(actor_id, &snapshot);
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.sequence = sequence;
+        actor.dirty_fields.clear();
+    }
+    Ok(())
+}
+
+/// Commit a workflow snapshot without a workflow event while preserving the
+/// RFC 0022 tail. This is used for suspension markers and compatibility
+/// checkpoints that cannot safely be folded into a domain event.
+pub(crate) fn commit_workflow_snapshot(
+    rt: &mut Runtime,
+    actor_id: u64,
+    mut snapshot: ActorSnapshot,
+) -> std::io::Result<()> {
+    let previous = rt.persistence.latest_sequence(actor_id);
+    let sequence = previous
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("workflow snapshot sequence overflow"))?;
+    snapshot.actor_id = actor_id;
+    snapshot.sequence = sequence;
+    let activation_epoch = durable_activation_epoch(rt, actor_id)?;
+
+    rt.persistence.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id,
+        activation_epoch,
+        sequence,
+        expected_previous_sequence: previous,
+        command: None,
+        snapshot: Some(snapshot.clone()),
+        workflow_events: vec![],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    })?;
+
     rt.maybe_shadow_replicate(actor_id, &snapshot);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.sequence = sequence;
@@ -353,22 +395,21 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
         }
     }
     if is_workflow {
-        if event == "ParallelBranchCompleted" && args.len() == 2 {
+        let durable_event = if event == "ParallelBranchCompleted" && args.len() == 2 {
             let parallel_step_name =
                 resolve_string_constant(rt, actor_id, &args[0]).unwrap_or_default();
             let branch_name = resolve_string_constant(rt, actor_id, &args[1]).unwrap_or_default();
-            let _ = rt.persistence.append_parallel_branch_completed(
-                actor_id,
-                seq,
-                parallel_step_name,
-                branch_name,
-            );
             if let Some(actor) = rt.actors.get_mut(&actor_id) {
                 let current = actor
                     .get_state_field("parallel_progress")
                     .and_then(|v| v.as_int())
                     .unwrap_or(0);
                 actor.set_state_field("parallel_progress", Value::int(current + 1));
+            }
+            WorkflowEvent::ParallelBranchCompleted {
+                sequence: seq,
+                parallel_step_name,
+                branch_name,
             }
         } else {
             let module = rt
@@ -379,16 +420,21 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 .iter()
                 .map(|v| PersistedValue::from_value_resolved(v, module))
                 .collect();
-            let _ = rt.persistence.append_workflow_event(
+            WorkflowEvent::Custom {
+                sequence: seq,
+                name: event.to_string(),
+                args: payload,
+            }
+        };
+
+        if let Err(error) = commit_workflow_event(rt, actor_id, durable_event) {
+            tracing::warn!(
                 actor_id,
-                WorkflowEvent::Custom {
-                    sequence: seq,
-                    name: event.to_string(),
-                    args: payload,
-                },
+                event,
+                %error,
+                "nulang-persist: workflow event was not durably committed"
             );
         }
-        checkpoint_actor(rt, actor_id);
     }
 }
 
