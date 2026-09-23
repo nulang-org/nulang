@@ -3858,6 +3858,97 @@ mod libsql_atomic_transition_tests {
     }
 
     #[test]
+    fn libsql_atomic_transition_rolls_back_after_mid_commit_failure() {
+        let mut store = LibsqlStore::in_memory().unwrap();
+
+        // Seed a conflicting outbox row for the sequence being committed. The
+        // transaction writes the snapshot, command journal, and staged events
+        // before it reaches the outbox insert, so this forces a real
+        // mid-transaction database failure rather than an up-front validation
+        // error.
+        {
+            let conn = store.conn();
+            store
+                .rt
+                .block_on(async {
+                    conn.execute(
+                        "INSERT INTO durable_outbox
+                         (actor_id, sequence, ordinal, destination_actor_id, behavior_id, payload)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        libsql::params![42_i64, 1_i64, 0_i64, 999_i64, 1_i64, "[]"],
+                    )
+                    .await
+                })
+                .unwrap();
+        }
+
+        let error = store.commit_transition(transition(42, 1, 1)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+
+        // Every write performed by the failed transition must have rolled
+        // back. The deliberately seeded conflicting row remains because it
+        // predates the transaction.
+        assert!(store.load_snapshot(42).is_none());
+        assert!(store.read_journal(42).is_empty());
+        assert!(store.read_workflow_events(42).is_empty());
+        assert!(store.read_events(42).is_empty());
+        assert_eq!(store.latest_sequence(42), 0);
+
+        let transitions = store
+            .query(
+                "SELECT COUNT(*) FROM durable_transitions WHERE actor_id = 42",
+                &[],
+            )
+            .unwrap();
+        let tails = store
+            .query(
+                "SELECT COUNT(*) FROM durable_tails WHERE actor_id = 42",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(transitions, vec!["[0]".to_string()]);
+        assert_eq!(tails, vec!["[0]".to_string()]);
+    }
+
+    #[test]
+    fn libsql_atomic_transition_survives_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "nulang_atomic_transition_{}_reopen.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+
+        {
+            let mut store = LibsqlStore::new(&path).unwrap();
+            store.commit_transition(transition(77, 4, 1)).unwrap();
+        }
+
+        {
+            let store = LibsqlStore::new(&path).unwrap();
+            assert_eq!(store.latest_sequence(77), 1);
+            assert_eq!(store.load_snapshot(77).unwrap().sequence, 1);
+            assert_eq!(store.read_journal(77).len(), 1);
+            assert_eq!(store.read_workflow_events(77).len(), 2);
+            assert_eq!(store.read_events(77).len(), 2);
+
+            let rows = store
+                .query(
+                    "SELECT activation_epoch, sequence
+                     FROM durable_tails WHERE actor_id = 77",
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(rows, vec!["[4,1]".to_string()]);
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
     fn libsql_atomic_transition_rejects_stale_epoch() {
         let mut store = LibsqlStore::in_memory().unwrap();
         store.commit_transition(transition(42, 2, 1)).unwrap();
