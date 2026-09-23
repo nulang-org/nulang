@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### RFC 0008 migration purity enforcement — 2026-09-22
+- **Entity migration bodies now fail compilation when they contain nondeterministic or externally visible operations** (`src/migration_purity.rs`, `src/effect_checker.rs`). The public effect-checking pipeline rejects direct or transitively hidden `perform`, spawn/send/ask/receive, actor migration, grain lookup, continuation resume, defer/errdefer, and extern/FFI calls; locally handling an effect does not launder it. Pure helpers and replay-stream `emit` remain allowed, and the existing conformance proof-of-gap now expects compilation failure.
+
+### Temporary concatenated-string reclamation — 2026-09-22
+- **Non-folded string concatenations now participate in MIR ownership-based reclamation** (`src/mir_codegen.rs`). Because `SConcat` creates a fresh actor-heap string, the liveness planner can release its sole local ORCA reference immediately after the last safe use instead of retaining the temporary until actor teardown. Runtime semantics and the existing ORCA/store-barrier protocol are unchanged.
+
 ### Typed JIT native SSA across arithmetic, loops, and simple CFGs — 2026-09-22
 - **The typed Cranelift JIT now keeps proven Int/Float values in native SSA form across arithmetic chains, simple loop backedges, and conservative forward-branch joins** (`src/jit/typed_compiler.rs`). It preserves Nulang's 48-bit integer wrap, nullable division/modulo behavior, NaN canonicalization, and runtime-helper fallbacks while avoiding repeated tag/unbox/register-file round trips. Per-block forward must-type analysis makes type facts CFG-derived rather than bytecode-emission-order-dependent. The implementation is the current-main replay of the independently tested #738→#768→#770→#771→#773→#774 stack.
 
