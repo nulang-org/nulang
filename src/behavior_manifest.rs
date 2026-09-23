@@ -876,14 +876,14 @@ mod tests {
 
     #[test]
     fn typed_hir_emits_durable_schema_and_migration_metadata() {
-        let manifest =
-            BehaviorManifest::from_typed_hir(
+        let manifest = BehaviorManifest::from_typed_hir(
             "demo",
             "0.1.0",
             &artifact(),
             b"compiled-nbc",
             &typed_hir(2),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(manifest.actors.len(), 1);
         let actor = &manifest.actors[0];
         assert_eq!(actor.name, "test::Counter");
