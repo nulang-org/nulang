@@ -1,7 +1,7 @@
 //! Local agent runtime: Director + Manager + Worker + SQLite + NLAP events.
 
 use crate::config::AgentConfigFile;
-use crate::store::{SqliteStore, StoreError};
+use crate::store::{AgentStateTransition, SqliteStore, StoreError};
 use chrono::Utc;
 use nulang_ai_core::{
     Commitment, CommitmentStatus, ConversationMessage, ConversationState, GoalStatus, Intention,
@@ -11,7 +11,7 @@ use nulang_ai_core::{
 use nulang_ai_director::{Director, LocalDirector};
 use nulang_ai_manager::{EngineeringManager, Manager};
 use nulang_ai_protocol::format_event_line;
-use nulang_ai_worker::{LocalWorker, TaskExecution, Worker};
+use nulang_ai_worker::{LocalWorker, Worker};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -33,9 +33,20 @@ pub enum RuntimeError {
 }
 
 enum PlanOutcome {
-    Completed,
-    Blocked { task_id: Uuid, reason: String },
-    Failed { task_id: Uuid, reason: String },
+    Completed {
+        terminal_task: Option<Task>,
+        agent_id: Option<String>,
+    },
+    Blocked {
+        terminal_task: Task,
+        agent_id: String,
+        reason: String,
+    },
+    Failed {
+        terminal_task: Task,
+        agent_id: String,
+        reason: String,
+    },
 }
 
 pub struct LocalRuntime {
@@ -171,10 +182,42 @@ impl LocalRuntime {
 
         loop {
             match self.execute_intention(&mut intention, tasks, out)? {
-                PlanOutcome::Completed => {
+                PlanOutcome::Completed {
+                    terminal_task,
+                    agent_id,
+                } => {
                     commitment.status = CommitmentStatus::Fulfilled;
                     commitment.updated_at = Utc::now();
-                    self.store.upsert_commitment(&commitment)?;
+                    goal.status = GoalStatus::Completed;
+                    goal.updated_at = Utc::now();
+
+                    self.store
+                        .commit_agent_state_transition(AgentStateTransition {
+                            terminal_task: terminal_task.as_ref(),
+                            intention: &intention,
+                            replacement_intention: None,
+                            revision: None,
+                            commitment: Some(&commitment),
+                            goal: Some(&goal),
+                        })?;
+
+                    if let (Some(task), Some(agent_id)) = (terminal_task.as_ref(), agent_id) {
+                        self.emit(
+                            out,
+                            SwarmEvent::TaskCompleted {
+                                task_id: task.id,
+                                agent_id,
+                            },
+                        )?;
+                    }
+                    self.emit(
+                        out,
+                        SwarmEvent::IntentionCompleted {
+                            intention_id: intention.id,
+                            commitment_id: intention.commitment_id,
+                            goal_id: intention.goal_id,
+                        },
+                    )?;
                     self.emit(
                         out,
                         SwarmEvent::CommitmentFulfilled {
@@ -182,27 +225,56 @@ impl LocalRuntime {
                             goal_id,
                         },
                     )?;
-
-                    goal.status = GoalStatus::Completed;
-                    goal.updated_at = Utc::now();
-                    self.store.upsert_goal(&goal)?;
                     self.emit(out, SwarmEvent::GoalCompleted { goal_id })?;
                     return Ok(goal_id);
                 }
-                PlanOutcome::Blocked { task_id, reason } => {
+                PlanOutcome::Blocked {
+                    terminal_task,
+                    agent_id,
+                    reason,
+                } => {
                     let revision = IntentionRevision::new(
                         &intention,
                         None,
-                        task_id,
+                        terminal_task.id,
                         TaskStatus::Blocked,
                         IntentionRevisionDecision::Suspend,
                         reason.clone(),
                     );
-                    self.record_revision(&revision, out)?;
 
                     commitment.status = CommitmentStatus::Suspended;
                     commitment.updated_at = Utc::now();
-                    self.store.upsert_commitment(&commitment)?;
+                    goal.status = GoalStatus::Blocked;
+                    goal.updated_at = Utc::now();
+
+                    self.store
+                        .commit_agent_state_transition(AgentStateTransition {
+                            terminal_task: Some(&terminal_task),
+                            intention: &intention,
+                            replacement_intention: None,
+                            revision: Some(&revision),
+                            commitment: Some(&commitment),
+                            goal: Some(&goal),
+                        })?;
+
+                    self.emit(
+                        out,
+                        SwarmEvent::TaskBlocked {
+                            task_id: terminal_task.id,
+                            agent_id,
+                            reason: reason.clone(),
+                        },
+                    )?;
+                    self.emit(
+                        out,
+                        SwarmEvent::IntentionBlocked {
+                            intention_id: intention.id,
+                            commitment_id: intention.commitment_id,
+                            goal_id: intention.goal_id,
+                            reason: reason.clone(),
+                        },
+                    )?;
+                    self.emit_revision(&revision, out)?;
                     self.emit(
                         out,
                         SwarmEvent::CommitmentSuspended {
@@ -211,14 +283,14 @@ impl LocalRuntime {
                             reason: reason.clone(),
                         },
                     )?;
-
-                    goal.status = GoalStatus::Blocked;
-                    goal.updated_at = Utc::now();
-                    self.store.upsert_goal(&goal)?;
                     self.emit(out, SwarmEvent::GoalBlocked { goal_id, reason })?;
                     return Ok(goal_id);
                 }
-                PlanOutcome::Failed { task_id, reason } if replan_count < MAX_AUTOMATIC_REPLANS => {
+                PlanOutcome::Failed {
+                    terminal_task,
+                    agent_id,
+                    reason,
+                } if replan_count < MAX_AUTOMATIC_REPLANS => {
                     replan_count += 1;
                     let replacement_tasks = self.engineering.plan_tasks(
                         goal_id,
@@ -231,36 +303,95 @@ impl LocalRuntime {
                         replan_count,
                         &replacement_tasks,
                     );
-                    self.store.upsert_intention(&replacement)?;
-
                     let revision = IntentionRevision::new(
                         &intention,
                         Some(replacement.id),
-                        task_id,
+                        terminal_task.id,
                         TaskStatus::Failed,
                         IntentionRevisionDecision::Replan,
-                        reason,
+                        reason.clone(),
                     );
-                    self.record_revision(&revision, out)?;
+
+                    self.store
+                        .commit_agent_state_transition(AgentStateTransition {
+                            terminal_task: Some(&terminal_task),
+                            intention: &intention,
+                            replacement_intention: Some(&replacement),
+                            revision: Some(&revision),
+                            commitment: None,
+                            goal: None,
+                        })?;
+
+                    self.emit(
+                        out,
+                        SwarmEvent::TaskFailed {
+                            task_id: terminal_task.id,
+                            agent_id,
+                            reason: reason.clone(),
+                        },
+                    )?;
+                    self.emit(
+                        out,
+                        SwarmEvent::IntentionFailed {
+                            intention_id: intention.id,
+                            commitment_id: intention.commitment_id,
+                            goal_id: intention.goal_id,
+                            reason,
+                        },
+                    )?;
+                    self.emit_revision(&revision, out)?;
                     self.emit_intention_activated(&replacement, out)?;
 
                     intention = replacement;
                     tasks = replacement_tasks;
                 }
-                PlanOutcome::Failed { task_id, reason } => {
+                PlanOutcome::Failed {
+                    terminal_task,
+                    agent_id,
+                    reason,
+                } => {
                     let revision = IntentionRevision::new(
                         &intention,
                         None,
-                        task_id,
+                        terminal_task.id,
                         TaskStatus::Failed,
                         IntentionRevisionDecision::Abandon,
                         reason.clone(),
                     );
-                    self.record_revision(&revision, out)?;
 
                     commitment.status = CommitmentStatus::Abandoned;
                     commitment.updated_at = Utc::now();
-                    self.store.upsert_commitment(&commitment)?;
+                    goal.status = GoalStatus::Failed;
+                    goal.updated_at = Utc::now();
+
+                    self.store
+                        .commit_agent_state_transition(AgentStateTransition {
+                            terminal_task: Some(&terminal_task),
+                            intention: &intention,
+                            replacement_intention: None,
+                            revision: Some(&revision),
+                            commitment: Some(&commitment),
+                            goal: Some(&goal),
+                        })?;
+
+                    self.emit(
+                        out,
+                        SwarmEvent::TaskFailed {
+                            task_id: terminal_task.id,
+                            agent_id,
+                            reason: reason.clone(),
+                        },
+                    )?;
+                    self.emit(
+                        out,
+                        SwarmEvent::IntentionFailed {
+                            intention_id: intention.id,
+                            commitment_id: intention.commitment_id,
+                            goal_id: intention.goal_id,
+                            reason: reason.clone(),
+                        },
+                    )?;
+                    self.emit_revision(&revision, out)?;
                     self.emit(
                         out,
                         SwarmEvent::CommitmentAbandoned {
@@ -269,10 +400,6 @@ impl LocalRuntime {
                             reason: reason.clone(),
                         },
                     )?;
-
-                    goal.status = GoalStatus::Failed;
-                    goal.updated_at = Utc::now();
-                    self.store.upsert_goal(&goal)?;
                     self.emit(out, SwarmEvent::GoalFailed { goal_id, reason })?;
                     return Ok(goal_id);
                 }
@@ -346,7 +473,8 @@ impl LocalRuntime {
             )?;
         }
 
-        for task in tasks {
+        let task_count = tasks.len();
+        for (index, task) in tasks.into_iter().enumerate() {
             let agent_id = task
                 .assigned_agent_id
                 .clone()
@@ -391,15 +519,14 @@ impl LocalRuntime {
                     })),
                 ),
             };
-            // Worker output is an outcome carrier, not authority to rewrite the
-            // scheduled task's identity, description, assignment, or plan links.
+
             let mut result = running;
             result.status = terminal_status;
             result.updated_at = Utc::now();
-            self.store.upsert_task(&result)?;
 
             match terminal_status {
-                TaskStatus::Completed => {
+                TaskStatus::Completed if index + 1 < task_count => {
+                    self.store.upsert_task(&result)?;
                     self.emit(
                         out,
                         SwarmEvent::TaskCompleted {
@@ -408,58 +535,30 @@ impl LocalRuntime {
                         },
                     )?;
                 }
+                TaskStatus::Completed => {
+                    intention.status = IntentionStatus::Completed;
+                    intention.updated_at = Utc::now();
+                    return Ok(PlanOutcome::Completed {
+                        terminal_task: Some(result),
+                        agent_id: Some(agent_id),
+                    });
+                }
                 TaskStatus::Blocked => {
-                    let reason = reason.expect("blocked outcome has reason");
-                    self.emit(
-                        out,
-                        SwarmEvent::TaskBlocked {
-                            task_id: result.id,
-                            agent_id,
-                            reason: reason.clone(),
-                        },
-                    )?;
                     intention.status = IntentionStatus::Blocked;
                     intention.updated_at = Utc::now();
-                    self.store.upsert_intention(intention)?;
-                    self.emit(
-                        out,
-                        SwarmEvent::IntentionBlocked {
-                            intention_id: intention.id,
-                            commitment_id: intention.commitment_id,
-                            goal_id: intention.goal_id,
-                            reason: reason.clone(),
-                        },
-                    )?;
                     return Ok(PlanOutcome::Blocked {
-                        task_id: result.id,
-                        reason,
+                        terminal_task: result,
+                        agent_id,
+                        reason: reason.expect("blocked outcome has reason"),
                     });
                 }
                 TaskStatus::Failed => {
-                    let reason = reason.expect("failed outcome has reason");
-                    self.emit(
-                        out,
-                        SwarmEvent::TaskFailed {
-                            task_id: result.id,
-                            agent_id,
-                            reason: reason.clone(),
-                        },
-                    )?;
                     intention.status = IntentionStatus::Failed;
                     intention.updated_at = Utc::now();
-                    self.store.upsert_intention(intention)?;
-                    self.emit(
-                        out,
-                        SwarmEvent::IntentionFailed {
-                            intention_id: intention.id,
-                            commitment_id: intention.commitment_id,
-                            goal_id: intention.goal_id,
-                            reason: reason.clone(),
-                        },
-                    )?;
                     return Ok(PlanOutcome::Failed {
-                        task_id: result.id,
-                        reason,
+                        terminal_task: result,
+                        agent_id,
+                        reason: reason.expect("failed outcome has reason"),
                     });
                 }
                 _ => unreachable!("worker result is normalized to a terminal status"),
@@ -468,24 +567,17 @@ impl LocalRuntime {
 
         intention.status = IntentionStatus::Completed;
         intention.updated_at = Utc::now();
-        self.store.upsert_intention(intention)?;
-        self.emit(
-            out,
-            SwarmEvent::IntentionCompleted {
-                intention_id: intention.id,
-                commitment_id: intention.commitment_id,
-                goal_id: intention.goal_id,
-            },
-        )?;
-        Ok(PlanOutcome::Completed)
+        Ok(PlanOutcome::Completed {
+            terminal_task: None,
+            agent_id: None,
+        })
     }
 
-    fn record_revision(
+    fn emit_revision(
         &self,
         revision: &IntentionRevision,
         out: &mut dyn Write,
     ) -> Result<(), RuntimeError> {
-        self.store.insert_intention_revision(revision)?;
         self.emit(
             out,
             SwarmEvent::IntentionRevised {
@@ -515,6 +607,7 @@ pub fn init_project(dir: &Path) -> Result<(), RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nulang_ai_worker::TaskExecution;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
