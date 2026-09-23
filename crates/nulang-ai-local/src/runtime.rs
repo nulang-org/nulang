@@ -11,7 +11,7 @@ use nulang_ai_core::{
 use nulang_ai_director::{Director, LocalDirector};
 use nulang_ai_manager::{EngineeringManager, Manager};
 use nulang_ai_protocol::format_event_line;
-use nulang_ai_worker::{LocalWorker, Worker};
+use nulang_ai_worker::{LocalWorker, TaskExecution, Worker};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -379,23 +379,32 @@ impl LocalRuntime {
                 },
             )?;
 
-            let mut result = self.worker.execute(&running);
+            let report = self.worker.execute_with_report(&running);
+            let mut result = report.task;
+            let worker_reason = report.reason;
             let (terminal_status, reason) = match result.status {
                 TaskStatus::Completed => (TaskStatus::Completed, None),
                 TaskStatus::Blocked => (
                     TaskStatus::Blocked,
-                    Some(format!("task {} blocked by worker", result.id)),
+                    Some(
+                        worker_reason
+                            .unwrap_or_else(|| format!("task {} blocked by worker", result.id)),
+                    ),
                 ),
                 TaskStatus::Failed => (
                     TaskStatus::Failed,
-                    Some(format!("task {} failed in worker execution", result.id)),
+                    Some(worker_reason.unwrap_or_else(|| {
+                        format!("task {} failed in worker execution", result.id)
+                    })),
                 ),
                 other => (
                     TaskStatus::Failed,
-                    Some(format!(
-                        "task {} returned non-terminal worker status {:?}",
-                        result.id, other
-                    )),
+                    Some(worker_reason.unwrap_or_else(|| {
+                        format!(
+                            "task {} returned non-terminal worker status {:?}",
+                            result.id, other
+                        )
+                    })),
                 ),
             };
             result.status = terminal_status;
@@ -550,6 +559,19 @@ mod tests {
             task.updated_at = Utc::now();
             task
         }
+
+        fn execute_with_report(&self, task: &Task) -> TaskExecution {
+            let task = self.execute(task);
+            match task.status {
+                TaskStatus::Blocked => {
+                    TaskExecution::with_reason(task, "scripted external dependency is unavailable")
+                }
+                TaskStatus::Failed => {
+                    TaskExecution::with_reason(task, "scripted worker execution failed")
+                }
+                _ => TaskExecution::new(task),
+            }
+        }
     }
 
     fn runtime_with_worker(tmp: &Path, statuses: Vec<TaskStatus>) -> LocalRuntime {
@@ -615,6 +637,10 @@ mod tests {
             IntentionRevisionDecision::Replan
         );
         assert_eq!(
+            graph.intention_revisions[0].reason,
+            "scripted worker execution failed"
+        );
+        assert_eq!(
             graph.intention_revisions[0].replacement_intention_id,
             Some(graph.intentions[1].id)
         );
@@ -642,6 +668,10 @@ mod tests {
         assert_eq!(
             graph.intention_revisions[0].decision,
             IntentionRevisionDecision::Suspend
+        );
+        assert_eq!(
+            graph.intention_revisions[0].reason,
+            "scripted external dependency is unavailable"
         );
         assert!(graph.intention_revisions[0]
             .replacement_intention_id
