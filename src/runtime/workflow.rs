@@ -161,11 +161,6 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
             .filter(|(_, model)| **model == StateModel::EventSourced)
             .map(|(name, _)| name.clone())
             .collect();
-        for name in &event_sourced_names {
-            if let Some(n) = actor.get_state_field(name).and_then(|v| v.as_int()) {
-                actor.set_state_field(name, Value::int(n + 1));
-            }
-        }
         // Persist events for EventSourced fields (non-workflow actors).
         if !is_workflow && !event_sourced_names.is_empty() {
             let module = actor.bytecode_module.as_ref();
@@ -174,10 +169,10 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 .map(|v| PersistedValue::from_value_resolved(v, module))
                 .collect();
             for name in &event_sourced_names {
-                // Capture the field's current value AFTER the apply
-                // handler has run and the +1 has been applied.  This
-                // snapshot lets recovery reconstruct the exact post-
-                // apply value without re-executing bytecode.
+                // Capture the field's current value AFTER the source-level
+                // apply handler has run. Event emission itself must never
+                // invent a domain-state mutation; recovery restores this
+                // exact post-apply value without re-executing bytecode.
                 let current_val = actor.get_state_field(name).unwrap_or(Value::nil());
                 let entry = EventEntry {
                     sequence: seq,
@@ -302,7 +297,15 @@ pub(crate) fn signal_workflow(
     name: &str,
     payload: Option<String>,
 ) {
-    let _ = append_signal_received(rt, actor_id, name, payload.clone());
+    if let Err(error) = append_signal_received(rt, actor_id, name, payload.clone()) {
+        tracing::warn!(
+            actor_id,
+            signal = %name,
+            %error,
+            "nulang-persist: refusing to admit workflow signal without durable commit"
+        );
+        return;
+    }
 
     let should_resume = {
         if let Some(actor) = rt.actors.get_mut(&actor_id) {
@@ -366,7 +369,16 @@ pub(crate) fn schedule_workflow_timer(
     duration_ms: u64,
 ) {
     if actor_is_workflow(rt, actor_id) {
-        let _ = append_timer_set(rt, actor_id, name, duration_ms);
+        if let Err(error) = append_timer_set(rt, actor_id, name, duration_ms) {
+            tracing::warn!(
+                actor_id,
+                timer = %name,
+                duration_ms,
+                %error,
+                "nulang-persist: refusing to arm workflow timer without durable commit"
+            );
+            return;
+        }
     }
     rt.rearm_timer(actor_id, name, duration_ms);
 }
