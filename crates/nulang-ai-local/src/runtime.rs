@@ -1449,7 +1449,12 @@ mod tests {
         .unwrap();
         let mut recovered_out = std::io::Cursor::new(Vec::new());
         third
-            .resume_goal(goal_id, request_id, "dependency recovered", &mut recovered_out)
+            .resume_goal(
+                goal_id,
+                request_id,
+                "dependency recovered",
+                &mut recovered_out,
+            )
             .unwrap();
 
         let completed = third.store().get_goal_graph(goal_id).unwrap();
