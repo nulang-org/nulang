@@ -151,15 +151,23 @@ def cargo_target_dir() -> Path:
 
 
 def nulang_result() -> dict:
-    estimates = (
-        cargo_target_dir()
-        / "criterion"
-        / "actor"
-        / "message_roundtrip_local"
-        / "100"
-        / "new"
-        / "estimates.json"
-    )
+    criterion_dir = cargo_target_dir() / "criterion"
+    candidates = [
+        path
+        for path in criterion_dir.glob("**/new/estimates.json")
+        if "message_roundtrip_local" in path.relative_to(criterion_dir).as_posix()
+        and path.parent.parent.name == "100"
+    ]
+    if len(candidates) != 1:
+        discovered = sorted(
+            path.relative_to(criterion_dir).as_posix()
+            for path in criterion_dir.glob("**/new/estimates.json")
+        )
+        raise RuntimeError(
+            "expected exactly one Nulang local-message estimate; "
+            f"found {len(candidates)} candidates under {criterion_dir}: {discovered}"
+        )
+    estimates = candidates[0]
     data = json.loads(estimates.read_text())
     mean = data["mean"]
     ns = float(mean["point_estimate"])
