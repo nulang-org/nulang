@@ -1631,6 +1631,55 @@ pub fn is_opcode_supported_typed(op: OpCode) -> bool {
     )
 }
 
+/// Discover true bytecode basic-block leaders inside a compiled region.
+///
+/// Leaders are the region entry, in-region branch targets, branch fallthrough
+/// points, and the instruction after an explicit terminator. Straight-line
+/// instructions between leaders can share one Cranelift block.
+pub(crate) fn typed_basic_block_leaders(
+    start_offset: usize,
+    end_offset: usize,
+    instructions: &[Instruction],
+) -> HashSet<usize> {
+    let mut leaders = HashSet::new();
+    if start_offset >= end_offset {
+        return leaders;
+    }
+    leaders.insert(start_offset);
+
+    for pc in start_offset..end_offset {
+        let instr = instructions[pc];
+        match instr.opcode {
+            OpCode::Jmp => {
+                let target = (pc as i64 + instr.simm16() as i64) as usize;
+                if target >= start_offset && target < end_offset {
+                    leaders.insert(target);
+                }
+                if pc + 1 < end_offset {
+                    leaders.insert(pc + 1);
+                }
+            }
+            OpCode::JmpT | OpCode::JmpF => {
+                let target = (pc as i64 + instr.offset16() as i64) as usize;
+                if target >= start_offset && target < end_offset {
+                    leaders.insert(target);
+                }
+                if pc + 1 < end_offset {
+                    leaders.insert(pc + 1);
+                }
+            }
+            OpCode::Halt | OpCode::Ret | OpCode::RetVal => {
+                if pc + 1 < end_offset {
+                    leaders.insert(pc + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    leaders
+}
+
 /// Compile a bytecode region to native code with optional type-directed
 /// optimization (type guard stripping).
 ///
@@ -1705,10 +1754,21 @@ pub fn compile_bytecode_region_typed(
     // Register runtime helpers (always needed for fallback)
     let helpers = register_runtime_helpers(module, &mut builder);
 
-    // Create blocks for each instruction offset
+    // Represent actual bytecode basic blocks rather than one Cranelift block
+    // per instruction. Existing SSA parameter blocks are forced to remain
+    // leaders even if future bytecode shaping changes their surface form.
+    let mut basic_block_leaders =
+        typed_basic_block_leaders(start_offset, end_offset, instructions);
+    if let Some(plan) = &cfg_ssa {
+        basic_block_leaders.extend(plan.param_blocks());
+    }
+    basic_block_leaders.insert(start_offset);
+
     let mut blocks: HashMap<usize, Block> = HashMap::new();
-    for i in start_offset..end_offset {
-        blocks.insert(i, builder.create_block());
+    let mut ordered_leaders: Vec<_> = basic_block_leaders.iter().copied().collect();
+    ordered_leaders.sort_unstable();
+    for leader in ordered_leaders {
+        blocks.insert(leader, builder.create_block());
     }
     if let (Some(plan), Some(&header)) = (&loop_ssa, blocks.get(&start_offset)) {
         for &(_, ty) in &plan.carried {
@@ -1788,16 +1848,22 @@ pub fn compile_bytecode_region_typed(
     let mut int_cache = NativeIntCache::default();
     let mut float_cache = NativeFloatCache::default();
 
-    // Compile each instruction
+    // Compile each instruction. Switch Cranelift blocks only at true bytecode
+    // leaders; straight-line instructions remain in the current block.
     for pc in start_offset..end_offset {
         let instr = instructions[pc];
-        let block = *blocks.get(&pc).unwrap();
-        builder.switch_to_block(block);
+        if basic_block_leaders.contains(&pc) {
+            let block = *blocks
+                .get(&pc)
+                .expect("basic-block leader must have a Cranelift block");
+            builder.switch_to_block(block);
+        }
 
         meta.regs = block_type_states[pc - start_offset].unwrap_or([KnownType::Unknown; 256]);
 
         if pc == start_offset {
             if let Some(plan) = &loop_ssa {
+                let block = blocks[&pc];
                 let params = builder.block_params(block).to_vec();
                 for (&(reg, ty), &value) in plan.carried.iter().zip(params.iter()) {
                     match ty {
@@ -1819,6 +1885,7 @@ pub fn compile_bytecode_region_typed(
             if let Some(carried) = plan.carried_for_block(pc) {
                 int_cache.clear();
                 float_cache.clear();
+                let block = blocks[&pc];
                 let params = builder.block_params(block).to_vec();
                 for (&(reg, ty), &value) in carried.iter().zip(params.iter()) {
                     match ty {
@@ -3011,15 +3078,16 @@ pub fn compile_bytecode_region_typed(
                 }
             }
 
-            if let Some(&next_block) = blocks.get(&(pc + 1)) {
+            if pc + 1 >= end_offset {
+                flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
+                builder.ins().jump(return_block, &[]);
+            } else if basic_block_leaders.contains(&(pc + 1)) {
+                let next_block = blocks[&(pc + 1)];
                 let next_preds = predecessor_counts[pc + 1 - start_offset];
                 if next_preds != 1 {
                     flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                 }
                 builder.ins().jump(next_block, &[]);
-            } else {
-                flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
-                builder.ins().jump(return_block, &[]);
             }
         }
     }
