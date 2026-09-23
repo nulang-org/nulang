@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Same-shard actor-send ORCA ownership handoff — 2026-09-22
+- **Compiler-proven single-use heap payloads can now hand their local ORCA token directly to a successfully admitted same-shard receiver** (src/mir_codegen.rs, src/vm.rs, src/runtime/{mod,gc,mailbox,callbacks}.rs). Source compilation records non-serialized send-site ownership metadata; the runtime validates actual locality/ownership and returns the consumed argument mask; the VM clears only sources whose handoff succeeded. The receiver adopts the transferred foreign hold without a second increment, eliminating two refcount updates per successful handoff. Backpressure, missing/nonresident targets, cross-shard and remote sends, AOT/default callback paths, and NBC-loaded artifacts retain the conservative protocol. GcStats exposes ownership_handoffs and refcount_ops_elided.
+
 ### Consuming actor-send ownership analysis — 2026-09-22
 - **The MIR backend now identifies provably consumable local-send payloads without changing runtime semantics** (`src/mir_codegen.rs`). A payload is marked only when it is a fresh/non-aliasing owning value with one definition and one total use, and that sole use is a same-node MIR `Send` argument. Multi-use and remote-send payloads remain ordinary copies. This establishes the compiler proof surface for a later ORCA local-reference-to-foreign-hold handoff.
 
