@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### Typed JIT native SSA across arithmetic, loops, and simple CFGs — 2026-09-22
+- **The typed Cranelift JIT now keeps proven Int/Float values in native SSA form across arithmetic chains, simple loop backedges, and conservative forward-branch joins** (`src/jit/typed_compiler.rs`). It preserves Nulang's 48-bit integer wrap, nullable division/modulo behavior, NaN canonicalization, and runtime-helper fallbacks while avoiding repeated tag/unbox/register-file round trips. Per-block forward must-type analysis makes type facts CFG-derived rather than bytecode-emission-order-dependent. The implementation is the current-main replay of the independently tested #738→#768→#770→#771→#773→#774 stack.
+
+### Candidate-only JIT hotness probing — 2026-09-22
+- **Cold interpreted execution now probes JIT hotness only at candidate compiled-region entries** (`src/vm.rs`). The VM precomputes per-module candidates for execution/function/behavior entries, source-statement starts, branch targets/fallthroughs, and successors of compilation boundaries, avoiding JIT backend dispatch and hot-counter mutation at ordinary straight-line bytecode PCs without changing language semantics.
+
 ### Canonical compiler semantic identity — 2026-09-21
 - **Compiler-owned `SemanticId` now derives from canonical backend-independent MIR plus typed actor-state schemas** (Experimental, `src/semantic_identity.rs`, `src/semantic_schema.rs`, `src/compiler_identity.rs`). The encoding alpha-normalizes compiler-generated IDs, excludes presentation/debug metadata and backend selection, includes executable/effect/authority/durable semantics, and folds dependency semantic identities deterministically. `ArtifactIdentityManifest` assembly now has a typed-program entry point that keeps exact `SourceId`, semantic identity, and backend-specific `ArtifactId` distinct without changing frozen NBC v1.
 
@@ -64,6 +70,14 @@ version + migration.*
 
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
+
+### Actor-capable `.nbc` execution — 2026-09-22
+- **Precompiled actor/workflow artifacts execute through the real Runtime**
+  instead of standalone VM actor callbacks. Serialized modules carrying actor
+  metadata now use the same spawn/send/state/scheduler path as source
+  execution, while pure modules retain the lower-overhead standalone VM path.
+  Regression coverage verifies message delivery after NBC round-trip and
+  durable-store selection for persistent actors.
 
 ### Actor protocol rolling-upgrade compatibility — 2026-09-20
 - **Directional structural compatibility** (Experimental, `src/protocol.rs`).
