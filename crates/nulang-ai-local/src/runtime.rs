@@ -217,26 +217,22 @@ impl LocalRuntime {
                     goal.status = GoalStatus::Blocked;
                     goal.updated_at = Utc::now();
                     self.store.upsert_goal(&goal)?;
-                    self.emit(
-                        out,
-                        SwarmEvent::GoalBlocked {
-                            goal_id,
-                            reason,
-                        },
-                    )?;
+                    self.emit(out, SwarmEvent::GoalBlocked { goal_id, reason })?;
                     return Ok(goal_id);
                 }
-                PlanOutcome::Failed { task_id, reason }
-                    if replan_count < MAX_AUTOMATIC_REPLANS =>
-                {
+                PlanOutcome::Failed { task_id, reason } if replan_count < MAX_AUTOMATIC_REPLANS => {
                     replan_count += 1;
                     let replacement_tasks = self.engineering.plan_tasks(
                         goal_id,
                         text,
                         self.config.director.default_budget_usd,
                     );
-                    let replacement =
-                        self.new_intention(goal_id, commitment.id, replan_count, &replacement_tasks);
+                    let replacement = self.new_intention(
+                        goal_id,
+                        commitment.id,
+                        replan_count,
+                        &replacement_tasks,
+                    );
                     self.store.upsert_intention(&replacement)?;
 
                     let revision = IntentionRevision::new(
@@ -283,13 +279,7 @@ impl LocalRuntime {
                     goal.status = GoalStatus::Failed;
                     goal.updated_at = Utc::now();
                     self.store.upsert_goal(&goal)?;
-                    self.emit(
-                        out,
-                        SwarmEvent::GoalFailed {
-                            goal_id,
-                            reason,
-                        },
-                    )?;
+                    self.emit(out, SwarmEvent::GoalFailed { goal_id, reason })?;
                     return Ok(goal_id);
                 }
             }
@@ -576,11 +566,8 @@ mod tests {
 
     fn runtime_with_worker(tmp: &Path, statuses: Vec<TaskStatus>) -> LocalRuntime {
         init_project(tmp).unwrap();
-        LocalRuntime::open_with_worker(
-            tmp.to_path_buf(),
-            Box::new(ScriptedWorker::new(statuses)),
-        )
-        .unwrap()
+        LocalRuntime::open_with_worker(tmp.to_path_buf(), Box::new(ScriptedWorker::new(statuses)))
+            .unwrap()
     }
 
     #[test]
@@ -617,8 +604,7 @@ mod tests {
     fn failed_task_replans_once_and_can_recover() {
         let tmp = std::env::temp_dir().join(format!("nulang-agent-replan-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let mut rt =
-            runtime_with_worker(&tmp, vec![TaskStatus::Failed, TaskStatus::Completed]);
+        let mut rt = runtime_with_worker(&tmp, vec![TaskStatus::Failed, TaskStatus::Completed]);
         let mut buf = std::io::Cursor::new(Vec::new());
         let goal_id = rt.handle_user_message("ship feature X", &mut buf).unwrap();
         let text = String::from_utf8(buf.into_inner()).unwrap();
