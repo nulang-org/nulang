@@ -360,6 +360,13 @@ mod tests {
         }
     }
 
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime")
+            .block_on(future)
+    }
+
     fn request(method: &str, params: Option<Value>) -> JsonRpcRequest {
         JsonRpcRequest {
             jsonrpc: "2.0".into(),
@@ -381,133 +388,143 @@ mod tests {
         Value::Object(object)
     }
 
-    #[tokio::test]
-    async fn discover_advertises_modern_protocol_and_tools() {
-        let server = McpServer::new(Arc::new(ToolRegistry::new()));
-        let response = server
-            .handle_request(request(
-                "server/discover",
-                Some(modern_params(json!({}))),
-            ))
-            .await;
-        let result = response.result.expect("discover result");
+    #[test]
+    fn discover_advertises_modern_protocol_and_tools() {
+        block_on(async {
+            let server = McpServer::new(Arc::new(ToolRegistry::new()));
+            let response = server
+                .handle_request(request(
+                    "server/discover",
+                    Some(modern_params(json!({}))),
+                ))
+                .await;
+            let result = response.result.expect("discover result");
 
-        assert_eq!(result["resultType"], "complete");
-        assert_eq!(result["supportedVersions"][0], MCP_PROTOCOL_VERSION);
-        assert!(result["capabilities"]["tools"].is_object());
-        assert_eq!(result["ttlMs"], 0);
-        assert_eq!(result["cacheScope"], "private");
+            assert_eq!(result["resultType"], "complete");
+            assert_eq!(result["supportedVersions"][0], MCP_PROTOCOL_VERSION);
+            assert!(result["capabilities"]["tools"].is_object());
+            assert_eq!(result["ttlMs"], 0);
+            assert_eq!(result["cacheScope"], "private");
+        });
     }
 
-    #[tokio::test]
-    async fn tool_list_is_deterministic_and_cache_explicit() {
-        let registry = Arc::new(ToolRegistry::new());
-        registry
-            .register(
-                ToolSpec {
-                    name: "zeta".into(),
-                    description: "z".into(),
-                    parameters: json!({"type": "object"}),
-                },
-                Arc::new(Echo),
-            )
-            .await;
-        registry
-            .register(
-                ToolSpec {
-                    name: "alpha".into(),
-                    description: "a".into(),
-                    parameters: json!({"type": "object"}),
-                },
-                Arc::new(Echo),
-            )
-            .await;
+    #[test]
+    fn tool_list_is_deterministic_and_cache_explicit() {
+        block_on(async {
+            let registry = Arc::new(ToolRegistry::new());
+            registry
+                .register(
+                    ToolSpec {
+                        name: "zeta".into(),
+                        description: "z".into(),
+                        parameters: json!({"type": "object"}),
+                    },
+                    Arc::new(Echo),
+                )
+                .await;
+            registry
+                .register(
+                    ToolSpec {
+                        name: "alpha".into(),
+                        description: "a".into(),
+                        parameters: json!({"type": "object"}),
+                    },
+                    Arc::new(Echo),
+                )
+                .await;
 
-        let server = McpServer::new(registry);
-        let response = server
-            .handle_request(request(
-                "tools/list",
-                Some(modern_params(json!({}))),
-            ))
-            .await;
-        let result = response.result.expect("tools/list result");
+            let server = McpServer::new(registry);
+            let response = server
+                .handle_request(request(
+                    "tools/list",
+                    Some(modern_params(json!({}))),
+                ))
+                .await;
+            let result = response.result.expect("tools/list result");
 
-        assert_eq!(result["tools"][0]["name"], "alpha");
-        assert_eq!(result["tools"][1]["name"], "zeta");
-        assert_eq!(result["resultType"], "complete");
-        assert_eq!(result["ttlMs"], 0);
-        assert_eq!(result["cacheScope"], "private");
+            assert_eq!(result["tools"][0]["name"], "alpha");
+            assert_eq!(result["tools"][1]["name"], "zeta");
+            assert_eq!(result["resultType"], "complete");
+            assert_eq!(result["ttlMs"], 0);
+            assert_eq!(result["cacheScope"], "private");
+        });
     }
 
-    #[tokio::test]
-    async fn unknown_tool_is_invalid_params_protocol_error() {
-        let server = McpServer::new(Arc::new(ToolRegistry::new()));
-        let response = server
-            .handle_request(request(
-                "tools/call",
-                Some(modern_params(json!({
-                    "name": "does_not_exist",
-                    "arguments": {}
-                }))),
-            ))
-            .await;
+    #[test]
+    fn unknown_tool_is_invalid_params_protocol_error() {
+        block_on(async {
+            let server = McpServer::new(Arc::new(ToolRegistry::new()));
+            let response = server
+                .handle_request(request(
+                    "tools/call",
+                    Some(modern_params(json!({
+                        "name": "does_not_exist",
+                        "arguments": {}
+                    }))),
+                ))
+                .await;
 
-        let error = response.error.expect("protocol error");
-        assert_eq!(error.code, JSON_RPC_INVALID_PARAMS);
-        assert_eq!(error.message, "Unknown tool: does_not_exist");
+            let error = response.error.expect("protocol error");
+            assert_eq!(error.code, JSON_RPC_INVALID_PARAMS);
+            assert_eq!(error.message, "Unknown tool: does_not_exist");
+        });
     }
 
-    #[tokio::test]
-    async fn execution_failure_is_normal_tool_error_result() {
-        let registry = Arc::new(ToolRegistry::new());
-        registry
-            .register(
-                ToolSpec {
-                    name: "unstable".into(),
-                    description: "fails".into(),
-                    parameters: json!({"type": "object"}),
-                },
-                Arc::new(Failing),
-            )
-            .await;
+    #[test]
+    fn execution_failure_is_normal_tool_error_result() {
+        block_on(async {
+            let registry = Arc::new(ToolRegistry::new());
+            registry
+                .register(
+                    ToolSpec {
+                        name: "unstable".into(),
+                        description: "fails".into(),
+                        parameters: json!({"type": "object"}),
+                    },
+                    Arc::new(Failing),
+                )
+                .await;
 
-        let server = McpServer::new(registry);
-        let response = server
-            .handle_request(request(
-                "tools/call",
-                Some(modern_params(json!({
-                    "name": "unstable",
-                    "arguments": {}
-                }))),
-            ))
-            .await;
-        let result = response.result.expect("tool result");
+            let server = McpServer::new(registry);
+            let response = server
+                .handle_request(request(
+                    "tools/call",
+                    Some(modern_params(json!({
+                        "name": "unstable",
+                        "arguments": {}
+                    }))),
+                ))
+                .await;
+            let result = response.result.expect("tool result");
 
-        assert_eq!(result["resultType"], "complete");
-        assert_eq!(result["isError"], true);
-        assert_eq!(
-            result["content"][0]["text"],
-            "provider temporarily unavailable"
-        );
+            assert_eq!(result["resultType"], "complete");
+            assert_eq!(result["isError"], true);
+            assert_eq!(
+                result["content"][0]["text"],
+                "provider temporarily unavailable"
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn unsupported_modern_protocol_version_fails_with_supported_set() {
-        let server = McpServer::new(Arc::new(ToolRegistry::new()));
-        let response = server
-            .handle_request(request(
-                "tools/list",
-                Some(json!({
-                    "_meta": {
-                        "io.modelcontextprotocol/protocolVersion": "1900-01-01",
-                        "io.modelcontextprotocol/clientCapabilities": {}
-                    }
-                })),
-            ))
-            .await;
+    #[test]
+    fn unsupported_modern_protocol_version_fails_with_supported_set() {
+        block_on(async {
+            let server = McpServer::new(Arc::new(ToolRegistry::new()));
+            let response = server
+                .handle_request(request(
+                    "tools/list",
+                    Some(json!({
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "1900-01-01",
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                        }
+                    })),
+                ))
+                .await;
 
-        let error = response.error.expect("unsupported version");
-        assert_eq!(error.code, MCP_UNSUPPORTED_PROTOCOL_VERSION);
-        assert_eq!(error.data.unwrap()["supported"][0], MCP_PROTOCOL_VERSION);
+            let error = response.error.expect("unsupported version");
+            assert_eq!(error.code, MCP_UNSUPPORTED_PROTOCOL_VERSION);
+            assert_eq!(error.data.unwrap()["supported"][0], MCP_PROTOCOL_VERSION);
+        });
     }
 }
