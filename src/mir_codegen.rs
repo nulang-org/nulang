@@ -2542,12 +2542,35 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
         }
     }
 
-    // Only proven owning sources become real transfers. Clearing the source
-    // is safe even if the destination later stops qualifying for early Drop:
-    // its register/spill now carries the ownership token and actor teardown
-    // remains the conservative fallback.
-    for (&site, &(_, src)) in &transfer_sites {
-        if candidate[src] {
+    // Prune transfer chains that do not end in another ownership candidate.
+    // If the destination escapes through an ordinary copy/return/etc., moving
+    // ownership there would add a clear instruction without enabling early
+    // reclamation. In that case the source must also stop being a candidate:
+    // its Load is semantically an ordinary uncounted alias and dropping the
+    // source would free the destination out from under that alias.
+    loop {
+        let mut changed = false;
+        for &(_, (dst, src)) in &transfer_sites {
+            if candidate[src] && !candidate[dst] {
+                candidate[src] = false;
+                changed = true;
+            }
+        }
+        for i in 0..nlocals {
+            if candidate[i] && transfer_inputs[i].iter().any(|src| !candidate[*src]) {
+                candidate[i] = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Only transfers whose source and destination both retain the ownership
+    // proof become real move-and-clear operations.
+    for (&site, &(dst, src)) in &transfer_sites {
+        if candidate[src] && candidate[dst] {
             plan.ownership_transfer.insert(site, func.locals[src].id);
         }
     }
@@ -3625,6 +3648,25 @@ mod optimize_tests {
         assert!(
             !plan.ownership_transfer.contains_key(&(0, 2)),
             "a source with another use is a copy, not an ownership move"
+        );
+    }
+
+    #[test]
+    fn test_drop_plan_prunes_transfer_when_destination_escapes() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("escaping_move", Some(arr_ty.clone()));
+        let root = b.add_temp(arr_ty.clone());
+        let moved = b.add_temp(arr_ty);
+
+        b.assign(root, mir::RValue::ArrayLit(vec![]));
+        b.assign(moved, mir::RValue::Load(root));
+        b.terminate(mir::Terminator::Return(Some(moved)));
+
+        let func = b.build();
+        let plan = plan_drops(&func);
+        assert!(
+            !plan.ownership_transfer.contains_key(&(0, 1)),
+            "transfer must be pruned when the destination escapes by copy"
         );
     }
 
