@@ -1958,7 +1958,7 @@ fn stmt_reads(stmt: &mir::Stmt, out: &mut HashSet<mir::LocalId>) {
     use mir::Stmt;
     match stmt {
         Stmt::Assign { op, .. } => rvalue_reads(op, out),
-        Stmt::ParallelMarker { .. } => {},
+        Stmt::ParallelMarker { .. } => {}
         Stmt::StoreFieldNamed { obj, src, .. } => {
             out.insert(*obj);
             out.insert(*src);
