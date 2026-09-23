@@ -369,8 +369,11 @@ mod tests {
     #[test]
     fn commitment_and_intention_roundtrip_json() {
         let goal = Goal::new("demo", "Ship feature", 10.0);
-        let mut commitment =
-            Commitment::new(goal.id, "director-local", "User goal accepted for execution");
+        let mut commitment = Commitment::new(
+            goal.id,
+            "director-local",
+            "User goal accepted for execution",
+        );
         commitment.status = CommitmentStatus::Active;
 
         let task = Task::new(goal.id, "Implement feature", ManagerKind::Engineering);
