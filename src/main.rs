@@ -2515,6 +2515,7 @@ fn compile_source_to_nbc(
             package_name,
             package_version,
             artifact_identity,
+            &bytes,
             &hir,
         )
         .map_err(|error| nulang::types::NuError::VMError {
