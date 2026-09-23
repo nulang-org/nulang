@@ -1042,7 +1042,7 @@ mod tests {
         assert_eq!(graph.tasks[0].status, TaskStatus::Failed);
         assert_eq!(graph.intentions[0].status, IntentionStatus::Failed);
         assert_eq!(graph.commitments[0].status, CommitmentStatus::Abandoned);
-        assert_eq!(graph.intention_revisions, vec![revision]);
+        assert_eq!(graph.intention_revisions, vec![revision.clone()]);
 
         let pending = store.pending_outbox(10).unwrap();
         assert_eq!(pending.len(), 1);
