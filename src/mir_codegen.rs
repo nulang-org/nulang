@@ -215,11 +215,12 @@ impl MirCodegen {
         }
     }
 
-    /// Clear a local to nil without releasing its pointer.
+    /// Clear a dead local to nil without performing another RC update.
     ///
-    /// Used only after a proven last-use `Load` ownership transfer: the
-    /// destination now carries the sole local ORCA ownership token, so
-    /// decrementing the dead source would free the transferred value.
+    /// Used when ownership accounting has already moved elsewhere: either a
+    /// proven last-use `Load` transferred the token to its destination, or a
+    /// consuming actor send released the sender's final local reference after
+    /// the message path established lifetime protection.
     fn clear_local_after_transfer(&mut self, id: mir::LocalId) {
         let nil_idx = match self.nil_constant {
             Some(idx) => idx,
@@ -558,6 +559,11 @@ impl MirCodegen {
         // Conservative liveness-based placement of `Drop` instructions (see
         // the module docs and `plan_drops`).
         let drop_plan = plan_drops(func);
+        let consuming_send_plan = plan_consuming_send_args(func);
+        // Relative send PCs collected while this function is compiled into
+        // the temporary instruction buffer. They become module-absolute once
+        // the function body is appended below.
+        let mut consuming_send_masks: Vec<(usize, u16)> = Vec::new();
 
         // Source-line map: `(block id, statement index) -> line`, translated
         // to bytecode PCs below so the debugger can place breakpoints and
@@ -603,7 +609,50 @@ impl MirCodegen {
                 if let Some(&line) = line_map.get(&(block.id.0, si)) {
                     func_lines.push((self.module.instructions.len(), line));
                 }
+                let stmt_start = self.module.instructions.len();
                 self.compile_stmt(stmt, func, &mut handle_patches)?;
+                if let Some(owned) = consuming_send_plan.args_by_stmt.get(&(bi, si)) {
+                    let mir::Stmt::Assign {
+                        op:
+                            mir::RValue::Send {
+                                args,
+                                remote: false,
+                                ..
+                            },
+                        ..
+                    } = stmt
+                    else {
+                        return Err(compile_err(
+                            "internal: consuming-send proof attached to a non-local-send statement",
+                            Span::default(),
+                        ));
+                    };
+
+                    let mut mask = 0u16;
+                    for (arg_idx, arg) in args.iter().enumerate() {
+                        if owned.contains(arg) {
+                            mask |= 1u16 << arg_idx;
+                        }
+                    }
+                    if mask != 0 {
+                        let send_pc = (stmt_start..self.module.instructions.len())
+                            .rev()
+                            .find(|&pc| self.module.instructions[pc].opcode == OpCode::Send)
+                            .ok_or_else(|| {
+                                compile_err(
+                                    "internal: consuming-send proof emitted without Send opcode",
+                                    Span::default(),
+                                )
+                            })?;
+                        consuming_send_masks.push((send_pc, mask));
+                        // The callback consumes the final local ORCA reference
+                        // for every set bit. Clear the dead MIR source without
+                        // issuing a second decrement.
+                        for arg in owned {
+                            self.clear_local_after_transfer(*arg);
+                        }
+                    }
+                }
                 if let Some(src) = drop_plan.ownership_transfer.get(&(bi, si)) {
                     self.clear_local_after_transfer(*src);
                 }
@@ -689,6 +738,12 @@ impl MirCodegen {
         self.module.instructions = saved_instructions;
         let code_len = function_code.len();
         self.module.instructions.extend(function_code);
+
+        for (rel_pc, mask) in consuming_send_masks {
+            self.module
+                .send_ownership_masks
+                .push((function_start + rel_pc, mask));
+        }
 
         // Publish the debugger's pc<->line map and per-function debug info.
         for (rel, line) in func_lines {
@@ -2707,6 +2762,116 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
     {
         ids.sort();
         ids.dedup();
+    }
+    plan
+}
+
+// ---------------------------------------------------------------------------
+// Consuming actor-send ownership analysis
+// ---------------------------------------------------------------------------
+
+/// Compiler proof candidates for consuming local actor sends.
+///
+/// Codegen attaches the resulting argument mask to the emitted `Send` pc.
+/// The VM uses that proof to release the sender's final local ORCA reference
+/// immediately after the send path establishes in-flight protection.
+///
+/// An argument qualifies only when:
+/// - the send is local (remote == false);
+/// - the local may hold a heap pointer and is not a param/capture/handler arg;
+/// - it has exactly one MIR definition and exactly one total use;
+/// - that definition is a fresh/non-aliasing owning rvalue; and
+/// - the sole use is this send argument.
+///
+/// Keeping this stricter than plan_drops is deliberate. Transfer chains
+/// through Load stay on the ordinary path until alias provenance is carried
+/// through the complete send handoff.
+#[derive(Default)]
+struct ConsumingSendPlan {
+    args_by_stmt: FxHashMap<(usize, usize), Vec<mir::LocalId>>,
+}
+
+fn plan_consuming_send_args(func: &mir::Function) -> ConsumingSendPlan {
+    let nlocals = func.locals.len();
+    if nlocals == 0 {
+        return ConsumingSendPlan::default();
+    }
+
+    let ptr_ty: Vec<bool> = func
+        .locals
+        .iter()
+        .map(|l| may_hold_heap_ptr(&l.ty))
+        .collect();
+
+    let mut excluded = vec![false; nlocals];
+    for id in func.params.iter().chain(&func.captures) {
+        excluded[id.0 as usize] = true;
+    }
+    for table in &func.handler_tables {
+        for binding in &table.bindings {
+            for id in &binding.params {
+                excluded[id.0 as usize] = true;
+            }
+        }
+    }
+
+    let mut def_count = vec![0usize; nlocals];
+    let mut use_count = vec![0usize; nlocals];
+    let mut owning_def = vec![false; nlocals];
+
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            for (u, _) in stmt_uses(stmt) {
+                use_count[u] += 1;
+            }
+            if let mir::Stmt::Assign { dst, op } = stmt {
+                let d = dst.0 as usize;
+                def_count[d] += 1;
+                let self_read = rvalue_uses(op).iter().any(|(u, _)| *u == d);
+                if def_count[d] == 1 && rvalue_is_owning(op) && !self_read {
+                    owning_def[d] = true;
+                } else {
+                    owning_def[d] = false;
+                }
+            }
+        }
+        for (u, _) in terminator_uses(&block.terminator) {
+            use_count[u] += 1;
+        }
+    }
+
+    let mut plan = ConsumingSendPlan::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (si, stmt) in block.stmts.iter().enumerate() {
+            let mir::Stmt::Assign {
+                op:
+                    mir::RValue::Send {
+                        args,
+                        remote: false,
+                        ..
+                    },
+                ..
+            } = stmt
+            else {
+                continue;
+            };
+
+            let mut owned = Vec::new();
+            for arg in args {
+                let a = arg.0 as usize;
+                if ptr_ty[a]
+                    && !excluded[a]
+                    && def_count[a] == 1
+                    && use_count[a] == 1
+                    && owning_def[a]
+                {
+                    owned.push(*arg);
+                }
+            }
+            if !owned.is_empty() {
+                plan.args_by_stmt.insert((bi, si), owned);
+            }
+        }
     }
     plan
 }
