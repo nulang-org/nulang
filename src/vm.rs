@@ -2508,6 +2508,53 @@ fn compute_jit_candidate_pcs(module: &CodeModule) -> Vec<bool> {
     candidates
 }
 
+#[cfg(feature = "native-codegen")]
+fn compute_jit_register_copy_lens(module: &CodeModule) -> Vec<u16> {
+    const FULL_REGISTER_FILE: u16 = 256;
+    const MIR_REGISTER_LIMIT: usize = 254; // r254 is reserved for direct-call staging.
+
+    let len = module.instructions.len();
+    let mut copy_lens = vec![FULL_REGISTER_FILE; len];
+    if len == 0 || module.function_table.is_empty() {
+        return copy_lens;
+    }
+
+    // Function-table entries and behavior starts form hard execution-region
+    // boundaries. A function's local-count metadata is valid only until the
+    // next such boundary; behavior frames deliberately fall back to the full
+    // register file because they do not yet carry equivalent local-count data.
+    let mut boundaries =
+        Vec::with_capacity(module.function_table.len() + module.behaviors.len() + 1);
+    boundaries.extend(module.function_table.iter().copied());
+    boundaries.extend(module.behaviors.iter().map(|b| b.code_offset));
+    boundaries.push(len);
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    for (func_idx, &start) in module.function_table.iter().enumerate() {
+        if start >= len {
+            continue;
+        }
+        let Some(&count) = module.function_local_counts.get(func_idx) else {
+            continue; // Old/hand-built NBC: preserve the conservative full-copy path.
+        };
+        if count == 0 {
+            continue;
+        }
+
+        let end = boundaries
+            .iter()
+            .copied()
+            .find(|&boundary| boundary > start)
+            .unwrap_or(len)
+            .min(len);
+        let active = count.clamp(1, MIR_REGISTER_LIMIT) as u16;
+        copy_lens[start..end].fill(active);
+    }
+
+    copy_lens
+}
+
 /// Register-based bytecode virtual machine.
 ///
 /// Executes Nulang bytecode modules with:
@@ -2542,6 +2589,20 @@ pub struct VM {
     /// behavior, statement, branch, and post-boundary entries.
     #[cfg(feature = "native-codegen")]
     jit_candidate_pcs: Vec<Vec<bool>>,
+    /// Per-module active-register prefix for JIT marshaling at each bytecode PC.
+    /// MIR-produced functions use compiler-known register counts; bytecode
+    /// without trustworthy metadata and actor behaviors conservatively use all
+    /// 256 registers.
+    #[cfg(feature = "native-codegen")]
+    jit_register_copy_lens: Vec<Vec<u16>>,
+    /// Stable per-frame-depth JIT register scratch buffers.
+    ///
+    /// Boxes keep an outer compiled region's register pointer stable while a
+    /// re-entrant direct call grows this Vec and runs a nested JIT region.
+    /// Buffers are initialized once and reused, so hot JIT entry does not
+    /// memset a fresh 2 KiB array on every transition.
+    #[cfg(feature = "native-codegen")]
+    jit_reg_scratch: Vec<Box<[u64; 256]>>,
     /// Runtime error raised by a re-entrant JIT direct call (taken from the
     /// JIT pending-error thread-local in `try_jit_execute`; consumed by
     /// `step` so the error surfaces as a VM error). None when the last JIT
@@ -2740,6 +2801,10 @@ impl VM {
             jit_constants: Vec::new(),
             #[cfg(feature = "native-codegen")]
             jit_candidate_pcs: Vec::new(),
+            #[cfg(feature = "native-codegen")]
+            jit_register_copy_lens: Vec::new(),
+            #[cfg(feature = "native-codegen")]
+            jit_reg_scratch: Vec::new(),
             jit_pending_error: None,
             node_id: 0,
             pending_migrations: Vec::new(),
@@ -3034,10 +3099,14 @@ impl VM {
         let bits = constants_to_jit_bits(&module.constants);
         #[cfg(feature = "native-codegen")]
         let jit_candidates = compute_jit_candidate_pcs(&module);
+        #[cfg(feature = "native-codegen")]
+        let jit_copy_lens = compute_jit_register_copy_lens(&module);
         self.modules.push(module);
         self.jit_constants.push(bits);
         #[cfg(feature = "native-codegen")]
         self.jit_candidate_pcs.push(jit_candidates);
+        #[cfg(feature = "native-codegen")]
+        self.jit_register_copy_lens.push(jit_copy_lens);
     }
 
     /// Number of hot regions compiled through the type-directed JIT path
@@ -3593,10 +3662,38 @@ impl VM {
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
 
-        // Snapshot registers into a flat array for the JIT ABI.
-        let mut regs: [u64; 256] = [0; 256];
-        for (i, r) in self.frames[frame_idx].regs.iter().enumerate() {
-            regs[i] = r.to_bits();
+        // Marshal only the compiler-known active register prefix. The old
+        // path copied all 256 registers in both directions on every JIT entry.
+        // Old/hand-built bytecode and behaviors without local-count metadata
+        // retain the conservative 256-register path.
+        let copy_len = self
+            .jit_register_copy_lens
+            .get(module_idx)
+            .and_then(|row| row.get(pc))
+            .copied()
+            .map(usize::from)
+            .unwrap_or(256)
+            .min(256);
+
+        while self.jit_reg_scratch.len() <= frame_idx {
+            self.jit_reg_scratch
+                .push(Box::new([Value::nil().to_bits(); 256]));
+        }
+        let regs_ptr: *mut [u64; 256] = self.jit_reg_scratch[frame_idx].as_mut();
+        // SAFETY: each frame depth owns a distinct boxed scratch buffer. The
+        // box allocation is stable even if a re-entrant direct call grows the
+        // outer Vec. The buffer remains alive for the VM's lifetime.
+        let regs = unsafe { &mut *regs_ptr };
+        for (dst, src) in regs[..copy_len]
+            .iter_mut()
+            .zip(self.frames[frame_idx].regs[..copy_len].iter())
+        {
+            *dst = src.to_bits();
+        }
+        // r254 is the compiler's reserved direct-call staging register and sits
+        // outside ordinary MIR local prefixes.
+        if copy_len <= 254 {
+            regs[254] = self.frames[frame_idx].regs[254].to_bits();
         }
         // SAFETY: The `&mut dyn ActorVmCallbacks` reference is valid for the
         // duration of this function call. `set_jit_callbacks` stores it in a
@@ -3618,14 +3715,20 @@ impl VM {
         unsafe {
             crate::jit::runtime::set_jit_vm(self_ptr);
         }
-        let action = jit.tiered_execute_step_typed(module_idx, pc, module, &mut regs, constants);
+        let action = jit.tiered_execute_step_typed(module_idx, pc, module, regs, constants);
         crate::jit::runtime::clear_jit_vm();
         crate::jit::runtime::clear_jit_constants();
         crate::jit::runtime::clear_jit_callbacks();
 
         if action != TieredAction::Interpret {
-            for (i, bits) in regs.iter().enumerate() {
-                self.frames[frame_idx].regs[i] = unsafe { Value::from_bits(*bits) };
+            for (dst, bits) in self.frames[frame_idx].regs[..copy_len]
+                .iter_mut()
+                .zip(regs[..copy_len].iter())
+            {
+                *dst = unsafe { Value::from_bits(*bits) };
+            }
+            if copy_len <= 254 {
+                self.frames[frame_idx].regs[254] = unsafe { Value::from_bits(regs[254]) };
             }
 
             // A re-entrant callee raised a runtime error (e.g. step-limit
@@ -6864,6 +6967,26 @@ mod vm_tests {
             err_msg.contains("resume called without a captured continuation"),
             "Error should mention missing continuation: {}",
             err_msg
+        );
+    }
+
+    #[cfg(feature = "native-codegen")]
+    #[test]
+    fn test_jit_register_copy_lens_use_function_metadata_and_boundaries() {
+        let mut module = CodeModule::new("jit_copy_lens");
+        for _ in 0..20 {
+            module.emit(Instruction::new0(OpCode::Nop));
+        }
+        module.function_table = vec![2, 10];
+        module.function_local_counts = vec![23, 0];
+
+        let lens = compute_jit_register_copy_lens(&module);
+        assert_eq!(lens[0], 256, "non-function code stays conservative");
+        assert_eq!(lens[2], 23);
+        assert_eq!(lens[9], 23);
+        assert_eq!(
+            lens[10], 256,
+            "a new function boundary with missing/zero metadata must not inherit the previous function's prefix"
         );
     }
 
