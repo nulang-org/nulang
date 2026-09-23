@@ -271,9 +271,9 @@ fn normal_successors(func: &mir::Function) -> HashMap<BlockId, Vec<BlockId>> {
     func.blocks
         .iter()
         .map(|block| {
-            let succs = match block.terminator {
-                Terminator::Jump(target) => vec![target],
-                Terminator::Branch { then_, else_, .. } => vec![then_, else_],
+            let succs = match &block.terminator {
+                Terminator::Jump(target) => vec![*target],
+                Terminator::Branch { then_, else_, .. } => vec![*then_, *else_],
                 _ => Vec::new(),
             };
             (block.id, succs)
