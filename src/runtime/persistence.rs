@@ -1341,6 +1341,15 @@ impl PersistenceStore for LibsqlStore {
             .await
             .map(|_| ())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            // Also remove legacy rows so a later reopen cannot migrate them
+            // back into events_v2.
+            conn.execute(
+                "DELETE FROM events WHERE actor_id = ?1",
+                libsql::params![actor_id as i64],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             Ok(())
         })
     }
