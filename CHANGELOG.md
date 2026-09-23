@@ -51,6 +51,13 @@ version + migration.*
 
 ## Stable tier
 
+### Re-entrant JIT ownership boundary — 2026-09-22
+- **JIT compilation/promotion and native execution are now separate backend phases** (`src/backends/mod.rs`, `src/jit/mod.rs`): module borrowing ends before native code can call back into the interpreter.
+- **`VM::try_jit_execute` detaches the mutable JIT backend and raw-bit constant cache before native entry** while preserving active-prefix register marshaling and stable per-frame scratch buffers (`src/vm.rs`).
+- **JIT helpers no longer keep a borrowed constant-pool slice in thread-local state**; interned strings resolve through the active VM and explicit module index (`src/jit/runtime.rs`).
+- **Re-entrant direct calls assert the ownership invariant in debug/test builds**, preventing future backend/cache aliasing regressions from becoming latent undefined behavior.
+
+
 ### Dense terminal Tier-2 JIT state — 2026-09-22
 - **Post-compilation hotness now lives beside each dense compiled-region cache entry** (`src/jit/mod.rs`) instead of a separate `FxHashMap<(module, pc), counter>`, removing the hash probe from repeated native-region entry.
 - **Tier-2 probing is terminal**: untyped regions stop probing once no new static type information can appear; typed regions get one SIMD specialization attempt and then stop paying counter updates.
