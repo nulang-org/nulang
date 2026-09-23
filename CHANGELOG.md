@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Benchmark history isolation — 2026-09-23
+- **Regression benchmark history now persists on a dedicated automation branch instead of protected `main`** (`.github/workflows/ci.yml`). CI loads prior JSON measurements from `automation/benchmark-history`, publishes only the current run as an artifact, and updates the history branch after regression checking, so benchmark retention no longer requires the validation workflow to mutate the branch it is testing.
+
 ### RFC 0008 migration purity enforcement — 2026-09-22
 - **Entity migration bodies now fail compilation when they contain nondeterministic or externally visible operations** (`src/migration_purity.rs`, `src/effect_checker.rs`). The public effect-checking pipeline rejects direct or transitively hidden `perform`, spawn/send/ask/receive, actor migration, grain lookup, continuation resume, defer/errdefer, and extern/FFI calls; locally handling an effect does not launder it. Pure helpers and replay-stream `emit` remain allowed, and the existing conformance proof-of-gap now expects compilation failure.
 
