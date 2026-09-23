@@ -838,13 +838,18 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
                 if let Some(callback_name) = callback_name {
                     let rt = self.runtime.borrow_mut();
                     let actor_id = rt.current_actor.unwrap_or(0);
-                    let behavior_id = rt.behavior_id_for(actor_id, &callback_name).unwrap_or(0);
-                    if behavior_id > 0 {
+                    if let Some(behavior_id) = rt.behavior_id_for(actor_id, &callback_name) {
                         rt.timer_wheel.send_after(
                             std::time::Duration::from_millis(ms as u64),
                             actor_id,
                             behavior_id,
                             vec![],
+                        );
+                    } else {
+                        tracing::warn!(
+                            actor_id,
+                            behavior = %callback_name,
+                            "nulang-timer: refusing unknown callback behavior"
                         );
                     }
                 }
@@ -1702,15 +1707,20 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                         })
                     });
                     if let Some(callback_name) = callback_name {
-                        let behavior_id = (*self.runtime)
-                            .behavior_id_for(self.actor_id, &callback_name)
-                            .unwrap_or(0);
-                        if behavior_id > 0 {
+                        if let Some(behavior_id) =
+                            (*self.runtime).behavior_id_for(self.actor_id, &callback_name)
+                        {
                             (*self.runtime).timer_wheel.send_after(
                                 std::time::Duration::from_millis(ms as u64),
                                 self.actor_id,
                                 behavior_id,
                                 vec![],
+                            );
+                        } else {
+                            tracing::warn!(
+                                actor_id = self.actor_id,
+                                behavior = %callback_name,
+                                "nulang-timer: refusing unknown callback behavior"
                             );
                         }
                     }
@@ -3002,6 +3012,125 @@ mod host_authority_tests {
         let (constants, regs) = string_args(&["/tmp/ambient.txt"]);
         assert!(
             authorize_actor_host_effect(&rt, None, "FS", Some("read"), &constants, &regs,).is_ok()
+        );
+    }
+}
+
+
+#[cfg(test)]
+mod timer_callback_tests {
+    use super::RuntimeVmCallbacks;
+    use crate::bytecode::{CodeModule, Constant};
+    use crate::runtime::Runtime;
+    use crate::vm::{ActorVmCallbacks, Value};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn noop(_actor: &mut crate::runtime::Actor, _args: &[Value]) {}
+
+    fn runtime_with_first_behavior() -> (Rc<RefCell<Runtime>>, u64) {
+        let runtime = Rc::new(RefCell::new(Runtime::new()));
+        let actor_id = runtime.borrow_mut().spawn_actor(Box::new(Vec::new));
+        {
+            let mut rt = runtime.borrow_mut();
+            rt.actors
+                .get_mut(&actor_id)
+                .expect("spawned actor")
+                .register_behavior("first", noop);
+            rt.current_actor = Some(actor_id);
+        }
+        (runtime, actor_id)
+    }
+
+    fn perform_timer_after(runtime: Rc<RefCell<Runtime>>, callback_name: &str) {
+        let mut module = CodeModule::new("timer-callback-regression");
+        module.add_constant(Constant::String(callback_name.to_string()));
+        let regs = [Value::int(1), Value::string(0)];
+        let mut callbacks = RuntimeVmCallbacks::new(runtime);
+        let result =
+            callbacks.perform_builtin_effect_in_module("Timer", Some("after"), &module, &regs);
+        assert!(
+            result.is_some(),
+            "Timer.after should be handled by the runtime"
+        );
+    }
+
+    #[test]
+    fn timer_after_schedules_declared_behavior_zero() {
+        let (runtime, actor_id) = runtime_with_first_behavior();
+        assert_eq!(
+            runtime.borrow().behavior_id_for(actor_id, "first"),
+            Some(0),
+            "the first registered behavior must retain id 0"
+        );
+        perform_timer_after(runtime.clone(), "first");
+        assert!(
+            !runtime.borrow().timer_wheel.is_empty(),
+            "Timer.after must schedule a valid behavior even when its id is 0"
+        );
+    }
+
+    #[test]
+    fn timer_after_rejects_unknown_behavior_without_aliasing_zero() {
+        let (runtime, _actor_id) = runtime_with_first_behavior();
+        perform_timer_after(runtime.clone(), "missing");
+        assert!(
+            runtime.borrow().timer_wheel.is_empty(),
+            "an unknown callback must not be converted into behavior id 0"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bytecode_timer_callback_tests {
+    use crate::bytecode::{CodeModule, Constant};
+    use crate::runtime::Runtime;
+    use crate::vm::{ActorVmCallbacks, Value};
+
+    fn noop(_actor: &mut crate::runtime::Actor, _args: &[Value]) {}
+
+    fn runtime_with_first_behavior() -> (Runtime, u64) {
+        let mut runtime = Runtime::new();
+        let actor_id = runtime.spawn_actor(Box::new(Vec::new));
+        runtime
+            .actors
+            .get_mut(&actor_id)
+            .expect("spawned actor")
+            .register_behavior("first", noop);
+        (runtime, actor_id)
+    }
+
+    fn perform_timer_after(runtime: &mut Runtime, actor_id: u64, callback_name: &str) {
+        let mut module = CodeModule::new("bytecode-timer-callback-regression");
+        module.add_constant(Constant::String(callback_name.to_string()));
+        let regs = [Value::int(1), Value::string(0)];
+        let mut callbacks = super::BytecodeRuntimeCallbacks::new(runtime as *mut Runtime, actor_id);
+        let result =
+            callbacks.perform_builtin_effect_in_module("Timer", Some("after"), &module, &regs);
+        assert!(
+            result.is_some(),
+            "Timer.after should be handled by the runtime"
+        );
+    }
+
+    #[test]
+    fn bytecode_timer_after_schedules_declared_behavior_zero() {
+        let (mut runtime, actor_id) = runtime_with_first_behavior();
+        assert_eq!(runtime.behavior_id_for(actor_id, "first"), Some(0));
+        perform_timer_after(&mut runtime, actor_id, "first");
+        assert!(
+            !runtime.timer_wheel.is_empty(),
+            "scheduler-driven Timer.after must schedule a valid behavior id 0"
+        );
+    }
+
+    #[test]
+    fn bytecode_timer_after_rejects_unknown_behavior_without_aliasing_zero() {
+        let (mut runtime, actor_id) = runtime_with_first_behavior();
+        perform_timer_after(&mut runtime, actor_id, "missing");
+        assert!(
+            runtime.timer_wheel.is_empty(),
+            "scheduler-driven Timer.after must fail closed for unknown callbacks"
         );
     }
 }
