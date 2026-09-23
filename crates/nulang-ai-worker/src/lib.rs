@@ -35,6 +35,8 @@ pub trait Worker: Send + Sync {
     /// Execute a task while preserving optional worker-supplied outcome evidence.
     ///
     /// Existing workers only implementing `execute` remain source-compatible.
+    /// The local runtime consumes the returned task's status as an outcome and
+    /// preserves the originally scheduled task identity and plan metadata.
     fn execute_with_report(&self, task: &Task) -> TaskExecution {
         TaskExecution::new(self.execute(task))
     }
