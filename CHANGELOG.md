@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Timer callback behavior-zero correctness — 2026-09-23
+- **`Timer.after` now preserves a valid behavior id 0 and fails closed for unknown callback names** (`src/runtime/callbacks.rs`). The runtime no longer maps failed callback lookup to 0 and then filters 0 out; declared first behaviors are schedulable, while unknown names emit a warning and create no timer. Focused regressions cover both cases.
+
 ### Actor density and mailbox hot-path allocation — 2026-09-23
 - **Idle actors no longer materialize their 16 KiB ORCA bump block at spawn** (`src/runtime/heap.rs`). The configured first-block capacity is preserved, but allocation is deferred until the first small-object heap allocation; LOS-only actors also remain bump-block-free.
 - **Mailbox logical-count atomics use relaxed ordering** (`src/runtime/mailbox.rs`) because Crossbeam `SegQueue` owns message publication/synchronization; the atomic counter remains capacity/accounting state and its modification order still prevents bounded producers from over-reserving.
