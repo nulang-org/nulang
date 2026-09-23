@@ -227,6 +227,16 @@ mod tests {
     }
 
     #[test]
+    fn test_nbc_roundtrip_preserves_send_ownership_masks() {
+        let mut m = sample_module();
+        m.send_ownership_masks.push((1, 0b0011));
+        let bytes = m.to_nbc(None).expect("encode");
+        let art = CodeModule::from_nbc(&bytes).expect("decode");
+        assert_eq!(art.module.send_ownership_masks, vec![(1, 0b0011)]);
+        assert_eq!(art.module, m, "optional send ownership metadata must round-trip");
+    }
+
+    #[test]
     fn test_nbc_roundtrip_with_source_hash() {
         let m = sample_module();
         let h = [0xAA; 32];
