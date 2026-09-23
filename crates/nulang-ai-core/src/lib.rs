@@ -224,9 +224,7 @@ pub struct IntentionRevision {
 
 impl IntentionRevision {
     pub fn new(
-        goal_id: Uuid,
-        commitment_id: Uuid,
-        superseded_intention_id: Uuid,
+        intention: &Intention,
         replacement_intention_id: Option<Uuid>,
         trigger_task_id: Uuid,
         trigger_status: TaskStatus,
@@ -235,9 +233,9 @@ impl IntentionRevision {
     ) -> Self {
         Self {
             id: Uuid::new_v4(),
-            goal_id,
-            commitment_id,
-            superseded_intention_id,
+            goal_id: intention.goal_id,
+            commitment_id: intention.commitment_id,
+            superseded_intention_id: intention.id,
             replacement_intention_id,
             trigger_task_id,
             trigger_status,
@@ -509,9 +507,7 @@ mod tests {
         );
         let task = Task::new(goal.id, "Implement feature", ManagerKind::Engineering);
         let revision = IntentionRevision::new(
-            goal.id,
-            commitment.id,
-            intention.id,
+            &intention,
             None,
             task.id,
             TaskStatus::Blocked,
