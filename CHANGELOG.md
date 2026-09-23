@@ -1593,6 +1593,11 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Atomic workflow transition runtime bridge — 2026-09-23
+- **Workflow creation and durable timer/signal/saga markers now commit through RFC 0022's atomic transition boundary** (`src/runtime/workflow.rs`, `src/runtime/spawn.rs`, `src/runtime/mod.rs`). The workflow event and its same-sequence snapshot become visible together; unsupported stores fail closed instead of falling back to independent journal + snapshot writes.
+- **Activation fencing is tied to cluster ownership, not merely the highest observed epoch.** When RFC 0014's durable-actor directory has an entry, commits require that it still names the local node and that any locally tracked re-spawn epoch agrees with the directory epoch. A stale node cannot adopt a replacement node's newer epoch to continue writing.
+- **Externally visible workflow progress is gated on durable commit.** Failed signal commits are not delivered, failed timer-fire commits are re-armed for bounded retry instead of disappearing from the live timer wheel, and saga compensation stops at the first completion marker that cannot be durably recorded.
+
 ### Atomic durable-transition storage contract — 2026-09-22
 - **Persistence backends now have a fail-closed atomic transition API** (Experimental, RFC 0022, `src/runtime/persistence.rs`). `DurableTransition` binds actor identity, activation epoch, sequence predecessor, command, snapshot, workflow/domain events, durable-effect records, and outbox messages to one canonical BLAKE3 digest. Unsupported backends return `Unsupported` rather than emulating atomicity with sequential writes. `MemoryStore` implements sequence/epoch fencing, idempotent exact retries, conflicting-retry rejection, and migration from existing legacy history.
 - **libSQL/SQLite commits durable transitions in one database transaction.** Additive transition/tail/event/effect/outbox tables preserve legacy readability while allowing multiple workflow/domain records at one logical sequence. The committed tail is compare-and-set under an IMMEDIATE transaction, so stale activations and sequence gaps fail before becoming visible.
