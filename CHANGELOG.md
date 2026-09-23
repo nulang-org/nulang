@@ -51,6 +51,14 @@ version + migration.*
 
 ## Stable tier
 
+### Bounded-liveness native JIT calls — 2026-09-22
+- **Native direct-call specialization now extends from straight-line leaves to bounded pure acyclic callees with forward control flow** (`src/jit/`), up to 96 bytecode instructions.
+- **Caller preservation is liveness-bounded**: one backward bytecode fixed point per caller range computes `live_after(call)`, then saves only registers that are both live and in the callee's static clobber set.
+- **Callee eligibility proves fresh-frame semantics**: only r0..argc begin defined; any path reading another register before a dominating definition is rejected. Loops, recursion, nested calls, effects, heap/refcount operations, suspension, malformed branches, oversized callees, and error-sensitive operations remain on the interpreter-helper fallback.
+- **Native thunks return through r255 as a tagged mailbox**, allowing multiple `RetVal` paths to use different source registers while the caller captures the result before restoring any live r255 value.
+- **A branchy call-loop Criterion benchmark and regression tests cover definite definitions, bounded liveness, FNeg destinations, INeg rejection, and forward-control-flow native thunks.**
+
+
 ### Native straight-line JIT leaf calls — 2026-09-22
 - **Hot compiled callers can invoke proven tiny leaf functions directly in native code** (`src/jit/mod.rs`, `src/jit/compiler.rs`) instead of re-entering the interpreter for every call.
 - **Leaf eligibility is deliberately strict**: ≤32 straight-line body instructions, no nested calls, branches, heap/container operations, effects, suspension, or error-capable `INeg`; rejected leaves are cached so static failures are not re-analyzed.
