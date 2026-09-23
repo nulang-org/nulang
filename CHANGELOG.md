@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### CI release-lane de-duplication — 2026-09-21
+- **Release CI keeps optimized build coverage without rerunning the entire test suite** (`.github/workflows/ci.yml`). The full suite remains authoritative in Build & Test; Release Build now verifies `cargo build --release` plus representative optimized regressions for raw-value provenance, nominal actor protocols, and durable actor-turn semantic closure, reducing runner pressure while preserving release-mode semantic coverage.
+
 ### Temporary concatenated-string reclamation — 2026-09-22
 - **Non-folded string concatenations now participate in MIR ownership-based reclamation** (`src/mir_codegen.rs`). Because `SConcat` creates a fresh actor-heap string, the liveness planner can release its sole local ORCA reference immediately after the last safe use instead of retaining the temporary until actor teardown. Runtime semantics and the existing ORCA/store-barrier protocol are unchanged.
 
