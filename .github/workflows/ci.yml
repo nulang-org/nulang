@@ -344,8 +344,9 @@ jobs:
   # run-to-run noise, so a naive fixed threshold would fail PRs for
   # noise, not real regressions). Runs on push to main only (not every
   # PR) since a full criterion run of every group is slow; results are
-  # committed back so PERFORMANCE_ANALYSIS.md can cite real numbers
-  # instead of estimates. The gate needs >= 3 prior commits' worth of
+  # persisted on a dedicated history branch so PERFORMANCE_ANALYSIS.md can
+  # cite real numbers without generated benchmark commits touching protected
+  # main. The gate needs >= 3 prior commits' worth of
   # history for a given benchmark before it will fail anything, so
   # early runs (and brand-new benchmarks) are informational only until
   # enough history accumulates.
