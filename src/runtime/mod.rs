@@ -5366,7 +5366,7 @@ impl Runtime {
                 let payload: Vec<Value> =
                     entry.payload.iter().map(|value| value.to_value()).collect();
 
-                if self.has_native_handler(actor_id, behavior_idx) {
+                let replay_result = if self.has_native_handler(actor_id, behavior_idx) {
                     let handler = self
                         .actors
                         .get(&actor_id)
@@ -5374,14 +5374,77 @@ impl Runtime {
                         .map(|behavior| behavior.handler_fn)?;
                     if let Some(actor) = self.actors.get_mut(&actor_id) {
                         handler(actor, &payload);
-                        actor.sequence = entry.sequence;
                     }
+                    Ok(Value::nil())
                 } else if self.has_bytecode_handler(actor_id, behavior_idx) {
                     self.current_actor = Some(actor_id);
-                    let _ = self.run_bytecode_behavior(actor_id, behavior_idx, &payload);
+                    let result = self.run_bytecode_behavior(actor_id, behavior_idx, &payload);
                     self.current_actor = None;
-                    if let Some(actor) = self.actors.get_mut(&actor_id) {
-                        actor.sequence = entry.sequence;
+                    result
+                } else {
+                    warn!(
+                        actor_id,
+                        behavior_id = entry.behavior_id,
+                        "nulang-recover: accepted workflow command has no recoverable handler"
+                    );
+                    self.actors.remove(&actor_id);
+                    return None;
+                };
+
+                if let Some(actor) = self.actors.get_mut(&actor_id) {
+                    actor.sequence = entry.sequence;
+                }
+
+                match replay_result {
+                    Ok(_) => {
+                        if !self.is_internal_behavior(actor_id, behavior_idx) {
+                            let sequence = self.next_sequence(actor_id);
+                            let step_name = self.step_name_for(actor_id, behavior_idx);
+                            if let Err(error) = workflow::commit_workflow_event(
+                                self,
+                                actor_id,
+                                WorkflowEvent::StepCompleted {
+                                    sequence,
+                                    step_name,
+                                },
+                            ) {
+                                warn!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-recover: replayed workflow command completion could not be committed"
+                                );
+                                self.actors.remove(&actor_id);
+                                return None;
+                            }
+                        }
+                    }
+                    Err(crate::types::NuError::Suspended(_)) => {
+                        // Persist only the suspension marker while retaining
+                        // the pre-command durable state. A later signal/effect
+                        // will resume and commit completion atomically.
+                        self.persist_suspension_marker(actor_id);
+                    }
+                    Err(error) => {
+                        let sequence = self.next_sequence(actor_id);
+                        let step_name = self.step_name_for(actor_id, behavior_idx);
+                        if let Err(commit_error) = workflow::commit_workflow_event(
+                            self,
+                            actor_id,
+                            WorkflowEvent::StepFailed {
+                                sequence,
+                                step_name,
+                                error: error.to_string(),
+                            },
+                        ) {
+                            warn!(
+                                actor_id,
+                                %commit_error,
+                                "nulang-recover: replayed workflow failure could not be committed"
+                            );
+                            self.actors.remove(&actor_id);
+                            return None;
+                        }
+                        self.run_saga_compensation(actor_id, behavior_idx);
                     }
                 }
             }
