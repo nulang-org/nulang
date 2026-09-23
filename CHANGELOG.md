@@ -1599,6 +1599,13 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Production readiness hardening — 2026-09-23
+- **Benchmark validation no longer writes generated history to protected `main`.** CI restores rolling benchmark JSON from `automation/benchmark-history`, uploads only the current result artifact, and persists generated history to that dedicated branch.
+- **Primary Rust build/test/check/bench commands and tagged release builds now resolve the checked-in dependency graph with `--locked`.** Tagged releases also fail preflight when the Git tag, `Cargo.toml` version, and CLI `VERSION` disagree.
+- **Release supply-chain permissions are narrower.** Matrix build jobs use read-only repository access; only the publishing job retains `contents: write`. Checksum generation works with GNU `sha256sum` or macOS `shasum -a 256`.
+- **Security disclosure policy is explicit.** `SECURITY.md` documents private reporting, high-risk compiler/runtime surfaces, and that `.cargo/audit.toml` suppressions are accepted risks rather than an advisory-free claim.
+- **Release/readiness documentation now matches the implementation.** The release matrix is Linux x86_64/aarch64, macOS aarch64, and Windows x86_64; stale CRDT-recovery, historical test-count, and launch-status claims were corrected.
+
 ### Allocation-free protocol actor-ref decoding — 2026-09-21
 - **ProtocolId wire decode no longer hex-allocates.** The fixed 32-byte protocol digest is reconstructed directly with `ProtocolId::from_bytes` instead of expanding to a 64-character hex `String` and reparsing it. Wire bytes and compatibility semantics are unchanged.
 
