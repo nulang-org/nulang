@@ -2228,36 +2228,24 @@ Runtime recovery process:
 4. Reconstruct `event_sourced` state by applying replayed events
 5. Merge `crdt` state from all available replicas
 
-**Implementation status (verified 2026-08-02; apply-handler recovery
-fixed 2026-08-13).** Recovery does not re-execute an `apply` handler
-(they are inlined at each `emit` call site by `hir_lower.rs`); instead
-`emit_event` persists the field's CURRENT value — captured AFTER the
-inlined apply handler ran and after the unconditional "+1" every
-`event_sourced` field gets per emit (`src/runtime/workflow.rs`) — in
-the `EventEntry`, and `recover_actor` restores that exact post-apply
-value from the event. The stored value, not a bare event count, is what
-recovery reconstructs, so non-trivial `apply` handlers survive a crash
-without needing an addressable bytecode unit. Pinned by
-`test_event_sourced_apply_handler_recovery`
-(`src/integration_tests/mod.rs`): an `entity Counter` with
-`apply | Incremented(by) => self.count = self.count + by`, sent
-`increment(3)` then `increment(4)` with no crash, reaches `count = 9`
-(matches `conformance/behavior/persist_07_emit_accumulates_across_sends.nula`);
-the same two messages with a crash-and-recover between them recover to
-`count = 4` after the first message (apply's `0 + 3`, plus the +1 bump)
-and reach `9` after continuing — identical to the never-crashed
-baseline.
+**Implementation status (corrected 2026-09-23).** Recovery does not
+re-execute an `apply` handler (handlers are inlined at each `emit` call
+site by `hir_lower.rs`). Instead, `emit_event` persists each
+`event_sourced` field's CURRENT value after the source-level transition has
+run, and `recover_actor` restores that exact post-apply value. Event emission
+itself is state-neutral: it never invents an implicit counter increment or
+other domain mutation.
 
-A related, more severe bug was found and fixed alongside this: before
-this session, `recover_actor` never restored `Actor.state_models` (the
-per-field Local/Durable/EventSourced/Crdt map) on the rebuilt actor,
-so *every* field silently reverted to the `Local` default the moment
-an actor recovered once -- a second crash would have dropped `durable`
-fields from the snapshot entirely, and `event_sourced` fields would
-have stopped accumulating altogether (the "+1 per emit" bump above
-iterates `state_models` to find which fields to bump). Fixed by
-restoring `state_models` from the recovery module's `actor_metadata`
-in the same place `bytecode_module`/`bytecode_offsets` are restored.
+For an `entity Counter` with
+`apply | Incremented(by) => self.count = self.count + by`, sending
+`increment(3)` then `increment(4)` therefore reaches `count = 7`, and an
+unrelated `event_sourced` integer field remains unchanged. The conformance
+cases `persist_06`, `persist_07`, and `persist_08` pin those semantics.
+
+Recovery also restores `Actor.state_models` (the per-field
+Local/Durable/EventSourced/Crdt map) from the recovery module's
+`actor_metadata` alongside bytecode metadata, so fields do not silently fall
+back to `Local` after the first recovery.
 
 ## 9.7 Deterministic Replay
 
