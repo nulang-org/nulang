@@ -1723,15 +1723,19 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
                     span: *span,
                 });
 
-                let ty = Type::Tuple(results.iter().map(hir::Operand::ty).collect());
-                let temp = fresh_temp_name();
-                body.push(hir::Stmt::Let {
-                    name: temp.clone(),
-                    ty: ty.clone(),
-                    value: hir::RValue::Tuple(results, ty.clone()),
-                    span: *span,
-                });
-                hir::Operand::Var(temp, ty)
+                if results.is_empty() {
+                    hir::Operand::Unit
+                } else {
+                    let ty = Type::Tuple(results.iter().map(|operand| operand.ty()).collect());
+                    let temp = fresh_temp_name();
+                    body.push(hir::Stmt::Let {
+                        name: temp.clone(),
+                        ty: ty.clone(),
+                        value: hir::RValue::Tuple(results, ty.clone()),
+                        span: *span,
+                    });
+                    hir::Operand::Var(temp, ty)
+                }
             } else {
                 let _ = pop_defer_scope();
                 hir::Operand::Unit
