@@ -3930,9 +3930,24 @@ impl VM {
                 return 1;
             }
         };
+
+        // Re-entrant direct calls are sound only because the outer native
+        // execution detached both the mutable JIT backend and its raw constant
+        // cache from the VM before entering native code.
+        debug_assert!(
+            self.jit_session.is_none(),
+            "re-entrant JIT direct call entered while VM still owns the JIT backend"
+        );
+
         // The callee lives in the same module as the caller (function_table
         // is per-module; direct calls are within-module).
         let module_idx = self.frames[caller_idx].module_idx;
+        debug_assert!(
+            self.jit_constants
+                .get(module_idx)
+                .map_or(true, |constants| constants.is_empty()),
+            "re-entrant JIT direct call entered while VM still owns JIT constants"
+        );
         let code_offset = match self
             .modules
             .get(module_idx)
