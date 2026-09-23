@@ -524,6 +524,28 @@ impl Scheduler {
         }
     }
 
+    /// True when any priority queue still contains runnable work.
+    ///
+    /// Used only for adaptive actor-turn sizing. This is a best-effort
+    /// contention signal, not a synchronization primitive.
+    pub fn has_ready_work(&self) -> bool {
+        for priority in [
+            ActorPriority::High,
+            ActorPriority::Normal,
+            ActorPriority::Low,
+        ] {
+            if !self.global_for(priority).is_empty()
+                || self
+                    .workers_for(priority)
+                    .iter()
+                    .any(|worker| !worker.is_empty())
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Number of configured worker slots.
     pub fn worker_count(&self) -> usize {
         self.worker_count
