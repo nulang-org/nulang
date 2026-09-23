@@ -80,7 +80,7 @@ impl PersistenceStore for RejectWorkflowEventStore {
 #[test]
 fn test_authority_snapshot_round_trip_recovery() {
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    let actor_id = rt.spawn_persistent_actor(Box::new(|| Vec::new()), HashMap::new());
     let manifest = crate::authority::AuthorityManifest::from_tokens([
         "Secret::Read(PAYMENTS_KEY)",
         "Net::TcpOut(api.example.com:443)",
@@ -2047,7 +2047,7 @@ fn test_event_sourced_counter_replays_post_apply_state_from_event_log() {
 #[test]
 fn test_workflow_timer_is_not_armed_when_durable_commit_fails() {
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    let actor_id = rt.spawn_persistent_actor(Box::new(|| Vec::new()), HashMap::new());
     rt.actors.get_mut(&actor_id).unwrap().is_workflow = true;
     rt.persistence = Box::new(RejectWorkflowEventStore::default());
 
@@ -2062,7 +2062,7 @@ fn test_workflow_timer_is_not_armed_when_durable_commit_fails() {
 #[test]
 fn test_workflow_signal_is_not_delivered_when_durable_commit_fails() {
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    let actor_id = rt.spawn_persistent_actor(Box::new(|| Vec::new()), HashMap::new());
     {
         let actor = rt.actors.get_mut(&actor_id).unwrap();
         actor.is_workflow = true;
