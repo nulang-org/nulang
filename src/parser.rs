@@ -3835,10 +3835,9 @@ impl Parser {
         })
     }
 
-    /// Parse a `par { e1; e2; ... }` block — an independence annotation
-    /// (see `Expr::Par`). The sub-expressions are evaluated in order, just
-    /// like a `Block`; the distinct node lets later passes exploit the
-    /// declared independence. Mirrors `parse_block`.
+    /// Parse a `par { e1; e2; ... }` region (see `Expr::Par`). Branches
+    /// remain sequential in the current executor but produce a source-ordered
+    /// tuple result and retain explicit structure for scoped-concurrency passes.
     fn parse_par(&mut self) -> NuResult<Expr> {
         let span = self.current_span();
         self.advance(); // consume 'par'

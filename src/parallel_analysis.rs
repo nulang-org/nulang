@@ -5,6 +5,7 @@
 //! hold before a future backend is allowed to run branches concurrently.
 
 use crate::ast::{Expr, Pattern};
+use crate::effect_semantics::{classify_effect_operation, ParallelEffectConstraint};
 use crate::types::{NuError, NuResult, Span};
 use std::collections::{BTreeSet, HashSet};
 
@@ -21,8 +22,13 @@ pub struct ParallelBranchSummary {
     pub state_reads: BTreeSet<String>,
     /// Actor-state fields written by the branch.
     pub state_writes: BTreeSet<String>,
-    /// Requested effect operations, for later effect-policy scheduling.
+    /// Requested effect operations, for diagnostics and manifest handoff.
     pub effects: BTreeSet<String>,
+    /// Strongest compiler-owned scheduling constraint imposed by operations in
+    /// this branch. Capture/ownership analysis may impose stricter limits.
+    pub effect_constraint: ParallelEffectConstraint,
+    /// Whether an operation in this branch may suspend the computation.
+    pub may_suspend: bool,
     /// Explicit external authority grants introduced by spawn sites.
     pub authorities: BTreeSet<String>,
     /// Control-flow escapes that cannot be scoped to one concurrent child yet.
@@ -109,6 +115,16 @@ pub fn summarize_branch(index: u32, expr: &Expr) -> ParallelBranchSummary {
     summary
 }
 
+fn constrain(out: &mut ParallelBranchSummary, constraint: ParallelEffectConstraint) {
+    out.effect_constraint = out.effect_constraint.combine(constraint);
+}
+
+fn apply_effect_semantics(out: &mut ParallelBranchSummary, effect: &str, operation: &str) {
+    let semantics = classify_effect_operation(effect, operation);
+    constrain(out, semantics.parallel);
+    out.may_suspend |= semantics.may_suspend;
+}
+
 fn par_error(msg: String, span: Span) -> NuError {
     NuError::TypeError {
         msg,
@@ -174,6 +190,7 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
             // checking governs whether captured values may later cross a task
             // boundary.
             out.effects.insert("Closure.capture".to_string());
+            constrain(out, ParallelEffectConstraint::ActorThreadOnly);
         }
         Expr::App { func, args, .. } => {
             summarize_expr(func, bound, out);
@@ -181,6 +198,9 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
                 summarize_expr(arg, bound, out);
             }
             out.effects.insert("Call".to_string());
+            // Until callee effect summaries are threaded into this pass, an
+            // arbitrary call may hide observable effects.
+            constrain(out, ParallelEffectConstraint::SequentialOnly);
         }
         Expr::Let {
             name, value, body, ..
@@ -298,6 +318,7 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
                 summarize_expr(node, bound, out);
             }
             out.effects.insert("Actor.spawn".to_string());
+            apply_effect_semantics(out, "Actor", "spawn");
             out.authorities.extend(capabilities.iter().cloned());
         }
         Expr::Send {
@@ -311,6 +332,7 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
                 summarize_expr(arg, bound, out);
             }
             out.effects.insert(format!("Actor.send.{behavior}"));
+            apply_effect_semantics(out, "Actor", "send");
         }
         Expr::Ask {
             actor,
@@ -323,9 +345,11 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
                 summarize_expr(arg, bound, out);
             }
             out.effects.insert(format!("Actor.ask.{behavior}"));
+            apply_effect_semantics(out, "Actor", "ask");
         }
         Expr::Receive { arms, after, .. } => {
             out.effects.insert("Actor.receive".to_string());
+            apply_effect_semantics(out, "Actor", "receive");
             for (_, patterns, guard, body) in arms {
                 let mut arm_bound = bound.clone();
                 for pattern in patterns {
@@ -346,6 +370,7 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
                 summarize_expr(arg, bound, out);
             }
             out.effects.insert(format!("Event.emit.{event}"));
+            apply_effect_semantics(out, "Event", "emit");
         }
         Expr::Perform {
             effect, op, args, ..
@@ -354,10 +379,12 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
                 summarize_expr(arg, bound, out);
             }
             out.effects.insert(format!("{effect}.{op}"));
+            apply_effect_semantics(out, effect, op);
         }
         Expr::GrainRef { key, .. } => {
             summarize_expr(key, bound, out);
             out.effects.insert("Grain.ref".to_string());
+            constrain(out, ParallelEffectConstraint::ActorThreadOnly);
         }
         Expr::Resume { value, .. } => {
             summarize_expr(value, bound, out);
@@ -375,6 +402,7 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
             summarize_expr(actor, bound, out);
             summarize_expr(node, bound, out);
             out.effects.insert("Actor.migrate".to_string());
+            apply_effect_semantics(out, "Actor", "migrate");
         }
         Expr::For {
             var,
@@ -604,8 +632,61 @@ mod tests {
         };
         let summary = summarize_branch(0, &branch);
         assert!(summary.effects.contains("Actor.spawn"));
+        assert_eq!(
+            summary.effect_constraint,
+            ParallelEffectConstraint::SequentialOnly
+        );
         assert!(summary
             .authorities
             .contains("Net::TcpOut(api.example.com:443)"));
+    }
+
+    #[test]
+    fn host_effects_reuse_compiler_owned_execution_semantics() {
+        let branch = Expr::Perform {
+            effect: "Storage".to_string(),
+            op: "read".to_string(),
+            args: vec![Expr::Literal(Literal::String("key".to_string()), sp())],
+            span: sp(),
+        };
+        let summary = summarize_branch(0, &branch);
+        assert!(summary.effects.contains("Storage.read"));
+        assert_eq!(
+            summary.effect_constraint,
+            ParallelEffectConstraint::SequentialOnly
+        );
+        assert!(!summary.may_suspend);
+    }
+
+    #[test]
+    fn suspension_is_visible_to_future_scoped_task_scheduler() {
+        let branch = Expr::Perform {
+            effect: "Timer".to_string(),
+            op: "sleep".to_string(),
+            args: vec![int(10)],
+            span: sp(),
+        };
+        let summary = summarize_branch(0, &branch);
+        assert_eq!(
+            summary.effect_constraint,
+            ParallelEffectConstraint::SequentialOnly
+        );
+        assert!(summary.may_suspend);
+    }
+
+    #[test]
+    fn pure_branch_has_no_effect_imposed_scheduling_constraint() {
+        let branch = Expr::Binary {
+            op: BinOp::Add,
+            left: Box::new(int(1)),
+            right: Box::new(int(2)),
+            span: sp(),
+        };
+        let summary = summarize_branch(0, &branch);
+        assert_eq!(
+            summary.effect_constraint,
+            ParallelEffectConstraint::Unconstrained
+        );
+        assert!(!summary.may_suspend);
     }
 }

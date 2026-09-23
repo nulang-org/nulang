@@ -126,12 +126,10 @@ pub enum Expr {
         exprs: Vec<Expr>,
         span: Span,
     },
-    /// `par { e1; e2; ... }` — an independence annotation and the source
-    /// surface reserved for scoped concurrency (RFC 0024). The current
-    /// implementation still evaluates branches in order, so keeping this AST
-    /// node distinct is semantically important: later lowering can introduce
-    /// structured concurrency only after capture, effect, cancellation, and
-    /// join invariants are enforced.
+    /// `par { e1; e2; ... }` — scoped structured-concurrency surface.
+    /// Branches are declared independent and produce a source-ordered tuple
+    /// of results. Execution remains sequential until the scoped-task runtime
+    /// is enabled; the distinct node preserves branch structure for analysis.
     Par {
         exprs: Vec<Expr>,
         span: Span,

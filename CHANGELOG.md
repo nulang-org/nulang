@@ -51,6 +51,13 @@ version + migration.*
 
 ## Stable tier
 
+### Structured `par` effect scheduling semantics — 2026-09-23
+- **The compiler now owns a conservative effect-execution classifier for future scoped-task scheduling** (`src/effect_semantics.rs`). Host operations reuse the canonical `HostReplayClass` registry instead of creating a second replay taxonomy, while concurrency constraints remain a separate axis: unconstrained, actor-thread-only, or sequential-only.
+- **`parallel_analysis` records the strongest effect scheduling constraint and suspension capability per branch.** Unknown/custom effects fail closed to sequential execution until they have an explicit compiler-owned contract; this metadata does not reject existing `par` programs or enable concurrent execution yet.
+
+### Structured `par` source-ordered results — 2026-09-23
+- **Experimental `par { ... }` now returns every branch result in source order instead of inheriting block-style "last expression wins" behavior.** Non-empty regions infer and lower to tuples, a single branch remains a one-element tuple, and an empty region has `Unit` type. Execution is still sequential; this change freezes the result contract before scoped-task scheduling is enabled and supersedes the earlier experimental block-result behavior. Conformance coverage pins multi-branch ordering, one-branch tuple shape, and empty-region typing.
+
 ### Actor density and mailbox hot-path allocation — 2026-09-23
 - **Idle actors no longer materialize their 16 KiB ORCA bump block at spawn** (`src/runtime/heap.rs`). The configured first-block capacity is preserved, but allocation is deferred until the first small-object heap allocation; LOS-only actors also remain bump-block-free.
 - **Mailbox logical-count atomics use relaxed ordering** (`src/runtime/mailbox.rs`) because Crossbeam `SegQueue` owns message publication/synchronization; the atomic counter remains capacity/accounting state and its modification order still prevents bounded producers from over-reserving.
