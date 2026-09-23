@@ -337,20 +337,34 @@ impl LocalRuntime {
         out: &mut dyn Write,
     ) -> Result<Uuid, RuntimeError> {
         let graph = self.store.get_goal_graph(resumption.goal_id)?;
-        let replacement = graph
+        if !graph
             .intentions
             .iter()
-            .find(|intention| intention.id == resumption.replacement_intention_id)
-            .cloned()
-            .ok_or(StoreError::InvalidTransition(
-                "resumption replacement intention is missing",
-            ))?;
-
-        if replacement.status != IntentionStatus::Active || graph.goal.status != GoalStatus::Running
+            .any(|intention| intention.id == resumption.replacement_intention_id)
         {
+            return Err(StoreError::InvalidTransition(
+                "resumption replacement intention is missing",
+            )
+            .into());
+        }
+
+        if graph.goal.status != GoalStatus::Running {
             self.flush_pending_events(out)?;
             return Ok(resumption.goal_id);
         }
+
+        let replacement = graph
+            .intentions
+            .iter()
+            .rev()
+            .find(|intention| {
+                intention.commitment_id == resumption.commitment_id
+                    && intention.status == IntentionStatus::Active
+            })
+            .cloned()
+            .ok_or(StoreError::InvalidTransition(
+                "running resumed goal has no active intention",
+            ))?;
 
         let commitment = graph
             .commitments
@@ -451,6 +465,7 @@ impl LocalRuntime {
                             terminal_task: terminal_task.as_ref(),
                             intention: &intention,
                             replacement_intention: None,
+                            replacement_tasks: &[],
                             revision: None,
                             commitment: Some(&commitment),
                             goal: Some(&goal),
@@ -525,6 +540,7 @@ impl LocalRuntime {
                             terminal_task: Some(&terminal_task),
                             intention: &intention,
                             replacement_intention: None,
+                            replacement_tasks: &[],
                             revision: Some(&revision),
                             commitment: Some(&commitment),
                             goal: Some(&goal),
@@ -559,7 +575,7 @@ impl LocalRuntime {
                         reason.clone(),
                     );
 
-                    let outbox_events = vec![
+                    let mut outbox_events = vec![
                         self.envelope_for(
                             SwarmEvent::TaskFailed {
                                 task_id: terminal_task.id,
@@ -597,12 +613,22 @@ impl LocalRuntime {
                             conversation_id,
                         ),
                     ];
+                    for task in &replacement_tasks {
+                        outbox_events.push(self.envelope_for(
+                            SwarmEvent::TaskCreated {
+                                task_id: task.id,
+                                goal_id: task.goal_id,
+                            },
+                            conversation_id,
+                        ));
+                    }
 
                     self.store
                         .commit_agent_state_transition(AgentStateTransition {
                             terminal_task: Some(&terminal_task),
                             intention: &intention,
                             replacement_intention: Some(&replacement),
+                            replacement_tasks: &replacement_tasks,
                             revision: Some(&revision),
                             commitment: None,
                             goal: None,
@@ -612,7 +638,7 @@ impl LocalRuntime {
 
                     intention = replacement;
                     tasks = replacement_tasks;
-                    initialize_tasks = true;
+                    initialize_tasks = false;
                 }
                 PlanOutcome::Failed {
                     terminal_task,
@@ -680,6 +706,7 @@ impl LocalRuntime {
                             terminal_task: Some(&terminal_task),
                             intention: &intention,
                             replacement_intention: None,
+                            replacement_tasks: &[],
                             revision: Some(&revision),
                             commitment: Some(&commitment),
                             goal: Some(&goal),
