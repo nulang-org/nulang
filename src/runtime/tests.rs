@@ -3580,6 +3580,14 @@ fn test_fired_workflow_timer_retries_when_atomic_commit_fails() {
         2,
         "TimerFired must remain invisible while persistence is failing"
     );
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .and_then(|actor| actor.get_state_field("step_index"))
+            .and_then(|value| value.as_int()),
+        Some(0),
+        "failed TimerFired commit must roll back the live step advance"
+    );
 
     store.set_fail_commits(false);
     std::thread::sleep(Duration::from_millis(
@@ -3590,6 +3598,15 @@ fn test_fired_workflow_timer_retries_when_atomic_commit_fails() {
     let events = rt.persistence.read_workflow_events(actor_id);
     assert_eq!(events.len(), 3);
     assert!(matches!(&events[2], WorkflowEvent::TimerFired { name, .. } if name == "deadline"));
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .and_then(|actor| actor.get_state_field("step_index"))
+            .and_then(|value| value.as_int()),
+        Some(1)
+    );
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(snapshot.state.get("step_index"), Some(&PersistedValue::Int(1)));
     assert!(rt.timer_wheel.is_empty());
 }
 
