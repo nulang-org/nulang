@@ -3900,6 +3900,132 @@ mod optimize_tests {
     }
 
     #[test]
+    fn test_consuming_send_plan_marks_unique_fresh_local_payload() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("send_unique", None);
+        let target = b.add_param("target", Type::unit());
+        let payload = b.add_temp(arr_ty);
+        let sent = b.add_temp(Type::unit());
+
+        b.assign(payload, mir::RValue::ArrayLit(vec![]));
+        b.assign(
+            sent,
+            mir::RValue::Send {
+                actor: target,
+                behavior_idx: 0,
+                args: vec![payload],
+                remote: false,
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+
+        let func = b.build();
+        let plan = plan_consuming_send_args(&func);
+        assert_eq!(plan.args_by_stmt.get(&(0, 1)), Some(&vec![payload]));
+    }
+
+    #[test]
+    fn test_consuming_send_plan_rejects_payload_with_competing_use() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("send_shared", None);
+        let target = b.add_param("target", Type::unit());
+        let payload = b.add_temp(arr_ty);
+        let len = b.add_temp(Type::int());
+        let sent = b.add_temp(Type::unit());
+
+        b.assign(payload, mir::RValue::ArrayLit(vec![]));
+        b.assign(len, mir::RValue::ArrayLen(payload));
+        b.assign(
+            sent,
+            mir::RValue::Send {
+                actor: target,
+                behavior_idx: 0,
+                args: vec![payload],
+                remote: false,
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+
+        let func = b.build();
+        let plan = plan_consuming_send_args(&func);
+        assert!(
+            !plan.args_by_stmt.contains_key(&(0, 2)),
+            "a payload with another use must remain an ordinary copied send"
+        );
+    }
+
+    #[test]
+    fn test_consuming_send_plan_rejects_remote_send() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("send_remote", None);
+        let target = b.add_param("target", Type::unit());
+        let payload = b.add_temp(arr_ty);
+        let sent = b.add_temp(Type::unit());
+
+        b.assign(payload, mir::RValue::ArrayLit(vec![]));
+        b.assign(
+            sent,
+            mir::RValue::Send {
+                actor: target,
+                behavior_idx: 0,
+                args: vec![payload],
+                remote: true,
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+
+        let func = b.build();
+        let plan = plan_consuming_send_args(&func);
+        assert!(
+            plan.args_by_stmt.is_empty(),
+            "remote sends must not consume sender ownership"
+        );
+    }
+
+    #[test]
+    fn test_codegen_attaches_consuming_mask_and_clears_sender_local() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("send_codegen", None);
+        let target = b.add_param("target", Type::unit());
+        let payload = b.add_temp(arr_ty);
+        let sent = b.add_temp(Type::unit());
+
+        b.assign(payload, mir::RValue::ArrayLit(vec![]));
+        b.assign(
+            sent,
+            mir::RValue::Send {
+                actor: target,
+                behavior_idx: 0,
+                args: vec![payload],
+                remote: false,
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("send_codegen");
+        module.functions.push(b.build());
+        let code = compile_mir(&mut module, "send_codegen").unwrap();
+
+        assert_eq!(code.send_ownership_masks.len(), 1);
+        let (send_pc, mask) = code.send_ownership_masks[0];
+        assert_eq!(mask, 1, "the first payload register should be consumed");
+        assert_eq!(code.instructions[send_pc].opcode, OpCode::Send);
+
+        let payload_reg = (LOCAL_BASE + payload.0) as u8;
+        assert!(
+            code.instructions.iter().skip(send_pc + 1).any(|ins| {
+                ins.opcode == OpCode::ConstU
+                    && ins.op3 == payload_reg
+                    && matches!(
+                        code.constants.get(ins.imm16() as usize),
+                        Some(Constant::Nil)
+                    )
+            }),
+            "consumed sender local must be cleared without a second Drop"
+        );
+    }
+
+    #[test]
     fn test_jump_thread() {
         // Manually build block0: Jump(1), block1: Jump(2), block2:
         // Const(42); Return. After threading, block0 jumps straight to
