@@ -1395,6 +1395,15 @@ impl RocksDbStore {
         key
     }
 
+    fn actor_event_key(actor_id: u64, sequence: u64, field_name: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(17 + field_name.len());
+        key.extend_from_slice(&actor_id.to_be_bytes());
+        key.extend_from_slice(&sequence.to_be_bytes());
+        key.push(0);
+        key.extend_from_slice(field_name.as_bytes());
+        key
+    }
+
     fn cf(&self, name: &str) -> io::Result<&rocksdb::ColumnFamily> {
         self.db
             .cf_handle(name)
@@ -1507,7 +1516,7 @@ impl PersistenceStore for RocksDbStore {
         self.db
             .put_cf(
                 cf,
-                Self::actor_seq_key(actor_id, entry.sequence),
+                Self::actor_event_key(actor_id, entry.sequence, &entry.field_name),
                 json.as_bytes(),
             )
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -1572,9 +1581,9 @@ impl PersistenceStore for RocksDbStore {
             Self::CF_EVENTS,
         ] {
             let cf = self.cf(cf_name)?;
-            // Start from the bare actor prefix.  Snapshot keys are exactly 8
-            // bytes; journal/event keys are 16 bytes (actor || sequence).
-            // Both layouts sort contiguously under the actor prefix.
+            // Start from the bare actor prefix. Snapshot keys are exactly 8
+            // bytes; journal/workflow keys are 16 bytes; event keys may carry
+            // a field-name suffix. All remain contiguous under this prefix.
             let actor_key = Self::actor_key(actor_id);
             let mut iter = self.db.iterator_cf(
                 cf,
