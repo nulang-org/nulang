@@ -51,6 +51,15 @@ version + migration.*
 
 ## Stable tier
 
+### Performance wave: JIT transitions, call analysis, and shard bus — 2026-09-22
+- **Bounded JIT register marshaling:** JIT transitions now reuse stable per-frame-depth scratch buffers and marshal only the compiler-known active register prefix for MIR-produced functions (`src/vm.rs`). Actor/legacy bytecode without trustworthy local-count metadata keeps the full 256-register path, and reserved direct-call staging state remains explicit.
+- **Linear-time JIT module call analysis:** direct-call suspension and recursion gating now share one lazily cached per-module call graph (`src/jit/mod.rs`). Suspension propagates with a reverse worklist and recursion uses iterative SCC traversal instead of an n×n reachability matrix plus Floyd-Warshall.
+- **Cross-shard runtime channel:** the bounded shard bus now uses Crossbeam channels (`src/runtime/mod.rs`) instead of `std::sync::mpsc::sync_channel`, preserving the 1024-message capacity and non-blocking admission/backpressure semantics.
+- **Medium actor-heap size classes:** actor-local bump/free-list allocation now covers 512 B, 1 KiB, 2 KiB, and 4 KiB classes (`src/runtime/heap.rs`), moving the LOS cutoff from 256 B to 4 KiB so common medium arrays/records/maps/strings avoid individual global allocations.
+- **Relaxed mailbox accounting atomics:** mailbox capacity/length accounting now uses relaxed atomic ordering while `SegQueue` remains the actual message publication synchronization edge (`src/runtime/mailbox.rs`).
+- **MIR scalar copy propagation and constant-branch pruning:** canonical MIR optimization removes redundant definitely-scalar block-local copies, folds locally-proven Bool branches, prunes unreachable blocks while preserving effect-handler roots, and keeps `Panic` observable (`src/mir_codegen.rs`).
+- **Compiler-latency benchmark baseline:** Criterion now times frontend→MIR, source→bytecode, and bounded source→native-AOT compilation (`benches/compiler_bench.rs`), wired into the real `bench_main` harness.
+
 ### Temporary concatenated-string reclamation — 2026-09-22
 - **Non-folded string concatenations now participate in MIR ownership-based reclamation** (`src/mir_codegen.rs`). Because `SConcat` creates a fresh actor-heap string, the liveness planner can release its sole local ORCA reference immediately after the last safe use instead of retaining the temporary until actor teardown. Runtime semantics and the existing ORCA/store-barrier protocol are unchanged.
 

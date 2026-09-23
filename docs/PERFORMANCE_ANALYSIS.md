@@ -29,7 +29,7 @@
 | 1.4 | MLIR dialect | Deferred | No MLIR in tree |
 | 1.5 | SIMD auto-vectorization | **Shipped** | `src/jit/simd_analyzer.rs` + `src/jit/simd_compiler.rs` (I64x2/F64x2/I32x4/F32x4) |
 | 2.1 | Lock-free MPSC mailboxes | **Shipped differently** | `src/runtime/mailbox.rs` uses an unbounded `crossbeam::queue::SegQueue`, **not** the `ArrayQueue` recommended below — a bounded queue would force blocking or message drops, violating BEAM never-drop semantics. crossbeam's epoch-based reclamation (the Risk Register's ABA mitigation) comes with `SegQueue` |
-| 2.2 | Dual-region actor heaps | **Shipped differently — LOS + grow-on-demand** | No `bumpalo` dependency — `src/runtime/heap.rs` is a hand-rolled bump allocator with size-class free lists, a large-object space (allocations over the 256-byte `Huge` threshold individually `std::alloc`'d, exact-size free-list reuse, released on `reset()`/`Drop`), and grow-on-demand chaining: bump-block exhaustion chains a fresh 64KB block instead of failing, objects never move, all blocks released on `reset()`/`Drop` (2026-07-12). No nursery/tenured split |
+| 2.2 | Dual-region actor heaps | **Shipped differently — LOS + grow-on-demand** | No `bumpalo` dependency — `src/runtime/heap.rs` is a hand-rolled bump allocator with size-class free lists, a large-object space (allocations over the 4 KiB `Huge` threshold individually `std::alloc`'d, with 512 B/1 KiB/2 KiB/4 KiB actor-local classes below it, exact-size LOS free-list reuse, released on `reset()`/`Drop`), and grow-on-demand chaining: bump-block exhaustion chains a fresh 64KB block instead of failing, objects never move, all blocks released on `reset()`/`Drop` (2026-07-12). No nursery/tenured split |
 | 2.3 | mimalloc global allocator | **Shipped** | `mimalloc = "0.1"` in `Cargo.toml`; `#[global_allocator]` in `src/main.rs` |
 | 2.4 | Static escape analysis | **Reverted** | `src/escape_analysis.rs` was added and later removed; no escape analysis in the tree today |
 | 2.5 | Actor arenas | Deferred | Not present |
@@ -161,7 +161,7 @@ No whole-function or ahead-of-time compilation; no inlining; no deoptimization o
 ### 2.2 Dual-Region Actor Heaps (LOS Split)
 **Recommendation:** **DO.** Natural evolution of the existing per-actor heap.
 
-**Status (2026-07-12): LOS SHIPPED.** There is no `bumpalo` dependency — `src/runtime/heap.rs` is a hand-rolled bump allocator with per-size-class intrusive free lists and ORCA headers, plus a large-object space: allocations over the 256-byte `Huge` threshold are individually `std::alloc`'d outside the 64KB backing block, with exact-size free-list reuse and release on `reset()`/`Drop`. No nursery/tenured split.
+**Status (2026-07-12): LOS SHIPPED.** There is no `bumpalo` dependency — `src/runtime/heap.rs` is a hand-rolled bump allocator with per-size-class intrusive free lists and ORCA headers, plus a large-object space: allocations over the 4 KiB `Huge` threshold are individually `std::alloc`'d outside the actor bump blocks; 512 B/1 KiB/2 KiB/4 KiB segregated classes stay actor-local, with exact-size free-list reuse for LOS blocks and release on `reset()`/`Drop`. No nursery/tenured split.
 
 ### 2.3 Global Memory Arena via mimalloc
 **Recommendation:** **DO RIGHT NOW.** Literally a one-line change. Instant 10-20% win.

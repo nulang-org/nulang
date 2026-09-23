@@ -15,12 +15,12 @@
 //!   never move (raw payload pointers are held in VM registers, foreign refs,
 //!   and JIT code), so growth must chain — never realloc/copy — the existing
 //!   block.
-//! * **Size-class free lists** (Tiny → Huge) so that freed objects can be
-//!   reused without touching the bump pointer.
-//! * **Large-object space (LOS)** — allocations whose total size exceeds the
-//!   largest size class (256 bytes) are individually allocated with the
-//!   global allocator instead of consuming the contiguous bump region, and
-//!   are reused on an exact-size match from the `Huge` free list.
+//! * **Size-class free lists** (Tiny → 4 KiB) so that freed small/medium
+//!   objects can be reused without touching the bump pointer or global allocator.
+//! * **Large-object space (LOS)** — allocations whose total size exceeds 4 KiB
+//!   are individually allocated with the global allocator instead of consuming
+//!   the contiguous bump region, and are reused on an exact-size match from the
+//!   `Huge` free list.
 //! * **Intrusive live list** — every live object is a node in a doubly-linked
 //!   list embedded in the header. This makes `iter_live_objects` O(live) and
 //!   avoids auxiliary hash maps or bitmaps.
@@ -36,13 +36,15 @@
 const ALIGN: usize = 8;
 
 /// Number of discrete size classes.
-const NUM_SIZE_CLASSES: usize = 5;
+const NUM_SIZE_CLASSES: usize = 9;
 
 /// Total-size threshold (header + aligned payload) above which allocations
-/// go to the large-object space instead of the bump region.  Set just above
-/// the largest size-class block (256 bytes), so exactly the `Huge` class
-/// is served by the LOS.
-const LOS_THRESHOLD: usize = 256;
+/// go to the large-object space instead of the bump region.
+///
+/// Keeping objects through 4 KiB in actor-local bump blocks avoids a global
+/// allocation for medium arrays, records, maps, and strings while retaining
+/// LOS semantics for genuinely large objects.
+const LOS_THRESHOLD: usize = 4 * 1024;
 
 // ---------------------------------------------------------------------------
 // SizeClass
@@ -64,8 +66,17 @@ pub enum SizeClass {
     Medium = 2,
     /// 129–256 bytes total.
     Large = 3,
-    /// 257+ bytes total (unbounded).
+    /// 4 KiB+ large-object space. Kept at discriminant 4 for compatibility
+    /// with existing in-memory/debug representations.
     Huge = 4,
+    /// 257–512 bytes total.
+    Size512 = 5,
+    /// 513–1024 bytes total.
+    Size1K = 6,
+    /// 1025–2048 bytes total.
+    Size2K = 7,
+    /// 2049–4096 bytes total.
+    Size4K = 8,
 }
 
 impl SizeClass {}
@@ -83,6 +94,10 @@ fn classify_total_size(total_size: usize) -> (SizeClass, usize) {
         33..=64 => (SizeClass::Small, 64),
         65..=128 => (SizeClass::Medium, 128),
         129..=256 => (SizeClass::Large, 256),
+        257..=512 => (SizeClass::Size512, 512),
+        513..=1024 => (SizeClass::Size1K, 1024),
+        1025..=2048 => (SizeClass::Size2K, 2048),
+        2049..=4096 => (SizeClass::Size4K, 4096),
         n => (SizeClass::Huge, n),
     }
 }
@@ -279,8 +294,8 @@ pub struct ActorHeap {
     /// Per-size-class intrusive free lists.
     /// Each entry is either `null_mut()` or points to the payload of the
     /// first free block in that class.  The first 8 bytes of a free payload
-    /// store a `*mut u8` to the next free block.  The `Huge` list doubles as
-    /// the large-object-space free list.
+    /// store a `*mut u8` to the next free block.  The `Huge` list remains
+    /// reserved for individually allocated LOS objects.
     free_lists: [*mut u8; NUM_SIZE_CLASSES],
     /// Payload pointers of every large-object-space block ever allocated by
     /// this heap (live or sitting in the `Huge` free list).  Each block is
@@ -1110,16 +1125,20 @@ fn test_size_classes() {
     let mut heap = ActorHeap::new(64 * 1024);
 
     // Payload sizes that result in different total-size buckets.
-    // HEADER_SIZE = 48, ALIGN = 8.
-    // total = 48 + align_up(payload)
+    // HEADER_SIZE = 56, ALIGN = 8.
+    // total = 56 + align_up(payload)
     let cases: Vec<(usize, SizeClass)> = vec![
-        (1, SizeClass::Small),   // total = 64 → Small (33-64)
-        (16, SizeClass::Medium), // total = 72 → Medium (65-128)
-        (17, SizeClass::Medium), // total = 80 → Medium
-        (80, SizeClass::Large),  // total = 136 → Large (129-256)
-        (81, SizeClass::Large),  // total = 144 → Large
-        (200, SizeClass::Large), // total = 256 → Large
-        (210, SizeClass::Huge),  // total = 272 → Huge (257+)
+        (1, SizeClass::Small),     // total = 64 → Small (33-64)
+        (16, SizeClass::Medium),   // total = 72 → Medium (65-128)
+        (17, SizeClass::Medium),   // total = 80 → Medium
+        (80, SizeClass::Large),    // total = 136 → Large (129-256)
+        (81, SizeClass::Large),    // total = 144 → Large
+        (200, SizeClass::Large),   // total = 256 → Large
+        (210, SizeClass::Size512), // total = 272 → 512-byte class
+        (600, SizeClass::Size1K),  // total = 656 → 1 KiB class
+        (1500, SizeClass::Size2K), // total = 1560 → 2 KiB class
+        (3000, SizeClass::Size4K), // total = 3056 → 4 KiB class
+        (5000, SizeClass::Huge),   // total = 5056 → LOS
     ];
 
     for (payload_size, expected_class) in cases {
@@ -1135,6 +1154,39 @@ fn test_size_classes() {
                 expected_class
             );
         }
+    }
+}
+
+#[test]
+fn test_medium_objects_stay_in_actor_bump_heap() {
+    let mut heap = ActorHeap::new(16 * 1024);
+
+    let medium = heap.alloc(3000, TypeTag::Array).expect("medium alloc");
+    assert!(
+        heap.los_blocks.is_empty(),
+        "objects fitting the 4 KiB class must not use the global LOS allocator"
+    );
+    unsafe {
+        assert_eq!(
+            (*ActorHeap::header_of(medium)).size_class,
+            SizeClass::Size4K
+        );
+        heap.free(medium);
+    }
+
+    // Reuse stays actor-local and should return the same LIFO free-list block.
+    let reused = heap.alloc(2500, TypeTag::Array).expect("medium reuse");
+    assert_eq!(reused, medium);
+    assert!(heap.los_blocks.is_empty());
+
+    let large = heap.alloc(5000, TypeTag::Array).expect("large alloc");
+    assert_eq!(
+        heap.los_blocks.len(),
+        1,
+        "objects above 4 KiB must still use large-object space"
+    );
+    unsafe {
+        assert_eq!((*ActorHeap::header_of(large)).size_class, SizeClass::Huge);
     }
 }
 
@@ -1404,22 +1456,22 @@ fn test_live_object_iteration() {
 fn test_large_allocation() {
     let mut heap = ActorHeap::new(64 * 1024);
 
-    // 512 bytes payload → total = 48 + 512 = 560 → Huge size class.
-    let p = heap.alloc(512, TypeTag::Array).unwrap();
+    // 5000-byte payload → total = 5056 > 4 KiB → Huge/LOS.
+    let p = heap.alloc(5000, TypeTag::Array).unwrap();
     unsafe {
         let h = &*ActorHeap::header_of(p);
         assert_eq!(h.size_class, SizeClass::Huge);
-        assert_eq!(h.size, ActorHeap::HEADER_SIZE + 512);
+        assert_eq!(h.size, ActorHeap::HEADER_SIZE + 5000);
         assert_eq!(h.type_tag, TypeTag::Array);
     }
 
     // Write and verify the full payload.
     unsafe {
-        let buf = std::slice::from_raw_parts_mut(p, 512);
+        let buf = std::slice::from_raw_parts_mut(p, 5000);
         for (i, slot) in buf.iter_mut().enumerate() {
             *slot = (i % 256) as u8;
         }
-        for i in 0..512 {
+        for i in 0..5000 {
             assert_eq!(buf[i], (i % 256) as u8);
         }
     }
@@ -1508,8 +1560,8 @@ fn test_statistics() {
 fn test_los_alloc_free_reuse() {
     let mut heap = ActorHeap::new(64 * 1024);
 
-    // 512-byte payload → total 568 > LOS_THRESHOLD → large-object space.
-    let p1 = heap.alloc(512, TypeTag::Array).unwrap();
+    // 5000-byte payload → total 5056 > LOS_THRESHOLD → large-object space.
+    let p1 = heap.alloc(5000, TypeTag::Array).unwrap();
     unsafe {
         assert_eq!((*ActorHeap::header_of(p1)).size_class, SizeClass::Huge);
     }
@@ -1524,7 +1576,7 @@ fn test_los_alloc_free_reuse() {
     assert_eq!(heap.live_count(), 0);
 
     // Same size → the exact-match LOS free list returns the same block.
-    let p2 = heap.alloc(512, TypeTag::Array).unwrap();
+    let p2 = heap.alloc(5000, TypeTag::Array).unwrap();
     assert_eq!(
         p1, p2,
         "freed LOS block should be reused on exact size match"
@@ -1536,18 +1588,22 @@ fn test_los_alloc_free_reuse() {
 fn test_los_exact_size_reuse_only() {
     let mut heap = ActorHeap::new(64 * 1024);
 
-    let p512 = heap.alloc(512, TypeTag::Array).unwrap();
+    let p512 = heap.alloc(5000, TypeTag::Array).unwrap();
     unsafe {
         heap.free(p512);
     }
 
-    // A different (larger) size must not reuse the 512-payload block.
-    let p768 = heap.alloc(768, TypeTag::Array).unwrap();
+    // A different LOS size must not reuse the 5000-payload block.
+    let p768 = heap.alloc(6000, TypeTag::Array).unwrap();
     assert_ne!(p512, p768, "LOS reuse requires an exact size match");
-    assert_eq!(heap.free_list_count(), 1, "512-byte block still queued");
+    assert_eq!(
+        heap.free_list_count(),
+        1,
+        "5000-byte LOS block still queued"
+    );
 
     // The original size is still available for reuse afterwards.
-    let p512_again = heap.alloc(512, TypeTag::Array).unwrap();
+    let p512_again = heap.alloc(5000, TypeTag::Array).unwrap();
     assert_eq!(p512, p512_again);
 }
 
@@ -1557,9 +1613,9 @@ fn test_los_interleaved_small_large() {
 
     // Interleave small (bump/size-class) and large (LOS) allocations.
     let s1 = heap.alloc(32, TypeTag::Tuple).unwrap();
-    let l1 = heap.alloc(1024, TypeTag::Array).unwrap();
+    let l1 = heap.alloc(5000, TypeTag::Array).unwrap();
     let s2 = heap.alloc(32, TypeTag::Tuple).unwrap();
-    let l2 = heap.alloc(2048, TypeTag::Array).unwrap();
+    let l2 = heap.alloc(7000, TypeTag::Array).unwrap();
 
     // Small and large regions must not overlap: LOS payloads lie outside
     // the heap's contiguous backing block.
@@ -1595,9 +1651,9 @@ fn test_los_interleaved_small_large() {
     assert_eq!(heap.free_list_count(), 4);
 
     let s2r = heap.alloc(32, TypeTag::Tuple).unwrap();
-    let l2r = heap.alloc(2048, TypeTag::Array).unwrap();
+    let l2r = heap.alloc(7000, TypeTag::Array).unwrap();
     let s1r = heap.alloc(32, TypeTag::Tuple).unwrap();
-    let l1r = heap.alloc(1024, TypeTag::Array).unwrap();
+    let l1r = heap.alloc(5000, TypeTag::Array).unwrap();
 
     assert_eq!(s2r, s2, "LIFO reuse within the small size class");
     assert_eq!(s1r, s1);
@@ -1610,9 +1666,9 @@ fn test_los_interleaved_small_large() {
 fn test_los_alignment() {
     let mut heap = ActorHeap::new(64 * 1024);
 
-    // Odd payload sizes above the threshold — every LOS payload and header
-    // must remain 8-byte aligned.
-    let sizes = [257, 300, 511, 513, 1000, 4097];
+    // Odd payload sizes above the 4 KiB total-size threshold — every LOS
+    // payload and header must remain 8-byte aligned.
+    let sizes = [4041, 4097, 5001, 6145, 8193];
     for &sz in &sizes {
         let p = heap.alloc(sz, TypeTag::Raw).unwrap();
         assert_eq!(
@@ -1646,20 +1702,20 @@ fn test_los_alignment() {
 fn test_los_threshold_boundary() {
     let mut heap = ActorHeap::new(64 * 1024);
 
-    // total = HEADER_SIZE + align_up(payload); LOS kicks in above 256.
-    // payload 200 → total 256 → Largest size-class block, bump path.
-    let p_at = heap.alloc(200, TypeTag::Raw).unwrap();
+    // total = HEADER_SIZE + align_up(payload); LOS kicks in above 4096.
+    // payload 4040 → total 4096 → 4 KiB size-class block, bump path.
+    let p_at = heap.alloc(4040, TypeTag::Raw).unwrap();
     let used_after_small = heap.used();
     unsafe {
-        assert_eq!((*ActorHeap::header_of(p_at)).size_class, SizeClass::Large);
+        assert_eq!((*ActorHeap::header_of(p_at)).size_class, SizeClass::Size4K);
     }
     assert_eq!(
-        used_after_small, 256,
+        used_after_small, 4096,
         "boundary block should use the bump region"
     );
 
-    // payload 201 → total 264 → Huge, served by the LOS.
-    let p_over = heap.alloc(201, TypeTag::Raw).unwrap();
+    // payload 4041 → aligned 4048 + 56 = 4104 → Huge/LOS.
+    let p_over = heap.alloc(4041, TypeTag::Raw).unwrap();
     unsafe {
         assert_eq!((*ActorHeap::header_of(p_over)).size_class, SizeClass::Huge);
     }
@@ -1674,16 +1730,16 @@ fn test_los_threshold_boundary() {
         heap.free(p_at);
         heap.free(p_over);
     }
-    assert_eq!(heap.alloc(200, TypeTag::Raw).unwrap(), p_at);
-    assert_eq!(heap.alloc(201, TypeTag::Raw).unwrap(), p_over);
+    assert_eq!(heap.alloc(4040, TypeTag::Raw).unwrap(), p_at);
+    assert_eq!(heap.alloc(4041, TypeTag::Raw).unwrap(), p_over);
 }
 
 #[test]
 fn test_los_reset_releases_blocks() {
     let mut heap = ActorHeap::new(64 * 1024);
 
-    let l1 = heap.alloc(1024, TypeTag::Array).unwrap();
-    let l2 = heap.alloc(2048, TypeTag::Array).unwrap();
+    let l1 = heap.alloc(5000, TypeTag::Array).unwrap();
+    let l2 = heap.alloc(7000, TypeTag::Array).unwrap();
     unsafe {
         heap.free(l1);
     }
@@ -1695,7 +1751,7 @@ fn test_los_reset_releases_blocks() {
     assert_eq!(heap.free_list_count(), 0);
 
     // Heap is fully functional after reset; LOS allocation still works.
-    let l3 = heap.alloc(1024, TypeTag::Array).unwrap();
+    let l3 = heap.alloc(5000, TypeTag::Array).unwrap();
     unsafe {
         assert_eq!((*ActorHeap::header_of(l3)).size_class, SizeClass::Huge);
     }
