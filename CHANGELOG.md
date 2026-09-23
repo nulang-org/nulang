@@ -51,6 +51,13 @@ version + migration.*
 
 ## Stable tier
 
+### Deterministic AI provider contract evals — 2026-09-23
+- **`nulang-ai` now exposes deterministic provider/evaluation helpers** (`crates/nulang-ai/src/eval.rs`) that run without an LLM judge and separate provider failures from response-contract or task-expectation failures.
+- **Provider responses are checked for runtime-critical invariants** including non-empty model identity, internally consistent token usage, non-empty output, and rejection of tool calls for tools the request never exposed.
+- **Eval cases can pin textual expectations, expected tool calls, and token ceilings** so OpenAI, Ollama, OpenAI-compatible gateways, and future native provider adapters can share one regression suite rather than accumulating provider-specific test semantics.
+- This deliberately strengthens the existing `LlmClient` boundary instead of adding provider-specific language/runtime primitives.
+
+
 ### Actor density and mailbox hot-path allocation — 2026-09-23
 - **Idle actors no longer materialize their 16 KiB ORCA bump block at spawn** (`src/runtime/heap.rs`). The configured first-block capacity is preserved, but allocation is deferred until the first small-object heap allocation; LOS-only actors also remain bump-block-free.
 - **Mailbox logical-count atomics use relaxed ordering** (`src/runtime/mailbox.rs`) because Crossbeam `SegQueue` owns message publication/synchronization; the atomic counter remains capacity/accounting state and its modification order still prevents bounded producers from over-reserving.
