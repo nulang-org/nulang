@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Multi-field event persistence — 2026-09-23
+- **Event stores now preserve multiple `event_sourced` fields written at the same actor sequence.** libSQL and Postgres migrate to an `events_v2` table keyed by `(actor_id, sequence, field_name)` while retaining legacy rows for compatibility; RocksDB includes the field name in event keys. Backend regression tests pin two fields at one sequence so neither row can overwrite or conflict with the other.
+
 ### Backend differential oracle hardening — 2026-09-22
 - **WASM differential execution now fails closed after artifact emission** (`src/fuzz.rs`, `src/difffuzz.rs`). Restricted-profile rejection remains an expected compile-time skip, but malformed/invalid emitted WASM, instantiation failures, or a missing required `nulang_init` export are backend correctness failures. Differential campaigns now record WASM agreement coverage, and the `wasm-backend` test lane requires positive WASM participation so a silently-disabled backend cannot leave CI green.
 
