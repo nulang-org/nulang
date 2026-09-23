@@ -115,10 +115,7 @@ fn snapshot_for_sequence(
 /// RFC 0014 directory entries are authoritative when present. A stale node
 /// must never "borrow" a replacement node's higher epoch: if the directory
 /// names another owner, the commit fails closed.
-pub(crate) fn durable_activation_epoch(
-    rt: &Runtime,
-    actor_id: u64,
-) -> std::io::Result<u64> {
+pub(crate) fn durable_activation_epoch(rt: &Runtime, actor_id: u64) -> std::io::Result<u64> {
     let local_node = rt
         .distributed
         .node_id
