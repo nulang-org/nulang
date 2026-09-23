@@ -3841,18 +3841,45 @@ impl Runtime {
                 .unwrap_or(false);
             if let Some(handler) = handler_fn {
                 if !is_placeholder {
-                    // Journal the message before handling so recovery can replay it.
+                    // Accept workflow commands on the same atomic tail used
+                    // by their later workflow transitions. Non-workflow
+                    // persistent actors retain the legacy journal path.
                     if self.actor_is_persistent(actor_id) {
-                        let seq = self.next_sequence(actor_id);
                         let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                        let _ = self.persistence.append_journal(
-                            actor_id,
-                            JournalEntry {
-                                sequence: seq,
-                                behavior_id: msg.behavior_id,
+                        let result = if self.actor_is_workflow(actor_id) {
+                            workflow::commit_workflow_command(
+                                self,
+                                actor_id,
+                                msg.behavior_id,
                                 payload,
-                            },
-                        );
+                            )
+                        } else {
+                            let sequence = self.next_sequence(actor_id);
+                            self.persistence.append_journal(
+                                actor_id,
+                                JournalEntry {
+                                    sequence,
+                                    behavior_id: msg.behavior_id,
+                                    payload,
+                                },
+                            )
+                        };
+                        if let Err(error) = result {
+                            if self.actor_is_workflow(actor_id) {
+                                tracing::warn!(
+                                    actor_id,
+                                    behavior_id = msg.behavior_id,
+                                    %error,
+                                    "nulang-persist: refusing to execute workflow command without durable acceptance"
+                                );
+                                if let Some(actor) = self.actors.get_mut(&actor_id) {
+                                    let _ = actor.mailbox.push_local(msg.clone());
+                                    actor.state = ActorState::Suspended;
+                                }
+                                self.current_actor = None;
+                                return;
+                            }
+                        }
                     }
                     let actor = match self.actors.get_mut(&actor_id) {
                         Some(a) => a,
@@ -3878,18 +3905,45 @@ impl Runtime {
                 }
             }
             if !processed && self.has_bytecode_handler(actor_id, behavior_idx) {
-                // Journal before executing bytecode as well.
+                // Journal before executing bytecode as well. Workflow
+                // commands use the RFC 0022 tail; plain persistent actors
+                // keep the compatibility journal path.
                 if self.actor_is_persistent(actor_id) {
-                    let seq = self.next_sequence(actor_id);
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                    let _ = self.persistence.append_journal(
-                        actor_id,
-                        JournalEntry {
-                            sequence: seq,
-                            behavior_id: msg.behavior_id,
+                    let result = if self.actor_is_workflow(actor_id) {
+                        workflow::commit_workflow_command(
+                            self,
+                            actor_id,
+                            msg.behavior_id,
                             payload,
-                        },
-                    );
+                        )
+                    } else {
+                        let sequence = self.next_sequence(actor_id);
+                        self.persistence.append_journal(
+                            actor_id,
+                            JournalEntry {
+                                sequence,
+                                behavior_id: msg.behavior_id,
+                                payload,
+                            },
+                        )
+                    };
+                    if let Err(error) = result {
+                        if self.actor_is_workflow(actor_id) {
+                            tracing::warn!(
+                                actor_id,
+                                behavior_id = msg.behavior_id,
+                                %error,
+                                "nulang-persist: refusing to execute workflow command without durable acceptance"
+                            );
+                            if let Some(actor) = self.actors.get_mut(&actor_id) {
+                                let _ = actor.mailbox.push_local(msg.clone());
+                                actor.state = ActorState::Suspended;
+                            }
+                            self.current_actor = None;
+                            return;
+                        }
+                    }
                 }
                 let payload = msg.payload.clone();
                 // Enable non-blocking LLM suspension for this
