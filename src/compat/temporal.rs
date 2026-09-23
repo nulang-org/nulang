@@ -539,7 +539,7 @@ mod tests {
         let completed = plan.complete(b"charged".to_vec());
         match completed.effect() {
             DurableEffectRecord::Completed { result, .. } => {
-                assert_eq!(result, b"charged");
+                assert_eq!(result.as_slice(), b"charged");
             }
             _ => panic!("expected completed durable effect"),
         }
@@ -579,7 +579,7 @@ mod tests {
                 input,
             } => {
                 assert_eq!(workflow_type, "OrderWorkflow");
-                assert_eq!(input, b"next");
+                assert_eq!(input.as_slice(), b"next");
             }
             _ => panic!("expected continue-as-new plan"),
         }
