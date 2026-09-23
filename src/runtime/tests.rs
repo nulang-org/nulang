@@ -10,10 +10,20 @@ use crate::runtime::heap::{ActorHeap, TypeTag};
 use crate::vm::{Frame, Value};
 #[cfg(feature = "tcp")]
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 fn noop_test_behavior(_actor: &mut Actor, _args: &[Value]) {}
+
+fn increment_step_test_behavior(actor: &mut Actor, _args: &[Value]) {
+    if let Some(step) = actor
+        .get_state_field("step_index")
+        .and_then(|value| value.as_int())
+    {
+        actor.set_state_field("step_index", Value::int(step + 1));
+    }
+}
 
 fn declare_test_behavior(rt: &mut Runtime, actor_id: u64, name: &str) {
     rt.actors
@@ -3315,6 +3325,98 @@ fn test_receiver_hold_survives_sender_drop_until_release() {
 // v0.8 Workflow Runtime Tests
 // ========================================================================
 
+#[derive(Clone)]
+struct AtomicWorkflowTestStore {
+    inner: Arc<Mutex<MemoryStore>>,
+    fail_commits: Arc<AtomicBool>,
+    legacy_writes: Arc<AtomicUsize>,
+}
+
+impl AtomicWorkflowTestStore {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(MemoryStore::new())),
+            fail_commits: Arc::new(AtomicBool::new(false)),
+            legacy_writes: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn set_fail_commits(&self, fail: bool) {
+        self.fail_commits.store(fail, Ordering::SeqCst);
+    }
+
+    fn legacy_write_count(&self) -> usize {
+        self.legacy_writes.load(Ordering::SeqCst)
+    }
+
+    fn reject_legacy_write(&self, operation: &str) -> std::io::Error {
+        self.legacy_writes.fetch_add(1, Ordering::SeqCst);
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("legacy persistence write called: {operation}"),
+        )
+    }
+}
+
+impl PersistenceStore for AtomicWorkflowTestStore {
+    fn commit_transition(
+        &mut self,
+        transition: DurableTransition,
+    ) -> std::io::Result<DurableCommit> {
+        if self.fail_commits.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected atomic transition failure",
+            ));
+        }
+        self.inner.lock().unwrap().commit_transition(transition)
+    }
+
+    fn save_snapshot(&mut self, _snapshot: ActorSnapshot) -> std::io::Result<()> {
+        Err(self.reject_legacy_write("save_snapshot"))
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.inner.lock().unwrap().load_snapshot(actor_id)
+    }
+
+    fn append_journal(&mut self, _actor_id: u64, _entry: JournalEntry) -> std::io::Result<()> {
+        Err(self.reject_legacy_write("append_journal"))
+    }
+
+    fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+        self.inner.lock().unwrap().read_journal(actor_id)
+    }
+
+    fn append_workflow_event(
+        &mut self,
+        _actor_id: u64,
+        _event: WorkflowEvent,
+    ) -> std::io::Result<()> {
+        Err(self.reject_legacy_write("append_workflow_event"))
+    }
+
+    fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+        self.inner.lock().unwrap().read_workflow_events(actor_id)
+    }
+
+    fn append_event(&mut self, _actor_id: u64, _entry: EventEntry) -> std::io::Result<()> {
+        Err(self.reject_legacy_write("append_event"))
+    }
+
+    fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+        self.inner.lock().unwrap().read_events(actor_id)
+    }
+
+    fn latest_sequence(&self, actor_id: u64) -> u64 {
+        self.inner.lock().unwrap().latest_sequence(actor_id)
+    }
+
+    fn clear(&mut self, actor_id: u64) -> std::io::Result<()> {
+        self.inner.lock().unwrap().clear(actor_id)
+    }
+}
+
 #[test]
 fn test_workflow_actor_emits_started_event() {
     let mut rt = Runtime::new();
@@ -3336,6 +3438,542 @@ fn test_workflow_actor_emits_started_event() {
     assert_eq!(
         snapshot.state.get("step_index"),
         Some(&PersistedValue::Int(0))
+    );
+}
+
+#[test]
+fn test_workflow_runtime_uses_atomic_transition_api() {
+    let store = AtomicWorkflowTestStore::new();
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store.clone());
+
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "AtomicWorkflow",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+
+    rt.append_timer_set(actor_id, "deadline", 500).unwrap();
+    rt.append_timer_fired(actor_id, "deadline").unwrap();
+    rt.append_signal_received(actor_id, "go", Some("payload".to_string()))
+        .unwrap();
+    rt.append_saga_compensated(actor_id, "reserve").unwrap();
+
+    assert_eq!(
+        store.legacy_write_count(),
+        0,
+        "workflow creation and durable markers must not use legacy multi-write APIs"
+    );
+
+    let events = rt.persistence.read_workflow_events(actor_id);
+    assert_eq!(events.len(), 5);
+    assert!(matches!(&events[0], WorkflowEvent::WorkflowStarted { .. }));
+    assert!(matches!(&events[1], WorkflowEvent::TimerSet { .. }));
+    assert!(matches!(&events[2], WorkflowEvent::TimerFired { .. }));
+    assert!(matches!(&events[3], WorkflowEvent::SignalReceived { .. }));
+    assert!(matches!(&events[4], WorkflowEvent::SagaCompensated { .. }));
+
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(snapshot.sequence, 5);
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 5);
+}
+
+#[test]
+fn test_workflow_checkpoint_stays_on_atomic_tail() {
+    let store = AtomicWorkflowTestStore::new();
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store.clone());
+
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "CheckpointWorkflow",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .set_state_field("step_index", Value::int(7));
+    rt.checkpoint_actor(actor_id);
+
+    assert_eq!(store.legacy_write_count(), 0);
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 2);
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(snapshot.sequence, 2);
+    assert_eq!(
+        snapshot.state.get("step_index"),
+        Some(&PersistedValue::Int(7))
+    );
+
+    let inner = store.inner.lock().unwrap();
+    let transitions = inner.committed_transitions(actor_id);
+    assert_eq!(transitions.len(), 2);
+    assert!(transitions[1].workflow_events.is_empty());
+    assert!(transitions[1].snapshot.is_some());
+}
+
+#[test]
+fn test_custom_workflow_event_stays_on_atomic_tail() {
+    let store = AtomicWorkflowTestStore::new();
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store.clone());
+
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "CustomEventWorkflow",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+
+    rt.emit_event(actor_id, "Approved", &[]);
+
+    assert_eq!(store.legacy_write_count(), 0);
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 2);
+    assert!(matches!(
+        rt.persistence.read_workflow_events(actor_id).as_slice(),
+        [
+            WorkflowEvent::WorkflowStarted { sequence: 1, .. },
+            WorkflowEvent::Custom {
+                sequence: 2,
+                name,
+                ..
+            }
+        ] if name == "Approved"
+    ));
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(snapshot.sequence, 2);
+}
+
+#[test]
+fn test_workflow_command_acceptance_keeps_atomic_tail_contiguous() {
+    let store = AtomicWorkflowTestStore::new();
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store.clone());
+
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "CommandWorkflow",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+
+    let behavior_id = {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.register_behavior("__command_probe", noop_test_behavior);
+        actor.behavior_table.len() as u16 - 1
+    };
+    rt.send_message_by_id(actor_id, behavior_id, &[]);
+    rt.step_actor(actor_id);
+
+    {
+        let inner = store.inner.lock().unwrap();
+        let transitions = inner.committed_transitions(actor_id);
+        assert_eq!(transitions.len(), 3);
+        assert_eq!(transitions[0].sequence, 1);
+        assert!(transitions[0].command.is_none());
+        assert_eq!(transitions[1].sequence, 2);
+        assert_eq!(
+            transitions[1]
+                .command
+                .as_ref()
+                .map(|command| command.behavior_id),
+            Some(behavior_id)
+        );
+        assert!(transitions[1].snapshot.is_none());
+        assert_eq!(transitions[2].sequence, 3);
+        assert!(transitions[2].snapshot.is_some());
+        assert!(matches!(
+            transitions[2].workflow_events.as_slice(),
+            [WorkflowEvent::StepCompleted { sequence: 3, .. }]
+        ));
+    }
+    assert_eq!(
+        store.legacy_write_count(),
+        0,
+        "a normal workflow command and completion must never fall back to legacy writes"
+    );
+
+    // The next durable transition must continue directly from the atomic
+    // command/completion tail rather than observe a legacy-only sequence.
+    rt.append_signal_received(actor_id, "after-command", None)
+        .unwrap();
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 4);
+    let events = rt.persistence.read_workflow_events(actor_id);
+    assert_eq!(events.len(), 3);
+    assert!(matches!(
+        &events[2],
+        WorkflowEvent::SignalReceived { sequence: 4, name, .. } if name == "after-command"
+    ));
+}
+
+#[test]
+fn test_workflow_command_failure_requeues_without_execution() {
+    let store = AtomicWorkflowTestStore::new();
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store.clone());
+
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "CommandFailureWorkflow",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+
+    let behavior_id = {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.register_behavior("__command_probe", increment_step_test_behavior);
+        actor.behavior_table.len() as u16 - 1
+    };
+    store.set_fail_commits(true);
+    rt.send_message_by_id(actor_id, behavior_id, &[]);
+    rt.step_actor(actor_id);
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(actor.state, ActorState::Suspended);
+    assert_eq!(
+        actor
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
+        Some(0),
+        "handler must not run before durable command acceptance"
+    );
+    assert_eq!(
+        actor.mailbox.len(),
+        1,
+        "unaccepted command must be requeued"
+    );
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 1);
+    assert!(rt.persistence.read_journal(actor_id).is_empty());
+}
+
+#[test]
+fn test_atomic_workflow_commit_rejects_stale_cluster_owner() {
+    let store = AtomicWorkflowTestStore::new();
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store.clone());
+
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "OwnedWorkflow",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+
+    let local = NodeId(0x1111);
+    let replacement = NodeId(0x2222);
+    let local_addr = "127.0.0.1:41001".parse().unwrap();
+    let mut cluster = ClusterState::new(local, local_addr);
+    cluster.announce_directory(DurableDirectoryEntry {
+        actor_id,
+        node_id: replacement,
+        epoch: 2,
+    });
+    rt.distributed.node_id = Some(local);
+    rt.distributed.cluster = Some(cluster);
+
+    let before_events = rt.persistence.read_workflow_events(actor_id).len();
+    let before_sequence = rt.persistence.latest_sequence(actor_id);
+    let error = rt
+        .append_signal_received(actor_id, "stale", None)
+        .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        rt.persistence.read_workflow_events(actor_id).len(),
+        before_events
+    );
+    assert_eq!(rt.persistence.latest_sequence(actor_id), before_sequence);
+    assert_eq!(store.legacy_write_count(), 0);
+}
+
+#[test]
+fn test_signal_delivery_stops_when_atomic_commit_fails() {
+    let store = AtomicWorkflowTestStore::new();
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store.clone());
+
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "SignalWorkflow",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+
+    store.set_fail_commits(true);
+    rt.signal_workflow(actor_id, "go", Some("payload".to_string()));
+
+    assert!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .received_signals
+            .is_empty(),
+        "signal must not become visible before its durable transition commits"
+    );
+    assert_eq!(rt.persistence.read_workflow_events(actor_id).len(), 1);
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 1);
+}
+
+#[test]
+fn test_fired_workflow_timer_retries_when_atomic_commit_fails() {
+    let store = AtomicWorkflowTestStore::new();
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store.clone());
+
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "TimerWorkflow",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+
+    rt.schedule_workflow_timer(actor_id, "deadline", 0);
+    assert_eq!(rt.timer_wheel.len(), 1);
+    assert_eq!(rt.persistence.read_workflow_events(actor_id).len(), 2);
+
+    store.set_fail_commits(true);
+    rt.tick_timers();
+
+    assert_eq!(
+        rt.timer_wheel.len(),
+        1,
+        "failed TimerFired commit must be re-armed instead of lost"
+    );
+    assert_eq!(
+        rt.persistence.read_workflow_events(actor_id).len(),
+        2,
+        "TimerFired must remain invisible while persistence is failing"
+    );
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .and_then(|actor| actor.get_state_field("step_index"))
+            .and_then(|value| value.as_int()),
+        Some(0),
+        "failed TimerFired commit must roll back the live step advance"
+    );
+
+    store.set_fail_commits(false);
+    std::thread::sleep(Duration::from_millis(
+        super::DURABLE_TIMER_COMMIT_RETRY_MS + 20,
+    ));
+    rt.tick_timers();
+
+    let events = rt.persistence.read_workflow_events(actor_id);
+    assert_eq!(events.len(), 3);
+    assert!(matches!(&events[2], WorkflowEvent::TimerFired { name, .. } if name == "deadline"));
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .and_then(|actor| actor.get_state_field("step_index"))
+            .and_then(|value| value.as_int()),
+        Some(1)
+    );
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(
+        snapshot.state.get("step_index"),
+        Some(&PersistedValue::Int(1))
+    );
+    assert!(rt.timer_wheel.is_empty());
+}
+
+#[test]
+fn test_atomic_workflow_recovery_replays_accepted_command_after_snapshot() {
+    use crate::bytecode::{
+        ActorMeta, BehaviorTableEntry, CodeModule, Constant, Instruction, OpCode,
+    };
+
+    let actor_id = 91_027;
+    let mut module = CodeModule::new("workflow_command_recovery");
+    module.add_actor_meta(ActorMeta {
+        name: "RecoveryWorkflow".to_string(),
+        persistent: true,
+        state_models: vec![(
+            "step_index".to_string(),
+            crate::ast::StateModel::Durable,
+        )],
+        state_defaults: vec![("step_index".to_string(), Constant::Int(0))],
+        behavior_indices: vec![0],
+        type_hash: None,
+        version: 1,
+        migrations: String::new(),
+        is_workflow: true,
+        is_agent: false,
+        is_organization: false,
+        is_virtual: false,
+        tools: vec![],
+        semantic_memory_dimensions: None,
+        procedural_memory_namespace: None,
+        backend: crate::ast::ActorBackendKind::Native,
+        fallback_config: String::new(),
+        retry_config: String::new(),
+    });
+    module.add_behavior(BehaviorTableEntry {
+        name: "RecoveryWorkflow.resume".to_string(),
+        param_count: 0,
+        code_offset: 0,
+        local_count: 1,
+        effect_mask: 0,
+        compensate_offset: None,
+        content_hash: None,
+        source_location: None,
+        parallel_branches: None,
+    });
+    let zero = module.add_constant(Constant::Int(0));
+    module.emit(Instruction::new3(
+        OpCode::ConstU,
+        ((zero >> 8) & 0xFF) as u8,
+        (zero & 0xFF) as u8,
+        0,
+    ));
+    module.emit(Instruction::new1(OpCode::RetVal, 0));
+
+    let mut initial_state = HashMap::new();
+    initial_state.insert("step_index".to_string(), PersistedValue::Int(0));
+    let snapshot = ActorSnapshot {
+        actor_id,
+        sequence: 1,
+        state: initial_state,
+        waiting_signal: None,
+        crdt_snapshot: None,
+        crdt_field_map: None,
+        authority_tokens: Default::default(),
+    };
+
+    let mut store = MemoryStore::new();
+    store
+        .commit_transition(DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id,
+            activation_epoch: 1,
+            sequence: 1,
+            expected_previous_sequence: 0,
+            command: None,
+            snapshot: Some(snapshot),
+            workflow_events: vec![WorkflowEvent::WorkflowStarted {
+                sequence: 1,
+                name: "RecoveryWorkflow".to_string(),
+                state: vec![PersistedValue::Int(0)],
+            }],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        })
+        .unwrap();
+    store
+        .commit_transition(DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id,
+            activation_epoch: 1,
+            sequence: 2,
+            expected_previous_sequence: 1,
+            command: Some(JournalEntry {
+                sequence: 2,
+                behavior_id: 0,
+                payload: vec![],
+            }),
+            snapshot: None,
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        })
+        .unwrap();
+
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store);
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    rt.recover_actor(actor_id).unwrap();
+
+    assert_eq!(
+        rt.actors.get(&actor_id).unwrap().sequence,
+        3,
+        "recovery must replay the accepted command and atomically commit its completion"
+    );
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 3);
+    assert!(matches!(
+        rt.persistence.read_workflow_events(actor_id).as_slice(),
+        [
+            WorkflowEvent::WorkflowStarted { sequence: 1, .. },
+            WorkflowEvent::StepCompleted { sequence: 3, .. }
+        ]
+    ));
+
+    // The completion snapshot at sequence 3 fences the accepted command at
+    // sequence 2. A second restart must not execute or commit it again.
+    rt.actors.remove(&actor_id);
+    rt.recover_actor(actor_id).unwrap();
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 3);
+    assert_eq!(rt.persistence.read_workflow_events(actor_id).len(), 2);
+}
+
+#[test]
+fn test_atomic_workflow_recovery_replays_metadata_older_than_latest_snapshot() {
+    let store = AtomicWorkflowTestStore::new();
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store.clone());
+
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "RecoveryMetadataWorkflow",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+
+    // These runtime metadata collections are not fields in ActorSnapshot.
+    // Commit another transition afterwards so both events are strictly older
+    // than the latest snapshot and therefore exercise full-journal replay.
+    rt.append_signal_received(actor_id, "approved", Some("yes".to_string()))
+        .unwrap();
+    rt.append_saga_compensated(actor_id, "reserve")
+        .unwrap();
+    rt.append_timer_set(actor_id, "later", 500).unwrap();
+
+    let latest_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(latest_snapshot.sequence, 4);
+
+    rt.actors.remove(&actor_id);
+    rt.recover_actor(actor_id).unwrap();
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(
+        actor.received_signals,
+        vec![("approved".to_string(), Some("yes".to_string()))],
+        "SignalReceived must survive a later co-committed snapshot"
+    );
+    assert!(
+        actor.compensated_steps.iter().any(|step| step == "reserve"),
+        "SagaCompensated must survive a later co-committed snapshot"
     );
 }
 
