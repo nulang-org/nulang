@@ -58,7 +58,6 @@ pub fn is_opcode_compilable(op: OpCode) -> bool {
             | OpCode::IMul
             | OpCode::IDiv
             | OpCode::IMod
-            | OpCode::INeg
             | OpCode::IInc
             | OpCode::IDec
             | OpCode::IPow
@@ -1089,7 +1088,9 @@ mod tests {
     fn test_is_opcode_compilable_conversion() {
         assert!(is_opcode_compilable(OpCode::IToF));
         assert!(is_opcode_compilable(OpCode::FToI));
-        assert!(is_opcode_compilable(OpCode::INeg));
+        // INeg can raise on INT48_MIN, so it remains interpreter-only until
+        // compiled regions have a first-class exceptional exit.
+        assert!(!is_opcode_compilable(OpCode::INeg));
         assert!(is_opcode_compilable(OpCode::IInc));
         assert!(is_opcode_compilable(OpCode::IDec));
     }

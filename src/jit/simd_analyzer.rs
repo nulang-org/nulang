@@ -762,7 +762,9 @@ fn try_detect_elementwise_unary(
             // Look for a unary operation that takes load_dst and produces store_src.
             for instr in body {
                 let op_kind = match instr.opcode {
-                    OpCode::INeg => Some(UnaryKind::INeg),
+                    // Integer negation is checked: INT48_MIN raises instead
+                    // of wrapping. SIMD lowering has no lane-wise exceptional
+                    // exit, so only floating-point negation is vectorized.
                     OpCode::FNeg => Some(UnaryKind::FNeg),
                     _ => None,
                 };

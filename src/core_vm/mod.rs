@@ -300,6 +300,12 @@ impl CoreVM {
             }
             OpCode::INeg => {
                 let a = value_layout::as_int_raw(self.frames[frame_idx].regs[op1 as usize]);
+                if a == value_layout::INT48_MIN {
+                    return Err(format!(
+                        "integer overflow: `neg` on {} exceeds the 48-bit range",
+                        a
+                    ));
+                }
                 self.frames[frame_idx].regs[op2 as usize] = value_layout::tag_int(-a);
             }
             OpCode::IInc => {
@@ -713,6 +719,31 @@ mod tests {
         assert_int("10 / 3", 3);
         assert_int("10 % 3", 1);
         assert_int("-5", -5);
+    }
+
+    #[test]
+    fn test_core_ineg_int48_min_overflow() {
+        let mut module = CodeModule::new("checked_ineg");
+        let idx = module.add_constant(Constant::Int(value_layout::INT48_MIN));
+        module.emit(Instruction::new3(
+            OpCode::ConstU,
+            ((idx >> 8) & 0xFF) as u8,
+            (idx & 0xFF) as u8,
+            0,
+        ));
+        module.emit(Instruction::new2(OpCode::INeg, 0, 1));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+
+        let mut vm = CoreVM::new();
+        let module_idx = vm.load_module_from_code(&module).unwrap();
+        let err = vm
+            .run(module_idx, 0)
+            .expect_err("negating INT48_MIN must raise instead of wrapping");
+        assert!(
+            err.contains("integer overflow"),
+            "unexpected Core VM error: {err}"
+        );
     }
 
     #[test]

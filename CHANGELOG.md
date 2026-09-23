@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Checked integer negation across backends — 2026-09-22
+- **Unary integer negation is checked identically in every backend** (`src/aot/codegen.rs`, `src/core_vm/mod.rs`, `src/jit/compiler.rs`, `src/jit/typed_compiler.rs`, `src/jit/simd_analyzer.rs`). `Neg` of `INT48_MIN` now raises the same overflow error in the interpreter, the native AOT backend, and the JIT instead of silently wrapping in one backend while erroring in another. AOT excludes any function containing unary `Neg` from the all-Int unboxed calling convention and routes the boxed path through the checked `nulang_ineg` runtime helper; the JIT keeps `INeg` out of typed regions and the SIMD analyzer no longer vectorizes it. This removes the interpreter/AOT/JIT divergence the differential fuzzer reports for negated operands.
+
 ### Temporary concatenated-string reclamation — 2026-09-22
 - **Non-folded string concatenations now participate in MIR ownership-based reclamation** (`src/mir_codegen.rs`). Because `SConcat` creates a fresh actor-heap string, the liveness planner can release its sole local ORCA reference immediately after the last safe use instead of retaining the temporary until actor teardown. Runtime semantics and the existing ORCA/store-barrier protocol are unchanged.
 
