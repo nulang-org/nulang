@@ -14,6 +14,7 @@
 
 use crate::vm::Value;
 use crossbeam::queue::SegQueue;
+use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -157,6 +158,107 @@ enum MatchLane {
     Normal,
 }
 
+/// Lazy positional index for one staged selective-receive lane.
+///
+/// Positions remain stable while a receive transaction only appends arrivals
+/// and rejects guards. A successful commit or ordinary pop shifts VecDeque
+/// positions and invalidates the index, which is rebuilt lazily.
+#[derive(Debug)]
+struct ReceiveLaneIndex {
+    positions: FxHashMap<u16, Vec<usize>>,
+    cursors: FxHashMap<u16, usize>,
+    valid: bool,
+}
+
+impl ReceiveLaneIndex {
+    fn new() -> Self {
+        Self {
+            positions: FxHashMap::default(),
+            cursors: FxHashMap::default(),
+            valid: true,
+        }
+    }
+
+    #[inline]
+    fn append(&mut self, behavior_id: u16, index: usize) {
+        if self.valid {
+            self.positions.entry(behavior_id).or_default().push(index);
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.positions.clear();
+        self.cursors.clear();
+        self.valid = false;
+    }
+
+    fn reset_cursors(&mut self) {
+        self.cursors.clear();
+    }
+
+    fn ensure(&mut self, buffer: &VecDeque<(Message, bool)>) {
+        if self.valid {
+            return;
+        }
+        self.positions.clear();
+        for (idx, (msg, _)) in buffer.iter().enumerate() {
+            self.positions.entry(msg.behavior_id).or_default().push(idx);
+        }
+        self.cursors.clear();
+        self.valid = true;
+    }
+
+    fn next_candidate(
+        &mut self,
+        buffer: &VecDeque<(Message, bool)>,
+        behavior_ids: &[u16],
+    ) -> Option<(usize, usize)> {
+        self.ensure(buffer);
+
+        let mut best: Option<(usize, usize)> = None;
+        for (arm_pos, &behavior_id) in behavior_ids.iter().enumerate() {
+            let Some(positions) = self.positions.get(&behavior_id) else {
+                continue;
+            };
+            let cursor = self.cursors.entry(behavior_id).or_insert(0);
+            while *cursor < positions.len() {
+                let idx = positions[*cursor];
+                match buffer.get(idx) {
+                    Some((_, false)) => break,
+                    Some((_, true)) | None => *cursor += 1,
+                }
+            }
+            if *cursor >= positions.len() {
+                continue;
+            }
+            let idx = positions[*cursor];
+            match best {
+                None => best = Some((arm_pos, idx)),
+                Some((_, best_idx)) if idx < best_idx => best = Some((arm_pos, idx)),
+                _ => {}
+            }
+        }
+        best
+    }
+}
+
+#[derive(Debug)]
+struct ReceiveIndexes {
+    system: ReceiveLaneIndex,
+    local: ReceiveLaneIndex,
+    normal: ReceiveLaneIndex,
+}
+
+impl ReceiveIndexes {
+    fn new() -> Self {
+        Self {
+            system: ReceiveLaneIndex::new(),
+            local: ReceiveLaneIndex::new(),
+            normal: ReceiveLaneIndex::new(),
+        }
+    }
+}
+
 /// MPSC mailbox with priority bands and optional capacity.
 ///
 /// Concurrent producers may call [`Mailbox::push`] through shared references;
@@ -180,6 +282,9 @@ pub struct Mailbox {
     local_skip_buffer: VecDeque<(Message, bool)>,
     /// Normal messages staged by selective receive.
     skip_buffer: VecDeque<(Message, bool)>,
+    /// Selective-receive indexes are allocated lazily so actors that only use
+    /// ordinary FIFO receive do not carry three hash maps in every mailbox.
+    receive_indexes: Option<Box<ReceiveIndexes>>,
     /// The most recently returned candidate. A second `receive_match` call
     /// means the previous candidate's guard rejected it; only this active
     /// candidate may be consumed by `commit_receive_match`.
@@ -201,6 +306,7 @@ impl Mailbox {
             system_skip_buffer: VecDeque::new(),
             local_skip_buffer: VecDeque::new(),
             skip_buffer: VecDeque::new(),
+            receive_indexes: None,
             active_match: None,
         }
     }
@@ -278,43 +384,67 @@ impl Mailbox {
             .or_else(|| self.normal_queue.pop());
         if result.is_some() {
             self.active_match = None;
+            self.invalidate_receive_indexes();
             self.release_slot();
         }
         result
     }
 
-    fn stage_arrivals(&mut self) {
-        // Scheduler-local system messages join the system lane; other local
-        // traffic stays in its own lane so its FIFO position is stable.
-        while let Some(msg) = self.local_queue.pop_front() {
-            if msg.priority == MessagePriority::System {
-                self.system_skip_buffer.push_back((msg, false));
-            } else {
-                self.local_skip_buffer.push_back((msg, false));
-            }
-        }
-        while let Some(msg) = self.system_queue.pop() {
-            self.system_skip_buffer.push_back((msg, false));
-        }
-        while let Some(msg) = self.normal_queue.pop() {
-            self.skip_buffer.push_back((msg, false));
+    fn stage_message(
+        buffer: &mut VecDeque<(Message, bool)>,
+        index: &mut ReceiveLaneIndex,
+        msg: Message,
+    ) {
+        let position = buffer.len();
+        let behavior_id = msg.behavior_id;
+        buffer.push_back((msg, false));
+        index.append(behavior_id, position);
+    }
+
+    fn ensure_receive_indexes(&mut self) {
+        if self.receive_indexes.is_none() {
+            self.receive_indexes = Some(Box::new(ReceiveIndexes::new()));
         }
     }
 
-    fn scan_staged(
-        buffer: &mut VecDeque<(Message, bool)>,
-        behavior_ids: &[u16],
-    ) -> Option<(usize, usize, Arc<Vec<Value>>)> {
-        for (idx, (msg, tried)) in buffer.iter_mut().enumerate() {
-            if *tried {
-                continue;
-            }
-            if let Some(pos) = behavior_ids.iter().position(|&id| id == msg.behavior_id) {
-                *tried = true;
-                return Some((pos, idx, msg.payload.to_shared()));
+    fn stage_arrivals(&mut self) {
+        let indexes = self
+            .receive_indexes
+            .as_mut()
+            .expect("selective receive indexes must be initialized");
+
+        while let Some(msg) = self.local_queue.pop_front() {
+            if msg.priority == MessagePriority::System {
+                Self::stage_message(
+                    &mut self.system_skip_buffer,
+                    &mut indexes.system,
+                    msg,
+                );
+            } else {
+                Self::stage_message(&mut self.local_skip_buffer, &mut indexes.local, msg);
             }
         }
-        None
+        while let Some(msg) = self.system_queue.pop() {
+            Self::stage_message(
+                &mut self.system_skip_buffer,
+                &mut indexes.system,
+                msg,
+            );
+        }
+        while let Some(msg) = self.normal_queue.pop() {
+            Self::stage_message(&mut self.skip_buffer, &mut indexes.normal, msg);
+        }
+    }
+
+    fn scan_indexed(
+        buffer: &mut VecDeque<(Message, bool)>,
+        index: &mut ReceiveLaneIndex,
+        behavior_ids: &[u16],
+    ) -> Option<(usize, usize, Arc<Vec<Value>>)> {
+        let (arm_pos, message_idx) = index.next_candidate(buffer, behavior_ids)?;
+        let (message, tried) = buffer.get_mut(message_idx)?;
+        *tried = true;
+        Some((arm_pos, message_idx, message.payload.to_shared()))
     }
 
     /// Selective receive is transactional: returning a candidate only marks it
@@ -326,21 +456,33 @@ impl Mailbox {
         // candidate was rejected by its pattern/guard. It remains `tried` for
         // this receive expression but is no longer the commit target.
         self.active_match = None;
+        self.ensure_receive_indexes();
         self.stage_arrivals();
 
-        if let Some((pos, idx, payload)) =
-            Self::scan_staged(&mut self.system_skip_buffer, behavior_ids)
-        {
+        let indexes = self
+            .receive_indexes
+            .as_mut()
+            .expect("selective receive indexes must be initialized");
+
+        if let Some((pos, idx, payload)) = Self::scan_indexed(
+            &mut self.system_skip_buffer,
+            &mut indexes.system,
+            behavior_ids,
+        ) {
             self.active_match = Some((MatchLane::System, idx, Arc::clone(&payload)));
             return Some((pos, payload));
         }
-        if let Some((pos, idx, payload)) =
-            Self::scan_staged(&mut self.local_skip_buffer, behavior_ids)
-        {
+        if let Some((pos, idx, payload)) = Self::scan_indexed(
+            &mut self.local_skip_buffer,
+            &mut indexes.local,
+            behavior_ids,
+        ) {
             self.active_match = Some((MatchLane::Local, idx, Arc::clone(&payload)));
             return Some((pos, payload));
         }
-        if let Some((pos, idx, payload)) = Self::scan_staged(&mut self.skip_buffer, behavior_ids) {
+        if let Some((pos, idx, payload)) =
+            Self::scan_indexed(&mut self.skip_buffer, &mut indexes.normal, behavior_ids)
+        {
             self.active_match = Some((MatchLane::Normal, idx, Arc::clone(&payload)));
             return Some((pos, payload));
         }
@@ -408,6 +550,19 @@ impl Mailbox {
         for (_, tried) in self.skip_buffer.iter_mut() {
             *tried = false;
         }
+        if let Some(indexes) = self.receive_indexes.as_mut() {
+            indexes.system.reset_cursors();
+            indexes.local.reset_cursors();
+            indexes.normal.reset_cursors();
+        }
+    }
+
+    fn invalidate_receive_indexes(&mut self) {
+        if let Some(indexes) = self.receive_indexes.as_mut() {
+            indexes.system.invalidate();
+            indexes.local.invalidate();
+            indexes.normal.invalidate();
+        }
     }
 
     /// Commit exactly the most recently returned candidate and return its
@@ -421,6 +576,7 @@ impl Mailbox {
             MatchLane::Normal => self.skip_buffer.remove(idx),
         }?;
         self.release_slot();
+        self.invalidate_receive_indexes();
         self.clear_tried_flags();
         Some(payload)
     }
@@ -713,5 +869,56 @@ mod transactional_receive_tests {
         assert_eq!(mb.pop().unwrap().sender, 1);
         assert_eq!(mb.pop().unwrap().sender, 2);
         assert_eq!(mb.pop().unwrap().sender, 3);
+    }
+
+    #[test]
+    fn indexed_receive_preserves_fifo_across_arm_order() {
+        let mut mb = Mailbox::new(8);
+        mb.push_local(msg(20, 1, MessagePriority::Normal)).unwrap();
+        mb.push_local(msg(10, 2, MessagePriority::Normal)).unwrap();
+
+        let (arm, payload) = mb.receive_match(&[10, 20]).expect("candidate");
+        assert_eq!(arm, 1, "oldest matching message wins before arm order");
+        assert_eq!(payload[0].as_int(), Some(1));
+    }
+
+    #[test]
+    fn indexed_receive_duplicate_behavior_uses_first_arm() {
+        let mut mb = Mailbox::new(4);
+        mb.push_local(msg(7, 11, MessagePriority::Normal)).unwrap();
+
+        let (arm, payload) = mb.receive_match(&[7, 7]).expect("candidate");
+        assert_eq!(arm, 0);
+        assert_eq!(payload[0].as_int(), Some(11));
+    }
+
+    #[test]
+    fn indexed_receive_rebuilds_after_middle_commit() {
+        let mut mb = Mailbox::new(8);
+        mb.push_local(msg(1, 1, MessagePriority::Normal)).unwrap();
+        mb.push_local(msg(2, 2, MessagePriority::Normal)).unwrap();
+        mb.push_local(msg(3, 3, MessagePriority::Normal)).unwrap();
+
+        let first = mb.receive_match(&[2]).expect("middle candidate");
+        assert_eq!(first.1[0].as_int(), Some(2));
+        mb.commit_receive_match().expect("commit middle");
+
+        let next = mb.receive_match(&[3]).expect("candidate after reindex");
+        assert_eq!(next.1[0].as_int(), Some(3));
+        mb.commit_receive_match().expect("commit tail");
+
+        assert_eq!(mb.pop().unwrap().sender, 1);
+        assert!(mb.is_empty());
+    }
+
+    #[test]
+    fn indexed_receive_sees_arrival_after_initial_miss() {
+        let mut mb = Mailbox::new(8);
+        mb.push_local(msg(1, 1, MessagePriority::Normal)).unwrap();
+        assert!(mb.receive_match(&[9]).is_none());
+
+        mb.push_local(msg(9, 2, MessagePriority::Normal)).unwrap();
+        let found = mb.receive_match(&[9]).expect("new indexed arrival");
+        assert_eq!(found.1[0].as_int(), Some(2));
     }
 }
