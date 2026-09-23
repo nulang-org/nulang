@@ -18,6 +18,7 @@ use crate::durable_effect::{DurableEffectRecord, DurableEffectSpec};
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
 use crate::primitives::{DeliverySemantics, EffectBoundary};
 use crate::runtime::persistence::WorkflowEvent;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
 
@@ -361,11 +362,364 @@ pub enum TemporalCommandPlan {
     },
 }
 
+/// Protocol-neutral subset of Temporal history consumed by the Nulang
+/// compatibility worker.
+///
+/// The wire adapter is responsible for decoding protobuf history into this
+/// representation. Event ids are retained because Temporal references earlier
+/// schedule/start events by id when recording terminal activity/timer events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemporalHistoryEvent {
+    WorkflowExecutionStarted {
+        event_id: u64,
+        workflow_type: String,
+        input: Vec<u8>,
+    },
+    ActivityTaskScheduled {
+        event_id: u64,
+        activity_id: String,
+        activity_type: String,
+        task_queue: String,
+        input: Vec<u8>,
+    },
+    ActivityTaskCompleted {
+        event_id: u64,
+        scheduled_event_id: u64,
+        result: Vec<u8>,
+    },
+    ActivityTaskFailed {
+        event_id: u64,
+        scheduled_event_id: u64,
+        message: String,
+    },
+    TimerStarted {
+        event_id: u64,
+        timer_id: String,
+        duration_ms: u64,
+    },
+    TimerFired {
+        event_id: u64,
+        started_event_id: u64,
+    },
+    WorkflowExecutionSignaled {
+        event_id: u64,
+        signal_name: String,
+        payload: Option<Vec<u8>>,
+    },
+    WorkflowExecutionCompleted {
+        event_id: u64,
+        result: Vec<u8>,
+    },
+    WorkflowExecutionFailed {
+        event_id: u64,
+        message: String,
+    },
+    WorkflowExecutionContinuedAsNew {
+        event_id: u64,
+        new_run_id: String,
+    },
+}
+
+impl TemporalHistoryEvent {
+    pub fn event_id(&self) -> u64 {
+        match self {
+            Self::WorkflowExecutionStarted { event_id, .. }
+            | Self::ActivityTaskScheduled { event_id, .. }
+            | Self::ActivityTaskCompleted { event_id, .. }
+            | Self::ActivityTaskFailed { event_id, .. }
+            | Self::TimerStarted { event_id, .. }
+            | Self::TimerFired { event_id, .. }
+            | Self::WorkflowExecutionSignaled { event_id, .. }
+            | Self::WorkflowExecutionCompleted { event_id, .. }
+            | Self::WorkflowExecutionFailed { event_id, .. }
+            | Self::WorkflowExecutionContinuedAsNew { event_id, .. } => *event_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemporalReplayedActivityState {
+    Scheduled,
+    Completed(Vec<u8>),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalReplayedActivity {
+    pub scheduled_event_id: u64,
+    pub activity_id: String,
+    pub activity_type: String,
+    pub task_queue: String,
+    pub input: Vec<u8>,
+    pub state: TemporalReplayedActivityState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalReplayedTimer {
+    pub started_event_id: u64,
+    pub timer_id: String,
+    pub duration_ms: u64,
+    pub fired: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalReplayedSignal {
+    pub event_id: u64,
+    pub signal_name: String,
+    pub payload: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemporalTerminalState {
+    Completed(Vec<u8>),
+    Failed(String),
+    ContinuedAsNew { new_run_id: String },
+}
+
+/// Deterministic projection of the supported Temporal history subset.
+///
+/// This state is adapter-owned. It exists to validate Temporal replay and to
+/// drive the compatibility worker; it is not a replacement for Nulang's own
+/// durable transition journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalReplayState {
+    pub workflow_type: String,
+    pub input: Vec<u8>,
+    pub last_event_id: u64,
+    pub activities: BTreeMap<u64, TemporalReplayedActivity>,
+    pub timers: BTreeMap<u64, TemporalReplayedTimer>,
+    pub signals: Vec<TemporalReplayedSignal>,
+    pub terminal: Option<TemporalTerminalState>,
+}
+
+impl TemporalReplayState {
+    pub fn replay(history: &[TemporalHistoryEvent]) -> Result<Self, TemporalCompatError> {
+        let mut workflow_type = None;
+        let mut input = Vec::new();
+        let mut last_event_id = 0;
+        let mut activities = BTreeMap::new();
+        let mut timers = BTreeMap::new();
+        let mut signals = Vec::new();
+        let mut terminal = None;
+
+        for event in history {
+            let event_id = event.event_id();
+            if event_id == 0 || event_id <= last_event_id {
+                return Err(TemporalCompatError::NonMonotonicHistory {
+                    previous: last_event_id,
+                    current: event_id,
+                });
+            }
+            if terminal.is_some() {
+                return Err(TemporalCompatError::EventAfterTerminal { event_id });
+            }
+
+            match event {
+                TemporalHistoryEvent::WorkflowExecutionStarted {
+                    workflow_type: ty,
+                    input: start_input,
+                    ..
+                } => {
+                    if workflow_type.is_some() {
+                        return Err(TemporalCompatError::DuplicateWorkflowStart);
+                    }
+                    validate_non_empty("workflow_type", ty)?;
+                    workflow_type = Some(ty.clone());
+                    input = start_input.clone();
+                }
+                TemporalHistoryEvent::ActivityTaskScheduled {
+                    event_id,
+                    activity_id,
+                    activity_type,
+                    task_queue,
+                    input,
+                } => {
+                    validate_non_empty("activity_id", activity_id)?;
+                    validate_non_empty("activity_type", activity_type)?;
+                    validate_non_empty("task_queue", task_queue)?;
+                    activities.insert(
+                        *event_id,
+                        TemporalReplayedActivity {
+                            scheduled_event_id: *event_id,
+                            activity_id: activity_id.clone(),
+                            activity_type: activity_type.clone(),
+                            task_queue: task_queue.clone(),
+                            input: input.clone(),
+                            state: TemporalReplayedActivityState::Scheduled,
+                        },
+                    );
+                }
+                TemporalHistoryEvent::ActivityTaskCompleted {
+                    scheduled_event_id,
+                    result,
+                    ..
+                } => {
+                    let activity = activities.get_mut(scheduled_event_id).ok_or(
+                        TemporalCompatError::UnknownActivityScheduledEvent(*scheduled_event_id),
+                    )?;
+                    if !matches!(activity.state, TemporalReplayedActivityState::Scheduled) {
+                        return Err(TemporalCompatError::ActivityAlreadyTerminal(
+                            *scheduled_event_id,
+                        ));
+                    }
+                    activity.state = TemporalReplayedActivityState::Completed(result.clone());
+                }
+                TemporalHistoryEvent::ActivityTaskFailed {
+                    scheduled_event_id,
+                    message,
+                    ..
+                } => {
+                    let activity = activities.get_mut(scheduled_event_id).ok_or(
+                        TemporalCompatError::UnknownActivityScheduledEvent(*scheduled_event_id),
+                    )?;
+                    if !matches!(activity.state, TemporalReplayedActivityState::Scheduled) {
+                        return Err(TemporalCompatError::ActivityAlreadyTerminal(
+                            *scheduled_event_id,
+                        ));
+                    }
+                    activity.state = TemporalReplayedActivityState::Failed(message.clone());
+                }
+                TemporalHistoryEvent::TimerStarted {
+                    event_id,
+                    timer_id,
+                    duration_ms,
+                } => {
+                    validate_non_empty("timer_id", timer_id)?;
+                    timers.insert(
+                        *event_id,
+                        TemporalReplayedTimer {
+                            started_event_id: *event_id,
+                            timer_id: timer_id.clone(),
+                            duration_ms: *duration_ms,
+                            fired: false,
+                        },
+                    );
+                }
+                TemporalHistoryEvent::TimerFired {
+                    started_event_id, ..
+                } => {
+                    let timer = timers.get_mut(started_event_id).ok_or(
+                        TemporalCompatError::UnknownTimerStartedEvent(*started_event_id),
+                    )?;
+                    if timer.fired {
+                        return Err(TemporalCompatError::TimerAlreadyFired(*started_event_id));
+                    }
+                    timer.fired = true;
+                }
+                TemporalHistoryEvent::WorkflowExecutionSignaled {
+                    event_id,
+                    signal_name,
+                    payload,
+                } => {
+                    validate_non_empty("signal_name", signal_name)?;
+                    signals.push(TemporalReplayedSignal {
+                        event_id: *event_id,
+                        signal_name: signal_name.clone(),
+                        payload: payload.clone(),
+                    });
+                }
+                TemporalHistoryEvent::WorkflowExecutionCompleted { result, .. } => {
+                    terminal = Some(TemporalTerminalState::Completed(result.clone()));
+                }
+                TemporalHistoryEvent::WorkflowExecutionFailed { message, .. } => {
+                    terminal = Some(TemporalTerminalState::Failed(message.clone()));
+                }
+                TemporalHistoryEvent::WorkflowExecutionContinuedAsNew {
+                    new_run_id, ..
+                } => {
+                    validate_non_empty("new_run_id", new_run_id)?;
+                    terminal = Some(TemporalTerminalState::ContinuedAsNew {
+                        new_run_id: new_run_id.clone(),
+                    });
+                }
+            }
+
+            last_event_id = event_id;
+        }
+
+        let workflow_type = workflow_type.ok_or(TemporalCompatError::HistoryMissingWorkflowStart)?;
+        Ok(Self {
+            workflow_type,
+            input,
+            last_event_id,
+            activities,
+            timers,
+            signals,
+            terminal,
+        })
+    }
+}
+
+/// One workflow task as presented to the protocol-neutral Nulang worker core.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalWorkflowTask {
+    pub execution: TemporalWorkflowExecution,
+    pub nulang_actor_id: u64,
+    pub workflow_task_started_event_id: u64,
+    pub transition_sequence: u64,
+    pub history: Vec<TemporalHistoryEvent>,
+}
+
+/// Validated/replayed workflow task ready for command generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalPreparedWorkflowTask {
+    pub context: TemporalWorkflowTaskContext,
+    pub replay: TemporalReplayState,
+}
+
+impl TemporalPreparedWorkflowTask {
+    /// Translate a complete ordered command list into Nulang compatibility
+    /// plans. The command index is the stable Temporal command ordinal.
+    pub fn plan_commands(
+        &self,
+        commands: Vec<TemporalCommand>,
+    ) -> Result<Vec<TemporalCommandPlan>, TemporalCompatError> {
+        commands
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, command)| {
+                let ordinal = u32::try_from(ordinal)
+                    .map_err(|_| TemporalCompatError::TooManyCommands)?;
+                self.context.plan_command(ordinal, command)
+            })
+            .collect()
+    }
+}
+
+/// Protocol-independent worker core shared by a native Temporal worker
+/// transport and Nulang Cloud's managed compatibility gateway.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TemporalWorkerCore;
+
+impl TemporalWorkerCore {
+    pub fn prepare_task(
+        task: TemporalWorkflowTask,
+    ) -> Result<TemporalPreparedWorkflowTask, TemporalCompatError> {
+        let replay = TemporalReplayState::replay(&task.history)?;
+        let context = TemporalWorkflowTaskContext::new(
+            task.execution,
+            task.nulang_actor_id,
+            task.workflow_task_started_event_id,
+            task.transition_sequence,
+        )?;
+        Ok(TemporalPreparedWorkflowTask { context, replay })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TemporalCompatError {
     EmptyField(&'static str),
     ZeroWorkflowTaskStartedEventId,
     ZeroTransitionSequence,
+    NonMonotonicHistory { previous: u64, current: u64 },
+    HistoryMissingWorkflowStart,
+    DuplicateWorkflowStart,
+    UnknownActivityScheduledEvent(u64),
+    ActivityAlreadyTerminal(u64),
+    UnknownTimerStartedEvent(u64),
+    TimerAlreadyFired(u64),
+    EventAfterTerminal { event_id: u64 },
+    TooManyCommands,
 }
 
 impl fmt::Display for TemporalCompatError {
@@ -377,6 +731,38 @@ impl fmt::Display for TemporalCompatError {
             }
             Self::ZeroTransitionSequence => {
                 write!(f, "Nulang durable transition sequence must be non-zero")
+            }
+            Self::NonMonotonicHistory { previous, current } => write!(
+                f,
+                "Temporal history event ids must increase strictly: previous {previous}, current {current}"
+            ),
+            Self::HistoryMissingWorkflowStart => {
+                write!(f, "Temporal history is missing WorkflowExecutionStarted")
+            }
+            Self::DuplicateWorkflowStart => {
+                write!(f, "Temporal history contains more than one WorkflowExecutionStarted")
+            }
+            Self::UnknownActivityScheduledEvent(event_id) => write!(
+                f,
+                "Temporal activity terminal event references unknown scheduled event {event_id}"
+            ),
+            Self::ActivityAlreadyTerminal(event_id) => write!(
+                f,
+                "Temporal activity scheduled at event {event_id} is already terminal"
+            ),
+            Self::UnknownTimerStartedEvent(event_id) => write!(
+                f,
+                "Temporal TimerFired references unknown TimerStarted event {event_id}"
+            ),
+            Self::TimerAlreadyFired(event_id) => {
+                write!(f, "Temporal timer started at event {event_id} already fired")
+            }
+            Self::EventAfterTerminal { event_id } => write!(
+                f,
+                "Temporal history event {event_id} appears after workflow terminal state"
+            ),
+            Self::TooManyCommands => {
+                write!(f, "Temporal workflow task contains more than u32::MAX commands")
             }
         }
     }
@@ -625,6 +1011,159 @@ mod tests {
                 assert_eq!(payload.as_deref(), Some("yes"));
             }
             _ => panic!("expected SignalReceived"),
+        }
+    }
+
+    fn replay_history() -> Vec<TemporalHistoryEvent> {
+        vec![
+            TemporalHistoryEvent::WorkflowExecutionStarted {
+                event_id: 1,
+                workflow_type: "OrderWorkflow".into(),
+                input: b"order-42".to_vec(),
+            },
+            TemporalHistoryEvent::ActivityTaskScheduled {
+                event_id: 2,
+                activity_id: "reserve".into(),
+                activity_type: "ReserveInventory".into(),
+                task_queue: "orders".into(),
+                input: b"sku-1".to_vec(),
+            },
+            TemporalHistoryEvent::ActivityTaskCompleted {
+                event_id: 3,
+                scheduled_event_id: 2,
+                result: b"reserved".to_vec(),
+            },
+            TemporalHistoryEvent::TimerStarted {
+                event_id: 4,
+                timer_id: "payment-timeout".into(),
+                duration_ms: 30_000,
+            },
+            TemporalHistoryEvent::TimerFired {
+                event_id: 5,
+                started_event_id: 4,
+            },
+            TemporalHistoryEvent::WorkflowExecutionSignaled {
+                event_id: 6,
+                signal_name: "approved".into(),
+                payload: Some(b"yes".to_vec()),
+            },
+        ]
+    }
+
+    #[test]
+    fn replay_projects_supported_history_deterministically() {
+        let state = TemporalReplayState::replay(&replay_history()).unwrap();
+        assert_eq!(state.workflow_type, "OrderWorkflow");
+        assert_eq!(state.last_event_id, 6);
+        assert_eq!(state.activities.len(), 1);
+        assert_eq!(state.timers.len(), 1);
+        assert_eq!(state.signals.len(), 1);
+        assert!(matches!(
+            state.activities.get(&2).unwrap().state,
+            TemporalReplayedActivityState::Completed(ref result)
+                if result.as_slice() == b"reserved"
+        ));
+        assert!(state.timers.get(&4).unwrap().fired);
+    }
+
+    #[test]
+    fn replay_rejects_unknown_activity_completion_and_non_monotonic_ids() {
+        let unknown = vec![
+            TemporalHistoryEvent::WorkflowExecutionStarted {
+                event_id: 1,
+                workflow_type: "OrderWorkflow".into(),
+                input: Vec::new(),
+            },
+            TemporalHistoryEvent::ActivityTaskCompleted {
+                event_id: 2,
+                scheduled_event_id: 999,
+                result: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            TemporalReplayState::replay(&unknown).unwrap_err(),
+            TemporalCompatError::UnknownActivityScheduledEvent(999)
+        );
+
+        let non_monotonic = vec![
+            TemporalHistoryEvent::WorkflowExecutionStarted {
+                event_id: 2,
+                workflow_type: "OrderWorkflow".into(),
+                input: Vec::new(),
+            },
+            TemporalHistoryEvent::WorkflowExecutionSignaled {
+                event_id: 2,
+                signal_name: "duplicate".into(),
+                payload: None,
+            },
+        ];
+        assert_eq!(
+            TemporalReplayState::replay(&non_monotonic).unwrap_err(),
+            TemporalCompatError::NonMonotonicHistory {
+                previous: 2,
+                current: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn replay_rejects_events_after_terminal_history() {
+        let history = vec![
+            TemporalHistoryEvent::WorkflowExecutionStarted {
+                event_id: 1,
+                workflow_type: "OrderWorkflow".into(),
+                input: Vec::new(),
+            },
+            TemporalHistoryEvent::WorkflowExecutionCompleted {
+                event_id: 2,
+                result: b"done".to_vec(),
+            },
+            TemporalHistoryEvent::WorkflowExecutionSignaled {
+                event_id: 3,
+                signal_name: "late".into(),
+                payload: None,
+            },
+        ];
+        assert_eq!(
+            TemporalReplayState::replay(&history).unwrap_err(),
+            TemporalCompatError::EventAfterTerminal { event_id: 3 }
+        );
+    }
+
+    #[test]
+    fn worker_core_replays_task_and_plans_ordered_commands() {
+        let task = TemporalWorkflowTask {
+            execution: TemporalWorkflowExecution::new(
+                "payments",
+                "order-42",
+                "run-abc",
+            )
+            .unwrap(),
+            nulang_actor_id: 77,
+            workflow_task_started_event_id: 101,
+            transition_sequence: 9,
+            history: replay_history(),
+        };
+        let prepared = TemporalWorkerCore::prepare_task(task).unwrap();
+        assert_eq!(prepared.replay.last_event_id, 6);
+
+        let plans = prepared
+            .plan_commands(vec![
+                TemporalCommand::StartTimer {
+                    timer_id: "retry".into(),
+                    duration_ms: 1_000,
+                },
+                TemporalCommand::ScheduleActivity(activity()),
+            ])
+            .unwrap();
+        assert_eq!(plans.len(), 2);
+        assert!(matches!(plans[0], TemporalCommandPlan::WorkflowEvent(_)));
+        match &plans[1] {
+            TemporalCommandPlan::Activity(plan) => {
+                let ordinal_one = context().prepare_activity(1, activity()).unwrap();
+                assert_eq!(plan.record.spec().id, ordinal_one.record.spec().id);
+            }
+            _ => panic!("expected activity plan"),
         }
     }
 
