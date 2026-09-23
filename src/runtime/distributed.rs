@@ -3297,7 +3297,9 @@ mod tests {
             &mut cluster_b,
             &mut resolver_b,
         );
+        assert_eq!(runtime_b.claim_next_ready_actor(), Some(actor_b));
         runtime_b.step_actor(actor_b);
+        runtime_b.finish_actor_turn(actor_b);
         let count = runtime_b
             .actors
             .get(&actor_b)
@@ -3327,7 +3329,10 @@ mod tests {
             &mut cluster_b,
             &mut resolver_b,
         );
-        runtime_b.step_actor(actor_b);
+        assert!(
+            runtime_b.claim_next_ready_actor().is_none(),
+            "unknown behavior must not create a ready token"
+        );
         let count = runtime_b
             .actors
             .get(&actor_b)
@@ -3570,7 +3575,9 @@ mod tests {
             "string message was not delivered to the remote actor's mailbox"
         );
 
+        assert_eq!(runtime_b.claim_next_ready_actor(), Some(actor_b));
         runtime_b.step_actor(actor_b);
+        runtime_b.finish_actor_turn(actor_b);
 
         let stored = runtime_b
             .actors
