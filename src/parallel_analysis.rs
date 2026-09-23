@@ -632,8 +632,61 @@ mod tests {
         };
         let summary = summarize_branch(0, &branch);
         assert!(summary.effects.contains("Actor.spawn"));
+        assert_eq!(
+            summary.effect_constraint,
+            ParallelEffectConstraint::SequentialOnly
+        );
         assert!(summary
             .authorities
             .contains("Net::TcpOut(api.example.com:443)"));
+    }
+
+    #[test]
+    fn host_effects_reuse_compiler_owned_execution_semantics() {
+        let branch = Expr::Perform {
+            effect: "Storage".to_string(),
+            op: "read".to_string(),
+            args: vec![Expr::Literal(Literal::String("key".to_string()), sp())],
+            span: sp(),
+        };
+        let summary = summarize_branch(0, &branch);
+        assert!(summary.effects.contains("Storage.read"));
+        assert_eq!(
+            summary.effect_constraint,
+            ParallelEffectConstraint::SequentialOnly
+        );
+        assert!(!summary.may_suspend);
+    }
+
+    #[test]
+    fn suspension_is_visible_to_future_scoped_task_scheduler() {
+        let branch = Expr::Perform {
+            effect: "Timer".to_string(),
+            op: "sleep".to_string(),
+            args: vec![int(10)],
+            span: sp(),
+        };
+        let summary = summarize_branch(0, &branch);
+        assert_eq!(
+            summary.effect_constraint,
+            ParallelEffectConstraint::SequentialOnly
+        );
+        assert!(summary.may_suspend);
+    }
+
+    #[test]
+    fn pure_branch_has_no_effect_imposed_scheduling_constraint() {
+        let branch = Expr::Binary {
+            op: BinOp::Add,
+            left: Box::new(int(1)),
+            right: Box::new(int(2)),
+            span: sp(),
+        };
+        let summary = summarize_branch(0, &branch);
+        assert_eq!(
+            summary.effect_constraint,
+            ParallelEffectConstraint::Unconstrained
+        );
+        assert!(!summary.may_suspend);
     }
 }
