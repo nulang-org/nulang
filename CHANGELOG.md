@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### Performance wave: JIT transitions, call analysis, and shard bus — 2026-09-22
+- **Bounded JIT register marshaling:** JIT transitions now reuse stable per-frame-depth scratch buffers and marshal only the compiler-known active register prefix for MIR-produced functions (`src/vm.rs`). Actor/legacy bytecode without trustworthy local-count metadata keeps the full 256-register path, and reserved direct-call staging state remains explicit.
+- **Linear-time JIT module call analysis:** direct-call suspension and recursion gating now share one lazily cached per-module call graph (`src/jit/mod.rs`). Suspension propagates with a reverse worklist and recursion uses iterative SCC traversal instead of an n×n reachability matrix plus Floyd-Warshall.
+- **Cross-shard runtime channel:** the bounded shard bus now uses Crossbeam channels (`src/runtime/mod.rs`) instead of `std::sync::mpsc::sync_channel`, preserving the 1024-message capacity and non-blocking admission/backpressure semantics.
+
+
 ### Typed JIT native SSA across arithmetic, loops, and simple CFGs — 2026-09-22
 - **The typed Cranelift JIT now keeps proven Int/Float values in native SSA form across arithmetic chains, simple loop backedges, and conservative forward-branch joins** (`src/jit/typed_compiler.rs`). It preserves Nulang's 48-bit integer wrap, nullable division/modulo behavior, NaN canonicalization, and runtime-helper fallbacks while avoiding repeated tag/unbox/register-file round trips. Per-block forward must-type analysis makes type facts CFG-derived rather than bytecode-emission-order-dependent. The implementation is the current-main replay of the independently tested #738→#768→#770→#771→#773→#774 stack.
 
