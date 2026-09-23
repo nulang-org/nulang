@@ -145,6 +145,7 @@ fn test_mailbox_push_pop() {
         payload: Arc::new(vec![Value::int(42)]),
         sender: 1,
         priority: MessagePriority::Normal,
+        ownership_handoff_mask: 0,
         trace_id: None,
     };
     assert!(mb.push(msg.clone()).is_ok());
@@ -188,6 +189,7 @@ fn test_delivery_establishes_child_context_and_inherits() {
                 payload: Arc::new(vec![]),
                 sender: 0,
                 priority: MessagePriority::Normal,
+                ownership_handoff_mask: 0,
                 trace_id: Some(incoming.to_string()),
             })
             .unwrap();
@@ -2970,6 +2972,129 @@ fn test_cycle_detector_accumulates_edge_ref_count() {
     // Both pending ops are drained in one call, so the edge ref_count drops
     // from 2 to 0 and the node is removed.
     assert_eq!(rt.cycle_detector.graph_size(), 0);
+}
+
+#[test]
+fn test_consuming_send_handoffs_local_ref_without_inflight_churn() {
+    let mut rt = Runtime::new();
+    let owner_id = rt.spawn_actor(Box::new(|| vec![]));
+    let receiver_id = rt.spawn_actor(Box::new(|| vec![]));
+    rt.current_actor = Some(owner_id);
+
+    let ptr = rt
+        .actors
+        .get_mut(&owner_id)
+        .unwrap()
+        .heap
+        .alloc(16, TypeTag::Raw)
+        .unwrap();
+    let value = unsafe { Value::ptr(ptr) };
+
+    let consumed = rt.send_message_by_id_consuming(receiver_id, 0, &[value], 1);
+    assert_eq!(consumed, 1);
+
+    unsafe {
+        let header = &*ActorHeap::header_of(ptr);
+        assert_eq!(header.ref_count, 0);
+        assert_eq!(header.foreign_count, 1);
+    }
+
+    let msg = rt
+        .actors
+        .get_mut(&receiver_id)
+        .unwrap()
+        .mailbox
+        .pop()
+        .expect("handoff message should be queued");
+    assert_eq!(msg.ownership_handoff_mask, 1);
+
+    rt.hold_payload_refs(receiver_id, &msg.payload, msg.ownership_handoff_mask);
+    unsafe {
+        let header = &*ActorHeap::header_of(ptr);
+        assert_eq!(header.ref_count, 0);
+        assert_eq!(
+            header.foreign_count, 1,
+            "adopting an already-handed-off payload must not add a second hold"
+        );
+    }
+
+    let stats = rt.gc_stats();
+    assert_eq!(stats.ownership_handoffs, 1);
+    assert_eq!(stats.refcount_ops_elided, 2);
+
+    rt.release_held_foreign_refs(receiver_id);
+    assert_eq!(
+        rt.actors.get(&owner_id).unwrap().heap.live_count(),
+        0,
+        "the receiver hold must be the final lifetime token"
+    );
+}
+
+#[test]
+fn test_consuming_send_rejects_self_send_handoff() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+    rt.current_actor = Some(actor_id);
+
+    let ptr = rt
+        .actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .heap
+        .alloc(16, TypeTag::Raw)
+        .unwrap();
+    let value = unsafe { Value::ptr(ptr) };
+
+    let consumed = rt.send_message_by_id_consuming(actor_id, 0, &[value], 1);
+    assert_eq!(consumed, 0);
+    unsafe {
+        let header = &*ActorHeap::header_of(ptr);
+        assert_eq!(header.ref_count, 1);
+    }
+    assert_eq!(rt.gc_stats().ownership_handoffs, 0);
+}
+
+#[test]
+fn test_consuming_send_rolls_back_on_mailbox_backpressure() {
+    let mut rt = Runtime::new();
+    let owner_id = rt.spawn_actor(Box::new(|| vec![]));
+    let receiver_id = rt.spawn_actor(Box::new(|| vec![]));
+    rt.current_actor = Some(owner_id);
+
+    rt.actors.get_mut(&receiver_id).unwrap().mailbox = Mailbox::new(1);
+    rt.actors
+        .get_mut(&receiver_id)
+        .unwrap()
+        .mailbox
+        .push_local(Message {
+            behavior_id: 0,
+            payload: std::sync::Arc::new(vec![]),
+            sender: owner_id,
+            priority: MessagePriority::Normal,
+            ownership_handoff_mask: 0,
+            trace_id: None,
+        })
+        .unwrap();
+
+    let ptr = rt
+        .actors
+        .get_mut(&owner_id)
+        .unwrap()
+        .heap
+        .alloc(16, TypeTag::Raw)
+        .unwrap();
+    let value = unsafe { Value::ptr(ptr) };
+
+    let consumed = rt.send_message_by_id_consuming(receiver_id, 0, &[value], 1);
+    assert_eq!(consumed, 0);
+    unsafe {
+        let header = &*ActorHeap::header_of(ptr);
+        assert_eq!(header.ref_count, 1);
+        assert_eq!(header.foreign_count, 0);
+    }
+    let stats = rt.gc_stats();
+    assert_eq!(stats.ownership_handoffs, 0);
+    assert_eq!(stats.refcount_ops_elided, 0);
 }
 
 #[test]
