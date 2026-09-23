@@ -11,7 +11,7 @@ use nulang_ai_core::{
 use nulang_ai_director::{Director, LocalDirector};
 use nulang_ai_manager::{EngineeringManager, Manager};
 use nulang_ai_protocol::format_event_line;
-use nulang_ai_worker::{LocalWorker, TaskExecution, Worker};
+use nulang_ai_worker::{LocalWorker, Worker};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -613,6 +613,7 @@ pub fn init_project(dir: &Path) -> Result<(), RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nulang_ai_worker::TaskExecution;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
