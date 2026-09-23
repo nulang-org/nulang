@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### Typed JIT real basic blocks — 2026-09-23
+- **Typed Cranelift codegen now emits one native block per real bytecode basic block rather than one per instruction** (`src/jit/typed_compiler.rs`). Region entry, branch targets/fallthroughs, post-terminator successors, and existing CFG-SSA parameter blocks remain explicit leaders; straight-line bytecode stays in the same CLIF block.
+- **Existing loop-carried and forward-CFG SSA rules are preserved**: no new value is carried across a control-flow edge without the current block-parameter proofs, and VM-register synchronization remains at unsupported joins/helpers/exits.
+- **JIT benchmarks now include a branch-heavy warm/interpreter pair** in addition to the existing hot-loop and first-run profitability suites.
+
 ### Dense terminal Tier-2 JIT state — 2026-09-23
 - **Post-compilation hotness now lives beside each dense compiled-region cache entry** (`src/jit/mod.rs`) instead of a separate `FxHashMap<(module, pc), counter>`, removing the hash probe from repeated native-region entry.
 - **Tier-2 probing becomes terminal**: untyped regions stop probing once no new static type facts can appear; typed regions get one SIMD specialization attempt, then stop paying counter updates.
