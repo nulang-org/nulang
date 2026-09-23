@@ -27,8 +27,8 @@ pub mod cir;
 pub mod cir_analysis;
 #[cfg(feature = "wasmfx-backend")]
 pub mod cir_lower;
-pub mod compiler_identity;
 pub mod compat;
+pub mod compiler_identity;
 pub mod content_identity;
 pub mod core_vm;
 #[cfg(feature = "native-codegen")]
