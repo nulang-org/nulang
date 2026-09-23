@@ -1599,6 +1599,9 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Atomic durable-transition storage contract — 2026-09-22
+- **Persistence backends now have a fail-closed atomic transition API** (Experimental, RFC 0022, `src/runtime/persistence.rs`). `DurableTransition` binds actor identity, activation epoch, sequence predecessor, command, snapshot, workflow/domain events, durable-effect records, and outbox messages to one canonical BLAKE3 digest. Unsupported backends return `Unsupported` rather than emulating atomicity with sequential writes. `MemoryStore` implements sequence/epoch fencing, idempotent exact retries, conflicting-retry rejection, and migration from existing legacy history.
+
 ### Allocation-free protocol actor-ref decoding — 2026-09-21
 - **ProtocolId wire decode no longer hex-allocates.** The fixed 32-byte protocol digest is reconstructed directly with `ProtocolId::from_bytes` instead of expanding to a 64-character hex `String` and reparsing it. Wire bytes and compatibility semantics are unchanged.
 
