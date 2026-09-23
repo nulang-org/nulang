@@ -71,12 +71,20 @@ The `@tool(description: "...")` annotation attaches a human-readable description
 
 ## Providers
 
-Nulang's LLM client is provider-agnostic. The `model` field selects the provider:
+Nulang's runtime is provider-agnostic through the Rust `LlmClient` boundary.
+The `model` field is the provider's model identifier; it does not silently
+route between providers. The built-in adapters are:
 
 | Provider | Example model | Configuration |
 |----------|---------------|---------------|
-| OpenAI | `gpt-4o` | `OPENAI_API_KEY` env var |
+| OpenAI / OpenAI-compatible | `gpt-4o` | `OpenAiClient::new` or `OpenAiClient::with_base_url` |
 | Ollama | `llama3.1` | Local Ollama server on `localhost:11434` |
+
+Gateways that implement the OpenAI chat-completions wire format can be installed
+through `OpenAiClient::with_base_url` without adding provider-specific language
+syntax. Native adapters can implement `LlmClient` directly. Run the
+[provider contract evals](/ai/evals/) before promoting a provider/gateway
+configuration into a production agent.
 
 Pipeline orchestration is available via the Rust `nulang-ai` crate (`Pipeline::new()`, `Pipeline::stage()`, `Pipeline::run()`) and can be accessed through the runtime API. A language-level pipeline expression is pending.
 
@@ -84,5 +92,6 @@ Pipeline orchestration is available via the Rust `nulang-ai` crate (`Pipeline::n
 
 - [Memory](/ai/memory/) — episodic, semantic, and procedural memory subsystems
 - [Multi-Agent Patterns](/ai/multi-agent/) — pipelines, debates, and supervisor teams
+- [Provider Contract Evals](/ai/evals/) — deterministic provider/gateway regression checks
 
 > **Note**: The `agent` keyword is currently Experimental and is proposed for deprecation in favor of plain `actor` declarations that import `nlc.ai` (RFC 0004). The keyword remains functional and will continue to work through at least two major language versions.
