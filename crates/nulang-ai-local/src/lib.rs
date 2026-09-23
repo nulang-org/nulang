@@ -7,6 +7,6 @@ pub mod store;
 pub use config::{AgentConfigFile, ConfigError};
 pub use runtime::{init_project, LocalRuntime, RuntimeError};
 pub use store::{
-    AgentResumeTransition, AgentStateTransition, OutboxEventRecord, ResumeCommitResult, SqliteStore,
-    StoreError,
+    AgentResumeTransition, AgentStateTransition, OutboxEventRecord, ResumeCommitResult,
+    SqliteStore, StoreError,
 };
