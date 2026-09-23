@@ -727,10 +727,7 @@ impl ActorHeap {
     ///
     /// Returns `None` only when the global allocator fails.
     fn grow_bump_block(&mut self, min_capacity: usize) -> Option<()> {
-        debug_assert!(
-            !self.base.is_null(),
-            "grow requires an active bump block"
-        );
+        debug_assert!(!self.base.is_null(), "grow requires an active bump block");
         let new_size = self.total_size.max(min_capacity);
         let layout = std::alloc::Layout::from_size_align(new_size, ALIGN).ok()?;
         // SAFETY: layout has non-zero size (`total_size` > 0) and is valid.
