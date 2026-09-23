@@ -2228,25 +2228,22 @@ Runtime recovery process:
 4. Reconstruct `event_sourced` state by applying replayed events
 5. Merge `crdt` state from all available replicas
 
-**Implementation status (verified 2026-08-02; apply-handler recovery
-fixed 2026-08-13).** Recovery does not re-execute an `apply` handler
-(they are inlined at each `emit` call site by `hir_lower.rs`); instead
-`emit_event` persists the field's CURRENT value — captured AFTER the
-inlined apply handler ran and after the unconditional "+1" every
-`event_sourced` field gets per emit (`src/runtime/workflow.rs`) — in
-the `EventEntry`, and `recover_actor` restores that exact post-apply
-value from the event. The stored value, not a bare event count, is what
-recovery reconstructs, so non-trivial `apply` handlers survive a crash
-without needing an addressable bytecode unit. Pinned by
-`test_event_sourced_apply_handler_recovery`
-(`src/integration_tests/mod.rs`): an `entity Counter` with
+**Implementation status (verified 2026-08-02; semantics corrected
+2026-09-22).** Recovery does not re-execute an `apply` handler
+(they are inlined at each `emit` call site by `hir_lower.rs`). Instead,
+`emit_event` persists each event-sourced field's CURRENT value, captured
+AFTER the matching source-level `apply` handler has run. Event emission
+itself performs no implicit domain-state mutation. The stored post-apply
+value is what `recover_actor` restores, so non-trivial `apply` handlers
+survive a crash without requiring an addressable bytecode replay unit.
+
+For example, an `entity Counter` with
 `apply | Incremented(by) => self.count = self.count + by`, sent
-`increment(3)` then `increment(4)` with no crash, reaches `count = 9`
-(matches `conformance/behavior/persist_07_emit_accumulates_across_sends.nula`);
-the same two messages with a crash-and-recover between them recover to
-`count = 4` after the first message (apply's `0 + 3`, plus the +1 bump)
-and reach `9` after continuing — identical to the never-crashed
-baseline.
+`increment(3)` then `increment(4)`, reaches `count = 7`
+(`conformance/behavior/persist_07_emit_accumulates_across_sends.nula`).
+An unrelated event-sourced integer field remains unchanged by those emits;
+`persist_08_emit_bumps_all_event_sourced` is retained as a historical test
+identifier but now pins the corrected result (no implicit bump).
 
 A related, more severe bug was found and fixed alongside this: before
 this session, `recover_actor` never restored `Actor.state_models` (the
