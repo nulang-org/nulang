@@ -191,6 +191,7 @@ pub(crate) fn reap_living_actor(rt: &mut Runtime, actor_id: u64, reason: ExitRea
                     ]),
                     sender: actor_id,
                     priority: MessagePriority::System,
+                    ownership_handoff_mask: 0,
                     trace_id: None,
                 };
                 if let Some(actor) = rt.actors.get_mut(&linked_id) {
@@ -341,6 +342,7 @@ pub(crate) fn send_down_message(
         ]),
         sender: target_id,
         priority: MessagePriority::System,
+        ownership_handoff_mask: 0,
         trace_id: None,
     };
     if let Some(watcher) = rt.actors.get_mut(&watcher_id) {
