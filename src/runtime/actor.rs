@@ -753,4 +753,29 @@ mod tests {
         assert_eq!(received.sender, 99);
         assert_eq!(*received.payload, vec![Value::int(42)]);
     }
+
+    #[test]
+    fn flight_recorder_storage_is_lazy() {
+        let mut recorder = FlightRecorder::new(4);
+        assert_eq!(recorder.entries.capacity(), 0);
+        assert!(recorder.is_empty());
+
+        recorder.record(7, 3, &[Value::int(42)]);
+
+        assert_eq!(recorder.len(), 1);
+        assert!(recorder.entries.capacity() > 0);
+        assert_eq!(recorder.entries()[0].sender, 7);
+        assert_eq!(recorder.entries()[0].behavior_id, 3);
+        assert_eq!(recorder.entries()[0].payload_summary, "42");
+    }
+
+    #[test]
+    fn zero_capacity_flight_recorder_is_noop() {
+        let mut recorder = FlightRecorder::new(0);
+        recorder.record(7, 3, &[Value::int(42)]);
+
+        assert!(recorder.is_empty());
+        assert_eq!(recorder.entries.capacity(), 0);
+        assert_eq!(recorder.next_seq, 0);
+    }
 }
