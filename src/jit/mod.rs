@@ -91,6 +91,13 @@ struct CompiledRegion {
     tier2_terminal: bool,
 }
 
+#[derive(Clone)]
+struct NativeCalleeThunk {
+    ptr: *const u8,
+    argc: u8,
+    clobbers: Vec<u8>,
+}
+
 /// Manages the Cranelift JIT compilation lifecycle.
 ///
 /// - Creates and configures the `JITModule`
@@ -127,12 +134,12 @@ pub struct JitSession {
     /// recursion-cycle gating. Computed once on first tier-up instead of
     /// independently rescanning bytecode for each property.
     module_analysis: FxHashMap<usize, ModuleJitAnalysis>,
-    /// Separately compiled native thunks for straight-line pure leaf
-    /// functions. They are not inserted into the ordinary region cache:
-    /// tiny callees should not make normal interpreter entry pay a JIT boundary.
-    native_leafs: FxHashMap<(usize, usize), compiler::NativeLeafCall>,
-    /// Static leaf analyses or compilations that failed. Retrying them cannot
-    /// become useful until the module changes.
+    /// Separately compiled native thunks for bounded pure callees. They are
+    /// intentionally not inserted into the ordinary region cache: native
+    /// callees are entered only from an already-native caller.
+    native_leafs: FxHashMap<(usize, usize), NativeCalleeThunk>,
+    /// Static native-callee analyses or compilations that failed. Retrying
+    /// them cannot become useful until the module changes.
     native_leaf_rejected: FxHashSet<(usize, usize)>,
     /// Reusable function builder context.
     builder_context: FunctionBuilderContext,
@@ -300,12 +307,12 @@ impl JitSession {
         &self.module_analysis_for(module_idx, module).recursive
     }
 
-    fn native_leaf_for(
+    fn native_callee_for(
         &mut self,
         module_idx: usize,
         func_idx: usize,
         module: &crate::bytecode::CodeModule,
-    ) -> Option<compiler::NativeLeafCall> {
+    ) -> Option<NativeCalleeThunk> {
         let key = (module_idx, func_idx);
         if let Some(existing) = self.native_leafs.get(&key) {
             return Some(existing.clone());
@@ -314,15 +321,15 @@ impl JitSession {
             return None;
         }
 
-        let Some((start, body_len, ret_reg, clobbers)) = analyze_native_leaf(module, func_idx)
+        let Some((start, body_len, argc, clobbers)) = analyze_native_callee(module, func_idx)
         else {
             self.native_leaf_rejected.insert(key);
             return None;
         };
 
-        let func_name = format!("nulang_leaf_{}_{}", module_idx, func_idx);
+        let func_name = format!("nulang_call_{}_{}", module_idx, func_idx);
         let no_calls = std::collections::HashMap::new();
-        let no_leaf_calls = std::collections::HashMap::new();
+        let no_native_calls = std::collections::HashMap::new();
         let ptr = match compiler::compile_bytecode_region_with_options(
             &mut self.module,
             &mut self.builder_context,
@@ -332,8 +339,9 @@ impl JitSession {
             body_len,
             &module.instructions,
             &no_calls,
-            &no_leaf_calls,
+            &no_native_calls,
             false,
+            Some(255),
         ) {
             Ok(ptr) => ptr,
             Err(_) => {
@@ -342,13 +350,13 @@ impl JitSession {
             }
         };
 
-        let leaf = compiler::NativeLeafCall {
+        let callee = NativeCalleeThunk {
             ptr,
-            ret_reg,
+            argc,
             clobbers,
         };
-        self.native_leafs.insert(key, leaf.clone());
-        Some(leaf)
+        self.native_leafs.insert(key, callee.clone());
+        Some(callee)
     }
 
     fn native_leaf_calls_for_region(
@@ -358,10 +366,54 @@ impl JitSession {
         native_calls: &std::collections::HashMap<usize, usize>,
     ) -> std::collections::HashMap<usize, compiler::NativeLeafCall> {
         let mut result = std::collections::HashMap::new();
+
+        // A region may contain many direct-call sites from the same caller
+        // function. Compute the caller's liveness fixed point once per code
+        // range and reuse its live-out table for every call, rather than
+        // paying O(calls × function_size) tier-up analysis cost.
+        let mut liveness_cache: FxHashMap<(usize, usize), Option<Vec<JitRegSet>>> =
+            FxHashMap::default();
+
         for (&pc, &func_idx) in native_calls {
-            if let Some(leaf) = self.native_leaf_for(module_idx, func_idx, module) {
-                result.insert(pc, leaf);
+            let Some(call) = module.instructions.get(pc) else {
+                continue;
+            };
+            let Some(callee) = self.native_callee_for(module_idx, func_idx, module) else {
+                continue;
+            };
+            if call.op2 != callee.argc {
+                continue;
             }
+
+            let live = match caller_code_range(module, pc) {
+                Some((start, end)) if pc >= start && pc < end => {
+                    let sets = liveness_cache
+                        .entry((start, end))
+                        .or_insert_with(|| caller_live_out_sets(module, start, end));
+                    sets.as_ref()
+                        .and_then(|live_out| live_out.get(pc - start))
+                        .copied()
+                        .unwrap_or_else(all_registers)
+                }
+                _ => all_registers(),
+            };
+
+            let mut preserve: Vec<u8> = callee
+                .clobbers
+                .iter()
+                .copied()
+                .filter(|&reg| reg != call.op3 && regset_contains(&live, reg))
+                .collect();
+            preserve.sort_unstable();
+            preserve.dedup();
+
+            result.insert(
+                pc,
+                compiler::NativeLeafCall {
+                    ptr: callee.ptr,
+                    preserve,
+                },
+            );
         }
         result
     }
@@ -485,6 +537,7 @@ impl JitSession {
             native_calls,
             native_leaf_calls,
             true,
+            None,
         ) {
             Ok(ptr) => {
                 self.store_compiled(module_idx, start_offset, ptr, num_instrs);
@@ -1147,137 +1200,409 @@ pub(crate) fn find_compilable_region(
     }
 }
 
-const NATIVE_LEAF_MAX_INSTRS: usize = 32;
+const NATIVE_CALLEE_MAX_INSTRS: usize = 96;
+type JitRegSet = [u64; 4];
 
-/// Prove that a named function can execute as an isolated native leaf thunk.
+#[inline]
+fn regset_insert(set: &mut JitRegSet, reg: u8) {
+    set[(reg / 64) as usize] |= 1u64 << (reg % 64);
+}
+
+#[inline]
+fn regset_contains(set: &JitRegSet, reg: u8) -> bool {
+    (set[(reg / 64) as usize] & (1u64 << (reg % 64))) != 0
+}
+
+#[inline]
+fn regset_union_into(dst: &mut JitRegSet, src: &JitRegSet) {
+    for i in 0..4 {
+        dst[i] |= src[i];
+    }
+}
+
+#[inline]
+fn regset_intersect(a: &JitRegSet, b: &JitRegSet) -> JitRegSet {
+    [a[0] & b[0], a[1] & b[1], a[2] & b[2], a[3] & b[3]]
+}
+
+#[inline]
+fn regset_subtract(a: &JitRegSet, b: &JitRegSet) -> JitRegSet {
+    [a[0] & !b[0], a[1] & !b[1], a[2] & !b[2], a[3] & !b[3]]
+}
+
+#[inline]
+fn regset_is_subset(a: &JitRegSet, b: &JitRegSet) -> bool {
+    (0..4).all(|i| a[i] & !b[i] == 0)
+}
+
+#[inline]
+fn all_registers() -> JitRegSet {
+    [u64::MAX; 4]
+}
+
+fn one_reg(reg: u8) -> JitRegSet {
+    let mut set = [0; 4];
+    regset_insert(&mut set, reg);
+    set
+}
+
+fn two_regs(a: u8, b: u8) -> JitRegSet {
+    let mut set = one_reg(a);
+    regset_insert(&mut set, b);
+    set
+}
+
+/// Read/write sets for the pure bytecode subset accepted by native callee
+/// thunks. Returning None deliberately rejects heap/container mutation,
+/// refcount operations, nested calls, effects, suspension and debug I/O.
+fn native_pure_reads_writes(
+    instr: &crate::bytecode::Instruction,
+) -> Option<(JitRegSet, JitRegSet)> {
+    use crate::bytecode::OpCode;
+
+    let none = [0; 4];
+    let rw = match instr.opcode {
+        OpCode::Nop | OpCode::Jmp => (none, none),
+        OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
+            (none, one_reg(instr.op1))
+        }
+        OpCode::ConstU => (none, one_reg(instr.op3)),
+        OpCode::Load | OpCode::Store | OpCode::Move | OpCode::Dup => {
+            (one_reg(instr.op1), one_reg(instr.op2))
+        }
+        OpCode::Swap => {
+            let regs = two_regs(instr.op1, instr.op2);
+            (regs, regs)
+        }
+        OpCode::IAdd
+        | OpCode::ISub
+        | OpCode::IMul
+        | OpCode::IDiv
+        | OpCode::IMod
+        | OpCode::IPow
+        | OpCode::FPow
+        | OpCode::Xor
+        | OpCode::Shl
+        | OpCode::Shr
+        | OpCode::BitAnd
+        | OpCode::BitOr
+        | OpCode::FAdd
+        | OpCode::FSub
+        | OpCode::FMul
+        | OpCode::FDiv
+        | OpCode::ICmpEq
+        | OpCode::ICmpLt
+        | OpCode::ICmpGt
+        | OpCode::ICmpLe
+        | OpCode::ICmpGe
+        | OpCode::FCmpEq
+        | OpCode::FCmpLt
+        | OpCode::FCmpGt
+        | OpCode::And
+        | OpCode::Or => (two_regs(instr.op1, instr.op2), one_reg(instr.op3)),
+        // INeg may raise a VM error (INT48_MIN/type mismatch). The scalar
+        // JIT helper cannot surface that error through a nested native thunk
+        // yet, so keep such callees on the interpreter-helper fallback.
+        OpCode::INeg => return None,
+        OpCode::Not | OpCode::IToF | OpCode::FToI => (one_reg(instr.op1), one_reg(instr.op2)),
+        OpCode::FNeg => (one_reg(instr.op1), one_reg(instr.op3)),
+        OpCode::IInc | OpCode::IDec => {
+            let reg = one_reg(instr.op1);
+            (reg, reg)
+        }
+        OpCode::JmpT | OpCode::JmpF => (one_reg(instr.op1), none),
+        OpCode::Ret => (one_reg(0), none),
+        OpCode::RetVal => (one_reg(instr.op1), none),
+        _ => return None,
+    };
+    Some(rw)
+}
+
+fn merge_defined(slot: &mut Option<JitRegSet>, incoming: &JitRegSet) {
+    match slot {
+        Some(existing) => *existing = regset_intersect(existing, incoming),
+        None => *slot = Some(*incoming),
+    }
+}
+
+/// Prove that a named function is safe to execute against the caller's shared
+/// register buffer.
 ///
-/// This first native-to-native slice is intentionally strict: one straight-line
-/// body, no calls, branches, heap/container operations, effects, or suspension,
-/// and at most NATIVE_LEAF_MAX_INSTRS instructions before the terminal return.
-/// The result includes the exact register write-set needed to recreate the
-/// interpreter's separate callee frame around an in-place register-ABI call.
-fn analyze_native_leaf(
+/// The accepted subset is intentionally bounded and acyclic. Forward branches
+/// are allowed, but backward edges, nested calls, effects, heap/refcount
+/// operations and suspension are not. A definite-definition analysis starts
+/// with only r0..argc initialized (matching VM::Call's fresh-frame argument
+/// copy) and rejects any path that reads a callee-local register before a
+/// dominating write. This prevents caller register contents from becoming
+/// observable through the shared native ABI.
+fn analyze_native_callee(
     module: &crate::bytecode::CodeModule,
     func_idx: usize,
 ) -> Option<(usize, usize, u8, Vec<u8>)> {
     use crate::bytecode::OpCode;
 
     let start = *module.function_table.get(func_idx)?;
-    let mut end = module.instructions.len();
+    let info = module
+        .debug_functions
+        .iter()
+        .find(|info| info.code_offset == start)?;
+    let argc = u8::try_from(info.params.len()).ok()?;
+    let end = start.checked_add(info.code_len)?;
+    if end > module.instructions.len() || end <= start {
+        return None;
+    }
+    let body_len = end - start;
+    if body_len > NATIVE_CALLEE_MAX_INSTRS {
+        return None;
+    }
 
-    // Prefer compiler-owned debug range metadata when available, then clamp to
-    // every other known executable entry point so malformed/legacy metadata
-    // cannot make the analysis spill into a neighboring function/behavior.
+    // Validate the whole range first so the scalar compiler never encounters
+    // an unsupported instruction even when that instruction is unreachable.
+    for pc in start..end {
+        let instr = &module.instructions[pc];
+        native_pure_reads_writes(instr)?;
+        match instr.opcode {
+            OpCode::Jmp => {
+                let target = pc as i64 + instr.simm16() as i64;
+                if target <= pc as i64 || target >= end as i64 {
+                    return None;
+                }
+            }
+            OpCode::JmpT | OpCode::JmpF => {
+                let target = pc as i64 + instr.offset16() as i64;
+                if target <= pc as i64 || target >= end as i64 || pc + 1 >= end {
+                    return None;
+                }
+            }
+            OpCode::Ret | OpCode::RetVal => {}
+            _ if pc + 1 >= end => return None,
+            _ => {}
+        }
+    }
+
+    let mut initial = [0; 4];
+    for reg in 0..argc {
+        regset_insert(&mut initial, reg);
+    }
+
+    // All accepted branches go forward, so an ascending pass sees every
+    // predecessor before a join. Definite definitions merge by intersection.
+    let mut defs_in: Vec<Option<JitRegSet>> = vec![None; body_len];
+    defs_in[0] = Some(initial);
+    let mut clobbers = [0; 4];
+    let mut saw_return = false;
+
+    for rel in 0..body_len {
+        let Some(defs) = defs_in[rel] else {
+            continue;
+        };
+        let pc = start + rel;
+        let instr = &module.instructions[pc];
+        let (reads, writes) = native_pure_reads_writes(instr)?;
+        if !regset_is_subset(&reads, &defs) {
+            return None;
+        }
+
+        regset_union_into(&mut clobbers, &writes);
+        let mut out = defs;
+        regset_union_into(&mut out, &writes);
+
+        match instr.opcode {
+            OpCode::Ret | OpCode::RetVal => {
+                saw_return = true;
+            }
+            OpCode::Jmp => {
+                let target = (pc as i64 + instr.simm16() as i64) as usize;
+                merge_defined(&mut defs_in[target - start], &out);
+            }
+            OpCode::JmpT | OpCode::JmpF => {
+                let target = (pc as i64 + instr.offset16() as i64) as usize;
+                merge_defined(&mut defs_in[rel + 1], &out);
+                merge_defined(&mut defs_in[target - start], &out);
+            }
+            _ => {
+                merge_defined(&mut defs_in[rel + 1], &out);
+            }
+        }
+    }
+
+    if !saw_return {
+        return None;
+    }
+
+    // Every thunk writes the tagged result into r255 immediately before
+    // native return. Treat that mailbox as a callee clobber so caller liveness
+    // preserves r255 when the old value is live across the call.
+    regset_insert(&mut clobbers, 255);
+    let mut clobber_vec = Vec::new();
+    for reg in 0..=255u8 {
+        if regset_contains(&clobbers, reg) {
+            clobber_vec.push(reg);
+        }
+    }
+
+    Some((start, body_len, argc, clobber_vec))
+}
+
+fn instruction_liveness_rw(instr: &crate::bytecode::Instruction) -> (JitRegSet, JitRegSet) {
+    use crate::bytecode::OpCode;
+
+    if let Some(rw) = native_pure_reads_writes(instr) {
+        return rw;
+    }
+
+    match instr.opcode {
+        OpCode::Call => {
+            let mut reads = one_reg(instr.op1);
+            for reg in 0..instr.op2 {
+                regset_insert(&mut reads, reg);
+            }
+            (reads, one_reg(instr.op3))
+        }
+        // ClosureCall copies the entire caller register file into the new
+        // frame, so every caller register is semantically observable. TailCall
+        // likewise consumes the current activation but has no destination
+        // register write in the caller.
+        OpCode::ClosureCall => (all_registers(), one_reg(instr.op3)),
+        OpCode::TailCall => (all_registers(), [0; 4]),
+        OpCode::Drop => (one_reg(instr.op1), one_reg(instr.op1)),
+        OpCode::Halt => ([0; 4], [0; 4]),
+        // Unknown instructions conservatively observe every register and kill
+        // none. That can increase save sets but cannot under-preserve state.
+        _ => (all_registers(), [0; 4]),
+    }
+}
+
+fn caller_code_range(module: &crate::bytecode::CodeModule, pc: usize) -> Option<(usize, usize)> {
     if let Some(info) = module
         .debug_functions
         .iter()
-        .find(|info| info.code_offset == start)
+        .find(|info| pc >= info.code_offset && pc < info.code_offset.saturating_add(info.code_len))
     {
-        end = end.min(start.saturating_add(info.code_len));
-    }
-    for &offset in &module.function_table {
-        if offset > start {
-            end = end.min(offset);
+        let end = info.code_offset.checked_add(info.code_len)?;
+        if end <= module.instructions.len() {
+            return Some((info.code_offset, end));
         }
-    }
-    for behavior in &module.behaviors {
-        if behavior.code_offset > start {
-            end = end.min(behavior.code_offset);
-        }
-    }
-    if let Some(entry) = module.entry_point {
-        if entry > start {
-            end = end.min(entry);
-        }
-    }
-    if end <= start {
-        return None;
     }
 
-    let terminal_pc = end - 1;
-    let terminal = *module.instructions.get(terminal_pc)?;
-    let ret_reg = match terminal.opcode {
-        OpCode::Ret => 0,
-        OpCode::RetVal => terminal.op1,
-        _ => return None,
+    if let Some(entry) = module.entry_point {
+        if pc >= entry && pc < module.instructions.len() {
+            return Some((entry, module.instructions.len()));
+        }
+    }
+
+    None
+}
+
+fn liveness_successors(
+    module: &crate::bytecode::CodeModule,
+    pc: usize,
+    start: usize,
+    end: usize,
+) -> Option<Vec<usize>> {
+    use crate::bytecode::OpCode;
+
+    let instr = module.instructions.get(pc)?;
+    let within = |target: i64| {
+        if target >= start as i64 && target < end as i64 {
+            Some(target as usize)
+        } else {
+            None
+        }
     };
 
-    let body_len = terminal_pc - start;
-    if body_len > NATIVE_LEAF_MAX_INSTRS {
+    match instr.opcode {
+        OpCode::Jmp => {
+            let target = pc as i64 + instr.simm16() as i64;
+            Some(vec![within(target)?])
+        }
+        OpCode::JmpT | OpCode::JmpF => {
+            let target = pc as i64 + instr.offset16() as i64;
+            let mut succ = Vec::with_capacity(2);
+            if pc + 1 < end {
+                succ.push(pc + 1);
+            } else {
+                return None;
+            }
+            succ.push(within(target)?);
+            Some(succ)
+        }
+        OpCode::Ret | OpCode::RetVal | OpCode::TailCall | OpCode::Halt | OpCode::Panic => {
+            Some(Vec::new())
+        }
+        _ => {
+            if pc + 1 < end {
+                Some(vec![pc + 1])
+            } else {
+                Some(Vec::new())
+            }
+        }
+    }
+}
+
+/// Compute backward bytecode liveness for one caller activation.
+///
+/// Unknown opcodes conservatively read all 256 registers. Malformed/out-of-
+/// range control flow returns None; callers then use the all-register fallback.
+/// The returned table is indexed relative to `start` and contains live-out
+/// sets for every instruction in the range.
+fn caller_live_out_sets(
+    module: &crate::bytecode::CodeModule,
+    start: usize,
+    end: usize,
+) -> Option<Vec<JitRegSet>> {
+    if end <= start || end > module.instructions.len() {
         return None;
     }
 
-    let mut writes = FxHashSet::default();
-    for instr in &module.instructions[start..terminal_pc] {
-        match instr.opcode {
-            OpCode::Nop => {}
-            OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
-                writes.insert(instr.op1);
+    let len = end - start;
+    let mut live_in = vec![[0; 4]; len];
+    let mut live_out = vec![[0; 4]; len];
+
+    // 256 registers and <= one function body: a monotone fixed point remains
+    // bounded. Region preparation caches this result per caller range so many
+    // direct-call sites do not repeat the full analysis.
+    loop {
+        let mut changed = false;
+        for pc in (start..end).rev() {
+            let succs = liveness_successors(module, pc, start, end)?;
+
+            let mut out = [0; 4];
+            for succ in succs {
+                regset_union_into(&mut out, &live_in[succ - start]);
             }
-            OpCode::ConstU => {
-                writes.insert(instr.op3);
+
+            let (reads, writes) = instruction_liveness_rw(&module.instructions[pc]);
+            let mut new_in = regset_subtract(&out, &writes);
+            regset_union_into(&mut new_in, &reads);
+
+            let rel = pc - start;
+            if live_out[rel] != out {
+                live_out[rel] = out;
+                changed = true;
             }
-            OpCode::Load | OpCode::Store | OpCode::Move | OpCode::Dup => {
-                writes.insert(instr.op2);
+            if live_in[rel] != new_in {
+                live_in[rel] = new_in;
+                changed = true;
             }
-            OpCode::Swap => {
-                writes.insert(instr.op1);
-                writes.insert(instr.op2);
-            }
-            OpCode::IAdd
-            | OpCode::ISub
-            | OpCode::IMul
-            | OpCode::IDiv
-            | OpCode::IMod
-            | OpCode::IPow
-            | OpCode::FPow
-            | OpCode::Xor
-            | OpCode::Shl
-            | OpCode::Shr
-            | OpCode::BitAnd
-            | OpCode::BitOr
-            | OpCode::FAdd
-            | OpCode::FSub
-            | OpCode::FMul
-            | OpCode::FDiv
-            | OpCode::ICmpEq
-            | OpCode::ICmpLt
-            | OpCode::ICmpGt
-            | OpCode::ICmpLe
-            | OpCode::ICmpGe
-            | OpCode::FCmpEq
-            | OpCode::FCmpLt
-            | OpCode::FCmpGt
-            | OpCode::And
-            | OpCode::Or => {
-                writes.insert(instr.op3);
-            }
-            // INeg can raise overflow/type errors. The tiered JIT helper
-            // currently records those only in the AOT error slot, so running
-            // it inside a native direct-call thunk would change interpreted
-            // callee error semantics. Keep it on the interpreter helper path.
-            OpCode::INeg => return None,
-            OpCode::Not | OpCode::IToF | OpCode::FToI => {
-                writes.insert(instr.op2);
-            }
-            // FNeg is the one unary opcode whose bytecode destination is op3.
-            OpCode::FNeg => {
-                writes.insert(instr.op3);
-            }
-            OpCode::IInc | OpCode::IDec => {
-                writes.insert(instr.op1);
-            }
-            // Anything with control flow, nested calls, heap/container access,
-            // effects, capability/closure state, or debugging side effects is
-            // outside the first native-leaf proof and uses the existing
-            // re-entrant interpreter helper instead.
-            _ => return None,
+        }
+        if !changed {
+            break;
         }
     }
 
-    let mut clobbers: Vec<u8> = writes.into_iter().collect();
-    clobbers.sort_unstable();
-    Some((start, body_len, ret_reg, clobbers))
+    Some(live_out)
+}
+
+/// Live registers after one call site. Kept as a small wrapper for focused
+/// tests and conservative fallback behavior.
+fn caller_live_after_call(module: &crate::bytecode::CodeModule, call_pc: usize) -> JitRegSet {
+    let Some((start, end)) = caller_code_range(module, call_pc) else {
+        return all_registers();
+    };
+    caller_live_out_sets(module, start, end)
+        .and_then(|live_out| live_out.get(call_pc.saturating_sub(start)).copied())
+        .unwrap_or_else(all_registers)
 }
 
 /// The code offset of the function containing `pc` (largest
