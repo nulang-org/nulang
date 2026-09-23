@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Consuming actor-send ownership analysis — 2026-09-22
+- **The MIR backend now identifies provably consumable local-send payloads without changing runtime semantics** (`src/mir_codegen.rs`). A payload is marked only when it is a fresh/non-aliasing owning value with one definition and one total use, and that sole use is a same-node MIR `Send` argument. Multi-use and remote-send payloads remain ordinary copies. This establishes the compiler proof surface for a later ORCA local-reference-to-foreign-hold handoff.
+
 ### RFC 0008 migration purity enforcement — 2026-09-22
 - **Entity migration bodies now fail compilation when they contain nondeterministic or externally visible operations** (`src/migration_purity.rs`, `src/effect_checker.rs`). The public effect-checking pipeline rejects direct or transitively hidden `perform`, spawn/send/ask/receive, actor migration, grain lookup, continuation resume, defer/errdefer, and extern/FFI calls; locally handling an effect does not launder it. Pure helpers and replay-stream `emit` remain allowed, and the existing conformance proof-of-gap now expects compilation failure.
 
