@@ -191,9 +191,7 @@ impl LocalRuntime {
                 }
                 PlanOutcome::Blocked { task_id, reason } => {
                     let revision = IntentionRevision::new(
-                        goal_id,
-                        commitment.id,
-                        intention.id,
+                        &intention,
                         None,
                         task_id,
                         TaskStatus::Blocked,
@@ -236,9 +234,7 @@ impl LocalRuntime {
                     self.store.upsert_intention(&replacement)?;
 
                     let revision = IntentionRevision::new(
-                        goal_id,
-                        commitment.id,
-                        intention.id,
+                        &intention,
                         Some(replacement.id),
                         task_id,
                         TaskStatus::Failed,
@@ -253,9 +249,7 @@ impl LocalRuntime {
                 }
                 PlanOutcome::Failed { task_id, reason } => {
                     let revision = IntentionRevision::new(
-                        goal_id,
-                        commitment.id,
-                        intention.id,
+                        &intention,
                         None,
                         task_id,
                         TaskStatus::Failed,
