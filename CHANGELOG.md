@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### Backend-neutral continuation analysis — 2026-09-23
+- **MIR now owns continuation-site classification and liveness** (`src/continuation_analysis.rs`) rather than duplicating backend-specific suspension reasoning.
+- **Scheduler suspension is distinguished from statically resolved resuming algebraic effects**, and compiler-proven single-shot metadata is carried into continuation sites.
+- **Continuation frames use deterministic live-across local sets**, including implicit selective-receive payload locals as resume-defined values.
+- **Native AOT and WasmFX consume the shared analysis** while WasmFX retains its existing `ReceiveMatch` compatibility lowering until a non-blocking host-mailbox operation exists.
+
 ### Actor runtime hot-path overhead reduction — 2026-09-23
 - **Per-actor flight recording is now opt-in for runtime-created actors** (`src/runtime/actor.rs`, `src/runtime/mod.rs`). `NULANG_FLIGHT_RECORDER=1` enables the existing recorder; disabled actors reserve no recorder ring storage and skip payload-summary formatting. Explicit `FlightRecorder::new(...)` callers retain enabled behavior, and accepted messages are recorded only after mailbox admission succeeds.
 - **Bytecode actor turns now reuse the cached VM module index without deep-cloning `CodeModule` on every dispatch** (`src/runtime/mod.rs`). The clone/load cost is paid only when an actor first installs its module into the runtime VM; subsequent turns execute directly against `bytecode_module_idx`. Bytecode format and execution semantics are unchanged.
