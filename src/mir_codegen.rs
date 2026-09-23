@@ -3722,6 +3722,15 @@ mod optimize_tests {
             clears_root_to_nil,
             "ownership transfer must clear the dead source register to nil"
         );
+
+        let mut vm = VM::new();
+        vm.load_module(code);
+        let value = vm.run().unwrap();
+        assert_eq!(
+            value.as_int(),
+            Some(0),
+            "clearing the moved-from source must not invalidate the destination"
+        );
     }
 
     #[test]
