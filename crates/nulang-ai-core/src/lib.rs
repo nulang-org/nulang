@@ -46,6 +46,38 @@ pub enum TaskStatus {
     Cancelled,
 }
 
+/// Lifecycle of an agent's explicit commitment to pursue a goal.
+///
+/// A goal describes desired state. A commitment records that an agent has
+/// accepted responsibility for trying to reach it. This distinction keeps
+/// BDI-style semantics in the agent library rather than adding language
+/// keywords to Nulang's frozen core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitmentStatus {
+    Proposed,
+    Active,
+    Suspended,
+    Fulfilled,
+    Abandoned,
+}
+
+/// Lifecycle of the concrete plan currently selected to satisfy a commitment.
+///
+/// An intention is intentionally narrower than a goal: it is an executable
+/// plan, represented today as an ordered set of task ids. Future planners can
+/// replace or branch intentions without changing the underlying goal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentionStatus {
+    Planned,
+    Active,
+    Blocked,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagerKind {
@@ -86,6 +118,81 @@ impl Goal {
             budget_usd,
             deadline: None,
             status: GoalStatus::Created,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+/// An explicit promise by an agent to pursue a goal under the goal's
+/// constraints and success criteria.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Commitment {
+    pub id: Uuid,
+    pub goal_id: Uuid,
+    pub owner_agent_id: String,
+    pub rationale: String,
+    pub success_criteria: Vec<String>,
+    pub status: CommitmentStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Commitment {
+    pub fn new(
+        goal_id: Uuid,
+        owner_agent_id: impl Into<String>,
+        rationale: impl Into<String>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            goal_id,
+            owner_agent_id: owner_agent_id.into(),
+            rationale: rationale.into(),
+            success_criteria: Vec::new(),
+            status: CommitmentStatus::Proposed,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+/// The currently selected executable plan for a commitment.
+///
+/// `planned_task_ids` is ordered. Keeping task identity separate from the
+/// intention lets the planner revise an intention while preserving durable
+/// task history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Intention {
+    pub id: Uuid,
+    pub goal_id: Uuid,
+    pub commitment_id: Uuid,
+    pub owner_agent_id: String,
+    pub description: String,
+    pub planned_task_ids: Vec<Uuid>,
+    pub status: IntentionStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Intention {
+    pub fn new(
+        goal_id: Uuid,
+        commitment_id: Uuid,
+        owner_agent_id: impl Into<String>,
+        description: impl Into<String>,
+        planned_task_ids: Vec<Uuid>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            goal_id,
+            commitment_id,
+            owner_agent_id: owner_agent_id.into(),
+            description: description.into(),
+            planned_task_ids,
+            status: IntentionStatus::Planned,
             created_at: now,
             updated_at: now,
         }
@@ -171,6 +278,26 @@ pub enum SwarmEvent {
     GoalCompleted {
         goal_id: Uuid,
     },
+    CommitmentActivated {
+        commitment_id: Uuid,
+        goal_id: Uuid,
+        owner_agent_id: String,
+    },
+    CommitmentFulfilled {
+        commitment_id: Uuid,
+        goal_id: Uuid,
+    },
+    IntentionActivated {
+        intention_id: Uuid,
+        commitment_id: Uuid,
+        goal_id: Uuid,
+        owner_agent_id: String,
+    },
+    IntentionCompleted {
+        intention_id: Uuid,
+        commitment_id: Uuid,
+        goal_id: Uuid,
+    },
     TaskCreated {
         task_id: Uuid,
         goal_id: Uuid,
@@ -221,6 +348,10 @@ pub struct GoalGraph {
     pub goal: Goal,
     pub tasks: Vec<Task>,
     pub agents: Vec<AgentRef>,
+    #[serde(default)]
+    pub commitments: Vec<Commitment>,
+    #[serde(default)]
+    pub intentions: Vec<Intention>,
 }
 
 #[cfg(test)]
@@ -233,6 +364,48 @@ mod tests {
         let json = serde_json::to_string(&goal).unwrap();
         let back: Goal = serde_json::from_str(&json).unwrap();
         assert_eq!(goal.id, back.id);
+    }
+
+    #[test]
+    fn commitment_and_intention_roundtrip_json() {
+        let goal = Goal::new("demo", "Ship feature", 10.0);
+        let mut commitment =
+            Commitment::new(goal.id, "director-local", "User goal accepted for execution");
+        commitment.status = CommitmentStatus::Active;
+
+        let task = Task::new(goal.id, "Implement feature", ManagerKind::Engineering);
+        let mut intention = Intention::new(
+            goal.id,
+            commitment.id,
+            "manager-engineering",
+            "Execute the engineering plan",
+            vec![task.id],
+        );
+        intention.status = IntentionStatus::Active;
+
+        let commitment_json = serde_json::to_string(&commitment).unwrap();
+        let intention_json = serde_json::to_string(&intention).unwrap();
+        assert_eq!(
+            commitment,
+            serde_json::from_str::<Commitment>(&commitment_json).unwrap()
+        );
+        assert_eq!(
+            intention,
+            serde_json::from_str::<Intention>(&intention_json).unwrap()
+        );
+    }
+
+    #[test]
+    fn goal_graph_accepts_legacy_json_without_bdi_fields() {
+        let goal = Goal::new("demo", "Optimize API", 25.0);
+        let json = serde_json::json!({
+            "goal": goal,
+            "tasks": [],
+            "agents": []
+        });
+        let graph: GoalGraph = serde_json::from_value(json).unwrap();
+        assert!(graph.commitments.is_empty());
+        assert!(graph.intentions.is_empty());
     }
 
     #[test]
