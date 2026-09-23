@@ -1608,7 +1608,7 @@ everything before it is implicitly Experimental.
 ### Agent commitments and intentions — 2026-09-23
 - **The optional agent runtime now distinguishes desired state from accepted responsibility and selected execution plans** (`crates/nulang-ai-core/`): `Goal` remains the desired outcome, `Commitment` records an agent accepting responsibility for pursuing it, and `Intention` records the concrete ordered task plan selected for that commitment. These are library/runtime concepts, not new Nulang syntax.
 - **The local SQLite runtime persists commitment and intention lifecycles** (`crates/nulang-ai-local/`) and exposes them through `GoalGraph`; additive schema tables/indexes preserve existing goal/task rows, while serde defaults keep older serialized goal graphs readable.
-- **NLAP emits additive commitment/intention lifecycle events** for activation, completion, and fulfillment, and `nulang-ai-protocol` re-exports the new domain types. The local runtime test pins the goal → commitment → intention → tasks → completed intention → fulfilled commitment sequence.
+- **NLAP 1.1.0 emits additive commitment/intention lifecycle events** for activation, completion, and fulfillment, and `nulang-ai-protocol` re-exports the new domain types. The envelope version moves from 1.0.0 to 1.1.0 so strict 1.0 consumers can detect the expanded event vocabulary. The local runtime test pins the goal → commitment → intention → tasks → completed intention → fulfilled commitment sequence.
 
 
 ### Atomic durable-transition storage contract — 2026-09-22
