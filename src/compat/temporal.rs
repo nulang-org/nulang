@@ -17,7 +17,7 @@
 use crate::durable_effect::{DurableEffectRecord, DurableEffectSpec};
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
 use crate::primitives::{DeliverySemantics, EffectBoundary};
-use crate::runtime::persistence::WorkflowEvent;
+use crate::runtime::WorkflowEvent;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
@@ -158,9 +158,9 @@ impl TemporalWorkflowTaskContext {
         command: TemporalCommand,
     ) -> Result<TemporalCommandPlan, TemporalCompatError> {
         match command {
-            TemporalCommand::ScheduleActivity(request) => Ok(
-                TemporalCommandPlan::Activity(self.prepare_activity(command_ordinal, request)?),
-            ),
+            TemporalCommand::ScheduleActivity(request) => Ok(TemporalCommandPlan::Activity(
+                self.prepare_activity(command_ordinal, request)?,
+            )),
             TemporalCommand::StartTimer {
                 timer_id,
                 duration_ms,
@@ -231,10 +231,7 @@ impl TemporalWorkflowTaskContext {
     fn activity_execution_key(&self, activity_id: &str) -> String {
         let mut out = self.execution.stable_key();
         out.push_str("/workflow-task");
-        append_component(
-            &mut out,
-            &self.workflow_task_started_event_id.to_string(),
-        );
+        append_component(&mut out, &self.workflow_task_started_event_id.to_string());
         out.push_str("/activity");
         append_component(&mut out, activity_id);
         out
@@ -624,9 +621,7 @@ impl TemporalReplayState {
                 TemporalHistoryEvent::WorkflowExecutionFailed { message, .. } => {
                     terminal = Some(TemporalTerminalState::Failed(message.clone()));
                 }
-                TemporalHistoryEvent::WorkflowExecutionContinuedAsNew {
-                    new_run_id, ..
-                } => {
+                TemporalHistoryEvent::WorkflowExecutionContinuedAsNew { new_run_id, .. } => {
                     validate_non_empty("new_run_id", new_run_id)?;
                     terminal = Some(TemporalTerminalState::ContinuedAsNew {
                         new_run_id: new_run_id.clone(),
@@ -637,7 +632,8 @@ impl TemporalReplayState {
             last_event_id = event_id;
         }
 
-        let workflow_type = workflow_type.ok_or(TemporalCompatError::HistoryMissingWorkflowStart)?;
+        let workflow_type =
+            workflow_type.ok_or(TemporalCompatError::HistoryMissingWorkflowStart)?;
         Ok(Self {
             workflow_type,
             input,
@@ -678,8 +674,8 @@ impl TemporalPreparedWorkflowTask {
             .into_iter()
             .enumerate()
             .map(|(ordinal, command)| {
-                let ordinal = u32::try_from(ordinal)
-                    .map_err(|_| TemporalCompatError::TooManyCommands)?;
+                let ordinal =
+                    u32::try_from(ordinal).map_err(|_| TemporalCompatError::TooManyCommands)?;
                 self.context.plan_command(ordinal, command)
             })
             .collect()
@@ -1133,12 +1129,7 @@ mod tests {
     #[test]
     fn worker_core_replays_task_and_plans_ordered_commands() {
         let task = TemporalWorkflowTask {
-            execution: TemporalWorkflowExecution::new(
-                "payments",
-                "order-42",
-                "run-abc",
-            )
-            .unwrap(),
+            execution: TemporalWorkflowExecution::new("payments", "order-42", "run-abc").unwrap(),
             nulang_actor_id: 77,
             workflow_task_started_event_id: 101,
             transition_sequence: 9,
