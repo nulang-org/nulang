@@ -1734,6 +1734,101 @@ fn run_frontend(
     Ok((ast, type_checker))
 }
 
+#[cfg(feature = "wasm-backend")]
+fn source_declares_import(source: &str) -> NuResult<bool> {
+    fn contains_import(decls: &[nulang::ast::Decl]) -> bool {
+        decls.iter().any(|decl| match decl {
+            nulang::ast::Decl::Import { .. } => true,
+            nulang::ast::Decl::Module { decls, .. } => contains_import(decls),
+            _ => false,
+        })
+    }
+
+    let tokens = Lexer::new(source).lex()?;
+    let ast = Parser::new(tokens).parse_module()?;
+    Ok(contains_import(&ast.decls))
+}
+
+#[cfg(feature = "wasm-backend")]
+fn emit_wasm_behavior_manifest(
+    source: &str,
+    file_path: Option<&str>,
+    wasm_file: &str,
+    wasm_bytes: &[u8],
+    ast: &nulang::ast::AstModule,
+    with_capabilities: &[String],
+) -> NuResult<Option<PathBuf>> {
+    // A single-file compile has a canonical empty dependency set. Importing
+    // source requires package/resolver provenance that this CLI path does not
+    // currently retain, so fail closed by omitting the sidecar rather than
+    // emitting incomplete dependency provenance.
+    if source_declares_import(source)? {
+        return Ok(None);
+    }
+
+    let compiler_path = std::env::current_exe().map_err(|error| NuError::VMError {
+        msg: format!("cannot resolve compiler executable for Behavior Manifest: {error}"),
+        span: Span::default(),
+    })?;
+    let compiler_bytes = std::fs::read(&compiler_path).map_err(|error| NuError::VMError {
+        msg: format!(
+            "cannot read compiler executable '{}' for Behavior Manifest: {error}",
+            compiler_path.display()
+        ),
+        span: Span::default(),
+    })?;
+
+    let mut checker = EffectChecker::new();
+    checker.set_resource_grants(with_capabilities);
+    checker.check_module(&ast.decls)?;
+
+    let package_name = std::env::var("NULANG_PACKAGE_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            file_path
+                .and_then(|path| std::path::Path::new(path).file_stem())
+                .and_then(|stem| stem.to_str())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "standalone".to_string());
+    let package_version = std::env::var("NULANG_PACKAGE_VERSION")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "0.0.0".to_string());
+
+    let manifest = nulang::behavior_manifest::BehaviorManifest::from_checked_module(
+        nulang::behavior_manifest::ManifestBuildInput {
+            package_name: &package_name,
+            package_version: &package_version,
+            language_version: nulang::format::constants::LANGUAGE_VERSION_STR,
+            artifact_kind: nulang::behavior_manifest::ArtifactKind::WasmModule,
+            artifact_bytes: wasm_bytes,
+            compiler_implementation: "nulang-rust",
+            compiler_version: VERSION,
+            compiler_bytes: &compiler_bytes,
+            source_bytes: source.as_bytes(),
+            dependency_bytes: b"[]",
+        },
+        &mut checker,
+        &ast.decls,
+    )?;
+    let json = manifest.to_canonical_json().map_err(|error| NuError::VMError {
+        msg: format!("cannot serialize Behavior Manifest: {error}"),
+        span: Span::default(),
+    })?;
+
+    let out = PathBuf::from(format!("{wasm_file}.behavior.json"));
+    std::fs::write(&out, json).map_err(|error| NuError::VMError {
+        msg: format!(
+            "failed to write Behavior Manifest '{}': {error}",
+            out.display()
+        ),
+        span: Span::default(),
+    })?;
+    Ok(Some(out))
+}
+
 #[cfg_attr(not(feature = "wasm-backend"), allow(unused_variables))]
 fn run_source(
     source: &str,
@@ -1767,6 +1862,18 @@ fn run_source(
                     span: Span::default(),
                 }
             })?;
+            if let Some(manifest_path) = emit_wasm_behavior_manifest(
+                source,
+                file_path,
+                wasm_file,
+                &wasm_bytes,
+                &ast,
+                with_capabilities,
+            )? {
+                if verbose {
+                    println!("Wrote {}", manifest_path.display());
+                }
+            }
             println!("Wrote {} ({} bytes)", wasm_file, wasm_bytes.len());
             return Ok(());
         }
