@@ -320,15 +320,15 @@ impl DurableTransition {
                 "durable transition sequence must be non-zero",
             ));
         }
-        let expected_sequence = self
-            .expected_previous_sequence
-            .checked_add(1)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "durable transition sequence overflow",
-                )
-            })?;
+        let expected_sequence =
+            self.expected_previous_sequence
+                .checked_add(1)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "durable transition sequence overflow",
+                    )
+                })?;
         if self.sequence != expected_sequence {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -3050,7 +3050,6 @@ mod postgres_store_tests {
         store.clear(actor_id).unwrap();
     }
 }
-
 
 #[cfg(test)]
 mod durable_transition_tests {
