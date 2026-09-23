@@ -1920,9 +1920,11 @@ impl TypeChecker {
 
             // Par: validate independence now, even though execution remains
             // sequential until RFC 0024's scoped-concurrency backend lands.
+            // Unlike an ordinary block, every branch contributes a result in
+            // source order, so the expression has tuple result semantics.
             Expr::Par { exprs, span } => {
                 crate::parallel_analysis::validate_parallel_branches(exprs, *span)?;
-                self.infer_block(ctx, exprs, *span)
+                self.infer_tuple(ctx, exprs, *span)
             }
 
             // Spawn actor
