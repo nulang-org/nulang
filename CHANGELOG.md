@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Benchmark-history CI isolation — 2026-09-23
+- **Performance history now persists on `automation/benchmark-history` instead of mutating protected `main`** (`.github/workflows/ci.yml`). The benchmark job still loads the rolling JSON window before regression analysis and uploads the current result as an artifact, but generated history no longer makes otherwise-green `main` validation fail at the final push step.
+
 ### Backend differential oracle hardening — 2026-09-22
 - **WASM differential execution now fails closed after artifact emission** (`src/fuzz.rs`, `src/difffuzz.rs`). Restricted-profile rejection remains an expected compile-time skip, but malformed/invalid emitted WASM, instantiation failures, or a missing required `nulang_init` export are backend correctness failures. Differential campaigns now record WASM agreement coverage, and the `wasm-backend` test lane requires positive WASM participation so a silently-disabled backend cannot leave CI green.
 
