@@ -19,7 +19,7 @@ mod duration_secs {
     }
 }
 
-pub const NLAP_VERSION: &str = "1.3.0";
+pub const NLAP_VERSION: &str = "1.4.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -247,6 +247,38 @@ impl IntentionRevision {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommitmentResumption {
+    pub id: Uuid,
+    pub request_id: Uuid,
+    pub goal_id: Uuid,
+    pub commitment_id: Uuid,
+    pub blocked_intention_id: Uuid,
+    pub replacement_intention_id: Uuid,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl CommitmentResumption {
+    pub fn new(
+        request_id: Uuid,
+        blocked_intention: &Intention,
+        replacement_intention_id: Uuid,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            request_id,
+            goal_id: blocked_intention.goal_id,
+            commitment_id: blocked_intention.commitment_id,
+            blocked_intention_id: blocked_intention.id,
+            replacement_intention_id,
+            reason: reason.into(),
+            created_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Task {
     pub id: Uuid,
     pub goal_id: Uuid,
@@ -333,6 +365,11 @@ pub enum SwarmEvent {
         goal_id: Uuid,
         reason: String,
     },
+    GoalResumed {
+        goal_id: Uuid,
+        request_id: Uuid,
+        reason: String,
+    },
     CommitmentActivated {
         commitment_id: Uuid,
         goal_id: Uuid,
@@ -350,6 +387,12 @@ pub enum SwarmEvent {
     CommitmentAbandoned {
         commitment_id: Uuid,
         goal_id: Uuid,
+        reason: String,
+    },
+    CommitmentResumed {
+        commitment_id: Uuid,
+        goal_id: Uuid,
+        request_id: Uuid,
         reason: String,
     },
     IntentionActivated {
@@ -451,6 +494,8 @@ pub struct GoalGraph {
     pub intentions: Vec<Intention>,
     #[serde(default)]
     pub intention_revisions: Vec<IntentionRevision>,
+    #[serde(default)]
+    pub resumptions: Vec<CommitmentResumption>,
 }
 
 #[cfg(test)]
@@ -523,6 +568,36 @@ mod tests {
     }
 
     #[test]
+    fn commitment_resumption_roundtrip_json() {
+        let goal = Goal::new("demo", "Ship feature", 10.0);
+        let commitment = Commitment::new(goal.id, "director-local", "accepted");
+        let mut blocked = Intention::new(
+            goal.id,
+            commitment.id,
+            "manager-engineering",
+            "blocked plan",
+            Vec::new(),
+        );
+        blocked.status = IntentionStatus::Blocked;
+        let replacement = Intention::new(
+            goal.id,
+            commitment.id,
+            "manager-engineering",
+            "replacement plan",
+            Vec::new(),
+        );
+        let resumption = CommitmentResumption::new(
+            Uuid::new_v4(),
+            &blocked,
+            replacement.id,
+            "dependency recovered",
+        );
+        let json = serde_json::to_string(&resumption).unwrap();
+        let back: CommitmentResumption = serde_json::from_str(&json).unwrap();
+        assert_eq!(resumption, back);
+    }
+
+    #[test]
     fn goal_graph_accepts_legacy_json_without_bdi_fields() {
         let goal = Goal::new("demo", "Optimize API", 25.0);
         let json = serde_json::json!({
@@ -534,6 +609,7 @@ mod tests {
         assert!(graph.commitments.is_empty());
         assert!(graph.intentions.is_empty());
         assert!(graph.intention_revisions.is_empty());
+        assert!(graph.resumptions.is_empty());
     }
 
     #[test]
@@ -565,7 +641,7 @@ mod tests {
             None,
         );
         let json = serde_json::to_string(&ev).unwrap();
-        assert!(json.contains("\"version\":\"1.3.0\""));
+        assert!(json.contains("\"version\":\"1.4.0\""));
         assert!(json.contains("\"event_id\":"));
         assert!(json.contains("goal_created"));
     }

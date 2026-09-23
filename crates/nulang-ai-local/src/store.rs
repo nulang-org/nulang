@@ -2,9 +2,9 @@
 
 use chrono::{DateTime, Utc};
 use nulang_ai_core::{
-    Commitment, CommitmentStatus, ConversationState, Goal, GoalGraph, GoalStatus, Intention,
-    IntentionRevision, IntentionRevisionDecision, IntentionStatus, ManagerKind, SwarmEventEnvelope,
-    Task, TaskStatus,
+    Commitment, CommitmentResumption, CommitmentStatus, ConversationState, Goal, GoalGraph,
+    GoalStatus, Intention, IntentionRevision, IntentionRevisionDecision, IntentionStatus,
+    ManagerKind, SwarmEventEnvelope, Task, TaskStatus,
 };
 use rusqlite::{params, Connection, TransactionBehavior};
 use std::path::{Path, PathBuf};
@@ -31,10 +31,27 @@ pub struct AgentStateTransition<'a> {
     pub terminal_task: Option<&'a Task>,
     pub intention: &'a Intention,
     pub replacement_intention: Option<&'a Intention>,
+    pub replacement_tasks: &'a [Task],
     pub revision: Option<&'a IntentionRevision>,
     pub commitment: Option<&'a Commitment>,
     pub goal: Option<&'a Goal>,
     pub outbox_events: &'a [SwarmEventEnvelope],
+}
+
+pub struct AgentResumeTransition<'a> {
+    pub blocked_intention: &'a Intention,
+    pub replacement_intention: &'a Intention,
+    pub replacement_tasks: &'a [Task],
+    pub resumption: &'a CommitmentResumption,
+    pub commitment: &'a Commitment,
+    pub goal: &'a Goal,
+    pub outbox_events: &'a [SwarmEventEnvelope],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResumeCommitResult {
+    Applied(CommitmentResumption),
+    AlreadyApplied(CommitmentResumption),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,6 +146,20 @@ impl SqliteStore {
             );
             CREATE INDEX IF NOT EXISTS intention_revisions_goal_idx ON intention_revisions(goal_id);
             CREATE INDEX IF NOT EXISTS intention_revisions_commitment_idx ON intention_revisions(commitment_id);
+            CREATE TABLE IF NOT EXISTS commitment_resumptions (
+                id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL UNIQUE,
+                goal_id TEXT NOT NULL,
+                commitment_id TEXT NOT NULL,
+                blocked_intention_id TEXT NOT NULL,
+                replacement_intention_id TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS commitment_resumptions_goal_idx
+                ON commitment_resumptions(goal_id, created_at);
+            CREATE INDEX IF NOT EXISTS commitment_resumptions_commitment_idx
+                ON commitment_resumptions(commitment_id, created_at);
             CREATE TABLE IF NOT EXISTS conversations (
                 id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
@@ -199,6 +230,9 @@ impl SqliteStore {
         upsert_intention_conn(&tx, transition.intention)?;
         if let Some(replacement) = transition.replacement_intention {
             upsert_intention_conn(&tx, replacement)?;
+            for task in transition.replacement_tasks {
+                upsert_task_conn(&tx, task)?;
+            }
         }
         if let Some(revision) = transition.revision {
             insert_intention_revision_conn(&tx, revision)?;
@@ -215,6 +249,53 @@ impl SqliteStore {
 
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn get_resumption_by_request(
+        &self,
+        request_id: Uuid,
+    ) -> Result<Option<CommitmentResumption>, StoreError> {
+        let conn = Connection::open(&self.path)?;
+        query_resumption_by_request_conn(&conn, request_id)
+    }
+
+    pub fn commit_agent_resume_transition(
+        &self,
+        transition: AgentResumeTransition<'_>,
+    ) -> Result<ResumeCommitResult, StoreError> {
+        validate_agent_resume_transition(&transition)?;
+
+        let mut conn = Connection::open(&self.path)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if let Some(existing) =
+            query_resumption_by_request_conn(&tx, transition.resumption.request_id)?
+        {
+            if existing.goal_id != transition.resumption.goal_id
+                || existing.commitment_id != transition.resumption.commitment_id
+                || existing.blocked_intention_id != transition.resumption.blocked_intention_id
+            {
+                return Err(StoreError::InvalidTransition(
+                    "resume request id conflicts with a different blocked source",
+                ));
+            }
+            tx.commit()?;
+            return Ok(ResumeCommitResult::AlreadyApplied(existing));
+        }
+
+        upsert_commitment_conn(&tx, transition.commitment)?;
+        upsert_goal_conn(&tx, transition.goal)?;
+        upsert_intention_conn(&tx, transition.replacement_intention)?;
+        for task in transition.replacement_tasks {
+            upsert_task_conn(&tx, task)?;
+        }
+        insert_commitment_resumption_conn(&tx, transition.resumption)?;
+        for envelope in transition.outbox_events {
+            insert_outbox_event_conn(&tx, envelope)?;
+        }
+
+        tx.commit()?;
+        Ok(ResumeCommitResult::Applied(transition.resumption.clone()))
     }
 
     pub fn pending_outbox(&self, limit: usize) -> Result<Vec<OutboxEventRecord>, StoreError> {
@@ -449,6 +530,27 @@ impl SqliteStore {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
+        let mut resumption_stmt = conn.prepare(
+            "SELECT id, request_id, commitment_id, blocked_intention_id, replacement_intention_id, reason, created_at
+             FROM commitment_resumptions
+             WHERE goal_id = ?1
+             ORDER BY created_at ASC",
+        )?;
+        let resumptions = resumption_stmt
+            .query_map(params![goal_id.to_string()], |row| {
+                Ok(CommitmentResumption {
+                    id: parse_uuid(row.get(0)?),
+                    request_id: parse_uuid(row.get(1)?),
+                    goal_id,
+                    commitment_id: parse_uuid(row.get(2)?),
+                    blocked_intention_id: parse_uuid(row.get(3)?),
+                    replacement_intention_id: parse_uuid(row.get(4)?),
+                    reason: row.get(5)?,
+                    created_at: parse_ts(row.get(6)?),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(GoalGraph {
             goal,
             tasks,
@@ -456,6 +558,7 @@ impl SqliteStore {
             commitments,
             intentions,
             intention_revisions,
+            resumptions,
         })
     }
 
@@ -492,6 +595,76 @@ impl SqliteStore {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
+}
+
+fn validate_agent_resume_transition(
+    transition: &AgentResumeTransition<'_>,
+) -> Result<(), StoreError> {
+    let blocked = transition.blocked_intention;
+    let replacement = transition.replacement_intention;
+    let resumption = transition.resumption;
+
+    if blocked.status != IntentionStatus::Blocked {
+        return Err(StoreError::InvalidTransition(
+            "resume source intention is not blocked",
+        ));
+    }
+    if replacement.status != IntentionStatus::Active {
+        return Err(StoreError::InvalidTransition(
+            "replacement intention is not active",
+        ));
+    }
+    if replacement.goal_id != blocked.goal_id
+        || replacement.commitment_id != blocked.commitment_id
+        || transition.commitment.id != blocked.commitment_id
+        || transition.commitment.goal_id != blocked.goal_id
+        || transition.goal.id != blocked.goal_id
+    {
+        return Err(StoreError::InvalidTransition(
+            "resume records do not belong to the same goal and commitment",
+        ));
+    }
+    if transition.commitment.status != CommitmentStatus::Active
+        || transition.goal.status != GoalStatus::Running
+    {
+        return Err(StoreError::InvalidTransition(
+            "resume target goal and commitment are not active",
+        ));
+    }
+    if resumption.goal_id != blocked.goal_id
+        || resumption.commitment_id != blocked.commitment_id
+        || resumption.blocked_intention_id != blocked.id
+        || resumption.replacement_intention_id != replacement.id
+    {
+        return Err(StoreError::InvalidTransition(
+            "resumption record does not match the supplied intentions",
+        ));
+    }
+
+    let planned = &replacement.planned_task_ids;
+    if planned.len() != transition.replacement_tasks.len()
+        || transition
+            .replacement_tasks
+            .iter()
+            .zip(planned.iter())
+            .any(|(task, planned_id)| task.id != *planned_id || task.goal_id != blocked.goal_id)
+    {
+        return Err(StoreError::InvalidTransition(
+            "replacement tasks do not match the replacement intention plan",
+        ));
+    }
+
+    if transition
+        .outbox_events
+        .iter()
+        .any(|envelope| envelope.event_id.is_none())
+    {
+        return Err(StoreError::InvalidTransition(
+            "resume outbox event is missing a stable event id",
+        ));
+    }
+
+    Ok(())
 }
 
 fn validate_agent_state_transition(
@@ -531,6 +704,19 @@ fn validate_agent_state_transition(
                     "replacement intention does not match the revision",
                 ));
             }
+            if replacement.planned_task_ids.len() != transition.replacement_tasks.len()
+                || transition
+                    .replacement_tasks
+                    .iter()
+                    .zip(replacement.planned_task_ids.iter())
+                    .any(|(task, planned_id)| {
+                        task.id != *planned_id || task.goal_id != intention.goal_id
+                    })
+            {
+                return Err(StoreError::InvalidTransition(
+                    "replacement tasks do not match the replacement intention plan",
+                ));
+            }
         } else if revision.replacement_intention_id.is_some() {
             return Err(StoreError::InvalidTransition(
                 "revision names a replacement intention that was not supplied",
@@ -539,6 +725,12 @@ fn validate_agent_state_transition(
     } else if transition.replacement_intention.is_some() {
         return Err(StoreError::InvalidTransition(
             "replacement intention requires a revision record",
+        ));
+    }
+
+    if transition.replacement_intention.is_none() && !transition.replacement_tasks.is_empty() {
+        return Err(StoreError::InvalidTransition(
+            "replacement tasks require a replacement intention",
         ));
     }
 
@@ -717,6 +909,62 @@ fn insert_intention_revision_conn(
         ],
     )?;
     Ok(())
+}
+
+fn insert_commitment_resumption_conn(
+    conn: &Connection,
+    resumption: &CommitmentResumption,
+) -> Result<(), StoreError> {
+    conn.execute(
+        r#"INSERT INTO commitment_resumptions (
+            id, request_id, goal_id, commitment_id, blocked_intention_id,
+            replacement_intention_id, reason, created_at
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"#,
+        params![
+            resumption.id.to_string(),
+            resumption.request_id.to_string(),
+            resumption.goal_id.to_string(),
+            resumption.commitment_id.to_string(),
+            resumption.blocked_intention_id.to_string(),
+            resumption.replacement_intention_id.to_string(),
+            resumption.reason,
+            resumption.created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn query_resumption_by_request_conn(
+    conn: &Connection,
+    request_id: Uuid,
+) -> Result<Option<CommitmentResumption>, StoreError> {
+    let result = conn.query_row(
+        "SELECT id, goal_id, commitment_id, blocked_intention_id, replacement_intention_id, reason, created_at
+         FROM commitment_resumptions
+         WHERE request_id = ?1",
+        params![request_id.to_string()],
+        |row| {
+            Ok(CommitmentResumption {
+                id: parse_uuid(row.get(0)?),
+                request_id,
+                goal_id: parse_uuid(row.get(1)?),
+                commitment_id: parse_uuid(row.get(2)?),
+                blocked_intention_id: parse_uuid(row.get(3)?),
+                replacement_intention_id: parse_uuid(row.get(4)?),
+                reason: row.get(5)?,
+                created_at: parse_ts(row.get(6)?),
+            })
+        },
+    );
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(StoreError::Sqlite(error)),
+    }
+}
+
+fn parse_uuid(raw: String) -> Uuid {
+    Uuid::parse_str(&raw).unwrap_or_else(|_| Uuid::nil())
 }
 
 fn insert_outbox_event_conn(
@@ -974,6 +1222,7 @@ mod tests {
                 terminal_task: Some(&task),
                 intention: &intention,
                 replacement_intention: None,
+                replacement_tasks: &[],
                 revision: Some(&revision),
                 commitment: Some(&commitment),
                 goal: Some(&goal),
@@ -1030,6 +1279,7 @@ mod tests {
                 terminal_task: Some(&task),
                 intention: &intention,
                 replacement_intention: None,
+                replacement_tasks: &[],
                 revision: Some(&revision),
                 commitment: Some(&commitment),
                 goal: Some(&goal),
@@ -1054,6 +1304,7 @@ mod tests {
                 terminal_task: Some(&task),
                 intention: &intention,
                 replacement_intention: None,
+                replacement_tasks: &[],
                 revision: Some(&revision),
                 commitment: Some(&commitment),
                 goal: Some(&goal),
@@ -1072,6 +1323,7 @@ mod tests {
                 terminal_task: Some(&task),
                 intention: &intention,
                 replacement_intention: None,
+                replacement_tasks: &[],
                 revision: Some(&revision),
                 commitment: Some(&commitment),
                 goal: Some(&goal),
@@ -1083,6 +1335,126 @@ mod tests {
 
         store.mark_outbox_delivered(event_id).unwrap();
         assert!(store.pending_outbox(10).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn resume_request_race_reuses_first_plan_and_rejects_different_source() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-resume-race-{}", Uuid::new_v4()));
+        let store = SqliteStore::open(&tmp).unwrap();
+        let (mut goal, mut commitment, mut blocked, mut original_task) = active_fixture(&store);
+
+        original_task.status = TaskStatus::Blocked;
+        blocked.status = IntentionStatus::Blocked;
+        commitment.status = CommitmentStatus::Suspended;
+        goal.status = GoalStatus::Blocked;
+        store.upsert_task(&original_task).unwrap();
+        store.upsert_intention(&blocked).unwrap();
+        store.upsert_commitment(&commitment).unwrap();
+        store.upsert_goal(&goal).unwrap();
+
+        let request_id = Uuid::new_v4();
+        let first_task = Task::new(goal.id, "resume plan one", ManagerKind::Engineering);
+        let mut first_intention = Intention::new(
+            goal.id,
+            commitment.id,
+            "manager-test",
+            "resume plan one",
+            vec![first_task.id],
+        );
+        first_intention.status = IntentionStatus::Active;
+        let first_resumption =
+            CommitmentResumption::new(request_id, &blocked, first_intention.id, "dependency ready");
+
+        commitment.status = CommitmentStatus::Active;
+        goal.status = GoalStatus::Running;
+        let first = store
+            .commit_agent_resume_transition(AgentResumeTransition {
+                blocked_intention: &blocked,
+                replacement_intention: &first_intention,
+                replacement_tasks: std::slice::from_ref(&first_task),
+                resumption: &first_resumption,
+                commitment: &commitment,
+                goal: &goal,
+                outbox_events: &[],
+            })
+            .unwrap();
+        assert!(matches!(first, ResumeCommitResult::Applied(_)));
+
+        let second_task = Task::new(goal.id, "resume plan two", ManagerKind::Engineering);
+        let mut second_intention = Intention::new(
+            goal.id,
+            commitment.id,
+            "manager-test",
+            "resume plan two",
+            vec![second_task.id],
+        );
+        second_intention.status = IntentionStatus::Active;
+        let second_resumption = CommitmentResumption::new(
+            request_id,
+            &blocked,
+            second_intention.id,
+            "dependency ready",
+        );
+        let second = store
+            .commit_agent_resume_transition(AgentResumeTransition {
+                blocked_intention: &blocked,
+                replacement_intention: &second_intention,
+                replacement_tasks: std::slice::from_ref(&second_task),
+                resumption: &second_resumption,
+                commitment: &commitment,
+                goal: &goal,
+                outbox_events: &[],
+            })
+            .unwrap();
+        let existing = match second {
+            ResumeCommitResult::AlreadyApplied(existing) => existing,
+            other => panic!("expected AlreadyApplied, got {other:?}"),
+        };
+        assert_eq!(
+            existing.replacement_intention_id, first_intention.id,
+            "the first committed replacement plan owns the request id"
+        );
+
+        let graph = store.get_goal_graph(goal.id).unwrap();
+        assert_eq!(graph.resumptions.len(), 1);
+        assert_eq!(graph.intentions.len(), 2);
+        assert!(graph
+            .intentions
+            .iter()
+            .all(|intention| intention.id != second_intention.id));
+        assert!(graph.tasks.iter().all(|task| task.id != second_task.id));
+
+        let mut other_blocked = blocked.clone();
+        other_blocked.id = Uuid::new_v4();
+        let third_task = Task::new(goal.id, "conflicting resume", ManagerKind::Engineering);
+        let mut third_intention = Intention::new(
+            goal.id,
+            commitment.id,
+            "manager-test",
+            "conflicting resume",
+            vec![third_task.id],
+        );
+        third_intention.status = IntentionStatus::Active;
+        let conflicting = CommitmentResumption::new(
+            request_id,
+            &other_blocked,
+            third_intention.id,
+            "different blocked source",
+        );
+        let err = store
+            .commit_agent_resume_transition(AgentResumeTransition {
+                blocked_intention: &other_blocked,
+                replacement_intention: &third_intention,
+                replacement_tasks: std::slice::from_ref(&third_task),
+                resumption: &conflicting,
+                commitment: &commitment,
+                goal: &goal,
+                outbox_events: &[],
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidTransition(_)));
 
         let _ = std::fs::remove_dir_all(tmp);
     }
@@ -1100,6 +1472,7 @@ mod tests {
                 terminal_task: Some(&task),
                 intention: &intention,
                 replacement_intention: None,
+                replacement_tasks: &[],
                 revision: None,
                 commitment: Some(&commitment),
                 goal: Some(&goal),
