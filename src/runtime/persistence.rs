@@ -702,11 +702,43 @@ impl PersistenceStore for MemoryStore {
                     ),
                 ));
             }
-        } else if transition.expected_previous_sequence != 0 || transition.sequence != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "first durable transition must start at sequence 1 with predecessor 0",
-            ));
+        } else {
+            // Atomic transitions may begin after legacy snapshot/journal history.
+            // The first atomic commit must extend the actually persisted legacy
+            // tail rather than pretending that history started at sequence 0.
+            let snapshot_seq = self
+                .snapshots
+                .get(&transition.actor_id)
+                .map(|snapshot| snapshot.sequence)
+                .unwrap_or(0);
+            let journal_seq = self
+                .journals
+                .get(&transition.actor_id)
+                .and_then(|entries| entries.last().map(|entry| entry.sequence))
+                .unwrap_or(0);
+            let workflow_seq = self
+                .workflow_events
+                .get(&transition.actor_id)
+                .and_then(|events| events.last().map(WorkflowEvent::sequence))
+                .unwrap_or(0);
+            let domain_seq = self
+                .events
+                .get(&transition.actor_id)
+                .and_then(|events| events.last().map(|event| event.sequence))
+                .unwrap_or(0);
+            let legacy_tail = snapshot_seq
+                .max(journal_seq)
+                .max(workflow_seq)
+                .max(domain_seq);
+            if transition.expected_previous_sequence != legacy_tail {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "first atomic durable transition predecessor {} does not match legacy tail {}",
+                        transition.expected_previous_sequence, legacy_tail
+                    ),
+                ));
+            }
         }
 
         if let Some(snapshot) = &transition.snapshot {
@@ -3109,6 +3141,20 @@ mod durable_transition_tests {
         assert_eq!(store.read_journal(10).len(), 1);
         assert_eq!(store.read_workflow_events(10).len(), 1);
         assert_eq!(store.read_events(10).len(), 1);
+        assert_eq!(store.committed_transitions(10).len(), 1);
+    }
+
+    #[test]
+    fn memory_store_first_atomic_transition_continues_legacy_history() {
+        let mut store = MemoryStore::new();
+        store
+            .save_snapshot(snapshot(10, 5, &[("count", 5)]))
+            .unwrap();
+
+        let committed = store.commit_transition(transition(10, 1, 6)).unwrap();
+
+        assert_eq!(committed.sequence, 6);
+        assert_eq!(store.latest_sequence(10), 6);
         assert_eq!(store.committed_transitions(10).len(), 1);
     }
 
