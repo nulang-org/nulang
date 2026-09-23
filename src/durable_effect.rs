@@ -22,11 +22,13 @@
 //! at-least-once external call into an unsound "exactly once" promise.
 
 use crate::primitives::{DeliverySemantics, EffectBoundary};
+use crate::semantic_identity::EffectSiteId;
 use blake3::Hasher;
 use std::fmt;
 use std::str::FromStr;
 
 const EFFECT_ID_DOMAIN: &[u8] = b"nulang.durable-effect.v1\0";
+const EFFECT_ID_SITE_DOMAIN: &[u8] = b"nulang.durable-effect-site.v1\0";
 const COMPENSATION_ID_DOMAIN: &[u8] = b"nulang.durable-compensation.v1\0";
 const REQUEST_DIGEST_DOMAIN: &[u8] = b"nulang.durable-effect-request.v1\0";
 
@@ -52,6 +54,29 @@ impl DurableEffectId {
         hash_len_prefixed(&mut hasher, execution_key.as_bytes());
         hasher.update(&effect_ordinal.to_le_bytes());
         hash_len_prefixed(&mut hasher, effect_operation.as_bytes());
+        Self(*hasher.finalize().as_bytes())
+    }
+
+    /// Derive a logical invocation ID from compiler-owned semantic site
+    /// identity plus durable execution identity.
+    ///
+    /// `execution_key` identifies the replay-stable owning turn/step/command.
+    /// `site_id` identifies the static `perform` site independently of source
+    /// lines and backend program counters. `occurrence_index` distinguishes
+    /// repeated dynamic execution of the same site inside one durable
+    /// execution (for example a loop). Retries MUST preserve all four inputs.
+    pub fn derive_from_site(
+        actor_id: u64,
+        execution_key: &str,
+        site_id: EffectSiteId,
+        occurrence_index: u32,
+    ) -> Self {
+        let mut hasher = Hasher::new();
+        hasher.update(EFFECT_ID_SITE_DOMAIN);
+        hasher.update(&actor_id.to_le_bytes());
+        hash_len_prefixed(&mut hasher, execution_key.as_bytes());
+        hasher.update(site_id.as_bytes());
+        hasher.update(&occurrence_index.to_le_bytes());
         Self(*hasher.finalize().as_bytes())
     }
 
@@ -463,6 +488,61 @@ mod tests {
         assert_ne!(
             base,
             DurableEffectId::derive(43, "step", 0, "Payment.charge")
+        );
+    }
+
+    #[test]
+    fn semantic_site_invocation_identity_is_stable_across_retry() {
+        let site = crate::semantic_identity::effect_site_id(
+            "orders",
+            crate::semantic_identity::EffectSiteOwnerKind::Behavior,
+            "OrderWorkflow.charge",
+            "Payment.charge",
+            0,
+        );
+        let first = DurableEffectId::derive_from_site(42, "turn:7", site, 0);
+        let retry = DurableEffectId::derive_from_site(42, "turn:7", site, 0);
+        assert_eq!(first, retry);
+    }
+
+    #[test]
+    fn dynamic_occurrence_distinguishes_repeated_execution_of_same_site() {
+        let site = crate::semantic_identity::effect_site_id(
+            "orders",
+            crate::semantic_identity::EffectSiteOwnerKind::Behavior,
+            "OrderWorkflow.charge",
+            "Payment.charge",
+            0,
+        );
+        let first = DurableEffectId::derive_from_site(42, "turn:7", site, 0);
+        let second = DurableEffectId::derive_from_site(42, "turn:7", site, 1);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn execution_key_and_site_both_participate_in_invocation_identity() {
+        let charge_site = crate::semantic_identity::effect_site_id(
+            "orders",
+            crate::semantic_identity::EffectSiteOwnerKind::Behavior,
+            "OrderWorkflow.charge",
+            "Payment.charge",
+            0,
+        );
+        let email_site = crate::semantic_identity::effect_site_id(
+            "orders",
+            crate::semantic_identity::EffectSiteOwnerKind::Behavior,
+            "OrderWorkflow.charge",
+            "Email.send",
+            0,
+        );
+        let base = DurableEffectId::derive_from_site(42, "turn:7", charge_site, 0);
+        assert_ne!(
+            base,
+            DurableEffectId::derive_from_site(42, "turn:8", charge_site, 0)
+        );
+        assert_ne!(
+            base,
+            DurableEffectId::derive_from_site(42, "turn:7", email_site, 0)
         );
     }
 
