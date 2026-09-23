@@ -5,8 +5,9 @@
 //! hold before a future backend is allowed to run branches concurrently.
 
 use crate::ast::{Expr, Pattern};
+use crate::effect_semantics::{classify_operation_name, EffectOperationSemantics};
 use crate::types::{NuError, NuResult, Span};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ParallelBranchSummary {
@@ -23,6 +24,10 @@ pub struct ParallelBranchSummary {
     pub state_writes: BTreeSet<String>,
     /// Requested effect operations, for later effect-policy scheduling.
     pub effects: BTreeSet<String>,
+    /// Conservative compiler-owned semantics for each requested operation.
+    /// Unknown/user-defined operations fail closed as `Unknown` until a typed
+    /// HIR/MIR pass can prove stronger properties.
+    pub effect_semantics: BTreeMap<String, EffectOperationSemantics>,
     /// Explicit external authority grants introduced by spawn sites.
     pub authorities: BTreeSet<String>,
     /// Control-flow escapes that cannot be scoped to one concurrent child yet.
@@ -109,6 +114,13 @@ pub fn summarize_branch(index: u32, expr: &Expr) -> ParallelBranchSummary {
     summary
 }
 
+fn record_effect(out: &mut ParallelBranchSummary, operation: impl Into<String>) {
+    let operation = operation.into();
+    out.effect_semantics
+        .insert(operation.clone(), classify_operation_name(&operation));
+    out.effects.insert(operation);
+}
+
 fn par_error(msg: String, span: Span) -> NuError {
     NuError::TypeError {
         msg,
@@ -173,14 +185,14 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
             // Creating a closure does not execute its body. Reference-capability
             // checking governs whether captured values may later cross a task
             // boundary.
-            out.effects.insert("Closure.capture".to_string());
+            record_effect(out, "Closure.capture".to_string());
         }
         Expr::App { func, args, .. } => {
             summarize_expr(func, bound, out);
             for arg in args {
                 summarize_expr(arg, bound, out);
             }
-            out.effects.insert("Call".to_string());
+            record_effect(out, "Call".to_string());
         }
         Expr::Let {
             name, value, body, ..
@@ -297,7 +309,7 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
             if let Some(node) = target_node {
                 summarize_expr(node, bound, out);
             }
-            out.effects.insert("Actor.spawn".to_string());
+            record_effect(out, "Actor.spawn".to_string());
             out.authorities.extend(capabilities.iter().cloned());
         }
         Expr::Send {
@@ -310,7 +322,7 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
             for arg in args {
                 summarize_expr(arg, bound, out);
             }
-            out.effects.insert(format!("Actor.send.{behavior}"));
+            record_effect(out, format!("Actor.send.{behavior}"));
         }
         Expr::Ask {
             actor,
@@ -322,10 +334,10 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
             for arg in args {
                 summarize_expr(arg, bound, out);
             }
-            out.effects.insert(format!("Actor.ask.{behavior}"));
+            record_effect(out, format!("Actor.ask.{behavior}"));
         }
         Expr::Receive { arms, after, .. } => {
-            out.effects.insert("Actor.receive".to_string());
+            record_effect(out, "Actor.receive".to_string());
             for (_, patterns, guard, body) in arms {
                 let mut arm_bound = bound.clone();
                 for pattern in patterns {
@@ -345,7 +357,7 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
             for arg in args {
                 summarize_expr(arg, bound, out);
             }
-            out.effects.insert(format!("Event.emit.{event}"));
+            record_effect(out, format!("Event.emit.{event}"));
         }
         Expr::Perform {
             effect, op, args, ..
@@ -353,11 +365,11 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
             for arg in args {
                 summarize_expr(arg, bound, out);
             }
-            out.effects.insert(format!("{effect}.{op}"));
+            record_effect(out, format!("{effect}.{op}"));
         }
         Expr::GrainRef { key, .. } => {
             summarize_expr(key, bound, out);
-            out.effects.insert("Grain.ref".to_string());
+            record_effect(out, "Grain.ref".to_string());
         }
         Expr::Resume { value, .. } => {
             summarize_expr(value, bound, out);
@@ -374,7 +386,7 @@ fn summarize_expr(expr: &Expr, bound: &HashSet<String>, out: &mut ParallelBranch
         Expr::Migrate { actor, node, .. } => {
             summarize_expr(actor, bound, out);
             summarize_expr(node, bound, out);
-            out.effects.insert("Actor.migrate".to_string());
+            record_effect(out, "Actor.migrate".to_string());
         }
         Expr::For {
             var,
@@ -604,8 +616,31 @@ mod tests {
         };
         let summary = summarize_branch(0, &branch);
         assert!(summary.effects.contains("Actor.spawn"));
+        assert_eq!(
+            summary.effect_semantics["Actor.spawn"].concurrency,
+            crate::effect_semantics::ConcurrencySemantics::Serialized
+        );
+        assert_eq!(
+            summary.effect_semantics["Actor.spawn"].replay,
+            crate::effect_semantics::ReplaySemantics::RequiresProtocol
+        );
         assert!(summary
             .authorities
             .contains("Net::TcpOut(api.example.com:443)"));
+    }
+
+    #[test]
+    fn unknown_effects_remain_conservative() {
+        let branch = Expr::Perform {
+            effect: "Payments".to_string(),
+            op: "charge".to_string(),
+            args: vec![],
+            span: sp(),
+        };
+        let summary = summarize_branch(0, &branch);
+        assert_eq!(
+            summary.effect_semantics["Payments.charge"],
+            EffectOperationSemantics::UNKNOWN
+        );
     }
 }

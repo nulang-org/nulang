@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Shared effect-operation semantics — 2026-09-23
+- **The compiler now has one conservative operation-semantics classifier for concurrency, replay, idempotency, and cancellation** (Experimental, `src/effect_semantics.rs`). Structured-`par` branch summaries attach these semantics to every observed effect operation instead of leaving each future scheduler/durability subsystem to invent independent policy. Known pure intrinsics are marked deterministic/concurrent, actor/event boundaries require ordered protocol handling, time/random observations require replay capture, and unknown user effects fail closed as unknown. Execution remains sequential; this is policy metadata only.
+
 ### Candidate-only JIT hotness probing — 2026-09-22
 - **Cold interpreted execution now probes JIT hotness only at candidate compiled-region entries** (`src/vm.rs`). The VM precomputes per-module candidates for execution/function/behavior entries, source-statement starts, branch targets/fallthroughs, and successors of compilation boundaries, avoiding JIT backend dispatch and hot-counter mutation at ordinary straight-line bytecode PCs without changing language semantics.
 
