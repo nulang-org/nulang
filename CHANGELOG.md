@@ -1599,6 +1599,9 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Benchmark history branch isolation — 2026-09-23
+- **Regression-gated benchmark history no longer writes generated results directly to protected `main`** (`.github/workflows/ci.yml`). CI restores prior JSON history from `automation/benchmark-history`, uploads the current run as an artifact, and persists generated history only to that dedicated automation branch. This keeps protected-branch validation read-only while retaining rolling benchmark comparisons.
+
 ### Allocation-free protocol actor-ref decoding — 2026-09-21
 - **ProtocolId wire decode no longer hex-allocates.** The fixed 32-byte protocol digest is reconstructed directly with `ProtocolId::from_bytes` instead of expanding to a 64-character hex `String` and reparsing it. Wire bytes and compatibility semantics are unchanged.
 
