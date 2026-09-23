@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### Durable event and workflow commit invariants — 2026-09-22
+- **Event emission no longer invents mutations for integer event-sourced fields** (`src/runtime/workflow.rs`). Source-level `apply` handlers or explicit behavior code are now the sole authority for domain-state evolution; the runtime records the resulting post-apply value for recovery.
+- **Durable workflow timers and signals now fail closed when their journal/checkpoint commit fails.** A timer is not armed until `TimerSet` commits, a fired workflow timer is not delivered until `TimerFired` commits, and a signal is not admitted/resumed until `SignalReceived` commits. Saga compensation completion is likewise not marked in memory unless `SagaCompensated` commits.
+
+
 ### Temporary concatenated-string reclamation — 2026-09-22
 - **Non-folded string concatenations now participate in MIR ownership-based reclamation** (`src/mir_codegen.rs`). Because `SConcat` creates a fresh actor-heap string, the liveness planner can release its sole local ORCA reference immediately after the last safe use instead of retaining the temporary until actor teardown. Runtime semantics and the existing ORCA/store-barrier protocol are unchanged.
 
