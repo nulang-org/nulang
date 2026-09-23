@@ -26,6 +26,7 @@
 //!                            handlers, no actor mailbox — requires wasm-backend)
 //!   --out <file>             Output file (WASM backends / --emit-nbc)
 //!   --emit-nbc               Compile <FILE> to a .nbc artifact; don't run
+//!   --emit-behavior-manifest <file>  Emit RFC 0020 behavior sidecar with durable schema metadata
 //!   <FILE>.nbc               Run a pre-compiled .nbc artifact directly
 //!   --verify <src>           Verify .nbc source hash against <src>
 //!   nula <cmd>               Package manager (new, init, build, build-wasm, test, run, add, remove, publish, deploy, list, clean)
@@ -475,6 +476,33 @@ fn main() {
                 }
             }
             "--emit-nbc" => opts.emit_nbc = true,
+            "--emit-behavior-manifest" => {
+                if i + 1 < args.len() {
+                    opts.emit_behavior_manifest = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Error: --emit-behavior-manifest requires a file path argument");
+                    std::process::exit(1);
+                }
+            }
+            "--behavior-package-name" => {
+                if i + 1 < args.len() {
+                    opts.behavior_package_name = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Error: --behavior-package-name requires a package name");
+                    std::process::exit(1);
+                }
+            }
+            "--behavior-package-version" => {
+                if i + 1 < args.len() {
+                    opts.behavior_package_version = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Error: --behavior-package-version requires a package version");
+                    std::process::exit(1);
+                }
+            }
             "--verify" => {
                 if i + 1 < args.len() {
                     opts.verify_source = Some(args[i + 1].clone());
@@ -510,6 +538,9 @@ fn main() {
                     "--backend",
                     "--out",
                     "--emit-nbc",
+                    "--emit-behavior-manifest",
+                    "--behavior-package-name",
+                    "--behavior-package-version",
                     "--verify",
                     "--bench",
                     "--json",
@@ -709,6 +740,9 @@ fn main() {
                 opts.rewrite_signals.as_deref(),
                 &opts.with_capabilities,
                 opts.deny_warnings,
+                opts.emit_behavior_manifest.as_deref(),
+                opts.behavior_package_name.as_deref(),
+                opts.behavior_package_version.as_deref(),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -890,6 +924,9 @@ fn main() {
                 opts.rewrite_signals.as_deref(),
                 &opts.with_capabilities,
                 opts.deny_warnings,
+                opts.emit_behavior_manifest.as_deref(),
+                opts.behavior_package_name.as_deref(),
+                opts.behavior_package_version.as_deref(),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -989,6 +1026,13 @@ struct Options {
     out_file: Option<String>,
     /// Compile the input to a `.nbc` artifact and write it, don't run.
     emit_nbc: bool,
+    /// Optional RFC 0020 behavior sidecar output path. Currently emitted for
+    /// the bytecode artifact path so package builds can bind durable schema
+    /// metadata to the same typed program and artifact identity.
+    emit_behavior_manifest: Option<String>,
+    /// Package identity embedded in the behavior sidecar.
+    behavior_package_name: Option<String>,
+    behavior_package_version: Option<String>,
     /// When running a `.nbc` artifact, verify its recorded source hash against
     /// this source file before executing. Refuses on mismatch.
     verify_source: Option<String>,
@@ -1044,6 +1088,9 @@ impl Default for Options {
             backend: "bytecode".to_string(),
             out_file: None,
             emit_nbc: false,
+            emit_behavior_manifest: None,
+            behavior_package_name: None,
+            behavior_package_version: None,
             verify_source: None,
             emit_stdlib_docs: None,
             emit_signals: None,
@@ -1116,6 +1163,7 @@ fn print_help() {
         println!("  --out <file>     Output file for WASM backends (default: out.wasm)");
     }
     println!("  --out <file>     Output path for --emit-nbc (default: <FILE> with .nbc extension)");
+    println!("  --emit-behavior-manifest <file>  Emit RFC 0020 durable-schema behavior sidecar");
     println!("  <FILE>.nbc       Run a pre-compiled .nbc artifact directly (no compiler invoked)");
     println!(
         "  --verify <src>   When running a .nbc artifact, verify its source hash against <src>"
@@ -2391,6 +2439,9 @@ fn compile_source_to_nbc(
     rewrite_signals: Option<&str>,
     with_capabilities: &[String],
     deny_warnings: bool,
+    behavior_manifest_path: Option<&str>,
+    behavior_package_name: Option<&str>,
+    behavior_package_version: Option<&str>,
 ) -> NuResult<()> {
     let (mut ast, type_checker) =
         run_frontend(source, None, false, with_capabilities, deny_warnings)?;
@@ -2411,7 +2462,33 @@ fn compile_source_to_nbc(
             span: Span::default(),
         })?;
     }
-    let m = compile_with_new_pipeline(&ast, "main", &type_checker)?;
+    // Keep typed HIR/MIR alive through artifact emission so the optional
+    // Behavior Manifest is derived from exactly the same semantic inputs as
+    // the executable artifact.
+    let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
+    let mut mir = nulang::mir_lower::lower_module(&hir)?;
+    let artifact_identity = if behavior_manifest_path.is_some() {
+        Some(
+            nulang::compiler_identity::artifact_identity_for_typed_program(
+                Some(source.as_bytes()),
+                &hir,
+                &mir,
+                [],
+                concat!("nulang-rust-", env!("CARGO_PKG_VERSION")),
+                "nulang-bytecode-v1",
+                "nulang-vm-v1",
+                "bytecode",
+                std::iter::empty::<&str>(),
+            )
+            .map_err(|error| nulang::types::NuError::VMError {
+                msg: format!("failed to derive artifact semantic identity: {error}"),
+                span: Span::default(),
+            })?,
+        )
+    } else {
+        None
+    };
+    let m = nulang::mir_codegen::compile_mir(&mut mir, "main")?;
     let source_hash = blake3::hash(source.as_bytes());
     let bytes =
         m.to_nbc(Some(*source_hash.as_bytes()))
@@ -2423,6 +2500,41 @@ fn compile_source_to_nbc(
         msg: format!("failed to write {out_path}: {e}"),
         span: Span::default(),
     })?;
+
+    if let (Some(manifest_path), Some(artifact_identity)) =
+        (behavior_manifest_path, artifact_identity.as_ref())
+    {
+        let package_name = behavior_package_name.unwrap_or("main");
+        let package_version = behavior_package_version.unwrap_or("0.0.0");
+        let behavior_manifest = nulang::behavior_manifest::BehaviorManifest::from_typed_hir(
+            package_name,
+            package_version,
+            artifact_identity,
+            &hir,
+        )
+        .map_err(|error| nulang::types::NuError::VMError {
+            msg: format!("failed to build behavior manifest: {error}"),
+            span: Span::default(),
+        })?;
+        let manifest_bytes =
+            behavior_manifest
+                .to_json()
+                .map_err(|error| nulang::types::NuError::VMError {
+                    msg: format!("failed to serialize behavior manifest: {error}"),
+                    span: Span::default(),
+                })?;
+        std::fs::write(manifest_path, manifest_bytes).map_err(|error| {
+            nulang::types::NuError::VMError {
+                msg: format!("failed to write behavior manifest {manifest_path}: {error}"),
+                span: Span::default(),
+            }
+        })?;
+        println!(
+            "Wrote {manifest_path} ({}, {})",
+            behavior_manifest.schema,
+            behavior_manifest.digest().unwrap_or_else(|_| "digest-unavailable".to_string())
+        );
+    }
     println!(
         "Wrote {out_path} ({} bytes, .nbc format v{}, language v{})",
         bytes.len(),
