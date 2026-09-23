@@ -855,7 +855,8 @@ mod tests {
             Err(BehaviorManifestError::UnsupportedSchema(_))
         ));
 
-        let mut value: serde_json::Value = serde_json::from_slice(&valid.to_json().unwrap()).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&valid.to_json().unwrap()).unwrap();
         value["actors"][0]["schema_version"] = serde_json::Value::from(2);
         let bytes = serde_json::to_vec(&value).unwrap();
         assert!(matches!(
