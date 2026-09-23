@@ -328,7 +328,7 @@ impl BehaviorManifest {
                     message: "schema_version must be positive".to_string(),
                 });
             }
-            validate_identity::<SemanticId>(
+            parse_identity::<SemanticId>(
                 "actors[].state_schema_semantic_id",
                 &actor.state_schema_semantic_id,
             )?;
