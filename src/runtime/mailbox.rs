@@ -14,6 +14,7 @@
 
 use crate::vm::Value;
 use crossbeam::queue::SegQueue;
+use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -160,6 +161,90 @@ enum MatchLane {
     Normal,
 }
 
+/// Lazy positional index for one staged selective-receive lane.
+///
+/// Positions remain stable while a receive transaction only appends arrivals
+/// and rejects guards. A successful commit or ordinary pop shifts VecDeque
+/// positions and invalidates the index, which is rebuilt lazily.
+#[derive(Debug)]
+struct ReceiveLaneIndex {
+    positions: FxHashMap<u16, Vec<usize>>,
+    cursors: FxHashMap<u16, usize>,
+    valid: bool,
+}
+
+impl ReceiveLaneIndex {
+    fn new() -> Self {
+        Self {
+            positions: FxHashMap::default(),
+            cursors: FxHashMap::default(),
+            valid: true,
+        }
+    }
+
+    #[inline]
+    fn append(&mut self, behavior_id: u16, index: usize) {
+        if self.valid {
+            self.positions.entry(behavior_id).or_default().push(index);
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.positions.clear();
+        self.cursors.clear();
+        self.valid = false;
+    }
+
+    fn reset_cursors(&mut self) {
+        self.cursors.clear();
+    }
+
+    fn ensure(&mut self, buffer: &VecDeque<(Message, bool)>) {
+        if self.valid {
+            return;
+        }
+        self.positions.clear();
+        for (idx, (msg, _)) in buffer.iter().enumerate() {
+            self.positions.entry(msg.behavior_id).or_default().push(idx);
+        }
+        self.cursors.clear();
+        self.valid = true;
+    }
+
+    fn next_candidate(
+        &mut self,
+        buffer: &VecDeque<(Message, bool)>,
+        behavior_ids: &[u16],
+    ) -> Option<(usize, usize)> {
+        self.ensure(buffer);
+
+        let mut best: Option<(usize, usize)> = None;
+        for (arm_pos, &behavior_id) in behavior_ids.iter().enumerate() {
+            let Some(positions) = self.positions.get(&behavior_id) else {
+                continue;
+            };
+            let cursor = self.cursors.entry(behavior_id).or_insert(0);
+            while *cursor < positions.len() {
+                let idx = positions[*cursor];
+                match buffer.get(idx) {
+                    Some((_, false)) => break,
+                    Some((_, true)) | None => *cursor += 1,
+                }
+            }
+            if *cursor >= positions.len() {
+                continue;
+            }
+            let idx = positions[*cursor];
+            match best {
+                None => best = Some((arm_pos, idx)),
+                Some((_, best_idx)) if idx < best_idx => best = Some((arm_pos, idx)),
+                _ => {}
+            }
+        }
+        best
+    }
+}
+
 /// MPSC mailbox with priority bands and optional capacity.
 ///
 /// Concurrent producers may call [`Mailbox::push`] through shared references;
@@ -183,6 +268,9 @@ pub struct Mailbox {
     local_skip_buffer: VecDeque<(Message, bool)>,
     /// Normal messages staged by selective receive.
     skip_buffer: VecDeque<(Message, bool)>,
+    system_index: ReceiveLaneIndex,
+    local_index: ReceiveLaneIndex,
+    normal_index: ReceiveLaneIndex,
     /// The most recently returned candidate. A second `receive_match` call
     /// means the previous candidate's guard rejected it; only this active
     /// candidate may be consumed by `commit_receive_match`.
@@ -204,6 +292,9 @@ impl Mailbox {
             system_skip_buffer: VecDeque::new(),
             local_skip_buffer: VecDeque::new(),
             skip_buffer: VecDeque::new(),
+            system_index: ReceiveLaneIndex::new(),
+            local_index: ReceiveLaneIndex::new(),
+            normal_index: ReceiveLaneIndex::new(),
             active_match: None,
         }
     }
