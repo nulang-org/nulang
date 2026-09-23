@@ -3,6 +3,25 @@
 use chrono::Utc;
 use nulang_ai_core::{Task, TaskStatus};
 
+#[derive(Debug, Clone)]
+pub struct TaskExecution {
+    pub task: Task,
+    pub reason: Option<String>,
+}
+
+impl TaskExecution {
+    pub fn new(task: Task) -> Self {
+        Self { task, reason: None }
+    }
+
+    pub fn with_reason(task: Task, reason: impl Into<String>) -> Self {
+        Self {
+            task,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
 pub trait Worker: Send + Sync {
     fn agent_id(&self) -> &str;
 
@@ -12,6 +31,13 @@ pub trait Worker: Send + Sync {
     /// as terminal worker outcomes. Other returned states are normalized to
     /// `Failed` so an agent cannot silently leave an active intention stuck.
     fn execute(&self, task: &Task) -> Task;
+
+    /// Execute a task while preserving optional worker-supplied outcome evidence.
+    ///
+    /// Existing workers only implementing `execute` remain source-compatible.
+    fn execute_with_report(&self, task: &Task) -> TaskExecution {
+        TaskExecution::new(self.execute(task))
+    }
 }
 
 pub struct LocalWorker {
