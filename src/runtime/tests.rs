@@ -496,7 +496,8 @@ fn test_anonymous_actor_accepts_untyped_mailbox_delivery_without_handler_alias()
     // there is no handler to execute.
     assert!(rt.actors[&actor_id].behavior_table.is_empty());
     assert!(rt.actors[&actor_id].bytecode_module.is_none());
-    assert_eq!(rt.scheduler.dequeue(), Some(actor_id));
+    assert_eq!(rt.claim_next_ready_actor(), Some(actor_id));
+    rt.finish_actor_turn(actor_id);
 
     rt.send_message(actor_id, "opaque-runtime-tag", &[Value::int(7)]);
 
@@ -515,18 +516,20 @@ fn test_named_actor_still_rejects_unknown_behavior_without_aliasing_zero() {
         .get_mut(&actor_id)
         .unwrap()
         .register_behavior("known", |_actor, _args| {});
-    assert_eq!(rt.scheduler.dequeue(), Some(actor_id));
+    assert_eq!(rt.claim_next_ready_actor(), Some(actor_id));
+    rt.finish_actor_turn(actor_id);
 
     rt.send_message(actor_id, "typo", &[]);
     assert!(
         rt.actors[&actor_id].mailbox.is_empty(),
         "unknown name must not alias declared behavior id 0"
     );
-    assert!(rt.scheduler.dequeue().is_none());
+    assert!(rt.claim_next_ready_actor().is_none());
 
     rt.send_message(actor_id, "known", &[]);
     assert_eq!(rt.actors[&actor_id].mailbox.len(), 1);
-    assert_eq!(rt.scheduler.dequeue(), Some(actor_id));
+    assert_eq!(rt.claim_next_ready_actor(), Some(actor_id));
+    rt.finish_actor_turn(actor_id);
 }
 
 // ========================================================================
@@ -2967,8 +2970,8 @@ fn test_runtime_scheduler_stats() {
 
     let stats = rt.scheduler_stats();
     assert_eq!(
-        stats.total_tasks_processed, 4,
-        "spawn + send should produce four actor tasks"
+        stats.total_tasks_processed, 2,
+        "spawn + send should collapse to one ready token per actor"
     );
     assert_eq!(
         stats.empty_polls, 1,
