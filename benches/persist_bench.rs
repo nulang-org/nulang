@@ -8,6 +8,9 @@
 use std::collections::HashMap;
 
 use criterion::{black_box, criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
+use nulang::durable_effect::{DurableEffectId, DurableEffectRecord, DurableEffectSpec};
+use nulang::durable_effect_persistence::DurableEffectPersistenceRecord;
+use nulang::primitives::{DeliverySemantics, EffectBoundary};
 use nulang::runtime::{ActorSnapshot, JournalEntry, MemoryStore, PersistedValue, PersistenceStore};
 
 fn snapshot_with_payload(payload_bytes: usize) -> ActorSnapshot {
@@ -138,10 +141,81 @@ fn bench_memory_journal_read(c: &mut Criterion) {
     group.finish();
 }
 
+
+fn durable_effect_spec() -> DurableEffectSpec {
+    DurableEffectSpec::new(
+        DurableEffectId::derive(7, "benchmark/order-42", 0, "Payment.charge"),
+        "Payment.charge",
+        EffectBoundary::External,
+        DeliverySemantics::EffectivelyOnceWithDeduplication,
+    )
+}
+
+/// Local bookkeeping cost to create a replay-safe external-effect intent.
+///
+/// This is deliberately not presented as end-to-end provider latency or as a
+/// Temporal/Golem comparison. It measures the runtime-owned work that Nulang
+/// adds before dispatching an external mutation: stable operation identity,
+/// request fingerprinting, and the Prepared record.
+fn bench_durable_effect_prepare(c: &mut Criterion) {
+    let request = b"order=42&amount=1000";
+
+    c.bench_function("persist/durable_effect_prepare", |b| {
+        b.iter(|| {
+            let record = DurableEffectRecord::prepare(
+                black_box(durable_effect_spec()),
+                black_box(request.as_slice()),
+            );
+            black_box(record);
+        })
+    });
+}
+
+/// Serialize and restore the versioned durable-effect receipt boundary.
+///
+/// This measures the persistence framing/JSON work separately from provider
+/// execution so regressions in durable bookkeeping remain visible even when
+/// network latency dominates real workloads.
+fn bench_durable_effect_persistence_roundtrip(c: &mut Criterion) {
+    let request = b"order=42&amount=1000";
+    let prepared = DurableEffectRecord::prepare(durable_effect_spec(), request);
+
+    c.bench_function("persist/durable_effect_json_roundtrip", |b| {
+        b.iter(|| {
+            let persisted = DurableEffectPersistenceRecord::from_effect(black_box(prepared.clone()));
+            let bytes = persisted.to_json().expect("serialize durable effect");
+            let restored =
+                DurableEffectPersistenceRecord::from_json(black_box(bytes.as_slice()))
+                    .expect("restore durable effect");
+            black_box(restored);
+        })
+    });
+}
+
+/// Recovery-decision overhead for the hardest external-effect crash window:
+/// intent is durable, provider completion may be unknown, and recovery must
+/// produce the same deduplicated logical operation.
+fn bench_durable_effect_recovery_decision(c: &mut Criterion) {
+    let request = b"order=42&amount=1000";
+    let prepared = DurableEffectRecord::prepare(durable_effect_spec(), request);
+
+    c.bench_function("persist/durable_effect_recovery_decision", |b| {
+        b.iter(|| {
+            let action = black_box(&prepared)
+                .recovery_action_for_request(black_box(request.as_slice()))
+                .expect("recovery decision");
+            black_box(action);
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_memory_store,
     bench_checkpoint_json_encode,
     bench_checkpoint_json_decode,
-    bench_memory_journal_read
+    bench_memory_journal_read,
+    bench_durable_effect_prepare,
+    bench_durable_effect_persistence_roundtrip,
+    bench_durable_effect_recovery_decision
 );

@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### Durable-effect bookkeeping benchmarks — 2026-09-23
+- **The existing Criterion persistence suite now measures replay-safe external-effect bookkeeping** (`benches/persist_bench.rs`): intent preparation, versioned JSON persistence round-trip, and recovery-decision overhead for effectively-once-with-deduplication effects.
+- These measurements intentionally cover only Nulang-owned local overhead. They are not provider-latency numbers and are not presented as Temporal/Golem head-to-head results; competitive crash/recovery measurements require equivalent external workloads and process-failure harnesses.
+
+
 ### Actor density and mailbox hot-path allocation — 2026-09-23
 - **Idle actors no longer materialize their 16 KiB ORCA bump block at spawn** (`src/runtime/heap.rs`). The configured first-block capacity is preserved, but allocation is deferred until the first small-object heap allocation; LOS-only actors also remain bump-block-free.
 - **Mailbox logical-count atomics use relaxed ordering** (`src/runtime/mailbox.rs`) because Crossbeam `SegQueue` owns message publication/synchronization; the atomic counter remains capacity/accounting state and its modification order still prevents bounded producers from over-reserving.
