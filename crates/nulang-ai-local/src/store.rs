@@ -252,7 +252,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub fn upsert_intention_revision(
+    pub fn insert_intention_revision(
         &self,
         revision: &IntentionRevision,
     ) -> Result<(), StoreError> {
