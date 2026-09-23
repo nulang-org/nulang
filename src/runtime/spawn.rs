@@ -75,7 +75,7 @@ fn try_spawn_actor_with_models_schema(
     )
 }
 
-fn validate_snapshot_schema(
+pub(crate) fn validate_snapshot_schema(
     snapshot: &ActorSnapshot,
     expected: Option<(&str, u32)>,
 ) -> std::io::Result<()> {
