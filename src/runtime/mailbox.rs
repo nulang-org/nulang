@@ -389,6 +389,7 @@ impl Mailbox {
             .or_else(|| self.normal_queue.pop());
         if result.is_some() {
             self.active_match = None;
+            self.invalidate_receive_indexes();
             self.release_slot_local();
         }
         result
@@ -539,6 +540,15 @@ impl Mailbox {
         for (_, tried) in self.skip_buffer.iter_mut() {
             *tried = false;
         }
+        self.system_index.reset_cursors();
+        self.local_index.reset_cursors();
+        self.normal_index.reset_cursors();
+    }
+
+    fn invalidate_receive_indexes(&mut self) {
+        self.system_index.invalidate();
+        self.local_index.invalidate();
+        self.normal_index.invalidate();
     }
 
     /// Commit exactly the most recently returned candidate and return its
@@ -552,6 +562,9 @@ impl Mailbox {
             MatchLane::Normal => self.skip_buffer.remove(idx),
         }?;
         self.release_slot_local();
+        // VecDeque::remove shifts positions in the selected lane. Invalidate
+        // all three compact indexes and rebuild them lazily on the next receive.
+        self.invalidate_receive_indexes();
         self.clear_tried_flags();
         Some(payload)
     }
