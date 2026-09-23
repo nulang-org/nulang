@@ -118,13 +118,31 @@ fn test_legacy_snapshot_without_authority_is_deny_by_default() {
 // ========================================================================
 
 fn run_ready_actor_turn(rt: &mut Runtime, actor_id: u64) {
-    assert_eq!(
-        rt.claim_next_ready_actor(),
-        Some(actor_id),
-        "expected actor {actor_id} to own the next ready token"
-    );
-    rt.step_actor(actor_id);
-    rt.finish_actor_turn(actor_id);
+    loop {
+        let ready = rt
+            .claim_next_ready_actor()
+            .unwrap_or_else(|| panic!("expected actor {actor_id} to own a ready token"));
+        if ready == actor_id {
+            rt.step_actor(actor_id);
+            rt.finish_actor_turn(actor_id);
+            return;
+        }
+
+        // Spawn/restart paths may leave equal-priority empty actors ahead of
+        // the target. Their relative ordering is intentionally unspecified.
+        // Only skip tokens that carry no runnable mailbox work; silently
+        // bypassing a genuinely runnable peer would hide a scheduler bug.
+        let has_mail = rt
+            .actors
+            .get(&ready)
+            .map(|actor| !actor.mailbox.is_empty())
+            .unwrap_or(false);
+        assert!(
+            !has_mail,
+            "unexpected runnable actor {ready} ahead of target {actor_id}"
+        );
+        rt.finish_actor_turn(ready);
+    }
 }
 
 #[test]
