@@ -83,7 +83,10 @@ impl FlightRecorder {
     /// Create a new flight recorder retaining up to `max_entries` messages.
     pub fn new(max_entries: usize) -> Self {
         FlightRecorder {
-            entries: Vec::with_capacity(max_entries),
+            // Keep the logical retention limit without reserving storage for
+            // every idle actor. The vector grows only when tracing data is
+            // actually recorded.
+            entries: Vec::new(),
             cursor: 0,
             next_seq: 0,
             max_entries,
@@ -92,6 +95,10 @@ impl FlightRecorder {
 
     /// Record a message delivery.
     pub fn record(&mut self, sender: u64, behavior_id: u16, payload: &[Value]) {
+        if self.max_entries == 0 {
+            return;
+        }
+
         let seq = self.next_seq;
         self.next_seq += 1;
 
@@ -160,6 +167,32 @@ impl FlightRecorder {
         self.next_seq = 0;
     }
 }
+
+#[cfg(test)]
+mod flight_recorder_tests {
+    use super::*;
+
+    #[test]
+    fn recorder_defers_backing_allocation_until_first_entry() {
+        let mut recorder = FlightRecorder::new(1_000);
+        assert_eq!(recorder.entries.capacity(), 0);
+        assert!(recorder.is_empty());
+
+        recorder.record(7, 3, &[Value::int(42)]);
+
+        assert_eq!(recorder.len(), 1);
+        assert!(recorder.entries.capacity() >= 1);
+    }
+
+    #[test]
+    fn zero_capacity_recorder_is_a_noop() {
+        let mut recorder = FlightRecorder::new(0);
+        recorder.record(7, 3, &[Value::int(42)]);
+        assert!(recorder.is_empty());
+        assert_eq!(recorder.entries.capacity(), 0);
+    }
+}
+
 /// Serialized hibernation state for an actor.
 #[derive(Debug, Clone)]
 pub struct HibernationState {
