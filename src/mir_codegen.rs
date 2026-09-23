@@ -845,6 +845,37 @@ impl MirCodegen {
         Ok(())
     }
 
+    fn record_effect_site(
+        &mut self,
+        relative_pc: usize,
+        site: Option<&MirEffectSite>,
+        effect_operation: &str,
+    ) -> NuResult<()> {
+        let site = site.ok_or_else(|| {
+            compile_err(
+                format!(
+                    "internal: missing semantic effect-site metadata for {effect_operation}"
+                ),
+                Span::default(),
+            )
+        })?;
+        if site.effect_operation != effect_operation {
+            return Err(compile_err(
+                format!(
+                    "internal: effect-site operation mismatch: semantic '{}' vs emitted '{}'",
+                    site.effect_operation, effect_operation
+                ),
+                Span::default(),
+            ));
+        }
+        self.module.effect_sites.push(EffectSiteMetadata {
+            pc: self.current_function_base + relative_pc,
+            id: *site.id.as_bytes(),
+            effect_operation: site.effect_operation.clone(),
+        });
+        Ok(())
+    }
+
     /// Move argument locals into the staging registers r0..rN.
     fn stage_args(&mut self, args: &[mir::LocalId]) -> NuResult<()> {
         if args.len() > MAX_STAGED_ARGS {
@@ -1074,6 +1105,9 @@ impl MirCodegen {
                 resolved_handler,
             } => {
                 self.stage_args(args)?;
+                let effect_operation = format!("{effect}.{op}");
+                let effect_pc = self.current_offset();
+                self.record_effect_site(effect_pc, effect_site, &effect_operation)?;
                 if let Some(href) = resolved_handler {
                     // Statically-resolved handler — emit PerformDirect with
                     // table and binding indices, skipping the string lookup.
@@ -1086,7 +1120,7 @@ impl MirCodegen {
                 } else {
                     let eff_idx = self
                         .module
-                        .add_constant(Constant::String(format!("{}.{}", effect, op)));
+                        .add_constant(Constant::String(effect_operation));
                     self.emit(Instruction::new3(
                         OpCode::Perform,
                         ((eff_idx >> 8) & 0xFF) as u8,
@@ -1101,6 +1135,8 @@ impl MirCodegen {
                 resolved_handler: _,
             } => {
                 self.stage_args(args)?;
+                let effect_pc = self.current_offset();
+                self.record_effect_site(effect_pc, effect_site, effect_op)?;
                 let eff_idx = self
                     .module
                     .add_constant(Constant::String(effect_op.clone()));
