@@ -20,6 +20,7 @@ use std::fmt;
 use std::str::FromStr;
 
 pub const BEHAVIOR_MANIFEST_SCHEMA: &str = "nulang.behavior/v0alpha1";
+pub const BEHAVIOR_ARTIFACT_KIND_NBC_V1: &str = "nulang-bytecode-v1";
 const BEHAVIOR_MANIFEST_DIGEST_DOMAIN: &[u8] = b"nulang.behavior-manifest.v0alpha1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +41,9 @@ pub struct BehaviorPackage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BehaviorArtifact {
+    pub kind: String,
+    /// Digest of the exact executable bytes this manifest accompanies.
+    pub digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
     pub semantic_id: String,
@@ -109,6 +113,7 @@ impl BehaviorManifest {
         package_name: impl Into<String>,
         package_version: impl Into<String>,
         artifact: &ArtifactIdentityManifest,
+        artifact_bytes: &[u8],
         hir: &hir::Module,
     ) -> Result<Self, BehaviorManifestError> {
         let package_name = package_name.into();
@@ -142,6 +147,8 @@ impl BehaviorManifest {
                 language_version: LANGUAGE_VERSION_STR.to_string(),
             },
             artifact: BehaviorArtifact {
+                kind: BEHAVIOR_ARTIFACT_KIND_NBC_V1.to_string(),
+                digest: artifact_digest(artifact_bytes),
                 source_id: artifact.source_id().map(|id| id.to_string()),
                 semantic_id: artifact.semantic_id().to_string(),
                 artifact_id: artifact.artifact_id().to_string(),
@@ -176,13 +183,34 @@ impl BehaviorManifest {
         Ok(manifest)
     }
 
-    /// Domain-separated digest of the canonical manifest JSON.
+    /// Domain-separated digest of the canonical compact JSON representation.
+    /// Human-readable sidecar whitespace therefore does not participate in
+    /// manifest identity.
     pub fn digest(&self) -> Result<String, BehaviorManifestError> {
-        let bytes = self.to_json()?;
+        let mut normalized = self.clone();
+        normalized.normalize();
+        normalized.validate()?;
+        let bytes = serde_json::to_vec(&normalized).map_err(BehaviorManifestError::from)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(BEHAVIOR_MANIFEST_DIGEST_DOMAIN);
         hasher.update(&bytes);
         Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+    }
+
+    /// Verify that this sidecar accompanies the exact executable bytes it
+    /// claims to describe.
+    pub fn verify_artifact_bytes(
+        &self,
+        artifact_bytes: &[u8],
+    ) -> Result<(), BehaviorManifestError> {
+        let actual = artifact_digest(artifact_bytes);
+        if actual != self.artifact.digest {
+            return Err(BehaviorManifestError::ArtifactDigestMismatch {
+                expected: self.artifact.digest.clone(),
+                actual,
+            });
+        }
+        Ok(())
     }
 
     /// Manifest-level preflight for replacing a previously deployed package.
@@ -231,6 +259,13 @@ impl BehaviorManifest {
                     incoming: new.persistence,
                 });
             }
+            if new.persistence != old.persistence {
+                return Err(BehaviorAdmissionError::PersistenceClassChanged {
+                    actor: old.name.clone(),
+                    previous: old.persistence,
+                    incoming: new.persistence,
+                });
+            }
             if new.schema_version < old.schema_version {
                 return Err(BehaviorAdmissionError::SchemaDowngrade {
                     actor: old.name.clone(),
@@ -245,7 +280,20 @@ impl BehaviorManifest {
                         version: old.schema_version,
                     });
                 }
+                if new.migrations != old.migrations {
+                    return Err(BehaviorAdmissionError::ExistingMigrationTopologyChanged {
+                        actor: old.name.clone(),
+                    });
+                }
                 continue;
+            }
+
+            for old_step in &old.migrations {
+                if !new.migrations.iter().any(|step| step == old_step) {
+                    return Err(BehaviorAdmissionError::ExistingMigrationTopologyChanged {
+                        actor: old.name.clone(),
+                    });
+                }
             }
 
             for version in old.schema_version..new.schema_version {
@@ -296,6 +344,12 @@ impl BehaviorManifest {
                 "package version must not be empty".to_string(),
             ));
         }
+        if self.artifact.kind != BEHAVIOR_ARTIFACT_KIND_NBC_V1 {
+            return Err(BehaviorManifestError::UnsupportedArtifactKind(
+                self.artifact.kind.clone(),
+            ));
+        }
+        validate_blake3_digest("artifact.digest", &self.artifact.digest)?;
 
         let semantic_id =
             parse_identity::<SemanticId>("artifact.semantic_id", &self.artifact.semantic_id)?;
@@ -394,10 +448,39 @@ where
 }
 
 fn state_schema_semantic_id(schema: &ActorStateSchema) -> SemanticId {
+    // The manifest exposes state schema separately from migration/version
+    // identity. Strip RFC 0008 evolution metadata before hashing so a version
+    // bump with unchanged fields does not masquerade as a state-shape change.
+    let mut state_only = schema.clone();
+    state_only.version = 1;
+    state_only.migrations.clear();
     SemanticId::from_canonical_bytes(
-        &canonical_actor_state_schema_bytes(std::slice::from_ref(schema)),
+        &canonical_actor_state_schema_bytes(std::slice::from_ref(&state_only)),
         [],
     )
+}
+
+fn artifact_digest(bytes: &[u8]) -> String {
+    format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+
+fn validate_blake3_digest(
+    field: &'static str,
+    value: &str,
+) -> Result<(), BehaviorManifestError> {
+    let Some(hex) = value.strip_prefix("blake3:") else {
+        return Err(BehaviorManifestError::InvalidDigest {
+            field,
+            message: "expected blake3:<64 lowercase hex characters>".to_string(),
+        });
+    };
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(BehaviorManifestError::InvalidDigest {
+            field,
+            message: "expected blake3:<64 hex characters>".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn migration_steps(schema: &ActorStateSchema) -> Vec<BehaviorMigrationStep> {
@@ -490,7 +573,12 @@ fn actor_defs_by_name(module: &hir::Module) -> BTreeMap<String, &hir::ActorDef> 
 pub enum BehaviorManifestError {
     Json(String),
     UnsupportedSchema(String),
+    UnsupportedArtifactKind(String),
     InvalidPackage(String),
+    InvalidDigest {
+        field: &'static str,
+        message: String,
+    },
     InvalidIdentity {
         field: &'static str,
         message: String,
@@ -499,6 +587,10 @@ pub enum BehaviorManifestError {
     ArtifactIdentityMismatch {
         expected: ArtifactId,
         actual: ArtifactId,
+    },
+    ArtifactDigestMismatch {
+        expected: String,
+        actual: String,
     },
     ActorSchemaMismatch {
         actor: String,
@@ -517,7 +609,14 @@ impl fmt::Display for BehaviorManifestError {
                 f,
                 "unsupported behavior manifest schema '{schema}'; expected {BEHAVIOR_MANIFEST_SCHEMA}"
             ),
+            Self::UnsupportedArtifactKind(kind) => write!(
+                f,
+                "unsupported behavior manifest artifact kind '{kind}'; expected {BEHAVIOR_ARTIFACT_KIND_NBC_V1}"
+            ),
             Self::InvalidPackage(message) => write!(f, "invalid behavior manifest package: {message}"),
+            Self::InvalidDigest { field, message } => {
+                write!(f, "invalid {field} in behavior manifest: {message}")
+            }
             Self::InvalidIdentity { field, message } => {
                 write!(f, "invalid {field} in behavior manifest: {message}")
             }
@@ -527,6 +626,10 @@ impl fmt::Display for BehaviorManifestError {
             Self::ArtifactIdentityMismatch { expected, actual } => write!(
                 f,
                 "behavior manifest artifact identity mismatch: expected {expected}, got {actual}"
+            ),
+            Self::ArtifactDigestMismatch { expected, actual } => write!(
+                f,
+                "behavior manifest executable digest mismatch: expected {expected}, got {actual}"
             ),
             Self::ActorSchemaMismatch { actor } => {
                 write!(f, "typed actor schema '{actor}' has no matching HIR actor")
@@ -562,6 +665,11 @@ pub enum BehaviorAdmissionError {
         previous: BehaviorPersistence,
         incoming: BehaviorPersistence,
     },
+    PersistenceClassChanged {
+        actor: String,
+        previous: BehaviorPersistence,
+        incoming: BehaviorPersistence,
+    },
     SchemaDowngrade {
         actor: String,
         previous: u32,
@@ -575,6 +683,9 @@ pub enum BehaviorAdmissionError {
         actor: String,
         from: u32,
         to: u32,
+    },
+    ExistingMigrationTopologyChanged {
+        actor: String,
     },
 }
 
@@ -603,6 +714,14 @@ impl fmt::Display for BehaviorAdmissionError {
                 f,
                 "incoming deployment removes durability from '{actor}' ({previous:?} -> {incoming:?})"
             ),
+            Self::PersistenceClassChanged {
+                actor,
+                previous,
+                incoming,
+            } => write!(
+                f,
+                "incoming deployment changes persistence class for '{actor}' ({previous:?} -> {incoming:?}) without a storage-model migration contract"
+            ),
             Self::SchemaDowngrade {
                 actor,
                 previous,
@@ -618,6 +737,10 @@ impl fmt::Display for BehaviorAdmissionError {
             Self::MissingMigrationStep { actor, from, to } => write!(
                 f,
                 "incoming deployment lacks migration {from} -> {to} required for durable actor '{actor}'"
+            ),
+            Self::ExistingMigrationTopologyChanged { actor } => write!(
+                f,
+                "incoming deployment changes an existing migration topology for durable actor '{actor}'"
             ),
         }
     }
@@ -706,6 +829,8 @@ mod tests {
                 language_version: LANGUAGE_VERSION_STR.to_string(),
             },
             artifact: BehaviorArtifact {
+                kind: BEHAVIOR_ARTIFACT_KIND_NBC_V1.to_string(),
+                digest: artifact_digest(b"artifact-bytes"),
                 source_id: None,
                 semantic_id: schema_id(b"program"),
                 artifact_id: ArtifactId::from_semantic(
@@ -752,7 +877,13 @@ mod tests {
     #[test]
     fn typed_hir_emits_durable_schema_and_migration_metadata() {
         let manifest =
-            BehaviorManifest::from_typed_hir("demo", "0.1.0", &artifact(), &typed_hir(2)).unwrap();
+            BehaviorManifest::from_typed_hir(
+            "demo",
+            "0.1.0",
+            &artifact(),
+            b"compiled-nbc",
+            &typed_hir(2),
+        ).unwrap();
         assert_eq!(manifest.actors.len(), 1);
         let actor = &manifest.actors[0];
         assert_eq!(actor.name, "test::Counter");
@@ -826,6 +957,40 @@ mod tests {
         assert!(matches!(
             removed.validate_upgrade_from(&previous),
             Err(BehaviorAdmissionError::DurableOwnerRemoved { .. })
+        ));
+    }
+
+    #[test]
+    fn executable_digest_binds_sidecar_to_exact_bytes() {
+        let manifest = base_manifest(actor(1, b"schema-v1"));
+        manifest.verify_artifact_bytes(b"artifact-bytes").unwrap();
+        assert!(matches!(
+            manifest.verify_artifact_bytes(b"different-bytes"),
+            Err(BehaviorManifestError::ArtifactDigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn durable_persistence_model_changes_fail_closed() {
+        let previous = base_manifest(actor(1, b"schema-v1"));
+        let mut incoming = previous.clone();
+        incoming.actors[0].persistence = BehaviorPersistence::EventSourced;
+
+        assert!(matches!(
+            incoming.validate_upgrade_from(&previous),
+            Err(BehaviorAdmissionError::PersistenceClassChanged { .. })
+        ));
+    }
+
+    #[test]
+    fn existing_migration_topology_cannot_be_rewritten_during_upgrade() {
+        let previous = base_manifest(actor(2, b"schema-v2"));
+        let mut incoming = base_manifest(actor(3, b"schema-v3"));
+        incoming.actors[0].migrations[0].state = false;
+
+        assert!(matches!(
+            incoming.validate_upgrade_from(&previous),
+            Err(BehaviorAdmissionError::ExistingMigrationTopologyChanged { .. })
         ));
     }
 
