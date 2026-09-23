@@ -112,7 +112,6 @@ fn bench_message_drain(c: &mut Criterion) {
     group.finish();
 }
 
-
 /// End-to-end local message cost for an already-created actor.
 ///
 /// This combines the admission/enqueue path and scheduler/native-handler drain
