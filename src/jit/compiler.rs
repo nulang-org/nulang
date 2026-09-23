@@ -166,18 +166,17 @@ fn register_runtime_helpers<M: Module>(
 // Compilation
 // ---------------------------------------------------------------------------
 
-/// Native thunk metadata for a direct, straight-line leaf call.
+/// Native thunk metadata for a direct call.
 ///
-/// Leaf thunks use the ordinary JIT register ABI, but they execute against the
-/// caller's register file. `clobbers` therefore lists every register written
-/// by the callee body so the caller can preserve frame isolation around the
-/// native call. `ret_reg` is captured before those saved registers are
-/// restored.
+/// Native callees execute against the caller's register buffer. `preserve`
+/// contains the bounded caller-live registers that must survive the call.
+/// The thunk writes its tagged return value into a dedicated mailbox register
+/// immediately before returning; the caller captures that value before
+/// restoring `preserve`.
 #[derive(Debug, Clone)]
 pub(crate) struct NativeLeafCall {
     pub ptr: *const u8,
-    pub ret_reg: u8,
-    pub clobbers: Vec<u8>,
+    pub preserve: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -253,16 +252,17 @@ pub fn compile_bytecode_region(
         native_calls,
         &HashMap::new(),
         true,
+        None,
     )
 }
 
-/// Internal scalar compiler entry point used by native-leaf specialization.
+/// Internal scalar compiler entry point used by native direct-call specialization.
 ///
 /// `native_leaf_calls` replaces selected re-entrant interpreter calls with
-/// native-to-native calls. `inject_safepoint=false` is used only for leaf
-/// thunks, which run inside an outer region that already owns the scheduling
-/// safepoint; an early safepoint return from a leaf would otherwise look like
-/// successful function completion to its caller.
+/// native-to-native calls. `inject_safepoint=false` is used for bounded
+/// callee thunks that execute inside an outer region which already owns the
+/// scheduling safepoint. `return_mailbox` makes Ret/RetVal copy the tagged
+/// return value into a register in the shared ABI buffer before native return.
 pub(crate) fn compile_bytecode_region_with_options(
     module: &mut JITModule,
     builder_context: &mut FunctionBuilderContext,
@@ -274,6 +274,7 @@ pub(crate) fn compile_bytecode_region_with_options(
     native_calls: &HashMap<usize, usize>,
     native_leaf_calls: &HashMap<usize, NativeLeafCall>,
     inject_safepoint: bool,
+    return_mailbox: Option<u8>,
 ) -> Result<*const u8, CompileError> {
     ctx.clear();
 
@@ -793,7 +794,7 @@ pub(crate) fn compile_bytecode_region_with_options(
                     // Save every register the leaf may write so this exactly
                     // recreates a separate callee frame.
                     let saved: Vec<(u8, Value)> = leaf
-                        .clobbers
+                        .preserve
                         .iter()
                         .copied()
                         .map(|reg| (reg, load_reg(&mut builder, regs_ptr, reg as usize)))
@@ -808,7 +809,7 @@ pub(crate) fn compile_bytecode_region_with_options(
                         .ins()
                         .call_indirect(leaf_sig_ref, callee, &[regs_ptr, consts_ptr]);
 
-                    let ret = load_reg(&mut builder, regs_ptr, leaf.ret_reg as usize);
+                    let ret = load_reg(&mut builder, regs_ptr, 255);
                     for (reg, value) in saved {
                         store_reg(&mut builder, regs_ptr, reg as usize, value);
                     }
@@ -837,6 +838,15 @@ pub(crate) fn compile_bytecode_region_with_options(
             }
 
             OpCode::Ret | OpCode::RetVal => {
+                if let Some(mailbox) = return_mailbox {
+                    let src = if instr.opcode == OpCode::Ret {
+                        0
+                    } else {
+                        instr.op1 as usize
+                    };
+                    let ret = load_reg(&mut builder, regs_ptr, src);
+                    store_reg(&mut builder, regs_ptr, mailbox as usize, ret);
+                }
                 builder.ins().jump(return_block, &[]);
             }
             OpCode::DbgPrint => {}
