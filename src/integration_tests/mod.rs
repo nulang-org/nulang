@@ -3221,40 +3221,21 @@ match { a: 2, b: 9 } with {
         let actor = rt_ref.actors.get(&actor_id).unwrap();
         assert_eq!(
             actor.get_state_field("count").and_then(|v| v.as_int()),
-            Some(3),
-            "event-sourced counter should be 3 after three inc messages"
+            Some(0),
+            "emit without source-level apply/behavior mutation must not invent state changes"
         );
         assert_eq!(actor.event_log.len(), 3, "three events should be logged");
         assert_eq!(actor.event_log[0].0, "Incremented");
     }
 
-    /// PLAN.md bullet 8 (persistence recovery correctness): does recovery
-    /// of an `event_sourced` field with an `apply` handler reproduce the
-    /// value a never-crashed run would reach? It does not -- see
-    /// SPEC2.md §9.6's "Implementation status" note for full analysis.
-    /// This test pins the CURRENT (buggy) recovered value so a silent
-    /// regression or silent fix is caught either way, rather than
-    /// leaving the gap purely as a documentation claim.
+    /// Event-sourced recovery must preserve the exact post-apply value.
     ///
-    /// Baseline (no crash): `entity Counter` with
-    /// `apply | Incremented(by) => self.count = self.count + by`, sent
-    /// `increment(3)` then `increment(4)`, reaches count = 9 -- this
-    /// matches `persist_07_emit_accumulates_across_sends.nula`'s real
-    /// captured output (apply computes `count + by`, plus an
-    /// unconditional "+1" every `event_sourced` field gets per emit,
-    /// see `persist_08_emit_bumps_all_event_sourced.json`).
-    ///
-    /// With a crash-and-recover between the two sends, recovery ignores
-    /// the first event's `by = 3` entirely (it only counts "one event
-    /// happened": `recover_actor` reconstructs `event_sourced` fields as
-    /// a bare count of persisted `EventEntry` rows, never running the
-    /// `apply` handler against their `args`), landing on 1 instead of
-    /// the live value of 4. The second send then applies on top of that
-    /// wrong base, landing the whole run on 6 instead of 9.
-    /// EventSourced fields with non-trivial `apply` handlers survive
-    /// crash + recovery: `emit_event` persists the post-apply field value
-    /// and `recover_actor` restores it (SPEC2 §9.6; was a bare event
-    /// count before the fix).
+    /// `emit` itself is state-neutral: source-level `apply` handlers (or
+    /// explicit behavior code) are the sole authority for domain-state
+    /// mutation. For increments of 3 then 4, both a never-crashed run and a
+    /// crash/recover run therefore reach 7. Persisted EventEntry values capture
+    /// the post-apply field value so recovery does not need to re-execute the
+    /// apply bytecode.
     #[test]
     fn test_event_sourced_apply_handler_recovery() {
         let source = r#"
@@ -3306,8 +3287,8 @@ match { a: 2, b: 9 } with {
             .and_then(|v| v.as_int())
             .unwrap();
         assert_eq!(
-            baseline_count, 9,
-            "sanity: must match persist_07 conformance case's real captured output"
+            baseline_count, 7,
+            "source-level apply is the sole state mutation: 0 + 3 + 4"
         );
 
         // Same two messages, but with a crash+recover in between them.
@@ -3329,9 +3310,8 @@ match { a: 2, b: 9 } with {
                 .unwrap()
                 .get_state_field("count")
                 .and_then(|v| v.as_int()),
-            Some(4),
-            "live (pre-crash) value after one increment(3): apply's 0+3, \
-             plus the unconditional +1 bump"
+            Some(3),
+            "live pre-crash value comes only from apply: 0 + 3"
         );
 
         let rt2 = Rc::new(RefCell::new(Runtime::new()));
@@ -3344,10 +3324,14 @@ match { a: 2, b: 9 } with {
         );
         rt2.borrow_mut().recover_actor(actor_id);
         assert_eq!(
-            rt2.borrow().actors.get(&actor_id).unwrap()
-                .get_state_field("count").and_then(|v| v.as_int()),
-            Some(4),
-            "recovered value: apply handler now runs before emit, snapshot captures post-apply value"
+            rt2.borrow()
+                .actors
+                .get(&actor_id)
+                .unwrap()
+                .get_state_field("count")
+                .and_then(|v| v.as_int()),
+            Some(3),
+            "recovered value restores the persisted post-apply state"
         );
 
         rt2.borrow_mut()
@@ -3362,7 +3346,7 @@ match { a: 2, b: 9 } with {
             .and_then(|v| v.as_int())
             .unwrap();
         assert_eq!(
-            recovered_count, 9,
+            recovered_count, 7,
             "recovered and continued: reaches {baseline_count} like the never-crashed baseline"
         );
     }
