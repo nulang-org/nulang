@@ -1128,6 +1128,28 @@ impl Runtime {
         workflow::signal_workflow(self, actor_id, name, payload)
     }
 
+    /// Return the representation-independent durable waits currently observable
+    /// for an actor-backed workflow.
+    ///
+    /// The returned identities are derived from existing durable state and do
+    /// not change snapshot, bytecode, or journal formats.
+    pub fn durable_waits(&self, actor_id: u64) -> Vec<crate::primitives::DurableWait> {
+        workflow::durable_waits(self, actor_id)
+    }
+
+    /// Resolve the exact current externally-wakeable durable wait.
+    ///
+    /// Replaying the same wake after resolution is idempotent. Runtime-owned
+    /// timer waits and backend-owned external-effect waits are observable but
+    /// reject manual waking.
+    pub fn wake_durable_wait(
+        &mut self,
+        wait: &crate::primitives::DurableWait,
+        payload: Option<String>,
+    ) -> std::io::Result<crate::primitives::DurableWakeResult> {
+        workflow::wake_durable_wait(self, wait, payload)
+    }
+
     /// Register a read-only query handler on a workflow actor.
     ///
     /// The handler is a function/closure value invoked by `query_workflow`
@@ -5201,6 +5223,20 @@ impl Runtime {
                 .filter(|e| e.sequence() > snapshot.sequence)
                 .cloned()
                 .collect();
+            // Signal delivery is sticky in the live runtime: once received,
+            // later waits for the same signal observe it as ready. Rebuild that
+            // sticky set from the full durable journal, not only entries after
+            // the latest snapshot. A SignalReceived event may have caused a
+            // checkpoint whose sequence is newer than the event itself.
+            let durable_received_signals: Vec<(String, Option<String>)> = workflow_events
+                .iter()
+                .filter_map(|event| match event {
+                    WorkflowEvent::SignalReceived { name, payload, .. } => {
+                        Some((name.clone(), payload.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
             let mut fired_timer_names: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             for event in &events_to_replay {
@@ -5213,6 +5249,9 @@ impl Runtime {
                     Self::apply_workflow_event(actor, event);
                     actor.sequence = event.sequence();
                 }
+            }
+            if let Some(actor) = self.actors.get_mut(&actor_id) {
+                actor.received_signals = durable_received_signals;
             }
             // Re-arm timers that were set before the snapshot/replay but have
             // not yet fired. Timers are reconstructed from the full durable
