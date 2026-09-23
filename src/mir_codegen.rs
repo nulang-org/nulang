@@ -2151,9 +2151,10 @@ pub fn compile_mir(mir: &mut mir::Module, module_name: impl Into<String>) -> NuR
 //   - it has at least one definition (never-assigned registers may hold
 //     VM-written values such as ReceiveMatch payloads, which follow the
 //     foreign-ref protocol and must not be dropped locally);
-//   - every definition is an owning rvalue — Tuple/Record/ArrayLit (fresh
-//     allocation) or Const (never a heap pointer) — that does not read the
-//     local itself;
+//   - every definition is either an owning rvalue — Tuple/Record/ArrayLit
+//     (fresh allocation), StrConcat (fresh string), or Const (non-aliasing)
+//     — or a proven ownership transfer from another candidate, and does not
+//     read the destination local itself;
 //   - no use copies the value through an uncounted channel: Move/Load,
 //     `&`/`*`, call or effect arguments, closure captures, sends/asks,
 //     returns/resumes, `StateSet`, or the AI builtins' staging moves.
