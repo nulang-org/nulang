@@ -1156,6 +1156,7 @@ impl EffectChecker {
             self.check_decl(decl)?;
         }
         check_durable_determinism(&flat)?;
+        crate::migration_purity::check_module(decls)?;
         self.check_resource_grants()?;
         Ok(())
     }

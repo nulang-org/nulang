@@ -27,6 +27,8 @@ pub mod type_ir;
 pub mod diagnostic;
 #[path = "../../../src/lexer.rs"]
 pub mod lexer;
+#[path = "../../../src/migration_purity.rs"]
+pub mod migration_purity;
 #[path = "../../../src/ast.rs"]
 pub mod ast;
 #[path = "../../../src/authority.rs"]
