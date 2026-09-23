@@ -4284,8 +4284,8 @@ impl Runtime {
     /// Schedule a durable timer for a workflow actor.
     ///
     /// Appends a `TimerSet` event, checkpoints state, and arms the runtime's
-    /// timer wheel. When the timer fires the runtime will append a
-    /// `TimerFired` event and deliver a `__timer_fired` message to the actor.
+    /// timer wheel. When the timer fires the runtime atomically commits the
+    /// `TimerFired` event together with the corresponding step advance.
     pub fn schedule_workflow_timer(&mut self, actor_id: u64, name: &str, duration_ms: u64) {
         workflow::schedule_workflow_timer(self, actor_id, name, duration_ms)
     }
@@ -4654,11 +4654,16 @@ impl Runtime {
                                 actor_id = target_actor,
                                 timer = context,
                                 %error,
-                                "nulang-persist: refusing to deliver fired workflow timer without atomic durable commit"
+                                "nulang-persist: refusing to advance fired workflow timer without atomic durable commit"
                             );
                             self.rearm_timer(target_actor, &context, DURABLE_TIMER_COMMIT_RETRY_MS);
-                            continue;
                         }
+                        // Durable workflow timers target the internal
+                        // __timer_fired behavior, whose only state effect is
+                        // now staged in append_timer_fired before commit.
+                        // Delivering the message as well would increment
+                        // step_index twice.
+                        continue;
                     }
                     self.send_message_by_id(target_actor, behavior_id, &payload);
                 }
