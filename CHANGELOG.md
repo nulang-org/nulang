@@ -51,6 +51,13 @@ version + migration.*
 
 ## Stable tier
 
+### Dense terminal Tier-2 JIT state — 2026-09-22
+- **Post-compilation hotness now lives beside each dense compiled-region cache entry** (`src/jit/mod.rs`) instead of a separate `FxHashMap<(module, pc), counter>`, removing the hash probe from repeated native-region entry.
+- **Tier-2 probing is terminal**: untyped regions stop probing once no new static type information can appear; typed regions get one SIMD specialization attempt and then stop paying counter updates.
+- **SIMD promotion can replace an existing Tier-1 cache entry** through a distinct Tier-2 symbol instead of short-circuiting on the already-cached pointer.
+- **Regression tests cover terminal counters, session isolation, and cached-region SIMD promotion behavior** (`src/jit/tests.rs`).
+
+
 ### Indexed selective receive — 2026-09-22
 - **Selective receive now builds per-lane behavior indexes while staging arrivals** (`src/runtime/mailbox.rs`), replacing the previous full staged-mailbox scan with behavior-to-position lookup plus FIFO candidate selection across requested arms.
 - **Guard retries reuse per-behavior cursors** instead of restarting from the front of every staged lane; commit/pop invalidates positional indexes and the next receive rebuilds lazily.
