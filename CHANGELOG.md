@@ -54,6 +54,9 @@ version + migration.*
 ### MIR scalar copy propagation and constant-branch pruning — 2026-09-22
 - **Canonical MIR optimization now removes redundant definitely-scalar block-local copies and folds locally-proven constant branches before bytecode lowering** (`src/mir_codegen.rs`). The pass remains conservative across CFG boundaries and excludes heap-capable locals so ownership/drop semantics are unchanged. Unreachable pruning preserves effect-handler roots, and reachable `Panic` is explicitly treated as observable/divergent so DCE cannot erase contract failures.
 
+### Typed JIT native SSA across arithmetic, loops, and simple CFGs — 2026-09-22
+- **The typed Cranelift JIT now keeps proven Int/Float values in native SSA form across arithmetic chains, simple loop backedges, and conservative forward-branch joins** (`src/jit/typed_compiler.rs`). It preserves Nulang's 48-bit integer wrap, nullable division/modulo behavior, NaN canonicalization, and runtime-helper fallbacks while avoiding repeated tag/unbox/register-file round trips. Per-block forward must-type analysis makes type facts CFG-derived rather than bytecode-emission-order-dependent. The implementation is the current-main replay of the independently tested #738→#768→#770→#771→#773→#774 stack.
+
 ### Candidate-only JIT hotness probing — 2026-09-22
 - **Cold interpreted execution now probes JIT hotness only at candidate compiled-region entries** (`src/vm.rs`). The VM precomputes per-module candidates for execution/function/behavior entries, source-statement starts, branch targets/fallthroughs, and successors of compilation boundaries, avoiding JIT backend dispatch and hot-counter mutation at ordinary straight-line bytecode PCs without changing language semantics.
 
