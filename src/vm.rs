@@ -3678,8 +3678,6 @@ impl VM {
 
     #[cfg(not(feature = "native-codegen"))]
     fn try_jit_execute(&mut self, _frame_idx: usize) -> bool {
-    #[cfg(not(feature = "native-codegen"))]
-    fn try_jit_execute(&mut self, _frame_idx: usize) -> bool {
         false
     }
 
