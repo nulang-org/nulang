@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Multi-field event persistence — 2026-09-23
+- **Event stores preserve multiple `event_sourced` fields at one actor sequence.** libSQL and Postgres migrate canonical event writes to `events_v2` keyed by `(actor_id, sequence, field_name)`; RocksDB includes the field name in its event key. The libSQL migration is integrated with RFC 0022 so a first atomic transition recognizes both legacy `events` and migrated `events_v2` history when fencing its predecessor.
+
 ### RFC 0008 migration purity enforcement — 2026-09-22
 - **Entity migration bodies now fail compilation when they contain nondeterministic or externally visible operations** (`src/migration_purity.rs`, `src/effect_checker.rs`). The public effect-checking pipeline rejects direct or transitively hidden `perform`, spawn/send/ask/receive, actor migration, grain lookup, continuation resume, defer/errdefer, and extern/FFI calls; locally handling an effect does not launder it. Pure helpers and replay-stream `emit` remain allowed, and the existing conformance proof-of-gap now expects compilation failure.
 
