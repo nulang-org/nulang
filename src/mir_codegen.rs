@@ -2550,7 +2550,7 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
     // source would free the destination out from under that alias.
     loop {
         let mut changed = false;
-        for &(_, (dst, src)) in &transfer_sites {
+        for (_, &(dst, src)) in &transfer_sites {
             if candidate[src] && !candidate[dst] {
                 candidate[src] = false;
                 changed = true;
