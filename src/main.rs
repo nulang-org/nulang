@@ -1769,10 +1769,7 @@ fn standalone_package_identity(file_path: Option<&str>) -> (String, String) {
 }
 
 #[cfg(feature = "wasm-backend")]
-fn emit_wasm_cyclonedx_sbom(
-    file_path: Option<&str>,
-    wasm_file: &str,
-) -> NuResult<PathBuf> {
+fn emit_wasm_cyclonedx_sbom(file_path: Option<&str>, wasm_file: &str) -> NuResult<PathBuf> {
     let (package_name, package_version) = standalone_package_identity(file_path);
     let sbom = serde_json::json!({
         "bomFormat": "CycloneDX",
@@ -1797,7 +1794,10 @@ fn emit_wasm_cyclonedx_sbom(
     })?;
     let out = PathBuf::from(format!("{wasm_file}.cdx.json"));
     std::fs::write(&out, bytes).map_err(|error| NuError::VMError {
-        msg: format!("failed to write CycloneDX SBOM '{}': {error}", out.display()),
+        msg: format!(
+            "failed to write CycloneDX SBOM '{}': {error}",
+            out.display()
+        ),
         span: Span::default(),
     })?;
     Ok(out)
