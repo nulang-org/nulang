@@ -1293,6 +1293,28 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS events_v2 (
+                    actor_id INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    field_name TEXT NOT NULL,
+                    event_name TEXT NOT NULL,
+                    args TEXT NOT NULL,
+                    value TEXT NOT NULL DEFAULT '1',
+                    PRIMARY KEY (actor_id, sequence, field_name)
+                )",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "INSERT OR IGNORE INTO events_v2
+                 (actor_id, sequence, field_name, event_name, args, value)
+                 SELECT actor_id, sequence, field_name, event_name, args, value FROM events",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             // Atomic durable-transition storage (RFC 0022). These tables are
             // additive to the legacy snapshot/journal tables so historical
             // stores remain readable while new commits gain one transaction
@@ -2015,7 +2037,7 @@ impl PersistenceStore for LibsqlStore {
             let value_json = serde_json::to_string(&entry.value)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             conn.execute(
-                "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO events_v2 (actor_id, sequence, field_name, event_name, args, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 libsql::params![actor_id as i64, entry.sequence as i64, entry.field_name, entry.event_name, args_json, value_json],
             ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
         })
@@ -2028,8 +2050,8 @@ impl PersistenceStore for LibsqlStore {
 
             if let Ok(mut rows) = conn
                 .query(
-                    "SELECT sequence, field_name, event_name, args, value FROM events
-                     WHERE actor_id = ?1 ORDER BY sequence ASC",
+                    "SELECT sequence, field_name, event_name, args, value FROM events_v2
+                     WHERE actor_id = ?1 ORDER BY sequence ASC, field_name ASC",
                     libsql::params![actor_id as i64],
                 )
                 .await
@@ -2149,7 +2171,7 @@ impl PersistenceStore for LibsqlStore {
             let event_seq: Option<i64> = async {
                 let mut rows = conn
                     .query(
-                        "SELECT sequence FROM events WHERE actor_id = ?1 ORDER BY sequence DESC LIMIT 1",
+                        "SELECT sequence FROM events_v2 WHERE actor_id = ?1 ORDER BY sequence DESC LIMIT 1",
                         libsql::params![actor_id as i64],
                     )
                     .await
@@ -2188,6 +2210,7 @@ impl PersistenceStore for LibsqlStore {
                 "journal",
                 "workflow_events",
                 "events",
+                "events_v2",
                 "durable_workflow_events",
                 "durable_domain_events",
                 "durable_effect_records",
@@ -2251,6 +2274,15 @@ impl RocksDbStore {
         let mut key = [0u8; 16];
         key[..8].copy_from_slice(&actor_id.to_be_bytes());
         key[8..].copy_from_slice(&sequence.to_be_bytes());
+        key
+    }
+
+    fn actor_event_key(actor_id: u64, sequence: u64, field_name: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(17 + field_name.len());
+        key.extend_from_slice(&actor_id.to_be_bytes());
+        key.extend_from_slice(&sequence.to_be_bytes());
+        key.push(0);
+        key.extend_from_slice(field_name.as_bytes());
         key
     }
 
@@ -2366,7 +2398,7 @@ impl PersistenceStore for RocksDbStore {
         self.db
             .put_cf(
                 cf,
-                Self::actor_seq_key(actor_id, entry.sequence),
+                Self::actor_event_key(actor_id, entry.sequence, &entry.field_name),
                 json.as_bytes(),
             )
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -2431,9 +2463,9 @@ impl PersistenceStore for RocksDbStore {
             Self::CF_EVENTS,
         ] {
             let cf = self.cf(cf_name)?;
-            // Start from the bare actor prefix.  Snapshot keys are exactly 8
-            // bytes; journal/event keys are 16 bytes (actor || sequence).
-            // Both layouts sort contiguously under the actor prefix.
+            // Start from the bare actor prefix. Snapshot keys are exactly 8
+            // bytes; journal/workflow keys are 16 bytes; event keys may carry
+            // a field-name suffix. All remain contiguous under this prefix.
             let actor_key = Self::actor_key(actor_id);
             let mut iter = self.db.iterator_cf(
                 cf,
@@ -2535,6 +2567,27 @@ impl PostgresStore {
                 value TEXT NOT NULL DEFAULT '1',
                 PRIMARY KEY (actor_id, sequence)
             )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS events_v2 (
+                actor_id BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                field_name TEXT NOT NULL,
+                event_name TEXT NOT NULL,
+                args TEXT NOT NULL,
+                value TEXT NOT NULL DEFAULT '1',
+                PRIMARY KEY (actor_id, sequence, field_name)
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "INSERT INTO events_v2
+             (actor_id, sequence, field_name, event_name, args, value)
+             SELECT actor_id, sequence, field_name, event_name, args, value FROM events
+             ON CONFLICT (actor_id, sequence, field_name) DO NOTHING",
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -2714,10 +2767,9 @@ impl PersistenceStore for PostgresStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value)
+            "INSERT INTO events_v2 (actor_id, sequence, field_name, event_name, args, value)
              VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (actor_id, sequence) DO UPDATE SET
-               field_name = EXCLUDED.field_name,
+             ON CONFLICT (actor_id, sequence, field_name) DO UPDATE SET
                event_name = EXCLUDED.event_name,
                args = EXCLUDED.args,
                value = EXCLUDED.value",
@@ -2740,8 +2792,8 @@ impl PersistenceStore for PostgresStore {
             Err(_) => return Vec::new(),
         };
         let rows = match conn.query(
-            "SELECT sequence, field_name, event_name, args, value FROM events
-             WHERE actor_id = $1 ORDER BY sequence ASC",
+            "SELECT sequence, field_name, event_name, args, value FROM events_v2
+             WHERE actor_id = $1 ORDER BY sequence ASC, field_name ASC",
             &[&(actor_id as i64)],
         ) {
             Ok(r) => r,
@@ -2798,7 +2850,7 @@ impl PersistenceStore for PostgresStore {
             .map(|row| row.get(0));
         let event_seq: Option<i64> = conn
             .query_opt(
-                "SELECT sequence FROM events WHERE actor_id = $1 ORDER BY sequence DESC LIMIT 1",
+                "SELECT sequence FROM events_v2 WHERE actor_id = $1 ORDER BY sequence DESC LIMIT 1",
                 &[&(actor_id as i64)],
             )
             .ok()
@@ -2813,7 +2865,13 @@ impl PersistenceStore for PostgresStore {
 
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        for table in ["snapshots", "journal", "workflow_events", "events"] {
+        for table in [
+            "snapshots",
+            "journal",
+            "workflow_events",
+            "events",
+            "events_v2",
+        ] {
             conn.execute(
                 &format!("DELETE FROM {} WHERE actor_id = $1", table),
                 &[&(actor_id as i64)],
@@ -3243,6 +3301,33 @@ mod rocksdb_store_tests {
     }
 
     #[test]
+    fn test_rocksdb_store_preserves_multiple_event_fields_at_same_sequence() {
+        let dir = fresh_dir("multi_field_events");
+        let mut store = RocksDbStore::new(&dir).unwrap();
+        for (field_name, value) in [("balance", 125), ("attempts", 7)] {
+            store
+                .append_event(
+                    1,
+                    EventEntry {
+                        sequence: 1,
+                        field_name: field_name.to_string(),
+                        event_name: "Deposited".to_string(),
+                        args: vec![PersistedValue::Int(25)],
+                        value: PersistedValue::Int(value),
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut events = store.read_events(1);
+        events.sort_by(|a, b| a.field_name.cmp(&b.field_name));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].field_name, "attempts");
+        assert_eq!(events[1].field_name, "balance");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_rocksdb_store_latest_sequence() {
         let dir = fresh_dir("latest_seq");
         let mut store = RocksDbStore::new(&dir).unwrap();
@@ -3436,6 +3521,37 @@ mod postgres_store_tests {
         assert_eq!(journal[0].sequence, 1);
         assert_eq!(journal[1].behavior_id, 1);
         assert_eq!(journal[1].payload, vec![PersistedValue::Int(20)]);
+        store.clear(actor_id).unwrap();
+    }
+
+    #[test]
+    fn test_postgres_store_preserves_multiple_event_fields_at_same_sequence() {
+        let url = match pg_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let mut store = PostgresStore::new(&url).unwrap();
+        let actor_id = fresh_actor_id();
+        for (field_name, value) in [("balance", 125), ("attempts", 7)] {
+            store
+                .append_event(
+                    actor_id,
+                    EventEntry {
+                        sequence: 1,
+                        field_name: field_name.to_string(),
+                        event_name: "Deposited".to_string(),
+                        args: vec![PersistedValue::Int(25)],
+                        value: PersistedValue::Int(value),
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut events = store.read_events(actor_id);
+        events.sort_by(|a, b| a.field_name.cmp(&b.field_name));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].field_name, "attempts");
+        assert_eq!(events[1].field_name, "balance");
         store.clear(actor_id).unwrap();
     }
 
