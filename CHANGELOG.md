@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Timer callback behavior-zero correctness — 2026-09-22
+- **`Timer.after` now preserves a valid behavior id 0 and fails closed for unknown callback names** (`src/runtime/callbacks.rs`). The runtime no longer maps failed callback lookup to 0 and then filters 0 out; declared first behaviors are schedulable, while unknown names emit a warning and create no timer. Focused regressions cover both cases.
+
+
 ### RFC 0008 migration purity enforcement — 2026-09-22
 - **Entity migration bodies now fail compilation when they contain nondeterministic or externally visible operations** (`src/migration_purity.rs`, `src/effect_checker.rs`). The public effect-checking pipeline rejects direct or transitively hidden `perform`, spawn/send/ask/receive, actor migration, grain lookup, continuation resume, defer/errdefer, and extern/FFI calls; locally handling an effect does not launder it. Pure helpers and replay-stream `emit` remain allowed, and the existing conformance proof-of-gap now expects compilation failure.
 
