@@ -16,6 +16,15 @@ use std::time::{Duration, Instant};
 
 fn noop_test_behavior(_actor: &mut Actor, _args: &[Value]) {}
 
+fn increment_step_test_behavior(actor: &mut Actor, _args: &[Value]) {
+    if let Some(step) = actor
+        .get_state_field("step_index")
+        .and_then(|value| value.as_int())
+    {
+        actor.set_state_field("step_index", Value::int(step + 1));
+    }
+}
+
 fn declare_test_behavior(rt: &mut Runtime, actor_id: u64, name: &str) {
     rt.actors
         .get_mut(&actor_id)
@@ -3471,6 +3480,100 @@ fn test_workflow_runtime_uses_atomic_transition_api() {
     let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
     assert_eq!(snapshot.sequence, 5);
     assert_eq!(rt.persistence.latest_sequence(actor_id), 5);
+}
+
+#[test]
+fn test_workflow_command_acceptance_keeps_atomic_tail_contiguous() {
+    let store = AtomicWorkflowTestStore::new();
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store.clone());
+
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "CommandWorkflow",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+
+    let behavior_id = {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.register_behavior("__command_probe", noop_test_behavior);
+        actor.behavior_table.len() as u16 - 1
+    };
+    rt.send_message_by_id(actor_id, behavior_id, &[]);
+    rt.step_actor(actor_id);
+
+    {
+        let inner = store.inner.lock().unwrap();
+        let transitions = inner.committed_transitions(actor_id);
+        assert_eq!(transitions.len(), 2);
+        assert_eq!(transitions[0].sequence, 1);
+        assert!(transitions[0].command.is_none());
+        assert_eq!(transitions[1].sequence, 2);
+        assert_eq!(
+            transitions[1]
+                .command
+                .as_ref()
+                .map(|command| command.behavior_id),
+            Some(behavior_id)
+        );
+        assert!(transitions[1].snapshot.is_none());
+    }
+
+    // This is the regression: a legacy journal write here used to advance
+    // latest_sequence to 2 while the atomic tail remained at 1, causing this
+    // next transition to fail predecessor fencing.
+    rt.append_signal_received(actor_id, "after-command", None)
+        .unwrap();
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 3);
+    let events = rt.persistence.read_workflow_events(actor_id);
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        &events[1],
+        WorkflowEvent::SignalReceived { sequence: 3, name, .. } if name == "after-command"
+    ));
+}
+
+#[test]
+fn test_workflow_command_failure_requeues_without_execution() {
+    let store = AtomicWorkflowTestStore::new();
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store.clone());
+
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "CommandFailureWorkflow",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+
+    let behavior_id = {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.register_behavior("__command_probe", increment_step_test_behavior);
+        actor.behavior_table.len() as u16 - 1
+    };
+    store.set_fail_commits(true);
+    rt.send_message_by_id(actor_id, behavior_id, &[]);
+    rt.step_actor(actor_id);
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(actor.state, ActorState::Suspended);
+    assert_eq!(
+        actor
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
+        Some(0),
+        "handler must not run before durable command acceptance"
+    );
+    assert_eq!(actor.mailbox.len(), 1, "unaccepted command must be requeued");
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 1);
+    assert!(rt.persistence.read_journal(actor_id).is_empty());
 }
 
 #[test]
