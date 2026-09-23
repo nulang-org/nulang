@@ -524,6 +524,29 @@ impl Scheduler {
         }
     }
 
+    /// True when any priority queue still contains runnable work.
+    ///
+    /// The runtime checks this at actor-turn boundaries to choose a
+    /// throughput/fairness budget; it is not intended as a synchronization
+    /// primitive or an exact concurrent emptiness guarantee.
+    pub fn has_ready_work(&self) -> bool {
+        for priority in [
+            ActorPriority::High,
+            ActorPriority::Normal,
+            ActorPriority::Low,
+        ] {
+            if !self.global_for(priority).is_empty()
+                || self
+                    .workers_for(priority)
+                    .iter()
+                    .any(|worker| !worker.is_empty())
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Number of configured worker slots.
     pub fn worker_count(&self) -> usize {
         self.worker_count
