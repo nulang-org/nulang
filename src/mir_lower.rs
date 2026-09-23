@@ -640,7 +640,8 @@ impl<'c> FnLowerer<'c> {
             hir::Stmt::Let { span, .. }
             | hir::Stmt::Assign { span, .. }
             | hir::Stmt::StateSet { span, .. }
-            | hir::Stmt::Emit { span, .. } => span.line(),
+            | hir::Stmt::Emit { span, .. }
+            | hir::Stmt::ParallelMarker { span, .. } => span.line(),
         } as u32;
         if line != 0 {
             self.b.set_line(line);
@@ -672,6 +673,10 @@ impl<'c> FnLowerer<'c> {
                     event: event.clone(),
                     args: ids,
                 });
+                Ok(())
+            }
+            hir::Stmt::ParallelMarker { marker, .. } => {
+                self.b.emit(mir::Stmt::ParallelMarker { marker: *marker });
                 Ok(())
             }
         }
@@ -2519,7 +2524,9 @@ fn count_local_uses(func: &mir::Function) -> Vec<usize> {
                     used.push(*idx);
                     used.push(*src);
                 }
-                mir::Stmt::EnterHandle { .. } | mir::Stmt::PopHandler => {}
+                mir::Stmt::EnterHandle { .. }
+                | mir::Stmt::PopHandler
+                | mir::Stmt::ParallelMarker { .. } => {}
                 mir::Stmt::Emit { args, .. } => used.extend(args.iter().copied()),
                 mir::Stmt::StateSet { src, .. } => used.push(*src),
             }
@@ -2629,6 +2636,7 @@ fn walk_hir_body(body: &hir::Body, acc: &mut HashSet<String>) {
                     walk_hir_operand(a, acc);
                 }
             }
+            hir::Stmt::ParallelMarker { .. } => {}
         }
     }
     match &body.terminator {
@@ -2870,6 +2878,32 @@ mod tests {
             .iter()
             .find(|f| f.name == name)
             .unwrap_or_else(|| panic!("function '{}' not lowered", name))
+    }
+
+    #[test]
+    fn test_par_region_markers_survive_into_mir() {
+        let module = lower_source("par { 1; 2; 3 }").unwrap();
+        let main = find_fn(&module, "__main");
+        let markers: Vec<crate::parallel_marker::ParallelRegionMarker> = main
+            .blocks
+            .iter()
+            .flat_map(|b| b.stmts.iter())
+            .filter_map(|stmt| match stmt {
+                mir::Stmt::ParallelMarker { marker } => Some(*marker),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            markers,
+            vec![
+                crate::parallel_marker::ParallelRegionMarker::Begin { branches: 3 },
+                crate::parallel_marker::ParallelRegionMarker::Branch { index: 0 },
+                crate::parallel_marker::ParallelRegionMarker::Branch { index: 1 },
+                crate::parallel_marker::ParallelRegionMarker::Branch { index: 2 },
+                crate::parallel_marker::ParallelRegionMarker::End,
+            ]
+        );
     }
 
     #[test]

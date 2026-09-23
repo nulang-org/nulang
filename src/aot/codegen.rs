@@ -2144,10 +2144,11 @@ fn compile_stmt(
             local_vals.insert(reg, val);
             Ok(())
         }
-        mir::Stmt::EnterHandle { .. } | mir::Stmt::PopHandler => {
-            // Handler tables and the handler stack are a runtime (VM)
-            // concept — at the AOT level these are no-ops.  The handler
-            // body is compiled inline as ordinary blocks.
+        mir::Stmt::EnterHandle { .. }
+        | mir::Stmt::PopHandler
+        | mir::Stmt::ParallelMarker { .. } => {
+            // Handler tables and parallel-region markers are compile-time /
+            // VM metadata at this backend boundary and emit no native code.
             Ok(())
         }
         mir::Stmt::StoreFieldNamed { obj, field, src } => {

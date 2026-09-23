@@ -771,6 +771,11 @@ impl MirCodegen {
                     args.len() as u8,
                 ));
             }
+            mir::Stmt::ParallelMarker { .. } => {
+                // Compile-time structured-concurrency metadata only. The
+                // bytecode path remains sequential until RFC 0024 Phase 2
+                // scheduling semantics are implemented.
+            }
         }
         Ok(())
     }
@@ -1996,6 +2001,7 @@ fn stmt_reads(stmt: &mir::Stmt, out: &mut HashSet<mir::LocalId>) {
     use mir::Stmt;
     match stmt {
         Stmt::Assign { op, .. } => rvalue_reads(op, out),
+        Stmt::ParallelMarker { .. } => {}
         Stmt::StoreFieldNamed { obj, src, .. } => {
             out.insert(*obj);
             out.insert(*src);
@@ -2349,7 +2355,9 @@ fn stmt_uses(stmt: &mir::Stmt) -> Vec<(usize, UseKind)> {
             (idx.0 as usize, UseKind::ReadOnly),
             (src.0 as usize, UseKind::Retaining),
         ],
-        mir::Stmt::EnterHandle { .. } | mir::Stmt::PopHandler => Vec::new(),
+        mir::Stmt::EnterHandle { .. }
+        | mir::Stmt::PopHandler
+        | mir::Stmt::ParallelMarker { .. } => Vec::new(),
         mir::Stmt::Emit { args, .. } => {
             args.iter().map(|a| (a.0 as usize, UseKind::Copy)).collect()
         }

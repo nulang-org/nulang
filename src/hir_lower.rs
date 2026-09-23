@@ -1653,7 +1653,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             });
             hir::Operand::Var(temp, ty)
         }
-        Expr::Block { exprs, span: _ } | Expr::Par { exprs, span: _ } => {
+        Expr::Block { exprs, span: _ } => {
             push_defer_scope();
             let mut last = hir::Operand::Unit;
             for e in exprs {
@@ -1677,6 +1677,51 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
                     }
                     let _ = lower_expr(&expr, body);
                 }
+            } else {
+                let _ = pop_defer_scope();
+            }
+            last
+        }
+        Expr::Par { exprs, span } => {
+            body.push(hir::Stmt::ParallelMarker {
+                marker: crate::parallel_marker::ParallelRegionMarker::Begin {
+                    branches: exprs.len() as u32,
+                },
+                span: *span,
+            });
+            push_defer_scope();
+            let mut last = hir::Operand::Unit;
+            for (index, e) in exprs.iter().enumerate() {
+                if body.is_terminated() {
+                    break;
+                }
+                body.push(hir::Stmt::ParallelMarker {
+                    marker: crate::parallel_marker::ParallelRegionMarker::Branch {
+                        index: index as u32,
+                    },
+                    span: *span,
+                });
+                if let Expr::Defer {
+                    expr, error_only, ..
+                } = e
+                {
+                    add_defer((**expr).clone(), *error_only);
+                    continue;
+                }
+                last = lower_expr(e, body);
+            }
+            if !body.is_terminated() {
+                let scope = pop_defer_scope();
+                for (expr, _error_only) in scope.into_iter().rev() {
+                    if body.is_terminated() {
+                        break;
+                    }
+                    let _ = lower_expr(&expr, body);
+                }
+                body.push(hir::Stmt::ParallelMarker {
+                    marker: crate::parallel_marker::ParallelRegionMarker::End,
+                    span: *span,
+                });
             } else {
                 let _ = pop_defer_scope();
             }
