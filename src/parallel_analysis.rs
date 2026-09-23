@@ -143,7 +143,10 @@ fn branch_conflict(
     }
     for name in &b.heap_mutations {
         if a.reads.contains(name) || a.writes.contains(name) || a.heap_mutations.contains(name) {
-            return Some(("shared aggregate mutation conflicts with access to", name.clone()));
+            return Some((
+                "shared aggregate mutation conflicts with access to",
+                name.clone(),
+            ));
         }
     }
 
