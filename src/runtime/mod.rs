@@ -5180,13 +5180,10 @@ impl Runtime {
             // EventSourced/Crdt), lost when `Actor::new` built a bare
             // actor above. Without this, `checkpoint_actor`'s
             // Durable/Crdt snapshot filter and `emit_event`'s
-            // EventSourced "+1" bump both silently fall back to
-            // treating every field as `Local` (via their
+            // EventSourced persistence selection both silently fall back
+            // to treating every field as `Local` (via their
             // `unwrap_or(StateModel::Local)`), breaking persistence for
-            // any field mutated after this recovery: a second crash
-            // would drop Durable fields from the snapshot entirely, and
-            // EventSourced fields would stop accumulating via emitted
-            // events.
+            // any field mutated after this recovery.
             actor.state_models = module
                 .actor_metadata
                 .iter()
