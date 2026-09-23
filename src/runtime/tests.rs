@@ -3721,6 +3721,122 @@ fn test_fired_workflow_timer_retries_when_atomic_commit_fails() {
 }
 
 #[test]
+fn test_atomic_workflow_recovery_replays_accepted_command_after_snapshot() {
+    use crate::bytecode::{
+        ActorMeta, BehaviorTableEntry, CodeModule, Constant, Instruction, OpCode,
+    };
+
+    let actor_id = 91_027;
+    let mut module = CodeModule::new("workflow_command_recovery");
+    module.add_actor_meta(ActorMeta {
+        name: "RecoveryWorkflow".to_string(),
+        persistent: true,
+        state_models: vec![(
+            "step_index".to_string(),
+            crate::ast::StateModel::Durable,
+        )],
+        state_defaults: vec![("step_index".to_string(), Constant::Int(0))],
+        behavior_indices: vec![0],
+        type_hash: None,
+        version: 1,
+        migrations: String::new(),
+        is_workflow: true,
+        is_agent: false,
+        is_organization: false,
+        is_virtual: false,
+        tools: vec![],
+        semantic_memory_dimensions: None,
+        procedural_memory_namespace: None,
+        backend: crate::ast::ActorBackendKind::Native,
+        fallback_config: String::new(),
+        retry_config: String::new(),
+    });
+    module.add_behavior(BehaviorTableEntry {
+        name: "RecoveryWorkflow.resume".to_string(),
+        param_count: 0,
+        code_offset: 0,
+        local_count: 1,
+        effect_mask: 0,
+        compensate_offset: None,
+        content_hash: None,
+        source_location: None,
+        parallel_branches: None,
+    });
+    let zero = module.add_constant(Constant::Int(0));
+    module.emit(Instruction::new3(
+        OpCode::ConstU,
+        ((zero >> 8) & 0xFF) as u8,
+        (zero & 0xFF) as u8,
+        0,
+    ));
+    module.emit(Instruction::new1(OpCode::RetVal, 0));
+
+    let mut initial_state = HashMap::new();
+    initial_state.insert("step_index".to_string(), PersistedValue::Int(0));
+    let snapshot = ActorSnapshot {
+        actor_id,
+        sequence: 1,
+        state: initial_state,
+        waiting_signal: None,
+        crdt_snapshot: None,
+        crdt_field_map: None,
+        authority_tokens: Default::default(),
+    };
+
+    let mut store = MemoryStore::new();
+    store
+        .commit_transition(DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id,
+            activation_epoch: 1,
+            sequence: 1,
+            expected_previous_sequence: 0,
+            command: None,
+            snapshot: Some(snapshot),
+            workflow_events: vec![WorkflowEvent::WorkflowStarted {
+                sequence: 1,
+                name: "RecoveryWorkflow".to_string(),
+                state: vec![PersistedValue::Int(0)],
+            }],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        })
+        .unwrap();
+    store
+        .commit_transition(DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id,
+            activation_epoch: 1,
+            sequence: 2,
+            expected_previous_sequence: 1,
+            command: Some(JournalEntry {
+                sequence: 2,
+                behavior_id: 0,
+                payload: vec![],
+            }),
+            snapshot: None,
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        })
+        .unwrap();
+
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store);
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    rt.recover_actor(actor_id).unwrap();
+
+    assert_eq!(
+        rt.actors.get(&actor_id).unwrap().sequence,
+        2,
+        "an accepted workflow command newer than the snapshot must be replayed"
+    );
+}
+
+#[test]
 fn test_atomic_workflow_recovery_replays_metadata_older_than_latest_snapshot() {
     let store = AtomicWorkflowTestStore::new();
     let mut rt = Runtime::new();
