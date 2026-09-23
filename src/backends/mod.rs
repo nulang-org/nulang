@@ -102,6 +102,11 @@ pub trait JitBackend {
     /// Number of regions compiled through the type-directed path.
     fn typed_compiled_count(&self) -> usize;
 
+    /// Number of separately compiled straight-line native leaf thunks.
+    fn native_leaf_compiled_count(&self) -> usize {
+        0
+    }
+
     /// Reset hot counters.
     fn reset_hot_counters(&mut self);
 
