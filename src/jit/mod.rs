@@ -450,15 +450,31 @@ impl JitSession {
         instructions: &[crate::bytecode::Instruction],
         native_calls: &std::collections::HashMap<usize, usize>,
     ) -> Option<JitFunctionPtr> {
-        // Check if already compiled
+        self.compile_region_with_leaf_calls(
+            module_idx,
+            start_offset,
+            num_instrs,
+            instructions,
+            native_calls,
+            &std::collections::HashMap::new(),
+        )
+    }
+
+    unsafe fn compile_region_with_leaf_calls(
+        &mut self,
+        module_idx: usize,
+        start_offset: usize,
+        num_instrs: usize,
+        instructions: &[crate::bytecode::Instruction],
+        native_calls: &std::collections::HashMap<usize, usize>,
+        native_leaf_calls: &std::collections::HashMap<usize, compiler::NativeLeafCall>,
+    ) -> Option<JitFunctionPtr> {
         if let Some(region) = self.compiled_entry(module_idx, start_offset) {
             return Some(std::mem::transmute(region.ptr));
         }
 
-        // Build the function
         let func_name = format!("nulang_jit_{}_{}", module_idx, start_offset);
-
-        match compiler::compile_bytecode_region(
+        match compiler::compile_bytecode_region_with_options(
             &mut self.module,
             &mut self.builder_context,
             &mut self.ctx,
@@ -467,6 +483,8 @@ impl JitSession {
             num_instrs,
             instructions,
             native_calls,
+            native_leaf_calls,
+            true,
         ) {
             Ok(ptr) => {
                 self.store_compiled(module_idx, start_offset, ptr, num_instrs);
@@ -497,7 +515,27 @@ impl JitSession {
         type_metadata: Option<&crate::jit::typed_compiler::TypeMetadata>,
         native_calls: &std::collections::HashMap<usize, usize>,
     ) -> Option<JitFunctionPtr> {
-        // Check if already compiled
+        self.compile_region_typed_with_leaf_calls(
+            module_idx,
+            start_offset,
+            num_instrs,
+            instructions,
+            type_metadata,
+            native_calls,
+            &std::collections::HashMap::new(),
+        )
+    }
+
+    unsafe fn compile_region_typed_with_leaf_calls(
+        &mut self,
+        module_idx: usize,
+        start_offset: usize,
+        num_instrs: usize,
+        instructions: &[crate::bytecode::Instruction],
+        type_metadata: Option<&crate::jit::typed_compiler::TypeMetadata>,
+        native_calls: &std::collections::HashMap<usize, usize>,
+        native_leaf_calls: &std::collections::HashMap<usize, compiler::NativeLeafCall>,
+    ) -> Option<JitFunctionPtr> {
         if let Some(region) = self.compiled_entry(module_idx, start_offset) {
             return Some(std::mem::transmute(region.ptr));
         }
@@ -511,9 +549,6 @@ impl JitSession {
             .unwrap_or(false);
 
         if has_known_types && native_calls.is_empty() {
-            // The typed compiler does not understand `Call`; a region
-            // containing a native direct call (non-empty map) must go through
-            // the scalar compiler, which handles `nulang_jit_direct_call`.
             let func_name = format!("nulang_tjit_{}_{}", module_idx, start_offset);
             if let Ok(ptr) = typed_compiler::compile_bytecode_region_typed(
                 &mut self.module,
@@ -529,15 +564,15 @@ impl JitSession {
                 self.typed_regions.insert((module_idx, start_offset));
                 return Some(std::mem::transmute(ptr));
             }
-            // Typed compilation failed: fall through to the scalar compiler.
         }
 
-        self.compile_region(
+        self.compile_region_with_leaf_calls(
             module_idx,
             start_offset,
             num_instrs,
             instructions,
             native_calls,
+            native_leaf_calls,
         )
     }
 
