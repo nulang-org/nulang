@@ -3064,9 +3064,7 @@ impl Runtime {
             // count. Adaptive batching can process up to 256 messages in one
             // turn, so counting turns would silently stretch GC/CRDT cadence
             // by the batch factor.
-            let work_units = reductions_after
-                .saturating_sub(reductions_before)
-                .max(1) as u64;
+            let work_units = reductions_after.saturating_sub(reductions_before).max(1) as u64;
             let previous_ticks = ticks;
             ticks = ticks.saturating_add(work_units);
             if previous_ticks / GC_PUMP_INTERVAL != ticks / GC_PUMP_INTERVAL {

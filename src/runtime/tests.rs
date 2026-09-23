@@ -447,8 +447,10 @@ fn test_actor_set_priority_changes_scheduling() {
     rt.send_message(a, "noop", &[]);
     rt.send_message(b, "noop", &[]);
     assert_eq!(rt.claim_next_ready_actor(), Some(b));
+    rt.step_actor(b);
     rt.finish_actor_turn(b);
     assert_eq!(rt.claim_next_ready_actor(), Some(a));
+    rt.step_actor(a);
     rt.finish_actor_turn(a);
 }
 
