@@ -897,6 +897,15 @@ mod tests {
     fn canonical_json_and_digest_ignore_input_ordering_noise() {
         let mut first = base_manifest(actor(2, b"v2"));
         first.artifact.flags = vec!["z".to_string(), "a".to_string(), "z".to_string()];
+        first.artifact.artifact_id = ArtifactId::from_semantic(
+            SemanticId::from_canonical_bytes(b"program", []),
+            "compiler",
+            "target",
+            "abi",
+            "bytecode",
+            first.artifact.flags.iter(),
+        )
+        .to_string();
         first.actors[0].migrations[0].events = vec![
             BehaviorMigrationEvent {
                 name: "Zed".to_string(),
