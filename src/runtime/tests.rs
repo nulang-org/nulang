@@ -3483,6 +3483,79 @@ fn test_workflow_runtime_uses_atomic_transition_api() {
 }
 
 #[test]
+fn test_workflow_checkpoint_stays_on_atomic_tail() {
+    let store = AtomicWorkflowTestStore::new();
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store.clone());
+
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "CheckpointWorkflow",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .set_state_field("step_index", Value::int(7));
+    rt.checkpoint_actor(actor_id);
+
+    assert_eq!(store.legacy_write_count(), 0);
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 2);
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(snapshot.sequence, 2);
+    assert_eq!(
+        snapshot.state.get("step_index"),
+        Some(&PersistedValue::Int(7))
+    );
+
+    let inner = store.inner.lock().unwrap();
+    let transitions = inner.committed_transitions(actor_id);
+    assert_eq!(transitions.len(), 2);
+    assert!(transitions[1].workflow_events.is_empty());
+    assert!(transitions[1].snapshot.is_some());
+}
+
+#[test]
+fn test_custom_workflow_event_stays_on_atomic_tail() {
+    let store = AtomicWorkflowTestStore::new();
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store.clone());
+
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "CustomEventWorkflow",
+            Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+            models,
+        )
+        .unwrap();
+
+    rt.emit_event(actor_id, "Approved", &[]);
+
+    assert_eq!(store.legacy_write_count(), 0);
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 2);
+    assert!(matches!(
+        rt.persistence.read_workflow_events(actor_id).as_slice(),
+        [
+            WorkflowEvent::WorkflowStarted { sequence: 1, .. },
+            WorkflowEvent::Custom {
+                sequence: 2,
+                name,
+                ..
+            }
+        ] if name == "Approved"
+    ));
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(snapshot.sequence, 2);
+}
+
+#[test]
 fn test_workflow_command_acceptance_keeps_atomic_tail_contiguous() {
     let store = AtomicWorkflowTestStore::new();
     let mut rt = Runtime::new();
