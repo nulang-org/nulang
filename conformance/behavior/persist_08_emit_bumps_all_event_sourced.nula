@@ -1,4 +1,4 @@
-entity Counter {
+// Historical test id: corrected semantics require emit NOT to mutate unrelated event-sourced fields.\nentity Counter {
     state count: Int = 0
     state other: Int = 100
     events
