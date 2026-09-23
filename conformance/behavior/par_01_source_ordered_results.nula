@@ -1,0 +1,12 @@
+// par_01 — source-level par returns all branch results in source order.
+// Execution is still sequential in this implementation slice; this pins the
+// permanent result contract before concurrent scheduling is enabled.
+let result = par {
+    1
+    2
+    3
+}
+let encoded = match result {
+    | (a, b, c) => a * 100 + b * 10 + c
+}
+perform IO.print(encoded)
