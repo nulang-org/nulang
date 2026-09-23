@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### Dense terminal Tier-2 JIT state — 2026-09-23
+- **Post-compilation hotness now lives beside each dense compiled-region cache entry** (`src/jit/mod.rs`) instead of a separate `FxHashMap<(module, pc), counter>`, removing the hash probe from repeated native-region entry.
+- **Tier-2 probing becomes terminal**: untyped regions stop probing once no new static type facts can appear; typed regions get one SIMD specialization attempt, then stop paying counter updates.
+- **SIMD promotion can replace an existing Tier-1 cache entry** through a distinct Tier-2 symbol instead of short-circuiting on the already-cached pointer; tests cover terminal state, session isolation, and replacement behavior.
+
 ### Linear-time JIT module call analysis — 2026-09-23
 - **Direct-call suspension and recursion gating now share one lazily cached per-module call graph** (`src/jit/mod.rs`). Suspension propagates to callers with a reverse worklist, and recursion uses iterative SCC traversal rather than an n×n reachability matrix plus Floyd–Warshall, making tier-up analysis linear in functions plus direct-call edges after the bytecode scan and avoiding host-stack recursion.
 
