@@ -323,7 +323,14 @@ pub(crate) fn durable_waits(rt: &Runtime, actor_id: u64) -> Vec<DurableWait> {
                 DurableWaitKind::ExternalEffect,
                 "LLM.ask",
             ));
-        } else {
+        } else if !actor
+            .received_signals
+            .iter()
+            .any(|(name, _)| name == marker)
+        {
+            // A persisted marker may survive until the suspended/recovered step
+            // is re-driven. Once the matching signal is durable, the logical
+            // wait is already resolved even if the marker has not yet cleared.
             waits.push(DurableWait::new(
                 actor_id,
                 generation,
