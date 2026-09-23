@@ -1605,6 +1605,13 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Production readiness hardening — 2026-09-23
+- **Benchmark validation no longer writes generated history to protected `main`.** CI restores rolling benchmark JSON from `automation/benchmark-history`, uploads only the current result artifact, and persists generated history to that dedicated branch.
+- **Primary Rust build/test/check/bench commands and tagged release builds now resolve the checked-in dependency graph with `--locked`.** Tagged releases also fail preflight when the Git tag, `Cargo.toml` version, and CLI `VERSION` disagree.
+- **Release supply-chain permissions are narrower.** Matrix build jobs use read-only repository access; only the publishing job retains `contents: write`. Checksum generation works with GNU `sha256sum` or macOS `shasum -a 256`.
+- **Security disclosure policy is explicit.** `SECURITY.md` documents private reporting, high-risk compiler/runtime surfaces, and that `.cargo/audit.toml` suppressions are accepted risks rather than an advisory-free claim.
+- **Release/readiness documentation now matches the implementation.** The release matrix is Linux x86_64/aarch64, macOS aarch64, and Windows x86_64; stale CRDT-recovery, historical test-count, and launch-status claims were corrected.
+
 ### Atomic durable-transition storage contract — 2026-09-22
 - **Persistence backends now have a fail-closed atomic transition API** (Experimental, RFC 0022, `src/runtime/persistence.rs`). `DurableTransition` binds actor identity, activation epoch, sequence predecessor, command, snapshot, workflow/domain events, durable-effect records, and outbox messages to one canonical BLAKE3 digest. Unsupported backends return `Unsupported` rather than emulating atomicity with sequential writes. `MemoryStore` implements sequence/epoch fencing, idempotent exact retries, conflicting-retry rejection, and migration from existing legacy history.
 - **libSQL/SQLite commits durable transitions in one database transaction.** Additive transition/tail/event/effect/outbox tables preserve legacy readability while allowing multiple workflow/domain records at one logical sequence. The committed tail is compare-and-set under an IMMEDIATE transaction, so stale activations and sequence gaps fail before becoming visible. Rollback, stale-epoch, exact-retry, and legacy-history migration tests pin the no-sequential-fallback contract.
