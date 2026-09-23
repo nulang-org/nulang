@@ -3672,7 +3672,7 @@ impl Runtime {
                 }
             }
         };
-        let should_requeue = if let Some(msg) = msg_opt {
+        if let Some(msg) = msg_opt {
             // Message delivery counts as activity for dehydration.
             if let Some(actor) = self.actors.get_mut(&actor_id) {
                 actor.idle_ms = 0;
