@@ -262,10 +262,7 @@ impl SqliteStore {
                 id, goal_id, commitment_id, superseded_intention_id, replacement_intention_id,
                 trigger_task_id, trigger_status, decision, reason, created_at
             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
-            ON CONFLICT(id) DO UPDATE SET
-                replacement_intention_id=excluded.replacement_intention_id,
-                decision=excluded.decision,
-                reason=excluded.reason
+            ON CONFLICT(id) DO NOTHING
             "#,
             params![
                 revision.id.to_string(),
