@@ -256,11 +256,7 @@ impl AotModule {
                 .push(AbiParam::new(jit_module.isa().pointer_type()));
             entry_sig.returns.push(AbiParam::new(types::I32));
             let entry_fid = jit_module
-                .declare_function(
-                    &entry_name,
-                    cranelift_module::Linkage::Local,
-                    &entry_sig,
-                )
+                .declare_function(&entry_name, cranelift_module::Linkage::Local, &entry_sig)
                 .map_err(|e| crate::types::NuError::VMError {
                     msg: format!(
                         "failed to declare native entry wrapper for '{}': {}",
@@ -285,21 +281,15 @@ impl AotModule {
                 span: Span::default(),
             })?;
 
-            let mut entry_ctx =
-                codegen::AotContext::new(&mut jit_module, &mut builder_context);
-            codegen::compile_actor_entry_wrapper(
-                &mut entry_ctx,
-                func.params.len(),
-                entry_fid,
-                fid,
-            )
-            .map_err(|e| crate::types::NuError::VMError {
-                msg: format!(
-                    "AOT native entry wrapper for behavior '{}' failed: {}",
-                    func.name, e
-                ),
-                span: Span::default(),
-            })?;
+            let mut entry_ctx = codegen::AotContext::new(&mut jit_module, &mut builder_context);
+            codegen::compile_actor_entry_wrapper(&mut entry_ctx, func.params.len(), entry_fid, fid)
+                .map_err(|e| crate::types::NuError::VMError {
+                    msg: format!(
+                        "AOT native entry wrapper for behavior '{}' failed: {}",
+                        func.name, e
+                    ),
+                    span: Span::default(),
+                })?;
 
             behavior_names.push(func.name.clone());
             behavior_entry_fids.push(entry_fid);
