@@ -117,8 +117,29 @@ pub trait JitBackend {
         false
     }
 
-    /// Execute one tiered step: if the region at `pc` is compiled, run it;
-    /// if hot, compile then run; otherwise record and return `Interpret`.
+    /// Prepare a probed tiered step without executing native code.
+    ///
+    /// The caller first invokes `probe_and_maybe_hot`. Implementations may
+    /// compile or promote the region here while a normal shared CodeModule
+    /// borrow is available. Returning true guarantees that
+    /// `execute_compiled` can run immediately without borrowing the module.
+    fn prepare_tiered_step(&mut self, module_idx: usize, pc: usize, module: &CodeModule) -> bool;
+
+    /// Execute a region prepared by `prepare_tiered_step`.
+    ///
+    /// Deliberately receives no CodeModule reference: the VM can detach the JIT
+    /// backend and module-derived constant cache before native entry, ensuring
+    /// re-entrant runtime helpers do not overlap Rust borrows into VM storage.
+    fn execute_compiled(
+        &mut self,
+        module_idx: usize,
+        pc: usize,
+        regs: &mut [u64; 256],
+        constants: &[u64],
+    ) -> TieredAction;
+
+    /// Convenience wrapper for callers that do not need re-entrant VM safety.
+    /// The VM itself uses the split probe/prepare/execute protocol.
     fn tiered_execute_step_typed(
         &mut self,
         module_idx: usize,
@@ -126,7 +147,14 @@ pub trait JitBackend {
         module: &CodeModule,
         regs: &mut [u64; 256],
         constants: &[u64],
-    ) -> TieredAction;
+    ) -> TieredAction {
+        if !self.probe_and_maybe_hot(module_idx, pc)
+            || !self.prepare_tiered_step(module_idx, pc, module)
+        {
+            return TieredAction::Interpret;
+        }
+        self.execute_compiled(module_idx, pc, regs, constants)
+    }
 }
 
 // ---------------------------------------------------------------------------
