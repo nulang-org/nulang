@@ -1040,6 +1040,43 @@ mod tests {
         }
     }
 
+    struct FailOnResumeFlushWriter {
+        bytes: Vec<u8>,
+        fail_next_flush: bool,
+        failed_once: bool,
+    }
+
+    impl FailOnResumeFlushWriter {
+        fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                fail_next_flush: false,
+                failed_once: false,
+            }
+        }
+    }
+
+    impl std::io::Write for FailOnResumeFlushWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            if String::from_utf8_lossy(&self.bytes).contains("\"goal_resumed\"") {
+                self.fail_next_flush = true;
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_next_flush && !self.failed_once {
+                self.failed_once = true;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected resume delivery failure",
+                ));
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn runtime_emits_nlap_events() {
         let tmp = std::env::temp_dir().join(format!("nulang-agent-test-{}", Uuid::new_v4()));
@@ -1180,6 +1217,119 @@ mod tests {
         let retried: SwarmEventEnvelope = serde_json::from_str(first_line).unwrap();
         assert_eq!(retried.event_id, Some(first_event_id));
         assert!(matches!(retried.event, SwarmEvent::TaskCompleted { .. }));
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn resume_goal_survives_restart_after_commit_before_execution() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-resume-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut first = runtime_with_worker(&tmp, vec![TaskStatus::Blocked]);
+        let mut initial_out = std::io::Cursor::new(Vec::new());
+        let goal_id = first
+            .handle_user_message("ship feature X", &mut initial_out)
+            .unwrap();
+        let blocked_graph = first.store().get_goal_graph(goal_id).unwrap();
+        let original_conversation_id = blocked_graph.goal.conversation_id;
+        assert_eq!(blocked_graph.goal.status, GoalStatus::Blocked);
+        drop(first);
+
+        let request_id = Uuid::new_v4();
+        let mut second = LocalRuntime::open_with_worker(
+            tmp.clone(),
+            Box::new(ScriptedWorker::new([TaskStatus::Completed])),
+        )
+        .unwrap();
+        assert_ne!(Some(second.conversation_id()), original_conversation_id);
+
+        let mut failing = FailOnResumeFlushWriter::new();
+        let err = second
+            .resume_goal(
+                goal_id,
+                request_id,
+                "external dependency recovered",
+                &mut failing,
+            )
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Io(_)));
+
+        let committed = second.store().get_goal_graph(goal_id).unwrap();
+        assert_eq!(committed.goal.status, GoalStatus::Running);
+        assert_eq!(committed.resumptions.len(), 1);
+        assert_eq!(committed.resumptions[0].request_id, request_id);
+        assert_eq!(committed.intentions.len(), 2);
+        assert_eq!(committed.intentions[1].status, IntentionStatus::Active);
+        assert_eq!(
+            ordered_tasks_for_intention(&committed.tasks, &committed.intentions[1])
+                .unwrap()[0]
+                .status,
+            TaskStatus::Created
+        );
+        drop(second);
+
+        let mut third = LocalRuntime::open_with_worker(
+            tmp.clone(),
+            Box::new(ScriptedWorker::new([TaskStatus::Completed])),
+        )
+        .unwrap();
+        let mut recovered_out = std::io::Cursor::new(Vec::new());
+        assert_eq!(
+            third
+                .resume_goal(
+                    goal_id,
+                    request_id,
+                    "external dependency recovered",
+                    &mut recovered_out,
+                )
+                .unwrap(),
+            goal_id
+        );
+
+        let completed = third.store().get_goal_graph(goal_id).unwrap();
+        assert_eq!(completed.goal.status, GoalStatus::Completed);
+        assert_eq!(completed.resumptions.len(), 1);
+        assert_eq!(completed.intentions.len(), 2);
+        assert_eq!(completed.intentions[1].status, IntentionStatus::Completed);
+        assert_eq!(completed.commitments[0].status, CommitmentStatus::Fulfilled);
+
+        let recovered_text = String::from_utf8(recovered_out.into_inner()).unwrap();
+        assert!(recovered_text.contains("goal_resumed"));
+        assert!(recovered_text.contains("commitment_resumed"));
+        assert!(recovered_text.contains("task_completed"));
+        for line in recovered_text.lines() {
+            let envelope: SwarmEventEnvelope = serde_json::from_str(line).unwrap();
+            assert_eq!(envelope.conversation_id, original_conversation_id);
+        }
+
+        let intentions_before = completed.intentions.len();
+        let tasks_before = completed.tasks.len();
+        drop(third);
+
+        let mut fourth = LocalRuntime::open_with_worker(
+            tmp.clone(),
+            Box::new(ScriptedWorker::new([TaskStatus::Completed])),
+        )
+        .unwrap();
+        let mut duplicate_out = std::io::Cursor::new(Vec::new());
+        assert_eq!(
+            fourth
+                .resume_goal(
+                    goal_id,
+                    request_id,
+                    "external dependency recovered",
+                    &mut duplicate_out,
+                )
+                .unwrap(),
+            goal_id
+        );
+        assert!(duplicate_out.into_inner().is_empty());
+
+        let duplicate = fourth.store().get_goal_graph(goal_id).unwrap();
+        assert_eq!(duplicate.resumptions.len(), 1);
+        assert_eq!(duplicate.intentions.len(), intentions_before);
+        assert_eq!(duplicate.tasks.len(), tasks_before);
 
         let _ = std::fs::remove_dir_all(tmp);
     }
