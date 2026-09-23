@@ -208,8 +208,11 @@ impl BehaviorManifest {
             });
         }
 
-        let incoming_by_name: BTreeMap<_, _> =
-            self.actors.iter().map(|actor| (&actor.name, actor)).collect();
+        let incoming_by_name: BTreeMap<_, _> = self
+            .actors
+            .iter()
+            .map(|actor| (&actor.name, actor))
+            .collect();
 
         for old in previous
             .actors
@@ -266,11 +269,10 @@ impl BehaviorManifest {
     fn normalize(&mut self) {
         self.artifact.flags.sort();
         self.artifact.flags.dedup();
-        self.actors.sort_by(|left, right| left.name.cmp(&right.name));
+        self.actors
+            .sort_by(|left, right| left.name.cmp(&right.name));
         for actor in &mut self.actors {
-            actor
-                .migrations
-                .sort_by_key(|step| (step.from, step.to));
+            actor.migrations.sort_by_key(|step| (step.from, step.to));
             for step in &mut actor.migrations {
                 step.events.sort();
                 step.events.dedup();
@@ -356,10 +358,7 @@ impl BehaviorManifest {
                 if !origins.insert(step.from) {
                     return Err(BehaviorManifestError::InvalidActor {
                         actor: actor.name.clone(),
-                        message: format!(
-                            "duplicate migration origin schema version {}",
-                            step.from
-                        ),
+                        message: format!("duplicate migration origin schema version {}", step.from),
                     });
                 }
             }
@@ -669,18 +668,12 @@ mod tests {
                     "count".to_string(),
                     StateModel::Durable,
                     Type::Primitive(PrimitiveType::Int),
-                    Operand::Literal(
-                        Literal::Int(0),
-                        Type::Primitive(PrimitiveType::Int),
-                    ),
+                    Operand::Literal(Literal::Int(0), Type::Primitive(PrimitiveType::Int)),
                 )],
                 behaviors: Vec::new(),
                 init: vec![(
                     "count".to_string(),
-                    Operand::Literal(
-                        Literal::Int(0),
-                        Type::Primitive(PrimitiveType::Int),
-                    ),
+                    Operand::Literal(Literal::Int(0), Type::Primitive(PrimitiveType::Int)),
                 )],
                 events: Vec::new(),
                 apply_handlers: Vec::new(),
@@ -853,7 +846,8 @@ mod tests {
     #[test]
     fn malformed_or_unknown_manifests_fail_closed() {
         let valid = base_manifest(actor(1, b"schema-v1"));
-        let mut value: serde_json::Value = serde_json::from_slice(&valid.to_json().unwrap()).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&valid.to_json().unwrap()).unwrap();
         value["schema"] = serde_json::Value::from("nulang.behavior/v9");
         let bytes = serde_json::to_vec(&value).unwrap();
         assert!(matches!(
