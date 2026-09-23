@@ -29,9 +29,6 @@ counting_loop(Parent, Count) ->
     end.
 
 counting() ->
-    Actor = spawn(fun() -> counting_loop(self(), 0) end),
-    %% Spawn closure's self() is the actor, so pass the parent explicitly.
-    exit(Actor, kill),
     Parent = self(),
     Counter = spawn(fun() -> counting_loop(Parent, 0) end),
     Start = erlang:monotonic_time(nanosecond),
@@ -42,20 +39,23 @@ counting() ->
     Counter ! stop,
     report("counting", ?COUNT_N, Elapsed).
 
-ping_loop(Pong, Parent, Remaining) ->
+ping_loop(Parent, Pong, Remaining) ->
     receive
+        {setup, P} ->
+            Parent ! ping_ready,
+            ping_loop(Parent, P, Remaining);
         {kick, N} ->
             Pong ! recv,
-            ping_loop(Pong, Parent, N);
+            ping_loop(Parent, Pong, N);
         {ack, PongCount} ->
             Next = Remaining - 1,
             case Next of
                 0 ->
                     Parent ! {ping_done, PongCount},
-                    ping_loop(Pong, Parent, 0);
+                    ping_loop(Parent, Pong, 0);
                 _ ->
                     Pong ! recv,
-                    ping_loop(Pong, Parent, Next)
+                    ping_loop(Parent, Pong, Next)
             end;
         stop -> ok
     end.
@@ -71,11 +71,10 @@ pong_loop(Ping, Count) ->
 
 ping_pong() ->
     Parent = self(),
-    %% Use a relay so both actor pids can be constructed without global names.
-    Relay = spawn(fun relay_loop/0),
-    Ping = spawn(fun() -> ping_loop(Relay, Parent, 0) end),
+    Ping = spawn(fun() -> ping_loop(Parent, undefined, 0) end),
     Pong = spawn(fun() -> pong_loop(Ping, 0) end),
-    Relay ! {target, Pong},
+    Ping ! {setup, Pong},
+    receive ping_ready -> ok end,
     Start = erlang:monotonic_time(nanosecond),
     Ping ! {kick, ?PING_N},
     Count = receive {ping_done, C} -> C end,
@@ -83,24 +82,7 @@ ping_pong() ->
     true = (Count =:= ?PING_N),
     Ping ! stop,
     Pong ! stop,
-    Relay ! stop,
     report("ping_pong", 2 * ?PING_N + 1, Elapsed).
-
-relay_loop() ->
-    receive
-        {target, Target} -> relay_loop(Target);
-        stop -> ok
-    end.
-relay_loop(Target) ->
-    receive
-        Msg ->
-            case Msg of
-                stop -> ok;
-                _ ->
-                    Target ! Msg,
-                    relay_loop(Target)
-            end
-    end.
 
 ring_loop(Parent, Next) ->
     receive
