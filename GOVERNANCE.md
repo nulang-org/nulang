@@ -4,14 +4,15 @@
 > programming language. The process it defines may evolve through the RFC
 > mechanism it specifies.
 >
-> **Status:** Ratified 2026-07-19 alongside RFC 0001 (Format Stability) and
-> RFC 0002 (Frozen Core). Language version 1.0-frozen.
+> **Status:** Ratified 2026-07-19 and amended by accepted RFC 0021
+> (Compatibility Before Permanent Freeze) on 2026-09-21.
 >
-> **Pre-1.0 reality check:** Nulang is alpha software without external users
-> yet. The tier guarantees below are the *intent* and the policy the
-> maintainer works to — but until the language has real users, **expect
-> breaking changes before v1.0** and treat any guarantee here as subject to
-> revision.
+> **Pre-adoption reality check:** Nulang is alpha software without meaningful
+> external adoption yet. Published artifacts/protocols remain explicit
+> compatibility obligations, but source semantics are not permanently Frozen
+> until the evidence-bearing adoption gate in RFC 0021 is met. Semantic breaks
+> still require an RFC, an explicit language-version transition, diagnostics,
+> and a migration story; silent churn is never permitted.
 
 ## 1. Purpose
 
@@ -33,20 +34,24 @@ determines what changes are permitted and how. See `CHANGELOG.md` for the
 current classification.
 
 ### Frozen
-Will never break. A change to a Frozen surface is, by definition, a new
-language and requires a new major version number and a migration path.
+A published version in this tier is an archival compatibility obligation. Its
+bytes/meaning are never silently reinterpreted; future encodings may evolve
+under a new explicit version with a reader/migration path. Frozen therefore
+applies to the named published version, not to internal implementation choices.
 
 - `.nbc` bytecode format version 1 (`src/format/constants.rs`).
 - NUL0 wire protocol version 1.
 - Value layout version 1 (`src/value_layout.rs`).
-- Nulang Core syntax and semantics (RFC 0002).
-- The `IO`, `Spawn`, `Send`, `Receive` built-in effects and their semantics.
+- The currently published `IO`, `Spawn`, `Send`, `Receive` built-in
+  effect contracts remain Frozen pending a dedicated reclassification RFC.
 
 ### Stable
 Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions (the deprecated surface remains functional, emits a
 warning, and is removed only in the version after next).
 
+- Nulang Core syntax and semantics (RFC 0002), reclassified from Frozen by
+  RFC 0021 until the external-adoption freeze gate is satisfied.
 - The full HM type system and inference rules.
 - The effect-row system (closed/open, regions).
 - The capability lattice (`iso/trn/ref/val/box/tag/lineariso`) and subtyping.
@@ -134,7 +139,9 @@ is audited in `SPEC2.md` §Implementation Status.
 
 An accepted RFC is **immutable**: its text is never edited after acceptance.
 Corrections require a new RFC that supersedes it (recorded in the superseding
-RFC's header).
+RFC's header). RFC 0021 is the accepted policy that supersedes the permanent
+source-semantic freeze portions of RFC 0002 without rewriting that historical
+RFC.
 
 ## 5. Versioning
 

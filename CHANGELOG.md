@@ -7,7 +7,15 @@
 > `LANGUAGE_VERSION` in `src/format/constants.rs`) is what this changelog
 > tracks — it moves only on RFC-ratified change.
 
-**Language version:** `1.0.0-frozen` (since 2026-07-19; RFCs 0001, 0002).
+**Published v1 artifact language metadata:** `1.0.0-frozen` (since
+2026-07-19; RFCs 0001, 0002). This historical identifier remains readable and
+is not rewritten.
+
+**Current compatibility policy:** RFC 0021 (accepted 2026-09-21) reclassifies
+pre-adoption Nulang Core source semantics as Stable until an evidence-bearing
+external-adoption freeze RFC is accepted. Published format/protocol/ABI
+versions remain archival compatibility obligations; future representations may
+evolve only behind explicit version boundaries and readers/migrations.
 
 ---
 
@@ -32,11 +40,12 @@ version + migration.*
   - `FormatError` enum: `Truncated`, `BadMagic`, `UnsupportedVersion`,
     `IncompatibleLanguage`, `LengthMismatch`, `UnknownOpcode`, `BodyDecode`,
     `BadConstant`.
-- **RFC 0002 — Frozen Core.** Defined Nulang Core, the minimal frozen subset:
-  `fn`/`let`/`if`/`match`/closures, `Int`/`Bool`/`String`/`Unit`/`Nil`/
-  `Vec`/`Map`/tuples/records/`enum`, HM inference over this subset, `IO.print`
-  and `IO.read` only, `val` capability only. Every Core program valid today is
-  valid in every future version.
+- **RFC 0002 — historical Frozen Core definition.** Defined the original Core
+  subset. RFC 0021 (accepted 2026-09-21) supersedes the *permanent
+  source-semantic freeze* portion of RFC 0002: Core remains the portability
+  kernel but is Stable until the external-adoption freeze gate is met.
+  Historical artifacts emitted under the old metadata remain compatibility
+  obligations.
 - Stability contract published as `SPEC2.md` §"Format Stability" and
   `GOVERNANCE.md`.
 
@@ -45,12 +54,33 @@ version + migration.*
 ### CI release-lane de-duplication — 2026-09-21
 - **Release CI keeps optimized build coverage without rerunning the entire test suite** (`.github/workflows/ci.yml`). The full suite remains authoritative in Build & Test; Release Build now verifies `cargo build --release` plus representative optimized regressions for raw-value provenance, nominal actor protocols, and durable actor-turn semantic closure, reducing runner pressure while preserving release-mode semantic coverage.
 
+### Typed JIT native SSA across arithmetic, loops, and simple CFGs — 2026-09-22
+- **The typed Cranelift JIT now keeps proven Int/Float values in native SSA form across arithmetic chains, simple loop backedges, and conservative forward-branch joins** (`src/jit/typed_compiler.rs`). It preserves Nulang's 48-bit integer wrap, nullable division/modulo behavior, NaN canonicalization, and runtime-helper fallbacks while avoiding repeated tag/unbox/register-file round trips. Per-block forward must-type analysis makes type facts CFG-derived rather than bytecode-emission-order-dependent. The implementation is the current-main replay of the independently tested #738→#768→#770→#771→#773→#774 stack.
+
+### Candidate-only JIT hotness probing — 2026-09-22
+- **Cold interpreted execution now probes JIT hotness only at candidate compiled-region entries** (`src/vm.rs`). The VM precomputes per-module candidates for execution/function/behavior entries, source-statement starts, branch targets/fallthroughs, and successors of compilation boundaries, avoiding JIT backend dispatch and hot-counter mutation at ordinary straight-line bytecode PCs without changing language semantics.
+
+### Canonical compiler semantic identity — 2026-09-21
+- **Compiler-owned `SemanticId` now derives from canonical backend-independent MIR plus typed actor-state schemas** (Experimental, `src/semantic_identity.rs`, `src/semantic_schema.rs`, `src/compiler_identity.rs`). The encoding alpha-normalizes compiler-generated IDs, excludes presentation/debug metadata and backend selection, includes executable/effect/authority/durable semantics, and folds dependency semantic identities deterministically. `ArtifactIdentityManifest` assembly now has a typed-program entry point that keeps exact `SourceId`, semantic identity, and backend-specific `ArtifactId` distinct without changing frozen NBC v1.
+
+### Production host-authority boundary — 2026-09-20
+- **Test effect handlers no longer exist in production runtime builds** (`src/runtime/mod.rs`, `src/runtime/callbacks.rs`). Mock effect interception is now `#[cfg(test)]` and crate-private, so actor-backed host effects in production cannot take the test-handler path before external-authority enforcement.
+- **Actor-backed `Process.run` remains non-dispatched until a real process sandbox exists** (`src/runtime/callbacks.rs`, `src/stdlib.rs`). A regression test proves that even an actor holding an exact `Process::Run(...)` grant cannot turn that grant into host shell execution; docs now mark the existing `/bin/sh -c` implementation as trusted/standalone-only.
+
 ### Typed process host authority — 2026-09-20
 - **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
 
 
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
+
+### Actor-capable `.nbc` execution — 2026-09-22
+- **Precompiled actor/workflow artifacts execute through the real Runtime**
+  instead of standalone VM actor callbacks. Serialized modules carrying actor
+  metadata now use the same spawn/send/state/scheduler path as source
+  execution, while pure modules retain the lower-overhead standalone VM path.
+  Regression coverage verifies message delivery after NBC round-trip and
+  durable-store selection for persistent actors.
 
 ### Actor protocol rolling-upgrade compatibility — 2026-09-20
 - **Directional structural compatibility** (Experimental, `src/protocol.rs`).
@@ -1557,6 +1587,20 @@ in this version; they are recorded here to establish their tier.
 No stability promise. The 0.x series is the alpha development track. Language
 version 1.0.0-frozen is the first version with a published stability contract;
 everything before it is implicitly Experimental.
+
+## Experimental tier
+
+### Allocation-free protocol actor-ref decoding — 2026-09-21
+- **ProtocolId wire decode no longer hex-allocates.** The fixed 32-byte protocol digest is reconstructed directly with `ProtocolId::from_bytes` instead of expanding to a 64-character hex `String` and reparsing it. Wire bytes and compatibility semantics are unchanged.
+
+### Single-pass LSP diagnostics parsing — 2026-09-21
+- **LSP diagnostics reuse their parsed AST.** Document open and debounced changes now populate `DocumentState.ast` from the frontend pass that already produced diagnostics, removing a guaranteed second lex+parse of the same source while preserving diagnostics and editor semantics.
+
+### Canonical stdlib module manifest — 2026-09-21
+- **Stdlib module metadata is now generated from one manifest.** `spec/stdlib/v0alpha1.json` owns module names, imports, source paths, stability tiers, descriptions, and declared official package mirrors. `scripts/generate_stdlib.py` materializes Rust descriptors and the docs module index from that file.
+- **Official package mirrors fail closed on drift.** The `json` seed package is generated from `src/stdlib/json.nula` with only its package-specific import preamble substituted; `scripts/verify_implementation.py` runs the generator in `--check` mode so stale package copies or generated metadata fail CI.
+- **Built-in effects remain executable registry data.** `src/stdlib.rs` still owns the compiler/runtime built-in operation registry used by effect docs; module metadata is no longer duplicated in its comments. This intentionally separates executable effect semantics from higher-level Nulang-authored module metadata while exposing both through `nulang::stdlib`.
+
 
 ## Experimental tier
 
