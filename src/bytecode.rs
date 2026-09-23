@@ -667,6 +667,19 @@ pub struct ExportTableEntry {
     pub type_sig: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendOwnershipSource {
+    Register(u8),
+    Spill(u16),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendOwnershipSite {
+    pub pc: usize,
+    pub candidate_mask: u16,
+    pub sources: Vec<(u8, SendOwnershipSource)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodeModule {
     pub name: String,
@@ -717,6 +730,8 @@ pub struct CodeModule {
     pub debug_functions: Vec<DebugFunctionInfo>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub export_table: Vec<ExportTableEntry>,
+    #[serde(skip)]
+    pub send_ownership_sites: Vec<SendOwnershipSite>,
 }
 
 impl CodeModule {
@@ -740,7 +755,12 @@ impl CodeModule {
             line_table: Vec::new(),
             debug_functions: Vec::new(),
             export_table: Vec::new(),
+            send_ownership_sites: Vec::new(),
         }
+    }
+
+    pub fn send_ownership_site(&self, pc: usize) -> Option<&SendOwnershipSite> {
+        self.send_ownership_sites.iter().find(|site| site.pc == pc)
     }
 
     pub fn add_actor_meta(&mut self, meta: ActorMeta) -> usize {

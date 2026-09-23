@@ -27,6 +27,7 @@ pub struct Message {
     pub payload: Arc<Vec<Value>>,
     pub sender: u64,
     pub priority: MessagePriority,
+    pub ownership_handoff_mask: u16,
     /// W3C traceparent for distributed tracing.
     pub trace_id: Option<String>,
 }
@@ -307,7 +308,7 @@ impl Mailbox {
     /// Commit exactly the most recently returned candidate and return its
     /// payload so the runtime can establish receiver-side ORCA ownership only
     /// after the pattern+guard succeeds.
-    pub fn commit_receive_match(&mut self) -> Option<Arc<Vec<Value>>> {
+    pub(crate) fn commit_receive_match_with_handoff(&mut self) -> Option<(Arc<Vec<Value>>, u16)> {
         let (lane, idx) = self.active_match.take()?;
         let removed = match lane {
             MatchLane::System => self.system_skip_buffer.remove(idx),
@@ -316,7 +317,12 @@ impl Mailbox {
         }?;
         self.release_slot();
         self.clear_tried_flags();
-        Some(removed.0.payload)
+        Some((removed.0.payload, removed.0.ownership_handoff_mask))
+    }
+
+    pub fn commit_receive_match(&mut self) -> Option<Arc<Vec<Value>>> {
+        self.commit_receive_match_with_handoff()
+            .map(|(payload, _)| payload)
     }
 
     /// Abort a selective-receive scan. No message is consumed and ownership
@@ -338,6 +344,7 @@ mod tests {
             payload: Arc::new(vec![Value::int(42)]),
             sender,
             priority: MessagePriority::Normal,
+            ownership_handoff_mask: 0,
             trace_id: None,
         }
     }
@@ -405,6 +412,7 @@ mod tests {
                 payload: Arc::new(vec![Value::int(i)]),
                 sender: i as u64,
                 priority: MessagePriority::System,
+                ownership_handoff_mask: 0,
                 trace_id: None,
             })
             .unwrap();
@@ -503,6 +511,7 @@ mod transactional_receive_tests {
             payload: Arc::new(vec![Value::int(sender as i64)]),
             sender,
             priority,
+            ownership_handoff_mask: 0,
             trace_id: None,
         }
     }
