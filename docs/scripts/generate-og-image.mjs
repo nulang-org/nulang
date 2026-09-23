@@ -10,6 +10,16 @@ const HEIGHT = 630;
 const logoPath = resolve(import.meta.dirname, '..', 'src', 'assets', 'logo.svg');
 const logoContent = readFileSync(logoPath, 'utf-8');
 
+// logo.svg is viewBox-only (no width/height attributes), so extract its
+// inner content and re-wrap it in an explicitly-sized svg. Fail loudly if
+// the injection produced no change instead of rendering an empty box.
+const logoInner = logoContent.replace(/<svg[^>]*>/, '').replace(/<\/svg>\s*$/, '').trim();
+if (!logoInner || logoInner === logoContent.trim() || !logoInner.includes('<path')) {
+  console.error(`Failed to inject logo: no inner content extracted from ${logoPath}`);
+  process.exit(1);
+}
+const logoSvg = `<svg width="80" height="80" viewBox="0 0 32 32">${logoInner}</svg>`;
+
 const svg = `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${HEIGHT}" viewBox="0 0 ${WIDTH} ${HEIGHT}">
   <defs>
@@ -19,13 +29,10 @@ const svg = `<?xml version="1.0" encoding="UTF-8"?>
     </linearGradient>
   </defs>
   <rect width="${WIDTH}" height="${HEIGHT}" fill="url(#bg)"/>
-  <!-- Logo centered above text -->
-  <g transform="translate(${WIDTH / 2 - 40}, ${HEIGHT / 2 - 120})">
-    ${logoContent.replace(/<svg[^>]*>/, '').replace('</svg>', '')
-      .replace(/width="32"/, 'width="80"')
-      .replace(/height="32"/, 'height="80"')
-      .replace(/viewBox="0 0 32 32"/, 'viewBox="0 0 32 32"')
-      .replace('stroke-width="4.5"', 'stroke-width="5"')}
+  <!-- Logo centered above text: wrapped in an explicitly-sized svg because
+       logo.svg is viewBox-only (no width/height attributes to replace) -->
+  <g transform="translate(${WIDTH / 2 - 40}, ${HEIGHT / 2 - 165})">
+    ${logoSvg}
   </g>
   <text x="${WIDTH / 2}" y="${HEIGHT / 2}" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="96" font-weight="bold" fill="#ffffff">Nulang</text>
   <text x="${WIDTH / 2}" y="${HEIGHT / 2 + 50}" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="28" fill="#93c5fd">A distributed, actor-based programming language</text>

@@ -1,0 +1,2 @@
+fn low17(x: Int) -> Int { x }
+let f = fn(comp_rec) => fn(src) => fn(eff_start) => fn(q5) => fn(len) => fn(nr) => fn(env) => fn(elen) => fn(no_left) => fn(p) => (if comp_rec == 1 then (nr * 262144) + p else if comp_rec == 2 then ((nr * 262144) + p) else (nr * 262144) + p) in 123

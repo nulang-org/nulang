@@ -2059,9 +2059,9 @@ counter ! increment()
 
 Message sending is asynchronous and non-blocking: the message is enqueued in the target's mailbox and the sender continues immediately. Send arguments must be sendable (§5.7).
 
-**Implementation status (verified 2026-08-02).** Behavior name resolution has two surprising edge cases, neither caught at compile time:
-1. A `send`/`ask` naming a behavior the target actor doesn't declare does not drop the message or error -- it silently runs the actor's first declared behavior instead (`Runtime::send_message` resolves an unknown name to behavior id 0; see the doc comment on `send_message` in `src/runtime/mod.rs`).
-2. Two different actor types that happen to declare a same-named behavior can collide: dispatch resolves by suffix-matching the *variable's* name hint, not the target's concrete actor type, so addressing one type's variable can run the *other* type's same-named behavior against the first type's state. See `conformance/behavior/lifecycle_03/04/05_*.nula` for the evidence trail. Both are tracked as known gaps, not fixed -- `send_message` is called pervasively enough that correcting the fallback needs a wider, carefully-audited change (the remote-message delivery path in §12.4 deliberately mirrors the same behavior-id-0 fallback today).
+**Implementation status (verified 2026-09-21).** Known actor references are checked statically for behavior existence/signature compatibility, and runtime delivery resolves names against the *target actor's* native/bytecode behavior metadata. For any actor that declares a named behavior surface, an unknown name is rejected across local, cross-shard, and remote delivery and cannot alias behavior id 0. Dynamic/opaque actor references still require runtime validation.
+
+The Rust embedder's low-level `Runtime::spawn_actor` primitive is intentionally different: it can create a metadata-free actor with no declared handlers. Such an anonymous actor keeps raw mailbox compatibility, so an arbitrary runtime label is admitted as inert behavior id 0. Because the actor has no native or bytecode handler at that id, the compatibility path cannot execute user code. Once any named behavior is registered, the actor uses the strict fail-closed rule above.
 
 ## 8.6 Request-Response
 
@@ -2404,19 +2404,23 @@ in this pass beyond the first):**
 ```nulang
 workflow OrderFulfillment {
   step receive_order {
-    perform IO.print("Processing order")
+    // Replay-safe order-receipt logic belongs here.
+    ()
   }
 
   step validate_inventory {
-    perform IO.print("Checking stock")
+    // Replay-safe inventory validation belongs here.
+    ()
   }
 
   step charge_payment {
-    perform IO.print("Charging payment")
+    // Replay-safe payment orchestration belongs here.
+    ()
   }
 
   step ship_order {
-    perform IO.print("Shipping")
+    // Replay-safe shipment orchestration belongs here.
+    ()
   }
 }
 ```
@@ -2449,15 +2453,18 @@ workflow OrderFulfillment {
 workflow ParallelProcessing {
   parallel {
     step gather_a {
-      perform IO.print("gathering A")
+      // Replay-safe branch A logic.
+      ()
     }
     step gather_b {
-      perform IO.print("gathering B")
+      // Replay-safe branch B logic.
+      ()
     }
   }
 
   step aggregate_results {
-    perform IO.print("aggregating")
+    // Replay-safe aggregation logic.
+    ()
   }
 }
 ```
@@ -2479,19 +2486,24 @@ workflow ParallelProcessing {
 ```nulang
 workflow SagaTransaction {
   step reserve_inventory {
-    perform IO.print("reserved")
+    // Replay-safe reservation logic.
+    ()
   } compensate {
-    perform IO.print("released")
+    // Replay-safe release logic.
+    ()
   }
 
   step charge_payment {
-    perform IO.print("charged")
+    // Replay-safe payment logic.
+    ()
   } compensate {
-    perform IO.print("refunded")
+    // Replay-safe refund logic.
+    ()
   }
 
   step ship_goods {
-    perform IO.print("shipped")
+    // Replay-safe shipment logic.
+    ()
   }
 }
 ```

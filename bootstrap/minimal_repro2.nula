@@ -1,0 +1,4 @@
+fn a(x: Int) -> Int { x }
+fn b(x: Int, y: Int, z: Int) -> Int { x + y + z }
+fn f(c: Int) -> Int { if c == 1 then (let x = a(a(a(c))) in let y = b(x)(x)(x) in let z = y >> 1 in if z > 0 then z else 0) else 99 }
+f(1)

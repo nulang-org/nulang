@@ -14,6 +14,30 @@ fn test_jit_session_creation() {
 }
 
 #[test]
+fn test_dense_compiled_slots_are_module_scoped() {
+    let mut jit = make_jit();
+    let ptr = std::ptr::NonNull::<u8>::dangling().as_ptr() as *const u8;
+
+    jit.store_compiled(2, 17, ptr, 9);
+
+    assert_eq!(jit.compiled_count(), 1);
+    assert!(jit.is_compiled(2, 17));
+    assert_eq!(jit.compiled_region_len(2, 17), Some(9));
+    assert!(!jit.is_compiled(1, 17));
+    assert!(!jit.is_compiled(2, 16));
+
+    // Replacing an occupied slot must not inflate the region count.
+    jit.store_compiled(2, 17, ptr, 11);
+    assert_eq!(jit.compiled_count(), 1);
+    assert_eq!(jit.compiled_region_len(2, 17), Some(11));
+
+    // The same PC in another module is a distinct slot.
+    jit.store_compiled(3, 17, ptr, 5);
+    assert_eq!(jit.compiled_count(), 2);
+    assert_eq!(jit.compiled_region_len(3, 17), Some(5));
+}
+
+#[test]
 fn test_hot_counter() {
     let mut jit = make_jit();
     assert!(!jit.record_and_check_hot(0, 0));
@@ -820,13 +844,13 @@ fn test_jit_execute_bitwise_ops() {
 
     func(regs.as_mut_ptr(), consts.as_ptr());
 
-    assert_eq!(Value::from_bits(regs[2]).as_int(), Some(0b0110));
-    assert_eq!(Value::from_bits(regs[3]).as_int(), Some(0b1000));
-    assert_eq!(Value::from_bits(regs[4]).as_int(), Some(0b1110));
-    assert_eq!(Value::from_bits(regs[7]).as_int(), Some(48));
-    assert_eq!(Value::from_bits(regs[10]).as_int(), Some(-4));
-    assert_eq!(Value::from_bits(regs[13]).as_int(), Some(2));
-    assert_eq!(Value::from_bits(regs[16]).as_int(), Some(7));
+    assert_eq!(unsafe { Value::from_bits(regs[2]) }.as_int(), Some(0b0110));
+    assert_eq!(unsafe { Value::from_bits(regs[3]) }.as_int(), Some(0b1000));
+    assert_eq!(unsafe { Value::from_bits(regs[4]) }.as_int(), Some(0b1110));
+    assert_eq!(unsafe { Value::from_bits(regs[7]) }.as_int(), Some(48));
+    assert_eq!(unsafe { Value::from_bits(regs[10]) }.as_int(), Some(-4));
+    assert_eq!(unsafe { Value::from_bits(regs[13]) }.as_int(), Some(2));
+    assert_eq!(unsafe { Value::from_bits(regs[16]) }.as_int(), Some(7));
 }
 
 /// FNeg must negate real floats and map any tagged (NaN-pattern) value to
@@ -850,7 +874,7 @@ fn test_jit_execute_fneg() {
 
     func(regs.as_mut_ptr(), consts.as_ptr());
 
-    assert_eq!(Value::from_bits(regs[1]).as_float(), Some(-2.5));
+    assert_eq!(unsafe { Value::from_bits(regs[1]) }.as_float(), Some(-2.5));
     assert_eq!(regs[3], (-0.0f64).to_bits());
 }
 
@@ -873,8 +897,8 @@ fn test_jit_execute_load_store() {
 
     func(regs.as_mut_ptr(), consts.as_ptr());
 
-    assert_eq!(Value::from_bits(regs[1]).as_int(), Some(42));
-    assert_eq!(Value::from_bits(regs[2]).as_int(), Some(42));
+    assert_eq!(unsafe { Value::from_bits(regs[1]) }.as_int(), Some(42));
+    assert_eq!(unsafe { Value::from_bits(regs[2]) }.as_int(), Some(42));
 }
 
 /// End-to-end equivalence: run a hot loop (2000 iterations, crossing
@@ -967,13 +991,13 @@ fn test_jit_bitwise_loop_matches_interpreter() {
     regs[7] = Value::int(1).as_raw();
     loop {
         func(regs.as_mut_ptr(), consts.as_ptr());
-        if Value::from_bits(regs[5]).as_bool() != Some(true) {
+        if unsafe { Value::from_bits(regs[5]) }.as_bool() != Some(true) {
             break;
         }
     }
 
     assert_eq!(
-        Value::from_bits(regs[0]).as_int(),
+        unsafe { Value::from_bits(regs[0]) }.as_int(),
         Some(expected),
         "JIT-compiled loop body must match the interpreter"
     );
@@ -1296,7 +1320,7 @@ fn test_typed_path_matches_scalar_path() {
         regs[8] = Value::int(2).as_raw();
         loop {
             func(regs.as_mut_ptr(), consts.as_ptr());
-            if Value::from_bits(regs[5]).as_bool() != Some(true) {
+            if unsafe { Value::from_bits(regs[5]) }.as_bool() != Some(true) {
                 break;
             }
         }
@@ -1386,12 +1410,12 @@ fn test_absent_metadata_uses_scalar_path() {
     regs[8] = Value::int(2).as_raw();
     loop {
         func(regs.as_mut_ptr(), consts.as_ptr());
-        if Value::from_bits(regs[5]).as_bool() != Some(true) {
+        if unsafe { Value::from_bits(regs[5]) }.as_bool() != Some(true) {
             break;
         }
     }
     assert_eq!(
-        Value::from_bits(regs[0]).as_int(),
+        unsafe { Value::from_bits(regs[0]) }.as_int(),
         Some(int_loop_expected(LIMIT))
     );
 
@@ -1504,7 +1528,7 @@ fn test_compute_recursive_classifies_cycles() {
 fn test_tier2_counter_increments() {
     let mut jit = make_jit();
     let dummy_ptr: *const u8 = std::ptr::null();
-    jit.compiled.insert((0, 100), (dummy_ptr, 5));
+    jit.store_compiled(0, 100, dummy_ptr, 5);
 
     // Counter starts at 0 (not yet in map), increments each call.
     for i in 0..TIER2_THRESHOLD - 1 {
@@ -1531,8 +1555,8 @@ fn test_tier2_counters_are_per_session() {
     let mut jit_a = make_jit();
     let mut jit_b = make_jit();
     let dummy_ptr: *const u8 = std::ptr::null();
-    jit_a.compiled.insert((0, 200), (dummy_ptr, 3));
-    jit_b.compiled.insert((0, 200), (dummy_ptr, 3));
+    jit_a.store_compiled(0, 200, dummy_ptr, 3);
+    jit_b.store_compiled(0, 200, dummy_ptr, 3);
 
     // Heat session A to threshold.
     for _ in 0..TIER2_THRESHOLD {

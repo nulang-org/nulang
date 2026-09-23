@@ -1,9 +1,8 @@
 ---
-import Default from '@astrojs/starlight/components/Head.astro';
-
-const { entry } = Astro.locals.starlightRoute;
+const { entry, head, lastUpdated } = Astro.locals.starlightRoute;
 const site = 'https://nulang.org';
-const isHome = Astro.url.pathname === '/' || entry.data.template === 'splash';
+const isHome = Astro.url.pathname === '/';
+const is404 = entry.id === '404';
 const canonical = new URL(Astro.url.pathname, site).href;
 
 const segments = Astro.url.pathname.split('/').filter(Boolean);
@@ -33,19 +32,14 @@ if (isHome) {
     name: 'Nulang',
     url: site,
     description:
-      'A distributed, actor-based programming language with algebraic effects and row-polymorphic types',
+      'An actor-based programming language with static types, algebraic effects, supervision, durable state, and experimental distribution',
     publisher: org,
-    potentialAction: {
-      '@type': 'SearchAction',
-      target: site + '/?q={search_term_string}',
-      'query-input': 'required name=search_term_string',
-    },
   });
   graph.push({
     '@type': 'SoftwareSourceCode',
     name: 'Nulang',
     description:
-      'A distributed, actor-based programming language with algebraic effects, row-polymorphic types, and reference capabilities. Built in Rust with a register-based VM, Cranelift JIT, WASM backend, and native AOT compilation.',
+      'An actor-based programming language with Hindley-Milner inference, algebraic effects, capability types, supervision, persistent actors, a semantic-reference bytecode VM, Cranelift JIT tiering, portable WASM execution, and experimental distributed/runtime surfaces.',
     programmingLanguage: ['Nulang', 'Rust'],
     url: site,
     codeRepository: 'https://github.com/nulang-org/nulang',
@@ -54,10 +48,9 @@ if (isHome) {
     keywords:
       'programming language, actor model, algebraic effects, distributed systems, Rust, WASM, JIT, type inference, reference capabilities, BEAM, OTP',
     operatingSystem: 'Linux, macOS',
-    version: '1.0.0-frozen',
   });
-} else {
-  graph.push({
+} else if (!is404) {
+  const article: any = {
     '@type': 'TechArticle',
     headline: entry.data.title,
     description: entry.data.description,
@@ -66,7 +59,12 @@ if (isHome) {
     author: org,
     publisher: org,
     isPartOf: { '@type': 'WebSite', name: 'Nulang', url: site },
-  });
+  };
+  if (lastUpdated instanceof Date) {
+    article.datePublished = lastUpdated.toISOString();
+    article.dateModified = lastUpdated.toISOString();
+  }
+  graph.push(article);
   if (crumbs.length > 1) {
     graph.push({
       '@type': 'BreadcrumbList',
@@ -81,11 +79,31 @@ if (isHome) {
 }
 
 const jsonld = JSON.stringify({ '@context': 'https://schema.org', '@graph': graph });
+
+// Starlight's default head sets og:type=article on every page (and the
+// site config appends a global og:type=website). Emit exactly one og:type
+// per page, replacing the first occurrence and dropping duplicates.
+const ogType = isHome ? 'website' : 'article';
+let ogTypeSeen = false;
+const headEntries = head
+  .map((h) => {
+    if (h.tag === 'meta' && (h.attrs as Record<string, string>)?.property === 'og:type') {
+      if (ogTypeSeen) return null;
+      ogTypeSeen = true;
+      return { tag: 'meta', attrs: { property: 'og:type', content: ogType } };
+    }
+    return h;
+  })
+  .filter(Boolean) as any[];
+
+const pageTitle = head.find((h) => h.tag === 'title')?.content ?? String(entry.data.title);
+const pageDescription =
+  entry.data.description ?? 'An actor-based programming language for resilient software';
 ---
-<Default><slot /></Default>
-<link rel="preconnect" href="https://fonts.googleapis.com" />
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link
-  href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
-  rel="stylesheet"
-/>
+{headEntries.map(({ tag: Tag, attrs, content }: any) => <Tag {...attrs} set:html={content} />)}
+{!ogTypeSeen && <meta property="og:type" content={ogType} />}
+<meta property="og:image:alt" content="Nulang — actor-based programming language for resilient software" />
+<meta name="twitter:title" content={pageTitle} />
+<meta name="twitter:description" content={pageDescription} />
+{is404 && <meta name="robots" content="noindex, nofollow" />}
+{!is404 && <script type="application/ld+json" set:html={jsonld} />}

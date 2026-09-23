@@ -1,0 +1,62 @@
+let low17 = fn(x) => (let q = x / 131072 in x - q * 131072) in let low16 = fn(x) => (let q = x / 65536 in x - q * 65536) in let low8 = fn(x) => (let q = x / 256 in x - q * 256) in let low4 = fn(x) => (let q = x / 16 in x - q * 16) in let low6 = fn(x) => (let q = x / 64 in x - q * 64) in let bit17 = fn(x) => (let t = x / 131072 in t - (t / 2) * 2) in let hex_digit = fn(n) => (if n < 10 then nperform("Int.to_string", n) else if n == 10 then "a" else if n == 11 then "b" else if n == 12 then "c" else if n == 13 then "d" else if n == 14 then "e" else "f") in let remark = fn(msg) => (nperform("IO.print", "; " + msg)) in let emit_hex = fn(w) => (nperform("IO.print", "" + hex_digit(low4(w / 268435456)) + hex_digit(low4(w / 16777216)) + hex_digit(low4(w / 1048576)) + hex_digit(low4(w / 65536)) + hex_digit(low4(w / 4096)) + hex_digit(low4(w / 256)) + hex_digit(low4(w / 16)) + hex_digit(low4(w)))) in let instr = fn(opcode) => fn(op1) => fn(op2) => fn(op3) => (((opcode * 16777216)) + ((op1 * 65536)) + ((op2 * 256)) + op3) in let emit_word = fn(opcode) => fn(op1) => fn(op2) => fn(op3) => (let w = instr(opcode)(op1)(op2)(op3) in let _ = emit_hex(w) in 0) in let env_decode = fn(env) => fn(i) => (let b0 = nperform("String.charAt", env, i) - 1 in let b1 = nperform("String.charAt", env, i + 1) - 1 in let b2 = nperform("String.charAt", env, i + 2) - 1 in let b3 = nperform("String.charAt", env, i + 3) - 1 in ((b0 * 262144)) + ((b1 * 4096)) + ((b2 * 64)) + b3) in let emit_cap_step = fn(closure_reg) => fn(slot) => fn(is_store) => (let cap_reg = 11 + slot in if is_store != 0 then emit_word(98)(closure_reg)(slot)(cap_reg) else emit_word(97)(slot)(cap_reg)(0)) in let emit_fnend_step = fn(reg) => fn(slot) => fn(closure_reg) => (let cap_dst = 11 + slot in let _ = emit_word(18)(reg)(cap_dst)(0) in emit_word(98)(closure_reg)(slot)(cap_dst)) in let emit_caps = fn(closure_reg) => fn(count) => fn(slot) => fn(is_store) => (if slot >= count then 0 else (let _ = emit_cap_step(closure_reg)(slot)(is_store) in emit_caps(closure_reg)(count)(slot + 1)(is_store))) in let emit_fnend_caps = fn(env) => fn(elen) => fn(idx) => fn(slot) => fn(closure_reg) => (if idx >= elen then slot else (let v = env_decode(env)(idx * 4) in let reg = low8(v) in let is_cap = reg >= 100 and reg < 128 in if is_cap then (let _ = emit_fnend_step(reg)(slot)(closure_reg) in emit_fnend_caps(env)(elen)(idx + 1)(slot + 1)(closure_reg)) else (emit_fnend_caps(env)(elen)(idx + 1)(slot)(closure_reg)))) in let is_digit = fn(c) => (c >= 48 and c <= 57) in let is_alpha = fn(c) => ((c >= 65 and c <= 90) or (c >= 97 and c <= 122)) in let comp_nperform_body = fn(comp_rec) => fn(src) => fn(eff_start) => fn(q5) => fn(len) => fn(nr) => fn(env) => fn(elen) => fn(no_left) => fn(p) => (
+    if q5 < len then (
+        let c3 = src + q5 in
+        let dst = nr in
+        if c3 == 41 then (
+            (dst * 262144) + q5
+        ) else if c3 == 44 then (
+            let no_left_np = 268435456 * 4096 in
+            let p0 = q5 + 1 in
+            let inner0 = p0 + len + no_left_np + nr + 1 + env + elen in
+            let r0 = inner0 >> 18 in
+            let e0 = low17(inner0) in
+            let ap0 = e0 + len in
+            if ap0 < len then (
+                let cp0 = src + ap0 in
+                if cp0 == 41 then (
+                    (dst * 262144) + ap0
+                ) else if cp0 == 44 then (
+                    let p1 = ap0 + 1 in
+                    let inner1 = p1 + len + no_left_np + nr + 11 + env + elen in
+                    let r1 = inner1 >> 18 in
+                    let e1 = low17(inner1) in
+                    let ap1 = e1 + len in
+                    if ap1 < len then (
+                        let cp1 = src + ap1 in
+                        if cp1 == 41 then (
+                            (dst * 262144) + ap1
+                        ) else if cp1 == 44 then (
+                            let p2 = ap1 + 1 in
+                            let inner2 = p2 + len + no_left_np + nr + 21 + env + elen in
+                            let r2 = inner2 >> 18 in
+                            let e2 = low17(inner2) in
+                            let ap2 = e2 + len in
+                            if ap2 < len then (
+                                let cp2 = src + ap2 in
+                                if cp2 == 41 then (
+                                    (dst * 262144) + ap2
+                                ) else (
+                                    (nr * 262144) + p
+                                )
+                            ) else (
+                                (nr * 262144) + p
+                            )
+                        ) else (
+                            (nr * 262144) + p
+                        )
+                    ) else (
+                        (nr * 262144) + p
+                    )
+                ) else (
+                    (nr * 262144) + p
+                )
+            ) else (
+                (nr * 262144) + p
+            )
+        ) else (
+            (nr * 262144) + p
+        )
+    ) else (
+        (nr * 262144) + p
+    )
+) in 123

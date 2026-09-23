@@ -6,6 +6,7 @@
 //! to keep the god-object at a manageable size.
 
 use crate::bytecode::Constant;
+use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{EventEntry, PersistedValue, WorkflowEvent};
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
@@ -22,7 +23,7 @@ pub(crate) fn next_sequence(rt: &Runtime, actor_id: u64) -> u64 {
 pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
     rt.actors
         .get(&actor_id)
-        .map(|a| a.is_workflow)
+        .map(|a| matches!(a.role(), Ok(ActorRole::Workflow)))
         .unwrap_or(false)
 }
 
@@ -30,14 +31,19 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
 // Checkpoint
 // ---------------------------------------------------------------------------
 
-/// Snapshot the durable and CRDT state of a persistent actor.
-pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
+/// Persist one checkpoint for a durable actor.
+///
+/// Unlike the compatibility wrapper below, this function is fallible. Callers
+/// that gate externally visible durable transitions (workflow creation, timer
+/// commits, signals, compensation) must use this path so storage failure cannot
+/// be mistaken for a committed transition.
+pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::Result<()> {
     let actor = match rt.actors.get(&actor_id) {
         Some(a) => a,
-        None => return,
+        None => return Ok(()),
     };
     if !actor.persistent {
-        return;
+        return Ok(());
     }
     let seq = next_sequence(rt, actor_id);
     let mut state = std::collections::HashMap::new();
@@ -60,11 +66,27 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
             state.insert(name.clone(), persisted);
         }
     }
+    let authority_tokens = actor
+        .authority_manifest()
+        .map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid actor authority manifest: {err}"),
+            )
+        })?
+        .canonical_token_set();
     // Snapshot the global CRDT state alongside durable actor fields.
     let crdt_snapshot = rt.crdt_manager.as_ref().map(|m| {
         m.snapshot()
             .into_iter()
             .map(|(id, (ty, bytes))| (id.0, ty.to_u8(), bytes))
+            .collect()
+    });
+    let crdt_field_map = rt.crdt_manager.as_ref().map(|m| {
+        m.field_map
+            .iter()
+            .filter(|((aid, _), _)| *aid == actor_id)
+            .map(|((_, name), id)| (name.clone(), id.0))
             .collect()
     });
     let snapshot = crate::runtime::persistence::ActorSnapshot {
@@ -73,15 +95,35 @@ pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
         state,
         waiting_signal: actor.waiting_signal.clone(),
         crdt_snapshot,
+        crdt_field_map,
+        authority_tokens,
     };
-    // RFC 0014 §3: re-spawn-opted actors replicate the snapshot to their
-    // deterministic shadow node before the local save, so the replica is a
-    // byte-identical copy of exactly what the local store will hold.
+    // The local persistence store is authoritative. Publish a shadow replica
+    // only after the local snapshot commit succeeds; otherwise a failed local
+    // checkpoint could leave a remote replica for an actor/transition that was
+    // never durably committed at home.
+    rt.persistence.save_snapshot(snapshot.clone())?;
     rt.maybe_shadow_replicate(actor_id, &snapshot);
-    let _ = rt.persistence.save_snapshot(snapshot);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.sequence = seq;
         actor.dirty_fields.clear();
+    }
+    Ok(())
+}
+
+/// Snapshot the durable and CRDT state of a persistent actor.
+///
+/// This wrapper intentionally preserves the legacy best-effort API for call
+/// sites where checkpoint failure is diagnostic rather than a commit boundary.
+/// New durable transitions should call `try_checkpoint_actor` and propagate
+/// the error.
+pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
+    if let Err(error) = try_checkpoint_actor(rt, actor_id) {
+        tracing::warn!(
+            actor_id,
+            %error,
+            "nulang-persist: durable checkpoint failed"
+        );
     }
 }
 
@@ -109,11 +151,7 @@ fn resolve_string_constant(rt: &Runtime, actor_id: u64, value: &Value) -> Option
 /// event-sourced (non-workflow) actors the event is persisted to the event
 /// journal and a checkpoint is forced.
 pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[Value]) {
-    let is_workflow = rt
-        .actors
-        .get(&actor_id)
-        .map(|a| a.is_workflow)
-        .unwrap_or(false);
+    let is_workflow = actor_is_workflow(rt, actor_id);
     let seq = next_sequence(rt, actor_id);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.event_log.push((event.to_string(), args.to_vec()));
@@ -211,7 +249,7 @@ pub(crate) fn append_timer_set(
     let seq = next_sequence(rt, actor_id);
     rt.persistence
         .append_timer_set(actor_id, seq, name.to_string(), duration_ms)?;
-    checkpoint_actor(rt, actor_id);
+    try_checkpoint_actor(rt, actor_id)?;
     Ok(())
 }
 
@@ -223,7 +261,7 @@ pub(crate) fn append_timer_fired(
     let seq = next_sequence(rt, actor_id);
     rt.persistence
         .append_timer_fired(actor_id, seq, name.to_string())?;
-    checkpoint_actor(rt, actor_id);
+    try_checkpoint_actor(rt, actor_id)?;
     Ok(())
 }
 
@@ -236,7 +274,7 @@ pub(crate) fn append_signal_received(
     let seq = next_sequence(rt, actor_id);
     rt.persistence
         .append_signal_received(actor_id, seq, name.to_string(), payload)?;
-    checkpoint_actor(rt, actor_id);
+    try_checkpoint_actor(rt, actor_id)?;
     Ok(())
 }
 
@@ -248,7 +286,7 @@ pub(crate) fn append_saga_compensated(
     let seq = next_sequence(rt, actor_id);
     rt.persistence
         .append_saga_compensated(actor_id, seq, step_name.to_string())?;
-    checkpoint_actor(rt, actor_id);
+    try_checkpoint_actor(rt, actor_id)?;
     Ok(())
 }
 
@@ -287,7 +325,7 @@ pub(crate) fn signal_workflow(
 /// Register a read-only query handler on a workflow actor.
 pub(crate) fn register_workflow_query(rt: &mut Runtime, actor_id: u64, name: &str, handler: Value) {
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
-        if actor.is_workflow {
+        if matches!(actor.role(), Ok(ActorRole::Workflow)) {
             actor.query_handlers.insert(name.to_string(), handler);
         }
     }
@@ -297,7 +335,7 @@ pub(crate) fn register_workflow_query(rt: &mut Runtime, actor_id: u64, name: &st
 pub(crate) fn query_workflow(rt: &mut Runtime, actor_id: u64, name: &str) -> Option<Value> {
     let (handler, module) = {
         let actor = rt.actors.get(&actor_id)?;
-        if !actor.is_workflow {
+        if !matches!(actor.role(), Ok(ActorRole::Workflow)) {
             return None;
         }
         let handler = *actor.query_handlers.get(name)?;

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-NULANG="${NULANG_BIN:-cargo run --quiet --}"
+NULANG="${NULANG_BIN:-cargo run --quiet --bin nulang --}"
 
 echo "=== Bootstrap Core verification ==="
 
@@ -100,6 +100,45 @@ add(double(3))
 EOF
 expect_mf bootstrap/pipeline_multi_fn.nula "7"
 rm -f bootstrap/pipeline_multi_fn.nula bootstrap/pipeline_mf.nbc
+
+# 7. Self-compile oracle: prep_core transforms compile_hex.nula into the
+#    self-hostable dialect, compile_hex compiles IT, and the resulting .nbc
+#    (a compiler built by the compiler) must emit byte-identical hex to the
+#    host compile_hex.nula on the reference expressions.
+export NULANG_STEP_LIMIT=400000000
+python3 bootstrap/prep_core.py < bootstrap/compile_hex.nula 2>/dev/null |
+    $NULANG bootstrap/compile_hex.nula 2>/dev/null |
+    python3 bootstrap/fixup_hex.py |
+    python3 bootstrap/hex2nbc.py > bootstrap/self_compile.nbc 2>/dev/null
+
+oracle_expr() {
+    local expr="$1"
+    printf '%s' "$expr" | $NULANG bootstrap/compile_hex.nula 2>/dev/null |
+        grep -v '^;' | tr -d '\n'
+    printf '%s' "$expr" | $NULANG bootstrap/self_compile.nbc 2>/dev/null |
+        grep -v '^;' | tr -d '\n'
+}
+expect_oracle() {
+    local expr="$1"
+    local host self
+    host=$(printf '%s' "$expr" | $NULANG bootstrap/compile_hex.nula 2>/dev/null |
+        grep -v '^;' | tr -d '\n')
+    self=$(printf '%s' "$expr" | $NULANG bootstrap/self_compile.nbc 2>/dev/null |
+        grep -v '^;' | tr -d '\n')
+    if [ "$host" != "$self" ]; then
+        echo "FAIL: self-compile oracle '$expr' differs"
+        rm -f bootstrap/self_compile.nbc
+        exit 1
+    fi
+    echo "PASS: self-compile oracle '$expr'"
+}
+expect_oracle '1 + 2 * 3'
+expect_oracle 'let x = 42 in x + 1'
+expect_oracle 'if 1 < 2 then 100 else 200'
+expect_oracle 'not false'
+expect_oracle '(fn(x) => x + 1)(41)'
+expect_oracle 'let fib = fn(n) => if n < 2 then n else fib(n - 1) + fib(n - 2) in fib(10)'
+rm -f bootstrap/self_compile.nbc
 
 echo ""
 echo "=== All bootstrap checks passed ==="

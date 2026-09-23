@@ -51,9 +51,11 @@ use std::time::{Duration, Instant};
 
 use super::cluster::{DurableDirectoryEntry, NodeGossip, NodeStatus};
 use super::crdt_manager::{CrdtDeltaOp, CrdtOp};
+use super::distributed_context::{FabricAdvertisement, FabricAdvertisementSnapshot};
 use super::supervision::RemoteLink;
 use super::MessagePriority;
 use super::NodeId;
+use crate::protocol::ProtocolId;
 use crate::vm::Value;
 
 #[cfg(feature = "tcp")]
@@ -559,6 +561,11 @@ pub enum Packet {
         /// sender's module; the receiver MAY verify it against the local
         /// behavior table during delivery (see process_network_packets).
         content_hash: Option<[u8; 32]>,
+        /// Optional canonical protocol contract required by the sender/client.
+        /// This is carried in the additive PRT0 NUL0-v1 tail. It is not the
+        /// receiver's installed protocol; receivers obtain that locally before
+        /// admission.
+        required_protocol_id: Option<ProtocolId>,
         payload: Vec<Value>,
         /// UTF-8 content for every `Value::string(id)` in `payload`: on the
         /// wire a string-id value indexes **this table**, never the sender's
@@ -639,6 +646,10 @@ pub enum Packet {
         /// piggybacked on the membership gossip round. Additive: older
         /// peers that predate this field ignore the trailing bytes.
         directory: Vec<DurableDirectoryEntry>,
+        /// Complete ephemeral Fabric subscription snapshot owned by the
+        /// gossip sender. Encoded as an optional additive tail; `None`
+        /// preserves the pre-Fabric gossip bytes exactly.
+        fabric: Option<FabricAdvertisementSnapshot>,
     },
 
     /// Request bytecode for a behavior identified by its BLAKE3 content hash.
@@ -881,6 +892,7 @@ impl Packet {
                 target_actor,
                 behavior_name,
                 content_hash,
+                required_protocol_id,
                 payload,
                 string_table,
                 object_table,
@@ -921,6 +933,13 @@ impl Packet {
                         write_string(buf, tid);
                     }
                     None => buf.push(0),
+                }
+                // Additive NUL0-v1 required-protocol tail. Historical readers
+                // stop after trace_id and ignore trailing bytes. PRT0 keeps the
+                // extension self-identifying for current readers.
+                if let Some(required_protocol_id) = required_protocol_id {
+                    buf.extend_from_slice(b"PRT0");
+                    buf.extend_from_slice(required_protocol_id.as_bytes());
                 }
             }
             Packet::Heartbeat { node_id, timestamp } => {
@@ -979,7 +998,11 @@ impl Packet {
             Packet::CrdtOp { op } => {
                 buf.extend_from_slice(&op.to_bytes());
             }
-            Packet::Gossip { members, directory } => {
+            Packet::Gossip {
+                members,
+                directory,
+                fabric,
+            } => {
                 buf.extend_from_slice(&(members.len() as u32).to_be_bytes());
                 for m in members {
                     buf.extend_from_slice(&m.node_id.0.to_be_bytes());
@@ -995,6 +1018,28 @@ impl Packet {
                     buf.extend_from_slice(&e.actor_id.to_be_bytes());
                     buf.extend_from_slice(&e.node_id.0.to_be_bytes());
                     buf.extend_from_slice(&e.epoch.to_be_bytes());
+                }
+
+                // Fabric metadata is an additive, self-identifying tail.
+                // Omitting it preserves the historical Gossip byte layout.
+                if let Some(snapshot) = fabric {
+                    buf.extend_from_slice(b"FAB0");
+                    buf.extend_from_slice(&snapshot.node_id.0.to_be_bytes());
+                    buf.extend_from_slice(&snapshot.generation.to_be_bytes());
+                    buf.extend_from_slice(&(snapshot.subscriptions.len() as u32).to_be_bytes());
+                    for subscription in &snapshot.subscriptions {
+                        buf.extend_from_slice(&subscription.node_id.0.to_be_bytes());
+                        write_string(buf, &subscription.pattern);
+                        buf.extend_from_slice(&subscription.actor_id.to_be_bytes());
+                        write_string(buf, &subscription.behavior);
+                        match &subscription.group {
+                            Some(group) => {
+                                buf.push(1);
+                                write_string(buf, group);
+                            }
+                            None => buf.push(0),
+                        }
+                    }
                 }
             }
             Packet::FetchBehaviorRequest { content_hash } => {
@@ -1130,18 +1175,36 @@ impl Packet {
         }
         // trace_id: 1-byte flag + optional string content.
         let trace_id = if offset < payload.len() && payload[offset] == 1 {
-            let _ = offset.checked_add(1)?;
-            let (tid, consumed) = read_string(payload, offset + 1)?;
-            let _ = offset.checked_add(consumed + 1)?;
+            offset = offset.checked_add(1)?;
+            let (tid, consumed) = read_string(payload, offset)?;
+            offset = offset.checked_add(consumed)?;
             Some(tid)
         } else {
-            let _ = offset.checked_add(1)?;
+            if offset < payload.len() {
+                offset = offset.checked_add(1)?;
+            }
+            None
+        };
+
+        // Optional additive sender-required protocol tail. Unknown trailing
+        // extensions remain ignored for NUL0-v1 forward compatibility.
+        let required_protocol_id = if payload.len() >= offset.saturating_add(4)
+            && payload.get(offset..offset + 4)? == b"PRT0"
+        {
+            if payload.len() < offset.saturating_add(36) {
+                return None;
+            }
+            let mut id = [0u8; 32];
+            id.copy_from_slice(payload.get(offset + 4..offset + 36)?);
+            Some(ProtocolId::from_bytes(id))
+        } else {
             None
         };
         Some(Packet::ActorMessage {
             target_actor,
             behavior_name,
             content_hash,
+            required_protocol_id,
             payload: values,
             string_table,
             object_table,
@@ -1317,8 +1380,11 @@ impl Packet {
         let mut directory = Vec::new();
         if offset + 4 <= payload.len() {
             let dcount = read_u32(payload, offset)? as usize;
+            if dcount > 4096 {
+                return None;
+            }
             offset += 4;
-            for _ in 0..dcount.min(4096) {
+            for _ in 0..dcount {
                 if offset + 24 > payload.len() {
                     return None;
                 }
@@ -1333,7 +1399,67 @@ impl Packet {
                 });
             }
         }
-        Some(Packet::Gossip { members, directory })
+
+        // New runtimes recognize the optional FAB0 tail. Older runtimes
+        // ignore all trailing bytes after the directory, so adding this
+        // section does not require a new packet discriminant or wire version.
+        let mut fabric = None;
+        if offset + 4 <= payload.len() && &payload[offset..offset + 4] == b"FAB0" {
+            offset += 4;
+            let node_id = NodeId(read_u64(payload, offset)?);
+            offset += 8;
+            let generation = read_u64(payload, offset)?;
+            offset += 8;
+            let fcount = read_u32(payload, offset)? as usize;
+            offset += 4;
+            if fcount > 4096 {
+                return None;
+            }
+
+            let mut subscriptions = Vec::with_capacity(fcount.min(256));
+            for _ in 0..fcount {
+                let entry_node_id = NodeId(read_u64(payload, offset)?);
+                offset += 8;
+                let (pattern, pattern_len) = read_string(payload, offset)?;
+                offset = offset.checked_add(pattern_len)?;
+                let actor_id = read_u64(payload, offset)?;
+                offset += 8;
+                let (behavior, behavior_len) = read_string(payload, offset)?;
+                offset = offset.checked_add(behavior_len)?;
+                let group = match *payload.get(offset)? {
+                    0 => {
+                        offset += 1;
+                        None
+                    }
+                    1 => {
+                        offset += 1;
+                        let (group, group_len) = read_string(payload, offset)?;
+                        offset = offset.checked_add(group_len)?;
+                        Some(group)
+                    }
+                    _ => return None,
+                };
+                subscriptions.push(FabricAdvertisement {
+                    node_id: entry_node_id,
+                    pattern,
+                    actor_id,
+                    behavior,
+                    group,
+                });
+            }
+
+            fabric = Some(FabricAdvertisementSnapshot {
+                node_id,
+                generation,
+                subscriptions,
+            });
+        }
+
+        Some(Packet::Gossip {
+            members,
+            directory,
+            fabric,
+        })
     }
 
     fn read_node_goodbye(payload: &[u8]) -> Option<Self> {
@@ -2605,6 +2731,7 @@ mod tests {
             target_actor: 42,
             behavior_name: "handle_msg".to_string(),
             content_hash: None,
+            required_protocol_id: None,
             payload: vec![Value::int(123), Value::string(456)],
             string_table: vec![],
             object_table: vec![],
@@ -2625,11 +2752,109 @@ mod tests {
     // 2b. ActorMessage string table roundtrip
     // ------------------------------------------------------------------
     #[test]
+    fn test_packet_actor_message_required_protocol_tail_roundtrip() {
+        let required_protocol_id = ProtocolId::from_bytes([0xA5; 32]);
+        let packet = Packet::ActorMessage {
+            target_actor: 42,
+            behavior_name: "handle_msg".to_string(),
+            content_hash: None,
+            required_protocol_id: Some(required_protocol_id),
+            payload: vec![Value::int(7)],
+            string_table: vec![],
+            object_table: vec![],
+            sender_actor: 9,
+            sender_node: NodeId(11),
+            priority: MessagePriority::Normal,
+            trace_id: Some("trace-1".to_string()),
+        };
+
+        let bytes = packet.to_bytes(0xBEEF);
+        assert!(bytes.windows(4).any(|window| window == b"PRT0"));
+        let (seq, decoded) =
+            Packet::from_bytes(&bytes).expect("required protocol tail should decode");
+        assert_eq!(seq, 0xBEEF);
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_actor_message_without_protocol_tail_preserves_legacy_bytes() {
+        let packet = Packet::ActorMessage {
+            target_actor: 5,
+            behavior_name: "ping".to_string(),
+            content_hash: None,
+            required_protocol_id: None,
+            payload: vec![],
+            string_table: vec![],
+            object_table: vec![],
+            sender_actor: 6,
+            sender_node: NodeId(7),
+            priority: MessagePriority::Normal,
+            trace_id: None,
+        };
+
+        let bytes = packet.to_bytes(19);
+        assert!(!bytes.windows(4).any(|window| window == b"PRT0"));
+        let (_, decoded) = Packet::from_bytes(&bytes).expect("legacy actor message should decode");
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_actor_message_ignores_unknown_additive_tail() {
+        let packet = Packet::ActorMessage {
+            target_actor: 1,
+            behavior_name: "ping".to_string(),
+            content_hash: None,
+            required_protocol_id: None,
+            payload: vec![],
+            string_table: vec![],
+            object_table: vec![],
+            sender_actor: 2,
+            sender_node: NodeId(3),
+            priority: MessagePriority::Normal,
+            trace_id: None,
+        };
+
+        let mut bytes = packet.to_bytes(23);
+        bytes.extend_from_slice(b"ZZZ0");
+        bytes.extend_from_slice(&[0x11; 32]);
+        let (seq, decoded) =
+            Packet::from_bytes(&bytes).expect("unknown additive tail must remain ignorable");
+        assert_eq!(seq, 23);
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_actor_message_rejects_truncated_required_protocol_tail() {
+        let packet = Packet::ActorMessage {
+            target_actor: 1,
+            behavior_name: "ping".to_string(),
+            content_hash: None,
+            required_protocol_id: None,
+            payload: vec![],
+            string_table: vec![],
+            object_table: vec![],
+            sender_actor: 2,
+            sender_node: NodeId(3),
+            priority: MessagePriority::Normal,
+            trace_id: None,
+        };
+
+        let mut bytes = packet.to_bytes(24);
+        bytes.extend_from_slice(b"PRT0");
+        bytes.extend_from_slice(&[0x22; 7]);
+        assert!(
+            Packet::from_bytes(&bytes).is_none(),
+            "a recognized PRT0 marker with a truncated digest must fail closed"
+        );
+    }
+
+    #[test]
     fn test_packet_actor_message_string_table_roundtrip() {
         let packet = Packet::ActorMessage {
             target_actor: 7,
             behavior_name: "store".to_string(),
             content_hash: None,
+            required_protocol_id: None,
             payload: vec![Value::string(0), Value::string(1), Value::string(0)],
             string_table: vec!["hello".to_string(), "wörld ✓".to_string()],
             object_table: vec![],
@@ -2656,6 +2881,7 @@ mod tests {
             target_actor: 8,
             behavior_name: "handle_bytes".to_string(),
             content_hash: None,
+            required_protocol_id: None,
             payload: vec![Value::object(0), Value::object(1), Value::object(0)],
             string_table: vec![],
             object_table: vec![(0, vec![1, 2, 3]), (1, vec![4, 5, 6, 7])],
@@ -2679,6 +2905,7 @@ mod tests {
             target_actor: 7,
             behavior_name: "store".to_string(),
             content_hash: None,
+            required_protocol_id: None,
             payload: vec![Value::string(0)],
             string_table: vec!["hello".to_string()],
             object_table: vec![],
@@ -2737,6 +2964,7 @@ mod tests {
                     epoch: 3,
                 },
             ],
+            fabric: None,
         };
 
         let bytes = packet.to_bytes(99);
@@ -2744,6 +2972,34 @@ mod tests {
 
         assert_eq!(seq, 99);
         assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_packet_gossip_fabric_snapshot_roundtrip() {
+        let packet = Packet::Gossip {
+            members: vec![],
+            directory: vec![],
+            fabric: Some(FabricAdvertisementSnapshot {
+                node_id: NodeId(0xABCD),
+                generation: 7,
+                subscriptions: vec![FabricAdvertisement {
+                    node_id: NodeId(0xABCD),
+                    pattern: "orders.*".into(),
+                    actor_id: 42,
+                    behavior: "handle".into(),
+                    group: Some("workers".into()),
+                }],
+            }),
+        };
+
+        let bytes = packet.to_bytes(101);
+        let (seq, decoded) =
+            Packet::from_bytes(&bytes).expect("Fabric gossip deserialization failed");
+        assert_eq!(seq, 101);
+        assert_eq!(decoded, packet);
+
+        let truncated = &bytes[..bytes.len() - 2];
+        assert!(Packet::from_bytes(truncated).is_none());
     }
 
     #[test]
@@ -2758,6 +3014,7 @@ mod tests {
                 incarnation: 3,
             }],
             directory: vec![],
+            fabric: None,
         };
         let bytes = packet.to_bytes(1);
         // Keep the header + count, chop the entry in half.
@@ -3095,7 +3352,13 @@ mod tests {
         // Heap/tagged values (except nil) would arrive corrupted on the
         // receiving node, so they must always be rejected. Nil is now
         // wire-safe (VAL_NIL tag).
-        assert!(!value_is_wire_safe(&Value::ptr(std::ptr::null_mut()), true));
+        assert!(!value_is_wire_safe(
+            &unsafe {
+                /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                Value::ptr(std::ptr::null_mut())
+            },
+            true
+        ));
         assert!(!value_is_wire_safe(&Value::actor_ref(9), true));
         assert!(!value_is_wire_safe(&Value::closure(3), true));
         assert!(value_is_wire_safe(&Value::nil(), true));
@@ -3106,6 +3369,7 @@ mod tests {
             target_actor: 1,
             behavior_name: "h".into(),
             content_hash: None,
+            required_protocol_id: None,
             payload,
             string_table,
             object_table: vec![],
@@ -3126,7 +3390,10 @@ mod tests {
         )));
         // Heap values stay rejected even with a table present.
         assert!(!packet_payload_wire_safe(&mk(
-            vec![Value::ptr(std::ptr::null_mut())],
+            vec![unsafe {
+                /* SAFETY: runtime path receives this pointer from its allocator or from an existing live pointer-tagged Value. */
+                Value::ptr(std::ptr::null_mut())
+            }],
             vec!["x".into()]
         )));
 
@@ -3192,6 +3459,7 @@ mod tests {
             target_actor: 1,
             behavior_name: "handle".into(),
             content_hash: None,
+            required_protocol_id: None,
             payload: vec![Value::string(42)],
             string_table: vec![],
             object_table: vec![],
@@ -3244,6 +3512,7 @@ mod tests {
             target_actor: 1,
             behavior_name: "handle".into(),
             content_hash: None,
+            required_protocol_id: None,
             payload: vec![Value::string(0), Value::int(7), Value::string(1)],
             string_table: vec!["hello".into(), "world".into()],
             object_table: vec![],
@@ -3300,6 +3569,7 @@ mod tests {
             target_actor: 1,
             behavior_name: "handle".into(),
             content_hash: None,
+            required_protocol_id: None,
             payload: vec![Value::int(123), Value::bool(true), Value::unit()],
             string_table: vec![],
             object_table: vec![],

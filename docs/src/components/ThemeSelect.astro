@@ -62,6 +62,13 @@ import Select from '@astrojs/starlight/components/Select.astro';
 	/** Update select menu UI, document theme, and local storage state. */
 	function onThemeChange(theme: Theme): void {
 		StarlightThemeProvider.updatePickers(theme);
+		// First-time visitors get light regardless of OS preference; reflect that
+		// in the control instead of leaving it on the misleading 'auto' option.
+		if (!hasStoredPreference()) {
+			document.querySelectorAll('starlight-theme-select select').forEach((select) => {
+				if (select instanceof HTMLSelectElement) select.value = 'light';
+			});
+		}
 		document.documentElement.dataset.theme = theme === 'auto' ? getPreferredColorScheme() : theme;
 		storeTheme(theme);
 	}

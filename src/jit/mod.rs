@@ -81,11 +81,17 @@ pub const STRAIGHT_LINE_MIN: usize = 8;
 pub struct JitSession {
     /// The Cranelift JIT module that owns compiled code memory.
     module: JITModule,
-    /// Map from `(module_idx, bytecode offset)` → (compiled function
-    /// pointer, region length in instructions). The length is recorded at
-    /// compile time so the VM can advance pc after a JIT run without
-    /// re-scanning the instruction stream.
-    compiled: FxHashMap<(usize, usize), (*const u8, usize)>,
+    /// Dense per-module table indexed `[module_idx][bytecode offset]`.
+    ///
+    /// The JIT probe runs on every JIT-enabled interpreter step. Once the
+    /// first region compiles, a hash map here would impose a hash lookup on
+    /// every remaining cold instruction. Bytecode PCs are already dense
+    /// integers, so direct indexing is both simpler and cheaper.
+    ///
+    /// Each occupied slot stores (compiled function pointer, region length).
+    compiled: Vec<Vec<Option<(*const u8, usize)>>>,
+    /// Number of occupied compiled-region slots across all modules.
+    compiled_count: usize,
     /// Per-region execution counters for already-compiled code. When a
     /// region crosses TIER2_THRESHOLD, a more aggressive compilation is
     /// attempted. Reset after each promotion attempt.
@@ -99,9 +105,6 @@ pub struct JitSession {
     /// is ample: a region crosses HOT_THRESHOLD (1000) and compiles long
     /// before a counter could wrap.
     hot_counts: Vec<Vec<u32>>,
-    /// Cache of the last compiled PC we probed, to avoid repeated HashMap lookups
-    /// for sequential execution in hot loops.
-    last_compiled_probe: Option<(usize, usize)>,
     /// Regions compiled through the type-directed (guard-stripped) path in
     /// `typed_compiler`, i.e. where inferred register types were available.
     typed_regions: FxHashSet<(usize, usize)>,
@@ -160,9 +163,9 @@ impl JitSession {
 
         Some(JitSession {
             module,
-            compiled: FxHashMap::default(),
+            compiled: Vec::new(),
+            compiled_count: 0,
             hot_counts: Vec::new(),
-            last_compiled_probe: None,
             typed_regions: FxHashSet::default(),
             may_suspend: FxHashMap::default(),
             recursive: FxHashMap::default(),
@@ -170,6 +173,36 @@ impl JitSession {
             tier2_counters: FxHashMap::default(),
             ctx,
         })
+    }
+
+    #[inline(always)]
+    fn compiled_entry(&self, module_idx: usize, offset: usize) -> Option<(*const u8, usize)> {
+        self.compiled
+            .get(module_idx)
+            .and_then(|row| row.get(offset))
+            .copied()
+            .flatten()
+    }
+
+    fn store_compiled(
+        &mut self,
+        module_idx: usize,
+        offset: usize,
+        ptr: *const u8,
+        region_len: usize,
+    ) {
+        if module_idx >= self.compiled.len() {
+            self.compiled.resize(module_idx + 1, Vec::new());
+        }
+        let row = &mut self.compiled[module_idx];
+        if offset >= row.len() {
+            let new_len = (offset + 1).max(row.len().max(1) * 2);
+            row.resize(new_len, None);
+        }
+        if row[offset].is_none() {
+            self.compiled_count += 1;
+        }
+        row[offset] = Some((ptr, region_len));
     }
 
     /// Record one interpreted execution of the region at
@@ -250,8 +283,8 @@ impl JitSession {
             return;
         }
 
-        let region_len = match self.compiled.get(&(module_idx, pc)) {
-            Some(&(_, len)) if len >= 3 => len,
+        let region_len = match self.compiled_entry(module_idx, pc) {
+            Some((_, len)) if len >= 3 => len,
             _ => return,
         };
 
@@ -297,7 +330,7 @@ impl JitSession {
         native_calls: &std::collections::HashMap<usize, usize>,
     ) -> Option<JitFunctionPtr> {
         // Check if already compiled
-        if let Some(&(ptr, _)) = self.compiled.get(&(module_idx, start_offset)) {
+        if let Some((ptr, _)) = self.compiled_entry(module_idx, start_offset) {
             return Some(std::mem::transmute(ptr));
         }
 
@@ -315,8 +348,7 @@ impl JitSession {
             native_calls,
         ) {
             Ok(ptr) => {
-                self.compiled
-                    .insert((module_idx, start_offset), (ptr, num_instrs));
+                self.store_compiled(module_idx, start_offset, ptr, num_instrs);
                 Some(std::mem::transmute(ptr))
             }
             Err(_) => None,
@@ -345,7 +377,7 @@ impl JitSession {
         native_calls: &std::collections::HashMap<usize, usize>,
     ) -> Option<JitFunctionPtr> {
         // Check if already compiled
-        if let Some(&(ptr, _)) = self.compiled.get(&(module_idx, start_offset)) {
+        if let Some((ptr, _)) = self.compiled_entry(module_idx, start_offset) {
             return Some(std::mem::transmute(ptr));
         }
 
@@ -372,8 +404,7 @@ impl JitSession {
                 instructions,
                 type_metadata,
             ) {
-                self.compiled
-                    .insert((module_idx, start_offset), (ptr, num_instrs));
+                self.store_compiled(module_idx, start_offset, ptr, num_instrs);
                 self.typed_regions.insert((module_idx, start_offset));
                 return Some(std::mem::transmute(ptr));
             }
@@ -402,13 +433,7 @@ impl JitSession {
 
     /// Check if a `(module_idx, offset)` region has already been compiled.
     pub fn is_compiled(&self, module_idx: usize, offset: usize) -> bool {
-        // Fast path: before any region is compiled — the common case for a
-        // cold program, which is exactly when the probe runs on every step —
-        // skip the hash entirely.
-        if self.compiled.is_empty() {
-            return false;
-        }
-        self.compiled.contains_key(&(module_idx, offset))
+        self.compiled_entry(module_idx, offset).is_some()
     }
 
     /// Get the compiled function pointer for `(module_idx, offset)` (if compiled).
@@ -417,9 +442,8 @@ impl JitSession {
     /// The returned function pointer is valid only while this `JitSession` is
     /// alive and the original bytecode has not been modified.
     pub unsafe fn get_compiled(&self, module_idx: usize, offset: usize) -> Option<JitFunctionPtr> {
-        self.compiled
-            .get(&(module_idx, offset))
-            .map(|&(ptr, _)| std::mem::transmute(ptr))
+        self.compiled_entry(module_idx, offset)
+            .map(|(ptr, _)| std::mem::transmute(ptr))
     }
 
     /// Number of bytecode instructions covered by the compiled region at
@@ -427,14 +451,12 @@ impl JitSession {
     /// to advance pc after a JIT run instead of re-scanning the
     /// instruction stream.
     pub fn compiled_region_len(&self, module_idx: usize, offset: usize) -> Option<usize> {
-        self.compiled
-            .get(&(module_idx, offset))
-            .map(|&(_, len)| len)
+        self.compiled_entry(module_idx, offset).map(|(_, len)| len)
     }
 
     /// Return the number of compiled regions.
     pub fn compiled_count(&self) -> usize {
-        self.compiled.len()
+        self.compiled_count
     }
 
     /// Compile a SIMD-vectorizable bytecode region.
@@ -464,7 +486,7 @@ impl JitSession {
         use crate::jit::simd_compiler::{compile_simd_region, is_simd_supported};
 
         // Check if already compiled
-        if let Some(&(ptr, _)) = self.compiled.get(&(module_idx, start_offset)) {
+        if let Some((ptr, _)) = self.compiled_entry(module_idx, start_offset) {
             return Some(std::mem::transmute(ptr));
         }
 
@@ -494,8 +516,7 @@ impl JitSession {
             &simd_region,
         ) {
             Ok(ptr) => {
-                self.compiled
-                    .insert((module_idx, start_offset), (ptr, num_instrs));
+                self.store_compiled(module_idx, start_offset, ptr, num_instrs);
                 Some(std::mem::transmute(ptr))
             }
             Err(_) => self.compile_region_typed(
@@ -983,12 +1004,7 @@ pub use crate::backends::TieredAction;
 
 impl crate::backends::JitBackend for JitSession {
     fn is_compiled(&self, module_idx: usize, pc: usize) -> bool {
-        // Fast path: skip the hash while nothing is compiled (the common
-        // per-step probe on a cold program).
-        if self.compiled.is_empty() {
-            return false;
-        }
-        self.compiled.contains_key(&(module_idx, pc))
+        self.compiled_entry(module_idx, pc).is_some()
     }
 
     fn record_and_check_hot(&mut self, module_idx: usize, pc: usize) -> bool {
@@ -1006,15 +1022,9 @@ impl crate::backends::JitBackend for JitSession {
     }
 
     fn probe_and_maybe_hot(&mut self, module_idx: usize, pc: usize) -> bool {
-        // Fast path: check if this is the last compiled PC we saw
-        // This avoids HashMap lookups for sequential execution in hot loops
-        if self.last_compiled_probe == Some((module_idx, pc)) {
-            return true;
-        }
-
-        // Check compiled map
-        if !self.compiled.is_empty() && self.compiled.contains_key(&(module_idx, pc)) {
-            self.last_compiled_probe = Some((module_idx, pc));
+        // Bytecode PCs are dense, so checking for compiled code is a pair of
+        // bounds checks plus an Option load rather than a hash-table probe.
+        if self.compiled_entry(module_idx, pc).is_some() {
             return true;
         }
 
@@ -1035,11 +1045,11 @@ impl crate::backends::JitBackend for JitSession {
     }
 
     fn compiled_region_len(&self, module_idx: usize, pc: usize) -> Option<usize> {
-        self.compiled.get(&(module_idx, pc)).map(|&(_, len)| len)
+        self.compiled_entry(module_idx, pc).map(|(_, len)| len)
     }
 
     fn compiled_count(&self) -> usize {
-        self.compiled.len()
+        self.compiled_count
     }
 
     fn typed_compiled_count(&self) -> usize {

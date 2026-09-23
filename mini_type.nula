@@ -1,0 +1,9 @@
+fn run(f: String -> Int, s: String) -> Int {
+    f(s)
+}
+
+fn check(s: String) -> Int {
+    perform String.length(s)
+}
+
+run(check, "hello world")

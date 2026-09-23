@@ -3,7 +3,7 @@
 // Import: `import stdlib::map`
 //
 // Maps are arrays of {key, value} records.
-// Key lookup is O(n). get() returns -1 for missing keys.
+// Key lookup is O(n). get() returns Option[value] so absence is explicit.
 
 /// An empty map.
 pub fn empty() { [] }
@@ -23,12 +23,12 @@ pub fn insert(k, v, m) {
     if found then result else { perform Array.push(result, {key: k, value: v}) }
 }
 
-/// Look up a key. Returns the value, or -1 if not found.
+/// Look up a key. Returns Some(value) when present, otherwise None.
 pub fn get(k, m) {
     for r in m {
-        if r.key == k then { return r.value } else {}
+        if r.key == k then { return Some(r.value) } else {}
     };
-    -1
+    None
 }
 
 /// True when the key is present.

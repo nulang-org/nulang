@@ -146,14 +146,41 @@ impl WasmFxBackend {
     // ── Compile ───────────────────────────────────────────────────
 
     pub fn compile(&mut self, mir_module: &mir::Module, _module_name: &str) -> NuResult<Vec<u8>> {
-        // Pre-scan: closures are unsupported (mirrors mir_wasm.rs).
+        // Pre-scan: closures and user-defined handler/resume semantics are
+        // unsupported. WasmFX suspension for built-in async effects is real,
+        // but user-defined effect-handler Resume is still an MVP stub in CIR
+        // codegen and must never be silently reinterpreted as `nil`.
         for func in mir_module
             .functions
             .iter()
             .chain(mir_module.behaviors.iter())
         {
             for block in &func.blocks {
+                if matches!(&block.terminator, mir::Terminator::Resume(_)) {
+                    return Err(crate::types::NuError::VMError {
+                        msg: "WasmFX backend restricted profile: user-defined effect handlers and continuation resume are not supported yet; use the bytecode backend"
+                            .into(),
+                        span: crate::types::Span::default(),
+                    });
+                }
+
                 for stmt in &block.stmts {
+                    if matches!(stmt, mir::Stmt::EnterHandle { .. } | mir::Stmt::PopHandler)
+                        || matches!(
+                            stmt,
+                            mir::Stmt::Assign {
+                                op: mir::RValue::Resume(..),
+                                ..
+                            }
+                        )
+                    {
+                        return Err(crate::types::NuError::VMError {
+                            msg: "WasmFX backend restricted profile: user-defined effect handlers and continuation resume are not supported yet; use the bytecode backend"
+                                .into(),
+                            span: crate::types::Span::default(),
+                        });
+                    }
+
                     if let mir::Stmt::Assign { op, .. } = stmt {
                         if let mir::RValue::Call {
                             func: mir::FuncRef::Local(_),
@@ -682,7 +709,8 @@ impl WasmFxBackend {
                 body.instruction(&Instruction::Unreachable);
             }
             CirTerminator::Resume(_) => {
-                // User-defined effect handler dispatch is deferred (MVP).
+                // Defensive only: compile() rejects user-defined handler/resume
+                // MIR before CIR lowering until this path has real semantics.
                 body.instruction(&Instruction::I64Const(value_layout::TAG_NIL as i64));
                 body.instruction(&Instruction::Return);
             }

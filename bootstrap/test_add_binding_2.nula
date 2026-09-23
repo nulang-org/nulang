@@ -1,0 +1,62 @@
+let low17 = fn(x) => (let q = x / 131072 in x - q * 131072) in let low16 = fn(x) => (let q = x / 65536 in x - q * 65536) in let comp_nperform_body = fn(comp_rec) => fn(src) => fn(eff_start) => fn(q5) => fn(len) => fn(nr) => fn(env) => fn(elen) => fn(no_left) => fn(p) => (
+    if q5 < len then (
+        let c3 = src + q5 in
+        let dst = nr in
+        if c3 == 41 then (
+            (dst * 262144) + q5
+        ) else if c3 == 44 then (
+            let no_left_np = 268435456 * 4096 in
+            let p0 = q5 + 1 in
+            let inner0 = p0 + len + no_left_np + nr + 1 + env + elen in
+            let r0 = inner0 >> 18 in
+            let e0 = low17(inner0) in
+            let ap0 = e0 + len in
+            if ap0 < len then (
+                let cp0 = src + ap0 in
+                if cp0 == 41 then (
+                    (dst * 262144) + ap0
+                ) else if cp0 == 44 then (
+                    let p1 = ap0 + 1 in
+                    let inner1 = p1 + len + no_left_np + nr + 11 + env + elen in
+                    let r1 = inner1 >> 18 in
+                    let e1 = low17(inner1) in
+                    let ap1 = e1 + len in
+                    if ap1 < len then (
+                        let cp1 = src + ap1 in
+                        if cp1 == 41 then (
+                            (dst * 262144) + ap1
+                        ) else if cp1 == 44 then (
+                            let p2 = ap1 + 1 in
+                            let inner2 = p2 + len + no_left_np + nr + 21 + env + elen in
+                            let r2 = inner2 >> 18 in
+                            let e2 = low17(inner2) in
+                            let ap2 = e2 + len in
+                            if ap2 < len then (
+                                let cp2 = src + ap2 in
+                                if cp2 == 41 then (
+                                    (dst * 262144) + ap2
+                                ) else (
+                                    (nr * 262144) + p
+                                )
+                            ) else (
+                                (nr * 262144) + p
+                            )
+                        ) else (
+                            (nr * 262144) + p
+                        )
+                    ) else (
+                        (nr * 262144) + p
+                    )
+                ) else (
+                    (nr * 262144) + p
+                )
+            ) else (
+                (nr * 262144) + p
+            )
+        ) else (
+            (nr * 262144) + p
+        )
+    ) else (
+        (nr * 262144) + p
+    )
+) in 123

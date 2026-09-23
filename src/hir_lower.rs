@@ -16,9 +16,7 @@ use crate::ast::{BinOp, Decl, Expr, FunctionAnnotation, Literal};
 use crate::hir;
 use crate::tool_schema::{function_to_tool_schema, ToolSchema};
 use crate::types::{Capability, EffectRow, Span, Type, TypeVar};
-
-type FxHashMap<K, V> =
-    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+use rustc_hash::FxHashMap;
 
 pub fn lower_module(
     ast: &ast::AstModule,
@@ -121,14 +119,17 @@ fn collect_tool_schemas_into(decls: &[Decl], tools: &mut Vec<ToolSchema>) {
                     let mut all_typed = true;
                     for p in params {
                         if let Some(ty) = &p.ty {
-                            typed_params.push((p.name.clone(), ty.clone()));
+                            typed_params.push((p.name.clone(), lower_runtime_type(ty)));
                         } else {
                             all_typed = false;
                             break;
                         }
                     }
                     if all_typed {
-                        let ret = ret_type.clone().unwrap_or_else(Type::unit);
+                        let ret = ret_type
+                            .as_ref()
+                            .map(lower_runtime_type)
+                            .unwrap_or_else(Type::unit);
                         tools.push(function_to_tool_schema(
                             name,
                             description,
@@ -153,7 +154,9 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
             fields: _,
             span,
         } => {
-            // In a full implementation, this would create a CRDT actor
+            // CRDT declarations are compile-time schemas. The typechecker binds
+            // the name to a record type describing the fields; at runtime they
+            // have no representation and lower to a unit constant.
             hir::Decl::Constant {
                 name: name.clone(),
                 body: hir::Body {
@@ -274,7 +277,7 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
                 .map(|(n, m, t, e)| {
                     let mut body = hir::Body::new();
                     let op = lower_expr(e, &mut body);
-                    (n.clone(), *m, t.clone(), op)
+                    (n.clone(), *m, lower_runtime_type(t), op)
                 })
                 .collect(),
             behaviors: behaviors
@@ -289,7 +292,18 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
                     (n.clone(), op)
                 })
                 .collect(),
-            events: events.clone(),
+            events: events
+                .iter()
+                .map(|event| ast::EventDecl {
+                    name: event.name.clone(),
+                    params: event
+                        .params
+                        .iter()
+                        .map(|(name, ty)| (name.clone(), lower_runtime_type(ty)))
+                        .collect(),
+                    span: event.span,
+                })
+                .collect(),
             apply_handlers: apply_handlers.clone(),
             version: *version,
             migrations: migrations.clone(),
@@ -314,7 +328,7 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
         } => hir::Decl::TypeAlias {
             name: name.clone(),
             type_params: type_params.clone(),
-            body: body.clone(),
+            body: lower_runtime_type(body),
             opaque: *opaque,
             public: *public,
             span: *span,
@@ -329,7 +343,10 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
         } => hir::Decl::RecordType {
             name: name.clone(),
             type_params: type_params.clone(),
-            fields: fields.clone(),
+            fields: fields
+                .iter()
+                .map(|(name, ty)| (name.clone(), lower_runtime_type(ty)))
+                .collect(),
             public: *public,
             span: *span,
         },
@@ -342,13 +359,25 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
         } => hir::Decl::VariantType {
             name: name.clone(),
             type_params: type_params.clone(),
-            variants: variants.clone(),
+            variants: variants
+                .iter()
+                .map(|(name, payload)| (name.clone(), payload.as_ref().map(lower_runtime_type)))
+                .collect(),
             public: *public,
             span: *span,
         },
         Decl::EffectDecl { name, ops, span } => hir::Decl::EffectDecl {
             name: name.clone(),
-            ops: ops.clone(),
+            ops: ops
+                .iter()
+                .map(|(name, params, ret)| {
+                    (
+                        name.clone(),
+                        params.iter().map(lower_runtime_type).collect(),
+                        lower_runtime_type(ret),
+                    )
+                })
+                .collect(),
             span: *span,
         },
         Decl::Extern {
@@ -364,9 +393,9 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
                     params: f
                         .params
                         .iter()
-                        .map(|(n, t)| (n.clone(), t.clone()))
+                        .map(|(n, t)| (n.clone(), lower_runtime_type(t)))
                         .collect(),
-                    ret: f.ret.clone(),
+                    ret: lower_runtime_type(&f.ret),
                     span: f.span,
                 })
                 .collect(),
@@ -514,7 +543,23 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
         }
         Decl::Database { name, tables, span } => hir::Decl::Database {
             name: name.clone(),
-            tables: tables.clone(),
+            tables: tables
+                .iter()
+                .map(|table| ast::DatabaseTable {
+                    name: table.name.clone(),
+                    columns: table
+                        .columns
+                        .iter()
+                        .map(|column| ast::DatabaseColumn {
+                            name: column.name.clone(),
+                            col_type: lower_runtime_type(&column.col_type),
+                            modifiers: column.modifiers.clone(),
+                            span: column.span,
+                        })
+                        .collect(),
+                    span: table.span,
+                })
+                .collect(),
             span: *span,
         },
         Decl::Given { span, .. } => {
@@ -1407,7 +1452,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
                     .and_then(|map| {
                         if let hir::Operand::Var(fn_name, _) = &fop {
                             map.get(fn_name).and_then(|t| match t {
-                                Type::Function { ret, .. } => Some((**ret).clone()),
+                                Type::Function { ret, .. } => Some(ret.erase_actor_protocols()),
                                 _ => None,
                             })
                         } else {
@@ -1803,6 +1848,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             actor_type,
             init,
             target_node,
+            capabilities,
             span,
             ..
         } => {
@@ -1821,7 +1867,7 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
                     actor_type: name,
                     init: init_ops,
                     target_node: target_operand,
-                    capabilities: vec![],
+                    capabilities: capabilities.clone(),
                     ty: ty.clone(),
                 },
                 span: *span,
@@ -2230,8 +2276,14 @@ fn lambda_references(name: &str, params: &[crate::ast::Param], body: &Expr) -> b
     lambda_captures(params, body).iter().any(|c| c == name)
 }
 
+fn lower_runtime_type(ty: &Type) -> Type {
+    ty.erase_actor_protocols()
+}
+
 fn resolve_type(ty: &Option<Type>) -> Type {
-    ty.clone().unwrap_or_else(Type::unit)
+    ty.as_ref()
+        .map(lower_runtime_type)
+        .unwrap_or_else(Type::unit)
 }
 
 fn literal_type(lit: &Literal) -> Type {
@@ -2782,6 +2834,7 @@ mod tests {
             positional_args: None,
             register_as: None,
             target_node: None,
+            capabilities: vec![],
             span,
         };
         assert!(used(&spawn).contains("k"), "spawn init must be free");

@@ -11,6 +11,13 @@ use std::time::Instant;
 use tracing::warn;
 
 mod actor;
+pub mod cache;
+pub mod cache_cluster;
+pub mod cache_dispatch;
+pub mod cache_pipeline;
+pub mod cache_routing;
+#[cfg(feature = "cache-server")]
+pub mod cache_server;
 mod gc;
 pub mod heap;
 pub(crate) mod heap_serialize;
@@ -20,13 +27,30 @@ pub use heap_serialize::*;
 mod cluster;
 mod distributed;
 mod distributed_context;
+mod fabric_stream;
+mod fabric_stream_cluster;
+mod fabric_stream_epoch;
 mod grain;
 mod network;
 mod object_store;
 mod orca_cycle;
 mod supervision;
 mod supervisor;
-use distributed_context::DistributedContext;
+pub use distributed_context::{
+    DistributedContext, FabricAdvertisement, FabricAdvertisementSnapshot, FabricPublishReport,
+};
+pub use fabric_stream::{
+    FabricStreamConfig, FabricStreamInfo, FabricStreamRecord, FileFabricStreamStore,
+};
+pub use fabric_stream_cluster::{
+    FabricStreamCatchUpReport, FabricStreamPlacement, FabricStreamRecoveryReport,
+    FabricStreamReplicaAppend, FabricStreamReplicaDispatchReport,
+    FabricStreamReplicatedAppendResult, FabricStreamReplicationStatus, FabricStreamRetryReport,
+};
+pub use fabric_stream_epoch::{
+    FabricStreamAutoFailoverReport, FabricStreamEpochPullReport, FabricStreamEpochRepairReport,
+    FabricStreamEpochTransitionStatus,
+};
 #[cfg(feature = "ai-runtime")]
 mod agent;
 #[cfg(feature = "ai-runtime")]
@@ -44,7 +68,11 @@ mod metrics;
 mod persistence;
 mod process_groups;
 mod registry;
+pub mod resp;
+pub mod resp_cache;
 mod spawn;
+#[cfg(feature = "native-codegen")]
+pub(crate) use spawn::spawn_from_module_with_authority;
 mod timer;
 mod trace;
 mod workflow;
@@ -60,6 +88,13 @@ mod cluster_sim;
 mod tests;
 
 pub use actor::*;
+pub use cache::*;
+pub use cache_cluster::*;
+pub use cache_dispatch::*;
+pub use cache_pipeline::*;
+pub use cache_routing::*;
+#[cfg(feature = "cache-server")]
+pub use cache_server::*;
 pub use callbacks::RuntimeVmCallbacks;
 pub(crate) use callbacks::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks};
 pub use cluster::*;
@@ -70,7 +105,7 @@ pub use distributed::*;
 pub use gc::{ForeignRefOp, GcStats, OrcaCoordinator, OrcaGc, OrcaHeap};
 pub use grain::*;
 pub use heap::*;
-pub use http_server::{render_route_handler, HttpServerState, WebDevServer, WebRoute};
+pub use http_server::{render_route_handler, HttpMethod, HttpServerState, WebDevServer, WebRoute};
 pub use mailbox::*;
 pub use network::NetworkTransport;
 pub use network::*;
@@ -79,6 +114,7 @@ pub use orca_cycle::*;
 pub use persistence::*;
 pub use process_groups::*;
 pub use registry::*;
+pub use resp_cache::*;
 pub use scheduler::*;
 pub use supervisor::*;
 pub use timer::*;
@@ -215,6 +251,16 @@ enum CrossShardMsg {
         trace_id: Option<String>,
         grain_id: Option<GrainId>,
     },
+    /// Name-based delivery to an actor owned by another shard. The owning
+    /// shard resolves the name against the target actor's behavior table;
+    /// the source shard must never invent a numeric fallback.
+    DeliverNamedMessage {
+        target_id: u64,
+        behavior_name: String,
+        payload: Vec<Value>,
+        sender: u64,
+        trace_id: Option<String>,
+    },
     /// Deliver a message whose payload contains object-store refs.  The bytes
     /// are copied because each shard owns a separate `ObjectStore`.
     DeliverMessageWithObjects {
@@ -227,11 +273,31 @@ enum CrossShardMsg {
         trace_id: Option<String>,
         grain_id: Option<GrainId>,
     },
+    /// Name-based delivery with copied object-store refs.
+    DeliverNamedMessageWithObjects {
+        target_id: u64,
+        behavior_name: String,
+        payload: Vec<Value>,
+        objects: Vec<(crate::runtime::object_store::ObjectId, Vec<u8>)>,
+        sender: u64,
+        trace_id: Option<String>,
+    },
     /// Enqueue an actor on the target shard (wake from idle/waiting).
     EnqueueActor {
         actor_id: u64,
         priority: ActorPriority,
     },
+}
+
+/// Admission result for a local-process actor delivery.
+///
+/// Fabric uses this to distinguish successful mailbox/channel admission from
+/// bounded-capacity backpressure without changing the public actor-send API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MessageAdmission {
+    Accepted,
+    Backpressured,
+    Rejected,
 }
 
 pub struct Runtime {
@@ -425,9 +491,11 @@ pub struct Runtime {
     /// AOT-compiled modules registered for native behavior dispatch, keyed by
     /// actor type name → module pointer. Ownership lives in
     /// `aot_module_storage`; the pointers are stable (each module is Boxed).
+    #[cfg(feature = "native-codegen")]
     pub aot_modules: std::collections::HashMap<String, *const crate::aot::AotModule>,
     /// Owns the registered AOT modules so the raw pointers in `aot_modules`
     /// (and on actors) stay valid for the Runtime's lifetime.
+    #[cfg(feature = "native-codegen")]
     pub aot_module_storage: Vec<Box<crate::aot::AotModule>>,
     /// Actor ID of the dead-letter queue (created lazily).
     /// Undeliverable messages are routed here.
@@ -436,13 +504,12 @@ pub struct Runtime {
     /// (empty run queue, no inflight LLM calls, no pending timers).
     /// The embedder (e.g. NLC guest agent) wires this to host signaling.
     pub idle_callback: Option<Box<dyn FnMut()>>,
-    // Test effect handlers - installed via `install_test_handler` to
-    // intercept `perform Effect.op` calls in tests.  Key is the qualified
-    // name (e.g. "IO.print", "DB.write").  A handler returns `Some(value)`
-    // to mock the effect or `None` to fall through to real dispatch.
     // HTTP server state (v0.7+).
     pub http_server: Option<HttpServerState>,
-    pub test_handlers: HashMap<String, Box<dyn Fn(&[Value]) -> Option<Value>>>,
+    // Test effect interception is deliberately absent from production builds:
+    // privileged host effects must not have a pre-authority dispatch hook.
+    #[cfg(test)]
+    test_handlers: HashMap<String, Box<dyn Fn(&[Value]) -> Option<Value>>>,
     /// Cryptographic provider (hashing, random, signing).
     /// Defaults to [`crate::backends::DefaultCryptoProvider`].
     pub crypto: Box<dyn crate::backends::CryptoProvider>,
@@ -566,7 +633,9 @@ impl Runtime {
             supervisor_teams: SupervisorTeamRegistry::new(),
             crypto: Box::new(crate::backends::DefaultCryptoProvider::new()),
             spawnable_behaviors: HashMap::new(),
+            #[cfg(feature = "native-codegen")]
             aot_modules: std::collections::HashMap::new(),
+            #[cfg(feature = "native-codegen")]
             aot_module_storage: Vec::new(),
             #[cfg(any(feature = "ai-runtime", feature = "http-client"))]
             http: Box::new(crate::backends::ReqwestHttpProvider::new()),
@@ -579,6 +648,7 @@ impl Runtime {
             spawn_translations: HashMap::new(),
             dlq_actor_id: None,
             http_server: None,
+            #[cfg(test)]
             test_handlers: HashMap::new(),
             shard_idx: 0,
             shard_count: 1,
@@ -679,7 +749,8 @@ impl Runtime {
     /// rt.install_test_handler("DB.write", |regs| {
     ///     // regs[0] = key, regs[1] = value
     ///     Some(Value::unit())  // pretend write succeeded
-    pub fn install_test_handler<F>(&mut self, effect_name: &str, handler: F)
+    #[cfg(test)]
+    pub(crate) fn install_test_handler<F>(&mut self, effect_name: &str, handler: F)
     where
         F: Fn(&[Value]) -> Option<Value> + 'static,
     {
@@ -689,7 +760,8 @@ impl Runtime {
 
     /// Check whether a test handler is installed for `qualified_name` and
     /// return its result if so.
-    pub fn check_test_handler(&self, qualified_name: &str, regs: &[Value]) -> Option<Value> {
+    #[cfg(test)]
+    pub(crate) fn check_test_handler(&self, qualified_name: &str, regs: &[Value]) -> Option<Value> {
         self.test_handlers
             .get(qualified_name)
             .and_then(|handler| handler(regs))
@@ -739,15 +811,37 @@ impl Runtime {
         spawn::spawn_actor_with_models(self, init, state_models, true, None)
     }
 
-    /// Spawn a durable workflow actor.  Workflows are always persistent and
+    /// Spawn a durable workflow actor. Workflows are always persistent and
     /// keep an append-only event journal in addition to snapshots.
+    ///
+    /// This compatibility API returns actor id 0 when the initial durable
+    /// commit fails. New callers that need the persistence error should use
+    /// `try_spawn_workflow_actor`.
     pub fn spawn_workflow_actor(
         &mut self,
         name: &str,
         init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
         state_models: HashMap<String, StateModel>,
     ) -> u64 {
-        spawn::spawn_actor_with_models(self, init, state_models, true, Some(name))
+        match self.try_spawn_workflow_actor(name, init, state_models) {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::warn!(workflow = name, %error, "durable workflow spawn failed");
+                0
+            }
+        }
+    }
+
+    /// Spawn a durable workflow and report failure if its initial
+    /// `WorkflowStarted` journal entry or first snapshot cannot be committed.
+    /// The actor is not published or scheduled until both writes succeed.
+    pub fn try_spawn_workflow_actor(
+        &mut self,
+        name: &str,
+        init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+        state_models: HashMap<String, StateModel>,
+    ) -> std::io::Result<u64> {
+        spawn::try_spawn_actor_with_models(self, init, state_models, true, Some(name), None)
     }
 
     /// Spawn an actor for `module`'s behavior `behavior_idx`, seeded with
@@ -1121,6 +1215,7 @@ impl Runtime {
     /// Mirrors the structure of `resume_suspended_llm_step` but without
     /// LLM-specific logic: re-installs callbacks, restores VM state,
     /// resets the safepoint counter, and resumes execution.
+    #[cfg(feature = "native-codegen")]
     fn resume_suspended_jit_yield(&mut self, actor_id: u64) {
         let suspended = match self.actors.get_mut(&actor_id) {
             Some(actor) => actor.suspended_execution.take(),
@@ -1146,7 +1241,7 @@ impl Runtime {
 
             // Reset the safepoint budget and wire the pointer for JIT code.
             if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
-                actor.jit_safepoint_counter = crate::jit::runtime::JIT_SAFEPOINT_BUDGET;
+                actor.jit_safepoint_counter = crate::backends::JIT_SAFEPOINT_BUDGET;
                 crate::jit::runtime::set_jit_safepoint_ptr(&mut actor.jit_safepoint_counter);
             }
 
@@ -1359,6 +1454,31 @@ impl Runtime {
                         grain_id,
                     );
                 }
+                CrossShardMsg::DeliverNamedMessage {
+                    target_id,
+                    behavior_name,
+                    payload,
+                    sender,
+                    trace_id,
+                } => {
+                    let Some(behavior_id) =
+                        self.behavior_id_for_delivery(target_id, &behavior_name)
+                    else {
+                        warn!(
+                            "nulang-shard: rejecting named message to actor {}: unknown behavior '{}'",
+                            target_id, behavior_name
+                        );
+                        continue;
+                    };
+                    self.deliver_cross_shard_message(
+                        target_id,
+                        behavior_id,
+                        payload,
+                        sender,
+                        trace_id,
+                        None,
+                    );
+                }
                 CrossShardMsg::DeliverMessageWithObjects {
                     target_id,
                     behavior_id,
@@ -1392,6 +1512,50 @@ impl Runtime {
                         sender,
                         trace_id,
                         grain_id,
+                    );
+                }
+                CrossShardMsg::DeliverNamedMessageWithObjects {
+                    target_id,
+                    behavior_name,
+                    mut payload,
+                    objects,
+                    sender,
+                    trace_id,
+                } => {
+                    // Resolve the behavior before hydrating transferred objects.
+                    // Invalid named delivery must not allocate orphaned object-store
+                    // entries on the destination shard.
+                    let Some(behavior_id) =
+                        self.behavior_id_for_delivery(target_id, &behavior_name)
+                    else {
+                        warn!(
+                            "nulang-shard: rejecting named object message to actor {}: unknown behavior '{}'",
+                            target_id, behavior_name
+                        );
+                        continue;
+                    };
+                    let mut id_map: std::collections::HashMap<
+                        crate::runtime::object_store::ObjectId,
+                        crate::runtime::object_store::ObjectId,
+                    > = std::collections::HashMap::with_capacity(objects.len());
+                    for (original_id, bytes) in objects {
+                        let local_id = self.object_store.put(bytes.into_boxed_slice());
+                        id_map.insert(original_id, local_id);
+                    }
+                    for value in &mut payload {
+                        if let Some(id) = value.as_object_id() {
+                            if let Some(&local_id) = id_map.get(&id) {
+                                *value = Value::object(local_id);
+                            }
+                        }
+                    }
+                    self.deliver_cross_shard_message(
+                        target_id,
+                        behavior_id,
+                        payload,
+                        sender,
+                        trace_id,
+                        None,
                     );
                 }
                 CrossShardMsg::EnqueueActor { actor_id, priority } => {
@@ -1556,14 +1720,9 @@ impl Runtime {
 
     /// Send a message to `target_id`'s `behavior` mailbox by name.
     ///
-    /// KNOWN SURPRISING BEHAVIOR (verified 2026-08-02, not fixed --
-    /// see the comment in `flush_actor_mailbox` for why): a `behavior`
-    /// name that doesn't match any of the target's registered
-    /// behaviors resolves to behavior id 0 via `unwrap_or(0)` below,
-    /// NOT a dropped/no-op message -- a typo'd or undeclared behavior
-    /// name silently runs the actor's FIRST declared behavior instead
-    /// of erroring or being ignored. See SPEC2.md Chapter 8 (message
-    /// passing) and `conformance/behavior/lifecycle_03/04_*.nula`.
+    /// Behavior-name resolution is fail-closed: an undeclared name is
+    /// rejected and never aliases behavior id 0. Numeric id 0 remains an
+    /// ordinary valid behavior only when the target actually declares it.
     pub fn send_message(&mut self, target_id: u64, behavior: &str, args: &[Value]) {
         // Name-based sends already carry the wire behavior name, so route
         // remote refs directly (same local-existence guard as
@@ -1574,7 +1733,30 @@ impl Runtime {
                 return;
             }
         }
-        let behavior_id = self.behavior_id_for(target_id, behavior).unwrap_or(0);
+
+        // A source shard may not own the target actor/schema. Preserve the
+        // behavior name until the owning shard can resolve it exactly.
+        if self.shard_count > 1 {
+            let target_shard = (target_id % self.shard_count as u64) as u16;
+            if target_shard != self.shard_idx {
+                let out_trace = self.current_trace.as_ref().map(|t| t.to_traceparent());
+                let _ = self.send_cross_shard_named_message(
+                    target_id,
+                    behavior,
+                    args.to_vec(),
+                    out_trace,
+                );
+                return;
+            }
+        }
+
+        let Some(behavior_id) = self.behavior_id_for_delivery(target_id, behavior) else {
+            warn!(
+                "nulang-runtime: rejecting message to actor {}: unknown behavior '{}'",
+                target_id, behavior
+            );
+            return;
+        };
         self.send_message_by_id(target_id, behavior_id, args);
     }
 
@@ -1649,6 +1831,15 @@ impl Runtime {
         args: &[Value],
     ) -> crate::types::NuResult<Value> {
         let behavior_idx = behavior_id as usize;
+        if !self.actor_has_behavior_id(actor_id, behavior_id) {
+            return Err(NuError::VMError {
+                msg: format!(
+                    "actor {} does not declare behavior id {}",
+                    actor_id, behavior_id
+                ),
+                span: Span::default(),
+            });
+        }
 
         // Intercept semantic-memory behaviors generated by compile_agent.  These
         // are bytecode behaviors at compile time, but their semantics are
@@ -1881,21 +2072,9 @@ impl Runtime {
                 self.current_actor = prev;
             }
             // A behavior_idx with neither a bytecode nor native handler
-            // falls through here silently. In practice this branch is
-            // unreachable for messages sent via `send_message`/
-            // `send_message_by_id` today: `send_message` resolves an
-            // unknown behavior NAME to id 0 via
-            // `behavior_id_for(..).unwrap_or(0)` (see its doc comment) --
-            // NOT a genuinely unknown numeric id -- so a typo'd or
-            // undeclared behavior name silently runs behavior 0 well
-            // before reaching this point, rather than being skipped as
-            // this comment used to claim. Tracked as a known surprising
-            // behavior in SPEC2.md (Chapter 8, message passing), not
-            // fixed here -- `send_message` is called pervasively and
-            // AGENTS.md documents the remote-message path as
-            // deliberately mirroring this same fallback, so correcting
-            // it needs a wider, carefully-audited change, not a
-            // single-site patch.
+            // falls through here without executing user code. Public
+            // name-based sends resolve fail-closed before enqueueing; this
+            // defensive path remains for trusted/internal numeric delivery.
 
             depth += 1;
             if depth >= MAX_FLUSH_DEPTH {
@@ -1904,6 +2083,19 @@ impl Runtime {
                 break;
             }
         }
+    }
+
+    /// Return whether `behavior_id` names a real native or bytecode handler on
+    /// `target_id`. Behavior id 0 is valid only when the target actually
+    /// declares handler 0; invalid ids are never aliases for it.
+    fn actor_has_behavior_id(&self, target_id: u64, behavior_id: u16) -> bool {
+        let behavior_idx = behavior_id as usize;
+        let has_native = self
+            .actors
+            .get(&target_id)
+            .and_then(|actor| actor.behavior_table.get(behavior_idx))
+            .is_some_and(|entry| !entry.name.is_empty());
+        has_native || self.has_bytecode_handler(target_id, behavior_idx)
     }
 
     pub fn behavior_id_for(&self, target_id: u64, behavior: &str) -> Option<u16> {
@@ -1935,6 +2127,41 @@ impl Runtime {
             .map(|idx| idx as u16)
     }
 
+    /// Resolve a public name-based delivery without reintroducing the old
+    /// "unknown name executes behavior 0" bug.
+    ///
+    /// Low-level actors created directly through `Runtime::spawn_actor` have
+    /// no behavior metadata at all. Their mailbox is intentionally usable as
+    /// an untyped runtime primitive, and behavior id 0 is inert because there
+    /// is no native or bytecode handler at that index. Preserve message
+    /// admission for those anonymous actors so scheduler/backpressure/runtime
+    /// tests and embedders can use the raw mailbox API.
+    ///
+    /// As soon as an actor declares any named native or bytecode behavior,
+    /// resolution is strict: an unknown name returns `None` and can never
+    /// alias a real behavior id 0 handler.
+    fn behavior_id_for_delivery(&self, target_id: u64, behavior: &str) -> Option<u16> {
+        if let Some(behavior_id) = self.behavior_id_for(target_id, behavior) {
+            return Some(behavior_id);
+        }
+
+        let actor = self.actors.get(&target_id)?;
+        let has_named_native = actor
+            .behavior_table
+            .iter()
+            .any(|entry| !entry.name.is_empty());
+        let has_named_bytecode = actor
+            .bytecode_module
+            .as_ref()
+            .is_some_and(|module| module.behaviors.iter().any(|entry| !entry.name.is_empty()));
+
+        if has_named_native || has_named_bytecode {
+            None
+        } else {
+            Some(0)
+        }
+    }
+
     /// Resolve a behavior name to a numeric id using the registered grain
     /// type's module. This lets `send_to_grain` route across shards before the
     /// target actor has been hydrated on the local shard.
@@ -1951,9 +2178,8 @@ impl Runtime {
 
     /// Send a message to an actor owned by another shard. Validates that the
     /// payload contains only value types (object-store refs are copied to the
-    /// target shard's store). Returns `true` if the message was accepted for
-    /// delivery, `false` if it was dropped because the payload contained a heap
-    /// pointer, actor ref, or closure.
+    /// target shard's store). Returns the admission outcome so callers can
+    /// distinguish bounded-channel backpressure from invalid payload rejection.
     fn send_cross_shard_message(
         &mut self,
         target_id: u64,
@@ -1961,7 +2187,7 @@ impl Runtime {
         args: Vec<Value>,
         out_trace: Option<String>,
         grain_id: Option<GrainId>,
-    ) -> bool {
+    ) -> MessageAdmission {
         let target_shard = (target_id % self.shard_count as u64) as u16;
         for arg in &args {
             if arg.is_ptr() || arg.is_actor_ref() || arg.is_closure() {
@@ -1970,21 +2196,21 @@ impl Runtime {
                      payload contains heap pointer / actor ref / closure",
                     target_id
                 );
-                return false;
+                return MessageAdmission::Rejected;
             }
         }
         let tx = self.cross_shard_tx.as_ref().unwrap();
         let object_refs: Vec<crate::runtime::object_store::ObjectId> =
             args.iter().filter_map(|v| v.as_object_id()).collect();
-        if object_refs.is_empty() {
-            let _ = tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessage {
+        let result = if object_refs.is_empty() {
+            tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessage {
                 target_id,
                 behavior_id,
                 payload: args,
                 sender: self.current_actor.unwrap_or(0),
                 trace_id: out_trace,
                 grain_id,
-            });
+            })
         } else {
             let mut objects = Vec::with_capacity(object_refs.len());
             for id in object_refs {
@@ -1992,7 +2218,7 @@ impl Runtime {
                     objects.push((id, entry.as_bytes().to_vec()));
                 }
             }
-            let _ = tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessageWithObjects {
+            tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessageWithObjects {
                 target_id,
                 behavior_id,
                 payload: args,
@@ -2000,9 +2226,125 @@ impl Runtime {
                 sender: self.current_actor.unwrap_or(0),
                 trace_id: out_trace,
                 grain_id,
-            });
+            })
+        };
+
+        match result {
+            Ok(()) => MessageAdmission::Accepted,
+            Err(mpsc::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    "nulang-shard: backpressure sending to actor {} on shard {}",
+                    target_id,
+                    target_shard
+                );
+                MessageAdmission::Backpressured
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                tracing::warn!(
+                    "nulang-shard: dropping message to actor {}: shard {} disconnected",
+                    target_id,
+                    target_shard
+                );
+                MessageAdmission::Rejected
+            }
         }
-        true
+    }
+
+    /// Route a name-based message to the target's owning shard. Resolution is
+    /// intentionally deferred to the destination so an absent source-side actor
+    /// cannot turn a valid name into behavior id 0 (or reject it prematurely).
+    fn send_cross_shard_named_message(
+        &mut self,
+        target_id: u64,
+        behavior_name: &str,
+        args: Vec<Value>,
+        out_trace: Option<String>,
+    ) -> MessageAdmission {
+        let target_shard = (target_id % self.shard_count as u64) as u16;
+        for arg in &args {
+            if arg.is_ptr() || arg.is_actor_ref() || arg.is_closure() {
+                warn!(
+                    "nulang-shard: dropping named cross-shard message to actor {}: \
+                     payload contains heap pointer / actor ref / closure",
+                    target_id
+                );
+                return MessageAdmission::Rejected;
+            }
+        }
+
+        let tx = self.cross_shard_tx.as_ref().unwrap();
+        let object_refs: Vec<crate::runtime::object_store::ObjectId> =
+            args.iter().filter_map(|v| v.as_object_id()).collect();
+        let result = if object_refs.is_empty() {
+            tx[target_shard as usize].try_send(CrossShardMsg::DeliverNamedMessage {
+                target_id,
+                behavior_name: behavior_name.to_string(),
+                payload: args,
+                sender: self.current_actor.unwrap_or(0),
+                trace_id: out_trace,
+            })
+        } else {
+            let mut objects = Vec::with_capacity(object_refs.len());
+            for id in object_refs {
+                if let Some(entry) = self.object_store.get(id) {
+                    objects.push((id, entry.as_bytes().to_vec()));
+                }
+            }
+            tx[target_shard as usize].try_send(CrossShardMsg::DeliverNamedMessageWithObjects {
+                target_id,
+                behavior_name: behavior_name.to_string(),
+                payload: args,
+                objects,
+                sender: self.current_actor.unwrap_or(0),
+                trace_id: out_trace,
+            })
+        };
+
+        match result {
+            Ok(()) => MessageAdmission::Accepted,
+            Err(mpsc::TrySendError::Full(_)) => {
+                warn!(
+                    "nulang-shard: backpressure sending named message to actor {} on shard {}",
+                    target_id, target_shard
+                );
+                MessageAdmission::Backpressured
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                warn!(
+                    "nulang-shard: dropping named message to actor {}: shard {} disconnected",
+                    target_id, target_shard
+                );
+                MessageAdmission::Rejected
+            }
+        }
+    }
+
+    /// Admit one Fabric delivery to an actor owned by this runtime process.
+    ///
+    /// Same-shard targets report bounded mailbox admission directly.
+    /// Cross-shard targets report admission to the bounded shard channel; the
+    /// destination mailbox may still apply its own capacity when that channel
+    /// is drained.
+    pub(crate) fn fabric_admit_local(
+        &mut self,
+        target_id: u64,
+        behavior_id: u16,
+        args: &[Value],
+    ) -> MessageAdmission {
+        let out_trace = self.current_trace.as_ref().map(|t| t.to_traceparent());
+        if self.shard_count > 1 {
+            let target_shard = (target_id % self.shard_count as u64) as u16;
+            if target_shard != self.shard_idx {
+                return self.send_cross_shard_message(
+                    target_id,
+                    behavior_id,
+                    args.to_vec(),
+                    out_trace,
+                    None,
+                );
+            }
+        }
+        self.deliver_local_message(target_id, behavior_id, args, out_trace)
     }
 
     /// Send a message to a virtual actor (grain) identified by its stable
@@ -2264,7 +2606,7 @@ impl Runtime {
         behavior_id: u16,
         args: &[Value],
         out_trace: Option<String>,
-    ) {
+    ) -> MessageAdmission {
         let msg = Message {
             behavior_id,
             payload: Arc::new(args.to_vec()),
@@ -2272,13 +2614,14 @@ impl Runtime {
             priority: MessagePriority::Normal,
             trace_id: out_trace.clone(),
         };
-        if let Some(actor) = self.actors.get_mut(&target_id) {
+        let admission = if let Some(actor) = self.actors.get_mut(&target_id) {
             actor
                 .flight_recorder
                 .record(self.current_actor.unwrap_or(0), behavior_id, args);
             if actor.mailbox.push_local(msg).is_ok() {
                 // Activity resets the dehydration idle timer.
                 actor.idle_ms = 0;
+                MessageAdmission::Accepted
             } else {
                 // Mailbox is full (capacity > 0). Route to DLQ with a simple notification.
                 self.route_to_dlq(
@@ -2291,6 +2634,7 @@ impl Runtime {
                     },
                     "mailbox full",
                 );
+                MessageAdmission::Backpressured
             }
         } else {
             self.route_to_dlq(
@@ -2303,7 +2647,13 @@ impl Runtime {
                 },
                 "target actor not found",
             );
+            MessageAdmission::Rejected
+        };
+
+        if admission != MessageAdmission::Accepted {
+            return admission;
         }
+
         for arg in args {
             if let Some(ptr) = arg.as_ptr() {
                 if ptr.is_null() {
@@ -2387,6 +2737,7 @@ impl Runtime {
                 self.resume_suspended_receive_wait(target_id);
             }
         }
+        MessageAdmission::Accepted
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
@@ -2630,6 +2981,12 @@ impl Runtime {
             if ticks % DEHYDRATE_CHECK_INTERVAL == 0 {
                 self.dehydrate_idle_grains();
             }
+            if ticks % CRDT_SYNC_INTERVAL_TICKS == 0 {
+                // Cheap no-op when distribution is disabled: only local
+                // tombstone GC runs. When clustered, this ships delta-state
+                // syncs to healthy peers on the scheduler cadence.
+                self.sync_crdts();
+            }
         }
         // Deliver pending foreign-ref decrements and run cycle detection only
         // once the run queue has drained. Receiver-side holds now keep
@@ -2824,7 +3181,7 @@ impl Runtime {
     /// updating the actor's own sequence/dirty tracking.
     fn build_actor_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
         let mut state = std::collections::HashMap::new();
-        let waiting_signal = {
+        let (waiting_signal, authority_tokens) = {
             let actor = self.actors.get(&actor_id)?;
             for (name, value) in &actor.state_data {
                 let model = actor
@@ -2858,7 +3215,17 @@ impl Runtime {
                     state.insert(name.clone(), persisted);
                 }
             }
-            actor.waiting_signal.clone()
+            let authority_tokens = match actor.authority_manifest() {
+                Ok(manifest) => manifest.canonical_token_set(),
+                Err(err) => {
+                    warn!(
+                        "nulang-persist: refusing to snapshot actor {} with invalid authority: {}",
+                        actor_id, err
+                    );
+                    return None;
+                }
+            };
+            (actor.waiting_signal.clone(), authority_tokens)
         };
         let sequence = self.next_sequence(actor_id);
         let crdt_snapshot = self.crdt_manager.as_ref().map(|m| {
@@ -2867,12 +3234,21 @@ impl Runtime {
                 .map(|(id, (ty, bytes))| (id.0, ty.to_u8(), bytes))
                 .collect()
         });
+        let crdt_field_map = self.crdt_manager.as_ref().map(|m| {
+            m.field_map
+                .iter()
+                .filter(|((aid, _), _)| *aid == actor_id)
+                .map(|((_, name), id)| (name.clone(), id.0))
+                .collect()
+        });
         Some(ActorSnapshot {
             actor_id,
             sequence,
             state,
             waiting_signal,
             crdt_snapshot,
+            crdt_field_map,
+            authority_tokens,
         })
     }
 
@@ -3180,13 +3556,16 @@ impl Runtime {
         // behavior (clearing suspended_execution) or re-suspend (setting it
         // again), after which the normal suspended_execution guard below
         // prevents processing new messages while the behavior is live.
-        let jit_yield = self
-            .actors
-            .get(&actor_id)
-            .map(|a| a.jit_yield_pending)
-            .unwrap_or(false);
-        if jit_yield {
-            self.resume_suspended_jit_yield(actor_id);
+        #[cfg(feature = "native-codegen")]
+        {
+            let jit_yield = self
+                .actors
+                .get(&actor_id)
+                .map(|a| a.jit_yield_pending)
+                .unwrap_or(false);
+            if jit_yield {
+                self.resume_suspended_jit_yield(actor_id);
+            }
         }
 
         let msg_opt = {
@@ -3442,6 +3821,7 @@ impl Runtime {
             };
             // AOT target to arm around the handler (None for bytecode/native
             // handlers or behaviors without an AOT-compiled version).
+            #[cfg(feature = "native-codegen")]
             let aot_target = self
                 .actors
                 .get(&actor_id)
@@ -3478,10 +3858,12 @@ impl Runtime {
                     };
                     // Arm the AOT native target so `aot_behavior_adapter` (the
                     // behavior's handler) dispatches through AOT code.
+                    #[cfg(feature = "native-codegen")]
                     if let Some(target) = aot_target {
                         crate::aot::set_aot_dispatch(Some(target));
                     }
                     handler(actor, &msg.payload);
+                    #[cfg(feature = "native-codegen")]
                     if aot_target.is_some() {
                         crate::aot::clear_aot_dispatch();
                     }
@@ -4439,30 +4821,36 @@ impl Runtime {
 
             (*self_ptr).vm_exec_begin();
 
-            // Reset JIT safepoint counter for this behavior invocation.
-            if let Some(actor) = self.actors.get_mut(&actor_id) {
-                actor.jit_safepoint_counter = crate::jit::runtime::JIT_SAFEPOINT_BUDGET;
-                crate::jit::runtime::set_jit_safepoint_ptr(&mut actor.jit_safepoint_counter);
+            #[cfg(feature = "native-codegen")]
+            {
+                // Reset native-codegen safepoint counter for this behavior.
+                if let Some(actor) = self.actors.get_mut(&actor_id) {
+                    actor.jit_safepoint_counter = crate::backends::JIT_SAFEPOINT_BUDGET;
+                    crate::jit::runtime::set_jit_safepoint_ptr(&mut actor.jit_safepoint_counter);
+                }
             }
 
             let result = vm.run_from(module_idx, code_offset);
 
-            // JIT safepoint yield: capture state for inline resume on next turn.
-            if vm.yield_pending {
-                if let Some(vm_state) = vm.take_suspended_state() {
-                    if let Some(actor) = self.actors.get_mut(&actor_id) {
-                        actor.suspended_execution =
-                            Some(crate::runtime::actor::SuspendedExecution {
-                                vm_state,
-                                behavior_idx: 0,
-                                step_name: String::new(),
-                            });
-                        actor.jit_yield_pending = true;
+            #[cfg(feature = "native-codegen")]
+            {
+                // JIT safepoint yield: capture state for inline resume.
+                if vm.yield_pending {
+                    if let Some(vm_state) = vm.take_suspended_state() {
+                        if let Some(actor) = self.actors.get_mut(&actor_id) {
+                            actor.suspended_execution =
+                                Some(crate::runtime::actor::SuspendedExecution {
+                                    vm_state,
+                                    behavior_idx: 0,
+                                    step_name: String::new(),
+                                });
+                            actor.jit_yield_pending = true;
+                        }
                     }
+                    crate::jit::runtime::clear_jit_safepoint_ptr();
+                    (*self_ptr).vm_exec_end();
+                    return Ok(Value::nil());
                 }
-                crate::jit::runtime::clear_jit_safepoint_ptr();
-                (*self_ptr).vm_exec_end();
-                return Ok(Value::nil());
             }
             // Capture VM state for a workflow signal wait, a non-blocking
             // LLM call, or a timed selective receive. Doing this here avoids
@@ -4491,6 +4879,7 @@ impl Runtime {
             // suspend still needs. Runs on every path, so wakes of other
             // actors are not lost when THIS actor suspends.
             (*self_ptr).vm_exec_end();
+            #[cfg(feature = "native-codegen")]
             crate::jit::runtime::clear_jit_safepoint_ptr();
             // String-id values index into this runtime VM's constant pool. When
             // the result is returned to a different VM (e.g. the top-level VM
@@ -4631,6 +5020,17 @@ impl Runtime {
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
+        let authority_manifest =
+            match crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens) {
+                Ok(manifest) => manifest,
+                Err(err) => {
+                    warn!(
+                        "nulang-recover: refusing actor {} with invalid authority manifest: {}",
+                        actor_id, err
+                    );
+                    return None;
+                }
+            };
         let workflow_events = self.persistence.read_workflow_events(actor_id);
         let is_workflow = self
             .recovery_modules
@@ -4649,16 +5049,29 @@ impl Runtime {
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
         actor.waiting_signal = snapshot.waiting_signal;
+        actor.install_authority_manifest(&authority_manifest);
         // Restore CRDT state if present in the snapshot.
         if let Some(crdt_snap) = &snapshot.crdt_snapshot {
             if let Some(manager) = &mut self.crdt_manager {
-                let snapshot: HashMap<CrdtId, (CrdtType, Vec<u8>)> = crdt_snap
+                let crdt_map: HashMap<CrdtId, (CrdtType, Vec<u8>)> = crdt_snap
                     .iter()
                     .filter_map(|(id, ty, bytes)| {
                         CrdtType::from_u8(*ty).map(|t| (CrdtId(*id), (t, bytes.clone())))
                     })
                     .collect();
-                manager.restore(snapshot);
+                manager.restore(crdt_map);
+                // Rebuild the (actor_id, field_name) -> CrdtId mapping so
+                // `perform Crdt.*` can target recovered fields.
+                if let Some(field_map) = &snapshot.crdt_field_map {
+                    for (field_name, crdt_id) in field_map {
+                        manager
+                            .field_map
+                            .insert((actor_id, field_name.clone()), CrdtId(*crdt_id));
+                        manager
+                            .field_reverse
+                            .insert(CrdtId(*crdt_id), (actor_id, field_name.clone()));
+                    }
+                }
             }
         }
         for (name, value) in snapshot.state {
@@ -4770,6 +5183,15 @@ impl Runtime {
             self.layout_workflow_behavior_table(actor_id);
         } else {
             self.actors.insert(actor_id, actor);
+        }
+        // Ensure CRDT-backed fields are registered (or re-registered after
+        // recovery). `register_actor_fields` is idempotent, so declared fields
+        // not covered by the snapshot get fresh replicas while recovered fields
+        // reuse their restored CrdtIds.
+        if let Some(ref mut mgr) = self.crdt_manager {
+            if let Some(actor) = self.actors.get(&actor_id) {
+                mgr.register_actor_fields(actor_id, actor);
+            }
         }
 
         if is_workflow {
@@ -4888,7 +5310,9 @@ impl Runtime {
         snapshot: &ActorSnapshot,
         is_workflow: bool,
         is_agent: bool,
-    ) -> Actor {
+    ) -> Result<Actor, crate::authority_runtime::RuntimeAuthorityError> {
+        let authority_manifest =
+            crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens)?;
         let offsets: Vec<usize> = crate::runtime::spawn::bytecode_offsets_for(module, is_workflow);
         let compensation_offsets: Vec<Option<usize>> = if is_workflow {
             module
@@ -4922,6 +5346,7 @@ impl Runtime {
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
         actor.waiting_signal = snapshot.waiting_signal.clone();
+        actor.install_authority_manifest(&authority_manifest);
         actor.bytecode_module = Some(module.clone());
         actor.bytecode_offsets = offsets;
         actor.compensation_offsets = compensation_offsets;
@@ -4959,7 +5384,7 @@ impl Runtime {
             actor.set_state_field(name, v);
         }
 
-        actor
+        Ok(actor)
     }
 
     /// Resolve a virtual actor (grain) identity to a resident actor id,
@@ -5001,6 +5426,14 @@ impl Runtime {
                 false,
                 false,
             )
+            .map_err(|err| NuError::RuntimeError {
+                msg: format!(
+                    "invalid authority snapshot for virtual actor {}: {}",
+                    grain_id.actor_name(),
+                    err
+                ),
+                span: Span::new(0, 0),
+            })?
         } else {
             let mut actor = Actor::new(stable_actor_id, grain_id.actor_name(), 0);
             actor.persistent = true;
@@ -5109,8 +5542,22 @@ impl Runtime {
         let is_workflow = module.actor_metadata.iter().any(|m| m.is_workflow);
         let is_agent = module.actor_metadata.iter().any(|m| m.is_agent);
 
-        let actor =
-            Self::restore_actor_from_snapshot(actor_id, &module, &snapshot, is_workflow, is_agent);
+        let actor = match Self::restore_actor_from_snapshot(
+            actor_id,
+            &module,
+            &snapshot,
+            is_workflow,
+            is_agent,
+        ) {
+            Ok(actor) => actor,
+            Err(err) => {
+                warn!(
+                    "nulang-migrate: invalid authority manifest for actor {}: {}",
+                    actor_id, err
+                );
+                return false;
+            }
+        };
 
         // Register the recovery module.
         let offsets: Vec<usize> = module
@@ -5151,6 +5598,16 @@ impl Runtime {
                     })
                     .collect();
                 manager.restore(crdt_map);
+                if let Some(field_map) = &snapshot.crdt_field_map {
+                    for (field_name, crdt_id) in field_map {
+                        manager
+                            .field_map
+                            .insert((actor_id, field_name.clone()), CrdtId(*crdt_id));
+                        manager
+                            .field_reverse
+                            .insert(CrdtId(*crdt_id), (actor_id, field_name.clone()));
+                    }
+                }
             }
         }
 
@@ -5158,6 +5615,11 @@ impl Runtime {
             self.layout_workflow_behavior_table(actor_id);
         }
         self.actors.insert(actor_id, actor);
+        if let Some(ref mut mgr) = self.crdt_manager {
+            if let Some(actor) = self.actors.get(&actor_id) {
+                mgr.register_actor_fields(actor_id, actor);
+            }
+        }
         self.enqueue_actor(actor_id);
 
         tracing::info!("nulang-migrate: actor {} received and enqueued", actor_id);
@@ -6065,7 +6527,11 @@ impl Runtime {
     /// their behaviors through AOT native code (bypassing the bytecode VM)
     /// when the behavior is compiled in the module; behaviors absent from the
     /// module keep their bytecode handlers.
-    pub fn register_aot_module(&mut self, module: crate::aot::AotModule) {
+    #[cfg(feature = "native-codegen")]
+    pub fn register_aot_module(
+        &mut self,
+        module: crate::aot::AotModule,
+    ) -> *const crate::aot::AotModule {
         // Box the module so its address is stable, then register the raw
         // pointer for every actor type it declares.
         let boxed = Box::new(module);
@@ -6074,6 +6540,7 @@ impl Runtime {
             self.aot_modules.entry(name).or_insert(module_ptr);
         }
         self.aot_module_storage.push(boxed);
+        module_ptr
     }
 
     /// Take the result of a previously issued remote spawn request.
@@ -6341,6 +6808,10 @@ pub(crate) struct ShadowReplica {
 /// Interval (in `sync_crdts` rounds) between full-state repair syncs.
 /// Round 1 is full; rounds 2..=N are delta; round N+1 is full again.
 const CRDT_FULL_SYNC_INTERVAL: u64 = 16;
+/// How often (in scheduler ticks) the runtime synchronizes CRDT state with
+/// healthy peers. Cheap when distribution is disabled: it only runs local
+/// tombstone GC and returns without counting a sync round.
+const CRDT_SYNC_INTERVAL_TICKS: u64 = 512;
 /// How often (in scheduler ticks) deferred local decrements are retried
 /// while actors are still running. Used by both the production
 /// `run_scheduler` and the deterministic DST scheduler.

@@ -1,0 +1,380 @@
+---
+title: Package Manager
+description: The nula package manager — scaffolding packages, Nulang.toml manifests, path/git/registry dependencies, lockfiles, builds, tests, WASM artifacts, and publishing.
+---
+
+Nulang ships a built-in package manager, `nula`, inside the `nulang` binary.
+It scaffolds packages, resolves dependencies from local paths, git, or a
+registry, type-checks and compiles packages, runs tests, and publishes
+tarballs to a registry server. Every `nula` command operates on the package
+in the current working directory (the one containing `Nulang.toml`).
+
+Run `nulang nula` with no arguments to list all subcommands.
+
+## Creating a package
+
+```bash
+nulang nula new my-app
+```
+
+```
+Created package 'my-app' at 'my-app'
+```
+
+This creates a `my-app` directory with a manifest and a default entry point:
+
+```text
+my-app/
+├── Nulang.toml
+└── src/
+    └── main.nula
+```
+
+```toml title="my-app/Nulang.toml"
+[package]
+name = "my-app"
+version = "0.1.0"
+
+[dependencies]
+```
+
+```nulang title="my-app/src/main.nula"
+fn main() {
+  perform IO.print("Hello from Nulang!")
+}
+```
+
+To scaffold a package in the current directory instead (adding a
+`.gitignore` for build artifacts), use `nulang nula init`.
+
+### Templates
+
+`nula new` accepts a `--template` flag:
+
+```bash
+nulang nula new my-app --template lib
+```
+
+| Template | Layout |
+|----------|--------|
+| `default` | `src/main.nula` hello-world entry point |
+| `cli` | CLI tool starting point (`System.arg`, `Env.get`, `FS.write`) |
+| `lib` | `src/lib.nula` public API + `tests/test_add.nula` |
+| `full` | `README.md`, `src/lib.nula`, `src/main.nula`, `tests/`, `examples/` |
+| `distributed` | supervised worker actors with message passing |
+| `ai-agent` | actor with LLM-backed conversation memory |
+| `web` | Nulang Web app with `[web]` manifest section and static assets |
+
+## The `Nulang.toml` manifest
+
+Every package has a `Nulang.toml` at its root. All fields:
+
+```toml
+[package]
+name = "my-app"              # required; letters, digits, '-' and '_'
+version = "0.1.0"            # required; semver x.y.z
+entry = "src/main.nula"      # optional; entry point, this is the default
+registry = "http://localhost:8087"
+                             # optional; default registry for publish and
+                             # bare version dependencies
+language = "1.0"             # optional; required language major.minor
+capabilities = ["net"]       # optional; resource capabilities, forwarded
+                             # to the compiler as --with <cap>
+
+[dependencies]
+# see "Dependencies" below
+
+[web]                        # optional; used by `nula dev` / `nula build --web`
+port = 8080                  # dev server port
+static_dir = "static"        # static assets, relative to the package root
+output_dir = "dist"          # static-site output directory
+
+[budgets]                    # optional; performance budgets for web builds
+initial_js = "20KB"          # max initial JS transfer size
+lcp = "1.5s"                 # Largest Contentful Paint target
+```
+
+:::note
+`language` pins the package to a toolchain: `nula build`, `nula test`, and
+`nula run` fail if the compiler's language major.minor differs from the
+pinned value.
+:::
+
+## Dependencies
+
+`[dependencies]` maps a package name to one of three source forms:
+
+```toml
+[dependencies]
+# 1. Local path — resolved straight from disk.
+util = { path = "../util" }
+
+# 2. Git — cloned into .nula/git/<name>. Pin with rev, branch, or tag;
+#    an optional version requirement is semver-checked after cloning.
+json = { git = "https://github.com/example/json.nu.git", tag = "v0.2.0" }
+head = { git = "https://example.com/head.git", branch = "main" }
+pinned = { git = "https://example.com/pinned.git", rev = "abc123" }
+
+# 3. Registry — a bare version requirement, fetched from the registry
+#    configured in [package] `registry` at build time.
+serde = "1.0"
+```
+
+The dependency's key must match the package's own `name` in its manifest,
+and cycles, conflicting sources for one name, and unmet version
+requirements are all hard resolution errors.
+
+`nula add` and `nula remove` edit the manifest and re-resolve the lockfile:
+
+```bash
+nulang nula add util --path ../util
+```
+
+```
+Added dependency 'util' to Nulang.toml.
+  Resolving dependencies...
+  Lockfile updated.
+```
+
+```bash
+nulang nula remove util
+```
+
+Version requirements use a simple semver-compatible rule: the resolved
+version must be at least as new as the requirement and share its major
+version. For `0.x` requirements (which make no stability promise) the minor
+version must match too, mirroring Cargo's caret semantics.
+
+### The `Nulang.lock` lockfile
+
+Every build re-resolves the dependency graph and writes `Nulang.lock` next
+to the manifest, pinning each dependency's exact source so builds are
+reproducible. Packages appear in topological order (dependencies before
+dependents).
+
+```toml
+version = 1
+
+[[package]]
+name = "util"
+version = "0.1.0"
+source = "path+/home/david/projects/util"
+content_hash = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+
+[[package]]
+name = "jsonlib"
+version = "0.2.0"
+source = "git+https://github.com/example/json.nu.git#v0.2.0"
+commit = "1ea88549599b9950c0e084bf6068ed91d126db03"
+```
+
+The `source` prefix records where the package came from: `path+<dir>` for
+local dependencies, `git+<url>#<rev>` for git ones (with the full commit
+SHA recorded separately in `commit` so a moved branch or tag is detected
+and re-fetched), and `reg+<url>` for registry packages. Path dependencies
+also carry a BLAKE3 `content_hash` of their `.nula` sources.
+
+`nulang nula list` prints the locked dependencies:
+
+```
+Locked dependencies (from /home/david/projects/my-app/Nulang.lock):
+  util v0.1.0 — path+/home/david/projects/util
+```
+
+### Using a dependency
+
+`nula build`, `nula run`, and `nula test` build a module path from the
+lockfile automatically, so code in the depending package can import the
+dependency's `src/` directory as `@nulang/<name>`:
+
+```nulang
+// fragment — requires a package with `util` in [dependencies]
+import @nulang/util
+
+fn main() {
+  perform IO.print("1 + 2 = " + perform Int.to_string(add(1, 2)))
+}
+```
+
+A package named `nulang-x` is imported as `@nulang/x`.
+
+## Building — `nula build`
+
+```bash
+cd my-app
+nulang nula build
+```
+
+```
+  Resolving dependencies...
+Building my-app...
+  Type-checking .../my-app/src/main.nula...
+Type check passed.
+  Compiling my-app to .nbc...
+Wrote .../my-app/.nula/dist/my-app.nbc (573 bytes, .nbc format v1, language v1)
+Build succeeded.
+```
+
+`nula build` resolves dependencies, writes `Nulang.lock`, type-checks the
+entry point, and compiles it to a frozen `.nbc` bytecode artifact in
+`.nula/dist/<name>.nbc`. `nulang nula build --json` emits a machine-readable
+JSON build report on stdout (progress stays on stderr) for editor and CI
+integrations. `nulang nula clean` removes `.nula/dist/`.
+
+Capabilities declared as `[package] capabilities = ["net"]` are forwarded to
+the compiler as `--with net`, so packages performing gated resource effects
+can declare their requirements in the manifest instead of failing the
+default-deny capability check.
+
+## Running — `nula run`
+
+```bash
+nulang nula run
+```
+
+```
+Building and running...
+  Resolving dependencies...
+Hello from Nulang!
+```
+
+`nula run` resolves the package (updating the lockfile) and executes the
+entry point. `nulang nula run --watch` (or `nulang nula watch`) re-runs it
+whenever a `.nula` file under `src/` changes.
+
+## Testing — `nula test`
+
+`nula test` discovers `.nula` files under the package's `tests/` directory
+and runs each one in a fresh `nulang` process. A test passes if the file
+runs to completion; any compile error, runtime error, or failed
+`Test.assert_eq` assertion fails it.
+
+```nulang title="tests/test_add.nula"
+fn add(a: Int, b: Int) -> Int {
+  a + b
+}
+
+fn main() {
+  perform Test.assert_eq(add(1, 2), 3)
+  perform Test.assert_eq(add(-5, 5), 0)
+}
+```
+
+```bash
+nulang nula test
+```
+
+```
+Preparing package...
+  Resolving dependencies...
+running 2 tests
+test tests/test_add.nula ... ok
+test tests/test_more.nula ... ok
+
+test result: 2 passed; 0 failed
+```
+
+Flags:
+
+- `--filter <substr>` — only run test files whose name contains the substring
+- `--verbose` / `-v` — print per-file results and failure details
+- `--watch` / `-w` — re-run when `src/` or `tests/` change
+- `--json` — machine-readable report on stdout
+
+If a test file defines `fn test_*` functions, each one is discovered and run
+as an independent test case (the file's `fn main`, if any, is stripped from
+the per-function wrappers); otherwise the whole file runs as a single test.
+
+## WASM builds — `nula build-wasm`
+
+```bash
+nulang nula build-wasm
+```
+
+`nula build-wasm` compiles the entry point with the WASM backend and emits
+`<name>.wasm` plus an AOT-compiled `<name>.cwasm` into `.nula/dist/`.
+
+:::caution
+This requires a `nulang` binary built with the `wasm-backend` cargo feature
+(not enabled by default). Without it the command fails with
+`wasm backend not compiled in (enable 'wasm-backend' feature)`.
+:::
+
+## Publishing
+
+`nula publish` packages the current package — `Nulang.toml`, the `src/`
+tree, and `tests/` if present — into a gzipped tarball and uploads it to a
+registry:
+
+```bash
+nulang nula publish --registry http://localhost:8087 --token mytoken
+```
+
+```
+Publishing util-0.1.0 to http://localhost:8087 ...
+Published util-0.1.0 successfully.
+```
+
+The registry URL comes from (first match wins) the `--registry` flag, the
+`[package] registry` field in `Nulang.toml`, or the `NULA_REGISTRY`
+environment variable. The auth token comes from `--token` or `NULA_TOKEN`;
+publishing without one fails with `No auth token — pass --token or set
+NULA_TOKEN env var`. Re-publishing an existing version is rejected with
+`409 Conflict`.
+
+### Running a registry server
+
+The `nulang` binary includes a minimal reference registry server:
+
+```bash
+nulang registry serve --bind 127.0.0.1:8087 --dir .nula-registry --token mytoken
+```
+
+```
+Registry listening on 127.0.0.1:8087 (data: .nula-registry)
+```
+
+It speaks a small HTTP API under `/api/v1/packages`:
+
+| Endpoint | Behavior |
+|----------|----------|
+| `PUT /api/v1/packages/<name>/<version>` | Store a tarball. Requires `Authorization: Bearer <token>` when the server has `--token`. `201 Created`, or `409` if the version already exists |
+| `GET /api/v1/packages/<name>` | List published versions as `{"name": ..., "versions": [...]}` |
+| `GET /api/v1/packages/<name>/<version>` | Download the stored tarball |
+
+:::note
+The reference server is a single-process file store with one shared bearer
+token — suitable for local development and small teams, not a replacement
+for a hosted registry with accounts, TLS, and rate limiting.
+:::
+
+### Consuming from a registry
+
+Point `[package] registry` at the server and use a bare version requirement:
+
+```toml
+[package]
+name = "consumer"
+version = "0.1.0"
+registry = "http://localhost:8087"
+
+[dependencies]
+util = "0.1.0"
+```
+
+At build time the resolver lists the published versions, picks the newest
+one satisfying the requirement, downloads the tarball into
+`.nula/registry/<name>-<version>/`, and pins it in the lockfile with a
+`reg+<url>` source.
+
+## Other commands
+
+| Command | Description |
+|---------|-------------|
+| `nulang nula add <name> [--path <dir>] [--git <url>] [--version <req>]` | Add a dependency to `Nulang.toml` and update the lockfile |
+| `nulang nula remove <name>` | Remove a dependency and update the lockfile |
+| `nulang nula list` | Print locked dependencies from `Nulang.lock` |
+| `nulang nula clean` | Remove `.nula/dist/` build artifacts |
+| `nulang nula doc [--open]` | Generate Markdown API docs to `docs/api.md` from `///` doc comments |
+| `nulang nula build --web` | Static-site build (uses the `[web]` and `[budgets]` manifest sections) |
+| `nulang nula dev [--port <n>]` | Nulang Web development server |

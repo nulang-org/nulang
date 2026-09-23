@@ -57,24 +57,24 @@ On recovery, durable timers are re-armed from the journal. If the timer should h
 
 ## LLM Calls
 
-`perform LLM.ask(prompt)` sends the prompt to the configured LLM and suspends the step until the response arrives:
+`perform Inference.ask(prompt)` sends the prompt to the configured LLM and suspends the step until the response arrives (the legacy `LLM.ask` spelling dispatches identically):
 
 ```nulang
 workflow LlmFlow {
-    step ask_step { self.answer = perform LLM.ask("hello") }
+    step ask_step { self.answer = perform Inference.ask("hello") }
 }
 ```
 
-Unlike a blocking `ask` to an agent, `LLM.ask` inside a workflow step suspends non-blockingly. The runtime spawns a worker thread for the HTTP call, the actor suspends, and the step resumes when the LLM response arrives.
+Unlike a blocking `ask` to an agent, `Inference.ask` inside a workflow step suspends non-blockingly. The runtime spawns a worker thread for the HTTP call, the actor suspends, and the step resumes when the LLM response arrives.
 
 ### LLM + signal chaining
 
-A step can perform `LLM.ask` and `Signal.wait` in sequence:
+A step can perform `Inference.ask` and `Signal.wait` in sequence:
 
 ```nulang
 workflow SignalThenLlm {
     step wait_then_ask {
-        (perform Signal.wait("go"), self.answer = perform LLM.ask("hello"))
+        (perform Signal.wait("go"), self.answer = perform Inference.ask("hello"))
     }
 }
 ```
@@ -123,7 +123,7 @@ The `handler` is a function value (a function-table index) returned from the pro
 |--------|-----------|-----------|-------------|
 | `Signal` | `wait` | `wait(name: String) -> Unit` | Suspend until the named signal arrives |
 | `Timer` | `sleep` | `sleep(name: String, duration_ms: Int) -> Unit` | Schedule a durable workflow timer |
-| `LLM` | `ask` | `ask(prompt: String) -> String` | Non-blocking LLM call; suspends until response |
+| `Inference` | `ask` | `ask(prompt: String) -> String` | Non-blocking LLM call; suspends until response |
 | `Workflow` | `query` | `query(self, name: String) -> Value` | Read-only state query via registered handler |
 
 These operations are only available inside workflow actors (runtime-host context). Outside a workflow, they are nil no-ops.

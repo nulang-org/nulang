@@ -1,0 +1,146 @@
+---
+title: Python & FFI Interop
+description: Call Python through the built-in Python.* effects and C libraries through extern blocks — two experimental interop surfaces.
+---
+import CopyMarkdown from '../../../components/CopyMarkdown.astro';
+
+## Overview
+
+<CopyMarkdown />
+
+Nulang has two ways to reach foreign code:
+
+- **Python interop** — built-in `Python.*` effects dispatched by the actor runtime into an embedded CPython interpreter (PyO3).
+- **C FFI** — `extern` blocks that declare functions in shared libraries, plus a stable C API for embedding Nulang in host applications.
+
+Both surfaces are **Experimental** tier (see `spec/grammar.ebnf` §4): they work today but may change without an RFC, and each has rough edges called out below. The C FFI path is the more mature of the two.
+
+## Calling Python from Nulang
+
+### Requirements
+
+- The `python` cargo feature, which is **on by default** (`Cargo.toml`). Build with `--no-default-features` to exclude it.
+- A Python 3 runtime on the host. Nulang links against `libpython` (PyO3 0.29, abi3 limited API) and initializes the interpreter on first use via `auto-initialize`. On Fedora-style systems, `build.rs` creates the `libpythonX.Y.so` symlink PyO3's linker expects.
+- The `os` resource capability at compile time — pass `--with os` — because performing the `Python` effect is gated like `Process` and `System` (`effect_resource_category` in `src/effect_checker.rs`).
+
+### The Python effect operations
+
+The canonical registry (`src/stdlib.rs`) lists three operations, all implemented in the runtime host (not the standalone VM):
+
+| Operation | Signature | Description |
+|-----------|-----------|-------------|
+| `Python.import` | `import(module: String) -> Unit` | Import a Python module. |
+| `Python.call` | `call(module: String, function: String, ...args) -> a` | Call a Python function with arguments. |
+| `Python.get_attr` | `get_attr(module: String, attr: String) -> a` | Get an attribute from a Python module. |
+
+Typical usage looks like this:
+
+```nulang
+// fragment — requires the os capability grant (`nulang --with os --check file.nula`)
+fn hypotenuse(a: Float, b: Float) -> Float ! {Python} {
+    perform Python.call("math", "hypot", a, b)
+}
+
+fn pi() -> Float ! {Python} {
+    perform Python.get_attr("math", "pi")
+}
+```
+
+### How values cross
+
+Marshalling (`src/python/marshal.rs`) converts primitives directly and keeps everything else as opaque handles into a global, GIL-protected registry (`src/python/bridge.rs`):
+
+| Nulang value | Python object |
+|--------------|---------------|
+| `Int` | `int` |
+| `Float` | `float` |
+| `Bool` | `bool` |
+| `()` / `nil` | `None` |
+| `String` | placeholder descriptor (see caveat below) |
+| Python object handle | the object itself |
+
+| Python object | Nulang value |
+|---------------|--------------|
+| `None` | `()` |
+| `bool` | `Bool` |
+| `int` | `Int` (clamped to i64) |
+| `float` | `Float` |
+| `str`, `list`, `tuple`, `dict`, anything else | opaque Python object handle |
+
+Complex Python values arrive as opaque handles tagged `TAG_PYTHON` — cheap `Copy` ids into the registry, not ORCA-managed heap objects. There are no `iso`/linear capability requirements on values crossing the boundary; the gates are the compile-time `os` capability and, for code running inside an actor behavior, an explicit authority grant (e.g. `spawn Worker {} with [Python::call]`).
+
+:::caution
+Two marshalling sharp edges, both verified against the implementation: Nulang strings passed as call arguments currently arrive in Python as placeholder descriptors (`<nulang_string:ID>`), not real `str` values, and Python `str` results come back as opaque handles that cannot be concatenated with Nulang strings directly. Numeric arguments and results round-trip cleanly.
+:::
+
+### Where Python effects run
+
+`Python.*` effects are dispatched only by the **actor runtime host**. A pure module run on the standalone VM rejects them at compile time (`Unhandled effect: 'Python.call'`). In practice that means the module must declare an actor so the CLI executes it on the runtime:
+
+```nulang
+// Run with: nulang --with os math_from_python.nula
+// Requires a host Python 3 runtime.
+actor PyCaller {
+    behavior run() {
+        let root = perform Python.call("math", "sqrt", 16)
+        perform IO.println("sqrt(16) = " + perform Int.to_string(root))
+    }
+}
+
+fn main() {
+    let worker = spawn PyCaller {} with [Python::call]
+    worker ! run()
+    0
+}
+```
+
+:::note
+Current state of this surface, verified with the compiler binary: `perform Python.import(...)` does not parse today — `import` is a reserved keyword and the parser does not exempt it as an effect operation name (error `E0102`). Until that is fixed there is no way to import a module from pure Nulang source, so `Python.call`/`Python.get_attr` compile and dispatch but return `nil` with a `module '<name>' not imported` diagnostic for never-imported modules, and performing `Python.*` from inside a behavior traps the behavior silently. The bridge itself (import, call, attribute access, marshalling) is implemented and unit-tested at the Rust level; driving it end-to-end from source is blocked on the import syntax gap.
+:::
+
+## The C FFI
+
+The FFI has three faces, all in `src/ffi/` behind the default-on `ffi` cargo feature (libloading + libffi): language-level `extern` blocks, dynamic library loading, and a stable C embedder API. There are no user-facing `FFI.*` effect operations in the stdlib registry — the surface is the `extern` syntax plus host registration APIs. This is lower-level and less polished than the rest of the language; treat it as experimental infrastructure.
+
+### extern blocks
+
+Declare external functions with an `extern "library" { ... }` block. Parameters must have explicit types, a return type is mandatory, and only `Int`, `Float`, `Bool`, `String`, and `Unit` may cross the boundary — anything else is rejected at parse time. The library is resolved lazily at call time:
+
+```nulang
+// Verified with: nulang libm_demo.nula  (Linux, requires libm)
+extern "libm.so.6" {
+    fn sqrt(x: Float) -> Float
+    fn pow(x: Float, y: Float) -> Float
+}
+
+fn main() {
+    perform IO.println("sqrt(2) = " + perform Float.to_string(sqrt(2.0)))
+    perform IO.println("2^10 = " + perform Float.to_string(pow(2.0, 10.0)))
+    0
+}
+```
+
+`String` arguments are copied into temporary C strings for the duration of the call; returned C strings are copied into the Nulang heap.
+
+An `extern` block **without** a library string targets `__nulang_registered__` — functions registered in-process by the host via the Rust API `ffi::register_native_function` or the C API `nulang_register_native_function`:
+
+```nulang
+// fragment — the host must register `host_lookup` before running
+extern {
+    fn host_lookup(key: String) -> String
+}
+```
+
+### Sandboxing and authority
+
+For untrusted programs, the CLI offers an allowlist: `--ffi-sandbox --ffi-allow libm.so.6` restricts `extern` calls to named libraries (and pre-registered functions). When actor behavior code makes FFI calls, each call additionally requires an exact authority grant naming the library and symbol — `spawn Worker {} with [FFI::Call("libm.so.6::cbrt")]` — so permission to call one symbol cannot authorize another.
+
+### Embedding Nulang in C
+
+`include/nulang.h` exposes a stable C ABI (implemented in `src/ffi/c_api.rs`): create a runtime, compile source, run the top-level expression or call exported functions by name, and register native C callbacks for Nulang to call back into the host. This is the intended integration point for C/C++ applications — link against `libnulang.so` and drive the language from there.
+
+## See also
+
+- [Algebraic Effects](/language/effects/) — how `perform` and effect rows work.
+- [Python effect](/stdlib/python/) — the auto-generated stdlib registry entry for `Python.*`.
+- [Installation](/getting-started/installation/) — building with/without the `python` and `ffi` features.

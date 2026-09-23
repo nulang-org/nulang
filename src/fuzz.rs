@@ -724,7 +724,7 @@ pub(crate) fn differential_fuzz_one(source: &str) -> Result<DiffOutcome, String>
                 true
             }
             Ok(Ok(raw)) => {
-                let aot_value = crate::vm::Value::from_raw(raw);
+                let aot_value = unsafe { crate::vm::Value::from_raw(raw) };
                 if !is_safely_comparable(aot_value) {
                     false
                 } else {

@@ -7,16 +7,16 @@ const links = [
 		icon: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
 	},
 	{
-		href: '/tutorial/',
-		label: 'Tutorial',
+		href: '/playground/',
+		label: 'Playground',
 		external: false,
-		icon: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
+		icon: '<polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>',
 	},
 	{
 		href: '/blog/',
 		label: 'Blog',
 		external: false,
-		icon: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
+		icon: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>',
 	},
 	{
 		href: 'https://www.nulang.cloud',
@@ -51,7 +51,7 @@ const links = [
 			<line x1="6" y1="6" x2="18" y2="18" />
 		</svg>
 	</button>
-	<nav id="mobile-nav-menu" class="mobile-nav-menu" hidden>
+	<nav id="mobile-nav-menu" class="mobile-nav-menu" aria-label="Main navigation" hidden>
 		{links.map((link) => (
 			<a
 				href={link.href}
@@ -60,13 +60,14 @@ const links = [
 			>
 				<svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" set:html={link.icon} />
 				{link.label}
+				{link.external && <span class="sr-only">(opens in new tab)</span>}
 			</a>
 		))}
-		<a href="/getting-started/installation/" class="mobile-nav-link">
+		<a href="/playground/" class="mobile-nav-link mobile-nav-primary">
 			<svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 				<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
 			</svg>
-			Get Started
+			Try Nulang
 		</a>
 	</nav>
 </div>
@@ -85,6 +86,11 @@ const links = [
 			toggle.setAttribute('aria-label', open ? 'Close navigation menu' : 'Open navigation menu');
 			menu.hidden = !open;
 			root.classList.toggle('is-open', open);
+			if (open) {
+				menu.querySelector('.mobile-nav-link')?.focus();
+			} else if (menu.contains(document.activeElement)) {
+				toggle.focus();
+			}
 		};
 
 		toggle.addEventListener('click', () => {
@@ -108,3 +114,29 @@ const links = [
 		});
 	})();
 </script>
+
+<style>
+	.mobile-nav-toggle {
+		min-width: 44px;
+		min-height: 44px;
+	}
+
+	.mobile-nav-primary {
+		margin-top: 0.5rem;
+		border-top: 1px solid var(--nu-border);
+		color: var(--nu-accent-high);
+		font-weight: 700;
+	}
+
+	.sr-only {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip: rect(0, 0, 0, 0);
+		white-space: nowrap;
+		border: 0;
+	}
+</style>

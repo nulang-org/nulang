@@ -1,0 +1,5 @@
+fn outer() {
+    fn inner() { 42 }
+    inner()
+}
+outer()

@@ -19,5 +19,3 @@ The `Signal` effect provides the following built-in operations, wired into the V
 | `Signal.wait` | `wait(name: String) -> Unit` | Suspend the workflow until the named signal arrives, then resume with unit. |
 
 _Implementation site: Runtime Host_
-
-`Signal.wait` suspends the actor only when called inside a workflow or durable actor with the runtime enabled. Outside a workflow context (e.g., in a standalone `--eval` script), it returns `nil` immediately.

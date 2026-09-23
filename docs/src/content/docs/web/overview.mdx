@@ -1,0 +1,257 @@
+---
+title: Web Servers & Routing
+description: Build and serve web applications with the Http, Web, and Realtime effects — from a one-function HTTP server to routed HTML apps with live broadcast.
+---
+import CopyMarkdown from '../../../components/CopyMarkdown.astro';
+
+## The Web Stack
+
+<CopyMarkdown />
+
+Nulang ships three built-in effects for the web, all resolved by the runtime host (no handler wiring required):
+
+| Effect | Purpose | Key operations |
+|--------|---------|----------------|
+| `Http` | HTTP client and a minimal HTTP/1.1 server | `get`, `post`, `serve` |
+| `Web` | Routing, HTML construction, request/response access | `route`, `html`, `text`, `raw`, `redirect`, `serve_static`, `read_body`, `param`, `header`, `cookie`, `set_cookie`, `clear_cookie` |
+| `Realtime` | Pub/sub broadcast to connected browsers | `broadcast` |
+
+:::note
+The web stack is **experimental**. The pieces below are real and verified, but the surface is small — expect it to grow. The framework-style `app` blocks, placement inference, and static-site builds described below are compiler-first conveniences layered over the `Web` effect registry.
+:::
+
+## Making HTTP Requests
+
+`Http.get` and `Http.post` perform a request and return the response **body as a string**, or `nil` on any error (DNS failure, non-2xx, timeout):
+
+```nulang
+// fragment — requires the net capability: run with `nulang --with net client.nula`
+fn main() {
+    let body = perform Http.get("https://httpbin.org/get")
+    perform IO.print(body)
+
+    let posted = perform Http.post(
+        "https://httpbin.org/post",
+        "{\"language\": \"Nulang\"}"
+    )
+    perform IO.print(posted)
+}
+```
+
+- `perform Http.get(url: String) -> String`
+- `perform Http.post(url: String, body: String) -> String` — sends `body` as the request body (JSON by convention, not enforced)
+
+Both are **blocking** calls performed inline. Because they open network connections, the compiler requires the `net` resource capability — run the program with `nulang --with net program.nula` (or `--check` will fail with `effect 'Net' requires resource capability 'net'`).
+
+## Serving HTTP with `Http.serve`
+
+The lowest-level way to serve is a single function:
+
+```nulang
+// fragment — requires the net capability: run with `nulang --with net server.nula`
+fn echo(body: String) -> String {
+    "you sent: " + body
+}
+
+fn main() {
+    let port = perform Http.serve(8080, echo)
+    perform IO.print("serving on port " + perform Int.to_string(port))
+    // keep the process alive: serve until stdin closes
+    let _ = perform IO.read()
+}
+```
+
+`perform Http.serve(port: Int, handler: fn(String) -> String) -> Int` binds a real HTTP/1.1 listener and returns the actual bound port (pass `0` to let the OS pick one). For every request it calls `handler(body)` with the **request body** and sends the returned string back as the response — always with status `200` and `Content-Type: text/plain`.
+
+Handler conventions:
+
+- The handler must be a **plain top-level function**. Closures that capture variables are rejected (the server dispatches by function-table index).
+- Request path, method, and headers are not passed to the handler — only the body. Use the `Web` effect (below) when you need routing.
+
+:::caution
+A standalone `Http.serve` program **exits when `main` returns** (the listener is leaked, but the process still dies). Block on something — `perform IO.read()` as above, or an actor mailbox — or serve from a runtime-backed program.
+:::
+
+## The `Web` Effect: Routes, HTML, and Requests
+
+For real applications, Nulang provides a routing layer. The idiomatic entry point is an `app` block, which registers routes and serves a static directory:
+
+```nulang
+import stdlib::web::html
+import stdlib::web::types
+
+fn home() -> Html {
+    document(
+        head([title("Hello Nulang Web")]),
+        body([
+            el("h1", [], [text("Hello, Nulang Web!")])
+        ])
+    )
+}
+
+app "hello" {
+    route "GET" "/" -> home
+}
+```
+
+An `app` block desugars into `perform Web.route(method, path, handler)` calls plus a `serve_static` fallback — `route "GET" "/path" -> handler` is exactly `perform Web.route("GET", "/path", handler)`. Handlers are `fn() -> Html` (for POST routes, the handler reads the request via the request-access operations below and still returns `Html`).
+
+### Building HTML
+
+The `stdlib::web::types` module defines `Html` as an **opaque type** — a compile-time distinction from `String` that erases at runtime. This is why you can't accidentally splice an unescaped string into a page:
+
+- `perform Web.html(tag: String, attrs: [(String, Html)], children: [Html]) -> Html` — build an element
+- `perform Web.text(s: String) -> Html` — escape and wrap as a text node
+- `perform Web.raw(s: String) -> Html` — wrap without escaping (trusted markup only)
+- `perform Web.redirect(url: String) -> Html` — a redirect response
+
+The `stdlib::web::html` module adds ergonomic helpers: `el`, `txt`, `attr`, `body`, `head`, `title`, `document`. It re-exports `text`, `raw`, and `redirect` from `stdlib::web::host`.
+
+:::note
+`Web.redirect` produces an HTML page with a `<meta http-equiv="refresh">` and is sent with status 200 — not an HTTP 3xx. Browsers follow it; API clients will not.
+:::
+
+### Reading the Request
+
+Inside a handler, these operations access the current request:
+
+| Operation | Signature | Notes |
+|-----------|-----------|-------|
+| `Web.param` | `param(name: String) -> String` | route parameter (`/chat/:room`) or `nil` |
+| `Web.header` | `header(name: String) -> String` | request header or `nil` |
+| `Web.cookie` | `cookie(name: String) -> String` | cookie value or `nil` |
+| `Web.read_body` | `read_body() -> String` | raw request body |
+| `Web.set_cookie` | `set_cookie(name: String, value: String) -> Unit` | add a `Set-Cookie` header |
+| `Web.clear_cookie` | `clear_cookie(name: String) -> Unit` | clear a cookie |
+
+The `stdlib::web::host` module wraps these plus a few more implemented operations: `request_method()`, `form_fields()` / `form_value(name)` for URL-encoded bodies, and an ephemeral in-memory key/value store (`kv_get`, `kv_set`, `kv_delete`, `kv_all`) handy for demos. The kv store is per-process and not persisted.
+
+:::caution
+Route parameters are **statically checked**: if a route declares `/chat/:room`, the handler must literally contain `perform Web.param("room")` or compilation fails with a route-parameter error. The check is syntactic — it does not follow calls into helper functions.
+:::
+
+## A Complete Minimal Web Server
+
+Here is a small but complete server combining routes, a path parameter, a POST form, the kv store, a redirect, and a broadcast — verified end-to-end with `nula dev`:
+
+```nulang
+import stdlib::web::html
+import stdlib::web::types
+
+fn page(page_title: String, content: [Html]) -> Html {
+    document(
+        head([title(page_title)]),
+        body(content)
+    )
+}
+
+fn home() -> Html {
+    page("Mini", [
+        el("h1", [], [text("Hello, Nulang web!")]),
+        el("form", [("method", text("POST")), ("action", text("/sign"))], [
+            el("input", [("name", text("msg")), ("type", text("text"))], []),
+            el("button", [("type", text("submit"))], [text("Sign")])
+        ])
+    ])
+}
+
+fn hello() -> Html {
+    let name = perform Web.param("name")
+    page("Hello", [el("h1", [], [text("Hello, " + name + "!")])])
+}
+
+fn sign() -> Html {
+    let msg = perform Web.form_value("msg")
+    perform Web.kv_set("last", msg)
+    perform Realtime.broadcast("signs", msg)
+    redirect("/")
+}
+
+fn last() -> Html {
+    let msg = perform Web.kv_get("last")
+    page("Last", [el("p", [], [text("Last message: " + msg)])])
+}
+
+app "mini" {
+    route "GET" "/" -> home
+    route "GET" "/hello/:name" -> hello
+    route "POST" "/sign" -> sign
+    route "GET" "/last" -> last
+}
+```
+
+With this `Nulang.toml` next to `src/main.nula`:
+
+```toml
+[package]
+name = "mini-web"
+version = "0.1.0"
+entry = "src/main.nula"
+
+[web]
+port = 8080
+static_dir = "static"
+output_dir = "dist"
+```
+
+run it with the dev server:
+
+```bash
+nulang nula dev            # serves on the [web] port (or: nula dev --port 8080)
+```
+
+`nula dev` compiles the package, starts the web server, serves each registered route dynamically, falls back to `static_dir` for unclaimed paths (e.g. `/style.css`), and injects the client runtime script into pages. Try it:
+
+```bash
+curl http://127.0.0.1:8080/hello/david      # <h1>Hello, david!</h1>
+curl -X POST -d 'msg=hi' http://127.0.0.1:8080/sign
+curl http://127.0.0.1:8080/last             # "Last message: hi"
+```
+
+:::note
+`nula run` is **not** the dev server — it compiles and runs the program once, which registers the routes and exits. Use `nula dev` (or `Http.serve`) to actually listen.
+:::
+
+## Static HTML and Static Sites
+
+Handlers that only perform `Web`/`Render` operations are **statically renderable** — the compiler can run them at build time. `nula build --web` does exactly that:
+
+```bash
+nulang nula build --web
+```
+
+It runs the route registrations, renders every route to `dist/<path>/index.html`, copies `static_dir` into `dist/`, and emits a deployment IR file (`nulang-app.ir.json`). The result is plain HTML + JS you can host on any static file server. Dynamic operations (`Web.param`, form parsing, the kv store, `Realtime.broadcast`) work under `nula dev` but render at their pattern path in a static build — e.g. `/hello/:name` becomes a literal `dist/hello/:name/index.html`.
+
+For a pure static response without the `app` machinery, `Web.text`/`Web.raw` are enough on their own — any `fn() -> Html` can be rendered by the same pipeline.
+
+## Realtime Broadcast
+
+`Realtime` currently has a single operation:
+
+- `perform Realtime.broadcast(room: String, message: String) -> Unit` — broadcast a message to all subscribers of a realtime room.
+
+Subscribers connect to the built-in Server-Sent Events endpoint `/<room-prefix>/sse/<room>` — in the dev server that is `GET /__nulang/sse/<room>`. In the server above, `perform Realtime.broadcast("signs", msg)` in the `sign` handler pushes `data: "<msg>"` events to every open SSE connection:
+
+```bash
+curl -N http://127.0.0.1:8080/__nulang/sse/signs   # in one terminal
+curl -X POST -d 'msg=live' http://127.0.0.1:8080/sign   # in another → SSE client receives it
+```
+
+The `examples/chat-web` package shows the full pattern: an SSE `<script>` in the page, a POST handler that stores and broadcasts, and a `redirect` back. Treat this layer as minimal — one broadcast op, one SSE transport, in-process delivery.
+
+## Deployment
+
+Two paths, depending on what your app does:
+
+- **Dynamic server** (uses request data, forms, kv store, broadcast): run the native runtime — `nulang --with net server.nula` for `Http.serve`-style programs, or ship the package and run `nulang nula dev` (the dev server is currently the runtime host for `Web`-routed apps). Native runtime required.
+- **Static site** (render-only handlers): `nulang nula build --web` and deploy `dist/` to any static host.
+
+:::caution
+The WASM backends (`--backend wasm`, `wasm-run`, `wasm-aot`, and `nula build-wasm`) are **not** a deployment target for web servers: they support `IO.print`/`IO.read` only — no user-defined effect handlers, and no `Http`/`Web`/`Realtime` host. WASM output is for compute-only programs today; serve on the native runtime.
+:::
+
+## Next
+
+- [Actor Model](/actors/overview/) — the actor runtime that web requests dispatch into
+- [Http Effect](/stdlib/http/) — the auto-generated operation reference
+- [Distribution & Clustering](/actors/distribution/) — take a served actor system multi-node

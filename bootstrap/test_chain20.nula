@@ -1,0 +1,23 @@
+fn main() -> Int {
+    let a0 = 0 in
+    let a1 = 1 in
+    let a2 = 2 in
+    let a3 = 3 in
+    let a4 = 4 in
+    let a5 = 5 in
+    let a6 = 6 in
+    let a7 = 7 in
+    let a8 = 8 in
+    let a9 = 9 in
+    let a10 = 10 in
+    let a11 = 11 in
+    let a12 = 12 in
+    let a13 = 13 in
+    let a14 = 14 in
+    let a15 = 15 in
+    let a16 = 16 in
+    let a17 = 17 in
+    let a18 = 18 in
+    let a19 = 19 in
+    a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13 + a14 + a15 + a16 + a17 + a18 + a19
+}

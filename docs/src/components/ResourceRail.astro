@@ -1,0 +1,124 @@
+---
+const resources = [
+  {
+    label: 'Documentation',
+    detail: 'Installation, syntax, types, effects, and the standard library.',
+    href: '/getting-started/installation/',
+    meta: 'Start here',
+  },
+  {
+    label: 'Tutorial',
+    detail: 'Build a Nulang program step by step.',
+    href: '/tutorial/',
+    meta: 'Learn',
+  },
+  {
+    label: 'GitHub',
+    detail: 'Inspect the compiler, runtime, RFCs, tests, and open issues.',
+    href: 'https://github.com/nulang-org/nulang',
+    meta: 'Contribute',
+    external: true,
+  },
+  {
+    label: 'Nulang Cloud',
+    detail: 'Managed runtime, deployment, and platform tooling.',
+    href: 'https://www.nulang.cloud',
+    meta: 'Platform',
+    external: true,
+  },
+];
+---
+
+<div class="resource-rail" role="list" aria-label="Nulang resources">
+  {resources.map((resource) => (
+    <a
+      class="resource-row"
+      href={resource.href}
+      role="listitem"
+      target={resource.external ? '_blank' : undefined}
+      rel={resource.external ? 'noopener noreferrer' : undefined}
+    >
+      <span class="resource-meta">{resource.meta}</span>
+      <span class="resource-copy">
+        <strong>{resource.label}</strong>
+        <span>{resource.detail}</span>
+      </span>
+      <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
+      </svg>
+    </a>
+  ))}
+</div>
+
+<style>
+  .resource-rail {
+    border-top: 1px solid var(--nu-border);
+    border-bottom: 1px solid var(--nu-border);
+  }
+
+  .resource-row {
+    display: grid;
+    grid-template-columns: 7rem minmax(0, 1fr) auto;
+    gap: 1rem;
+    align-items: center;
+    padding: 1.15rem 0.25rem;
+    color: var(--nu-text);
+    text-decoration: none;
+  }
+
+  .resource-row + .resource-row {
+    border-top: 1px solid var(--nu-border-subtle);
+  }
+
+  .resource-row:hover {
+    padding-inline: 0.75rem;
+    background: color-mix(in srgb, var(--nu-blue) 4%, transparent);
+    text-decoration: none;
+  }
+
+  .resource-meta {
+    color: var(--nu-blue);
+    font-size: 0.67rem;
+    font-weight: 750;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .resource-copy {
+    display: grid;
+    gap: 0.15rem;
+    min-width: 0;
+  }
+
+  .resource-copy strong {
+    font-size: 0.95rem;
+  }
+
+  .resource-copy > span {
+    color: var(--nu-text-secondary);
+    font-size: 0.82rem;
+    line-height: 1.45;
+  }
+
+  .resource-row svg {
+    width: 1rem;
+    height: 1rem;
+    color: var(--nu-text-tertiary);
+    transition: transform 0.18s ease, color 0.18s ease;
+  }
+
+  .resource-row:hover svg {
+    transform: translateX(4px);
+    color: var(--nu-accent-high);
+  }
+
+  @media (max-width: 40rem) {
+    .resource-row {
+      grid-template-columns: 1fr auto;
+    }
+
+    .resource-meta {
+      grid-column: 1 / -1;
+    }
+  }
+</style>

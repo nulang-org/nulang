@@ -43,6 +43,18 @@ use std::time::{Duration, Instant};
 // Imports from sibling modules in the runtime
 // ---------------------------------------------------------------------------
 
+use super::fabric_stream_cluster::{
+    FabricStreamCommitUpdate, FabricStreamReplicaAck, FabricStreamReplicaAppend,
+    FABRIC_STREAM_COMMIT_BEHAVIOR, FABRIC_STREAM_REPLICA_ACK_BEHAVIOR,
+    FABRIC_STREAM_REPLICA_BEHAVIOR,
+};
+use super::fabric_stream_epoch::{
+    FabricStreamEpochCommit, FabricStreamEpochPrepare, FabricStreamEpochPullRequest,
+    FabricStreamEpochPullResponse, FabricStreamEpochRepairBatch, FabricStreamEpochVote,
+    FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR, FABRIC_STREAM_EPOCH_PREPARE_BEHAVIOR,
+    FABRIC_STREAM_EPOCH_PULL_REQUEST_BEHAVIOR, FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR,
+    FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR, FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR,
+};
 use super::mailbox::{Message, MessagePriority};
 use super::network::{NetworkTransport, Packet};
 use super::{ClusterState, NodeId, NodeStatus};
@@ -492,10 +504,42 @@ impl AddressResolver {
         content_hash: Option<[u8; 32]>,
         trace_id: Option<String>,
     ) -> Packet {
+        self.build_packet_with_required_protocol(
+            target_actor,
+            behavior_name,
+            payload,
+            sender_actor,
+            priority,
+            string_table,
+            object_table,
+            content_hash,
+            trace_id,
+            None,
+        )
+    }
+
+    /// Build a remote actor message carrying the protocol contract required by
+    /// the sender/client. Existing callers keep using `build_packet`, which
+    /// emits the historical NUL0-v1 payload with no protocol tail.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_packet_with_required_protocol(
+        &self,
+        target_actor: u64,
+        behavior_name: &str,
+        payload: Vec<Value>,
+        sender_actor: u64,
+        priority: MessagePriority,
+        string_table: Vec<String>,
+        object_table: Vec<(u64, Vec<u8>)>,
+        content_hash: Option<[u8; 32]>,
+        trace_id: Option<String>,
+        required_protocol_id: Option<crate::protocol::ProtocolId>,
+    ) -> Packet {
         Packet::ActorMessage {
             target_actor,
             behavior_name: behavior_name.to_string(),
             content_hash,
+            required_protocol_id,
             payload,
             string_table,
             object_table,
@@ -505,9 +549,11 @@ impl AddressResolver {
             trace_id,
         }
     }
+
     /// Parse a received network packet into a message for local delivery.
     ///
-    /// Returns `Some((target_actor_id, behavior_name, message, string_table, content_hash))`
+    /// Returns the local target, behavior/message payload tables, optional
+    /// behavior content hash, and optional sender-required protocol identity.
     /// if the packet is an actor message that should be delivered locally.
     /// The message's `behavior_id` is left as `0` — the caller must resolve
     /// `behavior_name` against the target actor's behavior table before
@@ -530,12 +576,14 @@ impl AddressResolver {
         Vec<String>,
         Vec<(u64, Vec<u8>)>,
         Option<[u8; 32]>,
+        Option<crate::protocol::ProtocolId>,
     )> {
         match packet {
             Packet::ActorMessage {
                 target_actor,
                 behavior_name,
                 content_hash,
+                required_protocol_id,
                 payload,
                 string_table,
                 object_table,
@@ -562,6 +610,7 @@ impl AddressResolver {
                     string_table,
                     object_table,
                     content_hash,
+                    required_protocol_id,
                 ))
             }
             // Non-actor-message packets are not parsed here.
@@ -934,6 +983,21 @@ fn verify_behavior_hash(
     }
 }
 
+/* Resolve a behavior name only when the currently installed implementation
+ * satisfies the sender's content-hash contract.  Hot reload/fetch paths must
+ * use this helper instead of resolving the name and trusting the cache key:
+ * a cached module can be malformed or stale and may not actually contain the
+ * requested implementation hash. */
+fn resolve_verified_behavior(
+    runtime: &Runtime,
+    target_actor: u64,
+    behavior_name: &str,
+    sender_hash: &[u8; 32],
+) -> Option<u16> {
+    let behavior_id = runtime.behavior_id_for(target_actor, behavior_name)?;
+    verify_behavior_hash(runtime, target_actor, behavior_id, sender_hash).then_some(behavior_id)
+}
+
 /// Try to look up the content hash for a behavior name in the current
 /// actor's bytecode module. Returns `None` if no current actor context,
 /// no bytecode module, or the behavior has no content hash.
@@ -1007,13 +1071,32 @@ pub fn process_network_packets(
                 }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
-            Packet::Gossip { members, directory } => {
+            Packet::Gossip {
+                members,
+                directory,
+                fabric,
+            } => {
                 cluster.merge_membership_from_sender(members, incoming.from_node);
                 if !directory.is_empty() {
                     cluster.merge_directory(directory);
                     // A re-joined node may have been replaced while away:
                     // demote any local actor whose directory epoch is newer.
                     runtime.self_demote_superseded();
+                }
+                if let Some(snapshot) = fabric {
+                    if snapshot.node_id != incoming.from_node {
+                        warn!(
+                            "nulang-fabric: rejecting gossip snapshot for {:?} sent by {:?}",
+                            snapshot.node_id, incoming.from_node
+                        );
+                    } else if let Err(error) =
+                        runtime.fabric_replace_remote_advertisements(snapshot)
+                    {
+                        warn!(
+                            "nulang-fabric: rejecting gossip snapshot from {:?}: {}",
+                            incoming.from_node, error
+                        );
+                    }
                 }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
@@ -1126,10 +1209,12 @@ pub fn process_network_packets(
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
             Packet::CrdtSync { ops } => {
-                if let Some(manager) = &mut runtime.crdt_manager {
+                if let Some(mut manager) = runtime.crdt_manager.take() {
                     for op in ops.iter() {
                         manager.apply_op(op.clone());
                     }
+                    manager.push_to_actors(runtime);
+                    runtime.crdt_manager = Some(manager);
                 }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
@@ -1137,10 +1222,12 @@ pub fn process_network_packets(
                 // Delta ops merge into entries this node already holds;
                 // full-state-tagged ops behave exactly like CrdtSync above
                 // (including entry creation on first sight).
-                if let Some(manager) = &mut runtime.crdt_manager {
+                if let Some(mut manager) = runtime.crdt_manager.take() {
                     for op in ops.iter() {
                         manager.apply_delta_op(op.clone());
                     }
+                    manager.push_to_actors(runtime);
+                    runtime.crdt_manager = Some(manager);
                 }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
@@ -1237,24 +1324,24 @@ pub fn process_network_packets(
                                         &cached,
                                         &behavior_name,
                                     );
-                                    // Resolve behavior_id against the updated module
-                                    msg.behavior_id = runtime
-                                        .behavior_id_for(target_actor, &behavior_name)
-                                        .unwrap_or(0);
-                                    // Verify the hash now matches
-                                    if !verify_behavior_hash(
+                                    // Resolve and verify against the requested hash.
+                                    // A successful fetch that lacks the requested name OR
+                                    // installs a stale/malformed implementation is a failed
+                                    // delivery, never permission to run behavior 0.
+                                    let Some(behavior_id) = resolve_verified_behavior(
                                         runtime,
                                         target_actor,
-                                        msg.behavior_id,
+                                        &behavior_name,
                                         &content_hash,
-                                    ) {
+                                    ) else {
                                         notify_delivery_failed(
                                             runtime,
                                             msg.sender,
-                                            "behavior content hash still mismatched after fetch",
+                                            "behavior missing or content hash mismatched after fetch",
                                         );
                                         continue;
-                                    }
+                                    };
+                                    msg.behavior_id = behavior_id;
                                     // Intern string and object payloads, then deliver
                                     let mut payload_vec = (*msg.payload).clone();
                                     if !intern_wire_strings(
@@ -1326,8 +1413,10 @@ pub fn process_network_packets(
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
             Packet::CrdtOp { op } => {
-                if let Some(manager) = &mut runtime.crdt_manager {
+                if let Some(mut manager) = runtime.crdt_manager.take() {
                     manager.apply_op(op);
+                    manager.push_to_actors(runtime);
+                    runtime.crdt_manager = Some(manager);
                 }
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
@@ -1434,6 +1523,625 @@ pub fn process_network_packets(
                 runtime.store_shadow_replica(actor_id, nbc_bytes, snapshot_json, epoch);
                 ack_packet(transport, cluster, incoming.from_node, incoming.seq);
             }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_REPLICA_BEHAVIOR => {
+                let mut application_ack = None;
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric stream replica sender identity does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamReplicaAppend::from_wire_bytes(bytes)
+                            .and_then(|append| {
+                                if append.leader != incoming.from_node {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        "Fabric stream replica envelope leader does not match transport peer",
+                                    ));
+                                }
+                                let apply =
+                                    runtime.fabric_stream_apply_replica_from_cluster(&append, cluster);
+                                if let Some(replica) = runtime.distributed.node_id {
+                                    application_ack = Some(FabricStreamReplicaAck {
+                                        stream: append.stream.clone(),
+                                        partition: append.partition,
+                                        epoch: append.epoch,
+                                        leader: append.leader,
+                                        membership_fingerprint: append.membership_fingerprint,
+                                        replication_factor: append.replication_factor,
+                                        sequence: append.sequence,
+                                        replica,
+                                        accepted: apply.is_ok(),
+                                    });
+                                }
+                                apply
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric stream replica system message must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+
+                if let Err(error) = &result {
+                    warn!(
+                        "nulang-fabric-stream: rejected replica append from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+
+                // Application-level ACK/NACK is separate from the transport
+                // ACK below. It is emitted only after the follower has tried
+                // exact-sequence durable application.
+                if let Some(application_ack) = application_ack {
+                    if let Ok(bytes) = application_ack.to_wire_bytes() {
+                        let address = cluster
+                            .get_node(application_ack.leader)
+                            .map(|info| info.address)
+                            .or_else(|| transport.connection_addr(application_ack.leader));
+                        if let Some(address) = address {
+                            let packet = Packet::ActorMessage {
+                                target_actor: 0,
+                                behavior_name: FABRIC_STREAM_REPLICA_ACK_BEHAVIOR.to_string(),
+                                content_hash: None,
+                                required_protocol_id: None,
+                                payload: Vec::new(),
+                                string_table: Vec::new(),
+                                object_table: vec![(0, bytes)],
+                                sender_actor: 0,
+                                sender_node: application_ack.replica,
+                                priority: MessagePriority::System,
+                                trace_id: None,
+                            };
+                            transport.send(application_ack.leader, address, packet);
+                        }
+                    }
+                }
+
+                // Existing transport-level receipt acknowledgement. Quorum
+                // logic never counts this packet.
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_REPLICA_ACK_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric stream replica ACK sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamReplicaAck::from_wire_bytes(bytes)
+                            .and_then(|ack| {
+                                if ack.replica != incoming.from_node {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        "Fabric stream replica ACK identity mismatch",
+                                    ));
+                                }
+
+                                let accepted = ack.accepted;
+                                let stream = ack.stream.clone();
+                                let outcome =
+                                    runtime.fabric_stream_record_replica_ack_from_cluster(
+                                        ack, cluster,
+                                    )?;
+
+                                if accepted && outcome.committed_sequence > 0 {
+                                    for replica in outcome
+                                        .placement
+                                        .replicas
+                                        .iter()
+                                        .copied()
+                                        .filter(|node| *node != outcome.placement.leader)
+                                    {
+                                        let progress = runtime
+                                            .fabric_stream_replica_progress(&stream, replica.0)?;
+                                        if progress < outcome.committed_sequence {
+                                            continue;
+                                        }
+                                        let address = cluster
+                                            .get_node(replica)
+                                            .filter(|info| {
+                                                matches!(
+                                                    info.status,
+                                                    NodeStatus::Healthy | NodeStatus::Joining
+                                                )
+                                            })
+                                            .map(|info| info.address);
+                                        let Some(address) = address else {
+                                            continue;
+                                        };
+                                        let update = FabricStreamCommitUpdate {
+                                            stream: outcome.placement.stream.clone(),
+                                            partition: outcome.placement.partition,
+                                            epoch: outcome.epoch,
+                                            leader: outcome.placement.leader,
+                                            membership_fingerprint: outcome
+                                                .placement
+                                                .membership_fingerprint,
+                                            replication_factor: outcome.placement.replicas.len(),
+                                            committed_sequence: outcome.committed_sequence,
+                                        };
+                                        let update_bytes = update.to_wire_bytes()?;
+                                        transport.send(
+                                            replica,
+                                            address,
+                                            Packet::ActorMessage {
+                                                target_actor: 0,
+                                                behavior_name:
+                                                    FABRIC_STREAM_COMMIT_BEHAVIOR.to_string(),
+                                                content_hash: None,
+                                                required_protocol_id: None,
+                                                payload: Vec::new(),
+                                                string_table: Vec::new(),
+                                                object_table: vec![(0, update_bytes)],
+                                                sender_actor: 0,
+                                                sender_node: outcome.placement.leader,
+                                                priority: MessagePriority::System,
+                                                trace_id: None,
+                                            },
+                                        );
+                                    }
+                                }
+                                Ok(())
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric stream replica ACK must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected replica ACK from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_COMMIT_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric stream commit-update sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamCommitUpdate::from_wire_bytes(bytes)
+                            .and_then(|update| {
+                                if update.leader != incoming.from_node {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        "Fabric stream commit-update leader does not match transport peer",
+                                    ));
+                                }
+                                runtime
+                                    .fabric_stream_apply_commit_update_from_cluster(
+                                        &update, cluster,
+                                    )
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric stream commit update must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected commit update from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_EPOCH_PREPARE_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric epoch prepare sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamEpochPrepare::from_wire_bytes(bytes)
+                            .and_then(|prepare| {
+                                let vote = runtime.fabric_stream_evaluate_epoch_prepare(
+                                    &prepare.stream,
+                                    &prepare.proposal,
+                                    incoming.from_node,
+                                    cluster,
+                                )?;
+                                let response = FabricStreamEpochVote {
+                                    stream: prepare.stream,
+                                    vote,
+                                };
+                                let response_bytes = response.to_wire_bytes()?;
+                                let candidate = NodeId(prepare.proposal.to_policy.leader);
+                                let address = cluster
+                                    .get_node(candidate)
+                                    .map(|info| info.address)
+                                    .or_else(|| transport.connection_addr(candidate))
+                                    .ok_or_else(|| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::NotConnected,
+                                            "Fabric epoch candidate address is unavailable",
+                                        )
+                                    })?;
+                                let local = runtime.distributed.node_id.ok_or_else(|| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "Fabric epoch voter has no local NodeId",
+                                    )
+                                })?;
+                                transport.send(
+                                    candidate,
+                                    address,
+                                    Packet::ActorMessage {
+                                        target_actor: 0,
+                                        behavior_name:
+                                            FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR.to_string(),
+                                        content_hash: None,
+                                        required_protocol_id: None,
+                                        payload: Vec::new(),
+                                        string_table: Vec::new(),
+                                        object_table: vec![(0, response_bytes)],
+                                        sender_actor: 0,
+                                        sender_node: local,
+                                        priority: MessagePriority::System,
+                                        trace_id: None,
+                                    },
+                                );
+                                Ok(())
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric epoch prepare must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected epoch prepare from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_EPOCH_PULL_REQUEST_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric epoch pull-request sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamEpochPullRequest::from_wire_bytes(bytes)
+                            .and_then(|request| {
+                                let response = runtime
+                                    .fabric_stream_build_epoch_pull_response(
+                                        &request,
+                                        incoming.from_node,
+                                        cluster,
+                                    )?;
+                                let response_bytes = response.to_wire_bytes()?;
+                                let requester = NodeId(response.requester);
+                                let address = cluster
+                                    .get_node(requester)
+                                    .map(|info| info.address)
+                                    .or_else(|| transport.connection_addr(requester))
+                                    .ok_or_else(|| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::NotConnected,
+                                            "Fabric epoch pull requester address is unavailable",
+                                        )
+                                    })?;
+                                let local = runtime.distributed.node_id.ok_or_else(|| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "Fabric epoch pull source has no local NodeId",
+                                    )
+                                })?;
+                                transport.send(
+                                    requester,
+                                    address,
+                                    Packet::ActorMessage {
+                                        target_actor: 0,
+                                        behavior_name:
+                                            FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR.to_string(),
+                                        content_hash: None,
+                                        required_protocol_id: None,
+                                        payload: Vec::new(),
+                                        string_table: Vec::new(),
+                                        object_table: vec![(0, response_bytes)],
+                                        sender_actor: 0,
+                                        sender_node: local,
+                                        priority: MessagePriority::System,
+                                        trace_id: None,
+                                    },
+                                );
+                                Ok(())
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric epoch pull request must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected epoch pull request from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_EPOCH_PULL_RESPONSE_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric epoch pull-response sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamEpochPullResponse::from_wire_bytes(bytes)
+                            .and_then(|response| {
+                                runtime
+                                    .fabric_stream_apply_epoch_pull_response(
+                                        &response,
+                                        incoming.from_node,
+                                        cluster,
+                                    )
+                                    .map(|_| ())
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric epoch pull response must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected epoch pull response from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_EPOCH_REPAIR_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric epoch repair sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamEpochRepairBatch::from_wire_bytes(bytes)
+                            .and_then(|batch| {
+                                let vote = runtime.fabric_stream_apply_epoch_repair_from_cluster(
+                                    &batch,
+                                    incoming.from_node,
+                                    cluster,
+                                )?;
+                                let response = FabricStreamEpochVote {
+                                    stream: batch.stream,
+                                    vote,
+                                };
+                                let response_bytes = response.to_wire_bytes()?;
+                                let candidate = NodeId(batch.proposal.to_policy.leader);
+                                let address = cluster
+                                    .get_node(candidate)
+                                    .map(|info| info.address)
+                                    .or_else(|| transport.connection_addr(candidate))
+                                    .ok_or_else(|| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::NotConnected,
+                                            "Fabric epoch candidate address is unavailable",
+                                        )
+                                    })?;
+                                let local = runtime.distributed.node_id.ok_or_else(|| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "Fabric epoch repair target has no local NodeId",
+                                    )
+                                })?;
+                                transport.send(
+                                    candidate,
+                                    address,
+                                    Packet::ActorMessage {
+                                        target_actor: 0,
+                                        behavior_name:
+                                            FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR.to_string(),
+                                        content_hash: None,
+                                        required_protocol_id: None,
+                                        payload: Vec::new(),
+                                        string_table: Vec::new(),
+                                        object_table: vec![(0, response_bytes)],
+                                        sender_actor: 0,
+                                        sender_node: local,
+                                        priority: MessagePriority::System,
+                                        trace_id: None,
+                                    },
+                                );
+                                Ok(())
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric epoch repair must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected epoch repair from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_EPOCH_VOTE_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric epoch vote sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamEpochVote::from_wire_bytes(bytes)
+                            .and_then(|vote| {
+                                let outcome = runtime
+                                    .fabric_stream_record_epoch_vote_from_cluster(
+                                        vote,
+                                        incoming.from_node,
+                                    )?;
+                                if let Some(commit) = outcome.commit {
+                                    let commit_bytes = commit.to_wire_bytes()?;
+                                    let local = runtime.distributed.node_id.ok_or_else(|| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::NotConnected,
+                                            "Fabric epoch candidate has no local NodeId",
+                                        )
+                                    })?;
+                                    for replica in &commit.proposal.to_policy.replicas {
+                                        let replica = NodeId(*replica);
+                                        if replica == local {
+                                            continue;
+                                        }
+                                        let Some(address) = cluster
+                                            .get_node(replica)
+                                            .filter(|info| {
+                                                matches!(
+                                                    info.status,
+                                                    NodeStatus::Healthy | NodeStatus::Joining
+                                                )
+                                            })
+                                            .map(|info| info.address)
+                                        else {
+                                            continue;
+                                        };
+                                        transport.send(
+                                            replica,
+                                            address,
+                                            Packet::ActorMessage {
+                                                target_actor: 0,
+                                                behavior_name:
+                                                    FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR
+                                                        .to_string(),
+                                                content_hash: None,
+                                                required_protocol_id: None,
+                                                payload: Vec::new(),
+                                                string_table: Vec::new(),
+                                                object_table: vec![(
+                                                    0,
+                                                    commit_bytes.clone(),
+                                                )],
+                                                sender_actor: 0,
+                                                sender_node: local,
+                                                priority: MessagePriority::System,
+                                                trace_id: None,
+                                            },
+                                        );
+                                    }
+                                }
+                                Ok(())
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric epoch vote must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected epoch vote from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
+            Packet::ActorMessage {
+                target_actor: 0,
+                behavior_name,
+                object_table,
+                sender_node,
+                ..
+            } if behavior_name == FABRIC_STREAM_EPOCH_COMMIT_BEHAVIOR => {
+                let result = if sender_node != incoming.from_node {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Fabric epoch commit sender does not match transport peer",
+                    ))
+                } else {
+                    match object_table.as_slice() {
+                        [(0, bytes)] => FabricStreamEpochCommit::from_wire_bytes(bytes)
+                            .and_then(|commit| {
+                                runtime.fabric_stream_apply_epoch_commit_from_cluster(
+                                    &commit,
+                                    incoming.from_node,
+                                    cluster,
+                                )
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Fabric epoch commit must contain exactly one object-table entry with id 0",
+                        )),
+                    }
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "nulang-fabric-stream: rejected epoch commit from {:?}: {}",
+                        incoming.from_node, error
+                    );
+                }
+                ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+            }
             _ => {
                 if let Some((
                     target_actor,
@@ -1442,6 +2150,7 @@ pub fn process_network_packets(
                     string_table,
                     object_table,
                     content_hash,
+                    _required_protocol_id,
                 )) = resolver.parse_packet(incoming.packet)
                 {
                     // Record the wire sender (bare id → node) so the
@@ -1458,13 +2167,23 @@ pub fn process_network_packets(
                         );
                     }
                     // Resolve the behavior name against the target actor's
-                    // behavior table — the same rule local sends use
-                    // (`Runtime::send_message`). An unknown name falls back
-                    // to behavior 0, mirroring `send_message`'s
-                    // `unwrap_or(0)`.
-                    msg.behavior_id = runtime
-                        .behavior_id_for(target_actor, &behavior_name)
-                        .unwrap_or(0);
+                    // behavior table. Unknown names must never alias behavior 0.
+                    // If the sender attached a content hash, keep fetch-on-demand
+                    // viable with an invalid sentinel until the hash path loads the
+                    // missing implementation; the sentinel is never delivered.
+                    match runtime.behavior_id_for_delivery(target_actor, &behavior_name) {
+                        Some(behavior_id) => msg.behavior_id = behavior_id,
+                        None if content_hash.is_some() => msg.behavior_id = u16::MAX,
+                        None => {
+                            warn!(
+                                "nulang-net: rejecting message to actor {}: unknown behavior '{}'",
+                                target_actor, behavior_name
+                            );
+                            notify_delivery_failed(runtime, msg.sender, "unknown behavior");
+                            ack_packet(transport, cluster, incoming.from_node, incoming.seq);
+                            continue;
+                        }
+                    }
                     // If the sender attached a content hash, verify it
                     // against the local behavior table.
                     if let Some(sender_hash) = content_hash {
@@ -1479,10 +2198,29 @@ pub fn process_network_packets(
                             if let Some(cached) = cached_module {
                                 // Hot-reload: install the cached module
                                 hot_reload_behavior(runtime, target_actor, &cached, &behavior_name);
-                                // Retry resolution after hot-reload
-                                msg.behavior_id = runtime
-                                    .behavior_id_for(target_actor, &behavior_name)
-                                    .unwrap_or(0);
+                                // Re-resolve AND re-verify after hot reload.  The
+                                // cache key alone is not evidence that the installed
+                                // module actually contains the requested implementation.
+                                let Some(behavior_id) = resolve_verified_behavior(
+                                    runtime,
+                                    target_actor,
+                                    &behavior_name,
+                                    &sender_hash,
+                                ) else {
+                                    notify_delivery_failed(
+                                        runtime,
+                                        msg.sender,
+                                        "behavior missing or content hash mismatched after hot reload",
+                                    );
+                                    ack_packet(
+                                        transport,
+                                        cluster,
+                                        incoming.from_node,
+                                        incoming.seq,
+                                    );
+                                    continue;
+                                };
+                                msg.behavior_id = behavior_id;
                             } else {
                                 // Request the bytecode from the sender
                                 warn!(
@@ -1537,6 +2275,7 @@ pub fn process_network_packets(
                             msg.sender,
                             "string intern failed on receiver",
                         );
+                        continue;
                     }
                     if !intern_wire_objects(runtime, &mut payload_vec, &object_table) {
                         warn!(
@@ -1548,6 +2287,7 @@ pub fn process_network_packets(
                             msg.sender,
                             "object intern failed on receiver",
                         );
+                        continue;
                     }
                     msg.payload = Arc::new(payload_vec);
                     if let Some(actor) = runtime.actors.get_mut(&target_actor) {
@@ -1907,6 +2647,62 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+    #[test]
+    fn test_resolve_verified_behavior_rejects_mismatched_hot_reload_hash() {
+        use crate::bytecode::{BehaviorTableEntry, CodeModule};
+
+        let mut runtime = Runtime::new();
+        let actor_id = runtime.spawn_actor(Box::new(Vec::new));
+
+        let module_with_hash = |hash: [u8; 32]| {
+            let mut module = CodeModule::new("hash-verification");
+            module.behaviors.push(BehaviorTableEntry {
+                name: "store".to_string(),
+                param_count: 0,
+                code_offset: 0,
+                local_count: 0,
+                effect_mask: 0,
+                compensate_offset: None,
+                content_hash: Some(hash),
+                source_location: None,
+                parallel_branches: None,
+            });
+            module
+        };
+
+        {
+            let actor = runtime.actors.get_mut(&actor_id).unwrap();
+            actor.bytecode_module = Some(module_with_hash([0xAA; 32]));
+            actor.bytecode_offsets = vec![0];
+        }
+
+        let requested_hash = [0xCC; 32];
+        hot_reload_behavior(
+            &mut runtime,
+            actor_id,
+            &module_with_hash([0xBB; 32]),
+            "store",
+        );
+
+        assert_eq!(
+            resolve_verified_behavior(&runtime, actor_id, "store", &requested_hash),
+            None,
+            "a cached module must not be trusted merely because it was stored under the requested hash"
+        );
+
+        hot_reload_behavior(
+            &mut runtime,
+            actor_id,
+            &module_with_hash(requested_hash),
+            "store",
+        );
+        assert_eq!(
+            resolve_verified_behavior(&runtime, actor_id, "store", &requested_hash),
+            Some(0),
+            "matching reloaded behavior should remain deliverable"
+        );
+    }
+
     /// Helper: create a loopback address on a given port.
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
@@ -2189,6 +2985,7 @@ mod tests {
                 target_actor,
                 behavior_name,
                 content_hash,
+                required_protocol_id,
                 payload,
                 string_table,
                 sender_actor,
@@ -2200,6 +2997,7 @@ mod tests {
                 assert_eq!(target_actor, 42);
                 assert_eq!(behavior_name, "handle_msg");
                 assert_eq!(content_hash, None);
+                assert_eq!(required_protocol_id, None);
                 assert_eq!(sender_actor, 100);
                 assert_eq!(sender_node.0, local_node.0); // Same underlying u64
                 assert_eq!(priority, MessagePriority::Normal);
@@ -2207,6 +3005,35 @@ mod tests {
                 assert_eq!(string_table, vec!["hello".to_string()]);
                 assert_eq!(trace_id.as_deref(), Some(trace));
             }
+            other => panic!("expected ActorMessage packet, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_packet_with_required_protocol_preserves_typed_contract() {
+        let local_addr = addr(9000);
+        let local_node = NodeId::new(&local_addr);
+        let resolver = AddressResolver::new(local_node);
+        let required = crate::protocol::ProtocolId::from_bytes([0x5A; 32]);
+
+        let packet = resolver.build_packet_with_required_protocol(
+            42,
+            "handle_msg",
+            vec![Value::int(1)],
+            100,
+            MessagePriority::Normal,
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(required),
+        );
+
+        match packet {
+            Packet::ActorMessage {
+                required_protocol_id,
+                ..
+            } => assert_eq!(required_protocol_id, Some(required)),
             other => panic!("expected ActorMessage packet, got {:?}", other),
         }
     }
@@ -2223,6 +3050,7 @@ mod tests {
             target_actor: 77,
             behavior_name: "inc".to_string(),
             content_hash: None,
+            required_protocol_id: None,
             payload: vec![Value::int(123)],
             string_table: vec![],
             object_table: vec![],
@@ -2234,11 +3062,19 @@ mod tests {
         let result = resolver.parse_packet(packet);
         assert!(result.is_some());
 
-        let (target, behavior_name, msg, string_table, _object_table, content_hash) =
-            result.unwrap();
+        let (
+            target,
+            behavior_name,
+            msg,
+            string_table,
+            _object_table,
+            content_hash,
+            required_protocol_id,
+        ) = result.unwrap();
         assert_eq!(target, 77);
         assert_eq!(behavior_name, "inc");
         assert_eq!(content_hash, None);
+        assert_eq!(required_protocol_id, None);
         // behavior_id is resolved at delivery, not parse time.
         assert_eq!(msg.behavior_id, 0);
         assert_eq!(msg.sender, 88);
@@ -2474,8 +3310,8 @@ mod tests {
             "remote send must dispatch the named behavior \"inc\""
         );
 
-        // Unknown behavior name: falls back to behavior 0, mirroring
-        // `Runtime::send_message`'s `unwrap_or(0)` for local sends.
+        // Unknown behavior name: reject it without enqueueing or executing
+        // any target handler.
         send_distributed(
             &mut runtime_a,
             &mut transport_a,
@@ -2500,8 +3336,8 @@ mod tests {
             .and_then(|v| v.as_int())
             .unwrap();
         assert_eq!(
-            count, 4,
-            "unknown behavior name must fall back to behavior 0 (\"dec\")"
+            count, 5,
+            "unknown behavior name must leave target state unchanged"
         );
 
         transport_a.shutdown();
@@ -2760,6 +3596,99 @@ mod tests {
             content,
             Some("hello-cross-node".to_string()),
             "string payload must arrive by CONTENT, not by the sender's pool id"
+        );
+
+        transport_a.shutdown();
+        transport_b.shutdown();
+    }
+
+    #[cfg(feature = "tcp")]
+    /// Regression: a string payload addressed to an actor with NO module
+    /// pool (native handlers only) must be DROPPED, not delivered with
+    /// dangling pool ids. `intern_wire_strings` fails for such actors; the
+    /// receipt path must not fall through and deliver the un-interned
+    /// payload (which would resolve to the wrong string, or worse, read
+    /// out of bounds).
+    #[test]
+    fn test_remote_string_payload_dropped_without_module_pool() {
+        use crate::bytecode::{CodeModule, Constant};
+        use std::time::{Duration, Instant};
+
+        // --- Node A (sender): pool id 0 = "hello-cross-node". ---
+        let mut runtime_a = Runtime::new();
+        let mut module_a = CodeModule::new("sender");
+        module_a.add_constant(Constant::String("hello-cross-node".to_string()));
+        runtime_a.vm = Some(crate::vm::VM::new());
+        runtime_a.vm.as_mut().unwrap().load_module(module_a);
+        let actor_a = runtime_a.spawn_actor(Box::new(|| vec![]));
+        {
+            let actor = runtime_a.actors.get_mut(&actor_a).unwrap();
+            actor.bytecode_module_idx = Some(0);
+        }
+        runtime_a.current_actor = Some(actor_a);
+
+        // --- Node B (receiver): native handler, NO bytecode module. ---
+        let mut runtime_b = Runtime::new();
+        let actor_b =
+            runtime_b.spawn_actor(Box::new(|| vec![("received".to_string(), Value::nil())]));
+        {
+            let actor = runtime_b.actors.get_mut(&actor_b).unwrap();
+            // Deliberately NO bytecode_module: intern_wire_strings must fail.
+            actor.register_behavior("store", |actor, args| {
+                let v = args.get(0).copied().unwrap_or(Value::nil());
+                actor.set_state_field("received", v);
+            });
+        }
+
+        let mut transport_a = crate::runtime::network::TcpTransport::bind(
+            addr(0),
+            crate::runtime::network::TlsConfig::PlaintextInsecure,
+        )
+        .unwrap();
+        let mut transport_b = crate::runtime::network::TcpTransport::bind(
+            addr(0),
+            crate::runtime::network::TlsConfig::PlaintextInsecure,
+        )
+        .unwrap();
+        let node_b = transport_b.node_id();
+        let addr_b = transport_b.listen_addr();
+
+        let mut cluster_a = ClusterState::new(transport_a.node_id(), transport_a.listen_addr());
+        cluster_a.handle_heartbeat(node_b, addr_b);
+        let mut resolver_a = AddressResolver::new(transport_a.node_id());
+
+        let mut cluster_b = ClusterState::new(node_b, addr_b);
+        let mut resolver_b = AddressResolver::new(node_b);
+
+        let target = ActorAddress::remote(node_b, actor_b);
+        send_distributed(
+            &mut runtime_a,
+            &mut transport_a,
+            &mut cluster_a,
+            &mut resolver_a,
+            target,
+            "store",
+            &[Value::string(0)],
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            process_network_packets(
+                &mut runtime_b,
+                &mut transport_b,
+                &mut cluster_b,
+                &mut resolver_b,
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            runtime_b
+                .actors
+                .get(&actor_b)
+                .map(|a| a.mailbox.len())
+                .unwrap_or(0)
+                == 0,
+            "string payload to an actor without a module pool must be dropped, not delivered with dangling pool ids"
         );
 
         transport_a.shutdown();

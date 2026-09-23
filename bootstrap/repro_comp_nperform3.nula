@@ -1,0 +1,28 @@
+let skip_ws = fn(s) => fn(p) => fn(l) => p in
+let nperform = fn(name) => fn(a) => fn(b) => 41 in
+let comp_nperform_body = fn(comp_rec) => fn(src) => fn(eff_start) => fn(q5) => fn(len) => fn(nr) => fn(env) => fn(elen) => fn(no_left) => fn(p) => (
+    if q5 < len then (
+        let c3 = nperform("String.charAt")(src)(q5) in
+        let dst = nr in
+        if c3 == 41 then (dst * 262144) + q5
+        else if c3 == 44 then (
+            let no_left_np = 268435456 * 4096 in
+            let p0 = skip_ws(src)(q5 + 1)(len) in
+            let ap0 = skip_ws(src)(p0)(len) in
+            if ap0 < len then (
+                let cp0 = nperform("String.charAt")(src)(ap0) in
+                if cp0 == 41 then (dst * 262144) + ap0
+                else if cp0 == 44 then (
+                    let p1 = skip_ws(src)(ap0 + 1)(len) in
+                    let ap1 = skip_ws(src)(p1)(len) in
+                    if ap1 < len then (
+                        let cp1 = nperform("String.charAt")(src)(ap1) in
+                        if cp1 == 41 then (dst * 262144) + ap1
+                        else ((nr * 262144)) + p
+                    ) else ((nr * 262144)) + p
+                ) else ((nr * 262144)) + p
+            ) else ((nr * 262144)) + p
+        ) else ((nr * 262144)) + p
+    ) else ((nr * 262144)) + p
+) in
+let main = fn() => 123 in main()

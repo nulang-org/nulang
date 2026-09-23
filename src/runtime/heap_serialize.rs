@@ -725,7 +725,10 @@ fn deserialize_one_value(
     if tag == TAG_PTR {
         let obj_id = (raw & PAYLOAD_MASK) as u32;
         if let Some(&ptr) = obj_table.get(&obj_id) {
-            return Value::ptr(ptr);
+            return unsafe {
+                /* SAFETY: deserialization recovered this pointer from the live object table, not from persisted raw address bits. */
+                Value::ptr(ptr)
+            };
         }
         // Dangling reference — return nil.
         return Value::nil();
@@ -743,7 +746,8 @@ fn deserialize_one_value(
     }
 
     // All other tags pass through unchanged.
-    Value::from_raw(raw)
+    // SAFETY: TAG_PTR and TAG_STRING were validated/remapped above; this path contains only immediate/non-pointer tags.
+    unsafe { Value::from_raw(raw) }
 }
 
 fn read_closures(
@@ -816,11 +820,16 @@ fn read_frames(
                     func_idx: *func_idx as usize,
                     captures: captures.clone(),
                 });
-                Some(Value::from_raw(
-                    TAG_CLOSURE
-                        | crate::vm::CLOSURE_ENV_FLAG
-                        | (env_idx as u64 & crate::vm::CLOSURE_ENV_IDX_MASK),
-                ))
+                // SAFETY: this is an internally constructed closure handle. The
+                // environment index was allocated by this VM immediately above and is
+                // masked to the closure representation's validated index field.
+                Some(unsafe {
+                    Value::from_raw(
+                        TAG_CLOSURE
+                            | crate::vm::CLOSURE_ENV_FLAG
+                            | (env_idx as u64 & crate::vm::CLOSURE_ENV_IDX_MASK),
+                    )
+                })
             } else {
                 None
             }

@@ -1,0 +1,8 @@
+fn f(s: String) -> Int {
+    perform IO.print(s);
+    42
+}
+fn main() -> Int {
+    let input = perform IO.read() in
+    if input == "" then f("default") else f(input)
+}

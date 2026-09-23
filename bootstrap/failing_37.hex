@@ -1,0 +1,4521 @@
+; let low17 = fn(x) => (let q = x / 131072 in x - q * 131072) in let low16 = fn(x) => (let q = x / 65536 in x - q * 65536) in let low8 = fn(x) => (let q = x / 256 in x - q * 256) in let low4 = fn(x) => (let q = x / 16 in x - q * 16) in let low6 = fn(x) => (let q = x / 64 in x - q * 64) in let bit17 = fn(x) => (let t = x / 131072 in t - (t / 2) * 2) in let hex_digit = fn(n) => (if n < 10 then nperform("Int.to_string", n) else if n == 10 then "a" else if n == 11 then "b" else if n == 12 then "c" else if n == 13 then "d" else if n == 14 then "e" else "f") in let remark = fn(msg) => (nperform("IO.print", "; " + msg)) in let emit_hex = fn(w) => (nperform("IO.print", "" + hex_digit(low4(w / 268435456)) + hex_digit(low4(w / 16777216)) + hex_digit(low4(w / 1048576)) + hex_digit(low4(w / 65536)) + hex_digit(low4(w / 4096)) + hex_digit(low4(w / 256)) + hex_digit(low4(w / 16)) + hex_digit(low4(w)))) in let instr = fn(opcode) => fn(op1) => fn(op2) => fn(op3) => (((opcode * 16777216)) + ((op1 * 65536)) + ((op2 * 256)) + op3) in let emit_word = fn(opcode) => fn(op1) => fn(op2) => fn(op3) => (let w = instr(opcode)(op1)(op2)(op3) in let _ = emit_hex(w) in 0) in let env_decode = fn(env) => fn(i) => (let b0 = nperform("String.charAt", env, i) - 1 in let b1 = nperform("String.charAt", env, i + 1) - 1 in let b2 = nperform("String.charAt", env, i + 2) - 1 in let b3 = nperform("String.charAt", env, i + 3) - 1 in ((b0 * 262144)) + ((b1 * 4096)) + ((b2 * 64)) + b3) in let emit_cap_step = fn(closure_reg) => fn(slot) => fn(is_store) => (let cap_reg = 11 + slot in if is_store != 0 then emit_word(98)(closure_reg)(slot)(cap_reg) else emit_word(97)(slot)(cap_reg)(0)) in let emit_fnend_step = fn(reg) => fn(slot) => fn(closure_reg) => (let cap_dst = 11 + slot in let _ = emit_word(18)(reg)(cap_dst)(0) in emit_word(98)(closure_reg)(slot)(cap_dst)) in let emit_caps = fn(closure_reg) => fn(count) => fn(slot) => fn(is_store) => (if slot >= count then 0 else (let _ = emit_cap_step(closure_reg)(slot)(is_store) in emit_caps(closure_reg)(count)(slot + 1)(is_store))) in let emit_fnend_caps = fn(env) => fn(elen) => fn(idx) => fn(slot) => fn(closure_reg) => (if idx >= elen then slot else (let v = env_decode(env)(idx * 4) in let reg = low8(v) in let is_cap = reg >= 100 and reg < 128 in if is_cap then (let _ = emit_fnend_step(reg)(slot)(closure_reg) in emit_fnend_caps(env)(elen)(idx + 1)(slot + 1)(closure_reg)) else (emit_fnend_caps(env)(elen)(idx + 1)(slot)(closure_reg)))) in let is_digit = fn(c) => (c >= 48 and c <= 57) in let is_alpha = fn(c) => ((c >= 65 and c <= 90) or (c >= 97 and c <= 122)) in let is_alphanum = fn(c) => (is_alpha(c) or is_digit(c) or c == 95) in let is_space = fn(c) => (c == 32 or c == 10 or c == 13 or c == 9) in let skip_ws = fn(src) => fn(pos) => fn(len) => (if pos >= len then pos else if is_space(nperform("String.charAt", src, pos)) then skip_ws(src)(pos + 1)(len) else pos) in let read_int = fn(src) => fn(pos) => fn(len) => fn(acc) => (if pos >= len then ((acc * 65536)) + pos else (let c = nperform("String.charAt", src, pos) in if is_digit(c) then read_int(src)(pos + 1)(len)(acc * 10 + (c - 48)) else ((acc * 65536)) + pos)) in let read_ident = fn(src) => fn(pos) => fn(len) => fn(h) => (if pos >= len then (((low16(h)) * 65536)) + pos else (let c = nperform("String.charAt", src, pos) in if is_alphanum(c) then (let nh = h * 5 + c in read_ident(src)(pos + 1)(len)(nh)) else (((low16(h)) * 65536)) + pos)) in let read_string = fn(src) => fn(pos) => fn(len) => fn(acc) => (if pos >= len then acc else (let c = nperform("String.charAt", src, pos) in if c == 34 then acc else read_string(src)(pos + 1)(len)(acc + nperform("String.from_char", c)))) in let read_string_end = fn(src) => fn(pos) => fn(len) => (if pos >= len then pos else (let c = nperform("String.charAt", src, pos) in if c == 34 then pos + 1 else read_string_end(src)(pos + 1)(len))) in let env_push = fn(env) => fn(h) => fn(reg) => (let v = (((low16(h)) * 256)) + (low8(reg)) in let c0 = (low6((v >> 18))) + 1 in let c1 = (low6((v >> 12))) + 1 in let c2 = (low6((v >> 6))) + 1 in let c3 = (low6(v)) + 1 in env + nperform("String.from_char", c0) + nperform("String.from_char", c1) + nperform("String.from_char", c2) + nperform("String.from_char", c3)) in let env_lookup = fn(env) => fn(elen) => fn(h) => (if elen <= 0 then 0 else (let v = env_decode(env)((elen - 1) * 4) in let hh = low16((v >> 8)) in let reg = low8(v) in if hh == (low16(h)) then reg else env_lookup(env)(elen - 1)(h))) in let count_captures = fn(env) => fn(elen) => (if elen <= 0 then 0 else (let v = env_decode(env)((elen - 1) * 4) in let reg = low8(v) in let is_cap = reg >= 100 and reg < 128 in let rest = count_captures(env)(elen - 1) in if is_cap then 1 + rest else rest)) in let remap_captures = fn(env) => fn(elen) => fn(idx) => fn(slot) => (if idx >= elen then env else (let v = env_decode(env)(idx * 4) in let hh = low16((v >> 8)) in let reg = low8(v) in let is_cap = reg >= 100 and reg < 128 in if is_cap then (let tail = remap_captures(env)(elen)(idx + 1)(slot + 1) in env_push(tail)(hh)(11 + slot)) else (remap_captures(env)(elen)(idx + 1)(slot)))) in let prec_of = fn(c) => (if c == 43 then 2 else if c == 45 then 2 else if c == 42 then 3 else if c == 47 then 3 else if c == 38 then 2 else 0) in let parse_cmp = fn(src) => fn(p) => fn(len) => (if p >= len then 0 else (let c = nperform("String.charAt", src, p) in if c == 61 and p + 1 < len then (let c2 = nperform("String.charAt", src, p + 1) in if c2 == 61 then ((1 * 65536)) + ((64 * 256)) + 2 else 0) else if c == 33 and p + 1 < len then (let c2 = nperform("String.charAt", src, p + 1) in if c2 == 61 then ((1 * 65536)) + ((255 * 256)) + 2 else 0) else if c == 60 then (if p + 1 < len then (let c2 = nperform("String.charAt", src, p + 1) in if c2 == 61 then ((1 * 65536)) + ((67 * 256)) + 2 else ((1 * 65536)) + ((65 * 256)) + 1) else ((1 * 65536)) + ((65 * 256)) + 1) else if c == 62 then (if p + 1 < len then (let c2 = nperform("String.charAt", src, p + 1) in if c2 == 61 then ((1 * 65536)) + ((68 * 256)) + 2 else ((1 * 65536)) + ((66 * 256)) + 1) else ((1 * 65536)) + ((66 * 256)) + 1) else 0)) in let parse_shift = fn(src) => fn(p) => fn(len) => (if p + 1 < len then (let c1 = nperform("String.charAt", src, p) in let c2 = nperform("String.charAt", src, p + 1) in if c1 == 60 and c2 == 60 then ((3 * 65536)) + ((42 * 256)) + 2 else if c1 == 62 and c2 == 62 then ((3 * 65536)) + ((43 * 256)) + 2 else 0) else 0) in let skip_fn_type = fn(src) => fn(pos) => fn(len) => (let q5_raw = skip_ws(src)(pos)(len) in if q5_raw < len then (let c_colon = nperform("String.charAt", src, q5_raw) in if c_colon == 58 then (let after_colon = skip_ws(src)(q5_raw + 1)(len) in let type_id = read_ident(src)(after_colon)(len)(0) in low16(type_id)) else (q5_raw)) else (q5_raw)) in let comp_fn_closure = fn(comp_rec) => fn(src) => fn(q6) => fn(len) => fn(nr) => fn(env) => fn(elen) => fn(no_left) => fn(ph) => fn(p) => (if q6 + 1 < len then (let c3 = nperform("String.charAt", src, q6) in let c4 = nperform("String.charAt", src, q6 + 1) in if c3 == 61 and c4 == 62 then (let _ = remark("Jmp -> fn_end") in let _ = emit_word(80)(0)(0)(0) in let _ = remark("FN_START") in let param_save = 100 + elen in let _ = emit_word(18)(10)(param_save)(0) in let env_remapped = remap_captures(env)(elen)(0)(0) in let capture_count = (nperform("String.length", env_remapped) - nperform("String.length", env)) / 4 in let env2 = if capture_count > 0 then (env_push(env_remapped)(low16(ph))(param_save)) else (env_push(env)(low16(ph))(param_save)) in let elen2 = elen + capture_count + 1 in let _ = emit_caps(0)(capture_count)(0)(0) in let _ = emit_word(18)(param_save)(11 + capture_count)(0) in let body = comp_rec(src)(q6 + 2)(len)(no_left)(-1)(12 + capture_count)(env2)(elen2) in let body_reg = body >> 18 in let body_end = low17(body) in let _ = emit_word(18)(body_reg)(0)(0) in let _ = emit_word(87)(0)(0)(0) in let _ = remark("fn_end:") in let closure_reg = nr in let _ = emit_word(96)(255)(255)(closure_reg) in let _ = emit_caps(closure_reg)(capture_count)(0)(1) in ((closure_reg * 262144)) + body_end) else ((nr * 262144)) + p) else ((nr * 262144)) + p) in let comp_fn_parse = fn(comp_rec) => fn(src) => fn(pos) => fn(len) => fn(nr) => fn(env) => fn(elen) => fn(no_left) => fn(p) => fn(q) => (let q2 = skip_ws(src)(q)(len) in if q2 < len then (let c1 = nperform("String.charAt", src, q2) in if c1 == 40 then (let q3 = skip_ws(src)(q2 + 1)(len) in let param_id = read_ident(src)(q3)(len)(0) in let ph = param_id >> 16 in let q4 = low16(param_id) in let q5 = skip_fn_type(src)(q4)(len) in if q5 < len then (let c2 = nperform("String.charAt", src, q5) in if c2 == 41 then (let q6 = skip_ws(src)(q5 + 1)(len) in comp_fn_closure(comp_rec)(src)(q6)(len)(nr)(env)(elen)(no_left)(ph)(p)) else ((nr * 262144)) + p) else ((nr * 262144)) + p) else ((nr * 262144)) + p) else ((nr * 262144)) + p) in let nperform_finish = fn(src) => fn(eff_start) => fn(len) => fn(dst) => fn(end_pos) => (let eff_name = read_string(src)(eff_start)(len)("") in let quote = nperform("String.from_char", 34) in let _ = remark("const " + quote + eff_name + quote) in let _ = emit_word(144)(0)(0)(dst) in ((dst * 262144)) + end_pos) in let comp_nperform_body = fn(comp_rec) => fn(src) => fn(eff_start) => fn(q5) => fn(len) => fn(nr) => fn(env) => fn(elen) => fn(no_left) => fn(p) => (if q5 < len then (let c3 = nperform("String.charAt", src, q5) in let dst = nr in if c3 == 41 then (nperform_finish(src)(eff_start)(len)(dst)(skip_ws(src)(q5 + 1)(len))) else if c3 == 44 then (let no_left_np = 268435456 * 4096 in let p0 = skip_ws(src)(q5 + 1)(len) in let inner0 = comp_rec(src)(p0)(len)(no_left_np)(0)(nr + 1)(env)(elen) in let r0 = inner0 >> 18 in let e0 = low17(inner0) in let _ = emit_word(18)(r0)(0)(0) in let ap0 = skip_ws(src)(e0)(len) in if ap0 < len then (let cp0 = nperform("String.charAt", src, ap0) in if cp0 == 41 then (nperform_finish(src)(eff_start)(len)(dst)(skip_ws(src)(ap0 + 1)(len))) else if cp0 == 44 then (let p1 = skip_ws(src)(ap0 + 1)(len) in let inner1 = comp_rec(src)(p1)(len)(no_left_np)(0)(nr + 11)(env)(elen) in let r1 = inner1 >> 18 in let e1 = low17(inner1) in let _ = emit_word(18)(r1)(1)(0) in let ap1 = skip_ws(src)(e1)(len) in if ap1 < len then (let cp1 = nperform("String.charAt", src, ap1) in if cp1 == 41 then (nperform_finish(src)(eff_start)(len)(dst)(skip_ws(src)(ap1 + 1)(len))) else if cp1 == 44 then (let p2 = skip_ws(src)(ap1 + 1)(len) in let inner2 = comp_rec(src)(p2)(len)(no_left_np)(0)(nr + 21)(env)(elen) in let r2 = inner2 >> 18 in let e2 = low17(inner2) in let _ = emit_word(18)(r2)(2)(0) in let ap2 = skip_ws(src)(e2)(len) in if ap2 < len then (let cp2 = nperform("String.charAt", src, ap2) in if cp2 == 41 then (nperform_finish(src)(eff_start)(len)(dst)(skip_ws(src)(ap2 + 1)(len))) else ((nr * 262144)) + p) else ((nr * 262144)) + p) else ((nr * 262144)) + p) else ((nr * 262144)) + p) else ((nr * 262144)) + p) else ((nr * 262144)) + p) else ((nr * 262144)) + p) else ((nr * 262144)) + p) in 123
+; Jmp -> fn_end
+50000000
+; FN_START
+120a6500
+12650b00
+12650c00
+; const 131072
+0700000d
+230c0d0e
+120ed600
+12650d00
+12d60e00
+; const 131072
+0700000f
+220e0f10
+210d100f
+120f0000
+57000000
+; fn_end:
+60ffff08
+1208d000
+; Jmp -> fn_end
+50000000
+; FN_START
+120a6600
+12660b00
+12660c00
+; const 65536
+0700000d
+230c0d0e
+120ed700
+12660d00
+12d70e00
+; const 65536
+0700000f
+220e0f10
+210d100f
+120f0000
+57000000
+; fn_end:
+60ffff09
+1209d200
+; Jmp -> fn_end
+50000000
+; FN_START
+120a6700
+12670b00
+12670c00
+; const 256
+0700000d
+230c0d0e
+120ed800
+12670d00
+12d80e00
+; const 256
+0700000f
+220e0f10
+210d100f
+120f0000
+57000000
+; fn_end:
+60ffff0a
+120ad400
+; Jmp -> fn_end
+50000000
+; FN_START
+120a6800
+12680b00
+12680c00
+; const 16
+0700000d
+230c0d0e
+120ed900
+12680d00
+12d90e00
+; const 16
+0700000f
+220e0f10
+210d100f
+120f0000
+57000000
+; fn_end:
+60ffff0b
+120bd600
+; Jmp -> fn_end
+50000000
+; FN_START
+120a6900
+12690b00
+12690c00
+; const 64
+0700000d
+230c0d0e
+120eda00
+12690d00
+12da0e00
+; const 64
+0700000f
+220e0f10
+210d100f
+120f0000
+57000000
+; fn_end:
+60ffff0c
+120cd800
+; Jmp -> fn_end
+50000000
+; FN_START
+120a6a00
+126a0b00
+126a0c00
+; const 131072
+0700000d
+230c0d0e
+120edb00
+12db0d00
+12db0e00
+050f0000
+230e0f10
+050f0000
+22100f10
+210d100f
+120f0000
+57000000
+; fn_end:
+60ffff0d
+120dda00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a6b00
+126b0b00
+126b0c00
+; const 10
+0700000d
+410c0d0e
+; if
+; JmpF -> else
+520e0000
+; then:
+126b0e00
+120e0000
+; const "Int.to_string"
+9000000d
+120d0e00
+; Jmp -> end
+50000000
+; else:
+126b0d00
+; const 10
+0700000e
+400d0e0f
+; if
+; JmpF -> else
+520f0000
+; then:
+; const "a"
+0700000e
+120e0f00
+; Jmp -> end
+50000000
+; else:
+126b0e00
+; const 11
+0700000f
+400e0f10
+; if
+; JmpF -> else
+52100000
+; then:
+; const "b"
+0700000f
+120f1000
+; Jmp -> end
+50000000
+; else:
+126b0f00
+; const 12
+07000010
+400f1011
+; if
+; JmpF -> else
+52110000
+; then:
+; const "c"
+07000010
+12101100
+; Jmp -> end
+50000000
+; else:
+126b1000
+; const 13
+07000011
+40101112
+; if
+; JmpF -> else
+52120000
+; then:
+; const "d"
+07000011
+12111200
+; Jmp -> end
+50000000
+; else:
+126b1100
+; const 14
+07000012
+40111213
+; if
+; JmpF -> else
+52130000
+; then:
+; const "e"
+07000012
+12121300
+; Jmp -> end
+50000000
+; else:
+; const "f"
+07000012
+12121300
+; end:
+12131200
+; end:
+12121100
+; end:
+12111000
+; end:
+12100f00
+; end:
+120f0e00
+; end:
+120e0000
+57000000
+; fn_end:
+60ffff0e
+120edc00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a6c00
+126c0b00
+; const "; "
+0700000d
+126c0e00
+200d0e0f
+120f0000
+; const "IO.print"
+9000000c
+120c0000
+57000000
+; fn_end:
+60ffff0f
+120fde00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a6d00
+126d0b00
+; const ""
+0700000d
+12dc0e00
+120eae00
+12d60f00
+120faf00
+126d1000
+; const 268435456
+07000011
+23101112
+12120a00
+64af010f
+120f0a00
+64ae010e
+12dc1000
+1210b000
+12d61100
+1211b100
+126d1200
+; const 16777216
+07000013
+23121314
+12140a00
+64b10111
+12110a00
+64b00110
+12dc1200
+1212b200
+12d61300
+1213b300
+126d1400
+; const 1048576
+07000015
+23141516
+12160a00
+64b30113
+12130a00
+64b20112
+12dc1400
+1214b400
+12d61500
+1215b500
+126d1600
+; const 65536
+07000017
+23161718
+12180a00
+64b50115
+12150a00
+64b40114
+12dc1600
+1216b600
+12d61700
+1217b700
+126d1800
+; const 4096
+07000019
+2318191a
+121a0a00
+64b70117
+12170a00
+64b60116
+12dc1800
+1218b800
+12d61900
+1219b900
+126d1a00
+; const 256
+0700001b
+231a1b1c
+121c0a00
+64b90119
+12190a00
+64b80118
+12dc1a00
+121aba00
+12d61b00
+121bbb00
+126d1c00
+; const 16
+0700001d
+231c1d1e
+121e0a00
+64bb011b
+121b0a00
+64ba011a
+12dc1c00
+121cbc00
+12d61d00
+121dbd00
+126d1e00
+121e0a00
+64bd011d
+121d0a00
+64bc011c
+201a1c1d
+20181d1b
+20161b19
+20141917
+20121715
+20101513
+200e1311
+200d110f
+120f0000
+; const "IO.print"
+9000000c
+120c0000
+57000000
+; fn_end:
+60ffff10
+1210e000
+; Jmp -> fn_end
+50000000
+; FN_START
+120a6e00
+126e0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a6f00
+61000b00
+126f0c00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7100
+61000b00
+61010c00
+12710d00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7400
+61000b00
+61010c00
+61020d00
+12740e00
+120b0f00
+; const 16777216
+07000010
+220f1011
+120c1000
+; const 65536
+07000011
+22101112
+120d1100
+; const 256
+07000012
+22111213
+12741200
+20131213
+20121312
+20111211
+12110000
+57000000
+; fn_end:
+60ffff0e
+620e000b
+620e010c
+620e020d
+120e0000
+57000000
+; fn_end:
+60ffff0d
+620d000b
+620d010c
+120d0000
+57000000
+; fn_end:
+60ffff0c
+620c000b
+120c0000
+57000000
+; fn_end:
+60ffff11
+1211e200
+; Jmp -> fn_end
+50000000
+; FN_START
+120a6f00
+126f0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7000
+61000b00
+12700c00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7200
+61000b00
+61010c00
+12720d00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7500
+61000b00
+61010c00
+61020d00
+12750e00
+12e20f00
+120fbb00
+120b1000
+12100a00
+64bb010f
+120fbc00
+120c1100
+12110a00
+64bc0110
+1210bd00
+120d1200
+12120a00
+64bd0111
+1211be00
+12751300
+12130a00
+64be0112
+1212ec00
+12e01000
+1210bd00
+12ec1100
+12110a00
+64bd0110
+1210ee00
+03110000
+12110000
+57000000
+; fn_end:
+60ffff0e
+620e000b
+620e010c
+620e020d
+120e0000
+57000000
+; fn_end:
+60ffff0d
+620d000b
+620d010c
+120d0000
+57000000
+; fn_end:
+60ffff0c
+620c000b
+120c0000
+57000000
+; fn_end:
+60ffff12
+1212e400
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7000
+12700b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7100
+61000b00
+12710c00
+120b0e00
+120e0000
+12711800
+12180100
+; const "String.charAt"
+9000000d
+040e0000
+210d0e0f
+120fe400
+120b0f00
+120f0000
+12711900
+041a0000
+20191a1b
+121b0100
+; const "String.charAt"
+9000000e
+040f0000
+210e0f10
+1210e600
+120b1000
+12100000
+12711a00
+051b0000
+201a1b1c
+121c0100
+; const "String.charAt"
+9000000f
+04100000
+210f1011
+1211e800
+120b1100
+12110000
+12711b00
+; const 3
+0700001c
+201b1c1d
+121d0100
+; const "String.charAt"
+90000010
+04110000
+21101112
+1212ea00
+12e41100
+; const 262144
+07000012
+22111213
+12e61200
+; const 4096
+07000013
+22121314
+12e81300
+; const 64
+07000014
+22131415
+12ea1400
+20151415
+20141514
+20131413
+12130000
+57000000
+; fn_end:
+60ffff0c
+620c000b
+120c0000
+57000000
+; fn_end:
+60ffff13
+1213e600
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7100
+12710b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7200
+61000b00
+12720c00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7400
+61000b00
+61010c00
+12740d00
+; const 11
+0700000e
+120c0f00
+200e0f10
+1210e900
+12740f00
+03100000
+400f1011
+49111100
+; if
+; JmpF -> else
+52110000
+; then:
+12e41000
+1210ba00
+; const 98
+07000011
+12110a00
+64ba0110
+1210bb00
+120b1200
+12120a00
+64bb0111
+1211bc00
+120c1300
+12130a00
+64bc0112
+1212bd00
+12e91400
+12140a00
+64bd0113
+12131100
+; Jmp -> end
+50000000
+; else:
+12e41000
+1210ba00
+; const 97
+07000011
+12110a00
+64ba0110
+1210bb00
+120c1200
+12120a00
+64bb0111
+1211bc00
+12e91300
+12130a00
+64bc0112
+1212bd00
+03140000
+12140a00
+64bd0113
+12131100
+; end:
+12110000
+57000000
+; fn_end:
+60ffff0d
+620d000b
+620d010c
+120d0000
+57000000
+; fn_end:
+60ffff0c
+620c000b
+120c0000
+57000000
+; fn_end:
+60ffff14
+1214e800
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7200
+12720b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7300
+61000b00
+12730c00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7500
+61000b00
+61010c00
+12750d00
+; const 11
+0700000e
+120c0f00
+200e0f10
+1210ea00
+12e40f00
+120fbb00
+; const 18
+07000010
+12100a00
+64bb010f
+120fbc00
+120b1100
+12110a00
+64bc0110
+1210bd00
+12ea1200
+12120a00
+64bd0111
+1211be00
+03130000
+12130a00
+64be0112
+1212ec00
+12e41000
+1210bc00
+; const 98
+07000011
+12110a00
+64bc0110
+1210bd00
+12751200
+12120a00
+64bd0111
+1211be00
+120c1300
+12130a00
+64be0112
+1212bf00
+12ea1400
+12140a00
+64bf0113
+12130000
+57000000
+; fn_end:
+60ffff0d
+620d000b
+620d010c
+120d0000
+57000000
+; fn_end:
+60ffff0c
+620c000b
+120c0000
+57000000
+; fn_end:
+60ffff15
+1215ea00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7300
+12730b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7400
+61000b00
+12740c00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7600
+61000b00
+61010c00
+12760d00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7900
+61000b00
+61010c00
+61020d00
+12790e00
+120d0f00
+120c1000
+440f1011
+; if
+; JmpF -> else
+52110000
+; then:
+03100000
+12101100
+; Jmp -> end
+50000000
+; else:
+12e81000
+1210c000
+120b1100
+12110a00
+64c00110
+1210c100
+120d1200
+12120a00
+64c10111
+1211c200
+12791300
+12130a00
+64c20112
+1212f100
+12ec1100
+1211c100
+120b1200
+12120a00
+64c10111
+1211c200
+120c1300
+12130a00
+64c20112
+1212c300
+120d1400
+04150000
+20141516
+12160a00
+64c30113
+1213c400
+12791500
+12150a00
+64c40114
+12141100
+; end:
+12110000
+57000000
+; fn_end:
+60ffff0e
+620e000b
+620e010c
+620e020d
+120e0000
+57000000
+; fn_end:
+60ffff0d
+620d000b
+620d010c
+120d0000
+57000000
+; fn_end:
+60ffff0c
+620c000b
+120c0000
+57000000
+; fn_end:
+60ffff16
+1216ec00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7400
+12740b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7500
+61000b00
+12750c00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7700
+61000b00
+61010c00
+12770d00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7a00
+61000b00
+61010c00
+61020d00
+127a0e00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7e00
+61000b00
+61010c00
+61020d00
+61030e00
+127e0f00
+120d1000
+120c1100
+44101112
+; if
+; JmpF -> else
+52120000
+; then:
+120e1100
+12111200
+; Jmp -> end
+50000000
+; else:
+12e61100
+1211c700
+120b1200
+12120a00
+64c70111
+1211c800
+120d1300
+; const 4
+07000014
+22131415
+12150a00
+64c80112
+1212f800
+12d41200
+1212c900
+12f81300
+12130a00
+64c90112
+1212fa00
+12fa1300
+; const 100
+07000014
+44131415
+; and
+; JmpF -> and_end
+52150000
+12fa1700
+; const 128
+07000018
+41171819
+; and_end:
+1219fc00
+12fc1400
+; if
+; truthiness: check int 0
+03070000
+40140716
+49161600
+; JmpF -> else
+52160000
+; truthiness: check bool false
+04170000
+40071718
+40141819
+49191900
+; JmpF -> else
+52190000
+; then:
+12ea1500
+12155d00
+12fa1600
+12160a00
+645d0115
+12155e00
+120e1700
+12170a00
+645e0116
+12165f00
+127e1800
+12180a00
+645f0117
+1217ff00
+12ee1600
+12165e00
+120b1700
+12170a00
+645e0116
+12165f00
+120c1800
+12180a00
+645f0117
+12176000
+120d1900
+041a0000
+20191a1b
+121b0a00
+64600118
+12186100
+120e1a00
+041b0000
+201a1b1c
+121c0a00
+64610119
+12196200
+127e1b00
+121b0a00
+6462011a
+121a1600
+; Jmp -> end
+50000000
+; else:
+12ee1500
+1215cd00
+120b1600
+12160a00
+64cd0115
+12155d00
+120c1700
+12170a00
+645d0116
+12165e00
+120d1800
+04190000
+2018191a
+121a0a00
+645e0117
+12175f00
+120e1900
+12190a00
+645f0118
+12186000
+127e1a00
+121a0a00
+64600119
+12191600
+; end:
+12161200
+; end:
+12120000
+57000000
+; fn_end:
+60ffff0f
+620f000b
+620f010c
+620f020d
+620f030e
+120f0000
+57000000
+; fn_end:
+60ffff0e
+620e000b
+620e010c
+620e020d
+120e0000
+57000000
+; fn_end:
+60ffff0d
+620d000b
+620d010c
+120d0000
+57000000
+; fn_end:
+60ffff0c
+620c000b
+120c0000
+57000000
+; fn_end:
+60ffff17
+1217ee00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7500
+12750b00
+12750c00
+; const 48
+0700000d
+440c0d0e
+; and
+; JmpF -> and_end
+520e0000
+12751000
+; const 57
+07000011
+43101112
+; and_end:
+12120000
+57000000
+; fn_end:
+60ffff18
+1218f000
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7600
+12760b00
+12760c00
+; const 65
+0700000d
+440c0d0e
+; and
+; JmpF -> and_end
+520e0000
+12761000
+; const 90
+07000011
+43101112
+; and_end:
+; or
+03070000
+4012070d
+490d0d00
+; JmpF -> or_right
+520d0000
+040e0000
+; Jmp -> or_end
+50000000
+; or_right:
+12760f00
+; const 97
+07000010
+440f1011
+; and
+; JmpF -> and_end
+52110000
+12761300
+; const 122
+07000014
+43131415
+; and_end:
+; or_end:
+12150000
+57000000
+; fn_end:
+60ffff19
+1219f200
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7700
+12770b00
+12f20c00
+120cb600
+12770d00
+120d0a00
+64b6010c
+; or
+03070000
+400c070e
+490e0e00
+; JmpF -> or_right
+520e0000
+040f0000
+; Jmp -> or_end
+50000000
+; or_right:
+12f01000
+1210ba00
+12771100
+12110a00
+64ba0110
+; or
+03070000
+40100712
+49121200
+; JmpF -> or_right
+52120000
+04130000
+; Jmp -> or_end
+50000000
+; or_right:
+12771400
+; const 95
+07000015
+40141516
+; or_end:
+; or_end:
+12160000
+57000000
+; fn_end:
+60ffff1a
+121af400
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7800
+12780b00
+12780c00
+; const 32
+0700000d
+400c0d0e
+; or
+; JmpF -> or_right
+520e0000
+04110000
+; Jmp -> or_end
+50000000
+; or_right:
+12781200
+; const 10
+07000013
+40121314
+; or
+; JmpF -> or_right
+52140000
+04170000
+; Jmp -> or_end
+50000000
+; or_right:
+12781800
+; const 13
+07000019
+4018191a
+; or
+; JmpF -> or_right
+521a0000
+041d0000
+; Jmp -> or_end
+50000000
+; or_right:
+12781e00
+; const 9
+0700001f
+401e1f20
+; or_end:
+; or_end:
+; or_end:
+12200000
+57000000
+; fn_end:
+60ffff1b
+121bf600
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7900
+12790b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7a00
+61000b00
+127a0c00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7c00
+61000b00
+61010c00
+127c0d00
+120c0e00
+127c0f00
+440e0f10
+; if
+; JmpF -> else
+52100000
+; then:
+120c0f00
+120f1000
+; Jmp -> end
+50000000
+; else:
+12f60f00
+120fc000
+120b1100
+12110000
+120c1b00
+121b0100
+; const "String.charAt"
+90000010
+12100a00
+64c0010f
+; if
+; truthiness: check int 0
+03070000
+400f0711
+49111100
+; JmpF -> else
+52110000
+; truthiness: check bool false
+04120000
+40071213
+400f1314
+49141400
+; JmpF -> else
+52140000
+; then:
+12f81000
+1210c100
+120b1100
+12110a00
+64c10110
+1210c200
+120c1200
+04130000
+20121314
+12140a00
+64c20111
+1211c300
+127c1300
+12130a00
+64c30112
+12121100
+; Jmp -> end
+50000000
+; else:
+120c1000
+12101100
+; end:
+12111000
+; end:
+12100000
+57000000
+; fn_end:
+60ffff0d
+620d000b
+620d010c
+120d0000
+57000000
+; fn_end:
+60ffff0c
+620c000b
+120c0000
+57000000
+; fn_end:
+60ffff1c
+121cf800
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7a00
+127a0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7b00
+61000b00
+127b0c00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7d00
+61000b00
+61010c00
+127d0d00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8000
+61000b00
+61010c00
+61020d00
+12800e00
+120c0f00
+120d1000
+440f1011
+; if
+; JmpF -> else
+52110000
+; then:
+12801000
+; const 65536
+07000011
+22101112
+120c1100
+20121112
+12121100
+; Jmp -> end
+50000000
+; else:
+120b1100
+12110000
+120c1b00
+121b0100
+; const "String.charAt"
+90000010
+1210f800
+12f01100
+1211c800
+12f81200
+12120a00
+64c80111
+; if
+; truthiness: check int 0
+03070000
+40110713
+49131300
+; JmpF -> else
+52130000
+; truthiness: check bool false
+04140000
+40071415
+40111516
+49161600
+; JmpF -> else
+52160000
+; then:
+12fa1200
+1212c900
+120b1300
+12130a00
+64c90112
+1212ca00
+120c1400
+04150000
+20141516
+12160a00
+64ca0113
+1213cb00
+120d1500
+12150a00
+64cb0114
+1214cc00
+12801600
+; const 10
+07000017
+22161718
+12f81a00
+; const 48
+0700001b
+211a1b1c
+20181c1b
+121b0a00
+64cc0115
+12151300
+; Jmp -> end
+50000000
+; else:
+12801200
+; const 65536
+07000013
+22121314
+120c1300
+20141314
+12141300
+; end:
+12131100
+; end:
+12110000
+57000000
+; fn_end:
+60ffff0e
+620e000b
+620e010c
+620e020d
+120e0000
+57000000
+; fn_end:
+60ffff0d
+620d000b
+620d010c
+120d0000
+57000000
+; fn_end:
+60ffff0c
+620c000b
+120c0000
+57000000
+; fn_end:
+60ffff1d
+121dfa00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7b00
+127b0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7c00
+61000b00
+127c0c00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7e00
+61000b00
+61010c00
+127e0d00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8100
+61000b00
+61010c00
+61020d00
+12810e00
+120c0f00
+120d1000
+440f1011
+; if
+; JmpF -> else
+52110000
+; then:
+12d21000
+1210c700
+12811100
+12110a00
+64c70110
+; const 65536
+07000011
+22101112
+120c1100
+20121112
+12121100
+; Jmp -> end
+50000000
+; else:
+120b1100
+12110000
+120c1b00
+121b0100
+; const "String.charAt"
+90000010
+1210f900
+12f41100
+1211c900
+12f91200
+12120a00
+64c90111
+; if
+; truthiness: check int 0
+03070000
+40110713
+49131300
+; JmpF -> else
+52130000
+; truthiness: check bool false
+04140000
+40071415
+40111516
+49161600
+; JmpF -> else
+52160000
+; then:
+12811200
+; const 5
+07000013
+22121314
+12f91600
+20141617
+1217fc00
+12fc1300
+1213cc00
+120b1400
+12140a00
+64cc0113
+1213cd00
+120c1500
+04160000
+20151617
+12170a00
+64cd0114
+12145d00
+120d1600
+12160a00
+645d0115
+12155e00
+12fc1700
+12170a00
+645e0116
+12161300
+; Jmp -> end
+50000000
+; else:
+12d21200
+1212ca00
+12811300
+12130a00
+64ca0112
+; const 65536
+07000013
+22121314
+120c1300
+20141314
+12141300
+; end:
+12131100
+; end:
+12110000
+57000000
+; fn_end:
+60ffff0e
+620e000b
+620e010c
+620e020d
+120e0000
+57000000
+; fn_end:
+60ffff0d
+620d000b
+620d010c
+120d0000
+57000000
+; fn_end:
+60ffff0c
+620c000b
+120c0000
+57000000
+; fn_end:
+60ffff1e
+121efc00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7c00
+127c0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7d00
+61000b00
+127d0c00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7f00
+61000b00
+61010c00
+127f0d00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8200
+61000b00
+61010c00
+61020d00
+12820e00
+120c0f00
+120d1000
+440f1011
+; if
+; JmpF -> else
+52110000
+; then:
+12821000
+12101100
+; Jmp -> end
+50000000
+; else:
+120b1100
+12110000
+120c1b00
+121b0100
+; const "String.charAt"
+90000010
+1210fa00
+12fa1100
+; const 34
+07000012
+40111213
+; if
+; JmpF -> else
+52130000
+; then:
+12821200
+12121300
+; Jmp -> end
+50000000
+; else:
+12fe1200
+1212cb00
+120b1300
+12130a00
+64cb0112
+1212cc00
+120c1400
+04150000
+20141516
+12160a00
+64cc0113
+1213cd00
+120d1500
+12150a00
+64cd0114
+12145d00
+12821600
+12fa1800
+12180000
+; const "String.from_char"
+90000017
+20161718
+12180a00
+645d0115
+12151300
+; end:
+12131100
+; end:
+12110000
+57000000
+; fn_end:
+60ffff0e
+620e000b
+620e010c
+620e020d
+120e0000
+57000000
+; fn_end:
+60ffff0d
+620d000b
+620d010c
+120d0000
+57000000
+; fn_end:
+60ffff0c
+620c000b
+120c0000
+57000000
+; fn_end:
+60ffff1f
+121ffe00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7d00
+127d0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7e00
+61000b00
+127e0c00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8000
+61000b00
+61010c00
+12800d00
+120c0e00
+12800f00
+440e0f10
+; if
+; JmpF -> else
+52100000
+; then:
+120c0f00
+120f1000
+; Jmp -> end
+50000000
+; else:
+120b1000
+12100000
+120c1a00
+121a0100
+; const "String.charAt"
+9000000f
+120ff600
+12f61000
+; const 34
+07000011
+40101112
+; if
+; JmpF -> else
+52120000
+; then:
+120c1100
+04120000
+20111213
+12131200
+; Jmp -> end
+50000000
+; else:
+128f1100
+1211c700
+120b1200
+12120a00
+64c70111
+1211c800
+120c1300
+04140000
+20131415
+12150a00
+64c80112
+1212c900
+12801400
+12140a00
+64c90113
+12131200
+; end:
+12121000
+; end:
+12100000
+57000000
+; fn_end:
+60ffff0d
+620d000b
+620d010c
+120d0000
+57000000
+; fn_end:
+60ffff0c
+620c000b
+120c0000
+57000000
+; fn_end:
+60ffff20
+12208f00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7e00
+127e0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7f00
+61000b00
+127f0c00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8100
+61000b00
+61010c00
+12810d00
+12d20e00
+120ec500
+120c0f00
+120f0a00
+64c5010e
+; const 256
+0700000f
+220e0f10
+12d40f00
+120fc600
+12811000
+12100a00
+64c6010f
+20100f10
+1210f600
+12d80f00
+120fc700
+12f61000
+; const 18
+07000011
+2b101112
+12120a00
+64c7010f
+04100000
+200f1011
+1211f800
+12d81000
+1210c900
+12f61100
+; const 12
+07000012
+2b111213
+12130a00
+64c90110
+04110000
+20101112
+1212fa00
+12d81100
+1211cb00
+12f61200
+; const 6
+07000013
+2b121314
+12140a00
+64cb0111
+04120000
+20111213
+1213fc00
+12d81200
+1212cd00
+12f61300
+12130a00
+64cd0112
+04130000
+20121314
+1214fe00
+120b1300
+12f81500
+12150000
+; const "String.from_char"
+90000014
+12fa1600
+12160000
+; const "String.from_char"
+90000015
+12fc1700
+12170000
+; const "String.from_char"
+90000016
+12fe1800
+12180000
+; const "String.from_char"
+90000017
+20161718
+20151817
+20141716
+20131615
+12150000
+57000000
+; fn_end:
+60ffff0d
+620d000b
+620d010c
+120d0000
+57000000
+; fn_end:
+60ffff0c
+620c000b
+120c0000
+57000000
+; fn_end:
+60ffff21
+12219100
+; Jmp -> fn_end
+50000000
+; FN_START
+120a7f00
+127f0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8000
+61000b00
+12800c00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8200
+61000b00
+12820c00
+12800d00
+030e0000
+430d0e0f
+; if
+; JmpF -> else
+520f0000
+; then:
+030e0000
+120e0f00
+; Jmp -> end
+50000000
+; else:
+12e60e00
+120ec500
+120b0f00
+120f0a00
+64c5010e
+120ec600
+12801000
+04110000
+21101112
+; const 4
+07000011
+22121112
+12120a00
+64c6010f
+120ff600
+12d20f00
+120fc700
+12f61000
+; const 8
+07000011
+2b101112
+12120a00
+64c7010f
+120ff800
+12d41000
+1210c900
+12f61100
+12110a00
+64c90110
+1210fa00
+12f81100
+12d21200
+1212cb00
+12821300
+12130a00
+64cb0112
+40111213
+; if
+; JmpF -> else
+52130000
+; then:
+12fa1200
+12121300
+; Jmp -> end
+50000000
+; else:
+12931200
+1212cb00
+120b1300
+12130a00
+64cb0112
+1212cc00
+12801400
+04150000
+21141516
+12160a00
+64cc0113
+1213cd00
+12821500
+12150a00
+64cd0114
+12141300
+; end:
+12130f00
+; end:
+120f0000
+57000000
+; fn_end:
+60ffff0d
+620d000b
+120d0000
+57000000
+; fn_end:
+60ffff0c
+620c000b
+120c0000
+57000000
+; fn_end:
+60ffff22
+12229300
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8000
+12800b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8100
+12810b00
+12810c00
+030d0000
+430c0d0e
+; if
+; JmpF -> else
+520e0000
+; then:
+030d0000
+120d0e00
+; Jmp -> end
+50000000
+; else:
+12e60d00
+120dc200
+12800e00
+120e0a00
+64c2010d
+120dc300
+12810f00
+04100000
+210f1011
+; const 4
+07000010
+22111011
+12110a00
+64c3010e
+120ef300
+12d40e00
+120ec400
+12f30f00
+120f0a00
+64c4010e
+120ef500
+12f50f00
+; const 100
+07000010
+440f1011
+; and
+; JmpF -> and_end
+52110000
+12f51300
+; const 128
+07000014
+41131415
+; and_end:
+1215f700
+12951000
+1210c800
+12801100
+12110a00
+64c80110
+1210c900
+12811200
+04130000
+21121314
+12140a00
+64c90111
+1211f900
+12f71100
+; if
+; truthiness: check int 0
+03070000
+40110713
+49131300
+; JmpF -> else
+52130000
+; truthiness: check bool false
+04140000
+40071415
+40111516
+49161600
+; JmpF -> else
+52160000
+; then:
+04120000
+12f91300
+20121314
+12141300
+; Jmp -> end
+50000000
+; else:
+12f91200
+12121300
+; end:
+12130e00
+; end:
+120e0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff23
+12239500
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8100
+12810b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8200
+12820b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8300
+12830b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8400
+12840b00
+12830c00
+12820d00
+440c0d0e
+; if
+; JmpF -> else
+520e0000
+; then:
+12810d00
+120d0e00
+; Jmp -> end
+50000000
+; else:
+12e60d00
+120dc500
+12810e00
+120e0a00
+64c5010d
+120dc600
+12830f00
+; const 4
+07000010
+220f1011
+12110a00
+64c6010e
+120ef600
+12d20e00
+120ec700
+12f60f00
+; const 8
+07000010
+2b0f1011
+12110a00
+64c7010e
+120ef800
+12d40f00
+120fc900
+12f61000
+12100a00
+64c9010f
+120ffa00
+12fa1000
+; const 100
+07000011
+44101112
+; and
+; JmpF -> and_end
+52120000
+12fa1400
+; const 128
+07000015
+41141516
+; and_end:
+1216fc00
+12fc1100
+; if
+; truthiness: check int 0
+03070000
+40110713
+49131300
+; JmpF -> else
+52130000
+; truthiness: check bool false
+04140000
+40071415
+40111516
+49161600
+; JmpF -> else
+52160000
+; then:
+12971200
+12125d00
+12811300
+12130a00
+645d0112
+12125e00
+12821400
+12140a00
+645e0113
+12135f00
+12831500
+04160000
+20151617
+12170a00
+645f0114
+12146000
+12841600
+04170000
+20161718
+12180a00
+64600115
+1215ff00
+12911300
+12135e00
+12ff1400
+12140a00
+645e0113
+12135f00
+12f81500
+12150a00
+645f0114
+12146000
+; const 11
+07000016
+12841700
+20161718
+12180a00
+64600115
+12151300
+; Jmp -> end
+50000000
+; else:
+12971200
+1212cd00
+12811300
+12130a00
+64cd0112
+12125d00
+12821400
+12140a00
+645d0113
+12135e00
+12831500
+04160000
+20151617
+12170a00
+645e0114
+12145f00
+12841600
+12160a00
+645f0115
+12151300
+; end:
+12130e00
+; end:
+120e0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff24
+12249700
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8200
+12820b00
+12820c00
+; const 43
+0700000d
+400c0d0e
+; if
+; JmpF -> else
+520e0000
+; then:
+050d0000
+120d0e00
+; Jmp -> end
+50000000
+; else:
+12820d00
+; const 45
+0700000e
+400d0e0f
+; if
+; JmpF -> else
+520f0000
+; then:
+050e0000
+120e0f00
+; Jmp -> end
+50000000
+; else:
+12820e00
+; const 42
+0700000f
+400e0f10
+; if
+; JmpF -> else
+52100000
+; then:
+; const 3
+0700000f
+120f1000
+; Jmp -> end
+50000000
+; else:
+12820f00
+; const 47
+07000010
+400f1011
+; if
+; JmpF -> else
+52110000
+; then:
+; const 3
+07000010
+12101100
+; Jmp -> end
+50000000
+; else:
+12821000
+; const 38
+07000011
+40101112
+; if
+; JmpF -> else
+52120000
+; then:
+05110000
+12111200
+; Jmp -> end
+50000000
+; else:
+03110000
+12111200
+; end:
+12121100
+; end:
+12111000
+; end:
+12100f00
+; end:
+120f0e00
+; end:
+120e0000
+57000000
+; fn_end:
+60ffff25
+12259900
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8300
+12830b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8400
+12840b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8500
+12850b00
+12840c00
+12850d00
+440c0d0e
+; if
+; JmpF -> else
+520e0000
+; then:
+030d0000
+120d0e00
+; Jmp -> end
+50000000
+; else:
+12830e00
+120e0000
+12841800
+12180100
+; const "String.charAt"
+9000000d
+120df700
+12f70e00
+; const 61
+0700000f
+400e0f10
+; and
+; JmpF -> and_end
+52100000
+12841200
+04130000
+20121314
+12851600
+41141617
+; and_end:
+; if
+; truthiness: check int 0
+03070000
+40170710
+49101000
+; JmpF -> else
+52100000
+; truthiness: check bool false
+04110000
+40071112
+40171213
+49131300
+; JmpF -> else
+52130000
+; then:
+12831000
+12100000
+12841a00
+041b0000
+201a1b1c
+121c0100
+; const "String.charAt"
+9000000f
+120ffa00
+12fa1000
+; const 61
+07000011
+40101112
+; if
+; JmpF -> else
+52120000
+; then:
+04110000
+; const 65536
+07000012
+22111213
+; const 64
+07000012
+; const 256
+07000013
+22121314
+05130000
+20141314
+20131413
+12131200
+; Jmp -> end
+50000000
+; else:
+03110000
+12111200
+; end:
+12121000
+; Jmp -> end
+50000000
+; else:
+12f70f00
+; const 33
+07000010
+400f1011
+; and
+; JmpF -> and_end
+52110000
+12841300
+04140000
+20131415
+12851700
+41151718
+; and_end:
+; if
+; truthiness: check int 0
+03070000
+40180711
+49111100
+; JmpF -> else
+52110000
+; truthiness: check bool false
+04120000
+40071213
+40181314
+49141400
+; JmpF -> else
+52140000
+; then:
+12831100
+12110000
+12841b00
+041c0000
+201b1c1d
+121d0100
+; const "String.charAt"
+90000010
+1210fb00
+12fb1100
+; const 61
+07000012
+40111213
+; if
+; JmpF -> else
+52130000
+; then:
+04120000
+; const 65536
+07000013
+22121314
+; const 255
+07000013
+; const 256
+07000014
+22131415
+05140000
+20151415
+20141514
+12141300
+; Jmp -> end
+50000000
+; else:
+03120000
+12121300
+; end:
+12131100
+; Jmp -> end
+50000000
+; else:
+12f71000
+; const 60
+07000011
+40101112
+; if
+; JmpF -> else
+52120000
+; then:
+12841100
+04120000
+20111213
+12851500
+41131516
+; if
+; JmpF -> else
+52160000
+; then:
+12831300
+12130000
+12841d00
+041e0000
+201d1e1f
+121f0100
+; const "String.charAt"
+90000012
+1212fd00
+12fd1300
+; const 61
+07000014
+40131415
+; if
+; JmpF -> else
+52150000
+; then:
+04140000
+; const 65536
+07000015
+22141516
+; const 67
+07000015
+; const 256
+07000016
+22151617
+05160000
+20171617
+20161716
+12161500
+; Jmp -> end
+50000000
+; else:
+04140000
+; const 65536
+07000015
+22141516
+; const 65
+07000015
+; const 256
+07000016
+22151617
+04160000
+20171617
+20161716
+12161500
+; end:
+12151300
+; Jmp -> end
+50000000
+; else:
+04120000
+; const 65536
+07000013
+22121314
+; const 65
+07000013
+; const 256
+07000014
+22131415
+04140000
+20151415
+20141514
+12141300
+; end:
+12131200
+; Jmp -> end
+50000000
+; else:
+12f71100
+; const 62
+07000012
+40111213
+; if
+; JmpF -> else
+52130000
+; then:
+12841200
+04130000
+20121314
+12851600
+41141617
+; if
+; JmpF -> else
+52170000
+; then:
+12831400
+12140000
+12841e00
+041f0000
+201e1f20
+12200100
+; const "String.charAt"
+90000013
+1213fe00
+12fe1400
+; const 61
+07000015
+40141516
+; if
+; JmpF -> else
+52160000
+; then:
+04150000
+; const 65536
+07000016
+22151617
+; const 68
+07000016
+; const 256
+07000017
+22161718
+05170000
+20181718
+20171817
+12171600
+; Jmp -> end
+50000000
+; else:
+04150000
+; const 65536
+07000016
+22151617
+; const 66
+07000016
+; const 256
+07000017
+22161718
+04170000
+20181718
+20171817
+12171600
+; end:
+12161400
+; Jmp -> end
+50000000
+; else:
+04130000
+; const 65536
+07000014
+22131415
+; const 66
+07000014
+; const 256
+07000015
+22141516
+04150000
+20161516
+20151615
+12151400
+; end:
+12141300
+; Jmp -> end
+50000000
+; else:
+03120000
+12121300
+; end:
+12131200
+; end:
+12121100
+; end:
+12111000
+; end:
+12100e00
+; end:
+120e0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff26
+12269b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8400
+12840b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8500
+12850b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8600
+12860b00
+12850c00
+040d0000
+200c0d0e
+12861000
+410e1011
+; if
+; JmpF -> else
+52110000
+; then:
+12840e00
+120e0000
+12851800
+12180100
+; const "String.charAt"
+9000000d
+120df800
+12840f00
+120f0000
+12851900
+041a0000
+20191a1b
+121b0100
+; const "String.charAt"
+9000000e
+120efa00
+12f80f00
+; const 60
+07000010
+400f1011
+; and
+; JmpF -> and_end
+52110000
+12fa1300
+; const 60
+07000014
+40131415
+; and_end:
+; if
+; truthiness: check int 0
+03070000
+40150711
+49111100
+; JmpF -> else
+52110000
+; truthiness: check bool false
+04120000
+40071213
+40151314
+49141400
+; JmpF -> else
+52140000
+; then:
+; const 3
+07000010
+; const 65536
+07000011
+22101112
+; const 42
+07000011
+; const 256
+07000012
+22111213
+05120000
+20131213
+20121312
+12121100
+; Jmp -> end
+50000000
+; else:
+12f81000
+; const 62
+07000011
+40101112
+; and
+; JmpF -> and_end
+52120000
+12fa1400
+; const 62
+07000015
+40141516
+; and_end:
+; if
+; truthiness: check int 0
+03070000
+40160712
+49121200
+; JmpF -> else
+52120000
+; truthiness: check bool false
+04130000
+40071314
+40161415
+49151500
+; JmpF -> else
+52150000
+; then:
+; const 3
+07000011
+; const 65536
+07000012
+22111213
+; const 43
+07000012
+; const 256
+07000013
+22121314
+05130000
+20141314
+20131413
+12131200
+; Jmp -> end
+50000000
+; else:
+03110000
+12111200
+; end:
+12121100
+; end:
+12110e00
+; Jmp -> end
+50000000
+; else:
+030d0000
+120d0e00
+; end:
+120e0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff27
+12279d00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8500
+12850b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8600
+12860b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8700
+12870b00
+12f80c00
+120cc700
+12850d00
+120d0a00
+64c7010c
+120cc800
+12860e00
+120e0a00
+64c8010d
+120dc900
+12870f00
+120f0a00
+64c9010e
+120ef800
+12f80d00
+12870e00
+410d0e0f
+; if
+; JmpF -> else
+520f0000
+; then:
+12850f00
+120f0000
+12f81900
+12190100
+; const "String.charAt"
+9000000e
+120efb00
+12fb0f00
+; const 58
+07000010
+400f1011
+; if
+; JmpF -> else
+52110000
+; then:
+12f81000
+1210cd00
+12851100
+12110a00
+64cd0110
+12105d00
+12f81200
+04130000
+20121314
+12140a00
+645d0111
+12115e00
+12871300
+12130a00
+645e0112
+1212fe00
+12fc1100
+12115e00
+12851200
+12120a00
+645e0111
+12115f00
+12fe1300
+12130a00
+645f0112
+12126000
+12871400
+12140a00
+64600113
+12136100
+03150000
+12150a00
+64610114
+12148f00
+12d21200
+12125f00
+128f1300
+12130a00
+645f0112
+12121100
+; Jmp -> end
+50000000
+; else:
+12f81000
+12101100
+; end:
+12110f00
+; Jmp -> end
+50000000
+; else:
+12f80e00
+120e0f00
+; end:
+120f0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff28
+12289f00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8600
+12860b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8700
+12870b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8800
+12880b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8900
+12890b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8a00
+128a0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8b00
+128b0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8c00
+128c0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8d00
+128d0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8e00
+128e0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8f00
+128f0b00
+12880c00
+040d0000
+200c0d0e
+12891000
+410e1011
+; if
+; JmpF -> else
+52110000
+; then:
+12870e00
+120e0000
+12881800
+12180100
+; const "String.charAt"
+9000000d
+120d9000
+12870f00
+120f0000
+12881900
+041a0000
+20191a1b
+121b0100
+; const "String.charAt"
+9000000e
+120e9200
+12900f00
+; const 61
+07000010
+400f1011
+; and
+; JmpF -> and_end
+52110000
+12921300
+; const 62
+07000014
+40131415
+; and_end:
+; if
+; truthiness: check int 0
+03070000
+40150711
+49111100
+; JmpF -> else
+52110000
+; truthiness: check bool false
+04120000
+40071213
+40151314
+49141400
+; JmpF -> else
+52140000
+; then:
+12de1000
+12106400
+; const "Jmp -> fn_end"
+07000011
+12110a00
+64640110
+12109500
+12e41100
+12116600
+; const 80
+07000012
+12120a00
+64660111
+12116700
+03130000
+12130a00
+64670112
+12126800
+03140000
+12140a00
+64680113
+12136900
+03150000
+12150a00
+64690114
+12149700
+12de1200
+12126800
+; const "FN_START"
+07000013
+12130a00
+64680112
+12129900
+; const 100
+07000013
+128c1400
+20131415
+12159b00
+12e41400
+12146c00
+; const 18
+07000015
+12150a00
+646c0114
+12146d00
+; const 10
+07000016
+12160a00
+646d0115
+12156e00
+129b1700
+12170a00
+646e0116
+12166f00
+03180000
+12180a00
+646f0117
+12179d00
+12971500
+12156e00
+128b1600
+12160a00
+646e0115
+12156f00
+128c1700
+12170a00
+646f0116
+12167000
+03180000
+12180a00
+64700117
+12177100
+03190000
+12190a00
+64710118
+12189f00
+129f1700
+12170000
+; const "String.length"
+90000016
+128b1800
+12180000
+; const "String.length"
+90000017
+21161718
+; const 4
+07000017
+23181718
+1218a100
+12a11700
+03180000
+42171819
+; if
+; JmpF -> else
+52190000
+; then:
+12911800
+12187300
+129f1900
+12190a00
+64730118
+12187400
+12d21a00
+121a7500
+128e1b00
+121b0a00
+6475011a
+121a0a00
+64740119
+12197500
+129b1b00
+121b0a00
+6475011a
+121a1900
+; Jmp -> end
+50000000
+; else:
+12911800
+12187300
+128b1900
+12190a00
+64730118
+12187400
+12d21a00
+121a7500
+128e1b00
+121b0a00
+6475011a
+121a0a00
+64740119
+12197500
+129b1b00
+121b0a00
+6475011a
+121a1900
+; end:
+1219a300
+128c1800
+12a11900
+041a0000
+20191a1b
+20181b1a
+121aa500
+12ec1900
+12197600
+031a0000
+121a0a00
+64760119
+12197700
+12a11b00
+121b0a00
+6477011a
+121a7800
+031c0000
+121c0a00
+6478011b
+121b7900
+031d0000
+121d0a00
+6479011c
+121ca700
+12e41a00
+121a7800
+; const 18
+0700001b
+121b0a00
+6478011a
+121a7900
+129b1c00
+121c0a00
+6479011b
+121b7a00
+; const 11
+0700001d
+12a11e00
+201d1e1f
+121f0a00
+647a011c
+121c7b00
+031e0000
+121e0a00
+647b011d
+121da900
+12861b00
+121b7a00
+12871c00
+121c0a00
+647a011b
+121b7b00
+12881d00
+051e0000
+201d1e1f
+121f0a00
+647b011c
+121c7c00
+12891e00
+121e0a00
+647c011d
+121d7d00
+128d1f00
+121f0a00
+647d011e
+121e7e00
+04210000
+21202122
+12220a00
+647e011f
+121f7f00
+; const 12
+07000021
+12a12200
+20212223
+12230a00
+647f0120
+12208000
+12a32200
+12220a00
+64800121
+12218100
+12a52300
+12230a00
+64810122
+1222ab00
+12ab1c00
+; const 18
+0700001d
+2b1c1d1e
+121ead00
+12d01d00
+121d7e00
+12ab1e00
+121e0a00
+647e011d
+121daf00
+12e41e00
+121e8000
+; const 18
+0700001f
+121f0a00
+6480011e
+121e8100
+12ad2000
+12200a00
+6481011f
+121f8200
+03210000
+12210a00
+64820120
+12208300
+03220000
+12220a00
+64830121
+1221b100
+12e41f00
+121f8200
+; const 87
+07000020
+12200a00
+6482011f
+121f8300
+03210000
+12210a00
+64830120
+12208400
+03220000
+12220a00
+64840121
+12218500
+03230000
+12230a00
+64850122
+1222b300
+12de2000
+12208400
+; const "fn_end:"
+07000021
+12210a00
+64840120
+1220b500
+128e2100
+1221b700
+12e42200
+12228800
+; const 96
+07000023
+12230a00
+64880122
+12228900
+; const 255
+07000024
+12240a00
+64890123
+12238a00
+; const 255
+07000025
+12250a00
+648a0124
+12248b00
+12b72600
+12260a00
+648b0125
+1225b900
+12ec2300
+12238a00
+12b72400
+12240a00
+648a0123
+12238b00
+12a12500
+12250a00
+648b0124
+12248c00
+03260000
+12260a00
+648c0125
+12258d00
+04270000
+12270a00
+648d0126
+1226bb00
+12b72400
+; const 262144
+07000025
+22242526
+12af2500
+20262526
+12261100
+; Jmp -> end
+50000000
+; else:
+128e1000
+; const 262144
+07000011
+22101112
+128f1100
+20121112
+12121100
+; end:
+12110e00
+; Jmp -> end
+50000000
+; else:
+128e0d00
+; const 262144
+0700000e
+220d0e0f
+128f0e00
+200f0e0f
+120f0e00
+; end:
+120e0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff29
+1229a100
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8700
+12870b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8800
+12880b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8900
+12890b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8a00
+128a0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8b00
+128b0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8c00
+128c0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8d00
+128d0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8e00
+128e0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8f00
+128f0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a9000
+12900b00
+12f80c00
+120c5f00
+12880d00
+120d0a00
+645f010c
+120c6000
+12900e00
+120e0a00
+6460010d
+120d6100
+128a0f00
+120f0a00
+6461010e
+120e9000
+12900d00
+128a0e00
+410d0e0f
+; if
+; JmpF -> else
+520f0000
+; then:
+12880f00
+120f0000
+12901900
+12190100
+; const "String.charAt"
+9000000e
+120e9300
+12930f00
+; const 40
+07000010
+400f1011
+; if
+; JmpF -> else
+52110000
+; then:
+12f81000
+12106500
+12881100
+12110a00
+64650110
+12106600
+12901200
+04130000
+20121314
+12140a00
+64660111
+12116700
+128a1300
+12130a00
+64670112
+12129600
+12fc1100
+12116700
+12881200
+12120a00
+64670111
+12116800
+12961300
+12130a00
+64680112
+12126900
+128a1400
+12140a00
+64690113
+12136a00
+03150000
+12150a00
+646a0114
+12149800
+12981200
+; const 16
+07000013
+2b121314
+12149a00
+12d21300
+12136b00
+12981400
+12140a00
+646b0113
+12139c00
+129f1400
+12146d00
+12881500
+12150a00
+646d0114
+12146e00
+129c1600
+12160a00
+646e0115
+12156f00
+128a1700
+12170a00
+646f0116
+12169e00
+129e1500
+128a1600
+41151617
+; if
+; JmpF -> else
+52170000
+; then:
+12881700
+12170000
+129e2100
+12210100
+; const "String.charAt"
+90000016
+1216a100
+12a11700
+; const 41
+07000018
+40171819
+; if
+; JmpF -> else
+52190000
+; then:
+12f81800
+12187300
+12881900
+12190a00
+64730118
+12187400
+129e1a00
+041b0000
+201a1b1c
+121c0a00
+64740119
+12197500
+128a1b00
+121b0a00
+6475011a
+121aa400
+12a11900
+12197400
+12871a00
+121a0a00
+64740119
+12197500
+12881b00
+121b0a00
+6475011a
+121a7600
+12a41c00
+121c0a00
+6476011b
+121b7700
+128a1d00
+121d0a00
+6477011c
+121c7800
+129a1e00
+121e0a00
+6478011d
+121d7900
+128c1f00
+121f0a00
+6479011e
+121e7a00
+128d2000
+12200a00
+647a011f
+121f7b00
+128e2100
+12210a00
+647b0120
+12207c00
+129a2200
+12220a00
+647c0121
+12217d00
+128f2300
+12230a00
+647d0122
+12221900
+; Jmp -> end
+50000000
+; else:
+129a1800
+; const 262144
+07000019
+2218191a
+128f1900
+201a191a
+121a1900
+; end:
+12191700
+; Jmp -> end
+50000000
+; else:
+129a1600
+; const 262144
+07000017
+22161718
+128f1700
+20181718
+12181700
+; end:
+12171100
+; Jmp -> end
+50000000
+; else:
+128b1000
+; const 262144
+07000011
+22101112
+128f1100
+20121112
+12121100
+; end:
+12110f00
+; Jmp -> end
+50000000
+; else:
+128b0e00
+; const 262144
+0700000f
+220e0f10
+128f0f00
+20100f10
+12100f00
+; end:
+120f0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff2a
+122aa300
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8800
+12880b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8900
+12890b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8a00
+128a0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8b00
+128b0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8c00
+128c0b00
+12fe0c00
+120ccc00
+12880d00
+120d0a00
+64cc010c
+120ccd00
+12890e00
+120e0a00
+64cd010d
+120d5d00
+128a0f00
+120f0a00
+645d010e
+120e5e00
+; const ""
+07000010
+12100a00
+645e010f
+120ffd00
+; const 34
+0700000e
+120e0000
+; const "String.from_char"
+9000000d
+120dff00
+12de0e00
+120e5f00
+; const "const "
+0700000f
+12ff1000
+12fd1100
+12ff1200
+20111213
+20101312
+200f1211
+12110a00
+645f010e
+120e9000
+12e40f00
+120f6100
+; const 144
+07000010
+12100a00
+6461010f
+120f6200
+03110000
+12110a00
+64620110
+12106300
+03120000
+12120a00
+64630111
+12116400
+128b1300
+12130a00
+64640112
+12129200
+128b1000
+; const 262144
+07000011
+22101112
+128c1100
+20121112
+12120000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff2b
+122ba500
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8900
+12890b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8a00
+128a0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8b00
+128b0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8c00
+128c0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8d00
+128d0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8e00
+128e0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a8f00
+128f0b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a9000
+12900b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a9100
+12910b00
+; Jmp -> fn_end
+50000000
+; FN_START
+120a9200
+12920b00
+128c0c00
+128d0d00
+410c0d0e
+; if
+; JmpF -> else
+520e0000
+; then:
+128a0e00
+120e0000
+128c1800
+12180100
+; const "String.charAt"
+9000000d
+120d9300
+128e0e00
+120e9500
+12930f00
+; const 41
+07000010
+400f1011
+; if
+; JmpF -> else
+52110000
+; then:
+12a51000
+12106600
+128a1100
+12110a00
+64660110
+12106700
+128b1200
+12120a00
+64670111
+12116800
+128d1300
+12130a00
+64680112
+12126900
+12951400
+12140a00
+64690113
+12136a00
+12f81500
+12156b00
+128a1600
+12160a00
+646b0115
+12156c00
+128c1700
+04180000
+20171819
+12190a00
+646c0116
+12166d00
+128d1800
+12180a00
+646d0117
+12170a00
+646a0114
+12141100
+; Jmp -> end
+50000000
+; else:
+12931000
+; const 44
+07000011
+40101112
+; if
+; JmpF -> else
+52120000
+; then:
+; const 268435456
+07000011
+; const 4096
+07000012
+22111213
+12139900
+12f81200
+12126a00
+128a1300
+12130a00
+646a0112
+12126b00
+128c1400
+04150000
+20141516
+12160a00
+646b0113
+12136c00
+128d1500
+12150a00
+646c0114
+12149b00
+12891300
+12136c00
+128a1400
+12140a00
+646c0113
+12136d00
+129b1500
+12150a00
+646d0114
+12146e00
+128d1600
+12160a00
+646e0115
+12156f00
+12991700
+12170a00
+646f0116
+12167000
+03180000
+12180a00
+64700117
+12177100
+128e1900
+041a0000
+20191a1b
+121b0a00
+64710118
+12187200
+128f1a00
+121a0a00
+64720119
+12197300
+12901b00
+121b0a00
+6473011a
+121a9d00
+129d1400
+; const 18
+07000015
+2b141516
+12169f00
+12d01500
+12157000
+129d1600
+12160a00
+64700115
+1215a100
+12e41600
+12167200
+; const 18
+07000017
+12170a00
+64720116
+12167300
+129f1800
+12180a00
+64730117
+12177400
+03190000
+12190a00
+64740118
+12187500
+031a0000
+121a0a00
+64750119
+1219a300
+12f81700
+12177400
+128a1800
+12180a00
+64740117
+12177500
+12a11900
+12190a00
+64750118
+12187600
+128d1a00
+121a0a00
+64760119
+1219a500
+12a51800
+128d1900
+4118191a
+; if
+; JmpF -> else
+521a0000
+; then:
+128a1a00
+121a0000
+12a52400
+12240100
+; const "String.charAt"
+90000019
+1219a800
+12a81a00
+; const 41
+0700001b
+401a1b1c
+; if
+; JmpF -> else
+521c0000
+; then:
+12a51b00
+121b7900
+128a1c00
+121c0a00
+6479011b
+121b7a00
+128b1d00
+121d0a00
+647a011c
+121c7b00
+128d1e00
+121e0a00
+647b011d
+121d7c00
+12951f00
+121f0a00
+647c011e
+121e7d00
+12f82000
+12207e00
+128a2100
+12210a00
+647e0120
+12207f00
+12a52200
+04230000
+20222324
+12240a00
+647f0121
+12218000
+128d2300
+12230a00
+64800122
+12220a00
+647d011f
+121f1c00
+; Jmp -> end
+50000000
+; else:
+12a81b00
+; const 44
+0700001c
+401b1c1d
+; if
+; JmpF -> else
+521d0000
+; then:
+12f81c00
+121c7b00
+128a1d00
+121d0a00
+647b011c
+121c7c00
+12a51e00
+041f0000
+201e1f20
+12200a00
+647c011d
+121d7d00
+128d1f00
+121f0a00
+647d011e
+121eac00
+12891d00
+121d7d00
+128a1e00
+121e0a00
+647d011d
+121d7e00
+12ac1f00
+121f0a00
+647e011e
+121e7f00
+128d2000
+12200a00
+647f011f
+121f8000
+12992100
+12210a00
+64800120
+12208100
+03220000
+12220a00
+64810121
+12218200
+128e2300
+; const 11
+07000024
+20232425
+12250a00
+64820122
+12228300
+128f2400
+12240a00
+64830123
+12238400
+12902500
+12250a00
+64840124
+1224ae00
+12ae1e00
+; const 18
+0700001f
+2b1e1f20
+1220b000
+12d01f00
+121f8100
+12ae2000
+12200a00
+6481011f
+121fb200
+12e42000
+12208300
+; const 18
+07000021
+12210a00
+64830120
+12208400
+12b02200
+12220a00
+64840121
+12218500
+04230000
+12230a00
+64850122
+12228600
+03240000
+12240a00
+64860123
+1223b400
+12f82100
+12218500
+128a2200
+12220a00
+64850121
+12218600
+12b22300
+12230a00
+64860122
+12228700
+128d2400
+12240a00
+64870123
+1223b600
+12b62200
+128d2300
+41222324
+; if
+; JmpF -> else
+52240000
+; then:
+128a2400
+12240000
+12b62e00
+122e0100
+; const "String.charAt"
+90000023
+1223b900
+12b92400
+; const 41
+07000025
+40242526
+; if
+; JmpF -> else
+52260000
+; then:
+12a52500
+12258a00
+128a2600
+12260a00
+648a0125
+12258b00
+128b2700
+12270a00
+648b0126
+12268c00
+128d2800
+12280a00
+648c0127
+12278d00
+12952900
+12290a00
+648d0128
+12288e00
+12f82a00
+122a8f00
+128a2b00
+122b0a00
+648f012a
+122a9000
+12b62c00
+042d0000
+202c2d2e
+122e0a00
+6490012b
+122b9100
+128d2d00
+122d0a00
+6491012c
+122c0a00
+648e0129
+12292600
+; Jmp -> end
+50000000
+; else:
+12b92500
+; const 44
+07000026
+40252627
+; if
+; JmpF -> else
+52270000
+; then:
+12f82600
+12268c00
+128a2700
+12270a00
+648c0126
+12268d00
+12b62800
+04290000
+2028292a
+122a0a00
+648d0127
+12278e00
+128d2900
+12290a00
+648e0128
+1228bd00
+12892700
+12278e00
+128a2800
+12280a00
+648e0127
+12278f00
+12bd2900
+12290a00
+648f0128
+12289000
+128d2a00
+122a0a00
+64900129
+12299100
+12992b00
+122b0a00
+6491012a
+122a9200
+032c0000
+122c0a00
+6492012b
+122b9300
+128e2d00
+; const 21
+0700002e
+202d2e2f
+122f0a00
+6493012c
+122c9400
+128f2e00
+122e0a00
+6494012d
+122d9500
+12902f00
+122f0a00
+6495012e
+122ebf00
+12bf2800
+; const 18
+07000029
+2b28292a
+122ac100
+12d02900
+12299200
+12bf2a00
+122a0a00
+64920129
+1229c300
+12e42a00
+122a9400
+; const 18
+0700002b
+122b0a00
+6494012a
+122a9500
+122ac500
+12c59300
+12c59100
+12c58f00
+12c58d00
+12c58b00
+12c58b00
+12c52700
+; Jmp -> end
+50000000
+; else:
+12252600
+; end:
+12262400
+; Jmp -> end
+50000000
+; else:
+12221d00
+; Jmp -> end
+50000000
+; else:
+121b1c00
+; end:
+121c1a00
+; Jmp -> end
+50000000
+; else:
+12181200
+; Jmp -> end
+50000000
+; else:
+12101100
+; end:
+12110e00
+; Jmp -> end
+50000000
+; else:
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff0c
+120c0000
+57000000
+; fn_end:
+60ffff2c
+122ca700
+12a70000
+01000000
+; result in r167

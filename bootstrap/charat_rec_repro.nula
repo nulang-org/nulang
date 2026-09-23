@@ -1,0 +1,13 @@
+// Minimal repro: charAt inside recursion-callback shard corrupts callback register.
+fn shard(comp_rec, src: String, pos: Int, n: Int) -> Int {
+    let c = perform String.charAt(src, pos);
+    if pos < n then comp_rec(src, pos + 1, n) else c
+}
+
+fn comp(src: String, pos: Int, n: Int) -> Int {
+    shard(comp, src, pos, n)
+}
+
+fn main() {
+    perform IO.print(comp("abc", 0, 2))
+}

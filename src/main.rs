@@ -347,7 +347,7 @@ fn main() {
                     opts.store_path = Some(args[i + 1].clone());
                     i += 1;
                 } else {
-                    eprintln!("Error: --store requires a directory path argument");
+                    eprintln!("Error: --store requires a store URI argument");
                     std::process::exit(1);
                 }
             }
@@ -753,6 +753,13 @@ fn main() {
                 std::process::exit(exit_code(&e));
             }
         }
+        // Eval consumed the request: without this return, a piped stdin
+        // (non-terminal) fell through to the stdin-script block below and
+        // executed the empty/leftover stdin as a second program — e.g.
+        // `nulang --backend wasm-run --eval '1+2*3' < /dev/null` ran an
+        // empty module after the eval, failing on the missing nulang_init
+        // export (and double-running every other backend's eval).
+        return;
     }
     if let Some(path) = opts.check_file {
         let source = match std::fs::read_to_string(&path) {
@@ -821,7 +828,11 @@ fn main() {
         // compiler. This is the durable-distribution path — a `.nbc` minted
         // in 2026 runs on any conforming runtime in 2126.
         if path.ends_with(".nbc") {
-            if let Err(e) = run_nbc_file(path, opts.verify_source.as_deref()) {
+            if let Err(e) = run_nbc_file(
+                path,
+                opts.verify_source.as_deref(),
+                opts.store_path.as_deref(),
+            ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
             }
@@ -1009,10 +1020,13 @@ struct Options {
     with_capabilities: Vec<String>,
     /// Target ISA for AOT compilation: native (default), ptx, riscv64
     target: String,
-    /// Durable store directory for programs that declare durable/persistent
+    /// Durable store URI for programs that declare durable/persistent
     /// entities. `None` = resolve at run time: `NULANG_STORE_PATH` env var,
     /// else `.nulang/store/`. Only consulted when the program declares
     /// durable entities; other programs keep the in-memory store.
+    ///
+    /// Supported forms: `<dir>` or `json:<dir>` (JSON file store),
+    /// `rocksdb:<path>`, and `postgres:<conn_str>`.
     store_path: Option<String>,
     /// Escalate warnings (e.g. RFC 0015 deprecations) to a hard error.
     deny_warnings: bool,
@@ -1071,15 +1085,20 @@ fn print_help() {
     println!("  --emit-stdlib-docs <dir>  Generate per-effect stdlib Markdown docs into <dir>");
     println!("  --lsp            Start Language Server (stdio)");
     println!("  --dap            Start Debug Adapter (stdio; program via launch request)");
-    print!("  --backend <b>    Backend: bytecode (default) | native | core-vm");
+    print!("  --backend <b>    Backend: bytecode (default) | core-vm");
+    if cfg!(feature = "native-codegen") {
+        print!(" | native");
+    }
     if cfg!(feature = "wasm-backend") {
         print!(" | wasm | wasm-run | wasm-aot");
     }
     println!();
     println!("                   core-vm: frozen Core interpreter (Stage 3 bootstrap)");
-    println!("                   native: pure-functional subset only (no effects,");
-    println!("                   actors, or FFI — errors name the unsupported");
-    println!("                   construct; use bytecode for full-language programs)");
+    if cfg!(feature = "native-codegen") {
+        println!("                   native: pure-functional subset only (no effects,");
+        println!("                   actors, or FFI — errors name the unsupported");
+        println!("                   construct; use bytecode for full-language programs)");
+    }
     if cfg!(feature = "wasm-backend") {
         println!("                   wasm*: IO.print/read only (no user-defined effect");
         println!("                   handlers, no actor mailbox)");
@@ -1088,7 +1107,11 @@ fn print_help() {
         println!("                   wasmfx*: suspending effects lower to WasmFX stack");
         println!("                   switching (LLM.ask, Signal.wait, ReceiveWait)");
     }
-    println!("  --target <t>     Target ISA for native backend: native (default) | ptx | riscv64");
+    if cfg!(feature = "native-codegen") {
+        println!(
+            "  --target <t>     Target ISA for native backend: native (default) | ptx | riscv64"
+        );
+    }
     if cfg!(feature = "wasm-backend") {
         println!("  --out <file>     Output file for WASM backends (default: out.wasm)");
     }
@@ -1113,8 +1136,9 @@ fn print_help() {
     println!("  --metrics-port <N>  Start Prometheus metrics server on port N");
     println!("  --emit-signals <file> Emit signal graph JSON for the web framework");
     println!("  --rewrite-signals <file> Rewrite HTML for signals and emit client JS");
-    println!("  --store <dir>    Durable store directory for programs declaring durable");
-    println!("                   entities (default: $NULANG_STORE_PATH or .nulang/store/)");
+    println!("  --store <uri>    Durable store URI for programs declaring durable");
+    println!("                   entities (default: $NULANG_STORE_PATH or .nulang/store/).");
+    println!("                   Forms: <dir>|json:<dir>|rocksdb:<path>|postgres:<conn_str>");
     println!("  --color auto|always|never  Colorize error output (default: auto)");
     println!("  -h, --help       Show this help message");
 }
@@ -1364,21 +1388,10 @@ fn run_node_cmd(_args: &[String]) -> NuResult<()> {
 }
 
 fn print_error(err: &NuError, use_color: bool) {
-    // Prefer the ariadne-based renderer (source snippet with carets/labels,
-    // notes, and a stable `Error[Exxxx]` code). It returns `None` when no
-    // thread-local SourceMap is installed (e.g. errors raised before lexing
-    // or in synthetic contexts) — fall back to the hand-rolled rich format.
-    // Non-tty/CI output stays plain `Display` so tooling (and the
-    // conformance suite) can match on stable `Error: ...` prefixes.
-    if use_color {
-        if let Some(rendered) = nulang::diagnostic::render(err, true) {
-            eprint!("{rendered}");
-        } else {
-            eprint!("{}", err.format_rich());
-        }
-    } else {
-        eprintln!("Error: {}", err);
-    }
+    // Use the canonical rich diagnostic renderer (ariadne source snippet when
+    // a source map is installed, plain Rust-style fallback otherwise). The
+    // rendered report already ends with a newline.
+    eprint!("{}", nulang::diagnostic::format_diagnostic(err, use_color));
 }
 
 /// Resolve the `--color` flag against `is_terminal`.
@@ -1774,7 +1787,18 @@ fn run_source(
                     span: Span::default(),
                 }
             })?;
-            wasm_backend.run(&wasm_bytes)?;
+            // Run via the host runtime directly (not `WasmBackend::run`) so
+            // the Wasmtime store stays alive while the program result is
+            // stringified — a string result's bytes live in linear memory
+            // and would otherwise print as a raw `#Value(...)` repr.
+            let mut runtime = nulang::wasm_runtime::WasmRuntime::new(&wasm_bytes, None)?;
+            let result = runtime.run()?;
+            let result_str = runtime
+                .string_value(&result)
+                .unwrap_or_else(|| result.to_string_repr());
+            if !result_str.is_empty() && result_str != "unit" && result_str != "()" {
+                println!("{}", result_str);
+            }
             return Ok(());
         }
         #[cfg(feature = "wasm-backend")]
@@ -1861,6 +1885,7 @@ fn run_source(
             msg: "wasm backend not compiled in (enable 'wasm-backend' feature)".into(),
             span: Span::default(),
         }),
+        #[cfg(feature = "native-codegen")]
         "native" => {
             let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
             let mir = nulang::mir_lower::lower_module(&hir)?;
@@ -1890,14 +1915,86 @@ fn run_source(
                 return Ok(());
             }
 
-            let result_raw = aot_module.run()?;
-            let result = nulang::vm::Value::from_raw(result_raw);
-            let result_str = result.to_string_repr();
+            // Modules that declare actors need a real Runtime: spawn/send must
+            // create live actors and the scheduler must drain their mailboxes.
+            // Pure modules can use the synchronous standalone runner.
+            let has_actors = !mir.behaviors.is_empty();
+            let result_raw = if has_actors {
+                let mut rt = nulang::runtime::Runtime::new();
+                let has_durable = ast.decls.iter().any(|d| {
+                    matches!(
+                        d,
+                        nulang::ast::Decl::Actor {
+                            persistent: true,
+                            ..
+                        }
+                    )
+                }) || matches!(
+                    ast.decls.iter().find(|d| matches!(d, nulang::ast::Decl::Actor { .. })),
+                    Some(nulang::ast::Decl::Actor { state_fields, .. })
+                        if state_fields.iter().any(|(_, model, _, _)| matches!(
+                            model,
+                            nulang::ast::StateModel::Durable | nulang::ast::StateModel::EventSourced
+                        ))
+                );
+                let store_dir = if has_durable {
+                    Some(
+                        store_path
+                            .map(|s| s.to_string())
+                            .or_else(|| std::env::var("NULANG_STORE_PATH").ok())
+                            .unwrap_or_else(|| ".nulang/store".to_string()),
+                    )
+                } else {
+                    None
+                };
+                if let Some(dir) = store_dir.as_deref() {
+                    install_persistence_store(&mut rt, dir)?;
+                }
+                if let Some(port) = metrics_port {
+                    let _ = rt.enable_metrics_server(port);
+                }
+                let raw = aot_module.run_in_runtime(&mut rt)?;
+                let failures = rt.workflow_failures();
+                if !failures.is_empty() {
+                    for (step_name, error) in &failures {
+                        eprintln!("workflow step '{}' failed: {}", step_name, error);
+                    }
+                    std::process::exit(1);
+                }
+                if verbose {
+                    let snap = rt.metrics_snapshot();
+                    match serde_json::to_string(&snap) {
+                        Ok(json) => eprintln!("[metrics] {}", json),
+                        Err(_) => eprintln!("[metrics] <serialization error>"),
+                    }
+                    eprintln!("{}", rt.render_topology());
+                }
+                rt.publish_metrics();
+                raw
+            } else {
+                aot_module.run()?
+            };
+            // SAFETY: result_raw was produced by Nulang-generated native/AOT code
+            // using the same in-process Value ABI. String payloads are materialized
+            // before the standalone AOT heap is torn down and are not dereferenced
+            // through this fallback Value afterwards.
+            let result = unsafe { nulang::vm::Value::from_raw(result_raw) };
+            // Native runs materialize a string result before tearing down the
+            // standalone heap (see `aot::take_aot_result_repr`); without it
+            // the payload pointer dangles and string results print as raw
+            // `#Value(...)` instead of their content.
+            let result_str =
+                nulang::aot::take_aot_result_repr().unwrap_or_else(|| result.to_string_repr());
             if !result_str.is_empty() && result_str != "unit" && result_str != "()" {
                 println!("{}", result_str);
             }
             Ok(())
         }
+        #[cfg(not(feature = "native-codegen"))]
+        "native" => Err(nulang::types::NuError::VMError {
+            msg: "native backend not compiled in (enable 'native-codegen' feature)".into(),
+            span: Span::default(),
+        }),
         "bytecode" => {
             // Bytecode backend (default).
             let m = compile_with_new_pipeline(&ast, "main", &type_checker)?;
@@ -2005,7 +2102,10 @@ fn run_source(
             let result_str = if let Some(s) = vm.resolve_display_string(value) {
                 s
             } else {
-                nulang::vm::Value::from_raw(value).to_string_repr()
+                // SAFETY: this raw result was returned by the in-process CoreVM ABI.
+                // resolve_display_string handled live pointer/string cases above;
+                // this fallback only formats non-dereferencing immediate/tag metadata.
+                unsafe { nulang::vm::Value::from_raw(value) }.to_string_repr()
             };
             if !result_str.is_empty() && result_str != "unit" && result_str != "()" {
                 println!("{}", result_str);
@@ -2027,18 +2127,71 @@ fn run_source(
     }
 }
 
-/// Swap a runtime's in-memory persistence store for a file-backed
-/// [`JsonFileStore`](nulang::runtime::JsonFileStore) rooted at `dir`.
+/// Swap a runtime's in-memory persistence store for the backend described by
+/// `uri`.
+///
+/// Supported URI forms:
+/// - `<dir>` or `json:<dir>` — JSON file store (`JsonFileStore`).
+/// - `rocksdb:<path>` — RocksDB backend (requires the `rocksdb` feature).
+/// - `postgres:<conn_str>` — PostgreSQL backend (requires the `postgres`
+///   feature).
+///
 /// Used by `nulang run` when the program declares durable/event-sourced
 /// entities so their state survives process restarts.
-fn install_file_store(runtime: &mut nulang::runtime::Runtime, dir: &str) -> NuResult<()> {
-    let store = nulang::runtime::JsonFileStore::new(dir).map_err(|e| NuError::RuntimeError {
-        msg: format!("failed to open durable store at '{}': {}", dir, e),
-        span: Span::default(),
-    })?;
-    runtime.persistence = Box::new(store);
-    eprintln!("[durable] persistent store: {}", dir);
-    Ok(())
+fn install_persistence_store(runtime: &mut nulang::runtime::Runtime, uri: &str) -> NuResult<()> {
+    if uri.starts_with("rocksdb:") {
+        #[cfg(feature = "rocksdb")]
+        {
+            let path = &uri["rocksdb:".len()..];
+            let store =
+                nulang::runtime::RocksDbStore::new(path).map_err(|e| NuError::RuntimeError {
+                    msg: format!("failed to open RocksDB store at '{}': {}", path, e),
+                    span: Span::default(),
+                })?;
+            runtime.persistence = Box::new(store);
+            eprintln!("[durable] RocksDB persistent store: {}", path);
+            Ok(())
+        }
+        #[cfg(not(feature = "rocksdb"))]
+        {
+            Err(NuError::RuntimeError {
+                msg: "RocksDB persistence backend is not enabled (rebuild with --features rocksdb)"
+                    .to_string(),
+                span: Span::default(),
+            })
+        }
+    } else if uri.starts_with("postgres:") {
+        #[cfg(feature = "postgres")]
+        {
+            let conn = &uri["postgres:".len()..];
+            let store =
+                nulang::runtime::PostgresStore::new(conn).map_err(|e| NuError::RuntimeError {
+                    msg: format!("failed to connect to PostgreSQL '{}': {}", conn, e),
+                    span: Span::default(),
+                })?;
+            runtime.persistence = Box::new(store);
+            eprintln!("[durable] PostgreSQL persistent store: {}", conn);
+            Ok(())
+        }
+        #[cfg(not(feature = "postgres"))]
+        {
+            Err(NuError::RuntimeError {
+                msg: "PostgreSQL persistence backend is not enabled (rebuild with --features postgres)"
+                    .to_string(),
+                span: Span::default(),
+            })
+        }
+    } else {
+        let dir = uri.strip_prefix("json:").unwrap_or(uri);
+        let store =
+            nulang::runtime::JsonFileStore::new(dir).map_err(|e| NuError::RuntimeError {
+                msg: format!("failed to open durable store at '{}': {}", dir, e),
+                span: Span::default(),
+            })?;
+        runtime.persistence = Box::new(store);
+        eprintln!("[durable] persistent store: {}", dir);
+        Ok(())
+    }
 }
 
 /// Execute a module that declares actors against a real `Runtime`.
@@ -2069,7 +2222,7 @@ fn run_with_runtime(
         let mut shards = nulang::runtime::Runtime::new_sharded(num_shards);
         if let Some(dir) = store_dir {
             for shard in &mut shards {
-                install_file_store(shard, dir)?;
+                install_persistence_store(shard, dir)?;
             }
         }
         for shard in &mut shards {
@@ -2122,7 +2275,7 @@ fn run_with_runtime(
     } else {
         let runtime = std::rc::Rc::new(std::cell::RefCell::new(nulang::runtime::Runtime::new()));
         if let Some(dir) = store_dir {
-            install_file_store(&mut runtime.borrow_mut(), dir)?;
+            install_persistence_store(&mut runtime.borrow_mut(), dir)?;
         }
         runtime.borrow_mut().register_module_grains(&m);
         let mut vm = VM::new();
@@ -2281,8 +2434,10 @@ fn compile_source_to_nbc(
 
 /// Load and run a `.nbc` artifact directly, optionally verifying its recorded
 /// source hash against a source file. This is the durable-distribution path:
-/// no compiler invocation, no source parse — just `from_nbc` + `VM::run`.
-fn run_nbc_file(path: &str, verify_source: Option<&str>) -> NuResult<()> {
+/// no compiler invocation or source parse. Pure modules run directly in the VM;
+/// actor/workflow modules use `run_with_runtime` so spawn/send/state semantics
+/// match source execution.
+fn run_nbc_file(path: &str, verify_source: Option<&str>, store_path: Option<&str>) -> NuResult<()> {
     let bytes = std::fs::read(path).map_err(|e| nulang::types::NuError::VMError {
         msg: format!("cannot read .nbc file '{path}': {e}"),
         span: Span::default(),
@@ -2322,14 +2477,78 @@ fn run_nbc_file(path: &str, verify_source: Option<&str>) -> NuResult<()> {
         }
     }
 
-    let mut vm = VM::new();
-    vm.load_module(artifact.module);
-    let value = vm.run()?;
-    let result_str = value.to_string_repr();
+    let constants = artifact.module.constants.clone();
+    let (value, _runtime) = run_nbc_module(artifact.module, store_path)?;
+
+    let result_str = if value.is_string() || value.is_ptr() {
+        nulang::vm::resolve_value_string(&constants, value)
+    } else {
+        value.to_string_repr()
+    };
     if !result_str.is_empty() && result_str != "unit" && result_str != "()" {
         println!("{}", result_str);
     }
     Ok(())
+}
+
+/// Execute a deserialized `.nbc` module with the same actor semantics as
+/// source execution.
+///
+/// A bare `VM` installs `StandaloneVmCallbacks`, whose actor operations are
+/// deliberately inert (`spawn` returns actor-ref 0 and `send` is a no-op).
+/// Serialized actor/workflow modules therefore must use the real Runtime bridge
+/// and scheduler, exactly like the bytecode source path in `run_source`.
+fn run_nbc_module(
+    module: nulang::bytecode::CodeModule,
+    store_path: Option<&str>,
+) -> NuResult<(
+    nulang::vm::Value,
+    Option<std::rc::Rc<std::cell::RefCell<nulang::runtime::Runtime>>>,
+)> {
+    let has_actors = !module.actor_metadata.is_empty() || !module.behaviors.is_empty();
+    let has_durable = module.actor_metadata.iter().any(|meta| {
+        meta.persistent
+            || meta.is_workflow
+            || meta.state_models.iter().any(|(_, model)| {
+                matches!(
+                    model,
+                    nulang::ast::StateModel::Durable | nulang::ast::StateModel::EventSourced
+                )
+            })
+    });
+    let store_dir = if has_actors && has_durable {
+        Some(
+            store_path
+                .map(str::to_owned)
+                .or_else(|| std::env::var("NULANG_STORE_PATH").ok())
+                .unwrap_or_else(|| ".nulang/store".to_string()),
+        )
+    } else {
+        None
+    };
+
+    if has_actors {
+        let (value, runtime) = run_with_runtime(module, None, store_dir.as_deref())?;
+
+        let failures = runtime.borrow().workflow_failures();
+        if !failures.is_empty() {
+            let summary = failures
+                .iter()
+                .map(|(step, error)| format!("{step}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(NuError::RuntimeError {
+                msg: format!("workflow execution failed: {summary}"),
+                span: Span::default(),
+            });
+        }
+
+        Ok((value, Some(runtime)))
+    } else {
+        let mut vm = VM::new();
+        vm.load_module(module);
+        Ok((vm.run()?, None))
+    }
 }
 
 fn type_to_string(ty: &Type) -> String {
@@ -2472,6 +2691,97 @@ mod tests {
     /// An actor program run through the CLI path must create real actors
     /// and deliver sent messages: with the bare standalone VM the stub
     /// spawn/send callbacks would leave the counter at 0.
+    #[test]
+    fn test_nbc_actor_program_schedules_and_delivers() {
+        let source = r#"
+            actor Counter {
+                state count: Int = 0
+                behavior inc() { self.count = self.count + 1 }
+            }
+            let c = spawn Counter {} in {
+                send c inc()
+                send c inc()
+                c
+            }
+        "#;
+
+        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+            .expect("frontend should accept the actor program");
+        let module = compile_with_new_pipeline(&ast, "test", &type_checker)
+            .expect("actor program should compile");
+        let source_hash = blake3::hash(source.as_bytes());
+        let bytes = module
+            .to_nbc(Some(*source_hash.as_bytes()))
+            .expect("actor module should serialize to nbc");
+        let artifact = nulang::bytecode::CodeModule::from_nbc(&bytes)
+            .expect("serialized actor module should deserialize");
+
+        let (_value, runtime) =
+            run_nbc_module(artifact.module, None).expect("nbc actor program should run");
+        let runtime = runtime.expect("actor nbc must execute with a real Runtime");
+        let rt = runtime.borrow();
+        let actor = rt.actors.values().next().expect("one actor should exist");
+        assert_eq!(
+            actor.get_state_field("count").and_then(|v| v.as_int()),
+            Some(2),
+            "both inc messages must be delivered after nbc round-trip"
+        );
+    }
+
+    #[test]
+    fn test_nbc_persistent_actor_uses_requested_store() {
+        let source = r#"
+            persistent actor BankAccount {
+                state durable balance: Int = 0
+                behavior deposit(amount: Int) { self.balance = self.balance + amount }
+            }
+            let acc = spawn BankAccount {} in {
+                send acc deposit(50)
+                acc
+            }
+        "#;
+
+        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+            .expect("frontend should accept persistent actor program");
+        let module = compile_with_new_pipeline(&ast, "test", &type_checker)
+            .expect("persistent actor program should compile");
+        let source_hash = blake3::hash(source.as_bytes());
+        let bytes = module
+            .to_nbc(Some(*source_hash.as_bytes()))
+            .expect("persistent actor module should serialize");
+        let artifact = nulang::bytecode::CodeModule::from_nbc(&bytes)
+            .expect("persistent actor artifact should deserialize");
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let store_dir = std::env::temp_dir().join(format!(
+            "nulang-nbc-persist-{}-{unique}",
+            std::process::id()
+        ));
+        let store_str = store_dir.to_string_lossy().into_owned();
+
+        let (_value, runtime) = run_nbc_module(artifact.module, Some(&store_str))
+            .expect("persistent nbc actor program should run");
+        let runtime = runtime.expect("persistent actor nbc must use Runtime");
+        let rt = runtime.borrow();
+        let (actor_id, actor) = rt.actors.iter().next().expect("one actor should exist");
+        assert_eq!(
+            actor.get_state_field("balance").and_then(|v| v.as_int()),
+            Some(50)
+        );
+        let snapshot = store_dir
+            .join(format!("actor_{actor_id}"))
+            .join("snapshot.json");
+        assert!(
+            snapshot.exists(),
+            "durable nbc actor must checkpoint to the requested store"
+        );
+        drop(rt);
+        let _ = std::fs::remove_dir_all(store_dir);
+    }
+
     #[test]
     fn test_run_source_actor_program_schedules_and_delivers() {
         let source = r#"

@@ -1,0 +1,312 @@
+"""Self-hosting transforms for bootstrap/prep_core.py (let-chain depth workarounds)."""
+from __future__ import annotations
+
+import re
+
+Fn = tuple[str, list[str], str]
+
+_RECURSION_SPLITS = (
+    ('read_ident', 'read_ident_core', 'read_rec', None),
+    ('env_lookup', 'lookup_core', 'lk_rec', None),
+    ('count_captures', 'capcount_core', 'cc_rec', None),
+    ('remap_captures', 'remap_core', 'rm_rec', None),
+    ('emit_fnend_caps', 'caps_walk_core', 'walk_rec', 'caps_walk'),
+)
+_WRAPPER_DROP = frozenset(
+    {
+        'read_ident', 'env_lookup', 'count_captures', 'remap_captures',
+        'emit_fnend_caps',
+    }
+)
+_LATE_BIND = (
+    'low6', 'bit17', 'emit_cap_step', 'emit_fnend_step', 'emit_caps', 'env_decode',
+    'env_push', 'lookup_core', 'remap_core', 'capcount_core', 'caps_walk_core',
+    'prec_of', 'parse_cmp', 'parse_shift', 'read_string', 'read_string_end',
+)
+_LATE_SORT = {
+    'low6': 30,
+    'bit17': 31,
+    'env_decode': 32,
+    'env_push': 33,
+    'lookup_core': 34,
+    'remap_core': 35,
+    'capcount_core': 36,
+    'emit_cap_step': 37,
+    'emit_fnend_step': 38,
+    'emit_caps': 39,
+    'caps_walk_core': 40,
+    'parse_cmp': 41,
+    'parse_shift': 42,
+    'prec_of': 43,
+    'read_string': 44,
+    'read_string_end': 45,
+    'skip_fn_type': 62,
+    'nperform_finish': 63,
+    'comp_fn_closure': 64,
+    'comp_fn_parse': 65,
+    'comp_nperform_body': 66,
+    'comp_nperform_parse': 67,
+    'comp_nperform_arg0': 68,
+    'comp_nperform_arg1': 69,
+    'comp_nperform_arg2': 70,
+    'comp_nperform_args': 71,
+    'comp_nperform_more': 72,
+    'comp_char_digit': 73,
+    'comp_char_paren': 74,
+    'comp_char_string': 75,
+    'comp_kw_let': 76,
+    'comp_kw_fn': 77,
+    'comp_kw_if': 78,
+    'comp_kw_true': 79,
+    'comp_kw_false': 80,
+    'comp_kw_not': 81,
+    'comp_kw_nperform': 82,
+    'comp_kw_ident': 83,
+    'comp_left_value': 84,
+    'comp_infix_call': 85,
+    'comp_infix_cmp': 86,
+    'comp_infix_andor': 87,
+    'comp_infix_binop': 88,
+    'comp_alpha': 89,
+    'comp_value_primary': 90,
+    'comp_infix': 91,
+}
+_TERMINAL_FNS = ('comp', 'compile', 'main')
+_SELF_HOST_RENAMES = {'comp_nperform_parse': 'comp_nperform_pars'}
+_DROP_FROM_CHAIN = frozenset(
+    {
+        'remark', 'capcount_core', 'caps_walk_core', 'emit_caps', 'remap_core',
+        'skip_fn_type', 'nperform_finish', 'prec_of', 'low6', 'bit17', 'env_decode', 'read_int',
+        'comp_nperform_arg0', 'comp_nperform_arg1',
+        'comp_nperform_arg2', 'comp_nperform_args', 'comp_nperform_more',
+        # np_* shards are unused for the Stage-2 arithmetic oracle; dropping them
+        # keeps the let-chain under the host compiler's main()-call register ceiling.
+        'np_after2', 'np_arg2', 'np_after1', 'np_arg1', 'np_after0', 'np_arg0',
+        'np_body', 'np_parse',
+        'count_captures', 'emit_fnend_caps',
+    }
+)
+
+_READ_INT_STEP_BODY = (
+    'if rp >= len then ((ra * 65536)) + rp else '
+    '(let c = char_at(src)(rp) in '
+    'if is_digit(c) then read_int_step(src)(rp + 1)(len)(ra * 10 + (c - 48)) '
+    'else ((ra * 65536)) + rp)'
+)
+
+
+def _add_read_int_step_for_shards(fns: list[Fn]) -> list[Fn]:
+    """Shard bodies call read_int(); bind read_int_step at chain level (curried recursion)."""
+    if not any(n == 'comp' or n.startswith('comp_') for n, _, _ in fns):
+        return fns
+    pat = re.compile(r'read_int\s*\(\s*src\s*,\s*p\s*,\s*len\s*,\s*0\s*\)')
+    out: list[Fn] = []
+    for name, params, body in fns:
+        if name.startswith('comp_'):
+            body = pat.sub('read_int_step(src)(p)(len)(0)', body)
+        out.append((name, params, body))
+    if not any(n == 'read_int_step' for n, _, _ in out):
+        out.append(('read_int_step', ['src', 'rp', 'len', 'ra'], _READ_INT_STEP_BODY))
+    return out
+
+
+
+def _subst_params(body: str, params: list[str], args: list[str]) -> str:
+    out = body
+    for p, a in zip(params, args):
+        out = re.sub(rf'\b{re.escape(p)}\b', f'({a})', out)
+    return f'({out})'
+
+
+
+def _call_arg_list(args_parts: list[str]) -> list[str]:
+    if not args_parts:
+        return []
+    if len(args_parts) == 1:
+        return _split_call_args(args_parts[0])
+    return args_parts
+
+
+def _split_call_args(args_str: str) -> list[str]:
+    args: list[str] = []
+    depth = 0
+    curr = ''
+    in_str = False
+    for ch in args_str:
+        if ch == '"':
+            in_str = not in_str
+            curr += ch
+        elif in_str:
+            curr += ch
+        elif ch == ',' and depth == 0:
+            args.append(curr.strip())
+            curr = ''
+        elif ch in '({[':
+            depth += 1
+            curr += ch
+        elif ch in ')}]':
+            depth -= 1
+            curr += ch
+        else:
+            curr += ch
+    if curr.strip():
+        args.append(curr.strip())
+    return args
+
+
+def _inline_helper_functions(fns: list[Fn]) -> list[Fn]:
+    by_name = {n: (n, p, b) for n, p, b in fns}
+    drop = {'skip_fn_type', 'nperform_finish', 'prec_of', 'low6', 'bit17', 'env_decode', 'read_int'}
+    if not drop & by_name.keys():
+        return fns
+
+    def skip_fn_type_repl(args_parts: list[str]) -> str:
+        src, pos, length = (_call_arg_list(args_parts) + ['src', 'pos', 'len'])[:3]
+        return (
+            f'(let q5_raw = skip_ws({src})({pos})({length}) in '
+            f'if q5_raw < {length} then '
+            f'(let c_colon = nperform("String.charAt", {src}, q5_raw) in '
+            f'if c_colon == 58 then '
+            f'(let after_colon = skip_ws({src})(q5_raw + 1)({length}) in '
+            f'let type_id = read_ident({src})(after_colon)({length})(0) in '
+            f'low16(type_id)) else q5_raw) else q5_raw)'
+        )
+
+    def read_int_repl(args_parts: list[str]) -> str:
+        args = _call_arg_list(args_parts)
+        src, pos, length, acc = (args + ['src', 'pos', 'len', '0'])[:4]
+        return f'read_int_step({src})({pos})({length})({acc})'
+
+    def env_decode_repl(args_parts: list[str]) -> str:
+        args = _call_arg_list(args_parts)
+        env, i = (args + ['env', 'i'])[:2]
+        return (
+            f'(let b0 = perform String.charAt({env}, {i}) - 1 in '
+            f'let b1 = perform String.charAt({env}, {i} + 1) - 1 in '
+            f'let b2 = perform String.charAt({env}, {i} + 2) - 1 in '
+            f'let b3 = perform String.charAt({env}, {i} + 3) - 1 in '
+            f'(b0 << 18) + (b1 << 12) + (b2 << 6) + b3)'
+        )
+
+    def low6_repl(args_parts: list[str]) -> str:
+        args = _call_arg_list(args_parts)
+        x = args[0] if args else 'x'
+        return f'(let q = ({x}) / 64 in ({x}) - q * 64)'
+
+    def bit17_repl(args_parts: list[str]) -> str:
+        args = _call_arg_list(args_parts)
+        x = args[0] if args else 'x'
+        return f'(let t = ({x}) / 131072 in t - (t / 2) * 2)'
+
+    def prec_of_repl(args_parts: list[str]) -> str:
+        args = _call_arg_list(args_parts)
+        c = args[0] if args else 'c'
+        return (
+            f'(if {c} == 43 then 2 else if {c} == 45 then 2 '
+            f'else if {c} == 42 then 3 else if {c} == 47 then 3 '
+            f'else if {c} == 38 then 2 else 0)'
+        )
+
+    def nperform_finish_repl(args_parts: list[str]) -> str:
+        src, eff_start, length, dst, end_pos = (
+            _call_arg_list(args_parts) + ['src', 'eff_start', 'len', 'dst', 'end_pos']
+        )[:5]
+        return (
+            f'(let eff_name = read_string({src})({eff_start})({length})("") in '
+            f'let quote = nperform("String.from_char", 34) in '
+            f'let _ = nperform("IO.print", "; const " + quote + eff_name + quote) in '
+            f'let _ = (let w = ((144) * 16777216) + ((0) * 65536) + ((0) * 256) + ({dst}) in (let _ = emit_hex(w) in 0)) in '
+            f'(({dst}) * 262144) + {end_pos})'
+        )
+
+    replacers = {
+        'skip_fn_type': skip_fn_type_repl,
+        'nperform_finish': nperform_finish_repl,
+        'prec_of': prec_of_repl,
+        'low6': low6_repl,
+        'bit17': bit17_repl,
+        'env_decode': env_decode_repl,
+        'read_int': read_int_repl,
+    }
+
+    out: list[Fn] = []
+    for name, params, body in fns:
+        if name in drop:
+            continue
+        for helper, repl in replacers.items():
+            body = _replace_calls(body, helper, repl)
+        out.append((name, params, body))
+    return out
+
+def _balanced_call_args(src: str, start: int) -> tuple[str, int] | None:
+    if start >= len(src) or src[start] != '(':
+        return None
+    depth, i, in_str = 0, start, False
+    while i < len(src):
+        c = src[i]
+        if c == '"':
+            in_str = not in_str
+        elif not in_str:
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+                if depth == 0:
+                    return src[start + 1:i], i + 1
+        i += 1
+    return None
+
+
+def _replace_calls(body: str, name: str, repl) -> str:
+    out, i = [], 0
+    while i < len(body):
+        m = re.match(rf'\b{re.escape(name)}\b', body[i:])
+        if not m:
+            out.append(body[i])
+            i += 1
+            continue
+        j = i + m.end()
+        args_parts: list[str] = []
+        while True:
+            parsed = _balanced_call_args(body, j)
+            if parsed is None:
+                break
+            args_parts.append(parsed[0])
+            j = parsed[1]
+        if not args_parts:
+            out.append(body[i])
+            i += 1
+            continue
+        out.append(repl(args_parts) if callable(repl) else repl)
+        i = j
+    return ''.join(out)
+
+
+def _is_late_bind(name: str) -> bool:
+    return name in _LATE_BIND or name in _LATE_SORT
+
+
+def _late_sort_key(name: str) -> tuple[int, str]:
+    return (_LATE_SORT.get(name, 0), name)
+
+
+def _replace_fn_calls(body: str, old: str, new: str) -> str:
+    return re.sub(rf'\b{re.escape(old)}\s*\(', f'{new}(', body)
+
+
+def _split_recursion_cores(fns: list[Fn]) -> list[Fn]:
+    by_name = {n: (n, p, b) for n, p, b in fns}
+    out: list[Fn] = []
+    for wrapper, core, rec, _ in _RECURSION_SPLITS:
+        if wrapper not in by_name:
+            continue
+        _, params, body = by_name[wrapper]
+        out.append((core, [rec] + params, body))
+        body = re.sub(rf'\b{re.escape(wrapper)}\b', core, body)
+        out.append((wrapper, params, f'{core}({wrapper})'))
+    for name, params, body in fns:
+        if name in _WRAPPER_DROP or any(name == w for w, _, _, _ in _RECURSION_SPLITS):
+            continue
+        out.append((name, params, body))
+    return out
+

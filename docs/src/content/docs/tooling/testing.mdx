@@ -1,0 +1,221 @@
+---
+title: Testing
+description: Write and run Nulang tests with the built-in Test effect assertions and the `nula test` package-manager runner.
+---
+
+Nulang has testing built in at two levels: the `Test` effect, whose
+assertion primitives abort execution with a runtime error on failure, and
+the `nula test` runner, which discovers `.nula` files under a package's
+`tests/` directory and reports pass/fail per test.
+
+## The `Test` effect
+
+The `Test` effect is wired directly into the standalone VM. Each operation
+returns `Unit` on success and raises a runtime error on failure:
+
+| Operation | Signature | Failure message |
+|-----------|-----------|-----------------|
+| `Test.assert` | `assert(cond: Bool, msg: String) -> Unit ! {Test}` | `assertion failed: {msg}` |
+| `Test.assert_eq` | `assert_eq(a: Int, b: Int) -> Unit ! {Test}` | `assertion failed: expected {b}, got {a}` |
+| `Test.assert_true` | `assert_true(cond: Bool) -> Unit ! {Test}` | `assertion failed` |
+
+Note that `assert_eq` compares integers only — for strings, booleans, and
+floats use `Test.assert` with an explicit condition (or the
+[test-utils](#the-test-utils-package) helpers).
+
+The standard library also ships a thin wrapper module,
+`src/stdlib/test.nula`, that re-exports the same primitives plus
+`fail_with(message)` (an unconditional failure). Importing it brings the
+functions into scope directly:
+
+```nulang
+import stdlib::test
+
+fn test_basic() {
+  assert_eq(6 * 7, 42)
+  assert_true(1 < 2)
+  assert("abc" == "abc", "string equality")
+}
+
+fn main() {
+  test_basic()
+  perform IO.print("stdlib::test ok")
+}
+```
+
+## Writing a test
+
+A test is an ordinary standalone `.nula` program: define helper functions,
+then assert from `main`. Save this as `factorial_test.nula`:
+
+```nulang
+/// Compute the factorial of n recursively.
+fn factorial(n: Int) -> Int {
+  if n <= 1 then 1
+  else n * factorial(n - 1)
+}
+
+fn main() {
+  perform Test.assert_eq(factorial(5), 120)
+  perform Test.assert_true(factorial(0) == 1)
+  perform Test.assert(factorial(3) == 6, "factorial(3) should be 6")
+  perform IO.print("all assertions passed")
+}
+```
+
+Run it directly with `nulang factorial_test.nula` — it prints
+`all assertions passed` and exits 0. If an assertion fails, execution
+aborts with the error, e.g.
+`Error: Runtime error at 1:1: assertion failed: one is not two`.
+
+Because each test file runs standalone, helper functions must be defined in
+the test file itself (or imported — see
+[test-utils](#the-test-utils-package)).
+
+## Running tests with `nula test`
+
+Inside a package (a directory with a `Nulang.toml`), `nula test` discovers
+every `.nula` file in the `tests/` directory, runs each through the
+`nulang` executable, and reports pass/fail. A test passes if the file runs
+to completion without any compile or runtime error — an assertion failure
+from the `Test` effect counts as a failure, as does any type error.
+
+```bash
+nulang nula test
+```
+
+Given a package with a whole-file test `tests/test_math.nula` and a
+per-function file `tests/test_strings.nula` (see below), the output looks
+like:
+
+```text
+Preparing package...
+  Resolving dependencies...
+running 3 tests
+test tests/test_math.nula ... ok
+test test_greet_world ... ok
+test test_greet_empty ... ok
+
+test result: 3 passed; 0 failed
+```
+
+On failure the runner prints the test name, the error, and a non-zero exit
+code:
+
+```text
+test test_something_is_wrong ... FAILED
+Error: Runtime error at 1:1: assertion failed: expected 5, got 4
+
+test result: 3 passed; 1 failed
+```
+
+`nula new` scaffolds a sample test file under `tests/` so a fresh package
+is testable from the start.
+
+### Whole-file vs. per-function tests
+
+`nula test` supports two styles, and picks per file:
+
+- **Whole-file style** — the file contains no `fn test_*` functions, so the
+  entire file is run as a single test (entry point `main`):
+
+  ```nulang
+  // tests/test_math.nula — runs as one test case.
+
+  /// Compute the factorial of n recursively.
+  fn factorial(n: Int) -> Int {
+    if n <= 1 then 1
+    else n * factorial(n - 1)
+  }
+
+  fn main() {
+    perform Test.assert_eq(factorial(5), 120)
+    perform Test.assert_eq(factorial(0), 1)
+    perform Test.assert_true(factorial(10) > 100000)
+  }
+  ```
+
+- **Per-function style** — if a file defines functions whose names start
+  with `test_`, each one is discovered and run as a separate test case.
+  The runner strips the file's `fn main` and wraps each test function in
+  its own temporary `main`, so the functions must take no arguments:
+
+  ```nulang
+  // tests/test_strings.nula — two test cases: test_greet_world, test_greet_empty.
+
+  /// Return a greeting for the given name.
+  fn greet(name: String) -> String {
+    "Hello, " + name + "!"
+  }
+
+  fn test_greet_world() {
+    perform Test.assert(greet("World") == "Hello, World!", "greeting mismatch")
+  }
+
+  fn test_greet_empty() {
+    perform Test.assert_eq(perform String.length(greet("")), 8)
+  }
+  ```
+
+:::caution
+Discovery is a simple textual scan for `fn test_`. A comment containing
+that literal (e.g. `` `fn test_*` ``) is picked up as a test name too, and
+the resulting wrapper fails to compile. Avoid writing `fn test_` in test
+file comments.
+:::
+
+### Flags
+
+| Flag | Effect |
+|------|--------|
+| `--filter <substr>` | Run only test files whose file name contains `<substr>` |
+| `--verbose`, `-v` | List discovered test functions per file (`--- file ---` / `discovered: ...`) |
+| `--watch`, `-w` | Re-run tests when `.nula` files under `src/` or `tests/` change (mtime polling) |
+| `--json` | Emit a machine-readable JSON report (test name, status, duration, diagnostics) instead of text lines |
+
+## The test-utils package
+
+For assertions beyond the built-in `Test` effect, the official seed
+package [`test-utils`](https://github.com/nulang-org/nulang/tree/main/packages/test-utils)
+(Experimental tier) provides a library of `expect_*` helpers, all of which
+abort the test with a descriptive runtime error on failure:
+
+```nulang
+// fragment — requires a package with `nula add test-utils` (imports `lib`)
+import lib
+
+fn main() {
+  expect_eq_int(2 + 2, 4)
+  expect_contains("hello world", "lo wo")
+  expect_some(Some(1))
+
+  // Table-driven: run an expectation over every case in a list.
+  let expected = [1, 4, 9]
+  expect_eq_list_int([1, 4, 9], expected)
+  perform IO.print("test-utils ok")
+}
+```
+
+The full helper set (see the package's `README.md`):
+
+- Booleans: `expect_true`, `expect_false`
+- Equality: `expect_eq_int`, `expect_ne_int`, `expect_eq_str`,
+  `expect_eq_bool`, `expect_float_near` (epsilon), `expect_eq_list_int`
+- Ordering: `expect_gt`, `expect_lt`, `expect_between`
+- Option/Result: `expect_some`, `expect_none`, `expect_some_value`,
+  `expect_ok`, `expect_err`
+- Strings: `expect_contains`
+- Fixtures: `for_each(cases, f)` for table-driven tests, `unreachable(msg)`
+  for marking branches that must not execute
+
+Install it into a package with `nula add test-utils`, then `import lib`
+from any test file — package dependencies are resolved before tests run.
+
+## Conformance tests
+
+The repo's `conformance/` directory holds the language's independent
+behavioral specification: `.nula` cases paired with expected-output `.json`
+files, run by `conformance/run.py`. These test the implementation itself
+rather than user programs, but they follow the same conventions
+(`fn test_*` functions, `Test` assertions) and are a good source of
+examples.

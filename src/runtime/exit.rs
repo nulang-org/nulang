@@ -74,8 +74,9 @@ pub(crate) fn kill_actor(rt: &mut Runtime, actor_id: u64) {
 
 /// Run the exit protocol for an actor being removed: mark it terminated,
 /// release receiver-side ORCA holds, unregister names, leave process groups,
-/// send DOWN to monitors, propagate abnormal exits to linked actors, then
-/// reap (retire the heap while foreign references are outstanding).
+/// remove ephemeral Fabric subscriptions, send DOWN to monitors, propagate
+/// abnormal exits to linked actors, then reap (retire the heap while foreign
+/// references are outstanding).
 pub(crate) fn reap_living_actor(rt: &mut Runtime, actor_id: u64, reason: ExitReason) {
     let (monitors, links) = {
         let actor = match rt.actors.get(&actor_id) {
@@ -92,6 +93,7 @@ pub(crate) fn reap_living_actor(rt: &mut Runtime, actor_id: u64, reason: ExitRea
 
     rt.registry.unregister_by_actor(actor_id);
     rt.process_groups.leave_all(actor_id);
+    rt.fabric_unsubscribe_actor(actor_id);
 
     for watcher_id in monitors {
         send_down_message(rt, watcher_id, actor_id, &reason);
@@ -309,6 +311,7 @@ pub(crate) fn shutdown_supervisor(rt: &mut Runtime, supervisor_id: u64, supervis
     }
     rt.supervisors.remove(&supervisor_id);
     rt.registry.unregister_by_actor(supervisor_id);
+    rt.fabric_unsubscribe_actor(supervisor_id);
     if let Some(actor) = rt.actors.get_mut(&supervisor_id) {
         actor.state = ActorState::Terminated;
     }

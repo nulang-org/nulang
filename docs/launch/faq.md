@@ -27,19 +27,22 @@ one-for-all, rest-for-one, simple-one-for-one), links/monitors/process
 groups, algebraic effects with resume, HM inference, capabilities, persistent
 actors with checkpointing + journaling (in-memory, JSON-file, SQLite store
 backends), `entity`/`events`/`apply`/`emit` event sourcing, the `nula`
-package manager, LSP server, REPL, test runner. ~1,680 tests plus a `.nula`
-conformance suite under `conformance/`.
+package manager, LSP server, REPL, test runner, an extensive Rust test suite,
+and a `.nula` conformance suite under `conformance/`.
 
 Experimental (feature-gated or marked): multi-node distribution over TCP,
-WASM backend, AOT native backend (pure-functional programs only), AI-agent
-runtime, CRDT state fields (implemented and tested at the Rust level; the
-`.nula` surface parses but behaves as `durable` — SPEC2 §9.10).
+WASM/WasmFX backends, the secondary native AOT backend (restricted semantics),
+AI-agent runtime, Fabric, RESP cache serving, typed actor-protocol hardening,
+and CRDT state fields (implemented and tested at the Rust level; the `.nula`
+surface parses but behaves as `durable` — SPEC2 §9.10).
 
-Documented known gaps: `send` to an undeclared behavior currently runs the
-actor's first behavior instead of erroring, and cross-type behavior-name
-collisions exist (SPEC2 §8.5, with conformance evidence); snapshot
-compaction is planned; one pre-existing AOT test failure is noted in
-docs/STATUS.md.
+Actor protocol checking now rejects unknown behaviors and wrong arity when the
+receiver is statically known, and explicit `ActorRef[P]` values enforce their
+structural protocol. Dynamic or opaque actor references intentionally retain the
+legacy permissive compatibility path for now, so protocol/runtime admission is
+still an experimental hardening area rather than a universal guarantee.
+Snapshot compaction is planned; backend-specific AOT gaps remain documented in
+the status/conformance material.
 
 ## Why not just use Erlang/Elixir?
 

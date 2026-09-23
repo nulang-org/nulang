@@ -1,0 +1,11 @@
+fn f1(x) -> Int { x + 1 }
+fn f2(x) -> Int { x + 2 }
+fn f3(x) -> Int { x + 3 }
+fn f4(x) -> Int { x + 4 }
+fn f5(x) -> Int { x + 5 }
+fn f6(x) -> Int { x + 6 }
+fn f7(x) -> Int { x + 7 }
+fn f8(x) -> Int { x + 8 }
+fn is_alpha(c) -> Bool { (c >= 65 and c <= 90) or(c >= 97 and c <= 122) }
+fn f9(x) -> Int { x + 9 }
+f1(1)

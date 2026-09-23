@@ -1,0 +1,23 @@
+fn run(f, s: String) -> Int {
+    f(s)(1)(2)(3)(4)(5)
+}
+
+fn make(f, a: String) {
+    fn(b: Int) {
+        fn(c: Int) {
+            fn(d: Int) {
+                fn(e: Int) {
+                    fn(g: Int) {
+                        f(a, b, c, d, e, g)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn callee(s: String, b: Int, c: Int, d: Int, e: Int, g: Int) -> Int {
+    perform String.length(s)
+}
+
+run(make(callee), "hello world")

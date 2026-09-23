@@ -1,22 +1,21 @@
 import { defineConfig } from 'astro/config';
 import sitemap from '@astrojs/sitemap';
 import starlight from '@astrojs/starlight';
-import tailwindcss from '@astrojs/tailwind';
 
 // https://starlight.astro.build/reference/configuration
 export default defineConfig({
   site: 'https://nulang.org',
-  head: [
-    { tag: 'meta', attrs: { property: 'og:type', content: 'website' } },
-    { tag: 'meta', attrs: { property: 'og:image', content: 'https://nulang.org/og-image.png' } },
-    { tag: 'meta', attrs: { property: 'og:image:width', content: '1200' } },
-    { tag: 'meta', attrs: { property: 'og:image:height', content: '630' } },
-    { tag: 'meta', attrs: { name: 'twitter:card', content: 'summary_large_image' } },
-    { tag: 'meta', attrs: { name: 'twitter:image', content: 'https://nulang.org/og-image.png' } },
-  ],
   integrations: [sitemap({ filter: (page) => !page.endsWith('.md') && !page.endsWith('/llms-full.txt') }), starlight({
       title: 'Nulang',
-      description: 'A distributed, actor-based programming language',
+      head: [
+        { tag: 'meta', attrs: { property: 'og:type', content: 'website' } },
+        { tag: 'meta', attrs: { property: 'og:image', content: 'https://nulang.org/og-image.png' } },
+        { tag: 'meta', attrs: { property: 'og:image:width', content: '1200' } },
+        { tag: 'meta', attrs: { property: 'og:image:height', content: '630' } },
+        { tag: 'meta', attrs: { name: 'twitter:card', content: 'summary_large_image' } },
+        { tag: 'meta', attrs: { name: 'twitter:image', content: 'https://nulang.org/og-image.png' } },
+      ],
+      description: 'An actor-based programming language with static types, algebraic effects, supervision, and durable state',
       defaultLocale: 'en',
       logo: {
         src: './src/assets/logo.svg',
@@ -53,6 +52,7 @@ export default defineConfig({
           items: [
             { label: 'Installation', link: 'getting-started/installation/' },
             { label: 'Quick Start', link: 'getting-started/quick-start/' },
+            { label: 'Tutorial', link: 'tutorial/' },
             { label: 'Editor Setup', link: 'getting-started/editor-setup/' },
           ],
         },
@@ -61,26 +61,36 @@ export default defineConfig({
           collapsed: true,
           items: [
             { label: 'Language Server & Tooling', link: 'tooling/language-server/' },
+            { label: 'Package Manager', link: 'tooling/package-manager/' },
+            { label: 'Testing', link: 'tooling/testing/' },
           ],
         },
         {
-          label: 'Language Syntax',
+          label: 'Language Surface · Stable',
           collapsed: true,
           items: [
             { label: 'Syntax Basics', link: 'language/syntax/' },
             { label: 'Type System', link: 'language/types/' },
             { label: 'Algebraic Effects', link: 'language/effects/' },
-            { label: 'Performance', link: 'language/performance/' },
             { label: 'Safety', link: 'language/safety/' },
+            { label: 'Performance', link: 'language/performance/' },
+            { label: 'Python & FFI Interop', link: 'language/interop/' },
           ],
         },
         {
-          label: 'Distributed Actors',
+          label: 'Actor Surface · Stable',
           collapsed: true,
           items: [
             { label: 'Actor Model', link: 'actors/overview/' },
-            { label: 'Distribution & Clustering', link: 'actors/distribution/' },
             { label: 'Supervision Trees', link: 'actors/supervision/' },
+          ],
+        },
+        {
+          label: 'Distribution · Experimental',
+          collapsed: true,
+          items: [
+            { label: 'Distribution & Clustering', link: 'actors/distribution/' },
+            { label: 'Running a Cluster', link: 'actors/cluster-ops/' },
           ],
         },
         {
@@ -89,16 +99,34 @@ export default defineConfig({
           items: [
             { label: 'Overview', link: 'stdlib/overview/' },
             { label: 'IO', link: 'stdlib/io/' },
+            { label: 'Debug', link: 'stdlib/debug/' },
+            { label: 'FS', link: 'stdlib/fs/' },
+            { label: 'Array', link: 'stdlib/array/' },
+            { label: 'StrBuilder', link: 'stdlib/strbuilder/' },
+            { label: 'Map', link: 'stdlib/map/' },
+            { label: 'Test', link: 'stdlib/test/' },
             { label: 'Int', link: 'stdlib/int/' },
+            { label: 'Float', link: 'stdlib/float/' },
+            { label: 'String', link: 'stdlib/string/' },
+            { label: 'Time', link: 'stdlib/time/' },
             { label: 'Timer', link: 'stdlib/timer/' },
             { label: 'Signal', link: 'stdlib/signal/' },
-            { label: 'LLM', link: 'stdlib/llm/' },
+            { label: 'Inference', link: 'stdlib/inference/' },
+            { label: 'Http', link: 'stdlib/http/' },
+            { label: 'Web', link: 'stdlib/web/' },
+            { label: 'Realtime', link: 'stdlib/realtime/' },
             { label: 'Actor', link: 'stdlib/actor/' },
             { label: 'Otp', link: 'stdlib/otp/' },
+            { label: 'Crdt', link: 'stdlib/crdt/' },
+            { label: 'Env', link: 'stdlib/env/' },
+            { label: 'Process', link: 'stdlib/process/' },
+            { label: 'System', link: 'stdlib/system/' },
+            { label: 'Python', link: 'stdlib/python/' },
+            { label: 'Random', link: 'stdlib/random/' },
           ],
         },
         {
-          label: 'AI Agents',
+          label: 'AI Runtime · Experimental',
           collapsed: true,
           items: [
             { label: 'Overview', link: 'ai/overview/' },
@@ -107,11 +135,18 @@ export default defineConfig({
           ],
         },
         {
-          label: 'Durable Workflows',
+          label: 'Workflows · Experimental',
           collapsed: true,
           items: [
             { label: 'Overview', link: 'workflows/overview/' },
             { label: 'Signals, Timers & Queries', link: 'workflows/signals-timers/' },
+          ],
+        },
+        {
+          label: 'Web Services · Experimental',
+          collapsed: true,
+          items: [
+            { label: 'HTTP Servers & Routing', link: 'web/overview/' },
           ],
         },
         {
@@ -146,6 +181,5 @@ export default defineConfig({
         { icon: 'github', label: 'GitHub', href: 'https://github.com/nulang-org/nulang' },
       ],
     }),
-    tailwindcss(),
   ],
 });

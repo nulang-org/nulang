@@ -1,1 +1,1 @@
-{"exit_code":3,"stdout":"","stderr":"Parse error"}
+{"exit_code": 3, "stdout": "", "stderr": "Expected type, found fn"}

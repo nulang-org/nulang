@@ -40,9 +40,5 @@ jobs:
             work, please reopen it or create a new PR.
           exempt-pr-labels: "pinned,security,roadmap,blocked"
 
-          # Only scan issues/PRs with no activity in the stale period
-          days-before-issue-stale: 90
-          days-before-pr-stale: 60
-
           # Operations per run to stay within API limits
           operations-per-run: 30

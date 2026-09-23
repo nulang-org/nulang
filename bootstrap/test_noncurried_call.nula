@@ -1,0 +1,5 @@
+fn low17(x: Int) -> Int { x }
+fn add3(a: Int, b: Int, c: Int) -> Int { a + b + c }
+let f = fn(a) => fn(b) => fn(c) => (
+    add3(a, b, c)
+) in 123

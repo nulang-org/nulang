@@ -1,0 +1,18 @@
+fn run(f, s: String) -> Int {
+    f(s)(1)(2)(3)(4)(5)
+}
+
+let inner = fn(a: String) {
+    fn(b: Int) {
+        fn(c: Int) {
+            fn(d: Int) {
+                fn(e: Int) {
+                    fn(g: Int) {
+                        perform String.length(a)
+                    }
+                }
+            }
+        }
+    }
+} in
+run(inner, "hello world")

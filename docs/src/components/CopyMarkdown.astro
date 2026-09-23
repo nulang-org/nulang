@@ -7,8 +7,9 @@
     <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
     <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
   </svg>
-  Copy Markdown
+  <span id="copy-markdown-label">Copy Markdown</span>
 </button>
+<span id="copy-markdown-status" class="sr-only" role="status" aria-live="polite"></span>
 
 
 <style>
@@ -39,23 +40,41 @@
     color: #ffffff;
     border-color: var(--nu-orange);
   }
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
 </style>
 
 <script>
   const button = document.getElementById('copy-markdown-btn');
-  if (button) {
+  const label = document.getElementById('copy-markdown-label');
+  const status = document.getElementById('copy-markdown-status');
+  if (button && label instanceof HTMLElement && status instanceof HTMLElement) {
     button.addEventListener('click', async () => {
       try {
         const path = location.pathname.replace(/\/$/, '') + '.md';
         const res = await fetch(path);
-        if (!res.ok) return;
+        if (!res.ok) throw new Error(`fetch failed: ${res.status}`);
         await navigator.clipboard.writeText(await res.text());
         button.classList.add('copied');
-        const originalHTML = button.innerHTML;
-        button.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg> Copied!';
-        setTimeout(() => { button.classList.remove('copied'); button.innerHTML = originalHTML; }, 2000);
+        label.textContent = 'Copied!';
+        status.textContent = 'Copied!';
+        setTimeout(() => {
+          button.classList.remove('copied');
+          label.textContent = 'Copy Markdown';
+          status.textContent = '';
+        }, 2000);
       } catch {
-        // Clipboard/fetch unavailable — no-op
+        // Clipboard/fetch unavailable — surface it to screen readers.
+        status.textContent = 'Copy failed';
       }
     });
   }

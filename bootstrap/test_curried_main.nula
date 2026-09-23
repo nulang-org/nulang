@@ -1,0 +1,8 @@
+fn low17(x: Int) -> Int { x }
+let f = fn(a) => fn(b) => fn(c) => (
+    if a == 0 then (
+        if b == 0 then (
+            if c == 0 then 1 else 2
+        ) else 3
+    ) else 4
+) in 123

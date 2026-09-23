@@ -37,6 +37,7 @@ Child restart policies:
 | `0` | `permanent` | Always restarted on exit |
 | `1` | `temporary` | Never restarted |
 | `2` | `transient` | Restarted only on abnormal exit |
+| `3` | `respawn_on_node_loss` | Re-spawn the child on another node when its home node is confirmed gone (RFC 0014). Implies `permanent` semantics for the local exit protocol, plus shadow replication and directory registration. Only meaningful for durable children. |
 
 ## Simple One-for-One Templates
 

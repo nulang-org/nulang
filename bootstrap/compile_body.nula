@@ -1,0 +1,4 @@
+let comp = fn(src) => fn(pos) => fn(len) => fn(left) => fn(min_prec) => fn(nr) => fn(env) => fn(elen) => 0 in
+let emit_word = fn(opcode) => fn(op1) => fn(op2) => fn(op3) => 0 in
+let compile = fn(src) => (let len = nperform("String.length", src) in let _ = nperform("IO.print", "; " + src) in let result = comp(src)(0)(len)((1 * 1099511627776))(-1)(8)("")(0) in let reg = result >> 18 in let _ = emit_word(18)(reg)(0)(0) in let _ = emit_word(1)(0)(0)(0) in nperform("IO.print", "; result in r" + nperform("Int.to_string", result >> 18))) in
+compile("hello")

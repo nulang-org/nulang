@@ -1,0 +1,4 @@
+fn low17(x: Int) -> Int { x }
+let f = fn(a) => fn(b) => fn(c) => fn(d) => fn(e) => fn(nr) => fn(h) => fn(i) => fn(j) => fn(p) => (
+    (nr * 262144) + p
+) in 123

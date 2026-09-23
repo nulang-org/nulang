@@ -7,7 +7,15 @@
 > `LANGUAGE_VERSION` in `src/format/constants.rs`) is what this changelog
 > tracks — it moves only on RFC-ratified change.
 
-**Language version:** `1.0.0-frozen` (since 2026-07-19; RFCs 0001, 0002).
+**Published v1 artifact language metadata:** `1.0.0-frozen` (since
+2026-07-19; RFCs 0001, 0002). This historical identifier remains readable and
+is not rewritten.
+
+**Current compatibility policy:** RFC 0021 (accepted 2026-09-21) reclassifies
+pre-adoption Nulang Core source semantics as Stable until an evidence-bearing
+external-adoption freeze RFC is accepted. Published format/protocol/ABI
+versions remain archival compatibility obligations; future representations may
+evolve only behind explicit version boundaries and readers/migrations.
 
 ---
 
@@ -32,18 +40,492 @@ version + migration.*
   - `FormatError` enum: `Truncated`, `BadMagic`, `UnsupportedVersion`,
     `IncompatibleLanguage`, `LengthMismatch`, `UnknownOpcode`, `BodyDecode`,
     `BadConstant`.
-- **RFC 0002 — Frozen Core.** Defined Nulang Core, the minimal frozen subset:
-  `fn`/`let`/`if`/`match`/closures, `Int`/`Bool`/`String`/`Unit`/`Nil`/
-  `Vec`/`Map`/tuples/records/`enum`, HM inference over this subset, `IO.print`
-  and `IO.read` only, `val` capability only. Every Core program valid today is
-  valid in every future version.
+- **RFC 0002 — historical Frozen Core definition.** Defined the original Core
+  subset. RFC 0021 (accepted 2026-09-21) supersedes the *permanent
+  source-semantic freeze* portion of RFC 0002: Core remains the portability
+  kernel but is Stable until the external-adoption freeze gate is met.
+  Historical artifacts emitted under the old metadata remain compatibility
+  obligations.
 - Stability contract published as `SPEC2.md` §"Format Stability" and
   `GOVERNANCE.md`.
 
 ## Stable tier
 
+### Typed JIT native SSA across arithmetic, loops, and simple CFGs — 2026-09-22
+- **The typed Cranelift JIT now keeps proven Int/Float values in native SSA form across arithmetic chains, simple loop backedges, and conservative forward-branch joins** (`src/jit/typed_compiler.rs`). It preserves Nulang's 48-bit integer wrap, nullable division/modulo behavior, NaN canonicalization, and runtime-helper fallbacks while avoiding repeated tag/unbox/register-file round trips. Per-block forward must-type analysis makes type facts CFG-derived rather than bytecode-emission-order-dependent. The implementation is the current-main replay of the independently tested #738→#768→#770→#771→#773→#774 stack.
+
+### Candidate-only JIT hotness probing — 2026-09-22
+- **Cold interpreted execution now probes JIT hotness only at candidate compiled-region entries** (`src/vm.rs`). The VM precomputes per-module candidates for execution/function/behavior entries, source-statement starts, branch targets/fallthroughs, and successors of compilation boundaries, avoiding JIT backend dispatch and hot-counter mutation at ordinary straight-line bytecode PCs without changing language semantics.
+
+### Canonical compiler semantic identity — 2026-09-21
+- **Compiler-owned `SemanticId` now derives from canonical backend-independent MIR plus typed actor-state schemas** (Experimental, `src/semantic_identity.rs`, `src/semantic_schema.rs`, `src/compiler_identity.rs`). The encoding alpha-normalizes compiler-generated IDs, excludes presentation/debug metadata and backend selection, includes executable/effect/authority/durable semantics, and folds dependency semantic identities deterministically. `ArtifactIdentityManifest` assembly now has a typed-program entry point that keeps exact `SourceId`, semantic identity, and backend-specific `ArtifactId` distinct without changing frozen NBC v1.
+
+### Production host-authority boundary — 2026-09-20
+- **Test effect handlers no longer exist in production runtime builds** (`src/runtime/mod.rs`, `src/runtime/callbacks.rs`). Mock effect interception is now `#[cfg(test)]` and crate-private, so actor-backed host effects in production cannot take the test-handler path before external-authority enforcement.
+- **Actor-backed `Process.run` remains non-dispatched until a real process sandbox exists** (`src/runtime/callbacks.rs`, `src/stdlib.rs`). A regression test proves that even an actor holding an exact `Process::Run(...)` grant cannot turn that grant into host shell execution; docs now mark the existing `/bin/sh -c` implementation as trusted/standalone-only.
+
+### Typed process host authority — 2026-09-20
+- **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
+
+
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
+
+### Actor-capable `.nbc` execution — 2026-09-22
+- **Precompiled actor/workflow artifacts execute through the real Runtime**
+  instead of standalone VM actor callbacks. Serialized modules carrying actor
+  metadata now use the same spawn/send/state/scheduler path as source
+  execution, while pure modules retain the lower-overhead standalone VM path.
+  Regression coverage verifies message delivery after NBC round-trip and
+  durable-store selection for persistent actors.
+
+### Actor protocol rolling-upgrade compatibility — 2026-09-20
+- **Directional structural compatibility** (Experimental, `src/protocol.rs`).
+  A receiver may serve an older required protocol when it preserves every
+  required compiler-owned behavior contract exactly; additive receiver
+  behaviors are allowed. Parameter, return, effect, or capability changes are
+  incompatible. V1 deliberately avoids implicit variance/default-field rules.
+
+### Actor protocol schema registry — 2026-09-20
+- **Trusted canonical schema registry** (Experimental, `src/protocol.rs`).
+  `ProtocolRegistry` maps `ProtocolId` values to compiler-derived schemas so
+  different digests can be compared using directional rolling-upgrade rules.
+  Exact digest equality needs no lookup; different/unknown digests fail closed.
+  Structurally identical source renames register idempotently because display
+  names are intentionally excluded from protocol identity.
+
+### Actor protocol pre-mailbox admission — 2026-09-20
+- **Fail-closed protocol admission policy** (Experimental, `src/protocol.rs`).
+  `admit_protocol` is a side-effect-free decision point intended to run before
+  mailbox publication. `StrictCompatible` is the default: exact ids pass
+  directly, proven additive receiver upgrades pass through the trusted schema
+  registry, and incompatible/unknown/missing typed identities are rejected.
+  `LegacyCompatible` is explicit migration mode and relaxes only a missing
+  incoming required protocol identity; typed mismatches remain fail-closed.
+
+### NUL0 required actor-protocol identity tail — 2026-09-20
+- **Additive typed delivery metadata** (Experimental, `src/runtime/network.rs`,
+  `src/runtime/distributed.rs`). Actor messages may carry the sender/client's
+  required `ProtocolId` in a self-identifying `PRT0` trailing extension.
+  Existing untyped send paths emit the historical NUL0-v1 payload unchanged;
+  current readers accept messages without the tail and ignore unrelated future
+  trailing extensions. The receiver's installed protocol remains local runtime
+  metadata and is deliberately not trusted from the wire.
+
+### JIT compiled-region dense slots — 2026-09-20
+- **Dense compiled-region lookup** (Experimental, `src/jit/mod.rs`).
+  JIT-compiled region pointers are now stored in per-module dense PC-indexed
+  slots instead of an `FxHashMap<(module_idx, pc), ...>`. The interpreter's
+  per-step compiled-region probe therefore uses bounds checks plus an
+  `Option` load rather than hashing every still-interpreted instruction after
+  the first region tiers up. Compiled-region count, module/PC isolation, and
+  replacement semantics are covered by regression tests; tier thresholds and
+  JIT ABI are unchanged.
+
+### Typed actor protocol checking — 2026-09-20
+- **Static protocol validation for known actor references** (Experimental,
+  `src/actor_protocol.rs`, RFC 0023). Actor `send`/`ask` calls whose receiver
+  resolves statically to an actor declaration now reject unknown behaviors and
+  wrong arity, constrain behavior arguments through the existing HM checker,
+  and propagate conservatively known `ask` return types. Dynamic/opaque actor
+  references retain the previous compatibility behavior. The implementation is
+  a compiler pre-pass integrated directly into `TypeChecker::check_module`; it
+  does not alter runtime dispatch, persistence, or wire formats.
+- **Structural `ActorRef[P]` protocols** (Experimental). Public/generic actor
+  APIs can require a behavior record such as
+  `ActorRef[{ get: () -> Int, add: Int -> Unit }]`. Concrete actors advertise
+  declared behavior signatures through the existing `Type::Actor.behavior`
+  slot; concrete-to-`ActorRef` unification permits extra concrete behaviors
+  while requiring every requested behavior/signature. Calls through
+  `ActorRef[P]` are checked directly from `P`. The type is compile-time-only
+  and does not change runtime actor representation or stable formats.
+- **Directional ActorRef attenuation** (Experimental). Already-abstract
+  `ActorRef<P>` values may flow to narrower `ActorRef<Q>` requirements when
+  every required behavior/signature is present. Widening to claim missing
+  behaviors is rejected. The check is applied at value-to-expected-type
+  boundaries without making general HM unification asymmetric.
+- **Compiler-owned protocol fingerprints** (Experimental, `src/protocol.rs`).
+  `ProtocolSchema::from_actor_type` derives structural protocol identity from
+  the typechecker's canonical actor behavior record. Full behavior signatures
+  include parameter packs, return types, effects, and capabilities; unresolved
+  or open contracts fail closed. Protocol type hashes now use the canonical
+  content encoding rather than information-erasing NTIR.
+
+### Compiler-owned host effect ABI — 2026-09-20
+- **Built-in host effects now lower through a versioned compiler-owned contract**
+  (Experimental, `src/host_effect_abi.rs`, `spec/host-effects/v0alpha1.json`,
+  `src/mir_wasm.rs`). The compiler defines canonical operation identity,
+  deterministic request shape, response projection, minimum checked authority,
+  and replay classification for platform-provided effects. WASM lowering emits
+  canonical versioned host-operation identifiers for known operations instead
+  of requiring the host to reconstruct Nulang semantics from dotted source
+  spellings such as `Storage.write`. Unknown/custom effects retain the legacy
+  compatibility path while the experimental ABI rolls out.
+
+### Actor dispatch soundness — 2026-09-20
+- **Fail-closed behavior-name resolution** (Stable runtime correction). Actors
+  with a declared native or bytecode behavior surface reject unknown names
+  across local, cross-shard, and remote delivery; an unknown name can never
+  alias a real behavior id 0 handler. Metadata-free low-level actors created
+  directly through `Runtime::spawn_actor` retain raw mailbox admission through
+  inert id 0 for Rust-embedder/runtime compatibility; by definition those
+  actors have no handler at id 0, so this compatibility path cannot execute
+  user code. Name resolution remains on the owning runtime/shard, fetched or
+  hot-reloaded code must still declare the requested behavior, invalid
+  synchronous numeric asks fail explicitly, and a genuinely declared behavior
+  id 0 remains valid.
+
+### RESP-compatible cache kernel — 2026-09-19
+- **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
+  `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor
+  mailboxes, the VM heap, and ORCA: small values inline, larger keys/values use
+  reusable size-class arena blocks, the index is contiguous open addressing,
+  TTL references are generation-fenced, and routing preserves Redis Cluster's
+  16,384 logical slots and hash tags. RESP2 command frames are parsed into
+  borrowed slices without allocating an argument vector. Criterion coverage
+  tracks local GET/SET churn, arena reuse, and slot hashing.
+- **Initial RESP command execution layer** (Experimental,
+  `src/runtime/resp_cache.rs`). PING/GET/SET/DEL/EXISTS/INCR/EXPIRE/TTL/MGET/MSET
+  execute directly against the shard-local cache. SET supports EX/PX, INCR
+  preserves TTL while promoting numeric byte strings to the packed integer
+  representation, and multi-key operations reject CROSSSLOT before mutation.
+- **Epoch-fenced Redis-slot placement table** (Experimental,
+  `src/runtime/cache_routing.rs`). All 16,384 logical slots resolve by direct
+  indexed lookup to a physical node/shard owner. Placement changes validate the
+  complete range batch before mutation and reject stale epochs or overlapping
+  assignments, keeping topology coordination off the GET/SET hot path.
+- **Cache-specific local/remote dispatch boundary** (Experimental,
+  `src/runtime/cache_dispatch.rs`). Same-shard commands execute directly on
+  the owning `CacheStore`; other local shards use bounded request/reply queues
+  with explicit backpressure, while remote ownership produces a transport
+  handoff tagged with slot and placement epoch. RESP frames are copied only
+  when crossing a shard or node boundary.
+- **Ordered RESP connection pipeline** (Experimental,
+  `src/runtime/cache_pipeline.rs`). Cross-shard and remote completions may
+  arrive out of order, but responses are buffered behind a bounded
+  per-connection sequencer and emitted only as the longest contiguous completed
+  prefix. Direct responses stay immediate when no earlier async request is
+  pending; pipeline saturation is explicit backpressure.
+- **RESP pipeline retained-byte high-water mark** (Experimental,
+  `src/runtime/cache_pipeline.rs`). Deferred direct and completed local/remote
+  responses now contribute to a per-connection byte budget in addition to the
+  pending-entry limit. Crossing the byte high-water mark backpressures further
+  submissions/completions until ordered draining releases retained bytes.
+- **Redis Cluster MOVED redirect mode** (Experimental,
+  `src/runtime/cache_cluster.rs`, `src/runtime/cache_dispatch.rs`). Physical
+  cache owners can advertise preformatted RESP endpoints. Redirect mode sends
+  `MOVED` immediately for keyed commands received by a non-owning shard or
+  node, while transparent mode retains internal queue/transport routing.
+  Missing endpoint metadata fails closed rather than silently proxying.
+- **Redis Cluster topology discovery and compact default placement**
+  (Experimental, `src/runtime/cache_cluster.rs`,
+  `src/runtime/cache_routing.rs`). `CLUSTER KEYSLOT`, `CLUSTER SHARDS`,
+  and legacy `CLUSTER SLOTS` are served from the routing snapshot without
+  entering CacheStore. Default local ownership now uses balanced contiguous
+  slot ranges instead of modulo striping, keeping discovery payloads compact
+  while CRC16 preserves expected key balance.
+- **Dedicated per-shard RESP reactor** (Experimental, optional
+  `cache-server` feature, `src/runtime/cache_server.rs`). Mio readiness
+  polling keeps each physical shard's listener, connections, CacheStore,
+  expiration work, and RESP pipelines on one thread, independent of the actor
+  scheduler. Redirect mode is required so normal client traffic reaches the
+  owning shard directly. Cross-shard inbox activity and shutdown wake blocked
+  reactors through Mio Waker, while bounded connection/input/output/pipeline
+  limits provide explicit resource backpressure.
+
+### Progressive capability diagnostics — 2026-09-19
+- **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
+
+### C embedding handle and function dispatch correctness — 2026-09-18
+- **Public module handles now resolve through the runtime handle table before
+  accessing deduplicated compiled modules** (`src/ffi/c_api.rs`). Repeated
+  compilation of identical source can therefore use fresh public handles
+  consistently for execution, named calls, module string interning, and
+  returned-string stabilization.
+- **Named C API function calls now execute from the function's actual bytecode
+  offset instead of its function-table slot** (`src/bytecode.rs`,
+  `src/ffi/c_api.rs`). Non-first top-level functions no longer risk starting
+  execution at an unrelated bytecode PC.
+### Fabric confirmed-removal automatic failover — 2026-09-18
+- **Automatic ownership transition after confirmed leader removal**
+  (Experimental, `src/runtime/fabric_stream_epoch.rs`,
+  `src/runtime/distribution.rs`). Confirmed removed nodes are queued until
+  Runtime regains cluster/transport ownership, then durable stream policies are
+  scanned. A stream transitions automatically only when surviving old replicas
+  still satisfy the old majority, reduced placement contains exactly those old
+  survivors, and the local node is the deterministic candidate. Insufficient
+  quorum or placement requiring a new replica fails closed. Candidate prepare
+  traffic retries on the logical clock at 500ms/1s/2s/... up to 30s so
+  staggered removal confirmation cannot strand an otherwise safe transition.
+  Deterministic tests cover positive-goodbye automatic RF3->RF2 failover and
+  delayed peer removal followed by retry.
+
+### Fabric stable installed placement — 2026-09-18
+- **Durable policy is authoritative after stream bootstrap** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`). Established stream append, retry,
+  crash recovery, application ACK validation, committed catch-up, replica
+  application and commit propagation now derive leader/replica/fingerprint
+  state from the installed `replication_policy.json` rather than recomputing
+  rendezvous over the entire current cluster. Unrelated node joins and rejoins
+  therefore cannot implicitly rebalance a live stream or invalidate current
+  quorum traffic; membership still controls reachability and explicit epoch
+  transitions remain the only ownership-change path. Epoch-1 follower bootstrap
+  continues to use current rendezvous when no local policy exists, leaving a
+  documented first-contact race for a future explicit policy-bootstrap message.
+
+### Fabric automatic failover reconciliation — 2026-09-18
+- **Bounded push/pull repair during confirmed-removal failover** (Experimental,
+  `src/runtime/fabric_stream_epoch.rs`). The automatic failover logical-clock
+  scheduler now inspects durable transition votes before retrying prepare: it
+  pushes a proposal-scoped suffix to lagging proposed replicas, pulls from an
+  ahead survivor when the deterministic candidate is behind, and starts a
+  strictly higher term after a pull changes the proposal-bound candidate tail.
+  Each retry performs at most one 256-record reconciliation action and retains
+  the existing 500ms -> 1s -> 2s exponential backoff capped at 30s.
+  Deterministic coverage verifies both candidate-ahead and candidate-behind
+  failover complete without manual repair API calls.
+
+### Fabric epoch candidate reconciliation — 2026-09-18
+- **Proposal-scoped pull from an ahead surviving replica** (Experimental,
+  `src/runtime/fabric_stream_epoch.rs`, `src/runtime/distributed.rs`).
+  A prospective leader that is behind another proposed survivor can now request
+  a bounded exact durable suffix under the active proposal. The source validates
+  old policy, proposed placement, requester identity and promise fencing; the
+  candidate validates the recorded rejected-vote tail and exact next sequence
+  before appending. Because pulling changes the proposal-bound candidate tail,
+  the old proposal is never finalized: the caller starts a strictly higher
+  election term whose hash binds the reconciled tail. Deterministic coverage
+  exercises installed epoch 1 -> rejected term 2 -> pull sequence 2 -> successful
+  term 3 RF=2 transition.
+
+### Fabric epoch voter repair — 2026-09-18
+- **Proposal-scoped repair for lagging transition voters** (Experimental,
+  `src/runtime/fabric_stream_epoch.rs`, `src/runtime/distributed.rs`).
+  A prospective leader can now send a bounded exact suffix to a rejected
+  new-policy voter whose durable tail is behind the proposal tail, without
+  reopening normal traffic from the fenced old epoch. Repair batches validate
+  the active proposal and old durable policy, are idempotent across duplicate
+  delivery, append only the missing exact-sequence suffix, and immediately
+  re-evaluate/send the voter's proposal vote. Multi-round repair advances via
+  updated rejected-tail votes. Replicas ahead of the candidate are reported but
+  left untouched pending a separate pull/reconciliation protocol.
+
+### Fabric quorum-backed epoch transition — 2026-09-18
+- **Durable prepare/vote/commit ownership transition** (Experimental,
+  `src/runtime/fabric_stream_epoch.rs`, `src/runtime/fabric_stream.rs`,
+  `src/runtime/distributed.rs`). Existing replicas can now move a stream from
+  epoch N to N+1 after an old-policy majority fsyncs a single-proposal promise.
+  A higher promise immediately fences normal traffic from the old epoch.
+  Affirmative voters must hold the candidate's exact durable tail, every new
+  replica must be an affirmative old-policy voter, and finalization promotes
+  that majority-shared tail to the new committed boundary. Finalized transition
+  state is restart-resumable, old pending tickets are retired, and prepare,
+  vote, and commit messages reuse reserved NUL0-v1 ActorMessage behaviors.
+  Higher election terms may supersede an abandoned lower proposal without
+  requiring the old durable policy to advance first, preventing a stale vote
+  from permanently wedging the stream. The first version supports
+  shrink/leadership transition within the old replica set (for example RF3 ->
+  RF2 after confirmed loss); adding a replacement replica and automatic
+  failover remain follow-up work.
+
+### Fabric stream epoch fencing — 2026-09-18
+- **Durable replication policy + epoch-1 fencing** (Experimental,
+  `src/runtime/fabric_stream.rs`, `src/runtime/fabric_stream_cluster.rs`,
+  `src/runtime/distributed.rs`). Replicated streams now atomically persist
+  leader, ordered replica set, replication factor, membership fingerprint and a
+  non-zero epoch before the first replicated append. Pending intents, replica
+  appends, application ACK/NACKs, quorum tickets and commit updates carry the
+  epoch and must match both current deterministic placement and durable policy.
+  Existing durable history without policy fails closed instead of inferring
+  ownership from current membership. Additive wire fields default to epoch 1
+  for compatibility with the preceding experimental stack; epoch 0 is rejected.
+  No epoch transition or automatic failover is enabled yet.
+
+### Fabric automatic quorum retry — 2026-09-18
+- **Logical-clock pending replication retry** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`, `src/runtime/distribution.rs`).
+  Pending uncommitted stream sequences now retry from the runtime network loop
+  after 500 ms, then with exponential 1s/2s/4s backoff capped at 30 seconds.
+  Scheduling uses `Runtime::now()`, preserving virtual-clock determinism in
+  DST. Retries reuse exact-sequence idempotent replica application and never
+  count transport dispatch as quorum durability. Commit removes the associated
+  retry schedule immediately; recovered durable intents install an immediate
+  schedule after ticket reconstruction. Majority-committed lagging-replica
+  repair remains separately bounded by the catch-up API.
+
+### Fabric committed-replica catch-up — 2026-09-18
+- **Durable follower progress + committed-prefix repair** (Experimental,
+  `src/runtime/fabric_stream.rs`, `src/runtime/fabric_stream_cluster.rs`,
+  `src/runtime/distributed.rs`). Leaders now persist each follower's highest
+  application-ACKed sequence, can replay a bounded set of missing
+  quorum-committed records to a lagging replica, and propagate committed
+  visibility through a reserved NUL0-v1-compatible system ActorMessage.
+  Commit updates are sent only when durable ACK progress proves the follower
+  already stores the committed prefix; followers validate current placement
+  and local tail before advancing their own durable commit boundary. This
+  repairs replicas after partitions without introducing automatic leader
+  failover.
+
+### Fabric stream crash recovery — 2026-09-18
+- **Durable replication intent + explicit retry** (Experimental,
+  `src/runtime/fabric_stream.rs`, `src/runtime/fabric_stream_cluster.rs`).
+  Leaders now fsync a versioned replication intent before appending an
+  uncommitted replicated sequence. Restart recovery reconciles intent with the
+  committed boundary and exact local log, removes stale committed intents and
+  orphan pre-append reservations, reconstructs pending quorum tickets with the
+  leader self-ACK only, and fails closed if current placement differs from the
+  persisted leader/fingerprint/replica set. Explicit retry redispatches exact
+  pending sequences idempotently; an ACK arriving immediately after restart can
+  trigger ticket reconstruction automatically. Commit cleanup persists the
+  committed boundary before deleting intent, so crash ordering cannot promote
+  local durability to quorum durability.
+
+### Fabric stream quorum commit — 2026-09-17
+- **Application-level replica ACK/NACK and quorum visibility** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`, `src/runtime/distributed.rs`,
+  `src/runtime/fabric_stream.rs`). Replicated appends now create leader-local
+  pending tickets, count the leader's fsynced append as the first ACK, and
+  require a majority of the configured replica set before advancing a durable
+  contiguous commit index. Followers send a reserved application ACK/NACK only
+  after exact-sequence durable application; transport ACKs are never counted as
+  quorum durability. The committed boundary is persisted atomically and powers
+  committed-only reads, while raw local reads may expose uncommitted tails.
+  Duplicate ACKs are idempotent and pending ACKs are fenced to the current
+  membership fingerprint. Pending tickets remain volatile across restart;
+  uncommitted durable tails stay uncommitted until future retry/catch-up work.
+
+### Fabric stream replica transport — 2026-09-17
+- **NUL0-v1-compatible Fabric stream replication transport** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`, `src/runtime/distributed.rs`).
+  Leader-produced replica envelopes can now be dispatched through the existing
+  `Packet::ActorMessage` shape using reserved system actor 0 plus an internal
+  behavior name; no packet discriminant or wire-version change is required.
+  Receivers verify transport sender identity, envelope leader, placement, and
+  exact-sequence durable application before accepting data. Duplicate network
+  retry remains idempotent. Dispatch reporting distinguishes reachable sends
+  from unavailable replicas. Transport ACKs are explicitly not treated as
+  replica fsync/quorum ACKs; application-level quorum commit remains follow-up.
+
+### Fabric stream replica placement — 2026-09-17
+- **Deterministic Fabric stream ownership** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`, `src/runtime/fabric_stream.rs`).
+  Adds rendezvous-hash replica placement over the stable known-membership set,
+  exact-sequence idempotent replica application, leader-produced replica
+  envelopes, and stale-membership/leader/configuration rejection. Failed and
+  suspicious nodes remain in placement until confirmed removed so transient
+  partitions cannot silently elect a second writer. The current physical store
+  remains partition 0 only; remote transport, quorum ACKs, automatic failover,
+  and physical multi-partition logs remain follow-up work.
+
+### Fabric durable stream storage — 2026-09-17
+- **File-backed Fabric stream log** (Experimental, `src/runtime/fabric_stream.rs`).
+  Adds a dedicated append-only segmented log for Fabric Streams rather than
+  overloading actor journals. Records receive monotonic sequence numbers and a
+  BLAKE3 integrity checksum; successful appends flush and `sync_data` before
+  acknowledgement. Stream recovery verifies segment continuity/checksums and
+  truncates only an incomplete final frame after a torn write. Persisted
+  consumer cursors are monotonic, atomically replaced, and support replay from
+  the first uncommitted sequence. New Runtime APIs open/create streams,
+  append/read records, inspect stream metadata, and commit/read consumer
+  cursors. Distributed replication, retention, ACK/NACK redelivery, DLQs, and
+  deduplication remain follow-up work.
+
+### Runtime backend parity — 2026-09-17
+- **WASM guest-heap negation error parity** (`src/wasm_runtime.rs`,
+  `src/mir_wasm.rs`): unary negation of a guest heap value now reports the
+  same Nulang arithmetic type error as the interpreter instead of surfacing a
+  generic Wasmtime trap. The fix preserves pointer-provenance hardening: a
+  guest `TAG_PTR` remains a linear-memory offset and is never reconstructed as
+  a process-local host pointer. A focused WASM regression test covers tuple
+  negation, and the deterministic differential fuzzer exercises the same path.
+
+### Added since 1.0.0-frozen — 2026-09-14 (web contract + capacity broker hardening)
+- **Web request decoding fixes** (Experimental, `src/web/request_bindings.rs`,
+  `src/web/bindings.rs`, `src/web/contracts.rs`, `src/web/dispatch.rs`).
+  `percent_decode` no longer maps UTF-8 bytes to Latin-1 code points, so
+  non-ASCII query/form/cookie values survive intact. Route handlers with
+  `using` or typeclass-dictionary parameters, and handler parameters with
+  neither a request binding nor a matching route parameter, are now rejected
+  at contract compile time (serve refuses to start) instead of silently
+  staging the closure value into a parameter register. An attached but
+  incomplete binding plan for a handler that declares parameters now returns
+  a 500-series error instead of falling back to the legacy zero-argument
+  call; zero-parameter ambient-`Web.param` handlers keep the legacy path.
+- **Capacity broker fetch deadline + concurrency** (Experimental,
+  `crates/nulang-capacity/src/broker.rs`). `CapacityBroker::collect_snapshots`
+  awaited each provider's `fetch_offers` sequentially with no deadline, so a
+  hung endpoint stalled `rank`/`rank_at` forever and N provider latencies
+  added instead of overlapping. Provider fetches now fan out concurrently
+  (`futures::join_all`) and each is raced against
+  `BrokerPolicy::fetch_timeout` (default 10s, runtime-agnostic via
+  `futures-timer`); a timed-out provider is recorded as a retryable
+  `ProviderErrorKind::Unavailable` and isolated, preserving the existing
+  failure-isolation guarantee.
+- **Path capture decoding + finite Float params** (Experimental,
+  `src/web/runtime_bindings.rs`, `src/web/request_bindings.rs`). Request
+  path segments are now percent-decoded at match time (split on raw `/`
+  first, so an encoded `%2F` stays inside its segment; `+` stays literal
+  per RFC 3986) and route literals are decoded at pattern-compile time,
+  aligning captures with query/form/cookie decoding. Float-typed params
+  now reject `NaN`/`inf` instead of passing non-finite values to
+  handlers.
+
+### Added since 1.0.0-frozen — 2026-09-13 (mobile runtime boundary)
+- **Interpreter-only mobile runtime profile** (`Cargo.toml`, `src/runtime/`, `src/backends/`, `src/vm.rs`): native Cranelift/AOT code generation is now owned by the optional `native-codegen` feature while remaining enabled in default builds. The `mobile-runtime` profile excludes executable-code-generation and dynamic-loader dependencies, gates native backend wiring and benchmarks, and keeps Wasm support independently selectable. `scripts/check_mobile_runtime_profile.sh` provides the release gate for dependency-graph isolation and interpreter-only correctness.
+
+### Runtime soundness — 2026-09-12
+- **NaN-box pointer width safety** (`src/vm.rs`): `Value::ptr` now rejects host
+  addresses that do not fit the 48-bit payload instead of silently masking high
+  address bits and manufacturing a different pointer. Valid in-range pointers
+  keep the existing representation and behavior.
+
+### Added since 1.0.0-frozen — 2026-09-11 (backend parity + durable determinism)
+- **Canonical behavior content hashing** (`src/types.rs`,
+  `src/mir_codegen.rs`): the BLAKE3 content hash that gates
+  remote-behavior verification (and hot-reload fetch) now covers the
+  *full canonical signature* — every parameter type plus the return
+  type — instead of a parameter count and a `format!("{:?}")` Debug
+  string. The Debug string was non-canonical (record field order
+  changed the hash even though record unification is
+  order-insensitive) and the count-only hashing collided behaviors
+  that differ only in parameter types. The new
+  `types::write_canonical_type` encoding is explicit-tagged,
+  length-prefixed, record-field-sorted, and effect-row-sorted; it
+  deliberately preserves information NTIR erases (type variables,
+  effect rows, Nil/Never distinction) because a content hash has no
+  `mgu` backstop. Hash domain is separated (`NLBH\x02`) from NTIR and
+  wire-frame BLAKE3 uses.
+- **Continuation capture soundness** (`src/effect_checker.rs`): handler
+  arms in `handle ... with` are now capability-analyzed — previously
+  `CapabilityAnalyzer` walked only the handle body, so a linear value used
+  in an arm *and* in the resumed body passed checking (a use-after-move
+  across the dynamic `resume` boundary: the arm consumes before the body
+  continues). Each arm is analyzed as an alternative path from the incoming
+  consumption set (arm params shadow outer bindings as `Ref`), and every
+  arm's consumptions are unioned into the body's continuation set. Arm-only
+  uses now satisfy the exactly-once obligation; multi-arm handlers do not
+  double-count across arms.
+- **Durable-effect determinism gate** (`src/effect_checker.rs`): `workflow`
+  step bodies (including saga compensations), the behavior bodies of
+  `persistent` and `entity` actors, and entity `apply` handlers now reject
+  ambient effects that
+  are unsafe under crash re-drive at compile time: `Time.now*`, `Rand.*`,
+  `Net.*`, `FS.*`, and stdio (`IO.print`/`IO.println`/`IO.read`). Recovery
+  re-runs a suspended step from its start, so these would execute again with
+  different results or duplicate side effects; persistent actors and entity
+  apply handlers replay on recovery under the same rule. `Timer.sleep`
+  (journaled and
+  re-armed), performs intercepted by a user `handle`, and `LLM.ask`
+  (re-run by design) remain allowed. Module-function calls from steps are
+  followed transitively.
+- **Backend parity fixes** (`src/aot/mod.rs`, `src/main.rs`,
+  `src/wasm_runtime.rs`): the AOT perform helpers record `Unhandled effect`
+  on the pending-error channel instead of silently yielding nil; `--backend
+  wasm-run` prints the program result (previously discarded) and runs
+  `IO.print` (the host ignored the guest's null-terminated-string
+  contract); string results no longer print as raw `#Value(...)` after
+  backend memory teardown; `--eval` no longer falls through to piped-stdin
+  script execution after evaluating.
 
 ### Added since 1.0.0-frozen — 2026-08-22 (vscode extension)
 - **AOT backend error parity** (`src/aot/mod.rs`): the native AOT run path
@@ -1102,3 +1584,23 @@ in this version; they are recorded here to establish their tier.
 No stability promise. The 0.x series is the alpha development track. Language
 version 1.0.0-frozen is the first version with a published stability contract;
 everything before it is implicitly Experimental.
+
+## Experimental tier
+
+### Allocation-free protocol actor-ref decoding — 2026-09-21
+- **ProtocolId wire decode no longer hex-allocates.** The fixed 32-byte protocol digest is reconstructed directly with `ProtocolId::from_bytes` instead of expanding to a 64-character hex `String` and reparsing it. Wire bytes and compatibility semantics are unchanged.
+
+### Single-pass LSP diagnostics parsing — 2026-09-21
+- **LSP diagnostics reuse their parsed AST.** Document open and debounced changes now populate `DocumentState.ast` from the frontend pass that already produced diagnostics, removing a guaranteed second lex+parse of the same source while preserving diagnostics and editor semantics.
+
+### Canonical stdlib module manifest — 2026-09-21
+- **Stdlib module metadata is now generated from one manifest.** `spec/stdlib/v0alpha1.json` owns module names, imports, source paths, stability tiers, descriptions, and declared official package mirrors. `scripts/generate_stdlib.py` materializes Rust descriptors and the docs module index from that file.
+- **Official package mirrors fail closed on drift.** The `json` seed package is generated from `src/stdlib/json.nula` with only its package-specific import preamble substituted; `scripts/verify_implementation.py` runs the generator in `--check` mode so stale package copies or generated metadata fail CI.
+- **Built-in effects remain executable registry data.** `src/stdlib.rs` still owns the compiler/runtime built-in operation registry used by effect docs; module metadata is no longer duplicated in its comments. This intentionally separates executable effect semantics from higher-level Nulang-authored module metadata while exposing both through `nulang::stdlib`.
+
+
+## Experimental tier
+
+### Standard-library Option lookup contracts — 2026-09-21
+- **Collection absence is explicit.** Experimental `stdlib::map.get`, `stdlib::list.index_of`, and `stdlib::list.find` now return `Option` instead of sentinel `-1` values. `max_of`, `min_of`, `min_by`, and `max_by` now return `None` for empty inputs. Conformance fixtures and stdlib tests pin the new contracts. This is source-breaking for Experimental stdlib callers that compared missing results with integer sentinels.
+

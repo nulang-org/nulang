@@ -1,0 +1,4 @@
+fn is_alpha(c) -> Bool {
+    (c >= 65 and c <= 90) or(c >= 97 and c <= 122)
+}
+is_alpha(65)
