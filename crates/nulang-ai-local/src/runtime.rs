@@ -1,12 +1,14 @@
 //! Local agent runtime: Director + Manager + Worker + SQLite + NLAP events.
 
 use crate::config::AgentConfigFile;
-use crate::store::{AgentStateTransition, SqliteStore, StoreError};
+use crate::store::{
+    AgentResumeTransition, AgentStateTransition, ResumeCommitResult, SqliteStore, StoreError,
+};
 use chrono::Utc;
 use nulang_ai_core::{
-    Commitment, CommitmentStatus, ConversationMessage, ConversationState, GoalStatus, Intention,
-    IntentionRevision, IntentionRevisionDecision, IntentionStatus, SwarmEvent, SwarmEventEnvelope,
-    Task, TaskStatus,
+    Commitment, CommitmentResumption, CommitmentStatus, ConversationMessage, ConversationState,
+    Goal, GoalStatus, Intention, IntentionRevision, IntentionRevisionDecision, IntentionStatus,
+    SwarmEvent, SwarmEventEnvelope, Task, TaskStatus,
 };
 use nulang_ai_director::{Director, LocalDirector};
 use nulang_ai_manager::{EngineeringManager, Manager};
@@ -175,15 +177,238 @@ impl LocalRuntime {
         conv.updated_at = Utc::now();
         self.store.upsert_conversation(&conv)?;
 
-        let mut replan_count = 0usize;
-        let mut tasks =
+        let tasks =
             self.engineering
                 .plan_tasks(goal_id, text, self.config.director.default_budget_usd);
-        let mut intention = self.new_intention(goal_id, commitment.id, 0, &tasks);
+        let intention = self.new_intention(goal_id, commitment.id, 0, &tasks);
         self.activate_intention(&intention, out)?;
 
+        self.drive_goal(
+            goal,
+            commitment,
+            intention,
+            tasks,
+            text,
+            Some(self.conversation_id),
+            out,
+            true,
+            0,
+        )
+    }
+
+    pub fn resume_goal(
+        &mut self,
+        goal_id: Uuid,
+        request_id: Uuid,
+        reason: &str,
+        out: &mut dyn Write,
+    ) -> Result<Uuid, RuntimeError> {
+        self.flush_pending_events(out)?;
+
+        if let Some(existing) = self.store.get_resumption_by_request(request_id)? {
+            if existing.goal_id != goal_id {
+                return Err(StoreError::InvalidTransition(
+                    "resume request id already belongs to a different goal",
+                )
+                .into());
+            }
+            return self.continue_existing_resumption(existing, out);
+        }
+
+        let graph = self.store.get_goal_graph(goal_id)?;
+        if graph.goal.status != GoalStatus::Blocked {
+            return Err(StoreError::InvalidTransition("goal is not blocked").into());
+        }
+
+        let blocked_commitment = graph
+            .commitments
+            .iter()
+            .rev()
+            .find(|commitment| commitment.status == CommitmentStatus::Suspended)
+            .cloned()
+            .ok_or(StoreError::InvalidTransition(
+                "blocked goal has no suspended commitment",
+            ))?;
+        let blocked_intention = graph
+            .intentions
+            .iter()
+            .rev()
+            .find(|intention| {
+                intention.commitment_id == blocked_commitment.id
+                    && intention.status == IntentionStatus::Blocked
+            })
+            .cloned()
+            .ok_or(StoreError::InvalidTransition(
+                "suspended commitment has no blocked intention",
+            ))?;
+
+        let mut goal = graph.goal.clone();
+        let mut commitment = blocked_commitment;
+        let tasks = self.engineering.plan_tasks(
+            goal_id,
+            &goal.intent,
+            self.config.director.default_budget_usd,
+        );
+        let replacement =
+            self.new_intention(goal_id, commitment.id, graph.intentions.len(), &tasks);
+        let resumption =
+            CommitmentResumption::new(request_id, &blocked_intention, replacement.id, reason);
+
+        commitment.status = CommitmentStatus::Active;
+        commitment.updated_at = Utc::now();
+        goal.status = GoalStatus::Running;
+        goal.updated_at = Utc::now();
+
+        let conversation_id = goal.conversation_id;
+        let mut outbox_events = vec![
+            self.envelope_for(
+                SwarmEvent::CommitmentResumed {
+                    commitment_id: commitment.id,
+                    goal_id,
+                    request_id,
+                    reason: reason.to_string(),
+                },
+                conversation_id,
+            ),
+            self.envelope_for(
+                SwarmEvent::GoalResumed {
+                    goal_id,
+                    request_id,
+                    reason: reason.to_string(),
+                },
+                conversation_id,
+            ),
+            self.envelope_for(
+                SwarmEvent::IntentionActivated {
+                    intention_id: replacement.id,
+                    commitment_id: replacement.commitment_id,
+                    goal_id: replacement.goal_id,
+                    owner_agent_id: replacement.owner_agent_id.clone(),
+                },
+                conversation_id,
+            ),
+        ];
+        for task in &tasks {
+            outbox_events.push(self.envelope_for(
+                SwarmEvent::TaskCreated {
+                    task_id: task.id,
+                    goal_id: task.goal_id,
+                },
+                conversation_id,
+            ));
+        }
+
+        match self
+            .store
+            .commit_agent_resume_transition(AgentResumeTransition {
+                blocked_intention: &blocked_intention,
+                replacement_intention: &replacement,
+                replacement_tasks: &tasks,
+                resumption: &resumption,
+                commitment: &commitment,
+                goal: &goal,
+                outbox_events: &outbox_events,
+            })?
+        {
+            ResumeCommitResult::Applied(_) => {
+                self.flush_pending_events(out)?;
+                let plan_text = goal.intent.clone();
+                self.drive_goal(
+                    goal,
+                    commitment,
+                    replacement,
+                    tasks,
+                    &plan_text,
+                    conversation_id,
+                    out,
+                    false,
+                    0,
+                )
+            }
+            ResumeCommitResult::AlreadyApplied(existing) => {
+                self.flush_pending_events(out)?;
+                self.continue_existing_resumption(existing, out)
+            }
+        }
+    }
+
+    fn continue_existing_resumption(
+        &mut self,
+        resumption: CommitmentResumption,
+        out: &mut dyn Write,
+    ) -> Result<Uuid, RuntimeError> {
+        let graph = self.store.get_goal_graph(resumption.goal_id)?;
+        let replacement = graph
+            .intentions
+            .iter()
+            .find(|intention| intention.id == resumption.replacement_intention_id)
+            .cloned()
+            .ok_or(StoreError::InvalidTransition(
+                "resumption replacement intention is missing",
+            ))?;
+
+        if replacement.status != IntentionStatus::Active
+            || graph.goal.status != GoalStatus::Running
+        {
+            self.flush_pending_events(out)?;
+            return Ok(resumption.goal_id);
+        }
+
+        let commitment = graph
+            .commitments
+            .iter()
+            .find(|commitment| commitment.id == resumption.commitment_id)
+            .cloned()
+            .ok_or(StoreError::InvalidTransition(
+                "resumption commitment is missing",
+            ))?;
+        if commitment.status != CommitmentStatus::Active {
+            return Err(StoreError::InvalidTransition(
+                "resumption commitment is not active",
+            )
+            .into());
+        }
+
+        let tasks = ordered_tasks_for_intention(&graph.tasks, &replacement)?;
+        let goal = graph.goal;
+        let conversation_id = goal.conversation_id;
+        let plan_text = goal.intent.clone();
+        self.drive_goal(
+            goal,
+            commitment,
+            replacement,
+            tasks,
+            &plan_text,
+            conversation_id,
+            out,
+            false,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drive_goal(
+        &mut self,
+        mut goal: Goal,
+        mut commitment: Commitment,
+        mut intention: Intention,
+        mut tasks: Vec<Task>,
+        plan_text: &str,
+        conversation_id: Option<Uuid>,
+        out: &mut dyn Write,
+        mut initialize_tasks: bool,
+        mut replan_count: usize,
+    ) -> Result<Uuid, RuntimeError> {
+        let goal_id = goal.id;
+
         loop {
-            match self.execute_intention(&mut intention, tasks, out)? {
+            match self.execute_intention(
+                &mut intention,
+                tasks,
+                out,
+                initialize_tasks,
+                conversation_id,
+            )? {
                 PlanOutcome::Completed {
                     terminal_task,
                     agent_id,
@@ -197,21 +422,32 @@ impl LocalRuntime {
                     if let (Some(task), Some(agent_id)) =
                         (terminal_task.as_ref(), agent_id.as_ref())
                     {
-                        outbox_events.push(self.envelope(SwarmEvent::TaskCompleted {
-                            task_id: task.id,
-                            agent_id: agent_id.clone(),
-                        }));
+                        outbox_events.push(self.envelope_for(
+                            SwarmEvent::TaskCompleted {
+                                task_id: task.id,
+                                agent_id: agent_id.clone(),
+                            },
+                            conversation_id,
+                        ));
                     }
-                    outbox_events.push(self.envelope(SwarmEvent::IntentionCompleted {
-                        intention_id: intention.id,
-                        commitment_id: intention.commitment_id,
-                        goal_id: intention.goal_id,
-                    }));
-                    outbox_events.push(self.envelope(SwarmEvent::CommitmentFulfilled {
-                        commitment_id: commitment.id,
-                        goal_id,
-                    }));
-                    outbox_events.push(self.envelope(SwarmEvent::GoalCompleted { goal_id }));
+                    outbox_events.push(self.envelope_for(
+                        SwarmEvent::IntentionCompleted {
+                            intention_id: intention.id,
+                            commitment_id: intention.commitment_id,
+                            goal_id: intention.goal_id,
+                        },
+                        conversation_id,
+                    ));
+                    outbox_events.push(self.envelope_for(
+                        SwarmEvent::CommitmentFulfilled {
+                            commitment_id: commitment.id,
+                            goal_id,
+                        },
+                        conversation_id,
+                    ));
+                    outbox_events.push(
+                        self.envelope_for(SwarmEvent::GoalCompleted { goal_id }, conversation_id),
+                    );
 
                     self.store
                         .commit_agent_state_transition(AgentStateTransition {
@@ -246,30 +482,45 @@ impl LocalRuntime {
                     goal.updated_at = Utc::now();
 
                     let outbox_events = vec![
-                        self.envelope(SwarmEvent::TaskBlocked {
-                            task_id: terminal_task.id,
-                            agent_id,
-                            reason: reason.clone(),
-                        }),
-                        self.envelope(SwarmEvent::IntentionBlocked {
-                            intention_id: intention.id,
-                            commitment_id: intention.commitment_id,
-                            goal_id: intention.goal_id,
-                            reason: reason.clone(),
-                        }),
-                        self.envelope(SwarmEvent::IntentionRevised {
-                            revision_id: revision.id,
-                            superseded_intention_id: revision.superseded_intention_id,
-                            replacement_intention_id: revision.replacement_intention_id,
-                            decision: revision.decision,
-                            reason: revision.reason.clone(),
-                        }),
-                        self.envelope(SwarmEvent::CommitmentSuspended {
-                            commitment_id: commitment.id,
-                            goal_id,
-                            reason: reason.clone(),
-                        }),
-                        self.envelope(SwarmEvent::GoalBlocked { goal_id, reason }),
+                        self.envelope_for(
+                            SwarmEvent::TaskBlocked {
+                                task_id: terminal_task.id,
+                                agent_id,
+                                reason: reason.clone(),
+                            },
+                            conversation_id,
+                        ),
+                        self.envelope_for(
+                            SwarmEvent::IntentionBlocked {
+                                intention_id: intention.id,
+                                commitment_id: intention.commitment_id,
+                                goal_id: intention.goal_id,
+                                reason: reason.clone(),
+                            },
+                            conversation_id,
+                        ),
+                        self.envelope_for(
+                            SwarmEvent::IntentionRevised {
+                                revision_id: revision.id,
+                                superseded_intention_id: revision.superseded_intention_id,
+                                replacement_intention_id: revision.replacement_intention_id,
+                                decision: revision.decision,
+                                reason: revision.reason.clone(),
+                            },
+                            conversation_id,
+                        ),
+                        self.envelope_for(
+                            SwarmEvent::CommitmentSuspended {
+                                commitment_id: commitment.id,
+                                goal_id,
+                                reason: reason.clone(),
+                            },
+                            conversation_id,
+                        ),
+                        self.envelope_for(
+                            SwarmEvent::GoalBlocked { goal_id, reason },
+                            conversation_id,
+                        ),
                     ];
 
                     self.store
@@ -293,7 +544,7 @@ impl LocalRuntime {
                     replan_count += 1;
                     let replacement_tasks = self.engineering.plan_tasks(
                         goal_id,
-                        text,
+                        plan_text,
                         self.config.director.default_budget_usd,
                     );
                     let replacement = self.new_intention(
@@ -312,30 +563,42 @@ impl LocalRuntime {
                     );
 
                     let outbox_events = vec![
-                        self.envelope(SwarmEvent::TaskFailed {
-                            task_id: terminal_task.id,
-                            agent_id,
-                            reason: reason.clone(),
-                        }),
-                        self.envelope(SwarmEvent::IntentionFailed {
-                            intention_id: intention.id,
-                            commitment_id: intention.commitment_id,
-                            goal_id: intention.goal_id,
-                            reason: reason.clone(),
-                        }),
-                        self.envelope(SwarmEvent::IntentionRevised {
-                            revision_id: revision.id,
-                            superseded_intention_id: revision.superseded_intention_id,
-                            replacement_intention_id: revision.replacement_intention_id,
-                            decision: revision.decision,
-                            reason: revision.reason.clone(),
-                        }),
-                        self.envelope(SwarmEvent::IntentionActivated {
-                            intention_id: replacement.id,
-                            commitment_id: replacement.commitment_id,
-                            goal_id: replacement.goal_id,
-                            owner_agent_id: replacement.owner_agent_id.clone(),
-                        }),
+                        self.envelope_for(
+                            SwarmEvent::TaskFailed {
+                                task_id: terminal_task.id,
+                                agent_id,
+                                reason: reason.clone(),
+                            },
+                            conversation_id,
+                        ),
+                        self.envelope_for(
+                            SwarmEvent::IntentionFailed {
+                                intention_id: intention.id,
+                                commitment_id: intention.commitment_id,
+                                goal_id: intention.goal_id,
+                                reason: reason.clone(),
+                            },
+                            conversation_id,
+                        ),
+                        self.envelope_for(
+                            SwarmEvent::IntentionRevised {
+                                revision_id: revision.id,
+                                superseded_intention_id: revision.superseded_intention_id,
+                                replacement_intention_id: revision.replacement_intention_id,
+                                decision: revision.decision,
+                                reason: revision.reason.clone(),
+                            },
+                            conversation_id,
+                        ),
+                        self.envelope_for(
+                            SwarmEvent::IntentionActivated {
+                                intention_id: replacement.id,
+                                commitment_id: replacement.commitment_id,
+                                goal_id: replacement.goal_id,
+                                owner_agent_id: replacement.owner_agent_id.clone(),
+                            },
+                            conversation_id,
+                        ),
                     ];
 
                     self.store
@@ -352,6 +615,7 @@ impl LocalRuntime {
 
                     intention = replacement;
                     tasks = replacement_tasks;
+                    initialize_tasks = true;
                 }
                 PlanOutcome::Failed {
                     terminal_task,
@@ -373,30 +637,45 @@ impl LocalRuntime {
                     goal.updated_at = Utc::now();
 
                     let outbox_events = vec![
-                        self.envelope(SwarmEvent::TaskFailed {
-                            task_id: terminal_task.id,
-                            agent_id,
-                            reason: reason.clone(),
-                        }),
-                        self.envelope(SwarmEvent::IntentionFailed {
-                            intention_id: intention.id,
-                            commitment_id: intention.commitment_id,
-                            goal_id: intention.goal_id,
-                            reason: reason.clone(),
-                        }),
-                        self.envelope(SwarmEvent::IntentionRevised {
-                            revision_id: revision.id,
-                            superseded_intention_id: revision.superseded_intention_id,
-                            replacement_intention_id: revision.replacement_intention_id,
-                            decision: revision.decision,
-                            reason: revision.reason.clone(),
-                        }),
-                        self.envelope(SwarmEvent::CommitmentAbandoned {
-                            commitment_id: commitment.id,
-                            goal_id,
-                            reason: reason.clone(),
-                        }),
-                        self.envelope(SwarmEvent::GoalFailed { goal_id, reason }),
+                        self.envelope_for(
+                            SwarmEvent::TaskFailed {
+                                task_id: terminal_task.id,
+                                agent_id,
+                                reason: reason.clone(),
+                            },
+                            conversation_id,
+                        ),
+                        self.envelope_for(
+                            SwarmEvent::IntentionFailed {
+                                intention_id: intention.id,
+                                commitment_id: intention.commitment_id,
+                                goal_id: intention.goal_id,
+                                reason: reason.clone(),
+                            },
+                            conversation_id,
+                        ),
+                        self.envelope_for(
+                            SwarmEvent::IntentionRevised {
+                                revision_id: revision.id,
+                                superseded_intention_id: revision.superseded_intention_id,
+                                replacement_intention_id: revision.replacement_intention_id,
+                                decision: revision.decision,
+                                reason: revision.reason.clone(),
+                            },
+                            conversation_id,
+                        ),
+                        self.envelope_for(
+                            SwarmEvent::CommitmentAbandoned {
+                                commitment_id: commitment.id,
+                                goal_id,
+                                reason: reason.clone(),
+                            },
+                            conversation_id,
+                        ),
+                        self.envelope_for(
+                            SwarmEvent::GoalFailed { goal_id, reason },
+                            conversation_id,
+                        ),
                     ];
 
                     self.store
@@ -470,20 +749,29 @@ impl LocalRuntime {
         intention: &mut Intention,
         tasks: Vec<Task>,
         out: &mut dyn Write,
+        initialize_tasks: bool,
+        conversation_id: Option<Uuid>,
     ) -> Result<PlanOutcome, RuntimeError> {
-        for task in &tasks {
-            self.store.upsert_task(task)?;
-            self.emit(
-                out,
-                SwarmEvent::TaskCreated {
-                    task_id: task.id,
-                    goal_id: task.goal_id,
-                },
-            )?;
+        if initialize_tasks {
+            for task in &tasks {
+                self.store.upsert_task(task)?;
+                self.emit_for(
+                    out,
+                    SwarmEvent::TaskCreated {
+                        task_id: task.id,
+                        goal_id: task.goal_id,
+                    },
+                    conversation_id,
+                )?;
+            }
         }
 
-        let task_count = tasks.len();
-        for (index, task) in tasks.into_iter().enumerate() {
+        let executable_tasks: Vec<Task> = tasks
+            .into_iter()
+            .filter(|task| task.status != TaskStatus::Completed)
+            .collect();
+        let task_count = executable_tasks.len();
+        for (index, task) in executable_tasks.into_iter().enumerate() {
             let agent_id = task
                 .assigned_agent_id
                 .clone()
@@ -492,12 +780,13 @@ impl LocalRuntime {
             running.status = TaskStatus::Running;
             running.updated_at = Utc::now();
             self.store.upsert_task(&running)?;
-            self.emit(
+            self.emit_for(
                 out,
                 SwarmEvent::TaskStarted {
                     task_id: running.id,
                     agent_id: agent_id.clone(),
                 },
+                conversation_id,
             )?;
 
             let report = self.worker.execute_with_report(&running);
@@ -536,12 +825,13 @@ impl LocalRuntime {
             match terminal_status {
                 TaskStatus::Completed if index + 1 < task_count => {
                     self.store.upsert_task(&result)?;
-                    self.emit(
+                    self.emit_for(
                         out,
                         SwarmEvent::TaskCompleted {
                             task_id: result.id,
                             agent_id,
                         },
+                        conversation_id,
                     )?;
                 }
                 TaskStatus::Completed => {
@@ -583,7 +873,15 @@ impl LocalRuntime {
     }
 
     fn envelope(&self, event: SwarmEvent) -> SwarmEventEnvelope {
-        SwarmEventEnvelope::new(event, Some(self.conversation_id))
+        self.envelope_for(event, Some(self.conversation_id))
+    }
+
+    fn envelope_for(
+        &self,
+        event: SwarmEvent,
+        conversation_id: Option<Uuid>,
+    ) -> SwarmEventEnvelope {
+        SwarmEventEnvelope::new(event, conversation_id)
     }
 
     pub fn flush_pending_events(&self, out: &mut dyn Write) -> Result<usize, RuntimeError> {
@@ -619,13 +917,40 @@ impl LocalRuntime {
         Ok(delivered)
     }
 
-    fn emit(&self, out: &mut dyn Write, event: SwarmEvent) -> Result<(), RuntimeError> {
-        let envelope = self.envelope(event);
+    fn emit_for(
+        &self,
+        out: &mut dyn Write,
+        event: SwarmEvent,
+        conversation_id: Option<Uuid>,
+    ) -> Result<(), RuntimeError> {
+        let envelope = self.envelope_for(event, conversation_id);
         let line = format_event_line(&envelope)?;
         writeln!(out, "{}", line)?;
         out.flush()?;
         Ok(())
     }
+
+    fn emit(&self, out: &mut dyn Write, event: SwarmEvent) -> Result<(), RuntimeError> {
+        self.emit_for(out, event, Some(self.conversation_id))
+    }
+}
+
+fn ordered_tasks_for_intention(
+    tasks: &[Task],
+    intention: &Intention,
+) -> Result<Vec<Task>, RuntimeError> {
+    let mut ordered = Vec::with_capacity(intention.planned_task_ids.len());
+    for task_id in &intention.planned_task_ids {
+        let task = tasks
+            .iter()
+            .find(|task| task.id == *task_id)
+            .cloned()
+            .ok_or(StoreError::InvalidTransition(
+                "replacement intention references a missing task",
+            ))?;
+        ordered.push(task);
+    }
+    Ok(ordered)
 }
 
 pub fn init_project(dir: &Path) -> Result<(), RuntimeError> {
