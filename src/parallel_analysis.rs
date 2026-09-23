@@ -135,7 +135,10 @@ fn branch_conflict(
     }
     for name in &a.heap_mutations {
         if b.reads.contains(name) || b.writes.contains(name) || b.heap_mutations.contains(name) {
-            return Some(("shared aggregate mutation conflicts with access to", name.clone()));
+            return Some((
+                "shared aggregate mutation conflicts with access to",
+                name.clone(),
+            ));
         }
     }
     for name in &b.heap_mutations {
@@ -598,10 +601,8 @@ mod tests {
         };
         let summary = summarize_branch(0, &branch);
         assert!(summary.effects.contains("Actor.spawn"));
-        assert!(
-            summary
-                .authorities
-                .contains("Net::TcpOut(api.example.com:443)")
-        );
+        assert!(summary
+            .authorities
+            .contains("Net::TcpOut(api.example.com:443)"));
     }
 }
