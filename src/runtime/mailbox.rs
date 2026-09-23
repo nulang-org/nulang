@@ -394,38 +394,52 @@ impl Mailbox {
         result
     }
 
+    fn stage_message(
+        buffer: &mut VecDeque<(Message, bool)>,
+        index: &mut ReceiveLaneIndex,
+        msg: Message,
+    ) {
+        let position = buffer.len();
+        let behavior_id = msg.behavior_id;
+        buffer.push_back((msg, false));
+        index.append(behavior_id, position);
+    }
+
     fn stage_arrivals(&mut self) {
         // Scheduler-local system messages join the system lane; other local
         // traffic stays in its own lane so its FIFO position is stable.
         while let Some(msg) = self.local_queue.pop_front() {
             if msg.priority == MessagePriority::System {
-                self.system_skip_buffer.push_back((msg, false));
+                Self::stage_message(
+                    &mut self.system_skip_buffer,
+                    &mut self.system_index,
+                    msg,
+                );
             } else {
-                self.local_skip_buffer.push_back((msg, false));
+                Self::stage_message(&mut self.local_skip_buffer, &mut self.local_index, msg);
             }
         }
         while let Some(msg) = self.system_queue.pop() {
-            self.system_skip_buffer.push_back((msg, false));
+            Self::stage_message(
+                &mut self.system_skip_buffer,
+                &mut self.system_index,
+                msg,
+            );
         }
         while let Some(msg) = self.normal_queue.pop() {
-            self.skip_buffer.push_back((msg, false));
+            Self::stage_message(&mut self.skip_buffer, &mut self.normal_index, msg);
         }
     }
 
-    fn scan_staged(
+    fn scan_indexed(
         buffer: &mut VecDeque<(Message, bool)>,
+        index: &mut ReceiveLaneIndex,
         behavior_ids: &[u16],
     ) -> Option<(usize, usize, Arc<Vec<Value>>)> {
-        for (idx, (msg, tried)) in buffer.iter_mut().enumerate() {
-            if *tried {
-                continue;
-            }
-            if let Some(pos) = behavior_ids.iter().position(|&id| id == msg.behavior_id) {
-                *tried = true;
-                return Some((pos, idx, msg.payload.to_shared()));
-            }
-        }
-        None
+        let (arm_pos, message_idx) = index.next_candidate(buffer, behavior_ids)?;
+        let (message, tried) = buffer.get_mut(message_idx)?;
+        *tried = true;
+        Some((arm_pos, message_idx, message.payload.to_shared()))
     }
 
     /// Selective receive is transactional: returning a candidate only marks it
@@ -439,19 +453,25 @@ impl Mailbox {
         self.active_match = None;
         self.stage_arrivals();
 
-        if let Some((pos, idx, payload)) =
-            Self::scan_staged(&mut self.system_skip_buffer, behavior_ids)
-        {
+        if let Some((pos, idx, payload)) = Self::scan_indexed(
+            &mut self.system_skip_buffer,
+            &mut self.system_index,
+            behavior_ids,
+        ) {
             self.active_match = Some((MatchLane::System, idx, Arc::clone(&payload)));
             return Some((pos, payload));
         }
-        if let Some((pos, idx, payload)) =
-            Self::scan_staged(&mut self.local_skip_buffer, behavior_ids)
-        {
+        if let Some((pos, idx, payload)) = Self::scan_indexed(
+            &mut self.local_skip_buffer,
+            &mut self.local_index,
+            behavior_ids,
+        ) {
             self.active_match = Some((MatchLane::Local, idx, Arc::clone(&payload)));
             return Some((pos, payload));
         }
-        if let Some((pos, idx, payload)) = Self::scan_staged(&mut self.skip_buffer, behavior_ids) {
+        if let Some((pos, idx, payload)) =
+            Self::scan_indexed(&mut self.skip_buffer, &mut self.normal_index, behavior_ids)
+        {
             self.active_match = Some((MatchLane::Normal, idx, Arc::clone(&payload)));
             return Some((pos, payload));
         }
