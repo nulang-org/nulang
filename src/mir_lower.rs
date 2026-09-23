@@ -32,6 +32,39 @@ fn compile_err(msg: impl Into<String>, span: Span) -> NuError {
     }
 }
 
+/// Serialize the replay-relevant shape of RFC 0008 migration contracts into
+/// actor metadata. Migration bodies remain compiler IR, but runtime/tooling
+/// must at least retain the version topology and event surface instead of
+/// silently dropping every contract at the HIR -> MIR boundary.
+fn serialize_migration_metadata(migrations: &[crate::ast::MigrationDecl]) -> String {
+    let mut ordered: Vec<_> = migrations.iter().collect();
+    ordered.sort_by_key(|migration| migration.from_version);
+
+    let metadata: Vec<_> = ordered
+        .into_iter()
+        .map(|migration| {
+            let events: Vec<_> = migration
+                .event_migrations
+                .iter()
+                .map(|(name, params, _body)| {
+                    serde_json::json!({
+                        "name": name,
+                        "arity": params.len(),
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "from": migration.from_version,
+                "to": migration.to_version,
+                "state": migration.state_body.is_some(),
+                "events": events,
+            })
+        })
+        .collect();
+
+    serde_json::to_string(&metadata).expect("migration metadata is JSON-serializable")
+}
+
 pub fn lower_module(hir: &hir::Module) -> NuResult<mir::Module> {
     let mut ctx = ModuleCtx::new(&hir.name);
 
@@ -149,7 +182,7 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                 retry_config: a.retry_config.clone(),
                 type_hash: None,
                 version: a.version,
-                migrations: String::new(),
+                migrations: serialize_migration_metadata(&a.migrations),
             });
         }
         hir::Decl::Workflow { name, .. } => {
