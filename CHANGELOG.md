@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### RFC 0025 proposed — structured concurrency semantics — 2026-09-23
+- **RFC 0025 specifies the permanent target contract for source-level `par`** (Proposed, Experimental until implementation gates land): source-ordered typed results, lexical child lifetime, deterministic failure selection and sibling cancellation, conservative effect-operation scheduling, ownership-aware capture classes, sequential/cooperative/worker execution modes, and preservation of ORCA actor-heap thread confinement. The proposal explicitly supersedes the current experimental "last expression wins" `par` result behavior before stabilization.
+
 ### Backend differential oracle hardening — 2026-09-22
 - **WASM differential execution now fails closed after artifact emission** (`src/fuzz.rs`, `src/difffuzz.rs`). Restricted-profile rejection remains an expected compile-time skip, but malformed/invalid emitted WASM, instantiation failures, or a missing required `nulang_init` export are backend correctness failures. Differential campaigns now record WASM agreement coverage, and the `wasm-backend` test lane requires positive WASM participation so a silently-disabled backend cannot leave CI green.
 
