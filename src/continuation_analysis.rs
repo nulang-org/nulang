@@ -176,9 +176,7 @@ pub fn rvalue_uses(op: &RValue) -> Vec<LocalId> {
         RValue::ArrayLen(arr) => out.push(*arr),
         RValue::ArrayLit(items) | RValue::Tuple(items) => out.extend_from_slice(items),
         RValue::Unary(_, local) => out.push(*local),
-        RValue::Binary(_, lhs, rhs)
-        | RValue::StringEq(lhs, rhs)
-        | RValue::StrConcat(lhs, rhs) => {
+        RValue::Binary(_, lhs, rhs) | RValue::StringEq(lhs, rhs) | RValue::StrConcat(lhs, rhs) => {
             out.push(*lhs);
             out.push(*rhs);
         }
@@ -275,9 +273,7 @@ fn normal_successors(func: &mir::Function) -> HashMap<BlockId, Vec<BlockId>> {
         .map(|block| {
             let succs = match block.terminator {
                 Terminator::Jump(target) => vec![target],
-                Terminator::Branch {
-                    then_, else_, ..
-                } => vec![then_, else_],
+                Terminator::Branch { then_, else_, .. } => vec![then_, else_],
                 _ => Vec::new(),
             };
             (block.id, succs)
@@ -346,9 +342,7 @@ fn live_in_sets(func: &mir::Function) -> HashMap<BlockId, BTreeSet<LocalId>> {
     live_in
 }
 
-fn live_after_statements(
-    func: &mir::Function,
-) -> HashMap<(BlockId, usize), BTreeSet<LocalId>> {
+fn live_after_statements(func: &mir::Function) -> HashMap<(BlockId, usize), BTreeSet<LocalId>> {
     let succs = normal_successors(func);
     let live_in = live_in_sets(func);
     let mut result = HashMap::new();
