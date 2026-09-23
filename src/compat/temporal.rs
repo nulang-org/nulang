@@ -138,7 +138,8 @@ impl TemporalWorkflowTaskContext {
             EffectBoundary::External,
             delivery,
         );
-        let record = DurableEffectRecord::prepare(spec, &request.input);
+        let durable_request = request.durable_request_bytes();
+        let record = DurableEffectRecord::prepare(spec, &durable_request);
 
         Ok(TemporalActivityPlan { request, record })
     }
@@ -232,6 +233,20 @@ impl TemporalActivityRequest {
         validate_non_empty("task_queue", &self.task_queue)?;
         Ok(())
     }
+
+    /// Canonical request bytes bound to the durable-effect journal record.
+    ///
+    /// Every compatibility field that affects activity dispatch must be added
+    /// here when introduced. This makes replay fail closed when a worker emits
+    /// a different command for the same logical operation ID.
+    pub fn durable_request_bytes(&self) -> Vec<u8> {
+        let mut out = b"temporal-activity-request/v1\0".to_vec();
+        append_bytes(&mut out, self.activity_id.as_bytes());
+        append_bytes(&mut out, self.activity_type.as_bytes());
+        append_bytes(&mut out, self.task_queue.as_bytes());
+        append_bytes(&mut out, &self.input);
+        out
+    }
 }
 
 /// Result of translating a Temporal activity command into Nulang durability
@@ -281,6 +296,11 @@ fn append_component(out: &mut String, value: &str) {
     write!(out, "/{}:{value}", value.len()).expect("writing to String cannot fail");
 }
 
+fn append_bytes(out: &mut Vec<u8>, value: &[u8]) {
+    out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    out.extend_from_slice(value);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,10 +339,11 @@ mod tests {
         let replay = ctx.prepare_activity(0, activity()).unwrap();
 
         assert_eq!(first.record.spec().id, replay.record.spec().id);
+        let durable_request = first.request.durable_request_bytes();
         assert_eq!(
             first
                 .record
-                .recovery_action_for_request(br#"{"amount":4200}"#)
+                .recovery_action_for_request(&durable_request)
                 .unwrap(),
             DurableEffectRecoveryAction::RetryAtLeastOnce {
                 operation_id: first.record.spec().id,
@@ -363,13 +384,28 @@ mod tests {
             .unwrap();
         let id = plan.record.spec().id;
 
+        let durable_request = plan.request.durable_request_bytes();
         assert_eq!(
             plan.record
-                .recovery_action_for_request(br#"{"amount":4200}"#)
+                .recovery_action_for_request(&durable_request)
                 .unwrap(),
             DurableEffectRecoveryAction::RetryWithDeduplication { operation_id: id }
         );
         assert_eq!(id.idempotency_key(), plan.record.spec().id.to_string());
+    }
+
+    #[test]
+    fn replay_with_changed_dispatch_metadata_fails_closed() {
+        let ctx = context();
+        let plan = ctx.prepare_activity(0, activity()).unwrap();
+
+        let mut changed = activity();
+        changed.task_queue = "other-payments".into();
+
+        assert!(plan
+            .record
+            .recovery_action_for_request(&changed.durable_request_bytes())
+            .is_err());
     }
 
     #[test]
