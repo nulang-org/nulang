@@ -234,7 +234,6 @@ impl AotModule {
         // functions plus a stable runtime-facing entry wrapper. The runtime
         // never calls the arity-specific internal function directly.
         let mut behavior_names: Vec<String> = Vec::new();
-        let mut behavior_fids: Vec<cranelift_module::FuncId> = Vec::new();
         let mut behavior_entry_fids: Vec<cranelift_module::FuncId> = Vec::new();
         for (idx, func) in mir_module.behaviors.iter().enumerate() {
             let func_name = format!("nulang_behavior_{}", idx);
@@ -303,7 +302,6 @@ impl AotModule {
             })?;
 
             behavior_names.push(func.name.clone());
-            behavior_fids.push(fid);
             behavior_entry_fids.push(entry_fid);
         }
         jit_module
