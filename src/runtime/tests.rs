@@ -3371,11 +3371,7 @@ impl PersistenceStore for AtomicWorkflowTestStore {
         self.inner.lock().unwrap().load_snapshot(actor_id)
     }
 
-    fn append_journal(
-        &mut self,
-        _actor_id: u64,
-        _entry: JournalEntry,
-    ) -> std::io::Result<()> {
+    fn append_journal(&mut self, _actor_id: u64, _entry: JournalEntry) -> std::io::Result<()> {
         Err(self.reject_legacy_write("append_journal"))
     }
 
@@ -3411,7 +3407,6 @@ impl PersistenceStore for AtomicWorkflowTestStore {
         self.inner.lock().unwrap().clear(actor_id)
     }
 }
-
 
 #[test]
 fn test_workflow_actor_emits_started_event() {
