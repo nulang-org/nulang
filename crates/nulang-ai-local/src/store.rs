@@ -1,8 +1,9 @@
-//! SQLite persistence for goals, tasks, and conversations.
+//! SQLite persistence for goals, tasks, commitments, intentions, and conversations.
 
 use chrono::{DateTime, Utc};
 use nulang_ai_core::{
-    ConversationState, Goal, GoalGraph, GoalStatus, ManagerKind, Task, TaskStatus,
+    Commitment, CommitmentStatus, ConversationState, Goal, GoalGraph, GoalStatus, Intention,
+    IntentionStatus, ManagerKind, Task, TaskStatus,
 };
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
@@ -70,6 +71,30 @@ impl SqliteStore {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS commitments (
+                id TEXT PRIMARY KEY,
+                goal_id TEXT NOT NULL,
+                owner_agent_id TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                success_criteria TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS commitments_goal_idx ON commitments(goal_id);
+            CREATE TABLE IF NOT EXISTS intentions (
+                id TEXT PRIMARY KEY,
+                goal_id TEXT NOT NULL,
+                commitment_id TEXT NOT NULL,
+                owner_agent_id TEXT NOT NULL,
+                description TEXT NOT NULL,
+                planned_task_ids TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS intentions_goal_idx ON intentions(goal_id);
+            CREATE INDEX IF NOT EXISTS intentions_commitment_idx ON intentions(commitment_id);
             CREATE TABLE IF NOT EXISTS conversations (
                 id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
@@ -152,6 +177,62 @@ impl SqliteStore {
                 task.assigned_agent_id,
                 task.created_at.to_rfc3339(),
                 task.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_commitment(&self, commitment: &Commitment) -> Result<(), StoreError> {
+        let conn = Connection::open(&self.path)?;
+        conn.execute(
+            r#"INSERT INTO commitments (
+                id, goal_id, owner_agent_id, rationale, success_criteria, status, created_at, updated_at
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+            ON CONFLICT(id) DO UPDATE SET
+                owner_agent_id=excluded.owner_agent_id,
+                rationale=excluded.rationale,
+                success_criteria=excluded.success_criteria,
+                status=excluded.status,
+                updated_at=excluded.updated_at
+            "#,
+            params![
+                commitment.id.to_string(),
+                commitment.goal_id.to_string(),
+                commitment.owner_agent_id,
+                commitment.rationale,
+                serde_json::to_string(&commitment.success_criteria)?,
+                commitment_status_str(&commitment.status),
+                commitment.created_at.to_rfc3339(),
+                commitment.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_intention(&self, intention: &Intention) -> Result<(), StoreError> {
+        let conn = Connection::open(&self.path)?;
+        conn.execute(
+            r#"INSERT INTO intentions (
+                id, goal_id, commitment_id, owner_agent_id, description, planned_task_ids,
+                status, created_at, updated_at
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+            ON CONFLICT(id) DO UPDATE SET
+                owner_agent_id=excluded.owner_agent_id,
+                description=excluded.description,
+                planned_task_ids=excluded.planned_task_ids,
+                status=excluded.status,
+                updated_at=excluded.updated_at
+            "#,
+            params![
+                intention.id.to_string(),
+                intention.goal_id.to_string(),
+                intention.commitment_id.to_string(),
+                intention.owner_agent_id,
+                intention.description,
+                serde_json::to_string(&intention.planned_task_ids)?,
+                intention_status_str(&intention.status),
+                intention.created_at.to_rfc3339(),
+                intention.updated_at.to_rfc3339(),
             ],
         )?;
         Ok(())
@@ -274,10 +355,55 @@ impl SqliteStore {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
+        let mut commitment_stmt = conn.prepare(
+            "SELECT id, owner_agent_id, rationale, success_criteria, status, created_at, updated_at FROM commitments WHERE goal_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let commitments = commitment_stmt
+            .query_map(params![goal_id.to_string()], |row| {
+                let id = Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_else(|_| Uuid::nil());
+                Ok(Commitment {
+                    id,
+                    goal_id,
+                    owner_agent_id: row.get(1)?,
+                    rationale: row.get(2)?,
+                    success_criteria: serde_json::from_str(&row.get::<_, String>(3)?)
+                        .unwrap_or_default(),
+                    status: parse_commitment_status(row.get(4)?),
+                    created_at: parse_ts(row.get(5)?),
+                    updated_at: parse_ts(row.get(6)?),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut intention_stmt = conn.prepare(
+            "SELECT id, commitment_id, owner_agent_id, description, planned_task_ids, status, created_at, updated_at FROM intentions WHERE goal_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let intentions = intention_stmt
+            .query_map(params![goal_id.to_string()], |row| {
+                let id = Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_else(|_| Uuid::nil());
+                let commitment_id =
+                    Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_else(|_| Uuid::nil());
+                Ok(Intention {
+                    id,
+                    goal_id,
+                    commitment_id,
+                    owner_agent_id: row.get(2)?,
+                    description: row.get(3)?,
+                    planned_task_ids: serde_json::from_str(&row.get::<_, String>(4)?)
+                        .unwrap_or_default(),
+                    status: parse_intention_status(row.get(5)?),
+                    created_at: parse_ts(row.get(6)?),
+                    updated_at: parse_ts(row.get(7)?),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(GoalGraph {
             goal,
             tasks,
             agents: Vec::new(),
+            commitments,
+            intentions,
         })
     }
 
@@ -369,6 +495,48 @@ fn parse_task_status(raw: String) -> TaskStatus {
         "completed" => TaskStatus::Completed,
         "cancelled" => TaskStatus::Cancelled,
         _ => TaskStatus::Created,
+    }
+}
+
+fn commitment_status_str(status: &CommitmentStatus) -> &'static str {
+    match status {
+        CommitmentStatus::Proposed => "proposed",
+        CommitmentStatus::Active => "active",
+        CommitmentStatus::Suspended => "suspended",
+        CommitmentStatus::Fulfilled => "fulfilled",
+        CommitmentStatus::Abandoned => "abandoned",
+    }
+}
+
+fn parse_commitment_status(raw: String) -> CommitmentStatus {
+    match raw.as_str() {
+        "active" => CommitmentStatus::Active,
+        "suspended" => CommitmentStatus::Suspended,
+        "fulfilled" => CommitmentStatus::Fulfilled,
+        "abandoned" => CommitmentStatus::Abandoned,
+        _ => CommitmentStatus::Proposed,
+    }
+}
+
+fn intention_status_str(status: &IntentionStatus) -> &'static str {
+    match status {
+        IntentionStatus::Planned => "planned",
+        IntentionStatus::Active => "active",
+        IntentionStatus::Blocked => "blocked",
+        IntentionStatus::Completed => "completed",
+        IntentionStatus::Failed => "failed",
+        IntentionStatus::Cancelled => "cancelled",
+    }
+}
+
+fn parse_intention_status(raw: String) -> IntentionStatus {
+    match raw.as_str() {
+        "active" => IntentionStatus::Active,
+        "blocked" => IntentionStatus::Blocked,
+        "completed" => IntentionStatus::Completed,
+        "failed" => IntentionStatus::Failed,
+        "cancelled" => IntentionStatus::Cancelled,
+        _ => IntentionStatus::Planned,
     }
 }
 

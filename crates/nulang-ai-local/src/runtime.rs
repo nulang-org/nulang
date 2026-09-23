@@ -4,7 +4,8 @@ use crate::config::AgentConfigFile;
 use crate::store::{SqliteStore, StoreError};
 use chrono::Utc;
 use nulang_ai_core::{
-    ConversationMessage, ConversationState, GoalStatus, SwarmEvent, SwarmEventEnvelope, TaskStatus,
+    Commitment, CommitmentStatus, ConversationMessage, ConversationState, GoalStatus, Intention,
+    IntentionStatus, SwarmEvent, SwarmEventEnvelope, TaskStatus,
 };
 use nulang_ai_director::{Director, LocalDirector};
 use nulang_ai_manager::{EngineeringManager, Manager};
@@ -123,6 +124,24 @@ impl LocalRuntime {
         goal.updated_at = Utc::now();
         self.store.upsert_goal(&goal)?;
 
+        let mut commitment = Commitment::new(
+            goal_id,
+            "director-local",
+            "User goal accepted for execution",
+        );
+        commitment.success_criteria = goal.success_criteria.clone();
+        commitment.status = CommitmentStatus::Active;
+        commitment.updated_at = Utc::now();
+        self.store.upsert_commitment(&commitment)?;
+        self.emit(
+            out,
+            SwarmEvent::CommitmentActivated {
+                commitment_id: commitment.id,
+                goal_id,
+                owner_agent_id: commitment.owner_agent_id.clone(),
+            },
+        )?;
+
         conv.active_goal_id = Some(goal_id);
         conv.updated_at = Utc::now();
         self.store.upsert_conversation(&conv)?;
@@ -130,6 +149,27 @@ impl LocalRuntime {
         let tasks =
             self.engineering
                 .plan_tasks(goal_id, text, self.config.director.default_budget_usd);
+
+        let mut intention = Intention::new(
+            goal_id,
+            commitment.id,
+            "manager-engineering",
+            "Execute the selected engineering plan",
+            tasks.iter().map(|task| task.id).collect(),
+        );
+        intention.status = IntentionStatus::Active;
+        intention.updated_at = Utc::now();
+        self.store.upsert_intention(&intention)?;
+        self.emit(
+            out,
+            SwarmEvent::IntentionActivated {
+                intention_id: intention.id,
+                commitment_id: commitment.id,
+                goal_id,
+                owner_agent_id: intention.owner_agent_id.clone(),
+            },
+        )?;
+
         for task in tasks {
             self.store.upsert_task(&task)?;
             self.emit(
@@ -167,6 +207,29 @@ impl LocalRuntime {
             )?;
         }
 
+        intention.status = IntentionStatus::Completed;
+        intention.updated_at = Utc::now();
+        self.store.upsert_intention(&intention)?;
+        self.emit(
+            out,
+            SwarmEvent::IntentionCompleted {
+                intention_id: intention.id,
+                commitment_id: commitment.id,
+                goal_id,
+            },
+        )?;
+
+        commitment.status = CommitmentStatus::Fulfilled;
+        commitment.updated_at = Utc::now();
+        self.store.upsert_commitment(&commitment)?;
+        self.emit(
+            out,
+            SwarmEvent::CommitmentFulfilled {
+                commitment_id: commitment.id,
+                goal_id,
+            },
+        )?;
+
         goal.status = GoalStatus::Completed;
         goal.updated_at = Utc::now();
         self.store.upsert_goal(&goal)?;
@@ -192,7 +255,6 @@ pub fn init_project(dir: &Path) -> Result<(), RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
     #[test]
     fn runtime_emits_nlap_events() {
@@ -200,14 +262,26 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         init_project(&tmp).unwrap();
         let mut rt = LocalRuntime::open(tmp.clone()).unwrap();
-        let mut buf = Cursor::new(Vec::new());
+        let mut buf = std::io::Cursor::new(Vec::new());
         let goal_id = rt.handle_user_message("ship feature X", &mut buf).unwrap();
         assert!(!goal_id.is_nil());
         let text = String::from_utf8(buf.into_inner()).unwrap();
         assert!(text.contains("goal_created"));
+        assert!(text.contains("commitment_activated"));
+        assert!(text.contains("intention_activated"));
         assert!(text.contains("task_created"));
+        assert!(text.contains("intention_completed"));
+        assert!(text.contains("commitment_fulfilled"));
         let graph = rt.store().get_goal_graph(goal_id).unwrap();
         assert_eq!(graph.goal.status, GoalStatus::Completed);
+        assert_eq!(graph.commitments.len(), 1);
+        assert_eq!(graph.commitments[0].status, CommitmentStatus::Fulfilled);
+        assert_eq!(graph.intentions.len(), 1);
+        assert_eq!(graph.intentions[0].status, IntentionStatus::Completed);
+        assert_eq!(
+            graph.intentions[0].planned_task_ids.len(),
+            graph.tasks.len()
+        );
         let _ = std::fs::remove_dir_all(tmp);
     }
 }
