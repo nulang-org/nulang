@@ -12,8 +12,46 @@ env:
   CARGO_TARGET_DIR: target
 
 jobs:
+  preflight:
+    name: Release preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Verify tag matches crate and CLI versions
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          with open("Cargo.toml", "rb") as fh:
+              crate_version = tomllib.load(fh)["package"]["version"]
+
+          main = open("src/main.rs", encoding="utf-8").read()
+          match = re.search(r'const VERSION: &str = "([^"]+)";', main)
+          if not match:
+              raise SystemExit("src/main.rs VERSION constant not found")
+          cli_version = match.group(1)
+
+          expected_tag = f"v{crate_version}"
+          if tag != expected_tag:
+              raise SystemExit(
+                  f"release tag {tag!r} does not match Cargo.toml version {crate_version!r}; "
+                  f"expected {expected_tag!r}"
+              )
+          if cli_version != crate_version:
+              raise SystemExit(
+                  f"src/main.rs VERSION {cli_version!r} does not match Cargo.toml {crate_version!r}"
+              )
+          print(f"release version verified: {tag}")
+          PY
+
   release:
     name: Build (${{ matrix.target }})
+    needs: preflight
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -100,7 +138,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build (release)
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Test (release, native only)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -109,7 +147,7 @@ jobs:
         # to the test binary (target/<triple>/release/nulang). Without
         # --target the harness falls back to the test binary itself and
         # the web-build tests fail with exit 101.
-        run: cargo test --release --target ${{ matrix.target }}
+        run: cargo test --locked --release --target ${{ matrix.target }}
 
       - name: Strip binary
         # No strip on Windows: the MSVC toolchain has no equivalent
@@ -136,7 +174,11 @@ jobs:
           tar czf dist/${{ matrix.artifact }}.tar.gz -C dist ${{ matrix.artifact }}
           (
             cd dist
-            sha256sum "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.tar.gz.sha256"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.tar.gz.sha256"
+            else
+              shasum -a 256 "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.tar.gz.sha256"
+            fi
           )
 
       - name: Upload artifact
