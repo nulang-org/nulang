@@ -686,6 +686,40 @@ mod tests {
             .unwrap()
     }
 
+    struct FailOnFlushWriter {
+        bytes: Vec<u8>,
+        flushes: usize,
+        fail_on_flush: usize,
+    }
+
+    impl FailOnFlushWriter {
+        fn new(fail_on_flush: usize) -> Self {
+            Self {
+                bytes: Vec::new(),
+                flushes: 0,
+                fail_on_flush,
+            }
+        }
+    }
+
+    impl std::io::Write for FailOnFlushWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            if self.flushes == self.fail_on_flush {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected post-write flush failure",
+                ));
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn runtime_emits_nlap_events() {
         let tmp = std::env::temp_dir().join(format!("nulang-agent-test-{}", Uuid::new_v4()));
@@ -787,6 +821,47 @@ mod tests {
             graph_after_retry.intention_revisions[0].reason,
             "scripted external dependency is unavailable"
         );
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn committed_outbox_event_retries_with_same_id_after_delivery_ack_failure() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-outbox-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        init_project(&tmp).unwrap();
+        let mut rt = LocalRuntime::open(tmp.clone()).unwrap();
+
+        // Five direct events are flushed before the first terminal outbox event:
+        // goal_created, commitment_activated, intention_activated, task_created,
+        // and task_started. Fail the sixth flush after its bytes were written but
+        // before the outbox row can be acknowledged.
+        let mut failing = FailOnFlushWriter::new(6);
+        let err = rt
+            .handle_user_message("ship feature X", &mut failing)
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Io(_)));
+
+        let goal = rt.store().list_goals().unwrap().remove(0);
+        assert_eq!(goal.status, GoalStatus::Completed);
+
+        let pending = rt.store().pending_outbox(10).unwrap();
+        assert_eq!(pending.len(), 4);
+        let first_event_id = pending[0].envelope.event_id.unwrap();
+        assert!(
+            String::from_utf8_lossy(&failing.bytes).contains(&first_event_id.to_string()),
+            "the first outbox event reached the stream before acknowledgement failed"
+        );
+
+        let mut recovered = std::io::Cursor::new(Vec::new());
+        assert_eq!(rt.flush_pending_events(&mut recovered).unwrap(), 4);
+        assert!(rt.store().pending_outbox(10).unwrap().is_empty());
+
+        let recovered_text = String::from_utf8(recovered.into_inner()).unwrap();
+        let first_line = recovered_text.lines().next().unwrap();
+        let retried: SwarmEventEnvelope = serde_json::from_str(first_line).unwrap();
+        assert_eq!(retried.event_id, Some(first_event_id));
+        assert!(matches!(retried.event, SwarmEvent::TaskCompleted { .. }));
 
         let _ = std::fs::remove_dir_all(tmp);
     }
