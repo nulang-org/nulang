@@ -1610,6 +1610,8 @@ everything before it is implicitly Experimental.
 - **Resume request identity is durable.** `CommitmentResumption` persists a unique external `request_id`, blocked/replacement intention IDs, commitment/goal identity, reason, and timestamp. Repeating the same request after a process restart returns the already-created replacement plan instead of creating a second intention or task set.
 - **Resume state, replacement tasks, resumption evidence, and NLAP events commit atomically.** `AgentResumeTransition` validates that the blocked source, active replacement, tasks, commitment, goal, and resumption record all agree before a single SQLite `IMMEDIATE` transaction writes them and the transactional outbox.
 - **Restart execution preserves the original goal conversation correlation and persisted task order.** Completed replacement tasks are skipped; a task left `Running` at crash time is retried at-least-once rather than assumed complete.
+- **Automatic failure replans now persist their replacement task rows atomically with the replacement intention and revision.** `TaskCreated` events for those tasks share the transactional outbox, closing the prior crash window where an active replan intention could reference task IDs that had not yet been stored.
+- **Recovery follows the latest active intention in the commitment chain.** A process that dies after a resumed task fails and an automatic replan commits can restart with the same resume request and continue the replan rather than stopping at the original resumed intention.
 - **NLAP 1.4.0 adds `goal_resumed` and `commitment_resumed` events** carrying the stable resume request ID and reason, while existing 1.3 envelope compatibility remains intact.
 
 ### Transactional NLAP decision outbox — 2026-09-23
