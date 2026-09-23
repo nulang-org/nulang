@@ -3841,9 +3841,24 @@ fn test_atomic_workflow_recovery_replays_accepted_command_after_snapshot() {
 
     assert_eq!(
         rt.actors.get(&actor_id).unwrap().sequence,
-        2,
-        "an accepted workflow command newer than the snapshot must be replayed"
+        3,
+        "recovery must replay the accepted command and atomically commit its completion"
     );
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 3);
+    assert!(matches!(
+        rt.persistence.read_workflow_events(actor_id).as_slice(),
+        [
+            WorkflowEvent::WorkflowStarted { sequence: 1, .. },
+            WorkflowEvent::StepCompleted { sequence: 3, .. }
+        ]
+    ));
+
+    // The completion snapshot at sequence 3 fences the accepted command at
+    // sequence 2. A second restart must not execute or commit it again.
+    rt.actors.remove(&actor_id);
+    rt.recover_actor(actor_id).unwrap();
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 3);
+    assert_eq!(rt.persistence.read_workflow_events(actor_id).len(), 2);
 }
 
 #[test]
