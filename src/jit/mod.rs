@@ -695,9 +695,7 @@ fn is_non_suspending_op(op: crate::bytecode::OpCode) -> bool {
 /// suspension and used an O(n^2) reachability matrix plus O(n^3)
 /// Floyd-Warshall for recursion. This pass scans bytecode once and then uses
 /// O(V + E) graph traversals.
-fn compute_module_jit_analysis(
-    module: &crate::bytecode::CodeModule,
-) -> ModuleJitAnalysis {
+fn compute_module_jit_analysis(module: &crate::bytecode::CodeModule) -> ModuleJitAnalysis {
     use crate::bytecode::OpCode;
     use std::collections::VecDeque;
 
