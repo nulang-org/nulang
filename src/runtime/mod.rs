@@ -3,9 +3,9 @@
 //! Provides: actor lifecycle, scheduler, mailbox, heap, GC, supervision,
 //! distribution.
 
+use crossbeam::channel as shard_channel;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::warn;
@@ -530,15 +530,15 @@ pub struct Runtime {
     pub shard_count: u16,
     /// Channels to send messages to every shard (including self - unused).
     /// `None` when `shard_count == 1` (single-shard, no cross-shard routing).
-    cross_shard_tx: Option<Vec<mpsc::SyncSender<CrossShardMsg>>>,
+    cross_shard_tx: Option<Vec<shard_channel::Sender<CrossShardMsg>>>,
     /// Channel to receive messages for this shard.
     /// `None` when `shard_count == 1`.
-    cross_shard_rx: Option<mpsc::Receiver<CrossShardMsg>>,
+    cross_shard_rx: Option<shard_channel::Receiver<CrossShardMsg>>,
 }
 
 // SAFETY: in sharded mode each Runtime runs on exactly one thread (shard
 // ownership by actor_id % shard_count). Cross-shard communication uses
-// mpsc channels; no two threads access the same Runtime's internal state.
+// bounded Crossbeam channels; no two threads access the same Runtime's internal state.
 // The contained VM, callback trait objects, and raw ORCA pointers are all
 // thread-confined.
 unsafe impl Send for Runtime {}
@@ -686,8 +686,8 @@ impl Runtime {
     fn new_shard(
         shard_idx: u16,
         shard_count: u16,
-        cross_shard_tx: Vec<mpsc::SyncSender<CrossShardMsg>>,
-        cross_shard_rx: mpsc::Receiver<CrossShardMsg>,
+        cross_shard_tx: Vec<shard_channel::Sender<CrossShardMsg>>,
+        cross_shard_rx: shard_channel::Receiver<CrossShardMsg>,
     ) -> Self {
         let mut rt = Runtime::new();
         rt.shard_idx = shard_idx;
@@ -715,13 +715,15 @@ impl Runtime {
             return vec![Runtime::new()];
         }
 
-        // Create a sync_channel per shard (bounded, 1024 messages deep).
+        // Create one bounded Crossbeam channel per shard (1024 messages deep).
         let channels: Vec<(
-            mpsc::SyncSender<CrossShardMsg>,
-            mpsc::Receiver<CrossShardMsg>,
-        )> = (0..num_shards).map(|_| mpsc::sync_channel(1024)).collect();
+            shard_channel::Sender<CrossShardMsg>,
+            shard_channel::Receiver<CrossShardMsg>,
+        )> = (0..num_shards)
+            .map(|_| shard_channel::bounded(1024))
+            .collect();
 
-        let senders: Vec<mpsc::SyncSender<CrossShardMsg>> =
+        let senders: Vec<shard_channel::Sender<CrossShardMsg>> =
             channels.iter().map(|(tx, _)| tx.clone()).collect();
 
         let mut shards = Vec::with_capacity(num_shards);
@@ -1430,8 +1432,8 @@ impl Runtime {
             loop {
                 match rx.try_recv() {
                     Ok(msg) => pending.push(msg),
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => break,
+                    Err(shard_channel::TryRecvError::Empty) => break,
+                    Err(shard_channel::TryRecvError::Disconnected) => break,
                 }
             }
         }
@@ -2231,7 +2233,7 @@ impl Runtime {
 
         match result {
             Ok(()) => MessageAdmission::Accepted,
-            Err(mpsc::TrySendError::Full(_)) => {
+            Err(shard_channel::TrySendError::Full(_)) => {
                 tracing::warn!(
                     "nulang-shard: backpressure sending to actor {} on shard {}",
                     target_id,
@@ -2239,7 +2241,7 @@ impl Runtime {
                 );
                 MessageAdmission::Backpressured
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
+            Err(shard_channel::TrySendError::Disconnected(_)) => {
                 tracing::warn!(
                     "nulang-shard: dropping message to actor {}: shard {} disconnected",
                     target_id,
@@ -2302,14 +2304,14 @@ impl Runtime {
 
         match result {
             Ok(()) => MessageAdmission::Accepted,
-            Err(mpsc::TrySendError::Full(_)) => {
+            Err(shard_channel::TrySendError::Full(_)) => {
                 warn!(
                     "nulang-shard: backpressure sending named message to actor {} on shard {}",
                     target_id, target_shard
                 );
                 MessageAdmission::Backpressured
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
+            Err(shard_channel::TrySendError::Disconnected(_)) => {
                 warn!(
                     "nulang-shard: dropping named message to actor {}: shard {} disconnected",
                     target_id, target_shard
