@@ -219,8 +219,10 @@ the external-adoption freeze gate is satisfied. See
 > breaking changes before v1.0** — any guarantee may be revised until the
 > language sees real-world use.
 
-1550+ tests pass with `cargo test`. Add `--features wasm-backend` for the
-WASM backend test suite.
+The required GitHub Actions matrix is the release-readiness source of truth for
+build, test, lint, audit, documentation, formal-spec, minimal-feature, and
+WASM-backend validation. For local validation, run `cargo test --locked`; add
+`--features wasm-backend` for the WASM backend suite.
 
 ---
 
