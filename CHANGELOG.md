@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Last-use MIR ownership transfer — 2026-09-22
+- **Single-definition heap-owning locals can now transfer ownership through their sole `Load` use** (`src/mir_codegen.rs`). The compiler proves the source has exactly one MIR definition and exactly one use, copies the value to the destination, then clears the dead source to `nil` without decrementing ORCA. Ownership proofs propagate through chains of such moves, allowing the final owner to be reclaimed at its true last use while ordinary multi-use copies retain the previous conservative behavior.
+
 ### Temporary concatenated-string reclamation — 2026-09-22
 - **Non-folded string concatenations now participate in MIR ownership-based reclamation** (`src/mir_codegen.rs`). Because `SConcat` creates a fresh actor-heap string, the liveness planner can release its sole local ORCA reference immediately after the last safe use instead of retaining the temporary until actor teardown. Runtime semantics and the existing ORCA/store-barrier protocol are unchanged.
 
