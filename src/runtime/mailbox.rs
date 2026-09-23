@@ -858,4 +858,55 @@ mod transactional_receive_tests {
         assert_eq!(mb.pop().unwrap().sender, 2);
         assert_eq!(mb.pop().unwrap().sender, 3);
     }
+
+    #[test]
+    fn indexed_receive_preserves_fifo_across_arm_order() {
+        let mut mb = Mailbox::new(8);
+        mb.push_local(msg(20, 1, MessagePriority::Normal)).unwrap();
+        mb.push_local(msg(10, 2, MessagePriority::Normal)).unwrap();
+
+        let (arm, payload) = mb.receive_match(&[10, 20]).expect("candidate");
+        assert_eq!(arm, 1, "oldest matching message wins before arm order");
+        assert_eq!(payload[0].as_int(), Some(1));
+    }
+
+    #[test]
+    fn indexed_receive_duplicate_behavior_uses_first_arm() {
+        let mut mb = Mailbox::new(4);
+        mb.push_local(msg(7, 11, MessagePriority::Normal)).unwrap();
+
+        let (arm, payload) = mb.receive_match(&[7, 7]).expect("candidate");
+        assert_eq!(arm, 0);
+        assert_eq!(payload[0].as_int(), Some(11));
+    }
+
+    #[test]
+    fn indexed_receive_rebuilds_after_middle_commit() {
+        let mut mb = Mailbox::new(8);
+        mb.push_local(msg(1, 1, MessagePriority::Normal)).unwrap();
+        mb.push_local(msg(2, 2, MessagePriority::Normal)).unwrap();
+        mb.push_local(msg(3, 3, MessagePriority::Normal)).unwrap();
+
+        let first = mb.receive_match(&[2]).expect("middle candidate");
+        assert_eq!(first.1[0].as_int(), Some(2));
+        mb.commit_receive_match().expect("commit middle");
+
+        let next = mb.receive_match(&[3]).expect("candidate after reindex");
+        assert_eq!(next.1[0].as_int(), Some(3));
+        mb.commit_receive_match().expect("commit tail");
+
+        assert_eq!(mb.pop().unwrap().sender, 1);
+        assert!(mb.is_empty());
+    }
+
+    #[test]
+    fn indexed_receive_sees_arrival_after_initial_miss() {
+        let mut mb = Mailbox::new(8);
+        mb.push_local(msg(1, 1, MessagePriority::Normal)).unwrap();
+        assert!(mb.receive_match(&[9]).is_none());
+
+        mb.push_local(msg(9, 2, MessagePriority::Normal)).unwrap();
+        let found = mb.receive_match(&[9]).expect("new indexed arrival");
+        assert_eq!(found.1[0].as_int(), Some(2));
+    }
 }
