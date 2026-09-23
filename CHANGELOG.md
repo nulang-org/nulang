@@ -51,6 +51,13 @@ version + migration.*
 
 ## Stable tier
 
+### Indexed selective receive — 2026-09-22
+- **Selective receive now builds per-lane behavior indexes while staging arrivals** (`src/runtime/mailbox.rs`), replacing the previous full staged-mailbox scan with behavior-to-position lookup plus FIFO candidate selection across requested arms.
+- **Guard retries reuse per-behavior cursors** instead of restarting from the front of every staged lane; commit/pop invalidates positional indexes and the next receive rebuilds lazily.
+- **Transactional semantics are unchanged**: system/local/normal lane precedence, FIFO choice within a lane, duplicate-arm first-match behavior, rejected-guard retention, capacity accounting, and commit/reset lifecycle all have regression coverage.
+- **Actor benchmarks now cover mailbox depth, receive-arm count, and repeated guard rejection** (`benches/actor_bench.rs`).
+
+
 ### Inline small actor message payloads — 2026-09-22
 - **Actor messages with 0–4 values now store their NaN-boxed payload directly in the message envelope** (`src/runtime/mailbox.rs`) instead of allocating a `Vec` plus `Arc`; larger messages retain shared `Arc<Vec<Value>>` storage.
 - **Local runtime sends, AOT sends, supervision/system messages, cross-shard delivery, and decoded network delivery all use the small-message representation.**
