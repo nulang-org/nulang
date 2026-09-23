@@ -267,6 +267,14 @@ impl SqliteStore {
         if let Some(existing) =
             query_resumption_by_request_conn(&tx, transition.resumption.request_id)?
         {
+            if existing.goal_id != transition.resumption.goal_id
+                || existing.commitment_id != transition.resumption.commitment_id
+                || existing.blocked_intention_id != transition.resumption.blocked_intention_id
+            {
+                return Err(StoreError::InvalidTransition(
+                    "resume request id conflicts with a different blocked source",
+                ));
+            }
             tx.commit()?;
             return Ok(ResumeCommitResult::AlreadyApplied(existing));
         }
