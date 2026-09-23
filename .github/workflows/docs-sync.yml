@@ -105,11 +105,13 @@ jobs:
               --title "docs: sync generated site assets" \
               --body "Automated refresh of generated standard-library/API docs and the browser-playground bundle from the current main branch."
           else
-            gh pr create \
+            if ! gh pr create \
               --base main \
               --head "$sync_branch" \
               --title "docs: sync generated site assets" \
-              --body "Automated refresh of generated standard-library/API docs and the browser-playground bundle from the current main branch."
+              --body "Automated refresh of generated standard-library/API docs and the browser-playground bundle from the current main branch."; then
+              echo "::warning::Generated assets were pushed to $sync_branch, but this token cannot create pull requests. Create the persistent automation PR once or configure DOCS_SYNC_TOKEN."
+            fi
           fi
 
       - name: Ping DeepWiki to refresh index

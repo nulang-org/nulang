@@ -343,22 +343,24 @@ jobs:
   # percentage — GitHub Actions' shared runners commonly show 20-50%+
   # run-to-run noise, so a naive fixed threshold would fail PRs for
   # noise, not real regressions). Runs on push to main only (not every
-  # PR) since a full criterion run of every group is slow; results are
-  # committed back so PERFORMANCE_ANALYSIS.md can cite real numbers
-  # instead of estimates. The gate needs >= 3 prior commits' worth of
-  # history for a given benchmark before it will fail anything, so
-  # early runs (and brand-new benchmarks) are informational only until
-  # enough history accumulates.
+  # PR) since a full criterion run of every group is slow. Rolling telemetry
+  # is persisted on the unprotected automation/benchmarks branch rather than
+  # pushed back to protected main. The gate needs >= 3 prior samples for a
+  # given benchmark before it will fail anything, so early runs (and
+  # brand-new benchmarks) are informational only until enough history
+  # accumulates.
   # -----------------------------------------------------------------------
   bench:
     name: Benchmarks (regression-gated)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
-      contents: write  # Persist rolling benchmark history after regression checks pass
+      contents: write  # Persist rolling benchmark history on automation/benchmarks
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y python3-dev
@@ -377,13 +379,28 @@ jobs:
           python3 scripts/collect_bench_results.py \
             --out "benchmarks/$(git rev-parse --short HEAD).json"
 
+      - name: Load rolling benchmark history
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/nulang-bench-history
+          if git fetch origin automation/benchmarks:refs/remotes/origin/automation/benchmarks; then
+            git ls-tree -r --name-only origin/automation/benchmarks -- benchmarks \
+              | grep -E '^benchmarks/.*\.json$' \
+              | while IFS= read -r file; do
+                  git show "origin/automation/benchmarks:$file" \
+                    > "/tmp/nulang-bench-history/$(basename "$file")"
+                done
+          else
+            echo "No automation/benchmarks history branch yet; starting a new rolling window."
+          fi
+
       - name: Check for regressions
         id: regression_check
         continue-on-error: true
         run: |
           python3 scripts/check_bench_regression.py \
             --latest "benchmarks/$(git rev-parse --short HEAD).json" \
-            --history-dir benchmarks
+            --history-dir /tmp/nulang-bench-history
 
       - name: Upload results as build artifact
         uses: actions/upload-artifact@v7
@@ -392,17 +409,31 @@ jobs:
           path: benchmarks/*.json
           retention-days: 90
 
-      - name: Commit results to benchmarks/
+      - name: Persist rolling history on automation branch
         run: |
+          set -euo pipefail
+          short_sha="$(git rev-parse --short "$GITHUB_SHA")"
+          latest="benchmarks/$short_sha.json"
+          cp "$latest" /tmp/nulang-latest-bench.json
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "benchmarks/$(git rev-parse --short HEAD).json"
-          git diff --staged --quiet || git commit -m "bench: record results for $(git rev-parse --short HEAD) [skip ci]"
-          git push
 
-      # Separate from the check step itself so the commit above always
-      # happens (preserving complete rolling-window history) even when
-      # this commit's numbers regressed.
+          if git show-ref --verify --quiet refs/remotes/origin/automation/benchmarks; then
+            git checkout -B automation/benchmarks refs/remotes/origin/automation/benchmarks
+            git merge --no-edit "$GITHUB_SHA"
+          else
+            git checkout -B automation/benchmarks "$GITHUB_SHA"
+          fi
+
+          mkdir -p benchmarks
+          cp /tmp/nulang-latest-bench.json "benchmarks/$short_sha.json"
+          git add "benchmarks/$short_sha.json"
+          git diff --staged --quiet || git commit -m "bench: record results for $short_sha"
+          git push origin HEAD:automation/benchmarks
+
+      # Separate from persistence so a detected regression is still reported
+      # after its measurement has been retained on the telemetry branch.
       - name: Fail the job if a regression was found
         if: steps.regression_check.outcome == 'failure'
         run: exit 1

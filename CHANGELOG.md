@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Protected-branch automation hygiene — 2026-09-22
+- **Benchmark history no longer self-pushes to protected `main`** (`.github/workflows/ci.yml`, `benchmarks/README.md`). Main-branch benchmark runs load and append rolling JSON telemetry on `automation/benchmarks`, while artifacts remain attached to the CI run. Regression detection still happens before the job reports success/failure, but telemetry persistence is now compatible with protected-branch policy.
+- **Docs sync preserves generated output when PR creation is restricted** (`.github/workflows/docs-sync.yml`). The generated-assets branch remains authoritative and the workflow emits an explicit warning instead of discarding successful generation/build work when the active token cannot create a pull request.
+
 ### Temporary concatenated-string reclamation — 2026-09-22
 - **Non-folded string concatenations now participate in MIR ownership-based reclamation** (`src/mir_codegen.rs`). Because `SConcat` creates a fresh actor-heap string, the liveness planner can release its sole local ORCA reference immediately after the last safe use instead of retaining the temporary until actor teardown. Runtime semantics and the existing ORCA/store-barrier protocol are unchanged.
 

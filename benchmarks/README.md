@@ -1,7 +1,9 @@
 # Benchmark Results
 
 Machine-readable Criterion output from CI's `bench` job, one JSON file per
-`main`-branch commit that ran it. Human-readable HTML reports (Criterion's
+`main`-branch commit that ran it. Rolling JSON history is persisted on the
+`automation/benchmarks` telemetry branch so protected `main` never needs a
+CI self-push. Human-readable HTML reports (Criterion's
 own `target/criterion/**/report/index.html`) are not checked in — they're
 large and regenerate trivially from the raw estimates here.
 
@@ -16,9 +18,11 @@ mean_ns_upper}` per line).
 ## Status: regression-gated against a rolling window
 
 The CI `bench` job (`.github/workflows/ci.yml`) runs `cargo bench` on every
-push to `main`, collects results here and as a build artifact, then runs
-`scripts/check_bench_regression.py` against them. The job fails (after
-still committing the new result, so history stays complete) if any
+push to `main`, collects the current result as a build artifact, fetches prior
+JSON samples from `automation/benchmarks`, then runs
+`scripts/check_bench_regression.py` against that rolling history. After the
+measurement, the job appends the current sample to the telemetry branch. The
+job fails after persistence if any
 benchmark regresses beyond a threshold set from *that benchmark's own*
 historical spread — not a flat percentage. GitHub Actions' shared runners
 have enough run-to-run noise (commonly 20-50%+ on wall-clock-sensitive
