@@ -601,6 +601,7 @@ impl AddressResolver {
                     payload: Arc::new(payload),
                     sender: sender_actor,
                     priority,
+                    ownership_handoff_mask: 0,
                     trace_id,
                 };
                 Some((
