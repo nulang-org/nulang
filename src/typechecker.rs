@@ -3523,7 +3523,7 @@ impl TypeChecker {
                 // statically-known actor calls keep the Phase-1 compatibility
                 // behavior from actor_protocol.rs.
                 let unspecified = || Type::Nominal {
-                    name: "__UnspecifiedActorProtocolType".to_string(),
+                    name: crate::types::UNSPECIFIED_ACTOR_PROTOCOL_TYPE_NAME.to_string(),
                     underlying: Box::new(Type::unit()),
                 };
                 let params: Vec<Type> = behavior

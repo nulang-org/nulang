@@ -13,6 +13,15 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+fn noop_test_behavior(_actor: &mut Actor, _args: &[Value]) {}
+
+fn declare_test_behavior(rt: &mut Runtime, actor_id: u64, name: &str) {
+    rt.actors
+        .get_mut(&actor_id)
+        .expect("test actor exists")
+        .register_behavior(name, noop_test_behavior);
+}
+
 #[test]
 fn test_authority_snapshot_round_trip_recovery() {
     let mut rt = Runtime::new();
@@ -297,6 +306,8 @@ fn test_run_scheduler_processes_all_actors() {
     let mut rt = Runtime::new();
     let a1 = rt.spawn_actor(Box::new(|| vec![("counter".to_string(), Value::int(0))]));
     let a2 = rt.spawn_actor(Box::new(|| vec![("counter".to_string(), Value::int(0))]));
+    declare_test_behavior(&mut rt, a1, "add");
+    declare_test_behavior(&mut rt, a2, "add");
     rt.send_message(a1, "add", &[Value::int(10)]);
     rt.send_message(a2, "add", &[Value::int(20)]);
     rt.run_scheduler();
@@ -372,6 +383,8 @@ fn test_actor_set_priority_changes_scheduling() {
     let mut rt = Runtime::new();
     let a = rt.spawn_actor(Box::new(|| vec![]));
     let b = rt.spawn_actor(Box::new(|| vec![]));
+    declare_test_behavior(&mut rt, a, "noop");
+    declare_test_behavior(&mut rt, b, "noop");
     // Drain the spawn-time queue entries (both enqueued at Normal).
     assert_eq!(rt.scheduler.dequeue(), Some(a));
     assert_eq!(rt.scheduler.dequeue(), Some(b));
@@ -384,6 +397,49 @@ fn test_actor_set_priority_changes_scheduling() {
     rt.send_message(b, "noop", &[]);
     assert_eq!(rt.scheduler.dequeue(), Some(b));
     assert_eq!(rt.scheduler.dequeue(), Some(a));
+}
+
+#[test]
+fn test_anonymous_actor_accepts_untyped_mailbox_delivery_without_handler_alias() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+
+    // Anonymous low-level actors have no declared behavior surface. Preserve
+    // their raw mailbox semantics, but behavior id 0 remains inert because
+    // there is no handler to execute.
+    assert!(rt.actors[&actor_id].behavior_table.is_empty());
+    assert!(rt.actors[&actor_id].bytecode_module.is_none());
+    assert_eq!(rt.scheduler.dequeue(), Some(actor_id));
+
+    rt.send_message(actor_id, "opaque-runtime-tag", &[Value::int(7)]);
+
+    assert_eq!(rt.actors[&actor_id].mailbox.len(), 1);
+
+    rt.run_scheduler();
+    assert_eq!(rt.actors[&actor_id].reduction_count, 1);
+    assert!(rt.actors[&actor_id].mailbox.is_empty());
+}
+
+#[test]
+fn test_named_actor_still_rejects_unknown_behavior_without_aliasing_zero() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("known", |_actor, _args| {});
+    assert_eq!(rt.scheduler.dequeue(), Some(actor_id));
+
+    rt.send_message(actor_id, "typo", &[]);
+    assert!(
+        rt.actors[&actor_id].mailbox.is_empty(),
+        "unknown name must not alias declared behavior id 0"
+    );
+    assert!(rt.scheduler.dequeue().is_none());
+
+    rt.send_message(actor_id, "known", &[]);
+    assert_eq!(rt.actors[&actor_id].mailbox.len(), 1);
+    assert_eq!(rt.scheduler.dequeue(), Some(actor_id));
 }
 
 // ========================================================================
@@ -1257,6 +1313,7 @@ fn test_distributed_remote_address_local_fallback() {
     // the distribution wrapper: distributed disabled → local delivery.
     let mut rt = Runtime::new();
     let actor_id = rt.spawn_actor(Box::new(|| vec![("val".to_string(), Value::int(0))]));
+    declare_test_behavior(&mut rt, actor_id, "test");
 
     // Distributed is disabled by default: a remote address still delivers.
     let remote_addr = ActorAddress::remote(NodeId::LOCAL, actor_id);
@@ -2815,6 +2872,8 @@ fn test_runtime_scheduler_stats() {
 
     let a1 = rt.spawn_actor(Box::new(|| vec![("counter".to_string(), Value::int(0))]));
     let a2 = rt.spawn_actor(Box::new(|| vec![("counter".to_string(), Value::int(0))]));
+    declare_test_behavior(&mut rt, a1, "add");
+    declare_test_behavior(&mut rt, a2, "add");
     rt.send_message(a1, "add", &[Value::int(10)]);
     rt.send_message(a2, "add", &[Value::int(20)]);
     rt.run_scheduler();
@@ -5477,6 +5536,7 @@ fn test_message_retry_after_bytecode_fetch() {
         target_actor: actor_id,
         behavior_name: "store".to_string(),
         content_hash: Some(correct_hash),
+        required_protocol_id: None,
         payload: vec![Value::int(42)],
         string_table: vec![],
         object_table: vec![],
@@ -7062,5 +7122,161 @@ fn test_send_to_grain_cross_shard_routes_and_hydrates() {
         actor.get_state_field("count").and_then(|v| v.as_int()),
         Some(1),
         "inc message should be processed on shard 1"
+    );
+}
+
+#[test]
+fn p0_unknown_named_send_is_rejected() {
+    fn increment(actor: &mut Actor, _args: &[Value]) {
+        let n = actor
+            .get_state_field("count")
+            .and_then(|v| v.as_int())
+            .unwrap_or(0);
+        actor.set_state_field("count", Value::int(n + 1));
+    }
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("first", increment);
+
+    rt.send_message(actor_id, "does_not_exist", &[]);
+    assert!(rt.actors.get(&actor_id).unwrap().mailbox.is_empty());
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(0)
+    );
+
+    rt.send_message(actor_id, "first", &[]);
+    rt.run_scheduler();
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(1)
+    );
+}
+
+#[test]
+fn p0_unknown_cross_shard_object_send_does_not_hydrate_orphans() {
+    fn consume(_actor: &mut Actor, _args: &[Value]) {}
+
+    let mut shards = Runtime::new_sharded(2);
+    let mut target = shards[1].spawn_actor(Box::new(Vec::new));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(Vec::new));
+    }
+    shards[1]
+        .actors
+        .get_mut(&target)
+        .unwrap()
+        .register_behavior("consume", consume);
+
+    let source_object = shards[0]
+        .object_store
+        .put(vec![1, 2, 3, 4].into_boxed_slice());
+    let destination_objects_before = shards[1].object_store.len();
+
+    shards[0].send_message(target, "does_not_exist", &[Value::object(source_object)]);
+    shards[1].drain_cross_shard_messages();
+
+    assert_eq!(
+        shards[1].object_store.len(),
+        destination_objects_before,
+        "rejected named delivery must not hydrate orphaned destination objects"
+    );
+    assert!(shards[1].actors[&target].mailbox.is_empty());
+}
+
+#[test]
+fn p0_unknown_numeric_ask_is_rejected_without_running_behavior_zero() {
+    fn increment(actor: &mut Actor, _args: &[Value]) {
+        let n = actor
+            .get_state_field("count")
+            .and_then(|v| v.as_int())
+            .unwrap_or(0);
+        actor.set_state_field("count", Value::int(n + 1));
+    }
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("first", increment);
+
+    let err = rt
+        .ask_actor_sync(actor_id, 99, &[])
+        .expect_err("unknown behavior id must fail closed");
+    assert!(err.to_string().contains("does not declare behavior id 99"));
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(0)
+    );
+
+    rt.ask_actor_sync(actor_id, 0, &[])
+        .expect("declared behavior zero remains callable");
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(1)
+    );
+}
+
+#[test]
+fn p0_cross_shard_named_send_resolves_only_on_owner() {
+    fn increment(actor: &mut Actor, _args: &[Value]) {
+        let n = actor
+            .get_state_field("count")
+            .and_then(|v| v.as_int())
+            .unwrap_or(0);
+        actor.set_state_field("count", Value::int(n + 1));
+    }
+
+    let mut shards = Runtime::new_sharded(2);
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    }
+    shards[1]
+        .actors
+        .get_mut(&target)
+        .unwrap()
+        .register_behavior("first", increment);
+
+    shards[0].send_message(target, "first", &[]);
+    shards[1].drain_cross_shard_messages();
+    shards[1].run_scheduler();
+    assert_eq!(
+        shards[1].actors[&target]
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(1)
+    );
+
+    shards[0].send_message(target, "does_not_exist", &[]);
+    shards[1].drain_cross_shard_messages();
+    shards[1].run_scheduler();
+    assert_eq!(
+        shards[1].actors[&target]
+            .get_state_field("count")
+            .and_then(|v| v.as_int()),
+        Some(1),
+        "unknown cross-shard behavior must not execute behavior zero"
     );
 }

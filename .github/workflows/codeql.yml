@@ -33,6 +33,7 @@ jobs:
   analyze:
     name: Analyze (Rust)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:

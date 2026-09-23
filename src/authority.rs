@@ -29,6 +29,8 @@ pub enum AuthorityGrant {
     EnvRead { name: String },
     /// Permission to read one named secret.
     SecretRead { name: String },
+    /// Permission to execute one exact host command through `Process.run`.
+    ProcessRun { command: String },
     /// A namespaced extension authority. This keeps extension points typed
     /// without silently treating an arbitrary opaque string as permission.
     Other {
@@ -79,6 +81,9 @@ impl AuthorityGrant {
             }
             AuthorityGrant::SecretRead { name } => {
                 format!("Secret::Read({})", quote_source_string(name))
+            }
+            AuthorityGrant::ProcessRun { command } => {
+                format!("Process::Run({})", quote_source_string(command))
             }
             AuthorityGrant::Other {
                 namespace,
@@ -230,6 +235,7 @@ impl fmt::Display for AuthorityGrant {
             AuthorityGrant::FsWrite { path } => write!(f, "Fs::Write({path})"),
             AuthorityGrant::EnvRead { name } => write!(f, "Env::Read({name})"),
             AuthorityGrant::SecretRead { name } => write!(f, "Secret::Read({name})"),
+            AuthorityGrant::ProcessRun { command } => write!(f, "Process::Run({command})"),
             AuthorityGrant::Other {
                 namespace,
                 operation,
@@ -324,6 +330,9 @@ impl FromStr for AuthorityGrant {
             ("Secret", "Read") => Ok(AuthorityGrant::SecretRead {
                 name: require_nonempty_argument(token, argument)?.to_string(),
             }),
+            ("Process", "Run") => Ok(AuthorityGrant::ProcessRun {
+                command: require_nonempty_argument(token, argument)?.to_string(),
+            }),
             _ => Ok(AuthorityGrant::Other {
                 namespace: namespace.to_string(),
                 operation: operation.to_string(),
@@ -397,12 +406,26 @@ mod tests {
     }
 
     #[test]
+    fn process_run_round_trips_canonically() {
+        let grant: AuthorityGrant = "Process::Run(echo hello)".parse().unwrap();
+        assert_eq!(
+            grant,
+            AuthorityGrant::ProcessRun {
+                command: "echo hello".into(),
+            }
+        );
+        assert_eq!(grant.to_string(), "Process::Run(echo hello)");
+        assert_eq!(grant.to_source_syntax(), "Process::Run(\"echo hello\")");
+    }
+
+    #[test]
     fn source_parts_share_the_same_validation_path() {
         let grant =
             AuthorityGrant::from_parts("Net", "TcpOut", Some("api.stripe.com:443")).unwrap();
         assert_eq!(grant.to_string(), "Net::TcpOut(api.stripe.com:443)");
         assert!(AuthorityGrant::from_parts("Net", "TcpOut", Some("api.stripe.com:0")).is_err());
         assert!(AuthorityGrant::from_parts("Fs", "Read", Some("")).is_err());
+        assert!(AuthorityGrant::from_parts("Process", "Run", Some("")).is_err());
     }
 
     #[test]
@@ -481,6 +504,7 @@ mod tests {
             .parse::<AuthorityGrant>()
             .is_err());
         assert!("Fs::Read()".parse::<AuthorityGrant>().is_err());
+        assert!("Process::Run()".parse::<AuthorityGrant>().is_err());
     }
 
     #[test]

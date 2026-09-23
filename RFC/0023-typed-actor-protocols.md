@@ -124,6 +124,23 @@ The reverse is rejected: a reference cannot be widened to claim behaviors it
 does not expose. This makes protocol narrowing a capability attenuation
 operation rather than an unchecked cast.
 
+## Phase 4: canonical compiler protocol identity
+
+The compiler-owned `Type::Actor.behavior` record is now the source of truth for
+runtime/distributed protocol identity. `ProtocolSchema::from_actor_type`
+normalizes each behavior to its message argument pack and fingerprints the full
+canonical function contract: parameter types, return type, effect row, and
+capability.
+
+Protocol type identity uses `canonical_type_bytes`, not NTIR. NTIR intentionally
+erases distinctions that are acceptable for compiler equality fast paths but
+unsafe for persistent/distributed identity. Schema generation fails closed for
+unresolved type variables, open effect rows, open record rows, and unannotated
+behavior sentinels.
+
+`send` versus `ask` is delivery metadata rather than a property of a behavior
+declaration, so delivery mode is intentionally excluded from `ProtocolId`.
+
 ## Future phases
 
 1. Add explicit protocol intersection/composition syntax for reusable named capabilities.

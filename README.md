@@ -3,11 +3,11 @@
 </p>
 <h1 align="center">Nulang</h1>
 <p align="center">
-  An actor-based language with algebraic effects, capability-based types, and durable/distributed actors for building resilient software.
+  An actor-based language with algebraic effects, capability-based types, durable actors, and experimental distribution for building resilient software.
 </p>
 <p align="center">
   <a href="https://nulang.org">Website</a> •
-  <a href="playground/">Playground</a> •
+  <a href="https://nulang.org/playground/">Playground</a> •
   <a href="https://nulang.cloud">Nulang Cloud</a> •
   <a href="https://github.com/nulang-org/nulang">GitHub</a>
 </p>
@@ -28,28 +28,46 @@ Nulang is an actor-based programming language with algebraic effects and
 capability-based types. It fuses Erlang-style fault-tolerant actors with a
 Hindley-Milner type system, reference capabilities (`iso`/`trn`/`ref`/`val`/`box`/`tag`/`lineariso`),
 and row-polymorphic algebraic effects. The compiler pipeline (AST → HIR → MIR)
-targets a register-based bytecode VM with a Cranelift JIT, an ahead-of-time
-native backend, and an optional WASM backend. The runtime is a multi-threaded
-work-stealing executor with supervision trees, ORCA garbage collection,
-location-transparent distribution, and durable persistence.
+uses the register-based bytecode VM as the semantic reference implementation.
+Hot regions can tier into a Cranelift JIT; WASM is the canonical portable/cloud
+execution target; and native AOT remains a secondary backend until full semantic
+parity is demonstrated. An experimental WasmFX backend explores stack-switching
+for suspending effects. The runtime supports sharded multi-threaded execution: each `Runtime` shard has
+one owning cooperative scheduler thread, and `NULANG_SHARDS>1` runs shards in
+parallel with bounded cross-shard channels. The scheduler implementation retains
+Chase-Lev work-stealing APIs for multi-worker callers, but the live per-shard
+`run_scheduler()` path currently uses one worker slot. Supervision trees, ORCA
+garbage collection, durable persistence, and experimental location-transparent
+distribution are integrated into that model.
 
 ---
 
 ## Installation
 
 ### Pre-built binaries
-Download the latest release from [GitHub Releases](https://github.com/nulang-org/nulang/releases)
-*(prebuilt binaries coming with the first tagged release — for now build from source below)*.
+Tagged releases publish checksummed archives from the release CI matrix:
+
 - **Linux (x86_64)**: `nulang-linux-x86_64.tar.gz`
 - **Linux (aarch64)**: `nulang-linux-aarch64.tar.gz`
-- **macOS (x86_64)**: `nulang-macos-x86_64.tar.gz`
-- **macOS (aarch64)**: `nulang-macos-aarch64.tar.gz`
+- **macOS (Apple Silicon / aarch64)**: `nulang-macos-aarch64.tar.gz`
+- **Windows (x86_64)**: `nulang-windows-x86_64.tar.gz`
 
-Extract and place `nulang` in your PATH:
+Download the latest archive and its matching `.sha256` file from
+[GitHub Releases](https://github.com/nulang-org/nulang/releases), verify the
+checksum, then put the extracted executable on your PATH.
+
+Linux x86_64 example:
+
 ```bash
+sha256sum nulang-linux-x86_64.tar.gz
+cat nulang-linux-x86_64.tar.gz.sha256  # compare the published digest
 tar xzf nulang-linux-x86_64.tar.gz
-sudo mv nulang /usr/local/bin/
+install -m 0755 nulang-linux-x86_64 ~/.local/bin/nulang
 ```
+
+Windows x86_64 archives contain the release executable under its
+platform-qualified name; rename it to `nulang.exe` after extraction and place
+it in a directory on PATH.
 
 ### From source
 ```bash
@@ -57,12 +75,15 @@ git clone https://github.com/nulang-org/nulang.git
 cd nulang
 cargo build --release
 ```
-Requires Rust 1.95.0 (pinned by `rust-toolchain.toml`), Linux or macOS. Windows is not supported yet — use [WSL](https://learn.microsoft.com/windows/wsl/) and build inside a Linux environment.
 
+Source builds use Rust 1.95.0, pinned by `rust-toolchain.toml`. The tagged
+release matrix currently validates Linux x86_64/aarch64, macOS aarch64, and
+Windows x86_64; other platform/architecture combinations are not release-tested.
 
 ## Quick Start
 
-**Prerequisites:** Rust 1.95.0, Linux or macOS. Windows is unsupported for now — Windows users should build under WSL.
+A pre-built release binary needs no Rust toolchain. To build from source, use
+Rust 1.95.0:
 
 ```bash
 git clone https://github.com/nulang-org/nulang.git
@@ -90,9 +111,9 @@ perform IO.print("Hello, " + name + "!")
 > 17 verified programs covering actors, effects, pattern matching, records,
 > loops, arrays, HTTP, JSON, and more.
 >
-> No install? Try the [`playground/`](playground/) — run it locally with
-> `python3 playground/server.py` (a hosted version at nulang.org/playground
-> is coming soon).
+> No install? Try the hosted [browser playground](https://nulang.org/playground/).
+> It runs the compiler frontend + CoreVM locally in WebAssembly. Actors,
+> networking, FFI, and JIT execution still require the native runtime.
 
 ---
 
@@ -102,7 +123,8 @@ perform IO.print("Hello, " + name + "!")
 - **Capability-based types** — `iso`, `trn`, `ref`, `val`, `box`, `tag`, and `lineariso` guarantee memory safety and data-race freedom. Checked at compile time; erased at runtime.
 - **Hindley-Milner type inference** — full Algorithm W with row-polymorphic records, variant types, and algebraic effect rows.
 - **Actors** — `spawn`, `send`/`!`, `ask`, selective `receive` with `after` timeout, links, monitors, supervision trees, process groups, and actor priority scheduling.
-- **Entities & workflows** — `entity` declarations (durable-first, event-sourced by default). `workflow` declarations with steps, timers, signals, and saga compensation that survive restarts.
+- **Typed actor protocols** — structural `ActorRef[P]` contracts can restrict public actor APIs to required behaviors. Compiler-derived protocol fingerprints, a trusted schema registry, directional compatibility checks, and pre-mailbox admission are implemented as *Experimental* protocol hardening.
+- **Entities & workflows** — `entity` declarations are durable-first and event-sourced by default. The higher-level `workflow` declaration surface supports steps, timers, signals, and saga compensation, and remains *Experimental* while that API evolves.
 - **`let` and `var`** — immutable and mutable bindings. Records with `{ field: value }` syntax and `{ base .. field = new_val }` update syntax. Pattern matching with guards, alias patterns, and recursive sub-patterns. `**` exponentiation. Multi-line `"""..."""` strings with `\u{...}` unicode escapes. Pipe operator `|>`.
 - **Error handling** — `catch expr fallback` (prefix or postfix), `fail Error(...)` for structured short-circuit return, `T ! E` return types, `?` unwrap.
 - **FS file I/O** — `perform FS.read(path)`, `perform FS.write(path, content)`, `perform FS.append(path, content)`, `perform FS.exists(path)`.
@@ -112,8 +134,10 @@ perform IO.print("Hello, " + name + "!")
 - **REPL** — `nulang --repl` with `:help <topic>`, `:type <expr>`, `:load <file>`, tab completion, and automatic multi-line input.
 - **AI runtime** — `agent` declarations, LLM providers (OpenAI, Ollama), episodic/semantic/procedural memory, pipelines, debates, and supervisor teams. Gated behind the `ai-runtime` feature flag. *Experimental.*
 - **Distribution** — location-transparent `send`/`ask` over TCP (NUL0 wire protocol) and gossip membership. *Experimental.* The 8 CRDT types (`GCounter`, `ORSet`, …) are implemented and tested at the Rust embedder level only — `.nula`-level `state crdt` fields are not yet wired to them and behave as `durable` (see SPEC2 §9.10).
-- **WASM backend** — MIR→WASM compilation via `--backend wasm|wasm-run|wasm-aot`, Wasmtime host runtime with guard pages and SIMD. Gated behind the `wasm-backend` feature flag. *Experimental.*
-- **AOT native backend** — `--backend native` compiles pure-functional programs (no effects, actors, or FFI) to native code via Cranelift; other constructs fail with a specific "not yet supported in the native backend" error naming the construct. Use the default `bytecode` backend for full-language programs. *Experimental.*
+- **Fabric** — an *Experimental* messaging/stream substrate layered on the actor transport, with topic routing, consumer groups, durable replicated streams, quorum commit, epoch fencing, bounded repair/retry, and confirmed-removal failover. See [`docs/FABRIC.md`](docs/FABRIC.md).
+- **RESP-compatible cache kernel** — an *Experimental* Redis-compatible cache path with packed shard-local storage, Redis Cluster slot routing/`MOVED`, ordered pipelining, and an optional dedicated Mio reactor via the `cache-server` feature. See [`docs/RESP_CACHE_ARCHITECTURE.md`](docs/RESP_CACHE_ARCHITECTURE.md).
+- **WASM backend** — MIR→WASM compilation via `--backend wasm|wasm-run|wasm-aot`, with Wasmtime hosting and SIMD support. This is the canonical portable/cloud execution target, but the current plain-WASM profile still supports fewer language/runtime semantics than bytecode. The separate `wasmfx-backend` feature is an *Experimental* stack-switching path for suspending effects.
+- **Secondary native AOT backend** — `--backend native` compiles a restricted subset through Cranelift. It remains useful for differential testing and supported pure/native workloads, but it is not the semantic reference and must not be assumed to have full parity with bytecode. *Experimental.*
 
 ---
 
@@ -129,6 +153,9 @@ perform IO.print("Hello, " + name + "!")
 | [`CHANGELOG.md`](CHANGELOG.md) | Changelog organized by stability tier (Frozen / Stable / Experimental) |
 | [`GOVERNANCE.md`](GOVERNANCE.md) | Stability tiers, RFC process, and language versioning |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Implementation architecture and module map |
+| [`docs/SEMANTIC_STABILIZATION_CONTRACT.md`](docs/SEMANTIC_STABILIZATION_CONTRACT.md) | Current semantic-source-of-truth, backend, durability, and production-validation contract |
+| [`docs/FABRIC.md`](docs/FABRIC.md) | Experimental distributed messaging and durable stream substrate |
+| [`docs/RESP_CACHE_ARCHITECTURE.md`](docs/RESP_CACHE_ARCHITECTURE.md) | Experimental RESP-compatible cache architecture and cluster-routing invariants |
 | [`editors/vscode/`](editors/vscode/) | VS Code extension (syntax highlighting, language essentials, snippets) — build a `.vsix` or install manually |
 | [`RFC/`](RFC/) | RFC proposals (format stability, frozen core, deprecation cycles, roadmap) |
 
@@ -137,12 +164,13 @@ perform IO.print("Hello, " + name + "!")
 Changes to `src/**`, `examples/**`, `scripts/**`, `docs/**`, or the
 [`.github/workflows/docs-sync.yml`](.github/workflows/docs-sync.yml) workflow
 trigger a docs regeneration run on every push to `main`. The workflow regenerates
-the derived standard-library pages (`docs/src/content/docs/stdlib/`) and the
-full API reference (`docs/api.md`), commits any changes back to `main` with
-`[skip ci]`, validates the Astro site build, and pings
-[DeepWiki](https://deepwiki.com/nulang-org/nulang) as a best-effort nudge to
-re-index the repository docs. The site is then redeployed automatically by the
-Cloudflare Pages Git integration.
+the standard-library/API references and browser-playground bundle, validates the
+Astro site, then opens or updates the protected-branch
+`automation/docs-sync` PR with those generated assets. Once that PR passes the
+required checks and is merged, Cloudflare Pages redeploys `main`. When the
+workflow uses the default `GITHUB_TOKEN`, GitHub requires a maintainer to
+approve the generated PR's workflow runs; an optional `DOCS_SYNC_TOKEN`
+PAT/App token removes that approval step.
 
 ---
 
@@ -169,15 +197,18 @@ nulang nula doc              # generate Markdown API docs
 
 ## Project Status & Stability
 
-Nulang is **alpha software**. The language version is `1.0.0-frozen`
-(RFC 0001/0002). Every public surface is classified into one of three tiers
-(see [`GOVERNANCE.md`](GOVERNANCE.md) for the full definitions):
+Nulang is **alpha software**. Existing v1 artifacts still carry the historical
+`1.0.0-frozen` language metadata, but accepted RFC 0021 no longer treats
+pre-adoption source semantics as permanently Frozen. Published formats remain
+archival compatibility obligations, while source semantics stay Stable until
+the external-adoption freeze gate is satisfied. See
+[`GOVERNANCE.md`](GOVERNANCE.md) for the full definitions:
 
 | Tier | Scope |
 |------|-------|
-| **Frozen** | Never breaks — `.nbc` bytecode format, NUL0 wire protocol, value layout, Nulang Core, and the `IO`/`Spawn`/`Send`/`Receive` built-in effects. |
-| **Stable** | HM type system, effect rows, capability lattice, actor surface. Breaking changes require an RFC and a deprecation cycle. |
-| **Experimental** | Everything else — feature flags (`wasm-backend`, `python`, `sqlite`, `lsp`, `ai-runtime`), distribution (multi-node `send`/`ask`, CRDTs — Rust-level only so far), and items marked Experimental in [`CHANGELOG.md`](CHANGELOG.md). |
+| **Frozen** | Published v1 compatibility contracts: `.nbc` format v1, NUL0 v1, value layout v1, plus any explicitly Frozen effect contracts. Old versions are never silently reinterpreted; future versions may evolve behind explicit version boundaries. |
+| **Stable** | Nulang Core (pre-adoption), HM type system, effect rows, capability lattice, actor surface. Breaking changes require an RFC, an explicit version transition, diagnostics, and a migration path. |
+| **Experimental** | Everything else — including `wasm-backend`/`wasmfx-backend`, `cache-server`, the AI runtime, Fabric, typed actor-protocol hardening, multi-node distribution, CRDTs (Rust-level only so far), optional persistence backends, and other items marked Experimental in [`CHANGELOG.md`](CHANGELOG.md). |
 
 > **Pre-1.0 disclaimer:** Nulang does not have external users yet. The tier
 > guarantees above are the maintainer's stated policy and intent, but **expect
@@ -191,12 +222,13 @@ WASM backend test suite.
 
 ## Nulang Cloud
 
-**[Nulang Cloud](https://www.nulang.cloud)** is an optional managed platform
-for running Nulang actors in production — auto-scaling, zero cold start,
-managed durability, and location-transparent messaging across regions.
+**[Nulang Cloud](https://www.nulang.cloud)** is the optional managed platform
+for Nulang deployment, runtime, and platform tooling. It is under active
+development; check the Cloud site for the currently available surfaces rather
+than treating planned platform capabilities as production guarantees.
 
-The language and runtime in this repository are **Apache-2.0** and fully
-self-hostable. No lock-in.
+The language and runtime in this repository are **Apache-2.0** and
+self-hostable.
 
 ---
 
@@ -222,7 +254,7 @@ dependencies.
 
 ## Docs & Wiki
 
-The [nulang.org](https://nulang.org) documentation site is regenerated automatically on every push to `main` via the [Docs Sync workflow](.github/workflows/docs-sync.yml). When source files, examples, or docs content change, the workflow regenerates the standard-library reference and API docs, commits the updates, verifies the Astro build, and pings [DeepWiki](https://deepwiki.com/nulang-org/nulang) to encourage re-indexing.
+The [nulang.org](https://nulang.org) documentation site is regenerated automatically on every push to `main` via the [Docs Sync workflow](.github/workflows/docs-sync.yml). When source files, examples, or docs content change, the workflow rebuilds generated docs and the browser playground, verifies the Astro site, and proposes the generated files through the `automation/docs-sync` pull request rather than pushing directly to protected `main`.
 
 ---
 

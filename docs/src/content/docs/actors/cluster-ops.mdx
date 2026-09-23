@@ -79,7 +79,7 @@ Static quorum uses the *configured* expected size, not a live member count — i
 
 ## Registering Spawnable Behaviors
 
-A node never runs code a peer sends it. Remote spawn is **opt-in per behavior**: the receiving node must have registered the behavior name beforehand with `Runtime::register_spawnable_behavior`. An unregistered name is answered with `SpawnResponse { success: false }` and no actor is created — the crash-free counterpart of local send's unknown-behavior fallback.
+A node never runs code a peer sends it. Remote spawn is **opt-in per behavior**: the receiving node must have registered the behavior name beforehand with `Runtime::register_spawnable_behavior`. An unregistered name is answered with `SpawnResponse { success: false }` and no actor is created, matching the fail-closed rule used for actors with declared behavior metadata.
 
 ```rust
 // Embedding the runtime (Rust API — there is no CLI/module declaration yet)

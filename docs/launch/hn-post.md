@@ -40,9 +40,10 @@ There are also Coq/Lean formalization efforts in the repo (partial — see
 formal/).
 
 What's experimental or unfinished, honestly: multi-node distribution (works
-over TCP, marked experimental), the WASM and native AOT backends
-(feature-gated, partial), CRDT state (implemented at the Rust level only, not
-yet wired to source syntax), and an AI-agent runtime (feature-gated). There is
+over TCP, marked experimental), the WASM/WasmFX and native AOT execution paths (experimental and semantically
+restricted), CRDT state (implemented at the Rust level only, not yet wired to
+source syntax), Fabric/cache surfaces, typed actor-protocol hardening, and the
+AI-agent runtime. There is
 no production user base. This is alpha — I'm launching to get brutal feedback,
 not to claim it's done.
 
