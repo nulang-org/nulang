@@ -607,7 +607,6 @@ impl std::error::Error for BehaviorAdmissionError {}
 mod tests {
     use super::*;
     use crate::ast::{Expr, Literal, MigrationDecl, StateModel};
-    use crate::bytecode::Constant;
     use crate::content_identity::SemanticId;
     use crate::hir::{ActorDef, Module, Operand};
     use crate::types::{PrimitiveType, Span, Type};
@@ -653,7 +652,13 @@ mod tests {
                     ),
                 )],
                 behaviors: Vec::new(),
-                init: vec![("count".to_string(), Operand::Const(Constant::Int(0)))],
+                init: vec![(
+                    "count".to_string(),
+                    Operand::Literal(
+                        Literal::Int(0),
+                        Type::Primitive(PrimitiveType::Int),
+                    ),
+                )],
                 events: Vec::new(),
                 apply_handlers: Vec::new(),
                 version,
