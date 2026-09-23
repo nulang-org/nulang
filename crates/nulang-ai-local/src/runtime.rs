@@ -370,21 +370,21 @@ impl LocalRuntime {
             )?;
 
             let report = self.worker.execute_with_report(&running);
-            let mut result = report.task;
+            let reported_status = report.task.status;
             let worker_reason = report.reason;
-            let (terminal_status, reason) = match result.status {
+            let (terminal_status, reason) = match reported_status {
                 TaskStatus::Completed => (TaskStatus::Completed, None),
                 TaskStatus::Blocked => (
                     TaskStatus::Blocked,
                     Some(
                         worker_reason
-                            .unwrap_or_else(|| format!("task {} blocked by worker", result.id)),
+                            .unwrap_or_else(|| format!("task {} blocked by worker", running.id)),
                     ),
                 ),
                 TaskStatus::Failed => (
                     TaskStatus::Failed,
                     Some(worker_reason.unwrap_or_else(|| {
-                        format!("task {} failed in worker execution", result.id)
+                        format!("task {} failed in worker execution", running.id)
                     })),
                 ),
                 other => (
@@ -392,11 +392,14 @@ impl LocalRuntime {
                     Some(worker_reason.unwrap_or_else(|| {
                         format!(
                             "task {} returned non-terminal worker status {:?}",
-                            result.id, other
+                            running.id, other
                         )
                     })),
                 ),
             };
+            // Worker output is an outcome carrier, not authority to rewrite the
+            // scheduled task's identity, description, assignment, or plan links.
+            let mut result = running;
             result.status = terminal_status;
             result.updated_at = Utc::now();
             self.store.upsert_task(&result)?;
