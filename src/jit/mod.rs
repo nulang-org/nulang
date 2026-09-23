@@ -127,6 +127,13 @@ pub struct JitSession {
     /// recursion-cycle gating. Computed once on first tier-up instead of
     /// independently rescanning bytecode for each property.
     module_analysis: FxHashMap<usize, ModuleJitAnalysis>,
+    /// Separately compiled native thunks for straight-line pure leaf
+    /// functions. They are not inserted into the ordinary region cache:
+    /// tiny callees should not make normal interpreter entry pay a JIT boundary.
+    native_leafs: FxHashMap<(usize, usize), compiler::NativeLeafCall>,
+    /// Static leaf analyses or compilations that failed. Retrying them cannot
+    /// become useful until the module changes.
+    native_leaf_rejected: FxHashSet<(usize, usize)>,
     /// Reusable function builder context.
     builder_context: FunctionBuilderContext,
     /// Reusable codegen context.
@@ -176,6 +183,8 @@ impl JitSession {
             hot_counts: Vec::new(),
             typed_regions: FxHashSet::default(),
             module_analysis: FxHashMap::default(),
+            native_leafs: FxHashMap::default(),
+            native_leaf_rejected: FxHashSet::default(),
             builder_context: FunctionBuilderContext::new(),
             ctx,
         })
@@ -289,6 +298,72 @@ impl JitSession {
         module: &crate::bytecode::CodeModule,
     ) -> &[bool] {
         &self.module_analysis_for(module_idx, module).recursive
+    }
+
+    fn native_leaf_for(
+        &mut self,
+        module_idx: usize,
+        func_idx: usize,
+        module: &crate::bytecode::CodeModule,
+    ) -> Option<compiler::NativeLeafCall> {
+        let key = (module_idx, func_idx);
+        if let Some(existing) = self.native_leafs.get(&key) {
+            return Some(existing.clone());
+        }
+        if self.native_leaf_rejected.contains(&key) {
+            return None;
+        }
+
+        let Some((start, body_len, ret_reg, clobbers)) = analyze_native_leaf(module, func_idx)
+        else {
+            self.native_leaf_rejected.insert(key);
+            return None;
+        };
+
+        let func_name = format!("nulang_leaf_{}_{}", module_idx, func_idx);
+        let no_calls = std::collections::HashMap::new();
+        let no_leaf_calls = std::collections::HashMap::new();
+        let ptr = match compiler::compile_bytecode_region_with_options(
+            &mut self.module,
+            &mut self.builder_context,
+            &mut self.ctx,
+            &func_name,
+            start,
+            body_len,
+            &module.instructions,
+            &no_calls,
+            &no_leaf_calls,
+            false,
+        ) {
+            Ok(ptr) => ptr,
+            Err(_) => {
+                self.native_leaf_rejected.insert(key);
+                return None;
+            }
+        };
+
+        let leaf = compiler::NativeLeafCall {
+            ptr,
+            ret_reg,
+            clobbers,
+        };
+        self.native_leafs.insert(key, leaf.clone());
+        Some(leaf)
+    }
+
+    fn native_leaf_calls_for_region(
+        &mut self,
+        module_idx: usize,
+        module: &crate::bytecode::CodeModule,
+        native_calls: &std::collections::HashMap<usize, usize>,
+    ) -> std::collections::HashMap<usize, compiler::NativeLeafCall> {
+        let mut result = std::collections::HashMap::new();
+        for (&pc, &func_idx) in native_calls {
+            if let Some(leaf) = self.native_leaf_for(module_idx, func_idx, module) {
+                result.insert(pc, leaf);
+            }
+        }
+        result
     }
 
     /// Record one execution of an already-compiled region and attempt its one
