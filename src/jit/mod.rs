@@ -291,53 +291,72 @@ impl JitSession {
         &self.module_analysis_for(module_idx, module).recursive
     }
 
-    /// Record one execution of an already-compiled region and attempt
-    /// tier-2 promotion when the threshold is crossed.
+    /// Record one execution of an already-compiled region and attempt its one
+    /// useful tier-2 promotion when the threshold is crossed.
     ///
-    /// Tier-2 attempts more aggressive compilation: typed path for regions
-    /// that were compiled untyped, or SIMD for typed regions.  Promotion is
-    /// best-effort — a failed attempt just resets the counter so we retry
-    /// later.
+    /// First-tier compilation already performs static type inference. An
+    /// untyped region therefore cannot become typed merely by executing more
+    /// often with the current JIT; repeatedly retrying that promotion only
+    /// burns cycles. Typed regions get one SIMD specialization attempt. After
+    /// either outcome the region becomes terminal and the steady-state JIT
+    /// entry path stops updating tiering counters entirely.
     pub fn record_tier2_and_maybe_promote(
         &mut self,
         module_idx: usize,
         pc: usize,
-        instructions: &[crate::bytecode::Instruction],
+        module: &crate::bytecode::CodeModule,
     ) {
-        let count = self.tier2_counters.entry((module_idx, pc)).or_insert(0);
-        *count += 1;
-        if *count < TIER2_THRESHOLD {
+        let region_len = {
+            let Some(region) = self.compiled_entry_mut(module_idx, pc) else {
+                return;
+            };
+            if region.tier2_terminal {
+                return;
+            }
+
+            region.tier2_executions = region.tier2_executions.saturating_add(1);
+            if u64::from(region.tier2_executions) < TIER2_THRESHOLD {
+                return;
+            }
+            region.tier2_executions = 0;
+            region.len
+        };
+
+        if region_len < 3 || !self.typed_regions.contains(&(module_idx, pc)) {
+            if let Some(region) = self.compiled_entry_mut(module_idx, pc) {
+                region.tier2_terminal = true;
+            }
             return;
         }
 
-        let region_len = match self.compiled_entry(module_idx, pc) {
-            Some((_, len)) if len >= 3 => len,
-            _ => return,
+        let meta = typed_compiler::infer_reg_types(module, pc);
+        let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
+        let _ = unsafe {
+            self.promote_region_simd(
+                module_idx,
+                pc,
+                region_len,
+                &module.instructions,
+                meta_ref,
+            )
         };
 
-        let was_typed = self.typed_regions.contains(&(module_idx, pc));
-
-        if !was_typed {
-            // Try typed compilation with the benefit of profile data.
-            // We don't have a CodeModule here, so infer_reg_types needs
-            // one — skip for now, promotion will retry later.
-            // Reset counter to allow future retries.
-            self.tier2_counters.insert((module_idx, pc), 0);
-        } else {
-            // Try SIMD compilation for hot typed regions.
-            if let Some(_func) =
-                unsafe { self.compile_region_simd(module_idx, pc, region_len, instructions, None) }
-            {
-                // SIMD compilation succeeded; the compiled cache was
-                // updated inside compile_region_simd.
-            }
-            self.tier2_counters.insert((module_idx, pc), 0);
+        // SIMD eligibility is static for this region and target. Success or
+        // failure, retrying the same analysis every threshold buys nothing
+        // until the module changes.
+        if let Some(region) = self.compiled_entry_mut(module_idx, pc) {
+            region.tier2_terminal = true;
         }
     }
 
-    /// Reset tier-2 counters (used by tests).
+    /// Reset post-compilation execution counters without changing terminal
+    /// tier state.
     pub fn reset_tier2_counters(&mut self) {
-        self.tier2_counters.clear();
+        for row in &mut self.compiled {
+            for region in row.iter_mut().flatten() {
+                region.tier2_executions = 0;
+            }
+        }
     }
 
     /// Compile a bytecode region starting at `start_offset` with `num_instrs`
