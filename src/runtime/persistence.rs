@@ -320,15 +320,15 @@ impl DurableTransition {
                 "durable transition sequence must be non-zero",
             ));
         }
-        let expected_sequence = self
-            .expected_previous_sequence
-            .checked_add(1)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "durable transition sequence overflow",
-                )
-            })?;
+        let expected_sequence =
+            self.expected_previous_sequence
+                .checked_add(1)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "durable transition sequence overflow",
+                    )
+                })?;
         if self.sequence != expected_sequence {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1492,8 +1492,7 @@ impl PersistenceStore for LibsqlStore {
                 let bytes = record
                     .to_json()
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                String::from_utf8(bytes)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
             })
             .collect::<io::Result<Vec<_>>>()?;
         let outbox_payload_json = transition
@@ -2204,7 +2203,6 @@ impl PersistenceStore for LibsqlStore {
             Ok(())
         })
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -3565,7 +3563,6 @@ mod postgres_store_tests {
     }
 }
 
-
 #[cfg(test)]
 mod durable_transition_tests {
     use super::*;
@@ -3728,7 +3725,6 @@ mod durable_transition_tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }
-
 
 #[cfg(all(test, feature = "sqlite"))]
 mod libsql_atomic_transition_tests {
