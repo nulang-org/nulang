@@ -360,11 +360,12 @@ jobs:
 
       - name: Run Nulang local-message benchmark
         run: |
-          cargo bench --locked --bench bench_main actor/message_roundtrip_local -- \
+          cargo bench --locked --no-default-features --bench bench_main actor/message_roundtrip_local -- \
             --warm-up-time 1 --measurement-time 3 --sample-size 30
 
       - name: Compare with Rust, Go, and BEAM
         run: |
+          set -o pipefail
           python3 scripts/cross_runtime_baseline.py \
             --json-out /tmp/cross-runtime-baseline.json \
             | tee /tmp/cross-runtime-baseline.txt
