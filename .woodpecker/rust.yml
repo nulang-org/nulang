@@ -1,0 +1,61 @@
+# Nulang core validation on the self-hosted `bootstrap-ci` Woodpecker pool.
+#
+# Ported from the GitHub Actions jobs in .github/workflows/ci.yml so that the
+# repository can be validated on owned hardware, with the same ordering
+# (format -> both feature-set checks -> clippy -> both test runs -> whitespace).
+#
+# NOTE: Woodpecker pre-processes dollar-brace variable references at
+# config-evaluation time, including inside comments. Command lines therefore
+# avoid bare brace references and let the shell expand with dollar-paren or
+# doubled-dollar escapes.
+
+labels:
+  platform: linux/amd64
+  pool: bootstrap-ci
+
+when:
+  - event: pull_request
+    branch: main
+    path:
+      include:
+        - "**/*.rs"
+        - "**/Cargo.toml"
+        - "Cargo.lock"
+        - "build.rs"
+        - "scripts/**"
+        - ".woodpecker/**"
+  - event: push
+    branch: main
+    path:
+      include:
+        - "**/*.rs"
+        - "**/Cargo.toml"
+        - "Cargo.lock"
+        - "build.rs"
+        - "scripts/**"
+        - ".woodpecker/**"
+  - event: manual
+
+concurrency:
+  limit: 1
+  group: rust-validation
+
+steps:
+  - name: rust-validation
+    image: rust:1.95-bookworm
+    environment:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+    commands:
+      - set -eux
+      - echo "validating nulang core at revision $(git rev-parse HEAD)"
+      - apt-get update
+      - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-dev pkg-config
+      - rustup component add rustfmt clippy
+      - cargo fmt --all -- --check
+      - cargo check --all-targets --no-default-features
+      - cargo check --all-targets
+      - cargo clippy --all-targets --no-default-features -- -D clippy::correctness
+      - cargo test --no-default-features
+      - cargo test
+      - git diff --check
