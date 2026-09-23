@@ -51,6 +51,13 @@ version + migration.*
 
 ## Stable tier
 
+### Durable external-effect recovery coordinator — 2026-09-23
+- **Atomic durable-effect records are now recoverable through the storage-neutral `PersistenceStore` contract.** Memory and libSQL backends can load the newest record for a stable `DurableEffectId`; backends without recovery support fail with `Unsupported` instead of pretending the effect never ran.
+- **`DurableEffectCoordinator` connects the existing semantic effect state machine to atomic `DurableTransition` commits.** A new effect persists `Prepared` before external dispatch, recovery validates both request digest and full effect specification, terminal results persist as `Completed`, and completed results replay without redispatch.
+- **Activation fencing and sequence CAS remain authoritative at the persistence boundary.** The coordinator supplies the current activation epoch but does not invent replay identity; callers must provide a semantic, replay-stable `DurableEffectSpec`.
+- Focused store/coordinator tests pin request-drift rejection, monotonic completion, stale-activation rejection, newest-record lookup, and fail-closed unsupported-backend behavior.
+
+
 ### Actor density and mailbox hot-path allocation — 2026-09-23
 - **Idle actors no longer materialize their 16 KiB ORCA bump block at spawn** (`src/runtime/heap.rs`). The configured first-block capacity is preserved, but allocation is deferred until the first small-object heap allocation; LOS-only actors also remain bump-block-free.
 - **Mailbox logical-count atomics use relaxed ordering** (`src/runtime/mailbox.rs`) because Crossbeam `SegQueue` owns message publication/synchronization; the atomic counter remains capacity/accounting state and its modification order still prevents bounded producers from over-reserving.
