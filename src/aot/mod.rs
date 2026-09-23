@@ -676,6 +676,7 @@ pub fn set_aot_dispatch(target: Option<AotDispatchTarget>) {
             crate::jit::runtime::aot_set_constants(&(*t.module).constants());
             set_aot_module_ctx(&*t.module);
         }
+        set_aot_runtime_ctx(t.runtime);
     }
     AOT_DISPATCH.with(|c| *c.borrow_mut() = target);
 }
@@ -684,6 +685,7 @@ pub fn set_aot_dispatch(target: Option<AotDispatchTarget>) {
 pub fn clear_aot_dispatch() {
     AOT_DISPATCH.with(|c| *c.borrow_mut() = None);
     crate::jit::runtime::aot_clear_constants();
+    clear_aot_runtime_ctx();
     clear_aot_module_ctx();
 }
 
@@ -692,22 +694,34 @@ thread_local! {
     /// `nulang_aot_spawn` call (armed by the driver around dispatch).
     static AOT_SPAWN_CTX: std::cell::RefCell<*const AotModule> =
         std::cell::RefCell::new(std::ptr::null());
-    /// The `AotModule` whose compiled function table resolves the next
-    /// `nulang_aot_resolve_fn` call (armed around dispatch, so captured
-    /// closures can look up their target's native entry point).
+    /// The `AotModule` whose compiled function table, constants, code module,
+    /// and helper metadata are active for the current native call.
     static AOT_MODULE_CTX: std::cell::RefCell<*const AotModule> =
         std::cell::RefCell::new(std::ptr::null());
+    /// Real Runtime backing the current native helper call, or null for a
+    /// standalone AOT dispatch. This is helper context, not dispatch target
+    /// selection: runtime-owned behavior selection stays direct.
+    static AOT_RUNTIME_CTX: std::cell::Cell<*mut crate::runtime::Runtime> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
 
-/// Arm the module whose compiled function table resolves closure targets.
-/// The caller must clear it after dispatch.
+/// Arm the module whose compiled function table resolves closure targets and
+/// whose metadata backs native helper calls.
 pub fn set_aot_module_ctx(module: &AotModule) {
     AOT_MODULE_CTX.with(|c| *c.borrow_mut() = module as *const AotModule);
 }
 
-/// Disarm the compiled-function context.
+/// Disarm the compiled-function/module helper context.
 pub fn clear_aot_module_ctx() {
     AOT_MODULE_CTX.with(|c| *c.borrow_mut() = std::ptr::null());
+}
+
+fn set_aot_runtime_ctx(runtime: *mut crate::runtime::Runtime) {
+    AOT_RUNTIME_CTX.with(|c| c.set(runtime));
+}
+
+fn clear_aot_runtime_ctx() {
+    AOT_RUNTIME_CTX.with(|c| c.set(std::ptr::null_mut()));
 }
 
 thread_local! {
@@ -809,13 +823,12 @@ fn take_aot_spawn_authority() -> Option<Vec<String>> {
 
 /// Native-code entry point for `RValue::Spawn`: creates an actor of the type
 /// whose first behavior is at module index `behavior_idx`, applying any queued
-/// init pairs. When dispatched inside the real actor `Runtime` (the armed
-/// `AOT_DISPATCH` target carries a non-null runtime), the spawn routes through
-/// `Runtime::spawn_from_module` so the new actor joins the scheduler and gets
-/// AOT-wired; otherwise it creates a boxed standalone actor. Returns the new
-/// actor's id (boxed), or nil when no context is armed. Defined here (not in
-/// `jit/runtime.rs`) because it needs `AotModule`; the JIT linker resolves it
-/// by symbol name at link time.
+/// init pairs.
+///
+/// Runtime-owned native dispatch uses `AOT_MODULE_CTX` plus `AOT_RUNTIME_CTX`
+/// to route the spawn through `Runtime::spawn_from_module_with_authority`.
+/// Standalone dispatch uses the same module context with a null runtime and
+/// falls back to `AOT_SPAWN_CTX` for the explicit standalone spawn driver.
 #[no_mangle]
 pub unsafe extern "C" fn nulang_aot_spawn(behavior_idx: u64) -> u64 {
     let init = crate::jit::runtime::take_aot_spawn_init();
@@ -828,12 +841,14 @@ pub unsafe extern "C" fn nulang_aot_spawn(behavior_idx: u64) -> u64 {
         Ok(manifest) => manifest,
         Err(_) => return crate::vm::Value::nil().as_raw(),
     };
-    let dispatch = AOT_DISPATCH.with(|c| *c.borrow());
-    if let Some(t) = dispatch {
-        let module = unsafe { &*t.module };
-        if !t.runtime.is_null() {
+
+    let module_ptr = AOT_MODULE_CTX.with(|c| *c.borrow());
+    if !module_ptr.is_null() {
+        let module = unsafe { &*module_ptr };
+        let runtime = AOT_RUNTIME_CTX.with(|c| c.get());
+        if !runtime.is_null() {
             // Real Runtime path: spawn through the scheduler so the new actor
-            // is a live runtime actor (and its behaviors are AOT-wired).
+            // is live, authority-checked, and AOT-wired.
             if let Some(code) = module.code_module() {
                 let init: Vec<(String, crate::vm::Value)> = init
                     .iter()
@@ -851,7 +866,7 @@ pub unsafe extern "C" fn nulang_aot_spawn(behavior_idx: u64) -> u64 {
                     .collect();
                 let val = unsafe {
                     crate::runtime::spawn_from_module_with_authority(
-                        &mut *t.runtime,
+                        &mut *runtime,
                         code,
                         behavior_idx as usize,
                         init,
@@ -862,18 +877,19 @@ pub unsafe extern "C" fn nulang_aot_spawn(behavior_idx: u64) -> u64 {
             }
             return crate::vm::Value::nil().as_raw();
         }
-        // Standalone path: spawn a boxed standalone actor.
+
         return match module.spawn_actor_with_authority(behavior_idx as usize, init, &requested) {
             Some(id) => crate::vm::Value::actor_ref(id).as_raw(),
             None => crate::vm::Value::nil().as_raw(),
         };
     }
-    // Fallback: standalone spawn via the explicit spawn context.
+
+    // Explicit standalone fallback used by the standalone spawn driver.
     let module = AOT_SPAWN_CTX.with(|c| *c.borrow());
     if module.is_null() {
         return crate::vm::Value::nil().as_raw();
     }
-    match (*module).spawn_actor_with_authority(behavior_idx as usize, init, &requested) {
+    match unsafe { (*module).spawn_actor_with_authority(behavior_idx as usize, init, &requested) } {
         Some(id) => crate::vm::Value::actor_ref(id).as_raw(),
         None => crate::vm::Value::nil().as_raw(),
     }
@@ -910,11 +926,15 @@ macro_rules! define_aot_perform {
             // The module is only needed by `perform_builtin_effect_in_module`
             // for a few effects (Otp/Http resolve against it); the common
             // IO/Actor/Timer path ignores it.
-            let module = AOT_DISPATCH.with(|c| {
-                c.borrow()
-                    .and_then(|t| unsafe { (&*t.module).code_module() })
-                    .map(|cm| cm as *const crate::bytecode::CodeModule)
-                    .unwrap_or(std::ptr::null())
+            let module = AOT_MODULE_CTX.with(|c| {
+                let module = *c.borrow();
+                if module.is_null() {
+                    std::ptr::null()
+                } else {
+                    unsafe { (&*module).code_module() }
+                        .map(|cm| cm as *const crate::bytecode::CodeModule)
+                        .unwrap_or(std::ptr::null())
+                }
             });
             let constants = if module.is_null() {
                 crate::aot::aot_module_constants()
@@ -1083,12 +1103,14 @@ pub fn dispatch_aot_runtime_behavior(
         crate::jit::runtime::aot_set_constants((*target.module).constants());
         set_aot_module_ctx(&*target.module);
     }
+    set_aot_runtime_ctx(runtime);
 
     let mut callbacks = AotRuntimeCallbacks { runtime, actor_id };
     unsafe { crate::jit::runtime::set_jit_callbacks(&mut callbacks) };
     let status = call_aot_behavior(target.fn_ptr, actor_id, args);
     crate::jit::runtime::clear_jit_callbacks();
     crate::jit::runtime::aot_clear_constants();
+    clear_aot_runtime_ctx();
     clear_aot_module_ctx();
     status
 }
