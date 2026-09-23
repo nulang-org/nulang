@@ -576,14 +576,20 @@ fn main() {
         i += 1;
     }
 
-    if opts.emit_behavior_manifest.is_some()
-        && !opts.emit_nbc
-        && !matches!(opts.backend.as_str(), "wasm" | "wasm-aot")
-    {
-        eprintln!(
-            "Error: --emit-behavior-manifest requires --emit-nbc or an artifact-producing WASM backend (wasm|wasm-aot)"
-        );
-        std::process::exit(1);
+    if opts.emit_behavior_manifest.is_some() && !opts.emit_nbc {
+        let artifact_wasm = matches!(opts.backend.as_str(), "wasm" | "wasm-aot");
+        let normal_file_build = !positional.is_empty()
+            && opts.eval_code.is_none()
+            && opts.check_file.is_none()
+            && opts.watch.is_none()
+            && !opts.repl
+            && opts.bench_count.is_none();
+        if !artifact_wasm || !normal_file_build {
+            eprintln!(
+                "Error: --emit-behavior-manifest requires --emit-nbc or a direct file build with --backend wasm|wasm-aot"
+            );
+            std::process::exit(1);
+        }
     }
 
     // Resolve color mode once after all args are parsed.
