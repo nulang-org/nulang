@@ -13,9 +13,7 @@ use nulang::typechecker::TypeChecker;
 fn generated_program(functions: usize) -> String {
     let mut source = String::with_capacity(functions * 64 + 8);
     for i in 0..functions {
-        source.push_str(&format!(
-            "fn f{i}(x: Int) -> Int {{ x * 3 + {i} }};\n"
-        ));
+        source.push_str(&format!("fn f{i}(x: Int) -> Int {{ x * 3 + {i} }};\n"));
     }
     source.push_str("0");
     source
@@ -28,9 +26,7 @@ fn lower_to_mir(source: &str) -> nulang::mir::Module {
     let ast = parser.parse_module().expect("parse failed");
 
     let mut type_checker = TypeChecker::new();
-    type_checker
-        .check_module(&ast)
-        .expect("typecheck failed");
+    type_checker.check_module(&ast).expect("typecheck failed");
 
     let mut effect_checker = EffectChecker::new();
     effect_checker
@@ -53,8 +49,7 @@ fn lower_to_mir(source: &str) -> nulang::mir::Module {
 
 fn compile_bytecode(source: &str) -> nulang::bytecode::CodeModule {
     let mut mir = lower_to_mir(source);
-    nulang::mir_codegen::compile_mir(&mut mir, "compiler-bench")
-        .expect("bytecode codegen failed")
+    nulang::mir_codegen::compile_mir(&mut mir, "compiler-bench").expect("bytecode codegen failed")
 }
 
 fn bench_frontend_to_mir(c: &mut Criterion) {
