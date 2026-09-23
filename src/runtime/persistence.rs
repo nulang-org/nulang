@@ -1211,8 +1211,8 @@ impl PersistenceStore for LibsqlStore {
         self.rt.block_on(async {
             let mut rows = match conn
                 .query(
-                    "SELECT sequence, field_name, event_name, args, value FROM events
-                 WHERE actor_id = ?1 ORDER BY sequence ASC",
+                    "SELECT sequence, field_name, event_name, args, value FROM events_v2
+                 WHERE actor_id = ?1 ORDER BY sequence ASC, field_name ASC",
                     libsql::params![actor_id as i64],
                 )
                 .await
