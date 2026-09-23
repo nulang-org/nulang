@@ -659,7 +659,7 @@ impl EffectChecker {
                 Ok(row)
             }
 
-            // Par: independence annotation, sequential effect union.
+            // Par: union every branch effect; execution remains sequential today.
             Expr::Par { exprs, .. } => {
                 let mut row = EffectRow::empty();
                 for e in exprs {
@@ -2113,22 +2113,16 @@ impl CapabilityAnalyzer {
                 }
             }
 
-            // Par: independence annotation, sequential block semantics.
+            // Par: every branch contributes to the source-ordered tuple
+            // result, so its capability is the join of all branch results.
+            // All branches execute, therefore linear-consumption tracking uses
+            // the same shared `consumed` set across the region.
             Expr::Par { exprs, .. } => {
-                if exprs.is_empty() {
-                    Ok(Capability::Val)
-                } else {
-                    let block_ctx = ctx.clone();
-                    for (i, e) in exprs.iter().enumerate() {
-                        if i == exprs.len() - 1 {
-                            return self.infer_cap_tracked(&block_ctx, e, consumed);
-                        }
-                        // Intermediate expressions may bind variables.
-                        // We don't track those for now; just infer.
-                        let _ = self.infer_cap_tracked(&block_ctx, e, consumed)?;
-                    }
-                    Ok(Capability::Val)
+                let mut cap = Capability::Val;
+                for e in exprs {
+                    cap = cap.join(self.infer_cap_tracked(ctx, e, consumed)?);
                 }
+                Ok(cap)
             }
 
             // Tuple: join of element capabilities.
