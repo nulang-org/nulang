@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use nulang_ai_core::{
     Commitment, CommitmentStatus, ConversationState, Goal, GoalGraph, GoalStatus, Intention,
-    IntentionStatus, ManagerKind, Task, TaskStatus,
+    IntentionRevision, IntentionRevisionDecision, IntentionStatus, ManagerKind, Task, TaskStatus,
 };
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
@@ -95,6 +95,20 @@ impl SqliteStore {
             );
             CREATE INDEX IF NOT EXISTS intentions_goal_idx ON intentions(goal_id);
             CREATE INDEX IF NOT EXISTS intentions_commitment_idx ON intentions(commitment_id);
+            CREATE TABLE IF NOT EXISTS intention_revisions (
+                id TEXT PRIMARY KEY,
+                goal_id TEXT NOT NULL,
+                commitment_id TEXT NOT NULL,
+                superseded_intention_id TEXT NOT NULL,
+                replacement_intention_id TEXT,
+                trigger_task_id TEXT NOT NULL,
+                trigger_status TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS intention_revisions_goal_idx ON intention_revisions(goal_id);
+            CREATE INDEX IF NOT EXISTS intention_revisions_commitment_idx ON intention_revisions(commitment_id);
             CREATE TABLE IF NOT EXISTS conversations (
                 id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
@@ -233,6 +247,37 @@ impl SqliteStore {
                 intention_status_str(&intention.status),
                 intention.created_at.to_rfc3339(),
                 intention.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_intention_revision(
+        &self,
+        revision: &IntentionRevision,
+    ) -> Result<(), StoreError> {
+        let conn = Connection::open(&self.path)?;
+        conn.execute(
+            r#"INSERT INTO intention_revisions (
+                id, goal_id, commitment_id, superseded_intention_id, replacement_intention_id,
+                trigger_task_id, trigger_status, decision, reason, created_at
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+            ON CONFLICT(id) DO UPDATE SET
+                replacement_intention_id=excluded.replacement_intention_id,
+                decision=excluded.decision,
+                reason=excluded.reason
+            "#,
+            params![
+                revision.id.to_string(),
+                revision.goal_id.to_string(),
+                revision.commitment_id.to_string(),
+                revision.superseded_intention_id.to_string(),
+                revision.replacement_intention_id.map(|u| u.to_string()),
+                revision.trigger_task_id.to_string(),
+                task_status_str(&revision.trigger_status),
+                revision_decision_str(&revision.decision),
+                revision.reason,
+                revision.created_at.to_rfc3339(),
             ],
         )?;
         Ok(())
@@ -398,12 +443,43 @@ impl SqliteStore {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
+        let mut revision_stmt = conn.prepare(
+            "SELECT id, commitment_id, superseded_intention_id, replacement_intention_id, trigger_task_id, trigger_status, decision, reason, created_at FROM intention_revisions WHERE goal_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let intention_revisions = revision_stmt
+            .query_map(params![goal_id.to_string()], |row| {
+                let id = Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_else(|_| Uuid::nil());
+                let commitment_id =
+                    Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or_else(|_| Uuid::nil());
+                let superseded_intention_id =
+                    Uuid::parse_str(&row.get::<_, String>(2)?).unwrap_or_else(|_| Uuid::nil());
+                let replacement_intention_id = row
+                    .get::<_, Option<String>>(3)?
+                    .and_then(|s| Uuid::parse_str(&s).ok());
+                let trigger_task_id =
+                    Uuid::parse_str(&row.get::<_, String>(4)?).unwrap_or_else(|_| Uuid::nil());
+                Ok(IntentionRevision {
+                    id,
+                    goal_id,
+                    commitment_id,
+                    superseded_intention_id,
+                    replacement_intention_id,
+                    trigger_task_id,
+                    trigger_status: parse_task_status(row.get(5)?),
+                    decision: parse_revision_decision(row.get(6)?),
+                    reason: row.get(7)?,
+                    created_at: parse_ts(row.get(8)?),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(GoalGraph {
             goal,
             tasks,
             agents: Vec::new(),
             commitments,
             intentions,
+            intention_revisions,
         })
     }
 
@@ -455,6 +531,7 @@ fn goal_status_str(status: &GoalStatus) -> &'static str {
         GoalStatus::Blocked => "blocked",
         GoalStatus::Verifying => "verifying",
         GoalStatus::Completed => "completed",
+        GoalStatus::Failed => "failed",
         GoalStatus::Cancelled => "cancelled",
     }
 }
@@ -465,6 +542,7 @@ fn parse_goal_status(raw: String) -> GoalStatus {
         "blocked" => GoalStatus::Blocked,
         "verifying" => GoalStatus::Verifying,
         "completed" => GoalStatus::Completed,
+        "failed" => GoalStatus::Failed,
         "cancelled" => GoalStatus::Cancelled,
         _ => GoalStatus::Created,
     }
@@ -537,6 +615,22 @@ fn parse_intention_status(raw: String) -> IntentionStatus {
         "failed" => IntentionStatus::Failed,
         "cancelled" => IntentionStatus::Cancelled,
         _ => IntentionStatus::Planned,
+    }
+}
+
+fn revision_decision_str(decision: &IntentionRevisionDecision) -> &'static str {
+    match decision {
+        IntentionRevisionDecision::Replan => "replan",
+        IntentionRevisionDecision::Suspend => "suspend",
+        IntentionRevisionDecision::Abandon => "abandon",
+    }
+}
+
+fn parse_revision_decision(raw: String) -> IntentionRevisionDecision {
+    match raw.as_str() {
+        "suspend" => IntentionRevisionDecision::Suspend,
+        "abandon" => IntentionRevisionDecision::Abandon,
+        _ => IntentionRevisionDecision::Replan,
     }
 }
 
