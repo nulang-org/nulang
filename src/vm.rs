@@ -8108,6 +8108,86 @@ mod vm_tests {
     /// Regression: `perform IO.print` in a standalone script (no handler on
     /// the stack) must print via the standalone built-in instead of failing
     /// with "Unhandled effect: IO".
+    #[derive(Debug)]
+    struct ConsumingSendTestCallbacks {
+        consume: bool,
+    }
+
+    impl ActorVmCallbacks for ConsumingSendTestCallbacks {
+        fn alloc(&mut self, _size: usize, _type_tag: HeapTypeTag) -> Option<*mut u8> {
+            None
+        }
+
+        fn drop_ref(&mut self, _ptr: *mut u8) {}
+
+        fn retain_ref(&mut self, _ptr: *mut u8) {}
+
+        fn array_len(&self, _ptr: *mut u8) -> Option<usize> {
+            None
+        }
+
+        fn spawn_actor(
+            &mut self,
+            _module: &CodeModule,
+            _spawn_pc: usize,
+            _behavior_idx: usize,
+            _init: Vec<(String, Value)>,
+        ) -> Value {
+            Value::nil()
+        }
+
+        fn send_message(&mut self, _target: Value, _behavior_id: u16, _args: &[Value]) {}
+
+        fn send_message_consuming(
+            &mut self,
+            _target: Value,
+            _behavior_id: u16,
+            _args: &[Value],
+            candidate_mask: u16,
+        ) -> u16 {
+            if self.consume { candidate_mask } else { 0 }
+        }
+    }
+
+    fn run_consuming_send_source_clear(consume: bool) -> Value {
+        let mut module = CodeModule::new("consuming_send_clear");
+        module.add_behavior(BehaviorTableEntry {
+            name: "sink".into(),
+            param_count: 1,
+            code_offset: 0,
+            local_count: 0,
+            effect_mask: 0,
+            compensate_offset: None,
+            content_hash: None,
+            source_location: None,
+            parallel_branches: None,
+        });
+
+        module.emit(Instruction::new1(OpCode::Const1, 15));
+        module.emit(Instruction::new1(OpCode::Const1, 0));
+        module.emit(Instruction::new1(OpCode::Const1, 14));
+        let send_pc = module.emit(Instruction::new3(OpCode::Send, 14, 0, 0));
+        module.emit(Instruction::new2(OpCode::Move, 15, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+        module.send_ownership_sites.push(crate::bytecode::SendOwnershipSite {
+            pc: send_pc,
+            candidate_mask: 1,
+            sources: vec![(0, crate::bytecode::SendOwnershipSource::Register(15))],
+        });
+
+        let mut vm = VM::new();
+        vm.load_module(module);
+        vm.set_actor_callbacks(Box::new(ConsumingSendTestCallbacks { consume }));
+        vm.run().unwrap()
+    }
+
+    #[test]
+    fn test_send_clears_source_only_when_callback_consumes() {
+        assert!(run_consuming_send_source_clear(true).is_nil());
+        assert_eq!(run_consuming_send_source_clear(false).as_int(), Some(1));
+    }
+
     #[test]
     fn test_standalone_io_print_builtin() {
         let mut module = CodeModule::new("test_io_print");
