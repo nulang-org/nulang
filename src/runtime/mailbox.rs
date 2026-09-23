@@ -470,12 +470,7 @@ mod tests {
 
     #[test]
     fn small_payloads_inline_and_large_payloads_spill() {
-        let four = [
-            Value::int(1),
-            Value::int(2),
-            Value::int(3),
-            Value::int(4),
-        ];
+        let four = [Value::int(1), Value::int(2), Value::int(3), Value::int(4)];
         let inline = MessagePayload::from_slice(&four);
         assert!(inline.is_inline());
         assert_eq!(inline.as_slice(), &four);
