@@ -3,9 +3,9 @@
 //! Provides: actor lifecycle, scheduler, mailbox, heap, GC, supervision,
 //! distribution.
 
+use crossbeam::channel as shard_channel;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use crossbeam::channel as shard_channel;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::warn;
@@ -719,7 +719,9 @@ impl Runtime {
         let channels: Vec<(
             shard_channel::Sender<CrossShardMsg>,
             shard_channel::Receiver<CrossShardMsg>,
-        )> = (0..num_shards).map(|_| shard_channel::bounded(1024)).collect();
+        )> = (0..num_shards)
+            .map(|_| shard_channel::bounded(1024))
+            .collect();
 
         let senders: Vec<shard_channel::Sender<CrossShardMsg>> =
             channels.iter().map(|(tx, _)| tx.clone()).collect();
