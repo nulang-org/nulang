@@ -1,0 +1,55 @@
+name: Cross-runtime actor benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Measured runs per runtime
+        required: false
+        default: '5'
+      warmup:
+        description: Warm-up runs per runtime
+        required: false
+        default: '1'
+
+concurrency:
+  group: cross-runtime-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: Nulang vs Rust / Go / Erlang baselines
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.x'
+
+      - name: Install Erlang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y erlang-base erlang-dev
+
+      - name: Run cross-runtime baselines
+        run: |
+          python3 scripts/cross_runtime_bench.py \
+            --runs "${{ inputs.runs }}" \
+            --warmup "${{ inputs.warmup }}" \
+            --output cross-runtime-results.json
+
+      - name: Upload results
+        uses: actions/upload-artifact@v6
+        with:
+          name: cross-runtime-results-${{ github.sha }}
+          path: cross-runtime-results.json
+          if-no-files-found: error
