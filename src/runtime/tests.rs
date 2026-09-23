@@ -3509,7 +3509,7 @@ fn test_workflow_command_acceptance_keeps_atomic_tail_contiguous() {
     {
         let inner = store.inner.lock().unwrap();
         let transitions = inner.committed_transitions(actor_id);
-        assert_eq!(transitions.len(), 2);
+        assert_eq!(transitions.len(), 3);
         assert_eq!(transitions[0].sequence, 1);
         assert!(transitions[0].command.is_none());
         assert_eq!(transitions[1].sequence, 2);
@@ -3521,19 +3521,29 @@ fn test_workflow_command_acceptance_keeps_atomic_tail_contiguous() {
             Some(behavior_id)
         );
         assert!(transitions[1].snapshot.is_none());
+        assert_eq!(transitions[2].sequence, 3);
+        assert!(transitions[2].snapshot.is_some());
+        assert!(matches!(
+            transitions[2].workflow_events.as_slice(),
+            [WorkflowEvent::StepCompleted { sequence: 3, .. }]
+        ));
     }
+    assert_eq!(
+        store.legacy_write_count(),
+        0,
+        "a normal workflow command and completion must never fall back to legacy writes"
+    );
 
-    // This is the regression: a legacy journal write here used to advance
-    // latest_sequence to 2 while the atomic tail remained at 1, causing this
-    // next transition to fail predecessor fencing.
+    // The next durable transition must continue directly from the atomic
+    // command/completion tail rather than observe a legacy-only sequence.
     rt.append_signal_received(actor_id, "after-command", None)
         .unwrap();
-    assert_eq!(rt.persistence.latest_sequence(actor_id), 3);
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 4);
     let events = rt.persistence.read_workflow_events(actor_id);
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 3);
     assert!(matches!(
-        &events[1],
-        WorkflowEvent::SignalReceived { sequence: 3, name, .. } if name == "after-command"
+        &events[2],
+        WorkflowEvent::SignalReceived { sequence: 4, name, .. } if name == "after-command"
     ));
 }
 
