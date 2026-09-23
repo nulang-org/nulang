@@ -22,19 +22,20 @@ git push origin v0.2.0
 
 ## 3. Watch the workflow
 
-The `Release` workflow builds four targets in parallel
-(`linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `macos-aarch64`), runs
+The `Release` workflow first verifies that the pushed tag matches both
+`Cargo.toml` and the CLI `VERSION`, then builds four targets in parallel
+(`linux-x86_64`, `linux-aarch64`, `macos-aarch64`, `windows-x86_64`), runs
 `cargo test --release` on the native Linux build, then the `publish` job
 creates a GitHub Release with:
 
-- `nulang-{linux,macos}-{x86_64,aarch64}.tar.gz` — binary inside is named
-  `nulang`, matching the README install steps
+- one `nulang-<platform>-<arch>.tar.gz` archive per supported target; the
+  executable is `nulang` on Unix and `nulang.exe` on Windows
 - a `.sha256` checksum per tarball
 - auto-generated release notes
 
-> Note: the `linux-aarch64` artifact is cross-compiled and built **without**
-> the default `python` feature (PyO3 cannot cross-link libpython). All other
-> artifacts ship with default features.
+> Note: the `linux-aarch64` artifact is cross-compiled with the default
+> feature set. The workflow installs the arm64 Python development library and
+> pins PyO3's cross-Python version for that target.
 
 ## 4. Verify the release
 
