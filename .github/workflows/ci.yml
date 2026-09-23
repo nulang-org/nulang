@@ -336,6 +336,49 @@ jobs:
           fi
 
   # -----------------------------------------------------------------------
+  # Cross-runtime messaging baseline — informational, same-host comparison.
+  # This is intentionally non-blocking: shared-runner noise and package setup
+  # make it unsuitable as a merge gate. It exists to keep Nulang performance
+  # claims anchored to measured Rust/Go/BEAM numbers.
+  # -----------------------------------------------------------------------
+  cross-runtime-bench:
+    name: Cross-runtime baseline (informational)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install benchmark runtimes
+        run: sudo apt-get update && sudo apt-get install -y python3-dev golang-go erlang-base erlang-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Nulang local-message benchmark
+        run: |
+          cargo bench --locked --bench bench_main actor/message_roundtrip_local -- \
+            --warm-up-time 1 --measurement-time 3 --sample-size 30
+
+      - name: Compare with Rust, Go, and BEAM
+        run: |
+          python3 scripts/cross_runtime_baseline.py \
+            --json-out /tmp/cross-runtime-baseline.json \
+            | tee /tmp/cross-runtime-baseline.txt
+
+      - name: Upload cross-runtime baseline
+        uses: actions/upload-artifact@v7
+        with:
+          name: cross-runtime-baseline-${{ github.sha }}
+          path: |
+            /tmp/cross-runtime-baseline.json
+            /tmp/cross-runtime-baseline.txt
+          retention-days: 90
+
+  # -----------------------------------------------------------------------
   # Benchmarks — regression-gated against a rolling window of recent
   # main-branch history (see scripts/check_bench_regression.py and
   # benchmarks/README.md for the noise-aware methodology: each
