@@ -166,6 +166,20 @@ fn register_runtime_helpers<M: Module>(
 // Compilation
 // ---------------------------------------------------------------------------
 
+/// Native thunk metadata for a direct, straight-line leaf call.
+///
+/// Leaf thunks use the ordinary JIT register ABI, but they execute against the
+/// caller's register file. `clobbers` therefore lists every register written
+/// by the callee body so the caller can preserve frame isolation around the
+/// native call. `ret_reg` is captured before those saved registers are
+/// restored.
+#[derive(Debug, Clone)]
+pub(crate) struct NativeLeafCall {
+    pub ptr: *const u8,
+    pub ret_reg: u8,
+    pub clobbers: Vec<u8>,
+}
+
 #[derive(Debug)]
 pub enum CompileError {
     DeclareFailed(String),
@@ -228,6 +242,39 @@ pub fn compile_bytecode_region(
     instructions: &[Instruction],
     native_calls: &HashMap<usize, usize>,
 ) -> Result<*const u8, CompileError> {
+    compile_bytecode_region_with_options(
+        module,
+        builder_context,
+        ctx,
+        func_name,
+        start_offset,
+        num_instrs,
+        instructions,
+        native_calls,
+        &HashMap::new(),
+        true,
+    )
+}
+
+/// Internal scalar compiler entry point used by native-leaf specialization.
+///
+/// `native_leaf_calls` replaces selected re-entrant interpreter calls with
+/// native-to-native calls. `inject_safepoint=false` is used only for leaf
+/// thunks, which run inside an outer region that already owns the scheduling
+/// safepoint; an early safepoint return from a leaf would otherwise look like
+/// successful function completion to its caller.
+pub(crate) fn compile_bytecode_region_with_options(
+    module: &mut JITModule,
+    builder_context: &mut FunctionBuilderContext,
+    ctx: &mut codegen::Context,
+    func_name: &str,
+    start_offset: usize,
+    num_instrs: usize,
+    instructions: &[Instruction],
+    native_calls: &HashMap<usize, usize>,
+    native_leaf_calls: &HashMap<usize, NativeLeafCall>,
+    inject_safepoint: bool,
+) -> Result<*const u8, CompileError> {
     ctx.clear();
 
     let pointer_type = module.isa().pointer_type();
@@ -252,37 +299,40 @@ pub fn compile_bytecode_region(
         blocks.insert(i, builder.create_block());
     }
     let return_block = builder.create_block();
-    // Inject a thread-local JIT safepoint check. A runtime helper is used
-    // instead of an embedded process-global pointer so concurrent VMs cannot
-    // consume each other's actor reduction counters.
-    let zero = builder.ins().iconst(types::I64, 0);
-    let safepoint = builder
-        .ins()
-        .call(helpers[&RuntimeHelper::SafePoint], &[zero]);
-    let safepoint_result = builder.inst_results(safepoint)[0];
-    let exhausted = builder.ins().icmp(IntCC::NotEqual, safepoint_result, zero);
-    let yield_block = builder.create_block();
-    if let Some(&first_block) = blocks.get(&start_offset) {
+    if inject_safepoint {
+        // Inject a thread-local JIT safepoint check. A runtime helper is used
+        // instead of an embedded process-global pointer so concurrent VMs
+        // cannot consume each other's actor reduction counters.
+        let zero = builder.ins().iconst(types::I64, 0);
+        let safepoint = builder
+            .ins()
+            .call(helpers[&RuntimeHelper::SafePoint], &[zero]);
+        let safepoint_result = builder.inst_results(safepoint)[0];
+        let exhausted = builder.ins().icmp(IntCC::NotEqual, safepoint_result, zero);
+        let yield_block = builder.create_block();
+        if let Some(&first_block) = blocks.get(&start_offset) {
+            builder
+                .ins()
+                .brif(exhausted, yield_block, &[], first_block, &[]);
+        } else {
+            builder
+                .ins()
+                .brif(exhausted, yield_block, &[], return_block, &[]);
+        }
+
+        builder.switch_to_block(yield_block);
+        builder.set_cold_block(yield_block);
+        let zero = builder.ins().iconst(types::I64, 0);
         builder
             .ins()
-            .brif(exhausted, yield_block, &[], first_block, &[]);
+            .call(helpers[&RuntimeHelper::SetYield], &[zero]);
+        builder.ins().jump(return_block, &[]);
+        builder.seal_block(yield_block);
+    } else if let Some(&first_block) = blocks.get(&start_offset) {
+        builder.ins().jump(first_block, &[]);
     } else {
-        builder
-            .ins()
-            .brif(exhausted, yield_block, &[], return_block, &[]);
+        builder.ins().jump(return_block, &[]);
     }
-
-    // Yield block: mark a relative resume offset in thread-local state.
-    builder.switch_to_block(yield_block);
-    builder.set_cold_block(yield_block);
-    let zero = builder.ins().iconst(types::I64, 0);
-    builder
-        .ins()
-        .call(helpers[&RuntimeHelper::SetYield], &[zero]);
-    builder.ins().jump(return_block, &[]);
-
-    // Seal all new blocks.
-    builder.seal_block(yield_block);
     for pc in start_offset..end_offset {
         let instr = instructions[pc];
         let block = *blocks
@@ -701,35 +751,89 @@ pub fn compile_bytecode_region(
             ),
 
             OpCode::Call => {
-                // A direct, provably-non-suspending call (recovered by
-                // `find_compilable_region_with_calls`): run the callee to
-                // completion via the re-entrant `nulang_jit_direct_call`
-                // helper while this region stays resident in native code.
                 let func_idx = match native_calls.get(&pc) {
-                    Some(&idx) => idx as i64,
+                    Some(&idx) => idx,
                     None => {
                         return Err(CompileError::Internal(
                             "Call in compiled region without a native-call entry".into(),
                         ))
                     }
                 };
-                let fidx = builder.ins().iconst(types::I64, func_idx);
-                let argcv = builder.ins().iconst(types::I64, instr.op2 as i64);
-                let dstv = builder.ins().iconst(types::I64, instr.op3 as i64);
-                let status_inst = builder.ins().call(
-                    helpers[&RuntimeHelper::DirectCall],
-                    &[regs_ptr, fidx, argcv, dstv],
-                );
-                let status = builder.inst_results(status_inst)[0];
-                // On nonzero status the callee raised (e.g. step-limit); the
-                // error is already recorded in the pending-error thread-local,
-                // so exit the region and let the VM propagate it.
-                let zero = builder.ins().iconst(types::I64, 0);
-                let is_err = builder.ins().icmp(IntCC::NotEqual, status, zero);
-                let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
+
+                // direct_call_target is a compile-time hint. Re-check the
+                // live function register before dispatch so stale control-flow
+                // or bytecode mutations can never call the wrong function.
+                // On mismatch, deopt to this exact Call instruction.
+                let live_func = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
+                let expected_bits = TAG_INT | ((func_idx as u64) & PAYLOAD_MASK);
+                let expected = builder.ins().iconst(types::I64, expected_bits as i64);
+                let target_matches = builder.ins().icmp(IntCC::Equal, live_func, expected);
+                let call_block = builder.create_block();
+                let mismatch_block = builder.create_block();
                 builder
                     .ins()
-                    .brif(is_err, return_block, &[], fallthrough, &[]);
+                    .brif(target_matches, call_block, &[], mismatch_block, &[]);
+
+                builder.switch_to_block(mismatch_block);
+                builder.set_cold_block(mismatch_block);
+                emit_yield_pc(
+                    &mut builder,
+                    helpers[&RuntimeHelper::SetBranchExit],
+                    start_offset,
+                    pc,
+                );
+                builder.ins().jump(return_block, &[]);
+                builder.seal_block(mismatch_block);
+
+                builder.switch_to_block(call_block);
+                builder.seal_block(call_block);
+
+                if let Some(leaf) = native_leaf_calls.get(&pc) {
+                    // Native leaf code runs on the caller's register buffer.
+                    // Save every register the leaf may write so this exactly
+                    // recreates a separate callee frame.
+                    let saved: Vec<(u8, Value)> = leaf
+                        .clobbers
+                        .iter()
+                        .copied()
+                        .map(|reg| (reg, load_reg(&mut builder, regs_ptr, reg as usize)))
+                        .collect();
+
+                    let mut leaf_sig = module.make_signature();
+                    leaf_sig.params.push(AbiParam::new(pointer_type));
+                    leaf_sig.params.push(AbiParam::new(pointer_type));
+                    let leaf_sig_ref = builder.import_signature(leaf_sig);
+                    let callee = builder.ins().iconst(pointer_type, leaf.ptr as i64);
+                    builder
+                        .ins()
+                        .call_indirect(leaf_sig_ref, callee, &[regs_ptr, consts_ptr]);
+
+                    let ret = load_reg(&mut builder, regs_ptr, leaf.ret_reg as usize);
+                    for (reg, value) in saved {
+                        store_reg(&mut builder, regs_ptr, reg as usize, value);
+                    }
+                    store_reg(&mut builder, regs_ptr, instr.op3 as usize, ret);
+
+                    let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
+                    builder.ins().jump(fallthrough, &[]);
+                } else {
+                    // Existing safe fallback for non-leaf direct callees:
+                    // execute the callee on the interpreter frame stack.
+                    let fidx = builder.ins().iconst(types::I64, func_idx as i64);
+                    let argcv = builder.ins().iconst(types::I64, instr.op2 as i64);
+                    let dstv = builder.ins().iconst(types::I64, instr.op3 as i64);
+                    let status_inst = builder.ins().call(
+                        helpers[&RuntimeHelper::DirectCall],
+                        &[regs_ptr, fidx, argcv, dstv],
+                    );
+                    let status = builder.inst_results(status_inst)[0];
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_err = builder.ins().icmp(IntCC::NotEqual, status, zero);
+                    let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
+                    builder
+                        .ins()
+                        .brif(is_err, return_block, &[], fallthrough, &[]);
+                }
             }
 
             OpCode::Ret | OpCode::RetVal => {

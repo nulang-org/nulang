@@ -51,6 +51,14 @@ version + migration.*
 
 ## Stable tier
 
+### Native straight-line JIT leaf calls — 2026-09-22
+- **Hot compiled callers can invoke proven tiny leaf functions directly in native code** (`src/jit/mod.rs`, `src/jit/compiler.rs`) instead of re-entering the interpreter for every call.
+- **Leaf eligibility is deliberately strict**: ≤32 straight-line body instructions, no nested calls, branches, heap/container operations, effects, suspension, or error-capable `INeg`; rejected leaves are cached so static failures are not re-analyzed.
+- **Caller frame isolation is preserved with an exact clobber set**: generated code saves every register the leaf may write, invokes the leaf thunk on the register ABI, captures its return register, restores clobbers, and writes only the caller destination.
+- **Direct-call target recovery is stricter and native code re-checks live r254 before dispatch**, deoptimizing to the exact Call PC if the runtime target differs from the compile-time hint.
+- **Branchy or otherwise ineligible non-suspending callees keep the safe re-entrant interpreter helper fallback.**
+
+
 ### Re-entrant JIT ownership boundary — 2026-09-22
 - **JIT compilation/promotion and native execution are now separate backend phases** (`src/backends/mod.rs`, `src/jit/mod.rs`): module borrowing ends before native code can call back into the interpreter.
 - **`VM::try_jit_execute` detaches the mutable JIT backend and raw-bit constant cache before native entry** while preserving active-prefix register marshaling and stable per-frame scratch buffers (`src/vm.rs`).
