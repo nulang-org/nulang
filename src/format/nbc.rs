@@ -343,5 +343,9 @@ mod tests {
             module.function_local_counts.is_empty(),
             "missing function_local_counts must default to empty Vec"
         );
+        assert!(
+            module.effect_sites.is_empty(),
+            "missing effect_sites metadata must default to empty Vec"
+        );
     }
 }
