@@ -576,6 +576,11 @@ fn main() {
         i += 1;
     }
 
+    if opts.emit_behavior_manifest.is_some() && !opts.emit_nbc {
+        eprintln!("Error: --emit-behavior-manifest currently requires --emit-nbc");
+        std::process::exit(1);
+    }
+
     // Resolve color mode once after all args are parsed.
     let use_color = color_enabled(&opts);
     // Wave D4: --iso-arena enables the VM's per-activation arena path for
