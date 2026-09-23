@@ -3614,7 +3614,10 @@ impl TypeChecker {
         // every later compiler/runtime stage can rely on a canonical 1->N chain.
         if version == 0 {
             return Err(NuError::type_error(
-                format!("entity '{}' schema version must be a positive integer", name),
+                format!(
+                    "entity '{}' schema version must be a positive integer",
+                    name
+                ),
                 span,
             ));
         }
@@ -6024,5 +6027,4 @@ mod tests {
             .to_string()
             .contains("targets schema version beyond current version 1"));
     }
-
 }
