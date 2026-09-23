@@ -2488,8 +2488,14 @@ fn may_hold_heap_ptr(ty: &Type) -> bool {
     }
 }
 
-/// The rvalue forms whose result is a freshly allocated heap object (or a
-/// non-pointer constant) owned solely by the destination register.
+/// The rvalue forms whose result is either a freshly allocated heap object
+/// owned solely by the destination register or a value that cannot alias an
+/// existing heap object.
+///
+/// `StrConcat` is an owning producer: the VM allocates a fresh actor-heap
+/// string for every non-folded concatenation. Treating it as owning lets the
+/// liveness planner release that reference at its last use instead of keeping
+/// the string alive until actor teardown.
 fn rvalue_is_owning(op: &mir::RValue) -> bool {
     matches!(
         op,
@@ -2497,6 +2503,7 @@ fn rvalue_is_owning(op: &mir::RValue) -> bool {
             | mir::RValue::Record(_)
             | mir::RValue::RecordUpdate { .. }
             | mir::RValue::ArrayLit(_)
+            | mir::RValue::StrConcat(_, _)
             | mir::RValue::Const(_)
     )
 }
@@ -3864,6 +3871,30 @@ mod optimize_tests {
         assert!(
             !func.blocks[handler.0 as usize].stmts.is_empty(),
             "handler body statements must survive ordinary CFG pruning"
+        );
+    }
+
+    fn test_drop_plan_reclaims_fresh_string_concat_after_last_use() {
+        // A non-folded StrConcat allocates a fresh actor-heap string. The
+        // destination therefore owns the allocation's local ORCA reference
+        // and should be dropped immediately after its last read-only use.
+        let mut b = mir::FunctionBuilder::new("concat_owner", Some(Type::bool()));
+        let lhs = b.add_param("lhs", Type::string());
+        let rhs = b.add_param("rhs", Type::string());
+        let joined = b.add_temp(Type::string());
+        let same = b.add_temp(Type::bool());
+
+        b.assign(joined, mir::RValue::StrConcat(lhs, rhs));
+        b.assign(same, mir::RValue::StringEq(joined, lhs));
+        b.terminate(mir::Terminator::Return(Some(same)));
+
+        let func = b.build();
+        let plan = plan_drops(&func);
+        assert!(
+            plan.after_stmt
+                .get(&(0, 1))
+                .is_some_and(|ids| ids.contains(&joined)),
+            "fresh StrConcat result should be released after its last use"
         );
     }
 
