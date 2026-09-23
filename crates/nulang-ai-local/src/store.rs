@@ -565,10 +565,7 @@ fn upsert_task_conn(conn: &Connection, task: &Task) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn upsert_commitment_conn(
-    conn: &Connection,
-    commitment: &Commitment,
-) -> Result<(), StoreError> {
+fn upsert_commitment_conn(conn: &Connection, commitment: &Commitment) -> Result<(), StoreError> {
     conn.execute(
         r#"INSERT INTO commitments (
             id, goal_id, owner_agent_id, rationale, success_criteria, status, created_at, updated_at
@@ -784,7 +781,6 @@ fn parse_manager_kind(raw: String) -> ManagerKind {
         _ => ManagerKind::Engineering,
     }
 }
-
 
 #[cfg(test)]
 mod tests {
