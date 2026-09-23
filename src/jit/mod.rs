@@ -79,6 +79,18 @@ struct ModuleJitAnalysis {
     recursive: Vec<bool>,
 }
 
+/// Metadata for one compiled bytecode region.
+///
+/// Post-compilation tiering state lives next to the compiled pointer so the
+/// native-entry fast path avoids a separate hash lookup.
+#[derive(Clone, Copy, Debug)]
+struct CompiledRegion {
+    ptr: *const u8,
+    len: usize,
+    tier2_executions: u32,
+    tier2_terminal: bool,
+}
+
 /// Manages the Cranelift JIT compilation lifecycle.
 ///
 /// - Creates and configures the `JITModule`
@@ -94,14 +106,11 @@ pub struct JitSession {
     /// every remaining cold instruction. Bytecode PCs are already dense
     /// integers, so direct indexing is both simpler and cheaper.
     ///
-    /// Each occupied slot stores (compiled function pointer, region length).
-    compiled: Vec<Vec<Option<(*const u8, usize)>>>,
+    /// Each occupied slot stores the compiled pointer, region length, and
+    /// post-compilation tiering state.
+    compiled: Vec<Vec<Option<CompiledRegion>>>,
     /// Number of occupied compiled-region slots across all modules.
     compiled_count: usize,
-    /// Per-region execution counters for already-compiled code. When a
-    /// region crosses TIER2_THRESHOLD, a more aggressive compilation is
-    /// attempted. Reset after each promotion attempt.
-    tier2_counters: FxHashMap<(usize, usize), u64>,
     /// Hot counters, flat `Vec<Vec<u32>>` indexed `[module_idx][offset]` so
     /// identical offsets in different modules keep independent counts.
     /// A flat array (not an `FxHashMap`) because `record_and_check_hot` runs
@@ -168,18 +177,29 @@ impl JitSession {
             typed_regions: FxHashSet::default(),
             module_analysis: FxHashMap::default(),
             builder_context: FunctionBuilderContext::new(),
-            tier2_counters: FxHashMap::default(),
             ctx,
         })
     }
 
     #[inline(always)]
-    fn compiled_entry(&self, module_idx: usize, offset: usize) -> Option<(*const u8, usize)> {
+    fn compiled_entry(&self, module_idx: usize, offset: usize) -> Option<CompiledRegion> {
         self.compiled
             .get(module_idx)
             .and_then(|row| row.get(offset))
             .copied()
             .flatten()
+    }
+
+    #[inline(always)]
+    fn compiled_entry_mut(
+        &mut self,
+        module_idx: usize,
+        offset: usize,
+    ) -> Option<&mut CompiledRegion> {
+        self.compiled
+            .get_mut(module_idx)
+            .and_then(|row| row.get_mut(offset))
+            .and_then(Option::as_mut)
     }
 
     fn store_compiled(
@@ -197,10 +217,21 @@ impl JitSession {
             let new_len = (offset + 1).max(row.len().max(1) * 2);
             row.resize(new_len, None);
         }
-        if row[offset].is_none() {
-            self.compiled_count += 1;
+        match row[offset].as_mut() {
+            Some(region) => {
+                region.ptr = ptr;
+                region.len = region_len;
+            }
+            None => {
+                self.compiled_count += 1;
+                row[offset] = Some(CompiledRegion {
+                    ptr,
+                    len: region_len,
+                    tier2_executions: 0,
+                    tier2_terminal: false,
+                });
+            }
         }
-        row[offset] = Some((ptr, region_len));
     }
 
     /// Record one interpreted execution of the region at
