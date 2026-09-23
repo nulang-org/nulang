@@ -811,15 +811,37 @@ impl Runtime {
         spawn::spawn_actor_with_models(self, init, state_models, true, None)
     }
 
-    /// Spawn a durable workflow actor.  Workflows are always persistent and
+    /// Spawn a durable workflow actor. Workflows are always persistent and
     /// keep an append-only event journal in addition to snapshots.
+    ///
+    /// This compatibility API returns actor id 0 when the initial durable
+    /// commit fails. New callers that need the persistence error should use
+    /// `try_spawn_workflow_actor`.
     pub fn spawn_workflow_actor(
         &mut self,
         name: &str,
         init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
         state_models: HashMap<String, StateModel>,
     ) -> u64 {
-        spawn::spawn_actor_with_models(self, init, state_models, true, Some(name))
+        match self.try_spawn_workflow_actor(name, init, state_models) {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::warn!(workflow = name, %error, "durable workflow spawn failed");
+                0
+            }
+        }
+    }
+
+    /// Spawn a durable workflow and report failure if its initial
+    /// `WorkflowStarted` journal entry or first snapshot cannot be committed.
+    /// The actor is not published or scheduled until both writes succeed.
+    pub fn try_spawn_workflow_actor(
+        &mut self,
+        name: &str,
+        init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+        state_models: HashMap<String, StateModel>,
+    ) -> std::io::Result<u64> {
+        spawn::try_spawn_actor_with_models(self, init, state_models, true, Some(name), None)
     }
 
     /// Spawn an actor for `module`'s behavior `behavior_idx`, seeded with

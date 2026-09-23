@@ -123,7 +123,7 @@ fn bench_interp_cold_jit_probe(c: &mut Criterion) {
         )
     });
 
-    // JIT enabled but nothing hot: every step pays the JIT probe.
+    // JIT enabled but nothing hot: only candidate region-entry PCs probe.
     c.bench_function("interp/cold_jit_on", |b| {
         b.iter_batched(
             || {
