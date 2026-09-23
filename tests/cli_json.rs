@@ -197,6 +197,27 @@ fn nula_build_json_success() {
     assert_eq!(v["diagnostics"].as_array().unwrap().len(), 0);
     assert!(!stdout.contains("Build succeeded"));
 
+    let nbc_path = dir.join(".nula/dist/jsonprobe.nbc");
+    let behavior_path = dir.join(".nula/dist/jsonprobe.behavior.json");
+    assert!(
+        nbc_path.exists(),
+        "package build must emit bytecode artifact"
+    );
+    assert!(
+        behavior_path.exists(),
+        "package build must emit RFC 0020 behavior sidecar"
+    );
+
+    let artifact_bytes = std::fs::read(&nbc_path).expect("read emitted nbc");
+    let behavior_bytes = std::fs::read(&behavior_path).expect("read behavior sidecar");
+    let behavior = nulang::behavior_manifest::BehaviorManifest::from_json(&behavior_bytes)
+        .expect("parse emitted behavior sidecar");
+    assert_eq!(behavior.package.name, "jsonprobe");
+    assert_eq!(behavior.package.version, "0.1.0");
+    behavior
+        .verify_artifact_bytes(&artifact_bytes)
+        .expect("behavior sidecar must bind to emitted nbc bytes");
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

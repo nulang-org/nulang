@@ -1618,6 +1618,12 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### RFC 0020 Behavior Manifest durability admission subset — 2026-09-23
+- **Package builds now emit `<package>.behavior.json` beside `.nbc` artifacts** (`src/behavior_manifest.rs`, `src/main.rs`, `src/package/commands.rs`). The experimental `nulang.behavior/v0alpha1` sidecar binds package/language metadata to compiler artifact identity and exposes durable actor persistence class, schema version, canonical state-schema semantic identity, and migration topology.
+- **Manifest parsing fails closed** on unknown schema versions/artifact kinds, malformed content identities or digests, duplicate actors, invalid/incomplete migration chains, and artifact identity tampering. The sidecar includes a BLAKE3 digest of the exact emitted `.nbc` bytes and can verify the executable/manifest pairing; canonical ordering gives deterministic JSON and a separate domain-separated manifest digest.
+- **Deployment upgrade preflight rejects structural durable-state hazards**: removing a durable owner, dropping or changing its persistence model, schema downgrades, same-version schema drift, rewriting previously declared migration topology, package identity mismatch, or a missing version-by-version migration path. Migration body identity is explicitly `topology-only` in v0alpha1; successful preflight is not represented as proof that runtime migration execution is complete.
+- **`nula deploy` bundles the behavior sidecar automatically**, giving Nulang Cloud a machine-readable compatibility contract without depending on compiler HIR/MIR internals.
+
 ### Temporal compatibility boundary — 2026-09-23
 - **Temporal compatibility now has an explicit adapter boundary** (Experimental, RFC 0025, `src/compat/temporal.rs`). Concrete Temporal workflow/run identity and workflow-task identity derive replay-stable Nulang `DurableEffectId` values for activities without introducing Temporal types into the runtime, persistence backends, compiler, or language syntax.
 - **Temporal activity preparation reuses Nulang's durable-effect contract.** Activities default to at-least-once recovery; deduplicated delivery is explicit, and the durable request digest binds activity id/type, task queue, and payload so divergent replay fails closed. Timer and signal translation reuse the existing atomic durable-transition workflow-event path.
