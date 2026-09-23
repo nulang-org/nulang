@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Durable event and workflow commit invariants — 2026-09-23
+- **Event emission is state-neutral.** `emit` no longer increments every integer `event_sourced` field; source-level `apply` handlers or explicit behavior code are the sole authority for domain-state changes, and the journal captures the resulting post-apply value for recovery.
+- **Workflow coordination now fails closed at durability boundaries.** Signals do not enter actor state or resume execution unless `SignalReceived` commits; workflow timers are not armed unless `TimerSet` commits; fired timers are not delivered unless `TimerFired` commits; and saga compensation is not marked complete unless `SagaCompensated` commits.
+
 ### Backend differential oracle hardening — 2026-09-22
 - **WASM differential execution now fails closed after artifact emission** (`src/fuzz.rs`, `src/difffuzz.rs`). Restricted-profile rejection remains an expected compile-time skip, but malformed/invalid emitted WASM, instantiation failures, or a missing required `nulang_init` export are backend correctness failures. Differential campaigns now record WASM agreement coverage, and the `wasm-backend` test lane requires positive WASM participation so a silently-disabled backend cannot leave CI green.
 
