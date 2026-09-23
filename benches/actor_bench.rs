@@ -9,6 +9,7 @@ use nulang::runtime::Runtime;
 use nulang::vm::Value;
 
 const MESSAGE_BATCH: usize = 100;
+const IDLE_ACTOR_BATCH: usize = 1_000;
 
 fn noop_handler(_actor: &mut nulang::runtime::Actor, _args: &[Value]) {}
 
@@ -33,6 +34,25 @@ fn runtime_with_consumer() -> (Runtime, u64) {
     rt.process_gc_ops();
 
     (rt, actor_id)
+}
+
+/// Idle actor spawn throughput. This keeps message execution out of the timed
+/// path so eager per-actor allocations are visible directly.
+fn bench_spawn_idle_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("actor/spawn_idle");
+    group.throughput(Throughput::Elements(IDLE_ACTOR_BATCH as u64));
+
+    group.bench_function("1000", |b| {
+        b.iter(|| {
+            let mut rt = Runtime::new();
+            for _ in 0..IDLE_ACTOR_BATCH {
+                black_box(rt.spawn_actor(Box::new(|| vec![])));
+            }
+            black_box(rt.actor_count());
+        })
+    });
+
+    group.finish();
 }
 
 /// End-to-end runtime lifecycle cost: construct runtime, spawn actor, register a
@@ -114,6 +134,7 @@ fn bench_message_drain(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    bench_spawn_idle_batch,
     bench_spawn_send_receive,
     bench_message_enqueue,
     bench_message_drain
