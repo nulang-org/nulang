@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Consuming actor-send ownership analysis — 2026-09-23
+- **The MIR backend now identifies provably consumable local-send payloads without changing runtime semantics** (`src/mir_codegen.rs`). A payload is marked only when it is a fresh/non-aliasing owning value with one definition and one total use, and that sole use is a same-node MIR `Send` argument. Multi-use and remote-send payloads remain ordinary copies. This establishes the compiler proof surface for a later ORCA local-reference-to-foreign-hold handoff.
+
 ### Backend differential oracle hardening — 2026-09-22
 - **WASM differential execution now fails closed after artifact emission** (`src/fuzz.rs`, `src/difffuzz.rs`). Restricted-profile rejection remains an expected compile-time skip, but malformed/invalid emitted WASM, instantiation failures, or a missing required `nulang_init` export are backend correctness failures. Differential campaigns now record WASM agreement coverage, and the `wasm-backend` test lane requires positive WASM participation so a silently-disabled backend cannot leave CI green.
 
