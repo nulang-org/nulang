@@ -2909,6 +2909,59 @@ impl Runtime {
         0
     }
 
+    /// Claim the next valid scheduler entry and transition its actor from
+    /// Queued to Running. Stale queue entries are discarded here so every
+    /// caller that manually pumps the runtime shares the same run-state
+    /// invariant as the production scheduler.
+    pub(crate) fn claim_next_ready_actor(&mut self) -> Option<u64> {
+        loop {
+            let actor_id = self.scheduler.dequeue()?;
+            let claimed = match self.actors.get_mut(&actor_id) {
+                Some(actor) if actor.run_state == ActorRunState::Queued => {
+                    actor.run_state = ActorRunState::Running;
+                    actor.reset_reductions();
+                    true
+                }
+                Some(_) | None => false,
+            };
+            if claimed {
+                return Some(actor_id);
+            }
+        }
+    }
+
+    /// Close one actor turn and requeue it exactly once when runnable work
+    /// remains. This is shared by the production scheduler and manual/runtime
+    /// pumps so direct queue consumers cannot strand an actor in Queued state.
+    pub(crate) fn finish_actor_turn(&mut self, actor_id: u64) {
+        let should_requeue = self
+            .actors
+            .get(&actor_id)
+            .map(|actor| {
+                !actor.mailbox.is_empty()
+                    && actor.suspended_execution.is_none()
+                    && matches!(
+                        actor.state,
+                        ActorState::Running | ActorState::Created | ActorState::Waiting
+                    )
+            })
+            .unwrap_or(false);
+
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.run_state = ActorRunState::Idle;
+            actor.reset_reductions();
+            if actor.mailbox.is_empty()
+                && actor.suspended_execution.is_none()
+                && actor.state == ActorState::Running
+            {
+                actor.state = ActorState::Waiting;
+            }
+        }
+        if should_requeue {
+            self.enqueue_actor(actor_id);
+        }
+    }
+
     /// Choose a mailbox-run budget once per actor turn. When other actors are
     /// ready we cap the run aggressively for fairness; when this actor is the
     /// only runnable work we amortize scheduler/lookup overhead across a much
@@ -2933,7 +2986,7 @@ impl Runtime {
             // Drain cross-shard ingress before selecting local work. Ingress
             // uses the same deduplicating enqueue_actor path as local sends.
             self.drain_cross_shard_messages();
-            let actor_id = match self.scheduler.dequeue() {
+            let actor_id = match self.claim_next_ready_actor() {
                 Some(actor_id) => actor_id,
                 None => {
                     if self.llm_inflight_count() == 0 && self.timer_wheel.is_empty() {
@@ -2963,22 +3016,11 @@ impl Runtime {
                 }
             };
 
-            // Queued and running are a single ownership token: leave the actor
-            // marked non-idle for the whole mailbox run so self-sends and
-            // concurrent ingress cannot create duplicate ready entries.
-            let can_run = match self.actors.get_mut(&actor_id) {
-                Some(actor) if actor.run_state == ActorRunState::Queued => {
-                    actor.run_state = ActorRunState::Running;
-                    actor.reset_reductions();
-                    true
-                }
-                // A stale queue entry is harmless: discard it instead of
-                // executing an actor that no longer owns this scheduler slot.
-                Some(_) | None => false,
-            };
-            if !can_run {
-                continue;
-            }
+            let reductions_before = self
+                .actors
+                .get(&actor_id)
+                .map(|actor| actor.reduction_count)
+                .unwrap_or(0);
 
             #[cfg(feature = "ai-runtime")]
             self.poll_llm_completions();
@@ -3009,41 +3051,29 @@ impl Runtime {
                 }
             }
 
-            let should_requeue = self
+            let reductions_after = self
                 .actors
                 .get(&actor_id)
-                .map(|actor| {
-                    !actor.mailbox.is_empty()
-                        && actor.suspended_execution.is_none()
-                        && matches!(
-                            actor.state,
-                            ActorState::Running | ActorState::Created | ActorState::Waiting
-                        )
-                })
-                .unwrap_or(false);
+                .map(|actor| actor.reduction_count)
+                .unwrap_or(reductions_before);
+            self.finish_actor_turn(actor_id);
 
-            if let Some(actor) = self.actors.get_mut(&actor_id) {
-                actor.run_state = ActorRunState::Idle;
-                actor.reset_reductions();
-                if actor.mailbox.is_empty()
-                    && actor.suspended_execution.is_none()
-                    && actor.state == ActorState::Running
-                {
-                    actor.state = ActorState::Waiting;
-                }
-            }
-            if should_requeue {
-                self.enqueue_actor(actor_id);
-            }
-
-            ticks += 1;
-            if ticks % GC_PUMP_INTERVAL == 0 {
+            // Periodic maintenance is based on work performed, not actor-turn
+            // count. Adaptive batching can process up to 256 messages in one
+            // turn, so counting turns would silently stretch GC/CRDT cadence
+            // by the batch factor.
+            let work_units = reductions_after
+                .saturating_sub(reductions_before)
+                .max(1) as u64;
+            let previous_ticks = ticks;
+            ticks = ticks.saturating_add(work_units);
+            if previous_ticks / GC_PUMP_INTERVAL != ticks / GC_PUMP_INTERVAL {
                 self.process_deferred_all();
             }
-            if ticks % DEHYDRATE_CHECK_INTERVAL == 0 {
+            if previous_ticks / DEHYDRATE_CHECK_INTERVAL != ticks / DEHYDRATE_CHECK_INTERVAL {
                 self.dehydrate_idle_grains();
             }
-            if ticks % CRDT_SYNC_INTERVAL_TICKS == 0 {
+            if previous_ticks / CRDT_SYNC_INTERVAL_TICKS != ticks / CRDT_SYNC_INTERVAL_TICKS {
                 self.sync_crdts();
             }
         }
@@ -6852,12 +6882,12 @@ pub(crate) struct ShadowReplica {
 /// Interval (in `sync_crdts` rounds) between full-state repair syncs.
 /// Round 1 is full; rounds 2..=N are delta; round N+1 is full again.
 const CRDT_FULL_SYNC_INTERVAL: u64 = 16;
-/// How often (in scheduler ticks) the runtime synchronizes CRDT state with
-/// healthy peers. Cheap when distribution is disabled: it only runs local
+/// How often (in scheduler work units; approximately one processed message)
+/// the runtime synchronizes CRDT state with healthy peers. Cheap when distribution is disabled: it only runs local
 /// tombstone GC and returns without counting a sync round.
 const CRDT_SYNC_INTERVAL_TICKS: u64 = 512;
-/// How often (in scheduler ticks) deferred local decrements are retried
-/// while actors are still running. Used by both the production
+/// How often (in scheduler work units; approximately one processed message)
+/// deferred local decrements are retried while actors are still running. Used by both the production
 /// `run_scheduler` and the deterministic DST scheduler.
 const GC_PUMP_INTERVAL: u64 = 256;
 /// How long (wall-clock) a migrated-actor forwarding entry is kept
