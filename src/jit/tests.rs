@@ -8,6 +8,36 @@ fn make_jit() -> JitSession {
 }
 
 #[test]
+fn test_recursive_scc_analysis_marks_self_and_mutual_cycles() {
+    // 0 <-> 1 is a mutual cycle, 2 -> 2 is self-recursive, 3 is acyclic.
+    let graph = vec![vec![1], vec![0], vec![2], vec![]];
+    let reverse = vec![vec![1], vec![0], vec![2], vec![]];
+
+    assert_eq!(
+        recursive_from_call_graph(&graph, &reverse),
+        vec![true, true, true, false]
+    );
+}
+
+#[test]
+fn test_recursive_scc_analysis_handles_long_acyclic_chain() {
+    const N: usize = 2048;
+    let mut graph = vec![Vec::new(); N];
+    let mut reverse = vec![Vec::new(); N];
+    for i in 0..N - 1 {
+        graph[i].push(i + 1);
+        reverse[i + 1].push(i);
+    }
+
+    assert!(
+        recursive_from_call_graph(&graph, &reverse)
+            .into_iter()
+            .all(|recursive| !recursive),
+        "a long acyclic call chain must not be classified as recursive"
+    );
+}
+
+#[test]
 fn test_jit_session_creation() {
     let jit = JitSession::new().expect("JIT must be available");
     assert_eq!(jit.compiled_count(), 0);
