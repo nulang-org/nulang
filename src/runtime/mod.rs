@@ -4656,11 +4656,7 @@ impl Runtime {
                                 %error,
                                 "nulang-persist: refusing to deliver fired workflow timer without atomic durable commit"
                             );
-                            self.rearm_timer(
-                                target_actor,
-                                &context,
-                                DURABLE_TIMER_COMMIT_RETRY_MS,
-                            );
+                            self.rearm_timer(target_actor, &context, DURABLE_TIMER_COMMIT_RETRY_MS);
                             continue;
                         }
                     }
