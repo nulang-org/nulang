@@ -488,7 +488,7 @@ impl LocalRuntime {
         revision: &IntentionRevision,
         out: &mut dyn Write,
     ) -> Result<(), RuntimeError> {
-        self.store.upsert_intention_revision(revision)?;
+        self.store.insert_intention_revision(revision)?;
         self.emit(
             out,
             SwarmEvent::IntentionRevised {
@@ -662,6 +662,18 @@ mod tests {
         assert!(graph.intention_revisions[0]
             .replacement_intention_id
             .is_none());
+
+        let mut conflicting = graph.intention_revisions[0].clone();
+        conflicting.reason = "attempted revision rewrite".into();
+        rt.store()
+            .insert_intention_revision(&conflicting)
+            .unwrap();
+        let graph_after_retry = rt.store().get_goal_graph(goal_id).unwrap();
+        assert_eq!(
+            graph_after_retry.intention_revisions[0].reason,
+            "scripted external dependency is unavailable"
+        );
+
         let _ = std::fs::remove_dir_all(tmp);
     }
 
