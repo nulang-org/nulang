@@ -668,9 +668,7 @@ mod tests {
 
         let mut conflicting = graph.intention_revisions[0].clone();
         conflicting.reason = "attempted revision rewrite".into();
-        rt.store()
-            .insert_intention_revision(&conflicting)
-            .unwrap();
+        rt.store().insert_intention_revision(&conflicting).unwrap();
         let graph_after_retry = rt.store().get_goal_graph(goal_id).unwrap();
         assert_eq!(
             graph_after_retry.intention_revisions[0].reason,
