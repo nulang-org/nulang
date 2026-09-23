@@ -375,7 +375,7 @@ jobs:
       - name: Collect results
         run: |
           python3 scripts/collect_bench_results.py \
-            --out "benchmarks/$(git rev-parse --short HEAD).json"
+            --out "benchmarks/${{ github.sha }}.json"
 
       # Benchmark history is intentionally kept off protected main. Pulling the
       # JSON files from a dedicated branch preserves the rolling comparison
@@ -404,14 +404,14 @@ jobs:
         continue-on-error: true
         run: |
           python3 scripts/check_bench_regression.py \
-            --latest "benchmarks/$(git rev-parse --short HEAD).json" \
+            --latest "benchmarks/${{ github.sha }}.json" \
             --history-dir benchmarks
 
       - name: Upload results as build artifact
         uses: actions/upload-artifact@v7
         with:
           name: bench-results-${{ github.sha }}
-          path: benchmarks/$(git rev-parse --short HEAD).json
+          path: benchmarks/${{ github.sha }}.json
           retention-days: 90
 
       - name: Persist benchmark history
