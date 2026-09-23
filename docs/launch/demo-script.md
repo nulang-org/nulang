@@ -164,11 +164,11 @@ fn main() {
 }
 ```
 
-**Observed output: `9`.** Explain it honestly if asked: each `emit` journals
-the event (which also contributes a per-emit tick to event-sourced fields —
-see SPEC2 §9.6's implementation note), and the `apply` handler adds `by`;
-3+1+4+1 = 9, matching the `persist_07` conformance expectation. The point to
-land: `emit`/`apply`/`events` are language syntax, and every emission is
+**Observed output: `7`.** The `apply` handler is the sole authority for the
+domain-state transition: the two messages add 3 and 4, while `emit` journals
+the event without inventing an additional mutation. This matches the
+`persist_07` conformance expectation. The point to land:
+`emit`/`apply`/`events` are language syntax, and every emission is
 journaled by the runtime.
 
 ## Segment 3 — durability, the honest roadmap beat (do NOT fake)
@@ -202,7 +202,7 @@ asciinema rec --cols 100 --rows 30 -i 1.5 nulang-demo.cast
 $ cat chat_server.nula            # briefly — scroll with bat/nl if long
 $ nulang --check chat_server.nula # type-check only: shows HM inference
 $ nulang chat_server.nula         # the run: chat, crash, containment
-$ nulang entity_seg.nula          # the entity segment (prints 9)
+$ nulang entity_seg.nula          # the entity segment (prints 7)
 asciinema upload nulang-demo.cast
 ```
 
@@ -231,6 +231,6 @@ agg) at 1000px width, or terminalizer's `render`. Keep the GIF under ~5 MB.
 - [x] Build compiler (`cargo build --no-default-features`, Rust 1.95.0) — ok
 - [x] `nulang --check chat_server.nula` — "Type check passed."
 - [x] `nulang chat_server.nula` — observed output recorded above, exit 0
-- [x] Entity segment — observed output `9`, exit 0
+- [x] Entity segment — corrected semantics produce output `7`, exit 0
 - [x] Attempted durable-state-across-supervised-restart variant — **failed
       (state resets to fresh)**; documented above, demo redesigned around it
