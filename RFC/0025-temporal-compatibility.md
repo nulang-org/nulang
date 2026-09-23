@@ -165,7 +165,9 @@ Implement and test a protocol-independent Rust adapter boundary:
 - timer mapping;
 - signal mapping.
 
-No network endpoint is claimed in this phase.
+No network endpoint is claimed in this phase. The worker core is deliberately
+transport-neutral so the same replay/command semantics can be used by a
+standalone Temporal worker transport and by Nulang Cloud's managed gateway.
 
 ### Phase 1 — Nulang worker for Temporal Server
 
@@ -257,7 +259,10 @@ The first adapter provides:
 - stable length-prefixed execution keys;
 - durable activity preparation;
 - timer/signal mapping;
-- replay/collision tests.
+- a protocol-neutral supported-history projection;
+- fail-closed history reference/order validation;
+- a `TemporalWorkerCore` that prepares workflow tasks and plans ordered commands;
+- replay/collision/history-validation tests.
 
 ## Future crate boundary
 
