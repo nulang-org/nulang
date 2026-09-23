@@ -288,7 +288,7 @@ fn print_usage() {
     println!("                Scaffold a new package directory");
     println!("                Templates: default, cli, lib, full");
     println!("  init          Scaffold a new package in the current directory");
-    println!("  build         Build the package (type-check + .nbc artifact in .nula/dist/)");
+    println!("  build         Build .nbc + RFC 0020 behavior sidecar in .nula/dist/");
     println!("  build-wasm    Build package to .wasm + .cwasm in .nula/dist/");
     println!("  test [--filter <substr>] [--verbose|-v] [--watch|-w]  Run .nula test files");
     println!("  run           Build and run the package entry point");
@@ -2201,6 +2201,7 @@ fn cmd_deploy(
         span: Span::default(),
     })?;
     let name = manifest.package.name.clone();
+    let version = manifest.package.version.clone();
 
     // Build the web output so dist/ contains the IR and static assets.
     cmd_build_web()?;
@@ -2258,8 +2259,21 @@ fn cmd_deploy(
     let entry_str = entry.to_string_lossy().into_owned();
     let nbc_path = nula_dist.join(format!("{}.nbc", name));
     let nbc_path_str = nbc_path.to_string_lossy().into_owned();
-    eprintln!("Compiling {} to .nbc...", name);
-    nulang_exe(&["--emit-nbc", "--out", &nbc_path_str, &entry_str])?;
+    let behavior_path = nula_dist.join(format!("{}.behavior.json", name));
+    let behavior_path_str = behavior_path.to_string_lossy().into_owned();
+    eprintln!("Compiling {} to .nbc + behavior manifest...", name);
+    nulang_exe(&[
+        "--emit-nbc",
+        "--out",
+        &nbc_path_str,
+        "--emit-behavior-manifest",
+        &behavior_path_str,
+        "--behavior-package-name",
+        &name,
+        "--behavior-package-version",
+        &version,
+        &entry_str,
+    ])?;
 
     // Optionally build .wasm + .cwasm (WASM tier).
     if wasm {
