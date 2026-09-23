@@ -5271,10 +5271,23 @@ impl Runtime {
         }
 
         if is_workflow {
-            // Replay workflow events that arrived after the snapshot.
+            // Replay workflow state that is not represented by ActorSnapshot
+            // from the full durable journal. received_signals,
+            // compensated_steps, and the custom event log live outside
+            // snapshot.state, so a later snapshot must not make those events
+            // disappear during recovery. State-bearing events remain bounded
+            // by snapshot.sequence to avoid double-applying step/timer state
+            // already captured by the snapshot.
             let events_to_replay: Vec<_> = workflow_events
                 .iter()
-                .filter(|e| e.sequence() > snapshot.sequence)
+                .filter(|event| {
+                    matches!(
+                        event,
+                        WorkflowEvent::SignalReceived { .. }
+                            | WorkflowEvent::SagaCompensated { .. }
+                            | WorkflowEvent::Custom { .. }
+                    ) || event.sequence() > snapshot.sequence
+                })
                 .cloned()
                 .collect();
             let mut fired_timer_names: std::collections::HashSet<String> =
