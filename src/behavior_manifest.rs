@@ -238,6 +238,8 @@ impl BehaviorManifest {
         let effects = collect_checked_effects(effect_checker, decls)?;
         let effect_decls: Vec<EffectDecl> = effects.iter().map(classify_effect).collect();
         let authority = authority_requirements(&effects);
+        let (actors, durability) = actor_and_durability_declarations(decls);
+        let replay = replay_declarations(&effect_decls);
 
         Ok(Self {
             schema: BEHAVIOR_MANIFEST_SCHEMA.to_string(),
@@ -255,15 +257,15 @@ impl BehaviorManifest {
                 version: input.compiler_version.to_string(),
                 digest: digest(input.compiler_bytes),
             },
-            // Phase 0 intentionally emits no speculative contracts. These
-            // arrays become non-empty only when their compiler source of truth
-            // is authoritative and covered by conformance tests.
+            // Interfaces remain empty until their compiler source of truth is
+            // authoritative and covered by conformance tests. Actor identity,
+            // persistence, effects and replay are all already compiler-owned.
             interfaces: Vec::new(),
-            actors: Vec::new(),
+            actors,
             effects: effect_decls,
             authority,
-            durability: Vec::new(),
-            replay: Vec::new(),
+            durability,
+            replay,
             resources: ResourceIntent::default(),
             provenance: Provenance {
                 source_digest: digest(input.source_bytes),
@@ -447,6 +449,63 @@ fn add_row(out: &mut BTreeMap<String, Effect>, row: &crate::types::EffectRow) {
         out.entry(effect.to_string())
             .or_insert_with(|| effect.clone());
     }
+}
+
+fn actor_and_durability_declarations(
+    decls: &[Decl],
+) -> (Vec<ActorDecl>, Vec<DurabilityDecl>) {
+    let mut actors = BTreeMap::new();
+    let mut durability = BTreeMap::new();
+
+    for decl in flatten_decls(decls) {
+        if let Decl::Actor {
+            name,
+            persistent,
+            implements,
+            ..
+        } = decl
+        {
+            let persistence = if *persistent {
+                PersistenceClass::Durable
+            } else {
+                PersistenceClass::Transient
+            };
+            actors.entry(name.clone()).or_insert_with(|| ActorDecl {
+                name: name.clone(),
+                durability: persistence,
+                protocol: implements.clone(),
+                state_schema: None,
+            });
+            durability
+                .entry(name.clone())
+                .or_insert_with(|| DurabilityDecl {
+                    owner: name.clone(),
+                    persistence,
+                    schema: None,
+                    migration_contract: None,
+                });
+        }
+    }
+
+    (actors.into_values().collect(), durability.into_values().collect())
+}
+
+fn replay_declarations(effects: &[EffectDecl]) -> Vec<ReplayDecl> {
+    effects
+        .iter()
+        .map(|effect| ReplayDecl {
+            effect: effect.effect.clone(),
+            class: match effect.replay {
+                EffectReplay::None => ReplayClass::Pure,
+                EffectReplay::Safe => ReplayClass::LocalReplaySafe,
+                EffectReplay::RequiresJournal => ReplayClass::JournalResult,
+                EffectReplay::RequiresIdempotencyKey => {
+                    ReplayClass::ExternalRequiresIdempotencyKey
+                }
+                EffectReplay::Nonreplayable => ReplayClass::ExternalNonreplayable,
+            },
+        })
+        .collect()
 }
 
 fn classify_effect(effect: &Effect) -> EffectDecl {
@@ -640,6 +699,43 @@ mod tests {
         assert_eq!(manifest.compiler.digest, digest(b"compiler-bytes"));
         assert_eq!(manifest.effects.len(), 1);
         assert_eq!(manifest.effects[0].effect, "IO");
+    }
+
+    #[test]
+    fn actors_and_replay_are_derived_from_checked_semantics() {
+        let source = r#"
+            persistent actor Ledger {
+                behavior record() { perform DB.query("select 1") }
+            }
+            fn main() { perform Time.now() }
+        "#;
+        let (ast, mut checker) = checked(source);
+        let manifest = BehaviorManifest::from_checked_module(
+            ManifestBuildInput {
+                package_name: "demo",
+                package_version: "0.1.0",
+                language_version: "1.0.0-frozen",
+                artifact_kind: ArtifactKind::WasmModule,
+                artifact_bytes: b"artifact",
+                compiler_implementation: "nulang-rust",
+                compiler_version: "0.1.0",
+                compiler_bytes: b"compiler",
+                source_bytes: source.as_bytes(),
+                dependency_bytes: b"[]",
+            },
+            &mut checker,
+            &ast.decls,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.actors.len(), 1);
+        assert_eq!(manifest.actors[0].name, "Ledger");
+        assert_eq!(manifest.actors[0].durability, PersistenceClass::Durable);
+        assert_eq!(manifest.durability[0].owner, "Ledger");
+        assert!(manifest
+            .replay
+            .iter()
+            .any(|entry| entry.class == ReplayClass::JournalResult));
     }
 
     #[test]
