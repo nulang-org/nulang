@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Structured `par` source-ordered results — 2026-09-23
+- **Experimental `par { ... }` now returns every branch result in source order instead of inheriting block-style "last expression wins" behavior.** Non-empty regions infer and lower to tuples, a single branch remains a one-element tuple, and an empty region has `Unit` type. Execution is still sequential; this change freezes the result contract before scoped-task scheduling is enabled and supersedes the earlier experimental block-result behavior. Conformance coverage pins multi-branch ordering, one-branch tuple shape, and empty-region typing.
+
 ### Actor density and mailbox hot-path allocation — 2026-09-23
 - **Idle actors no longer materialize their 16 KiB ORCA bump block at spawn** (`src/runtime/heap.rs`). The configured first-block capacity is preserved, but allocation is deferred until the first small-object heap allocation; LOS-only actors also remain bump-block-free.
 - **Mailbox logical-count atomics use relaxed ordering** (`src/runtime/mailbox.rs`) because Crossbeam `SegQueue` owns message publication/synchronization; the atomic counter remains capacity/accounting state and its modification order still prevents bounded producers from over-reserving.
