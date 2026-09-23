@@ -112,9 +112,39 @@ fn bench_message_drain(c: &mut Criterion) {
     group.finish();
 }
 
+
+/// End-to-end local message cost for an already-created actor.
+///
+/// This combines the admission/enqueue path and scheduler/native-handler drain
+/// path in one timed region. Actor/runtime construction remains setup so the
+/// result is directly comparable to other runtimes' pre-created local mailbox
+/// send+drain loops.
+fn bench_message_roundtrip_local(c: &mut Criterion) {
+    let mut group = c.benchmark_group("actor/message_roundtrip_local");
+    group.throughput(Throughput::Elements(MESSAGE_BATCH as u64));
+
+    group.bench_function("100", |b| {
+        b.iter_batched(
+            runtime_with_consumer,
+            |(mut rt, actor_id)| {
+                let msg = Value::int(1);
+                for _ in 0..MESSAGE_BATCH {
+                    rt.send_message(actor_id, "handle", &[msg]);
+                }
+                rt.run_scheduler();
+                black_box(rt);
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_spawn_send_receive,
     bench_message_enqueue,
-    bench_message_drain
+    bench_message_drain,
+    bench_message_roundtrip_local
 );
