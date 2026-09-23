@@ -51,6 +51,13 @@ version + migration.*
 
 ## Stable tier
 
+### MCP 2026-07-28 core hardening — 2026-09-23
+- **`nulang-ai-mcp` now implements the modern stateless discovery/tool result shapes** for MCP `2026-07-28`: `server/discover`, `resultType: complete`, explicit cache hints, supported-version errors, and server identity metadata.
+- **Tool listings are deterministic**, improving client and prompt-cache stability, and tool execution no longer holds the registry read lock across arbitrary async handler code.
+- **Protocol errors and tool-execution errors are separated**: malformed/unknown calls use JSON-RPC errors while handler failures return `CallToolResult` with `isError: true`; successful JSON results are also emitted as `structuredContent`.
+- This is transport-independent core hardening, not a full MCP compliance claim. Streamable-HTTP header validation, complete JSON Schema 2020-12 input/output validation, authorization/rate limiting, and transport adapters remain separate work.
+
+
 ### Actor density and mailbox hot-path allocation — 2026-09-23
 - **Idle actors no longer materialize their 16 KiB ORCA bump block at spawn** (`src/runtime/heap.rs`). The configured first-block capacity is preserved, but allocation is deferred until the first small-object heap allocation; LOS-only actors also remain bump-block-free.
 - **Mailbox logical-count atomics use relaxed ordering** (`src/runtime/mailbox.rs`) because Crossbeam `SegQueue` owns message publication/synchronization; the atomic counter remains capacity/accounting state and its modification order still prevents bounded producers from over-reserving.
