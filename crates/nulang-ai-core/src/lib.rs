@@ -19,7 +19,7 @@ mod duration_secs {
     }
 }
 
-pub const NLAP_VERSION: &str = "1.2.0";
+pub const NLAP_VERSION: &str = "1.3.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -419,6 +419,8 @@ pub enum SwarmEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SwarmEventEnvelope {
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<Uuid>,
     pub tenant_id: Option<String>,
     pub conversation_id: Option<Uuid>,
     pub ts: DateTime<Utc>,
@@ -429,6 +431,7 @@ impl SwarmEventEnvelope {
     pub fn new(event: SwarmEvent, conversation_id: Option<Uuid>) -> Self {
         Self {
             version: NLAP_VERSION.to_string(),
+            event_id: Some(Uuid::new_v4()),
             tenant_id: None,
             conversation_id,
             ts: Utc::now(),
@@ -534,6 +537,24 @@ mod tests {
     }
 
     #[test]
+    fn swarm_event_envelope_accepts_legacy_message_without_event_id() {
+        let goal_id = Uuid::new_v4();
+        let legacy = serde_json::json!({
+            "version": "1.2.0",
+            "tenant_id": null,
+            "conversation_id": null,
+            "ts": Utc::now(),
+            "event": {
+                "type": "goal_completed",
+                "goal_id": goal_id
+            }
+        });
+        let envelope: SwarmEventEnvelope = serde_json::from_value(legacy).unwrap();
+        assert!(envelope.event_id.is_none());
+        assert_eq!(envelope.version, "1.2.0");
+    }
+
+    #[test]
     fn swarm_event_tagged_json() {
         let goal_id = Uuid::new_v4();
         let ev = SwarmEventEnvelope::new(
@@ -544,7 +565,8 @@ mod tests {
             None,
         );
         let json = serde_json::to_string(&ev).unwrap();
-        assert!(json.contains("\"version\":\"1.2.0\""));
+        assert!(json.contains("\"version\":\"1.3.0\""));
+        assert!(json.contains("\"event_id\":"));
         assert!(json.contains("goal_created"));
     }
 }
