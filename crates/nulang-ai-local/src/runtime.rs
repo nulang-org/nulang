@@ -121,6 +121,8 @@ impl LocalRuntime {
         text: &str,
         out: &mut dyn Write,
     ) -> Result<Uuid, RuntimeError> {
+        self.flush_pending_events(out)?;
+
         let now = Utc::now();
         let mut conv = self.store.get_conversation(self.conversation_id)?;
         conv.messages.push(ConversationMessage {
@@ -191,6 +193,26 @@ impl LocalRuntime {
                     goal.status = GoalStatus::Completed;
                     goal.updated_at = Utc::now();
 
+                    let mut outbox_events = Vec::new();
+                    if let (Some(task), Some(agent_id)) =
+                        (terminal_task.as_ref(), agent_id.as_ref())
+                    {
+                        outbox_events.push(self.envelope(SwarmEvent::TaskCompleted {
+                            task_id: task.id,
+                            agent_id: agent_id.clone(),
+                        }));
+                    }
+                    outbox_events.push(self.envelope(SwarmEvent::IntentionCompleted {
+                        intention_id: intention.id,
+                        commitment_id: intention.commitment_id,
+                        goal_id: intention.goal_id,
+                    }));
+                    outbox_events.push(self.envelope(SwarmEvent::CommitmentFulfilled {
+                        commitment_id: commitment.id,
+                        goal_id,
+                    }));
+                    outbox_events.push(self.envelope(SwarmEvent::GoalCompleted { goal_id }));
+
                     self.store
                         .commit_agent_state_transition(AgentStateTransition {
                             terminal_task: terminal_task.as_ref(),
@@ -199,33 +221,9 @@ impl LocalRuntime {
                             revision: None,
                             commitment: Some(&commitment),
                             goal: Some(&goal),
+                            outbox_events: &outbox_events,
                         })?;
-
-                    if let (Some(task), Some(agent_id)) = (terminal_task.as_ref(), agent_id) {
-                        self.emit(
-                            out,
-                            SwarmEvent::TaskCompleted {
-                                task_id: task.id,
-                                agent_id,
-                            },
-                        )?;
-                    }
-                    self.emit(
-                        out,
-                        SwarmEvent::IntentionCompleted {
-                            intention_id: intention.id,
-                            commitment_id: intention.commitment_id,
-                            goal_id: intention.goal_id,
-                        },
-                    )?;
-                    self.emit(
-                        out,
-                        SwarmEvent::CommitmentFulfilled {
-                            commitment_id: commitment.id,
-                            goal_id,
-                        },
-                    )?;
-                    self.emit(out, SwarmEvent::GoalCompleted { goal_id })?;
+                    self.flush_pending_events(out)?;
                     return Ok(goal_id);
                 }
                 PlanOutcome::Blocked {
@@ -247,6 +245,33 @@ impl LocalRuntime {
                     goal.status = GoalStatus::Blocked;
                     goal.updated_at = Utc::now();
 
+                    let outbox_events = vec![
+                        self.envelope(SwarmEvent::TaskBlocked {
+                            task_id: terminal_task.id,
+                            agent_id,
+                            reason: reason.clone(),
+                        }),
+                        self.envelope(SwarmEvent::IntentionBlocked {
+                            intention_id: intention.id,
+                            commitment_id: intention.commitment_id,
+                            goal_id: intention.goal_id,
+                            reason: reason.clone(),
+                        }),
+                        self.envelope(SwarmEvent::IntentionRevised {
+                            revision_id: revision.id,
+                            superseded_intention_id: revision.superseded_intention_id,
+                            replacement_intention_id: revision.replacement_intention_id,
+                            decision: revision.decision,
+                            reason: revision.reason.clone(),
+                        }),
+                        self.envelope(SwarmEvent::CommitmentSuspended {
+                            commitment_id: commitment.id,
+                            goal_id,
+                            reason: reason.clone(),
+                        }),
+                        self.envelope(SwarmEvent::GoalBlocked { goal_id, reason }),
+                    ];
+
                     self.store
                         .commit_agent_state_transition(AgentStateTransition {
                             terminal_task: Some(&terminal_task),
@@ -255,35 +280,9 @@ impl LocalRuntime {
                             revision: Some(&revision),
                             commitment: Some(&commitment),
                             goal: Some(&goal),
+                            outbox_events: &outbox_events,
                         })?;
-
-                    self.emit(
-                        out,
-                        SwarmEvent::TaskBlocked {
-                            task_id: terminal_task.id,
-                            agent_id,
-                            reason: reason.clone(),
-                        },
-                    )?;
-                    self.emit(
-                        out,
-                        SwarmEvent::IntentionBlocked {
-                            intention_id: intention.id,
-                            commitment_id: intention.commitment_id,
-                            goal_id: intention.goal_id,
-                            reason: reason.clone(),
-                        },
-                    )?;
-                    self.emit_revision(&revision, out)?;
-                    self.emit(
-                        out,
-                        SwarmEvent::CommitmentSuspended {
-                            commitment_id: commitment.id,
-                            goal_id,
-                            reason: reason.clone(),
-                        },
-                    )?;
-                    self.emit(out, SwarmEvent::GoalBlocked { goal_id, reason })?;
+                    self.flush_pending_events(out)?;
                     return Ok(goal_id);
                 }
                 PlanOutcome::Failed {
@@ -312,6 +311,33 @@ impl LocalRuntime {
                         reason.clone(),
                     );
 
+                    let outbox_events = vec![
+                        self.envelope(SwarmEvent::TaskFailed {
+                            task_id: terminal_task.id,
+                            agent_id,
+                            reason: reason.clone(),
+                        }),
+                        self.envelope(SwarmEvent::IntentionFailed {
+                            intention_id: intention.id,
+                            commitment_id: intention.commitment_id,
+                            goal_id: intention.goal_id,
+                            reason: reason.clone(),
+                        }),
+                        self.envelope(SwarmEvent::IntentionRevised {
+                            revision_id: revision.id,
+                            superseded_intention_id: revision.superseded_intention_id,
+                            replacement_intention_id: revision.replacement_intention_id,
+                            decision: revision.decision,
+                            reason: revision.reason.clone(),
+                        }),
+                        self.envelope(SwarmEvent::IntentionActivated {
+                            intention_id: replacement.id,
+                            commitment_id: replacement.commitment_id,
+                            goal_id: replacement.goal_id,
+                            owner_agent_id: replacement.owner_agent_id.clone(),
+                        }),
+                    ];
+
                     self.store
                         .commit_agent_state_transition(AgentStateTransition {
                             terminal_task: Some(&terminal_task),
@@ -320,27 +346,9 @@ impl LocalRuntime {
                             revision: Some(&revision),
                             commitment: None,
                             goal: None,
+                            outbox_events: &outbox_events,
                         })?;
-
-                    self.emit(
-                        out,
-                        SwarmEvent::TaskFailed {
-                            task_id: terminal_task.id,
-                            agent_id,
-                            reason: reason.clone(),
-                        },
-                    )?;
-                    self.emit(
-                        out,
-                        SwarmEvent::IntentionFailed {
-                            intention_id: intention.id,
-                            commitment_id: intention.commitment_id,
-                            goal_id: intention.goal_id,
-                            reason,
-                        },
-                    )?;
-                    self.emit_revision(&revision, out)?;
-                    self.emit_intention_activated(&replacement, out)?;
+                    self.flush_pending_events(out)?;
 
                     intention = replacement;
                     tasks = replacement_tasks;
@@ -364,6 +372,33 @@ impl LocalRuntime {
                     goal.status = GoalStatus::Failed;
                     goal.updated_at = Utc::now();
 
+                    let outbox_events = vec![
+                        self.envelope(SwarmEvent::TaskFailed {
+                            task_id: terminal_task.id,
+                            agent_id,
+                            reason: reason.clone(),
+                        }),
+                        self.envelope(SwarmEvent::IntentionFailed {
+                            intention_id: intention.id,
+                            commitment_id: intention.commitment_id,
+                            goal_id: intention.goal_id,
+                            reason: reason.clone(),
+                        }),
+                        self.envelope(SwarmEvent::IntentionRevised {
+                            revision_id: revision.id,
+                            superseded_intention_id: revision.superseded_intention_id,
+                            replacement_intention_id: revision.replacement_intention_id,
+                            decision: revision.decision,
+                            reason: revision.reason.clone(),
+                        }),
+                        self.envelope(SwarmEvent::CommitmentAbandoned {
+                            commitment_id: commitment.id,
+                            goal_id,
+                            reason: reason.clone(),
+                        }),
+                        self.envelope(SwarmEvent::GoalFailed { goal_id, reason }),
+                    ];
+
                     self.store
                         .commit_agent_state_transition(AgentStateTransition {
                             terminal_task: Some(&terminal_task),
@@ -372,35 +407,9 @@ impl LocalRuntime {
                             revision: Some(&revision),
                             commitment: Some(&commitment),
                             goal: Some(&goal),
+                            outbox_events: &outbox_events,
                         })?;
-
-                    self.emit(
-                        out,
-                        SwarmEvent::TaskFailed {
-                            task_id: terminal_task.id,
-                            agent_id,
-                            reason: reason.clone(),
-                        },
-                    )?;
-                    self.emit(
-                        out,
-                        SwarmEvent::IntentionFailed {
-                            intention_id: intention.id,
-                            commitment_id: intention.commitment_id,
-                            goal_id: intention.goal_id,
-                            reason: reason.clone(),
-                        },
-                    )?;
-                    self.emit_revision(&revision, out)?;
-                    self.emit(
-                        out,
-                        SwarmEvent::CommitmentAbandoned {
-                            commitment_id: commitment.id,
-                            goal_id,
-                            reason: reason.clone(),
-                        },
-                    )?;
-                    self.emit(out, SwarmEvent::GoalFailed { goal_id, reason })?;
+                    self.flush_pending_events(out)?;
                     return Ok(goal_id);
                 }
             }
@@ -573,25 +582,42 @@ impl LocalRuntime {
         })
     }
 
-    fn emit_revision(
-        &self,
-        revision: &IntentionRevision,
-        out: &mut dyn Write,
-    ) -> Result<(), RuntimeError> {
-        self.emit(
-            out,
-            SwarmEvent::IntentionRevised {
-                revision_id: revision.id,
-                superseded_intention_id: revision.superseded_intention_id,
-                replacement_intention_id: revision.replacement_intention_id,
-                decision: revision.decision,
-                reason: revision.reason.clone(),
-            },
-        )
+    fn envelope(&self, event: SwarmEvent) -> SwarmEventEnvelope {
+        SwarmEventEnvelope::new(event, Some(self.conversation_id))
+    }
+
+    pub fn flush_pending_events(&self, out: &mut dyn Write) -> Result<usize, RuntimeError> {
+        const BATCH_SIZE: usize = 100;
+        let mut delivered = 0usize;
+
+        loop {
+            let pending = self.store.pending_outbox(BATCH_SIZE)?;
+            if pending.is_empty() {
+                break;
+            }
+            let batch_len = pending.len();
+
+            for record in pending {
+                let event_id = record.envelope.event_id.ok_or(StoreError::InvalidTransition(
+                    "pending outbox event is missing a stable event id",
+                ))?;
+                let line = format_event_line(&record.envelope)?;
+                writeln!(out, "{}", line)?;
+                out.flush()?;
+                self.store.mark_outbox_delivered(event_id)?;
+                delivered += 1;
+            }
+
+            if batch_len < BATCH_SIZE {
+                break;
+            }
+        }
+
+        Ok(delivered)
     }
 
     fn emit(&self, out: &mut dyn Write, event: SwarmEvent) -> Result<(), RuntimeError> {
-        let envelope = SwarmEventEnvelope::new(event, Some(self.conversation_id));
+        let envelope = self.envelope(event);
         let line = format_event_line(&envelope)?;
         writeln!(out, "{}", line)?;
         out.flush()?;
