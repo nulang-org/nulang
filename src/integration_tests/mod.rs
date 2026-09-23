@@ -7884,9 +7884,12 @@ match { a: 2, b: 9 } with {
         // response sits untouched in the channel no matter how long the
         // worker takes.
         loop {
-            let next = rt.borrow_mut().scheduler.dequeue();
+            let next = rt.borrow_mut().claim_next_ready_actor();
             match next {
-                Some(actor_id) => rt.borrow_mut().step_actor(actor_id),
+                Some(actor_id) => {
+                    rt.borrow_mut().step_actor(actor_id);
+                    rt.borrow_mut().finish_actor_turn(actor_id);
+                }
                 None => break,
             }
         }
