@@ -308,8 +308,7 @@ impl LocalRuntime {
                 commitment: &commitment,
                 goal: &goal,
                 outbox_events: &outbox_events,
-            })?
-        {
+            })? {
             ResumeCommitResult::Applied(_) => {
                 self.flush_pending_events(out)?;
                 let plan_text = goal.intent.clone();
@@ -347,8 +346,7 @@ impl LocalRuntime {
                 "resumption replacement intention is missing",
             ))?;
 
-        if replacement.status != IntentionStatus::Active
-            || graph.goal.status != GoalStatus::Running
+        if replacement.status != IntentionStatus::Active || graph.goal.status != GoalStatus::Running
         {
             self.flush_pending_events(out)?;
             return Ok(resumption.goal_id);
@@ -363,10 +361,9 @@ impl LocalRuntime {
                 "resumption commitment is missing",
             ))?;
         if commitment.status != CommitmentStatus::Active {
-            return Err(StoreError::InvalidTransition(
-                "resumption commitment is not active",
-            )
-            .into());
+            return Err(
+                StoreError::InvalidTransition("resumption commitment is not active").into(),
+            );
         }
 
         let tasks = ordered_tasks_for_intention(&graph.tasks, &replacement)?;
@@ -872,15 +869,7 @@ impl LocalRuntime {
         })
     }
 
-    fn envelope(&self, event: SwarmEvent) -> SwarmEventEnvelope {
-        self.envelope_for(event, Some(self.conversation_id))
-    }
-
-    fn envelope_for(
-        &self,
-        event: SwarmEvent,
-        conversation_id: Option<Uuid>,
-    ) -> SwarmEventEnvelope {
+    fn envelope_for(&self, event: SwarmEvent, conversation_id: Option<Uuid>) -> SwarmEventEnvelope {
         SwarmEventEnvelope::new(event, conversation_id)
     }
 
