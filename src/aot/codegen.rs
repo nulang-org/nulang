@@ -4023,11 +4023,11 @@ mod tests {
 
     #[test]
     fn test_aot_runtime_native_dispatch() {
-        // Phase 3: the real actor `Runtime` dispatches a spawned actor's
-        // behavior through AOT native code. A `Counter` actor spawned from a
-        // CodeModule whose AotModule is registered must run `Add` natively
-        // (handler = aot_behavior_adapter, target armed) and mutate state
-        // through `AotRuntimeCallbacks` routing to the Runtime.
+        // The real actor Runtime dispatches a spawned actor's behavior
+        // directly through the stable AOT actor-entry ABI. The behavior table
+        // keeps the compatibility adapter for standalone/legacy callers, but
+        // Runtime dispatch uses the per-behavior AOT target directly and
+        // mutates state through AotRuntimeCallbacks.
         use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
         use crate::lexer::Lexer;
         use crate::parser::Parser;
@@ -4066,8 +4066,8 @@ mod tests {
             .as_actor_id()
             .expect("spawn should return an actor ref");
 
-        // The Add behavior must dispatch through the AOT adapter with an armed
-        // target (proving native wiring, not bytecode).
+        // The behavior table retains the compatibility adapter while the
+        // runtime-owned AOT target proves native wiring is available.
         {
             let actor = rt.actors.get(&id).expect("spawned actor");
             assert_eq!(actor.behavior_table.len(), 2, "both behaviors registered");
@@ -4076,7 +4076,7 @@ mod tests {
                     == crate::aot::aot_behavior_adapter
                         as fn(&mut crate::runtime::Actor, &[crate::vm::Value])
                         as usize,
-                "Add should dispatch through the AOT adapter"
+                "Add should retain the AOT compatibility adapter"
             );
             assert!(
                 actor.aot_targets[0].is_some(),
@@ -4098,6 +4098,23 @@ mod tests {
             total,
             Some(5),
             "AOT-native Add should mutate state through the Runtime"
+        );
+
+        // Queue one native message, then issue a synchronous native ask.
+        // ask_actor_sync first flushes the mailbox, so this exercises both
+        // non-scheduler runtime entry points without arming AOT_DISPATCH.
+        rt.send_message_by_id(id, 0, &[crate::vm::Value::int(2)]);
+        rt.ask_actor_sync(id, 0, &[crate::vm::Value::int(3)])
+            .expect("direct AOT sync dispatch should succeed");
+        let total = rt
+            .actors
+            .get(&id)
+            .and_then(|a| a.get_state_field("total"))
+            .and_then(|v| v.as_int());
+        assert_eq!(
+            total,
+            Some(10),
+            "queued flush plus sync AOT dispatch must both use the direct native path"
         );
     }
 
