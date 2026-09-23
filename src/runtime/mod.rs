@@ -3911,12 +3911,7 @@ impl Runtime {
                 if self.actor_is_persistent(actor_id) {
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
                     let result = if self.actor_is_workflow(actor_id) {
-                        workflow::commit_workflow_command(
-                            self,
-                            actor_id,
-                            msg.behavior_id,
-                            payload,
-                        )
+                        workflow::commit_workflow_command(self, actor_id, msg.behavior_id, payload)
                     } else {
                         let sequence = self.next_sequence(actor_id);
                         self.persistence.append_journal(
