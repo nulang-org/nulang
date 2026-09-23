@@ -15,6 +15,7 @@
 //! The Nulang runtime must not depend on Temporal protocol types.
 
 use crate::durable_effect::{DurableEffectRecord, DurableEffectSpec};
+use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
 use crate::primitives::{DeliverySemantics, EffectBoundary};
 use crate::runtime::persistence::WorkflowEvent;
 use std::fmt;
@@ -144,6 +145,46 @@ impl TemporalWorkflowTaskContext {
         Ok(TemporalActivityPlan { request, record })
     }
 
+    /// Translate one command emitted by a Temporal workflow task into a
+    /// Nulang-side compatibility action.
+    ///
+    /// `command_ordinal` is the ordinal in the complete Temporal command list,
+    /// not merely among activities. Keeping the global ordinal in durable
+    /// effect identity makes command reordering observable during replay.
+    pub fn plan_command(
+        &self,
+        command_ordinal: u32,
+        command: TemporalCommand,
+    ) -> Result<TemporalCommandPlan, TemporalCompatError> {
+        match command {
+            TemporalCommand::ScheduleActivity(request) => Ok(
+                TemporalCommandPlan::Activity(self.prepare_activity(command_ordinal, request)?),
+            ),
+            TemporalCommand::StartTimer {
+                timer_id,
+                duration_ms,
+            } => Ok(TemporalCommandPlan::WorkflowEvent(
+                self.timer_started(timer_id, duration_ms)?,
+            )),
+            TemporalCommand::CompleteWorkflow { result } => {
+                Ok(TemporalCommandPlan::CompleteWorkflow { result })
+            }
+            TemporalCommand::FailWorkflow { message } => {
+                Ok(TemporalCommandPlan::FailWorkflow { message })
+            }
+            TemporalCommand::ContinueAsNew {
+                workflow_type,
+                input,
+            } => {
+                validate_non_empty("workflow_type", &workflow_type)?;
+                Ok(TemporalCommandPlan::ContinueAsNew {
+                    workflow_type,
+                    input,
+                })
+            }
+        }
+    }
+
     /// Stage a Temporal timer using Nulang's existing durable workflow-event
     /// representation. The containing `DurableTransition` supplies atomicity.
     pub fn timer_started(
@@ -259,6 +300,65 @@ impl TemporalActivityRequest {
 pub struct TemporalActivityPlan {
     pub request: TemporalActivityRequest,
     pub record: DurableEffectRecord,
+}
+
+impl TemporalActivityPlan {
+    /// Persistence envelope ready to stage in
+    /// `DurableTransition::durable_effects` before external dispatch.
+    pub fn prepared_persistence_record(&self) -> DurableEffectPersistenceRecord {
+        DurableEffectPersistenceRecord::from_effect(self.record.clone())
+    }
+
+    /// Mark this activity completed and return the persistence envelope that
+    /// should be committed before the workflow observes the result.
+    pub fn complete(self, result: Vec<u8>) -> DurableEffectPersistenceRecord {
+        DurableEffectPersistenceRecord::from_effect(self.record.complete(result))
+    }
+}
+
+/// Core Temporal commands that can already be represented by Nulang's durable
+/// primitives without importing Temporal protobuf types.
+///
+/// Wire adapters should preserve the original command ordering and pass the
+/// zero-based ordinal to `TemporalWorkflowTaskContext::plan_command`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemporalCommand {
+    ScheduleActivity(TemporalActivityRequest),
+    StartTimer {
+        timer_id: String,
+        duration_ms: u64,
+    },
+    CompleteWorkflow {
+        result: Vec<u8>,
+    },
+    FailWorkflow {
+        message: String,
+    },
+    ContinueAsNew {
+        workflow_type: String,
+        input: Vec<u8>,
+    },
+}
+
+/// Nulang-side plan produced from a supported Temporal command.
+///
+/// Completion/failure/continue-as-new remain adapter actions until the
+/// protocol gateway owns the corresponding workflow lifecycle records. They
+/// intentionally do not create new Nulang runtime primitives.
+#[derive(Debug, Clone)]
+pub enum TemporalCommandPlan {
+    Activity(TemporalActivityPlan),
+    WorkflowEvent(WorkflowEvent),
+    CompleteWorkflow {
+        result: Vec<u8>,
+    },
+    FailWorkflow {
+        message: String,
+    },
+    ContinueAsNew {
+        workflow_type: String,
+        input: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,6 +506,95 @@ mod tests {
             .record
             .recovery_action_for_request(&changed.durable_request_bytes())
             .is_err());
+    }
+
+    #[test]
+    fn command_planner_preserves_global_command_ordinal_in_activity_identity() {
+        let ctx = context();
+
+        let first = match ctx
+            .plan_command(0, TemporalCommand::ScheduleActivity(activity()))
+            .unwrap()
+        {
+            TemporalCommandPlan::Activity(plan) => plan,
+            _ => panic!("expected activity plan"),
+        };
+        let reordered = match ctx
+            .plan_command(1, TemporalCommand::ScheduleActivity(activity()))
+            .unwrap()
+        {
+            TemporalCommandPlan::Activity(plan) => plan,
+            _ => panic!("expected activity plan"),
+        };
+
+        assert_ne!(first.record.spec().id, reordered.record.spec().id);
+    }
+
+    #[test]
+    fn activity_plan_produces_prepared_and_completed_persistence_records() {
+        let plan = context().prepare_activity(0, activity()).unwrap();
+        let prepared = plan.prepared_persistence_record();
+        assert_eq!(prepared.effect().spec().id, plan.record.spec().id);
+
+        let completed = plan.complete(b"charged".to_vec());
+        match completed.effect() {
+            DurableEffectRecord::Completed { result, .. } => {
+                assert_eq!(result, b"charged");
+            }
+            _ => panic!("expected completed durable effect"),
+        }
+    }
+
+    #[test]
+    fn command_planner_keeps_lifecycle_actions_outside_runtime_primitives() {
+        let ctx = context();
+
+        match ctx
+            .plan_command(
+                0,
+                TemporalCommand::CompleteWorkflow {
+                    result: b"done".to_vec(),
+                },
+            )
+            .unwrap()
+        {
+            TemporalCommandPlan::CompleteWorkflow { result } => {
+                assert_eq!(result, b"done");
+            }
+            _ => panic!("expected complete workflow plan"),
+        }
+
+        match ctx
+            .plan_command(
+                1,
+                TemporalCommand::ContinueAsNew {
+                    workflow_type: "OrderWorkflow".into(),
+                    input: b"next".to_vec(),
+                },
+            )
+            .unwrap()
+        {
+            TemporalCommandPlan::ContinueAsNew {
+                workflow_type,
+                input,
+            } => {
+                assert_eq!(workflow_type, "OrderWorkflow");
+                assert_eq!(input, b"next");
+            }
+            _ => panic!("expected continue-as-new plan"),
+        }
+
+        assert_eq!(
+            ctx.plan_command(
+                2,
+                TemporalCommand::ContinueAsNew {
+                    workflow_type: String::new(),
+                    input: Vec::new(),
+                },
+            )
+            .unwrap_err(),
+            TemporalCompatError::EmptyField("workflow_type")
+        );
     }
 
     #[test]
