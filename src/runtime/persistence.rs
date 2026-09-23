@@ -924,6 +924,28 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS events_v2 (
+                    actor_id INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    field_name TEXT NOT NULL,
+                    event_name TEXT NOT NULL,
+                    args TEXT NOT NULL,
+                    value TEXT NOT NULL DEFAULT '1',
+                    PRIMARY KEY (actor_id, sequence, field_name)
+                )",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "INSERT OR IGNORE INTO events_v2
+                 (actor_id, sequence, field_name, event_name, args, value)
+                 SELECT actor_id, sequence, field_name, event_name, args, value FROM events",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             Ok(())
         })
     }
@@ -1178,7 +1200,7 @@ impl PersistenceStore for LibsqlStore {
             let value_json = serde_json::to_string(&entry.value)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             conn.execute(
-                "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO events_v2 (actor_id, sequence, field_name, event_name, args, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 libsql::params![actor_id as i64, entry.sequence as i64, entry.field_name, entry.event_name, args_json, value_json],
             ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
         })
@@ -1275,7 +1297,7 @@ impl PersistenceStore for LibsqlStore {
             }.await;
             let event_seq: Option<i64> = async {
                 let mut rows = conn.query(
-                    "SELECT sequence FROM events WHERE actor_id = ?1 ORDER BY sequence DESC LIMIT 1",
+                    "SELECT sequence FROM events_v2 WHERE actor_id = ?1 ORDER BY sequence DESC LIMIT 1",
                     libsql::params![actor_id as i64],
                 ).await.ok()?;
                 let row = rows.next().await.ok()??;
@@ -1313,7 +1335,7 @@ impl PersistenceStore for LibsqlStore {
             .map(|_| ())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             conn.execute(
-                "DELETE FROM events WHERE actor_id = ?1",
+                "DELETE FROM events_v2 WHERE actor_id = ?1",
                 libsql::params![actor_id as i64],
             )
             .await
