@@ -1131,8 +1131,7 @@ pub fn aot_behavior_adapter(actor: &mut crate::runtime::Actor, args: &[crate::vm
         crate::jit::runtime::clear_jit_callbacks();
         crate::jit::runtime::aot_clear_constants();
     } else {
-        let status =
-            dispatch_aot_runtime_behavior(target, target.runtime, actor.id, args);
+        let status = dispatch_aot_runtime_behavior(target, target.runtime, actor.id, args);
         if status != crate::native_abi::NativeActorStatus::Completed {
             tracing::warn!(
                 actor_id = actor.id,
