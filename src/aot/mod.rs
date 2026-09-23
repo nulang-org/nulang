@@ -38,8 +38,10 @@ pub struct AotModule {
     compiled_funcs: Vec<*const u8>,
     /// Actor behavior names, parallel to `compiled_behaviors`.
     behavior_names: Vec<String>,
-    /// Compiled actor behavior pointers (native code), parallel to
-    /// `behavior_names`. Empty when the module has no `actor` declarations.
+    /// Stable runtime-facing actor entry wrappers, parallel to
+    /// `behavior_names`. Each pointer has the uniform `NativeActorEntry`
+    /// ABI and tail-calls the behavior's optimized internal native function.
+    /// Empty when the module has no `actor` declarations.
     compiled_behaviors: Vec<*const u8>,
     /// Entry point index (the `__main` or `main` function).
     entry_idx: Option<usize>,
@@ -228,13 +230,12 @@ impl AotModule {
             }
         }
 
-        // Pass: compile actor behaviors to native code, indexed by behavior
-        // name. Behaviors are ordinary `Function`s (params + blocks); they
-        // are never `Call` targets, so each compiles into its own native
-        // entry point keyed by name. The actor runtime can later dispatch
-        // messages straight to these pointers, bypassing the bytecode VM.
+        // Pass: compile actor behaviors to optimized internal native
+        // functions plus a stable runtime-facing entry wrapper. The runtime
+        // never calls the arity-specific internal function directly.
         let mut behavior_names: Vec<String> = Vec::new();
         let mut behavior_fids: Vec<cranelift_module::FuncId> = Vec::new();
+        let mut behavior_entry_fids: Vec<cranelift_module::FuncId> = Vec::new();
         for (idx, func) in mir_module.behaviors.iter().enumerate() {
             let func_name = format!("nulang_behavior_{}", idx);
             let mut sig = jit_module.make_signature();
@@ -248,6 +249,27 @@ impl AotModule {
                     msg: format!("failed to declare behavior '{}': {}", func.name, e),
                     span: Span::default(),
                 })?;
+
+            let entry_name = format!("nulang_behavior_entry_{}", idx);
+            let mut entry_sig = jit_module.make_signature();
+            entry_sig
+                .params
+                .push(AbiParam::new(jit_module.isa().pointer_type()));
+            entry_sig.returns.push(AbiParam::new(types::I32));
+            let entry_fid = jit_module
+                .declare_function(
+                    &entry_name,
+                    cranelift_module::Linkage::Local,
+                    &entry_sig,
+                )
+                .map_err(|e| crate::types::NuError::VMError {
+                    msg: format!(
+                        "failed to declare native entry wrapper for '{}': {}",
+                        func.name, e
+                    ),
+                    span: Span::default(),
+                })?;
+
             let mut ctx = codegen::AotContext::new(&mut jit_module, &mut builder_context);
             ctx.func_ids = func_ids.clone();
             ctx.field_map = field_map.clone();
@@ -263,8 +285,26 @@ impl AotModule {
                 msg: format!("AOT compilation of behavior '{}' failed: {}", func.name, e),
                 span: Span::default(),
             })?;
+
+            let mut entry_ctx =
+                codegen::AotContext::new(&mut jit_module, &mut builder_context);
+            codegen::compile_actor_entry_wrapper(
+                &mut entry_ctx,
+                func.params.len(),
+                entry_fid,
+                fid,
+            )
+            .map_err(|e| crate::types::NuError::VMError {
+                msg: format!(
+                    "AOT native entry wrapper for behavior '{}' failed: {}",
+                    func.name, e
+                ),
+                span: Span::default(),
+            })?;
+
             behavior_names.push(func.name.clone());
             behavior_fids.push(fid);
+            behavior_entry_fids.push(entry_fid);
         }
         jit_module
             .finalize_definitions()
@@ -277,7 +317,7 @@ impl AotModule {
             .iter()
             .map(|fid| jit_module.get_finalized_function(*fid))
             .collect();
-        let compiled_behaviors: Vec<*const u8> = behavior_fids
+        let compiled_behaviors: Vec<*const u8> = behavior_entry_fids
             .iter()
             .map(|fid| jit_module.get_finalized_function(*fid))
             .collect();
@@ -310,10 +350,9 @@ impl AotModule {
     /// Look up a compiled behavior's native entry pointer by name.
     ///
     /// Returns `None` when the module has no behavior with that name. The
-    /// returned pointer is a function with the AOT calling convention:
-    /// `extern "C" fn(boxed_param_0, boxed_param_1, ...) -> u64`. It is only
-    /// valid while the `AotModule` is alive (the pointer lives in the JIT
-    /// code memory it owns).
+    /// returned pointer has the stable `crate::native_abi::NativeActorEntry`
+    /// calling convention. It is only valid while the `AotModule` is alive
+    /// (the pointer lives in the JIT code memory it owns).
     pub fn fn_ptr_for_behavior(&self, name: &str) -> Option<*const u8> {
         self.behavior_names
             .iter()
@@ -991,56 +1030,19 @@ pub fn unregister_aot_actor(id: u64) {
 
 /// Invoke an AOT-compiled behavior with a boxed payload (arity-matched). The
 /// target is the `AOT_DISPATCH` thread-local armed by the driver/scheduler.
-fn call_aot_behavior(ptr: *const u8, raw: &[u64]) {
-    // SAFETY (each arm): `ptr` is a finalized AOT behavior with this arity.
-    match raw.len() {
-        0 => {
-            let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(ptr) };
-            let _ = f();
-        }
-        1 => {
-            let f: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(ptr) };
-            let _ = f(raw[0]);
-        }
-        2 => {
-            let f: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(ptr) };
-            let _ = f(raw[0], raw[1]);
-        }
-        3 => {
-            let f: extern "C" fn(u64, u64, u64) -> u64 = unsafe { std::mem::transmute(ptr) };
-            let _ = f(raw[0], raw[1], raw[2]);
-        }
-        4 => {
-            let f: extern "C" fn(u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(ptr) };
-            let _ = f(raw[0], raw[1], raw[2], raw[3]);
-        }
-        5 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 =
-                unsafe { std::mem::transmute(ptr) };
-            let _ = f(raw[0], raw[1], raw[2], raw[3], raw[4]);
-        }
-        6 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
-                unsafe { std::mem::transmute(ptr) };
-            let _ = f(raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
-        }
-        7 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                unsafe { std::mem::transmute(ptr) };
-            let _ = f(raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6]);
-        }
-        8 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
-                unsafe { std::mem::transmute(ptr) };
-            let _ = f(
-                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-            );
-        }
-        n => panic!(
-            "call_aot_behavior: unsupported arity {} (add an arity arm)",
-            n
-        ),
-    }
+fn call_aot_behavior(
+    ptr: *const u8,
+    actor_id: u64,
+    raw: &[u64],
+) -> crate::native_abi::NativeActorStatus {
+    let mut ctx = crate::native_abi::NativeActorContext::new(actor_id, raw);
+    // SAFETY: `ptr` is a finalized wrapper produced by
+    // `compile_actor_entry_wrapper` and therefore has exactly the
+    // `NativeActorEntry` ABI.
+    let entry: crate::native_abi::NativeActorEntry = unsafe { std::mem::transmute(ptr) };
+    let raw_status = unsafe { entry(&mut ctx) };
+    crate::native_abi::NativeActorStatus::from_raw(raw_status)
+        .unwrap_or(crate::native_abi::NativeActorStatus::Faulted)
 }
 
 /// `Actor::register_behavior` handler that runs the actor's current message
@@ -1070,7 +1072,18 @@ pub fn aot_behavior_adapter(actor: &mut crate::runtime::Actor, args: &[crate::vm
             actor: actor as *mut crate::runtime::Actor,
         };
         unsafe { crate::jit::runtime::set_jit_callbacks(&mut cb) };
-        call_aot_behavior(target.fn_ptr, &raw);
+        let status = call_aot_behavior(target.fn_ptr, actor.id, &raw);
+        if matches!(
+            status,
+            crate::native_abi::NativeActorStatus::Faulted
+                | crate::native_abi::NativeActorStatus::BadArity
+                | crate::native_abi::NativeActorStatus::AbiMismatch
+        ) {
+            crate::jit::runtime::aot_set_pending_error(format!(
+                "native actor entry failed for actor {}: {:?}",
+                actor.id, status
+            ));
+        }
         crate::jit::runtime::clear_jit_callbacks();
         crate::jit::runtime::aot_clear_constants();
     } else {
@@ -1082,7 +1095,18 @@ pub fn aot_behavior_adapter(actor: &mut crate::runtime::Actor, args: &[crate::vm
             actor_id: actor.id,
         };
         unsafe { crate::jit::runtime::set_jit_callbacks(&mut cb) };
-        call_aot_behavior(target.fn_ptr, &raw);
+        let status = call_aot_behavior(target.fn_ptr, actor.id, &raw);
+        if matches!(
+            status,
+            crate::native_abi::NativeActorStatus::Faulted
+                | crate::native_abi::NativeActorStatus::BadArity
+                | crate::native_abi::NativeActorStatus::AbiMismatch
+        ) {
+            crate::jit::runtime::aot_set_pending_error(format!(
+                "native actor entry failed for actor {}: {:?}",
+                actor.id, status
+            ));
+        }
         crate::jit::runtime::clear_jit_callbacks();
         crate::jit::runtime::aot_clear_constants();
     }
