@@ -56,6 +56,9 @@ version + migration.*
 - **Linear-time JIT module call analysis:** direct-call suspension and recursion gating now share one lazily cached per-module call graph (`src/jit/mod.rs`). Suspension propagates with a reverse worklist and recursion uses iterative SCC traversal instead of an n×n reachability matrix plus Floyd-Warshall.
 - **Cross-shard runtime channel:** the bounded shard bus now uses Crossbeam channels (`src/runtime/mod.rs`) instead of `std::sync::mpsc::sync_channel`, preserving the 1024-message capacity and non-blocking admission/backpressure semantics.
 - **Medium actor-heap size classes:** actor-local bump/free-list allocation now covers 512 B, 1 KiB, 2 KiB, and 4 KiB classes (`src/runtime/heap.rs`), moving the LOS cutoff from 256 B to 4 KiB so common medium arrays/records/maps/strings avoid individual global allocations.
+- **Relaxed mailbox accounting atomics:** mailbox capacity/length accounting now uses relaxed atomic ordering while `SegQueue` remains the actual message publication synchronization edge (`src/runtime/mailbox.rs`).
+- **MIR scalar copy propagation and constant-branch pruning:** canonical MIR optimization removes redundant definitely-scalar block-local copies, folds locally-proven Bool branches, prunes unreachable blocks while preserving effect-handler roots, and keeps `Panic` observable (`src/mir_codegen.rs`).
+- **Compiler-latency benchmark baseline:** Criterion now times frontend→MIR, source→bytecode, and bounded source→native-AOT compilation (`benches/compiler_bench.rs`), wired into the real `bench_main` harness.
 
 
 ### Typed JIT native SSA across arithmetic, loops, and simple CFGs — 2026-09-22
