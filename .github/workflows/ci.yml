@@ -92,14 +92,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --all-targets
+        run: cargo build --locked --all-targets
 
       - name: Test
         run: |
           # The five-node split-brain cluster test is known to be timing-
           # sensitive on GitHub Actions shared runners. Retry the whole suite
           # once on failure so a single flaky run does not block merges.
-          cargo test || (echo "Retrying test suite after flaky failure..." && cargo test)
+          cargo test --locked || (echo "Retrying test suite after flaky failure..." && cargo test --locked)
 
       - name: Install cargo-llvm-cov
         if: env.CODECOV_TOKEN != ''
@@ -107,7 +107,7 @@ jobs:
 
       - name: Generate coverage report
         if: env.CODECOV_TOKEN != ''
-        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+        run: cargo llvm-cov --locked --all-features --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
         if: env.CODECOV_TOKEN != ''
@@ -141,10 +141,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Test (release)
-        run: cargo test --release
+        run: cargo test --locked --release
 
 
   # -----------------------------------------------------------------------
@@ -174,7 +174,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build nulang (release)
-        run: cargo build --release --bin nulang
+        run: cargo build --locked --release --bin nulang
 
       - name: Smoke test (eval)
         run: ./target/release/nulang --eval 'perform IO.print("hello")'
@@ -206,13 +206,13 @@ jobs:
       # No python3-dev installed here on purpose: this job proves the
       # no-default-features build has zero PyO3/SQLite/LSP dependencies.
       - name: Build
-        run: cargo build --all-targets --no-default-features
+        run: cargo build --locked --all-targets --no-default-features
 
       - name: Test
-        run: cargo test --no-default-features
+        run: cargo test --locked --no-default-features
 
       - name: Check zero warnings
-        run: cargo check --tests --no-default-features
+        run: cargo check --locked --tests --no-default-features
 
   # -----------------------------------------------------------------------
   # WASM backend
@@ -234,10 +234,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --all-targets --features wasm-backend
+        run: cargo build --locked --all-targets --features wasm-backend
 
       - name: Test
-        run: cargo test --features wasm-backend
+        run: cargo test --locked --features wasm-backend
 
   # -----------------------------------------------------------------------
   # Lint — format, clippy, audit, docs, all-features check
@@ -266,19 +266,19 @@ jobs:
 
       # Clippy with default features — correctness lints are blocking.
       - name: Clippy (default features)
-        run: cargo clippy --all-targets -- -D clippy::correctness
+        run: cargo clippy --locked --all-targets -- -D clippy::correctness
 
       # Clippy with all features — catches wasm-backend code paths.
       - name: Clippy (all features)
-        run: cargo clippy --all-targets --all-features -- -D clippy::correctness
+        run: cargo clippy --locked --all-targets --all-features -- -D clippy::correctness
 
       # Clippy with no default features — catches minimal-build code paths.
       - name: Clippy (no default features)
-        run: cargo clippy --all-targets --no-default-features -- -D clippy::correctness
+        run: cargo clippy --locked --all-targets --no-default-features -- -D clippy::correctness
 
       # Zero compiler warnings on the main build path.
       - name: Check zero warnings (tests)
-        run: cargo check --tests
+        run: cargo check --locked --tests
 
       # Security audit of dependency tree.
       - name: Audit (cargo-audit)
@@ -288,15 +288,15 @@ jobs:
 
       # All-features compilation check.
       - name: Check all features
-        run: cargo check --all-features
+        run: cargo check --locked --all-features
 
       # Documentation builds without errors.
       - name: Check docs
-        run: cargo doc --no-deps
+        run: cargo doc --locked --no-deps
 
       # Documentation warnings are non-blocking but visible.
       - name: Doc warnings (info only)
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps 2>&1 || true
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps 2>&1 || true
 
   # -----------------------------------------------------------------------
   # Lean formalization — verifies the formal specs compile
@@ -344,7 +344,7 @@ jobs:
   # run-to-run noise, so a naive fixed threshold would fail PRs for
   # noise, not real regressions). Runs on push to main only (not every
   # PR) since a full criterion run of every group is slow; results are
-  # committed back so PERFORMANCE_ANALYSIS.md can cite real numbers
+  # persisted on a dedicated automation branch so regression history is retained
   # instead of estimates. The gate needs >= 3 prior commits' worth of
   # history for a given benchmark before it will fail anything, so
   # early runs (and brand-new benchmarks) are informational only until
@@ -370,35 +370,59 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run benchmarks
-        run: cargo bench --bench bench_main
+        run: cargo bench --locked --bench bench_main
 
       - name: Collect results
         run: |
           python3 scripts/collect_bench_results.py \
-            --out "benchmarks/$(git rev-parse --short HEAD).json"
+            --out "benchmarks/${{ github.sha }}.json"
+
+      # Keep generated history off protected main. Pull prior JSON from the
+      # dedicated history branch so regression checks retain their rolling
+      # baseline without mutating the branch being validated.
+      - name: Load benchmark history
+        env:
+          BENCH_HISTORY_BRANCH: automation/benchmark-history
+        run: |
+          git fetch origin "${BENCH_HISTORY_BRANCH}" || true
+          if git rev-parse --verify "origin/${BENCH_HISTORY_BRANCH}" >/dev/null 2>&1; then
+            git ls-tree -r --name-only "origin/${BENCH_HISTORY_BRANCH}" benchmarks |
+              while read -r path; do
+                case "${path}" in
+                  *.json)
+                    if [ ! -e "${path}" ]; then
+                      mkdir -p "$(dirname "${path}")"
+                      git show "origin/${BENCH_HISTORY_BRANCH}:${path}" > "${path}"
+                    fi
+                    ;;
+                esac
+              done
+          fi
 
       - name: Check for regressions
         id: regression_check
         continue-on-error: true
         run: |
           python3 scripts/check_bench_regression.py \
-            --latest "benchmarks/$(git rev-parse --short HEAD).json" \
+            --latest "benchmarks/${{ github.sha }}.json" \
             --history-dir benchmarks
 
       - name: Upload results as build artifact
         uses: actions/upload-artifact@v7
         with:
           name: bench-results-${{ github.sha }}
-          path: benchmarks/*.json
+          path: benchmarks/${{ github.sha }}.json
           retention-days: 90
 
-      - name: Commit results to benchmarks/
+      - name: Persist benchmark history
+        env:
+          BENCH_HISTORY_BRANCH: automation/benchmark-history
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "benchmarks/$(git rev-parse --short HEAD).json"
-          git diff --staged --quiet || git commit -m "bench: record results for $(git rev-parse --short HEAD) [skip ci]"
-          git push
+          git add benchmarks/*.json
+          git diff --staged --quiet || git commit -m "bench: record results for ${{ github.sha }} [skip ci]"
+          git push --force-with-lease origin "HEAD:refs/heads/${BENCH_HISTORY_BRANCH}"
 
       # Separate from the check step itself so the commit above always
       # happens (preserving complete rolling-window history) even when
