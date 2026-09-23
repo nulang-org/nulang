@@ -278,7 +278,10 @@ mod tests {
         assert_eq!(graph.commitments[0].status, CommitmentStatus::Fulfilled);
         assert_eq!(graph.intentions.len(), 1);
         assert_eq!(graph.intentions[0].status, IntentionStatus::Completed);
-        assert_eq!(graph.intentions[0].planned_task_ids.len(), graph.tasks.len());
+        assert_eq!(
+            graph.intentions[0].planned_task_ids.len(),
+            graph.tasks.len()
+        );
         let _ = std::fs::remove_dir_all(tmp);
     }
 }
