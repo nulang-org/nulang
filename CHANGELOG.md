@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### Actor density and mailbox hot-path allocation — 2026-09-23
+- **Idle actors no longer materialize their 16 KiB ORCA bump block at spawn** (`src/runtime/heap.rs`). The configured first-block capacity is preserved, but allocation is deferred until the first small-object heap allocation; LOS-only actors also remain bump-block-free.
+- **Flight recorders preserve the 1,000-entry retention contract without preallocating 1,000 trace slots per actor** (`src/runtime/actor.rs`). Backing storage grows only after a trace is recorded, and zero-capacity recorders are safe no-ops.
+- **Mailbox logical-count atomics use relaxed ordering** (`src/runtime/mailbox.rs`) because Crossbeam `SegQueue` owns message publication/synchronization; the atomic counter remains solely capacity/accounting state and its modification order still prevents bounded producers from over-reserving.
+- **Criterion now tracks `actor/spawn_idle/1000`** so actor-density allocation changes have a direct throughput regression signal.
+
 ### RFC 0008 migration compatibility substrate — 2026-09-23
 - **Entity migration graphs are now validated before lowering** (`src/typechecker.rs`). Schema versions must be positive; migration steps must advance exactly one version, cannot duplicate an origin or target beyond the current schema, and must form a complete 1→current chain. Invalid skipped-version and downgrade conformance cases now fail compilation instead of silently running.
 - **Migration compatibility metadata now survives HIR→MIR lowering** (`src/mir_lower.rs`, `src/bytecode.rs`) instead of being replaced with an empty `ActorMeta.migrations` payload.
