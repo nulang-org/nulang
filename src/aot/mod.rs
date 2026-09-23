@@ -1061,16 +1061,12 @@ pub fn aot_behavior_adapter(actor: &mut crate::runtime::Actor, args: &[crate::vm
         };
         unsafe { crate::jit::runtime::set_jit_callbacks(&mut cb) };
         let status = call_aot_behavior(target.fn_ptr, actor.id, &raw);
-        if matches!(
-            status,
-            crate::native_abi::NativeActorStatus::Faulted
-                | crate::native_abi::NativeActorStatus::BadArity
-                | crate::native_abi::NativeActorStatus::AbiMismatch
-        ) {
-            crate::jit::runtime::aot_set_pending_error(format!(
-                "native actor entry failed for actor {}: {:?}",
-                actor.id, status
-            ));
+        if status != crate::native_abi::NativeActorStatus::Completed {
+            tracing::warn!(
+                actor_id = actor.id,
+                ?status,
+                "native actor entry returned a non-completed status"
+            );
         }
         crate::jit::runtime::clear_jit_callbacks();
         crate::jit::runtime::aot_clear_constants();
@@ -1084,16 +1080,12 @@ pub fn aot_behavior_adapter(actor: &mut crate::runtime::Actor, args: &[crate::vm
         };
         unsafe { crate::jit::runtime::set_jit_callbacks(&mut cb) };
         let status = call_aot_behavior(target.fn_ptr, actor.id, &raw);
-        if matches!(
-            status,
-            crate::native_abi::NativeActorStatus::Faulted
-                | crate::native_abi::NativeActorStatus::BadArity
-                | crate::native_abi::NativeActorStatus::AbiMismatch
-        ) {
-            crate::jit::runtime::aot_set_pending_error(format!(
-                "native actor entry failed for actor {}: {:?}",
-                actor.id, status
-            ));
+        if status != crate::native_abi::NativeActorStatus::Completed {
+            tracing::warn!(
+                actor_id = actor.id,
+                ?status,
+                "native actor entry returned a non-completed status"
+            );
         }
         crate::jit::runtime::clear_jit_callbacks();
         crate::jit::runtime::aot_clear_constants();
