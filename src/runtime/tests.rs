@@ -2163,6 +2163,44 @@ fn test_libsql_store_append_read_journal() {
 
 #[cfg(feature = "sqlite")]
 #[test]
+fn test_libsql_store_preserves_multiple_event_fields_at_same_sequence() {
+    let mut store = LibsqlStore::in_memory().unwrap();
+    store
+        .append_event(
+            1,
+            EventEntry {
+                sequence: 1,
+                field_name: "balance".to_string(),
+                event_name: "Deposited".to_string(),
+                args: vec![PersistedValue::Int(25)],
+                value: PersistedValue::Int(125),
+            },
+        )
+        .unwrap();
+    store
+        .append_event(
+            1,
+            EventEntry {
+                sequence: 1,
+                field_name: "attempts".to_string(),
+                event_name: "Deposited".to_string(),
+                args: vec![PersistedValue::Int(25)],
+                value: PersistedValue::Int(7),
+            },
+        )
+        .unwrap();
+
+    let mut events = store.read_events(1);
+    events.sort_by(|a, b| a.field_name.cmp(&b.field_name));
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].field_name, "attempts");
+    assert_eq!(events[0].value, PersistedValue::Int(7));
+    assert_eq!(events[1].field_name, "balance");
+    assert_eq!(events[1].value, PersistedValue::Int(125));
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
 fn test_libsql_store_latest_sequence() {
     let mut store = LibsqlStore::in_memory().unwrap();
     store
