@@ -2595,14 +2595,14 @@ pub struct VM {
     /// 256 registers.
     #[cfg(feature = "native-codegen")]
     jit_register_copy_lens: Vec<Vec<u16>>,
-    /// Stable per-frame-depth JIT register scratch buffers.
+    /// Reusable per-frame-depth JIT register scratch buffers.
     ///
-    /// Boxes keep an outer compiled region's register pointer stable while a
-    /// re-entrant direct call grows this Vec and runs a nested JIT region.
-    /// Buffers are initialized once and reused, so hot JIT entry does not
-    /// memset a fresh 2 KiB array on every transition.
+    /// Each Box is temporarily taken out of the VM before native execution,
+    /// so a re-entrant `&mut VM` never overlaps an active mutable reference
+    /// into VM-owned scratch storage. The allocation is restored afterward and
+    /// reused, avoiding a fresh 2 KiB buffer on every JIT transition.
     #[cfg(feature = "native-codegen")]
-    jit_reg_scratch: Vec<Box<[u64; 256]>>,
+    jit_reg_scratch: Vec<Option<Box<[u64; 256]>>>,
     /// Runtime error raised by a re-entrant JIT direct call (taken from the
     /// JIT pending-error thread-local in `try_jit_execute`; consumed by
     /// `step` so the error surfaces as a VM error). None when the last JIT
@@ -3687,13 +3687,12 @@ impl VM {
             .min(256);
 
         while self.jit_reg_scratch.len() <= frame_idx {
-            self.jit_reg_scratch
-                .push(Box::new([Value::nil().to_bits(); 256]));
+            self.jit_reg_scratch.push(None);
         }
-        let regs_ptr: *mut [u64; 256] = self.jit_reg_scratch[frame_idx].as_mut();
-        // SAFETY: every frame depth owns a distinct stable Box.
-        let regs = unsafe { &mut *regs_ptr };
-        for (dst, src) in regs[..copy_len]
+        let mut regs_box = self.jit_reg_scratch[frame_idx]
+            .take()
+            .unwrap_or_else(|| Box::new([Value::nil().to_bits(); 256]));
+        for (dst, src) in regs_box[..copy_len]
             .iter_mut()
             .zip(self.frames[frame_idx].regs[..copy_len].iter())
         {
@@ -3702,7 +3701,7 @@ impl VM {
         // r254 is reserved for direct-call staging and can sit outside the
         // ordinary MIR local prefix.
         if copy_len <= 254 {
-            regs[254] = self.frames[frame_idx].regs[254].to_bits();
+            regs_box[254] = self.frames[frame_idx].regs[254].to_bits();
         }
 
         // No Rust borrow into VM-owned module/backend/constant-cache storage
@@ -3716,7 +3715,7 @@ impl VM {
             crate::jit::runtime::set_jit_vm(self_ptr, module_idx);
         }
 
-        let action = jit.execute_compiled(module_idx, pc, regs, &constants);
+        let action = jit.execute_compiled(module_idx, pc, regs_box.as_mut(), &constants);
 
         crate::jit::runtime::clear_jit_vm();
         crate::jit::runtime::clear_jit_callbacks();
@@ -3737,14 +3736,21 @@ impl VM {
         if action != TieredAction::Interpret {
             for (dst, bits) in self.frames[frame_idx].regs[..copy_len]
                 .iter_mut()
-                .zip(regs[..copy_len].iter())
+                .zip(regs_box[..copy_len].iter())
             {
                 *dst = unsafe { Value::from_bits(*bits) };
             }
             if copy_len <= 254 {
-                self.frames[frame_idx].regs[254] = unsafe { Value::from_bits(regs[254]) };
+                self.frames[frame_idx].regs[254] = unsafe { Value::from_bits(regs_box[254]) };
             }
+        }
 
+        // Native execution is over; return the reusable allocation to the VM
+        // only after no mutable reference into it remains live.
+        debug_assert!(self.jit_reg_scratch[frame_idx].is_none());
+        self.jit_reg_scratch[frame_idx] = Some(regs_box);
+
+        if action != TieredAction::Interpret {
             // A re-entrant callee raised a runtime error. Surface it before
             // handling normal branch exits or safepoint yields.
             if let Some(msg) = crate::jit::runtime::take_jit_pending_vm_error() {
