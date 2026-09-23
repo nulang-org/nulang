@@ -31,6 +31,7 @@ pub struct AgentStateTransition<'a> {
     pub terminal_task: Option<&'a Task>,
     pub intention: &'a Intention,
     pub replacement_intention: Option<&'a Intention>,
+    pub replacement_tasks: &'a [Task],
     pub revision: Option<&'a IntentionRevision>,
     pub commitment: Option<&'a Commitment>,
     pub goal: Option<&'a Goal>,
@@ -229,6 +230,9 @@ impl SqliteStore {
         upsert_intention_conn(&tx, transition.intention)?;
         if let Some(replacement) = transition.replacement_intention {
             upsert_intention_conn(&tx, replacement)?;
+            for task in transition.replacement_tasks {
+                upsert_task_conn(&tx, task)?;
+            }
         }
         if let Some(revision) = transition.revision {
             insert_intention_revision_conn(&tx, revision)?;
@@ -700,6 +704,19 @@ fn validate_agent_state_transition(
                     "replacement intention does not match the revision",
                 ));
             }
+            if replacement.planned_task_ids.len() != transition.replacement_tasks.len()
+                || transition
+                    .replacement_tasks
+                    .iter()
+                    .zip(replacement.planned_task_ids.iter())
+                    .any(|(task, planned_id)| {
+                        task.id != *planned_id || task.goal_id != intention.goal_id
+                    })
+            {
+                return Err(StoreError::InvalidTransition(
+                    "replacement tasks do not match the replacement intention plan",
+                ));
+            }
         } else if revision.replacement_intention_id.is_some() {
             return Err(StoreError::InvalidTransition(
                 "revision names a replacement intention that was not supplied",
@@ -708,6 +725,16 @@ fn validate_agent_state_transition(
     } else if transition.replacement_intention.is_some() {
         return Err(StoreError::InvalidTransition(
             "replacement intention requires a revision record",
+        ));
+    } else if !transition.replacement_tasks.is_empty() {
+        return Err(StoreError::InvalidTransition(
+            "replacement tasks require a replacement intention",
+        ));
+    }
+
+    if transition.replacement_intention.is_none() && !transition.replacement_tasks.is_empty() {
+        return Err(StoreError::InvalidTransition(
+            "replacement tasks require a replacement intention",
         ));
     }
 
@@ -1199,6 +1226,7 @@ mod tests {
                 terminal_task: Some(&task),
                 intention: &intention,
                 replacement_intention: None,
+                replacement_tasks: &[],
                 revision: Some(&revision),
                 commitment: Some(&commitment),
                 goal: Some(&goal),
@@ -1255,6 +1283,7 @@ mod tests {
                 terminal_task: Some(&task),
                 intention: &intention,
                 replacement_intention: None,
+                replacement_tasks: &[],
                 revision: Some(&revision),
                 commitment: Some(&commitment),
                 goal: Some(&goal),
@@ -1279,6 +1308,7 @@ mod tests {
                 terminal_task: Some(&task),
                 intention: &intention,
                 replacement_intention: None,
+                replacement_tasks: &[],
                 revision: Some(&revision),
                 commitment: Some(&commitment),
                 goal: Some(&goal),
@@ -1297,6 +1327,7 @@ mod tests {
                 terminal_task: Some(&task),
                 intention: &intention,
                 replacement_intention: None,
+                replacement_tasks: &[],
                 revision: Some(&revision),
                 commitment: Some(&commitment),
                 goal: Some(&goal),
@@ -1364,8 +1395,12 @@ mod tests {
             vec![second_task.id],
         );
         second_intention.status = IntentionStatus::Active;
-        let second_resumption =
-            CommitmentResumption::new(request_id, &blocked, second_intention.id, "dependency ready");
+        let second_resumption = CommitmentResumption::new(
+            request_id,
+            &blocked,
+            second_intention.id,
+            "dependency ready",
+        );
         let second = store
             .commit_agent_resume_transition(AgentResumeTransition {
                 blocked_intention: &blocked,
@@ -1382,8 +1417,7 @@ mod tests {
             other => panic!("expected AlreadyApplied, got {other:?}"),
         };
         assert_eq!(
-            existing.replacement_intention_id,
-            first_intention.id,
+            existing.replacement_intention_id, first_intention.id,
             "the first committed replacement plan owns the request id"
         );
 
@@ -1442,6 +1476,7 @@ mod tests {
                 terminal_task: Some(&task),
                 intention: &intention,
                 replacement_intention: None,
+                replacement_tasks: &[],
                 revision: None,
                 commitment: Some(&commitment),
                 goal: Some(&goal),
