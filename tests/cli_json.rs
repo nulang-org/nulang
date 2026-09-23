@@ -238,7 +238,10 @@ fn nula_build_wasm_emits_behavior_manifest_bound_to_wasm() {
     let cwasm_path = dir.join(".nula/dist/jsonprobe.cwasm");
     let behavior_path = dir.join(".nula/dist/jsonprobe.behavior.json");
     assert!(wasm_path.exists(), "build-wasm must emit canonical wasm");
-    assert!(cwasm_path.exists(), "build-wasm must emit precompiled cwasm");
+    assert!(
+        cwasm_path.exists(),
+        "build-wasm must emit precompiled cwasm"
+    );
     assert!(
         behavior_path.exists(),
         "build-wasm must emit RFC 0020 behavior sidecar"
