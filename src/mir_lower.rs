@@ -2914,6 +2914,38 @@ mod tests {
     }
 
     #[test]
+    fn test_entity_migration_metadata_survives_into_mir() {
+        let module = lower_source(
+            r#"
+            entity Counter {
+                version: 2
+                state count: Int = 0
+                behavior get() { self.count }
+                migration from 1 to 2 {
+                    state => { 0 }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let meta = module
+            .actor_metadata
+            .iter()
+            .find(|meta| meta.name == "Counter")
+            .expect("Counter actor metadata");
+        assert_eq!(meta.version, 2);
+
+        let migrations: serde_json::Value =
+            serde_json::from_str(&meta.migrations).expect("migration metadata JSON");
+        let steps = migrations.as_array().expect("migration metadata array");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0]["from"].as_u64(), Some(1));
+        assert_eq!(steps[0]["to"].as_u64(), Some(2));
+        assert_eq!(steps[0]["state"].as_bool(), Some(true));
+    }
+
+    #[test]
     fn test_par_region_markers_survive_into_mir() {
         let module = lower_source("par { 1; 2; 3 }").unwrap();
         let main = find_fn(&module, "__main");
