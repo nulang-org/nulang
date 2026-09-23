@@ -174,34 +174,25 @@ fn try_spawn_actor_with_id(
             }
             state
         };
-        let commit = rt
-            .persistence
-            .append_workflow_event(
-                id,
-                WorkflowEvent::WorkflowStarted {
-                    sequence: seq,
-                    name: workflow_name.as_ref().unwrap().clone(),
-                    state,
-                },
-            )
-            .and_then(|_| crate::runtime::workflow::try_checkpoint_actor(rt, id));
+        let commit = crate::runtime::workflow::commit_workflow_event(
+            rt,
+            id,
+            WorkflowEvent::WorkflowStarted {
+                sequence: seq,
+                name: workflow_name.as_ref().unwrap().clone(),
+                state,
+            },
+        );
         if let Err(error) = commit {
             rt.actors.remove(&id);
             if let Some(ref mut mgr) = rt.crdt_manager {
                 mgr.unregister_actor_fields(id);
             }
 
-            // WorkflowStarted may already have committed when the initial
-            // snapshot fails. A failed spawn must not leave that half-created
-            // durable identity behind for later recovery/reconciliation.
-            if let Err(cleanup_error) = rt.persistence.clear(id) {
-                return Err(std::io::Error::new(
-                    error.kind(),
-                    format!(
-                        "{error}; failed to clear partial durable workflow state: {cleanup_error}"
-                    ),
-                ));
-            }
+            // Atomic workflow creation either commits the journal entry and
+            // initial snapshot together or leaves no durable identity behind.
+            // Do not issue a compensating clear here: on fencing/conflict
+            // errors that could erase an already-valid prior activation.
             return Err(error);
         }
     }
