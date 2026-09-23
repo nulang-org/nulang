@@ -222,6 +222,35 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// Send a message to an actor by behavior table index.
     fn send_message(&mut self, target: Value, behavior_id: u16, args: &[Value]);
 
+    /// Send a message whose selected payload arguments are proven final uses.
+    ///
+    /// The ordinary send runs first so its transport/local-mailbox path has
+    /// established whatever lifetime protection it needs. The proven sender
+    /// ownership tokens can then be released immediately instead of surviving
+    /// until actor teardown. Runtime-specific callbacks may override this to
+    /// fuse the ownership transition more aggressively.
+    fn send_message_consuming(
+        &mut self,
+        target: Value,
+        behavior_id: u16,
+        args: &[Value],
+        ownership_mask: u16,
+    ) {
+        self.send_message(target, behavior_id, args);
+        for (idx, value) in args.iter().enumerate() {
+            if ownership_mask & (1u16 << idx) == 0 {
+                continue;
+            }
+            if let Some(ptr) = value.as_ptr() {
+                // Arena allocations are reclaimed as a region and do not
+                // participate in ORCA local-ref accounting.
+                if !self.is_arena_ptr(ptr) {
+                    self.drop_ref(ptr);
+                }
+            }
+        }
+    }
+
     /// Synchronously ask an actor and return its response.
     /// Default implementation sends the message and returns nil.
     fn ask_actor(&mut self, target: Value, behavior_id: u16, args: &[Value]) -> Value {
@@ -5109,8 +5138,18 @@ impl VM {
                     .map(|b| (b.param_count, behavior_idx as u16))
                     .unwrap_or((0, 0));
                 let args: Vec<Value> = (0..param_count).map(|i| frame.regs[i]).collect();
-                self.actor_callbacks
-                    .send_message(actor_val, behavior_id, &args);
+                let ownership_mask = module.send_ownership_mask_at(pc);
+                if ownership_mask == 0 {
+                    self.actor_callbacks
+                        .send_message(actor_val, behavior_id, &args);
+                } else {
+                    self.actor_callbacks.send_message_consuming(
+                        actor_val,
+                        behavior_id,
+                        &args,
+                        ownership_mask,
+                    );
+                }
                 return Ok(());
             }
             OpCode::Ask => {
