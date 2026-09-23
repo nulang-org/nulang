@@ -598,9 +598,12 @@ impl LocalRuntime {
             let batch_len = pending.len();
 
             for record in pending {
-                let event_id = record.envelope.event_id.ok_or(StoreError::InvalidTransition(
-                    "pending outbox event is missing a stable event id",
-                ))?;
+                let event_id = record
+                    .envelope
+                    .event_id
+                    .ok_or(StoreError::InvalidTransition(
+                        "pending outbox event is missing a stable event id",
+                    ))?;
                 let line = format_event_line(&record.envelope)?;
                 writeln!(out, "{}", line)?;
                 out.flush()?;
