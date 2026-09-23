@@ -1924,7 +1924,11 @@ impl TypeChecker {
             // source order, so the expression has tuple result semantics.
             Expr::Par { exprs, span } => {
                 crate::parallel_analysis::validate_parallel_branches(exprs, *span)?;
-                self.infer_tuple(ctx, exprs, *span)
+                if exprs.is_empty() {
+                    Ok((vec![], Type::unit()))
+                } else {
+                    self.infer_tuple(ctx, exprs, *span)
+                }
             }
 
             // Spawn actor
