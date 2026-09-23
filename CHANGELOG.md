@@ -51,6 +51,13 @@ version + migration.*
 
 ## Stable tier
 
+### Semantic effect-site artifact metadata — 2026-09-23
+- **Bytecode artifacts now carry an additive `effect_sites` metadata sidecar** mapping the exact `Perform` / `PerformDirect` / `PerformAsync` instruction PC to the compiler-owned semantic effect-site digest and qualified operation. Opcode bytes and NBC format version remain unchanged.
+- **MIR codegen captures semantic sites before optimization and consumes them while emitting effects.** If optimization ever removes or reorders observable effect operations, codegen fails instead of silently attaching an incorrect durable identity.
+- Effect metadata is attached after argument staging, so the recorded PC points at the effect opcode itself rather than preceding spill/move instructions.
+- NBC round-trip tests pin metadata preservation, legacy artifacts without the field default to an empty sidecar, and formatting-only source changes preserve the semantic site digest.
+
+
 ### Compiler-owned semantic effect-site identity — 2026-09-23
 - **MIR can now derive backend-independent `EffectSiteId` values for every `Perform` / `PerformAsync` site.** Identity is domain-separated by module, owner kind, fully qualified function/behavior name, effect operation, and same-operation ordinal; source spans, compiler-generated local/block IDs, and bytecode PCs are deliberately excluded.
 - **Durable invocation identity can compose semantic site identity with durable execution identity.** `DurableEffectId::derive_from_site` combines actor identity, a replay-stable execution key, the compiler-owned site ID, and a dynamic occurrence index so repeated execution of one site inside a loop remains distinguishable while retries remain stable.
