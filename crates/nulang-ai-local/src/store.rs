@@ -726,10 +726,6 @@ fn validate_agent_state_transition(
         return Err(StoreError::InvalidTransition(
             "replacement intention requires a revision record",
         ));
-    } else if !transition.replacement_tasks.is_empty() {
-        return Err(StoreError::InvalidTransition(
-            "replacement tasks require a replacement intention",
-        ));
     }
 
     if transition.replacement_intention.is_none() && !transition.replacement_tasks.is_empty() {
