@@ -1104,6 +1104,43 @@ mod tests {
         }
     }
 
+    struct FailOnReplanFlushWriter {
+        bytes: Vec<u8>,
+        fail_next_flush: bool,
+        failed_once: bool,
+    }
+
+    impl FailOnReplanFlushWriter {
+        fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                fail_next_flush: false,
+                failed_once: false,
+            }
+        }
+    }
+
+    impl std::io::Write for FailOnReplanFlushWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            if String::from_utf8_lossy(&self.bytes).contains("\"intention_revised\"") {
+                self.fail_next_flush = true;
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_next_flush && !self.failed_once {
+                self.failed_once = true;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected replan delivery failure",
+                ));
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn runtime_emits_nlap_events() {
         let tmp = std::env::temp_dir().join(format!("nulang-agent-test-{}", Uuid::new_v4()));
@@ -1360,6 +1397,69 @@ mod tests {
         assert_eq!(duplicate.resumptions.len(), 1);
         assert_eq!(duplicate.intentions.len(), intentions_before);
         assert_eq!(duplicate.tasks.len(), tasks_before);
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn resumed_goal_recovers_latest_active_replan_after_restart() {
+        let tmp =
+            std::env::temp_dir().join(format!("nulang-agent-resume-replan-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut first = runtime_with_worker(&tmp, vec![TaskStatus::Blocked]);
+        let mut initial_out = std::io::Cursor::new(Vec::new());
+        let goal_id = first
+            .handle_user_message("ship feature X", &mut initial_out)
+            .unwrap();
+        drop(first);
+
+        let request_id = Uuid::new_v4();
+        let mut second = LocalRuntime::open_with_worker(
+            tmp.clone(),
+            Box::new(ScriptedWorker::new([
+                TaskStatus::Failed,
+                TaskStatus::Completed,
+            ])),
+        )
+        .unwrap();
+        let mut failing = FailOnReplanFlushWriter::new();
+        let err = second
+            .resume_goal(goal_id, request_id, "dependency recovered", &mut failing)
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Io(_)));
+
+        let replanned = second.store().get_goal_graph(goal_id).unwrap();
+        assert_eq!(replanned.goal.status, GoalStatus::Running);
+        assert_eq!(replanned.resumptions.len(), 1);
+        assert_eq!(replanned.intentions.len(), 3);
+        assert_eq!(replanned.intentions[0].status, IntentionStatus::Blocked);
+        assert_eq!(replanned.intentions[1].status, IntentionStatus::Failed);
+        assert_eq!(replanned.intentions[2].status, IntentionStatus::Active);
+        let replan_tasks =
+            ordered_tasks_for_intention(&replanned.tasks, &replanned.intentions[2]).unwrap();
+        assert_eq!(replan_tasks.len(), 1);
+        assert_eq!(replan_tasks[0].status, TaskStatus::Created);
+        drop(second);
+
+        let mut third = LocalRuntime::open_with_worker(
+            tmp.clone(),
+            Box::new(ScriptedWorker::new([TaskStatus::Completed])),
+        )
+        .unwrap();
+        let mut recovered_out = std::io::Cursor::new(Vec::new());
+        third
+            .resume_goal(goal_id, request_id, "dependency recovered", &mut recovered_out)
+            .unwrap();
+
+        let completed = third.store().get_goal_graph(goal_id).unwrap();
+        assert_eq!(completed.goal.status, GoalStatus::Completed);
+        assert_eq!(completed.resumptions.len(), 1);
+        assert_eq!(completed.intentions.len(), 3);
+        assert_eq!(completed.intentions[2].status, IntentionStatus::Completed);
+        assert!(String::from_utf8(recovered_out.into_inner())
+            .unwrap()
+            .contains("task_completed"));
 
         let _ = std::fs::remove_dir_all(tmp);
     }
