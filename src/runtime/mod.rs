@@ -3244,9 +3244,12 @@ impl Runtime {
                 .map(|((_, name), id)| (name.clone(), id.0))
                 .collect()
         });
+        let actor = self.actors.get(&actor_id)?;
         Some(ActorSnapshot {
             actor_id,
             sequence,
+            schema_owner: actor.schema_owner.clone(),
+            schema_version: actor.schema_version,
             state,
             waiting_signal,
             crdt_snapshot,
