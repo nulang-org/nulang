@@ -54,6 +54,7 @@ version + migration.*
 ### Durable event and workflow commit invariants — 2026-09-22
 - **Event emission no longer invents mutations for integer event-sourced fields** (`src/runtime/workflow.rs`). Source-level `apply` handlers or explicit behavior code are now the sole authority for domain-state evolution; the runtime records the resulting post-apply value for recovery.
 - **Durable workflow timers and signals now fail closed when their journal/checkpoint commit fails.** A timer is not armed until `TimerSet` commits, a fired workflow timer is not delivered until `TimerFired` commits, and a signal is not admitted/resumed until `SignalReceived` commits. Saga compensation completion is likewise not marked in memory unless `SagaCompensated` commits.
+- **Multi-field event-sourced state is preserved by every persistence backend.** libSQL/Postgres now key event rows by `(actor_id, sequence, field_name)` (with additive legacy-table migration), and RocksDB includes the field name in its event key, so one `emit` can durably record several event-sourced fields without collision or overwrite.
 
 
 ### Temporary concatenated-string reclamation — 2026-09-22
