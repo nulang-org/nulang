@@ -2242,8 +2242,8 @@ For example, an `entity Counter` with
 `increment(3)` then `increment(4)`, reaches `count = 7`
 (`conformance/behavior/persist_07_emit_accumulates_across_sends.nula`).
 An unrelated event-sourced integer field remains unchanged by those emits;
-`persist_08_emit_bumps_all_event_sourced` is retained as a historical test
-identifier but now pins the corrected result (no implicit bump).
+`persist_08_emit_does_not_mutate_unrelated_state` pins the same invariant for
+unrelated event-sourced fields.
 
 A related, more severe bug was found and fixed alongside this: before
 this session, `recover_actor` never restored `Actor.state_models` (the
