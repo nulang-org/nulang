@@ -369,6 +369,12 @@ impl DurableTransition {
             }
         }
         if let Some(snapshot) = &self.snapshot {
+            if snapshot.schema_version == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "durable transition snapshot schema version must be positive",
+                ));
+            }
             if snapshot.actor_id != self.actor_id {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
