@@ -3,8 +3,8 @@
 use chrono::{DateTime, Utc};
 use nulang_ai_core::{
     Commitment, CommitmentStatus, ConversationState, Goal, GoalGraph, GoalStatus, Intention,
-    IntentionRevision, IntentionRevisionDecision, IntentionStatus, ManagerKind, SwarmEvent,
-    SwarmEventEnvelope, Task, TaskStatus,
+    IntentionRevision, IntentionRevisionDecision, IntentionStatus, ManagerKind, SwarmEventEnvelope,
+    Task, TaskStatus,
 };
 use rusqlite::{params, Connection, TransactionBehavior};
 use std::path::{Path, PathBuf};
@@ -880,6 +880,7 @@ fn parse_manager_kind(raw: String) -> ManagerKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nulang_ai_core::SwarmEvent;
 
     fn active_fixture(store: &SqliteStore) -> (Goal, Commitment, Intention, Task) {
         let mut goal = Goal::new("atomic-test", "ship feature", 10.0);
