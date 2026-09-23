@@ -79,29 +79,69 @@ pub struct FlightRecorder {
     max_entries: usize,
 }
 
+fn runtime_flight_recorder_enabled() -> bool {
+    use std::sync::OnceLock;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NULANG_FLIGHT_RECORDER")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
 impl FlightRecorder {
-    /// Create a new flight recorder retaining up to `max_entries` messages.
+    /// Create an enabled flight recorder retaining up to `max_entries` messages.
+    ///
+    /// Storage is allocated lazily on the first recorded message rather than
+    /// reserving the whole ring for every actor at spawn time.
     pub fn new(max_entries: usize) -> Self {
         FlightRecorder {
-            entries: Vec::with_capacity(max_entries),
+            entries: Vec::new(),
             cursor: 0,
             next_seq: 0,
             max_entries,
         }
     }
 
+    /// Create the runtime-default flight recorder.
+    ///
+    /// Per-actor flight recording is intentionally opt-in in production
+    /// because payload summarization formats values and the ring can grow to a
+    /// meaningful amount of memory across large actor populations. Set
+    /// `NULANG_FLIGHT_RECORDER=1` (or `true`) to enable it for actors
+    /// created by the runtime. Direct callers of `FlightRecorder::new` retain
+    /// the historical always-enabled behavior.
+    pub fn runtime_default(max_entries: usize) -> Self {
+        if cfg!(test) || runtime_flight_recorder_enabled() {
+            Self::new(max_entries)
+        } else {
+            Self::new(0)
+        }
+    }
+
     /// Record a message delivery.
     pub fn record(&mut self, sender: u64, behavior_id: u16, payload: &[Value]) {
+        if self.max_entries == 0 {
+            return;
+        }
+
         let seq = self.next_seq;
         self.next_seq += 1;
 
         let payload_len = payload.len();
-        let payload_summary = payload
-            .iter()
-            .take(3)
-            .map(|v| v.to_string_repr())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let mut payload_summary = String::new();
+        for (idx, value) in payload.iter().take(3).enumerate() {
+            if idx != 0 {
+                payload_summary.push_str(", ");
+            }
+            payload_summary.push_str(&value.to_string_repr());
+        }
 
         let entry = TraceEntry {
             seq,
@@ -385,7 +425,7 @@ impl Actor {
             receive_wait: None,
             timer_sleep_fired: false,
             retry_config: None,
-            flight_recorder: FlightRecorder::new(1000),
+            flight_recorder: FlightRecorder::runtime_default(1000),
             fallback_config: Vec::new(),
             hibernation_state: None,
             idle_ms: 0,
@@ -712,5 +752,30 @@ mod tests {
         assert_eq!(received.behavior_id, 1);
         assert_eq!(received.sender, 99);
         assert_eq!(*received.payload, vec![Value::int(42)]);
+    }
+
+    #[test]
+    fn flight_recorder_storage_is_lazy() {
+        let mut recorder = FlightRecorder::new(4);
+        assert_eq!(recorder.entries.capacity(), 0);
+        assert!(recorder.is_empty());
+
+        recorder.record(7, 3, &[Value::int(42)]);
+
+        assert_eq!(recorder.len(), 1);
+        assert!(recorder.entries.capacity() > 0);
+        assert_eq!(recorder.entries()[0].sender, 7);
+        assert_eq!(recorder.entries()[0].behavior_id, 3);
+        assert_eq!(recorder.entries()[0].payload_summary, "42");
+    }
+
+    #[test]
+    fn zero_capacity_flight_recorder_is_noop() {
+        let mut recorder = FlightRecorder::new(0);
+        recorder.record(7, 3, &[Value::int(42)]);
+
+        assert!(recorder.is_empty());
+        assert_eq!(recorder.entries.capacity(), 0);
+        assert_eq!(recorder.next_seq, 0);
     }
 }

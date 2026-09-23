@@ -2615,10 +2615,13 @@ impl Runtime {
             trace_id: out_trace.clone(),
         };
         let admission = if let Some(actor) = self.actors.get_mut(&target_id) {
-            actor
-                .flight_recorder
-                .record(self.current_actor.unwrap_or(0), behavior_id, args);
             if actor.mailbox.push_local(msg).is_ok() {
+                // Record only messages that were actually admitted. The
+                // runtime-default recorder is disabled unless explicitly
+                // enabled, making this branch effectively free in production.
+                actor
+                    .flight_recorder
+                    .record(self.current_actor.unwrap_or(0), behavior_id, args);
                 // Activity resets the dehydration idle timer.
                 actor.idle_ms = 0;
                 MessageAdmission::Accepted
@@ -4775,13 +4778,33 @@ impl Runtime {
         code_offset: usize,
         args: &[Value],
     ) -> crate::types::NuResult<Value> {
-        let module = match self.actors.get(&actor_id) {
-            Some(a) => match a.bytecode_module.clone() {
-                Some(m) => m,
-                None => return Ok(Value::nil()),
-            },
+        // Avoid cloning the actor's CodeModule on every behavior turn. Once a
+        // module is loaded into the runtime VM, the actor's cached module index
+        // is sufficient for all subsequent executions. A deep CodeModule clone
+        // is now paid only on the actor's first bytecode turn.
+        let existing_module_idx = match self.actors.get(&actor_id) {
+            Some(actor) => actor.bytecode_module_idx,
             None => return Ok(Value::nil()),
         };
+        let module_to_load = if existing_module_idx.is_none() {
+            match self
+                .actors
+                .get(&actor_id)
+                .and_then(|actor| actor.bytecode_module.clone())
+            {
+                Some(module) => Some(module),
+                None => return Ok(Value::nil()),
+            }
+        } else {
+            None
+        };
+
+        // Grain registration only needs the module on first load; keep it
+        // outside the VM execution window so the common cached-index path
+        // touches no CodeModule-owned vectors or strings.
+        if let Some(module) = module_to_load.as_ref() {
+            self.register_module_grains(module);
+        }
 
         let self_ptr: *mut Runtime = self;
         unsafe {
@@ -4790,17 +4813,13 @@ impl Runtime {
             }
             let vm = (*self_ptr).vm.as_mut().unwrap();
 
-            let module_idx = if let Some(idx) = (*self_ptr)
-                .actors
-                .get(&actor_id)
-                .unwrap()
-                .bytecode_module_idx
-            {
+            let module_idx = if let Some(idx) = existing_module_idx {
                 idx
             } else {
                 let idx = vm.modules.len();
-                vm.load_module(module.clone());
-                (*self_ptr).register_module_grains(&module);
+                vm.load_module(
+                    module_to_load.expect("module must exist when bytecode_module_idx is absent"),
+                );
                 if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                     actor.bytecode_module_idx = Some(idx);
                 }

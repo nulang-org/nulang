@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Actor runtime hot-path overhead reduction — 2026-09-23
+- **Per-actor flight recording is now opt-in for runtime-created actors** (`src/runtime/actor.rs`, `src/runtime/mod.rs`). `NULANG_FLIGHT_RECORDER=1` enables the existing recorder; disabled actors reserve no recorder ring storage and skip payload-summary formatting. Explicit `FlightRecorder::new(...)` callers retain enabled behavior, and accepted messages are recorded only after mailbox admission succeeds.
+- **Bytecode actor turns now reuse the cached VM module index without deep-cloning `CodeModule` on every dispatch** (`src/runtime/mod.rs`). The clone/load cost is paid only when an actor first installs its module into the runtime VM; subsequent turns execute directly against `bytecode_module_idx`. Bytecode format and execution semantics are unchanged.
+
 ### RFC 0008 migration compatibility substrate — 2026-09-23
 - **Entity migration graphs are now validated before lowering** (`src/typechecker.rs`). Schema versions must be positive; migration steps must advance exactly one version, cannot duplicate an origin or target beyond the current schema, and must form a complete 1→current chain. Invalid skipped-version and downgrade conformance cases now fail compilation instead of silently running.
 - **Migration compatibility metadata now survives HIR→MIR lowering** (`src/mir_lower.rs`, `src/bytecode.rs`) instead of being replaced with an empty `ActorMeta.migrations` payload.
