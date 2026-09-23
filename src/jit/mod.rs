@@ -1454,6 +1454,10 @@ impl crate::backends::JitBackend for JitSession {
         self.typed_regions.len()
     }
 
+    fn native_leaf_compiled_count(&self) -> usize {
+        self.native_leafs.len()
+    }
+
     fn reset_hot_counters(&mut self) {
         self.hot_counts.clear();
     }
@@ -1481,16 +1485,19 @@ impl crate::backends::JitBackend for JitSession {
         let (region_len, native_calls) =
             find_compilable_region_with_calls(pc, instructions, module, Some(&ms), Some(&rc));
         if region_len >= 3 {
+            let native_leaf_calls =
+                self.native_leaf_calls_for_region(module_idx, module, &native_calls);
             let meta = typed_compiler::infer_reg_types(module, pc);
             let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
             if unsafe {
-                self.compile_region_typed(
+                self.compile_region_typed_with_leaf_calls(
                     module_idx,
                     pc,
                     region_len,
                     instructions,
                     meta_ref,
                     &native_calls,
+                    &native_leaf_calls,
                 )
             }
             .is_some()
