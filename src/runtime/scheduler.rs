@@ -66,6 +66,25 @@ pub fn core_pinning_enabled() -> bool {
     })
 }
 
+/// Scheduler profiling is useful for diagnostics but each counter update is an
+/// atomic RMW on the hottest dequeue path. Keep it enabled by default in debug
+/// builds and opt-in for release via NULANG_SCHEDULER_STATS=1.
+fn scheduler_stats_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NULANG_SCHEDULER_STATS")
+            .map(|v| {
+                let v = v.trim();
+                !(v.is_empty()
+                    || v == "0"
+                    || v.eq_ignore_ascii_case("false")
+                    || v.eq_ignore_ascii_case("off"))
+            })
+            .unwrap_or(cfg!(debug_assertions))
+    })
+}
+
 /// Lightweight, atomics-based profiling metrics for the scheduler.
 ///
 /// All counters are monotonically increasing unless reset via
@@ -97,6 +116,7 @@ pub struct SchedulerStats {
 /// counter traffic does not false-share with scheduler queue metadata.
 #[repr(align(64))]
 struct SchedulerStatsInternal {
+    enabled: bool,
     total_tasks_processed: AtomicU64,
     tasks_from_local_queue: AtomicU64,
     tasks_from_global_queue: AtomicU64,
@@ -108,6 +128,9 @@ struct SchedulerStatsInternal {
 
 impl SchedulerStatsInternal {
     fn snapshot(&self) -> SchedulerStats {
+        if !self.enabled {
+            return SchedulerStats::default();
+        }
         SchedulerStats {
             total_tasks_processed: self.total_tasks_processed.load(Ordering::Relaxed),
             tasks_from_local_queue: self.tasks_from_local_queue.load(Ordering::Relaxed),
@@ -120,6 +143,9 @@ impl SchedulerStatsInternal {
     }
 
     fn reset(&self) {
+        if !self.enabled {
+            return;
+        }
         self.total_tasks_processed.store(0, Ordering::Relaxed);
         self.tasks_from_local_queue.store(0, Ordering::Relaxed);
         self.tasks_from_global_queue.store(0, Ordering::Relaxed);
@@ -187,6 +213,7 @@ impl Scheduler {
             worker_count,
             processed_count: AtomicUsize::new(0),
             stats: SchedulerStatsInternal {
+                enabled: scheduler_stats_enabled(),
                 total_tasks_processed: AtomicU64::new(0),
                 tasks_from_local_queue: AtomicU64::new(0),
                 tasks_from_global_queue: AtomicU64::new(0),
@@ -227,6 +254,9 @@ impl Scheduler {
 
     #[inline]
     fn record_local_task(&self) {
+        if !self.stats.enabled {
+            return;
+        }
         self.stats
             .total_tasks_processed
             .fetch_add(1, Ordering::Relaxed);
@@ -237,6 +267,9 @@ impl Scheduler {
 
     #[inline]
     fn record_global_task(&self) {
+        if !self.stats.enabled {
+            return;
+        }
         self.stats
             .total_tasks_processed
             .fetch_add(1, Ordering::Relaxed);
@@ -247,6 +280,9 @@ impl Scheduler {
 
     #[inline]
     fn record_steal_attempts(&self, attempts: u64) {
+        if !self.stats.enabled {
+            return;
+        }
         if attempts != 0 {
             self.stats
                 .steal_attempts
@@ -256,6 +292,9 @@ impl Scheduler {
 
     #[inline]
     fn record_stolen_task(&self, attempts: u64) {
+        if !self.stats.enabled {
+            return;
+        }
         self.stats
             .total_tasks_processed
             .fetch_add(1, Ordering::Relaxed);
@@ -522,6 +561,27 @@ impl Scheduler {
         } else {
             false
         }
+    }
+
+    /// True when any priority queue still contains runnable work. The live
+    /// shard owner uses this once per actor turn to choose a throughput/fairness
+    /// budget; it is deliberately not polled per message.
+    pub fn has_ready_work(&self) -> bool {
+        for priority in [
+            ActorPriority::High,
+            ActorPriority::Normal,
+            ActorPriority::Low,
+        ] {
+            if !self.global_for(priority).is_empty()
+                || self
+                    .workers_for(priority)
+                    .iter()
+                    .any(|worker| !worker.is_empty())
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Number of configured worker slots.

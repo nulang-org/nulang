@@ -138,6 +138,55 @@ fn test_spawn_send_step_sequence() {
 }
 
 #[test]
+fn burst_send_has_single_ready_queue_entry() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("handle", |_actor, _args| {});
+
+    for _ in 0..1_000 {
+        rt.send_message_by_id(actor_id, 0, &[Value::int(1)]);
+    }
+
+    assert_eq!(rt.actors[&actor_id].mailbox.len(), 1_000);
+    assert_eq!(rt.actors[&actor_id].run_state, ActorRunState::Queued);
+    assert_eq!(rt.scheduler.dequeue(), Some(actor_id));
+    assert!(
+        rt.scheduler.dequeue().is_none(),
+        "one actor burst must occupy only one ready-queue slot"
+    );
+}
+
+#[test]
+fn adaptive_actor_turn_drains_burst_without_duplicate_wakeups() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("inc", |actor, _args| {
+            let next = actor
+                .get_state_field("count")
+                .and_then(|value| value.as_int())
+                .unwrap_or(0)
+                + 1;
+            actor.set_state_field("count", Value::int(next));
+        });
+
+    for _ in 0..1_000 {
+        rt.send_message_by_id(actor_id, 0, &[]);
+    }
+    rt.run_scheduler();
+
+    let actor = &rt.actors[&actor_id];
+    assert_eq!(actor.get_state_field("count"), Some(Value::int(1_000)));
+    assert!(actor.mailbox.is_empty());
+    assert_eq!(actor.run_state, ActorRunState::Idle);
+}
+
+#[test]
 fn test_mailbox_push_pop() {
     let mut mb = Mailbox::new(4);
     let msg = Message {
@@ -386,8 +435,10 @@ fn test_actor_set_priority_changes_scheduling() {
     declare_test_behavior(&mut rt, a, "noop");
     declare_test_behavior(&mut rt, b, "noop");
     // Drain the spawn-time queue entries (both enqueued at Normal).
-    assert_eq!(rt.scheduler.dequeue(), Some(a));
-    assert_eq!(rt.scheduler.dequeue(), Some(b));
+    assert_eq!(rt.claim_next_ready_actor(), Some(a));
+    rt.finish_actor_turn(a);
+    assert_eq!(rt.claim_next_ready_actor(), Some(b));
+    rt.finish_actor_turn(b);
     // Boost b via the builtin-effect path, then send to a before b.
     assert_eq!(
         rt.perform_actor_builtin(Some(b), Some("set_priority"), &[], &[Value::int(0)]),
@@ -395,8 +446,12 @@ fn test_actor_set_priority_changes_scheduling() {
     );
     rt.send_message(a, "noop", &[]);
     rt.send_message(b, "noop", &[]);
-    assert_eq!(rt.scheduler.dequeue(), Some(b));
-    assert_eq!(rt.scheduler.dequeue(), Some(a));
+    assert_eq!(rt.claim_next_ready_actor(), Some(b));
+    rt.step_actor(b);
+    rt.finish_actor_turn(b);
+    assert_eq!(rt.claim_next_ready_actor(), Some(a));
+    rt.step_actor(a);
+    rt.finish_actor_turn(a);
 }
 
 #[test]
@@ -409,7 +464,8 @@ fn test_anonymous_actor_accepts_untyped_mailbox_delivery_without_handler_alias()
     // there is no handler to execute.
     assert!(rt.actors[&actor_id].behavior_table.is_empty());
     assert!(rt.actors[&actor_id].bytecode_module.is_none());
-    assert_eq!(rt.scheduler.dequeue(), Some(actor_id));
+    assert_eq!(rt.claim_next_ready_actor(), Some(actor_id));
+    rt.finish_actor_turn(actor_id);
 
     rt.send_message(actor_id, "opaque-runtime-tag", &[Value::int(7)]);
 
@@ -428,7 +484,8 @@ fn test_named_actor_still_rejects_unknown_behavior_without_aliasing_zero() {
         .get_mut(&actor_id)
         .unwrap()
         .register_behavior("known", |_actor, _args| {});
-    assert_eq!(rt.scheduler.dequeue(), Some(actor_id));
+    assert_eq!(rt.claim_next_ready_actor(), Some(actor_id));
+    rt.finish_actor_turn(actor_id);
 
     rt.send_message(actor_id, "typo", &[]);
     assert!(
@@ -2880,8 +2937,8 @@ fn test_runtime_scheduler_stats() {
 
     let stats = rt.scheduler_stats();
     assert_eq!(
-        stats.total_tasks_processed, 4,
-        "spawn + send should produce four actor tasks"
+        stats.total_tasks_processed, 2,
+        "deduplicated spawn + send should produce one scheduler turn per actor"
     );
     assert_eq!(
         stats.empty_polls, 1,

@@ -104,12 +104,6 @@ impl Mailbox {
     /// System messages and unbounded mailboxes always reserve successfully.
     /// Bounded normal/bulk traffic uses CAS so concurrent producers cannot all
     /// observe the same free slot and overfill the mailbox.
-    ///
-    /// `queued_count` is accounting only. Message publication/visibility is
-    /// synchronized by `SegQueue`; the counter is incremented before queue
-    /// publication, so Acquire/Release ordering here cannot provide that
-    /// synchronization anyway. Relaxed ordering is sufficient for the atomic
-    /// modification order needed by capacity reservation and length snapshots.
     fn reserve_slot(&self, system: bool) -> bool {
         if system || self.capacity == 0 {
             self.queued_count.fetch_add(1, Ordering::Relaxed);
@@ -133,9 +127,26 @@ impl Mailbox {
         }
     }
 
-    fn release_slot(&self) {
-        let previous = self.queued_count.fetch_sub(1, Ordering::Relaxed);
-        debug_assert!(previous > 0, "mailbox logical count underflow");
+    /// Scheduler-owner reservation. Because callers hold &mut Mailbox, Rust's
+    /// aliasing rules guarantee there is no safe concurrent producer holding a
+    /// shared reference to this mailbox at the same instant. Update the atomic
+    /// storage through get_mut so same-shard sends avoid an atomic RMW.
+    #[inline]
+    fn reserve_slot_local(&mut self, system: bool) -> bool {
+        let count = self.queued_count.get_mut();
+        if !system && self.capacity != 0 && *count >= self.capacity {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    /// Scheduler-owner counterpart to reserve_slot_local.
+    #[inline]
+    fn release_slot_local(&mut self) {
+        let count = self.queued_count.get_mut();
+        debug_assert!(*count > 0, "mailbox logical count underflow");
+        *count -= 1;
     }
 
     /// Push a message from a concurrent producer.
@@ -155,7 +166,7 @@ impl Mailbox {
     /// Push a message from the scheduler thread.
     pub fn push_local(&mut self, msg: Message) -> Result<(), Message> {
         let system = msg.priority == MessagePriority::System;
-        if !self.reserve_slot(system) {
+        if !self.reserve_slot_local(system) {
             return Err(msg);
         }
         self.local_queue.push_back(msg);
@@ -178,7 +189,7 @@ impl Mailbox {
             .or_else(|| self.normal_queue.pop());
         if result.is_some() {
             self.active_match = None;
-            self.release_slot();
+            self.release_slot_local();
         }
         result
     }
@@ -249,7 +260,7 @@ impl Mailbox {
 
     /// Total logical message count. Safe to query concurrently.
     pub fn len(&self) -> usize {
-        self.queued_count.load(Ordering::Relaxed)
+        self.queued_count.load(Ordering::Acquire)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -320,7 +331,7 @@ impl Mailbox {
             MatchLane::Local => self.local_skip_buffer.remove(idx),
             MatchLane::Normal => self.skip_buffer.remove(idx),
         }?;
-        self.release_slot();
+        self.release_slot_local();
         self.clear_tried_flags();
         Some(removed.0.payload)
     }

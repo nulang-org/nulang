@@ -65,13 +65,30 @@ fn bench_message_enqueue(c: &mut Criterion) {
     let mut group = c.benchmark_group("actor/message_enqueue");
     group.throughput(Throughput::Elements(MESSAGE_BATCH as u64));
 
-    group.bench_function("100", |b| {
+    group.bench_function("named_100", |b| {
         b.iter_batched(
             runtime_with_consumer,
             |(mut rt, actor_id)| {
                 let msg = Value::int(1);
                 for _ in 0..MESSAGE_BATCH {
                     rt.send_message(actor_id, "handle", &[msg]);
+                }
+                black_box(rt);
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    // Numeric behavior ids are what compiler-generated Send opcodes already
+    // carry. Keep this separate from name resolution so runtime hot-path
+    // improvements are visible instead of being hidden by benchmark setup.
+    group.bench_function("by_id_100", |b| {
+        b.iter_batched(
+            runtime_with_consumer,
+            |(mut rt, actor_id)| {
+                let msg = Value::int(1);
+                for _ in 0..MESSAGE_BATCH {
+                    rt.send_message_by_id(actor_id, 0, &[msg]);
                 }
                 black_box(rt);
             },

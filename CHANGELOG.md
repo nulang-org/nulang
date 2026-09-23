@@ -51,6 +51,14 @@ version + migration.*
 
 ## Stable tier
 
+### Deduplicated actor scheduling and adaptive turns — 2026-09-22
+- **Ready-queue ownership is now explicit and deduplicated** (`src/runtime/actor.rs`, `src/runtime/mod.rs`): actors move through Idle → Queued → Running, with one scheduler token per actor and shared claim/finish helpers used by production and manual runtime pumps.
+- **Mailbox runs adapt to contention**: actors process up to 16 messages when peers are runnable and up to 256 when effectively solo, with reduction-budget fairness and periodic peer-pressure checks.
+- **Periodic GC/CRDT/dehydration cadence is charged by processed work, not actor-turn count**, so larger adaptive batches do not silently stretch maintenance intervals.
+- **Scheduler-owner mailbox operations avoid atomic RMWs** while concurrent producer accounting retains the relaxed ordering established by the prior performance wave.
+- **Release builds avoid hot-path diagnostic overhead by default** for scheduler stats and actor flight recording; both remain opt-in through their existing environment toggles.
+
+
 ### Performance wave: JIT transitions, call analysis, and shard bus — 2026-09-22
 - **Bounded JIT register marshaling:** JIT transitions now reuse stable per-frame-depth scratch buffers and marshal only the compiler-known active register prefix for MIR-produced functions (`src/vm.rs`). Actor/legacy bytecode without trustworthy local-count metadata keeps the full 256-register path, and reserved direct-call staging state remains explicit.
 - **Linear-time JIT module call analysis:** direct-call suspension and recursion gating now share one lazily cached per-module call graph (`src/jit/mod.rs`). Suspension propagates with a reverse worklist and recursion uses iterative SCC traversal instead of an n×n reachability matrix plus Floyd-Warshall.

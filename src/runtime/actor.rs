@@ -46,6 +46,19 @@ pub enum ActorPriority {
     Low,
 }
 
+/// Scheduler ownership state for an actor.
+///
+/// This is intentionally shard-thread confined: cross-shard producers enter
+/// through the owning runtime's ingress queue, so ordinary local sends do not
+/// need an atomic "scheduled" flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActorRunState {
+    #[default]
+    Idle,
+    Queued,
+    Running,
+}
+
 // -- Flight recorder (deterministic replay support) ---------------------
 
 /// A single entry in an actor's flight-recorder trace.  Captures enough
@@ -77,6 +90,9 @@ pub struct FlightRecorder {
     next_seq: u64,
     /// Maximum number of entries to retain.
     max_entries: usize,
+    /// Disabled in release runtimes by default so deterministic-debug
+    /// formatting is not paid on every production message.
+    enabled: bool,
 }
 
 impl FlightRecorder {
@@ -87,11 +103,40 @@ impl FlightRecorder {
             cursor: 0,
             next_seq: 0,
             max_entries,
+            enabled: true,
         }
+    }
+
+    /// Runtime default: keep the recorder enabled in debug/test builds, but
+    /// make it opt-in in release builds. Set NULANG_FLIGHT_RECORDER=1 to
+    /// force it on (or =0/false/off to force it off).
+    pub fn runtime_default(max_entries: usize) -> Self {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| {
+            std::env::var("NULANG_FLIGHT_RECORDER")
+                .map(|v| {
+                    let v = v.trim();
+                    !(v.is_empty()
+                        || v == "0"
+                        || v.eq_ignore_ascii_case("false")
+                        || v.eq_ignore_ascii_case("off"))
+                })
+                .unwrap_or(cfg!(debug_assertions))
+        });
+        let mut recorder = Self::new(max_entries);
+        recorder.enabled = enabled;
+        if !enabled {
+            recorder.entries = Vec::new();
+        }
+        recorder
     }
 
     /// Record a message delivery.
     pub fn record(&mut self, sender: u64, behavior_id: u16, payload: &[Value]) {
+        if !self.enabled || self.max_entries == 0 {
+            return;
+        }
         let seq = self.next_seq;
         self.next_seq += 1;
 
@@ -221,6 +266,8 @@ pub struct Actor {
     pub trap_exits: bool,    // If true, exit signals become messages instead of killing this actor
     /// Scheduling priority, consulted by the scheduler on every enqueue.
     pub priority: ActorPriority,
+    /// Idle/queued/running state used to deduplicate ready-queue entries.
+    pub run_state: ActorRunState,
     pub reduction_count: u32, // Lifetime messages handled (monotonic progress metric)
     turn_reductions: u32,     // Messages handled in the current scheduling turn
     pub max_reductions: u32,  // Max reductions per turn before yield (preemption)
@@ -361,6 +408,7 @@ impl Actor {
             links: Vec::new(),
             trap_exits: false,
             priority: ActorPriority::Normal,
+            run_state: ActorRunState::Idle,
             jit_safepoint_counter: crate::backends::JIT_SAFEPOINT_BUDGET,
             jit_yield_pending: false,
             reduction_count: 0,
@@ -385,7 +433,7 @@ impl Actor {
             receive_wait: None,
             timer_sleep_fired: false,
             retry_config: None,
-            flight_recorder: FlightRecorder::new(1000),
+            flight_recorder: FlightRecorder::runtime_default(1000),
             fallback_config: Vec::new(),
             hibernation_state: None,
             idle_ms: 0,
