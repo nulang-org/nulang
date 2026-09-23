@@ -25,7 +25,7 @@ git push origin v0.2.0
 The `Release` workflow first verifies that the pushed tag matches both
 `Cargo.toml` and the CLI `VERSION`, then builds four targets in parallel
 (`linux-x86_64`, `linux-aarch64`, `macos-aarch64`, `windows-x86_64`), runs
-`cargo test --release` on the native Linux build, then the `publish` job
+`cargo test --locked --release` on the native Linux build, then the `publish` job
 creates a GitHub Release with:
 
 - one `nulang-<platform>-<arch>.tar.gz` archive per supported target; the
