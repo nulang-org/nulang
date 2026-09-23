@@ -6,9 +6,9 @@
 //!
 //! Suspension points in MIR are implicit — they are `RValue::ReceiveWait`,
 //! `RValue::SignalWait`, `RValue::Perform("LLM", "ask")`, and
-//! `RValue::PerformAsync`. Plain `ReceiveMatch` is a non-blocking scan and
-//! does not suspend. CIR makes suspension explicit as
-//! `CirTerminator::SuspendAndYield`.
+//! `RValue::PerformAsync`. The current WasmFX restricted profile also keeps
+//! its pre-existing host-suspension lowering for `ReceiveMatch` until it has
+//! a dedicated non-blocking mailbox host operation.
 //!
 //! Variable mapping: MIR locals use a flat register model. CIR `VarId`s are
 //! the flat Wasm local indices, so `var(local) = pc + local.0` where
@@ -54,6 +54,7 @@ pub fn has_suspension(func: &mir::Function) -> bool {
 /// Returns true if this rvalue suspends (or may suspend) the computation.
 pub fn is_suspending_rvalue(op: &RValue) -> bool {
     crate::continuation_analysis::scheduler_suspend_kind(op).is_some()
+        || matches!(op, RValue::ReceiveMatch { .. })
 }
 
 /// Non-suspending functions produce a CIR with no `SuspendAndYield`
@@ -401,6 +402,10 @@ fn suspend_effect_and_args(op: &RValue, pc: u32) -> (EffectKind, Vec<CirExpr>) {
                 CirExpr::Var(var(timeout, pc)),
             ],
         ),
+        RValue::ReceiveMatch { max_params, .. } => (
+            EffectKind::MailboxDequeue,
+            vec![CirExpr::ConstI64(*max_params as i64)],
+        ),
         RValue::PerformAsync {
             effect_op, args, ..
         } => (
@@ -537,15 +542,6 @@ mod tests {
     #[test]
     fn test_is_suspending_rvalue_add_not() {
         let rv = RValue::Binary(crate::ast::BinOp::Add, LocalId(0), LocalId(1));
-        assert!(!is_suspending_rvalue(&rv));
-    }
-
-    #[test]
-    fn test_receive_match_is_non_blocking() {
-        let rv = RValue::ReceiveMatch {
-            behavior_ids: vec![1, 2],
-            max_params: 2,
-        };
         assert!(!is_suspending_rvalue(&rv));
     }
 
