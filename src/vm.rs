@@ -222,6 +222,18 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// Send a message to an actor by behavior table index.
     fn send_message(&mut self, target: Value, behavior_id: u16, args: &[Value]);
 
+    fn send_message_consuming(
+        &mut self,
+        target: Value,
+        behavior_id: u16,
+        args: &[Value],
+        candidate_mask: u16,
+    ) -> u16 {
+        let _ = candidate_mask;
+        self.send_message(target, behavior_id, args);
+        0
+    }
+
     /// Synchronously ask an actor and return its response.
     /// Default implementation sends the message and returns nil.
     fn ask_actor(&mut self, target: Value, behavior_id: u16, args: &[Value]) -> Value {
@@ -5109,8 +5121,38 @@ impl VM {
                     .map(|b| (b.param_count, behavior_idx as u16))
                     .unwrap_or((0, 0));
                 let args: Vec<Value> = (0..param_count).map(|i| frame.regs[i]).collect();
-                self.actor_callbacks
-                    .send_message(actor_val, behavior_id, &args);
+                let send_pc = frame.pc.saturating_sub(1);
+                let ownership_site = self
+                    .modules
+                    .get(module_idx)
+                    .and_then(|m| m.send_ownership_site(send_pc))
+                    .cloned();
+                if let Some(site) = ownership_site {
+                    let consumed = self.actor_callbacks.send_message_consuming(
+                        actor_val,
+                        behavior_id,
+                        &args,
+                        site.candidate_mask,
+                    );
+                    for (arg_idx, source) in site.sources {
+                        if consumed & (1u16 << arg_idx) == 0 {
+                            continue;
+                        }
+                        match source {
+                            crate::bytecode::SendOwnershipSource::Register(reg) => {
+                                frame.regs[reg as usize] = Value::nil();
+                            }
+                            crate::bytecode::SendOwnershipSource::Spill(slot) => {
+                                if let Some(value) = frame.spilled.get_mut(slot as usize) {
+                                    *value = Value::nil();
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    self.actor_callbacks
+                        .send_message(actor_val, behavior_id, &args);
+                }
                 return Ok(());
             }
             OpCode::Ask => {
