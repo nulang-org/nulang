@@ -9,7 +9,7 @@ use crate::bytecode::Constant;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{
-    ActorSnapshot, DurableTransition, EventEntry, PersistedValue, WorkflowEvent,
+    ActorSnapshot, DurableTransition, EventEntry, JournalEntry, PersistedValue, WorkflowEvent,
     DURABLE_TRANSITION_VERSION,
 };
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
@@ -149,6 +149,50 @@ pub(crate) fn durable_activation_epoch(rt: &Runtime, actor_id: u64) -> std::io::
     }
 
     Ok(opted_epoch.unwrap_or(1).max(1))
+}
+
+/// Atomically accept an incoming workflow command without advancing the
+/// workflow snapshot.
+///
+/// The command is committed before execution so a crash during a suspending or
+/// long-running step leaves a journal record above the last completed
+/// snapshot. Recovery can therefore replay the accepted command. Keeping this
+/// on the same RFC 0022 tail also prevents legacy journal writes from creating
+/// sequence gaps between atomic workflow transitions.
+pub(crate) fn commit_workflow_command(
+    rt: &mut Runtime,
+    actor_id: u64,
+    behavior_id: u16,
+    payload: Vec<PersistedValue>,
+) -> std::io::Result<()> {
+    let previous = rt.persistence.latest_sequence(actor_id);
+    let sequence = previous
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("workflow command sequence overflow"))?;
+    let activation_epoch = durable_activation_epoch(rt, actor_id)?;
+
+    rt.persistence.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id,
+        activation_epoch,
+        sequence,
+        expected_previous_sequence: previous,
+        command: Some(JournalEntry {
+            sequence,
+            behavior_id,
+            payload,
+        }),
+        snapshot: None,
+        workflow_events: vec![],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    })?;
+
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.sequence = sequence;
+    }
+    Ok(())
 }
 
 /// Atomically persist one workflow event together with the workflow snapshot.
