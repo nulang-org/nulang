@@ -51,6 +51,13 @@ version + migration.*
 
 ## Stable tier
 
+### Compiler-owned semantic effect-site identity — 2026-09-23
+- **MIR can now derive backend-independent `EffectSiteId` values for every `Perform` / `PerformAsync` site.** Identity is domain-separated by module, owner kind, fully qualified function/behavior name, effect operation, and same-operation ordinal; source spans, compiler-generated local/block IDs, and bytecode PCs are deliberately excluded.
+- **Durable invocation identity can compose semantic site identity with durable execution identity.** `DurableEffectId::derive_from_site` combines actor identity, a replay-stable execution key, the compiler-owned site ID, and a dynamic occurrence index so repeated execution of one site inside a loop remains distinguishable while retries remain stable.
+- Regression tests pin formatting/source-line stability, unrelated-definition stability, actor-qualified behavior identity, same-operation site ordinals, dynamic occurrence separation, and hex round-tripping.
+- This changes no source syntax or bytecode format. Preserving the site ID through backend artifacts is the next integration step before receipt-backing `Provider.ask` / `Inference.ask`.
+
+
 ### Actor density and mailbox hot-path allocation — 2026-09-23
 - **Idle actors no longer materialize their 16 KiB ORCA bump block at spawn** (`src/runtime/heap.rs`). The configured first-block capacity is preserved, but allocation is deferred until the first small-object heap allocation; LOS-only actors also remain bump-block-free.
 - **Mailbox logical-count atomics use relaxed ordering** (`src/runtime/mailbox.rs`) because Crossbeam `SegQueue` owns message publication/synchronization; the atomic counter remains capacity/accounting state and its modification order still prevents bounded producers from over-reserving.
