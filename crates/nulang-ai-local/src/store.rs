@@ -828,9 +828,7 @@ mod tests {
         goal.updated_at = Utc::now();
 
         let revision = IntentionRevision::new(
-            goal.id,
-            commitment.id,
-            intention.id,
+            &intention,
             None,
             task.id,
             TaskStatus::Blocked,
@@ -890,9 +888,7 @@ mod tests {
         goal.updated_at = Utc::now();
 
         let revision = IntentionRevision::new(
-            goal.id,
-            commitment.id,
-            intention.id,
+            &intention,
             None,
             task.id,
             TaskStatus::Failed,
