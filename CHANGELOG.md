@@ -55,7 +55,7 @@ version + migration.*
 - **MIR now has one backend-neutral continuation/suspension analysis** (`src/continuation_analysis.rs`) that classifies scheduler suspensions versus resuming algebraic effects, preserves compiler-proven single-shot metadata, and computes deterministic live-across locals for continuation frames.
 - **Selective-receive resume definitions include implicit payload locals.** Timed `ReceiveWait` writes its destination plus contiguous payload slots on resume; the analysis excludes all of those resume-defined locals from saved frames instead of preserving stale pre-suspend values.
 - **Native AOT now consumes the shared continuation liveness model** rather than maintaining a separate backward-liveness implementation for resuming effect handlers.
-- **WasmFX now shares the scheduler-suspension classifier, and plain `ReceiveMatch` remains non-blocking** in agreement with the core MIR/runtime contract; only timed `ReceiveWait` yields to the host.
+- **WasmFX now shares the scheduler-suspension classifier for true runtime suspension points** while retaining its existing `ReceiveMatch` compatibility lowering until a dedicated non-blocking mailbox host operation is implemented; the backend-neutral MIR analysis itself correctly treats plain `ReceiveMatch` as non-suspending.
 
 ### Stable native actor entry ABI — 2026-09-23
 - **AOT actor dispatch now crosses one versioned C-ABI boundary** (`src/native_abi.rs`, `src/aot/codegen.rs`, `src/aot/mod.rs`). Generated Cranelift wrappers validate ABI version and payload arity, load boxed arguments, and call the behavior's optimized internal native function. The runtime no longer selects an arity-specific Rust function type from message length.
