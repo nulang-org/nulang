@@ -97,6 +97,26 @@ fn bench_message_enqueue(c: &mut Criterion) {
         )
     });
 
+    group.bench_function("by_id_shared_5arg_100", |b| {
+        b.iter_batched(
+            runtime_with_consumer,
+            |(mut rt, actor_id)| {
+                let args = [
+                    Value::int(1),
+                    Value::int(2),
+                    Value::int(3),
+                    Value::int(4),
+                    Value::int(5),
+                ];
+                for _ in 0..MESSAGE_BATCH {
+                    rt.send_message_by_id(actor_id, 0, &args);
+                }
+                black_box(rt);
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
     group.finish();
 }
 
