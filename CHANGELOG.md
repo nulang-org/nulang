@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### Deduplicated actor ready queue and adaptive turns — 2026-09-23
+- **Actor scheduling now has explicit shard-owned `Idle → Queued → Running` ownership** (`src/runtime/actor.rs`, `src/runtime/mod.rs`), so bursts of sends append mailbox work without injecting duplicate ready tokens. Production, cross-shard delivery, timer wakeups, supervisor restarts, and internal manual pumps use the same claim/finish transition helpers.
+- **Mailbox turns adapt to runnable-peer pressure**: contended actors keep the existing 16-message quantum, while an effectively solo actor may drain up to 256 messages before returning to the scheduler; peer pressure is rechecked every 16 messages and the actor reduction budget remains the hard preemption ceiling.
+- **GC/CRDT/dehydration cadence is charged by messages actually processed rather than actor-turn count**, preventing larger solo batches from stretching maintenance intervals.
+- **Actor benchmarks retain the existing named-send history and add a numeric behavior-id enqueue signal**, making scheduler/mailbox changes visible without conflating them with behavior-name resolution.
+
 ### Backend differential oracle hardening — 2026-09-22
 - **WASM differential execution now fails closed after artifact emission** (`src/fuzz.rs`, `src/difffuzz.rs`). Restricted-profile rejection remains an expected compile-time skip, but malformed/invalid emitted WASM, instantiation failures, or a missing required `nulang_init` export are backend correctness failures. Differential campaigns now record WASM agreement coverage, and the `wasm-backend` test lane requires positive WASM participation so a silently-disabled backend cannot leave CI green.
 
