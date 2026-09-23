@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Runtime actor schema identity — 2026-09-22
+- **Module-spawned actors now retain their canonical owning `ActorMeta.name` at runtime** (`src/runtime/spawn.rs`). This preserves the target actor schema needed for subsequent fail-closed behavior ownership checks without changing manually spawned/native actor instance names. Regression coverage pins both paths.
+
+
 ### RFC 0008 migration purity enforcement — 2026-09-22
 - **Entity migration bodies now fail compilation when they contain nondeterministic or externally visible operations** (`src/migration_purity.rs`, `src/effect_checker.rs`). The public effect-checking pipeline rejects direct or transitively hidden `perform`, spawn/send/ask/receive, actor migration, grain lookup, continuation resume, defer/errdefer, and extern/FFI calls; locally handling an effect does not launder it. Pure helpers and replay-stream `emit` remain allowed, and the existing conformance proof-of-gap now expects compilation failure.
 
