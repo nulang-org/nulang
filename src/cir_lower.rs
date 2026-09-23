@@ -234,9 +234,7 @@ fn translate_stmt(stmt: &Stmt, func: &mir::Function, pc: u32) -> CirStmt {
                 src: translate_rvalue(op, func, pc),
             },
         },
-        Stmt::EnterHandle { .. }
-        | Stmt::PopHandler
-        | Stmt::ParallelMarker { .. } => {
+        Stmt::EnterHandle { .. } | Stmt::PopHandler | Stmt::ParallelMarker { .. } => {
             // User-defined handler frames and parallel-region markers are
             // compiler/runtime metadata at the CIR boundary.
             CirStmt::Assign {
