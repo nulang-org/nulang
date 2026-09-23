@@ -5,7 +5,8 @@ use crate::store::{SqliteStore, StoreError};
 use chrono::Utc;
 use nulang_ai_core::{
     Commitment, CommitmentStatus, ConversationMessage, ConversationState, GoalStatus, Intention,
-    IntentionStatus, SwarmEvent, SwarmEventEnvelope, TaskStatus,
+    IntentionRevision, IntentionRevisionDecision, IntentionStatus, SwarmEvent, SwarmEventEnvelope,
+    Task, TaskStatus,
 };
 use nulang_ai_director::{Director, LocalDirector};
 use nulang_ai_manager::{EngineeringManager, Manager};
@@ -14,6 +15,8 @@ use nulang_ai_worker::{LocalWorker, Worker};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+const MAX_AUTOMATIC_REPLANS: usize = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
@@ -29,6 +32,12 @@ pub enum RuntimeError {
     MissingConfig(PathBuf),
 }
 
+enum PlanOutcome {
+    Completed,
+    Blocked { task_id: Uuid, reason: String },
+    Failed { task_id: Uuid, reason: String },
+}
+
 pub struct LocalRuntime {
     project_dir: PathBuf,
     config: AgentConfigFile,
@@ -37,11 +46,18 @@ pub struct LocalRuntime {
     project_id: String,
     director: LocalDirector,
     engineering: EngineeringManager,
-    worker: LocalWorker,
+    worker: Box<dyn Worker>,
 }
 
 impl LocalRuntime {
     pub fn open(project_dir: PathBuf) -> Result<Self, RuntimeError> {
+        Self::open_with_worker(project_dir, Box::new(LocalWorker::new("worker-local")))
+    }
+
+    pub fn open_with_worker(
+        project_dir: PathBuf,
+        worker: Box<dyn Worker>,
+    ) -> Result<Self, RuntimeError> {
         if !project_dir.join("agent.toml").exists() {
             return Err(RuntimeError::MissingConfig(project_dir));
         }
@@ -73,7 +89,7 @@ impl LocalRuntime {
             project_id,
             director: LocalDirector::new("director-local"),
             engineering: EngineeringManager,
-            worker: LocalWorker::new("worker-local"),
+            worker,
         })
     }
 
@@ -146,40 +162,207 @@ impl LocalRuntime {
         conv.updated_at = Utc::now();
         self.store.upsert_conversation(&conv)?;
 
-        let tasks =
+        let mut replan_count = 0usize;
+        let mut tasks =
             self.engineering
                 .plan_tasks(goal_id, text, self.config.director.default_budget_usd);
+        let mut intention = self.new_intention(goal_id, commitment.id, 0, &tasks);
+        self.activate_intention(&intention, out)?;
 
+        loop {
+            match self.execute_intention(&mut intention, tasks, out)? {
+                PlanOutcome::Completed => {
+                    commitment.status = CommitmentStatus::Fulfilled;
+                    commitment.updated_at = Utc::now();
+                    self.store.upsert_commitment(&commitment)?;
+                    self.emit(
+                        out,
+                        SwarmEvent::CommitmentFulfilled {
+                            commitment_id: commitment.id,
+                            goal_id,
+                        },
+                    )?;
+
+                    goal.status = GoalStatus::Completed;
+                    goal.updated_at = Utc::now();
+                    self.store.upsert_goal(&goal)?;
+                    self.emit(out, SwarmEvent::GoalCompleted { goal_id })?;
+                    return Ok(goal_id);
+                }
+                PlanOutcome::Blocked { task_id, reason } => {
+                    let revision = IntentionRevision::new(
+                        goal_id,
+                        commitment.id,
+                        intention.id,
+                        None,
+                        task_id,
+                        TaskStatus::Blocked,
+                        IntentionRevisionDecision::Suspend,
+                        reason.clone(),
+                    );
+                    self.record_revision(&revision, out)?;
+
+                    commitment.status = CommitmentStatus::Suspended;
+                    commitment.updated_at = Utc::now();
+                    self.store.upsert_commitment(&commitment)?;
+                    self.emit(
+                        out,
+                        SwarmEvent::CommitmentSuspended {
+                            commitment_id: commitment.id,
+                            goal_id,
+                            reason: reason.clone(),
+                        },
+                    )?;
+
+                    goal.status = GoalStatus::Blocked;
+                    goal.updated_at = Utc::now();
+                    self.store.upsert_goal(&goal)?;
+                    self.emit(
+                        out,
+                        SwarmEvent::GoalBlocked {
+                            goal_id,
+                            reason,
+                        },
+                    )?;
+                    return Ok(goal_id);
+                }
+                PlanOutcome::Failed { task_id, reason }
+                    if replan_count < MAX_AUTOMATIC_REPLANS =>
+                {
+                    replan_count += 1;
+                    let replacement_tasks = self.engineering.plan_tasks(
+                        goal_id,
+                        text,
+                        self.config.director.default_budget_usd,
+                    );
+                    let replacement =
+                        self.new_intention(goal_id, commitment.id, replan_count, &replacement_tasks);
+                    self.store.upsert_intention(&replacement)?;
+
+                    let revision = IntentionRevision::new(
+                        goal_id,
+                        commitment.id,
+                        intention.id,
+                        Some(replacement.id),
+                        task_id,
+                        TaskStatus::Failed,
+                        IntentionRevisionDecision::Replan,
+                        reason,
+                    );
+                    self.record_revision(&revision, out)?;
+                    self.emit_intention_activated(&replacement, out)?;
+
+                    intention = replacement;
+                    tasks = replacement_tasks;
+                }
+                PlanOutcome::Failed { task_id, reason } => {
+                    let revision = IntentionRevision::new(
+                        goal_id,
+                        commitment.id,
+                        intention.id,
+                        None,
+                        task_id,
+                        TaskStatus::Failed,
+                        IntentionRevisionDecision::Abandon,
+                        reason.clone(),
+                    );
+                    self.record_revision(&revision, out)?;
+
+                    commitment.status = CommitmentStatus::Abandoned;
+                    commitment.updated_at = Utc::now();
+                    self.store.upsert_commitment(&commitment)?;
+                    self.emit(
+                        out,
+                        SwarmEvent::CommitmentAbandoned {
+                            commitment_id: commitment.id,
+                            goal_id,
+                            reason: reason.clone(),
+                        },
+                    )?;
+
+                    goal.status = GoalStatus::Failed;
+                    goal.updated_at = Utc::now();
+                    self.store.upsert_goal(&goal)?;
+                    self.emit(
+                        out,
+                        SwarmEvent::GoalFailed {
+                            goal_id,
+                            reason,
+                        },
+                    )?;
+                    return Ok(goal_id);
+                }
+            }
+        }
+    }
+
+    fn new_intention(
+        &self,
+        goal_id: Uuid,
+        commitment_id: Uuid,
+        attempt: usize,
+        tasks: &[Task],
+    ) -> Intention {
+        let description = if attempt == 0 {
+            "Execute the selected engineering plan".to_string()
+        } else {
+            format!("Execute engineering replan attempt {attempt}")
+        };
         let mut intention = Intention::new(
             goal_id,
-            commitment.id,
+            commitment_id,
             "manager-engineering",
-            "Execute the selected engineering plan",
+            description,
             tasks.iter().map(|task| task.id).collect(),
         );
         intention.status = IntentionStatus::Active;
         intention.updated_at = Utc::now();
-        self.store.upsert_intention(&intention)?;
+        intention
+    }
+
+    fn activate_intention(
+        &self,
+        intention: &Intention,
+        out: &mut dyn Write,
+    ) -> Result<(), RuntimeError> {
+        self.store.upsert_intention(intention)?;
+        self.emit_intention_activated(intention, out)
+    }
+
+    fn emit_intention_activated(
+        &self,
+        intention: &Intention,
+        out: &mut dyn Write,
+    ) -> Result<(), RuntimeError> {
         self.emit(
             out,
             SwarmEvent::IntentionActivated {
                 intention_id: intention.id,
-                commitment_id: commitment.id,
-                goal_id,
+                commitment_id: intention.commitment_id,
+                goal_id: intention.goal_id,
                 owner_agent_id: intention.owner_agent_id.clone(),
             },
-        )?;
+        )
+    }
 
-        for task in tasks {
-            self.store.upsert_task(&task)?;
+    fn execute_intention(
+        &self,
+        intention: &mut Intention,
+        tasks: Vec<Task>,
+        out: &mut dyn Write,
+    ) -> Result<PlanOutcome, RuntimeError> {
+        for task in &tasks {
+            self.store.upsert_task(task)?;
             self.emit(
                 out,
                 SwarmEvent::TaskCreated {
                     task_id: task.id,
-                    goal_id,
+                    goal_id: task.goal_id,
                 },
             )?;
+        }
 
+        for task in tasks {
             let agent_id = task
                 .assigned_agent_id
                 .clone()
@@ -196,46 +379,127 @@ impl LocalRuntime {
                 },
             )?;
 
-            let completed = self.worker.execute(&running);
-            self.store.upsert_task(&completed)?;
-            self.emit(
-                out,
-                SwarmEvent::TaskCompleted {
-                    task_id: completed.id,
-                    agent_id,
-                },
-            )?;
+            let mut result = self.worker.execute(&running);
+            let (terminal_status, reason) = match result.status {
+                TaskStatus::Completed => (TaskStatus::Completed, None),
+                TaskStatus::Blocked => (
+                    TaskStatus::Blocked,
+                    Some(format!("task {} blocked by worker", result.id)),
+                ),
+                TaskStatus::Failed => (
+                    TaskStatus::Failed,
+                    Some(format!("task {} failed in worker execution", result.id)),
+                ),
+                other => (
+                    TaskStatus::Failed,
+                    Some(format!(
+                        "task {} returned non-terminal worker status {:?}",
+                        result.id, other
+                    )),
+                ),
+            };
+            result.status = terminal_status;
+            result.updated_at = Utc::now();
+            self.store.upsert_task(&result)?;
+
+            match terminal_status {
+                TaskStatus::Completed => {
+                    self.emit(
+                        out,
+                        SwarmEvent::TaskCompleted {
+                            task_id: result.id,
+                            agent_id,
+                        },
+                    )?;
+                }
+                TaskStatus::Blocked => {
+                    let reason = reason.expect("blocked outcome has reason");
+                    self.emit(
+                        out,
+                        SwarmEvent::TaskBlocked {
+                            task_id: result.id,
+                            agent_id,
+                            reason: reason.clone(),
+                        },
+                    )?;
+                    intention.status = IntentionStatus::Blocked;
+                    intention.updated_at = Utc::now();
+                    self.store.upsert_intention(intention)?;
+                    self.emit(
+                        out,
+                        SwarmEvent::IntentionBlocked {
+                            intention_id: intention.id,
+                            commitment_id: intention.commitment_id,
+                            goal_id: intention.goal_id,
+                            reason: reason.clone(),
+                        },
+                    )?;
+                    return Ok(PlanOutcome::Blocked {
+                        task_id: result.id,
+                        reason,
+                    });
+                }
+                TaskStatus::Failed => {
+                    let reason = reason.expect("failed outcome has reason");
+                    self.emit(
+                        out,
+                        SwarmEvent::TaskFailed {
+                            task_id: result.id,
+                            agent_id,
+                            reason: reason.clone(),
+                        },
+                    )?;
+                    intention.status = IntentionStatus::Failed;
+                    intention.updated_at = Utc::now();
+                    self.store.upsert_intention(intention)?;
+                    self.emit(
+                        out,
+                        SwarmEvent::IntentionFailed {
+                            intention_id: intention.id,
+                            commitment_id: intention.commitment_id,
+                            goal_id: intention.goal_id,
+                            reason: reason.clone(),
+                        },
+                    )?;
+                    return Ok(PlanOutcome::Failed {
+                        task_id: result.id,
+                        reason,
+                    });
+                }
+                _ => unreachable!("worker result is normalized to a terminal status"),
+            }
         }
 
         intention.status = IntentionStatus::Completed;
         intention.updated_at = Utc::now();
-        self.store.upsert_intention(&intention)?;
+        self.store.upsert_intention(intention)?;
         self.emit(
             out,
             SwarmEvent::IntentionCompleted {
                 intention_id: intention.id,
-                commitment_id: commitment.id,
-                goal_id,
+                commitment_id: intention.commitment_id,
+                goal_id: intention.goal_id,
             },
         )?;
+        Ok(PlanOutcome::Completed)
+    }
 
-        commitment.status = CommitmentStatus::Fulfilled;
-        commitment.updated_at = Utc::now();
-        self.store.upsert_commitment(&commitment)?;
+    fn record_revision(
+        &self,
+        revision: &IntentionRevision,
+        out: &mut dyn Write,
+    ) -> Result<(), RuntimeError> {
+        self.store.upsert_intention_revision(revision)?;
         self.emit(
             out,
-            SwarmEvent::CommitmentFulfilled {
-                commitment_id: commitment.id,
-                goal_id,
+            SwarmEvent::IntentionRevised {
+                revision_id: revision.id,
+                superseded_intention_id: revision.superseded_intention_id,
+                replacement_intention_id: revision.replacement_intention_id,
+                decision: revision.decision,
+                reason: revision.reason.clone(),
             },
-        )?;
-
-        goal.status = GoalStatus::Completed;
-        goal.updated_at = Utc::now();
-        self.store.upsert_goal(&goal)?;
-        self.emit(out, SwarmEvent::GoalCompleted { goal_id })?;
-
-        Ok(goal_id)
+        )
     }
 
     fn emit(&self, out: &mut dyn Write, event: SwarmEvent) -> Result<(), RuntimeError> {
@@ -255,6 +519,47 @@ pub fn init_project(dir: &Path) -> Result<(), RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct ScriptedWorker {
+        statuses: Mutex<VecDeque<TaskStatus>>,
+    }
+
+    impl ScriptedWorker {
+        fn new(statuses: impl IntoIterator<Item = TaskStatus>) -> Self {
+            Self {
+                statuses: Mutex::new(statuses.into_iter().collect()),
+            }
+        }
+    }
+
+    impl Worker for ScriptedWorker {
+        fn agent_id(&self) -> &str {
+            "worker-scripted"
+        }
+
+        fn execute(&self, task: &Task) -> Task {
+            let mut task = task.clone();
+            task.status = self
+                .statuses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(TaskStatus::Completed);
+            task.updated_at = Utc::now();
+            task
+        }
+    }
+
+    fn runtime_with_worker(tmp: &Path, statuses: Vec<TaskStatus>) -> LocalRuntime {
+        init_project(tmp).unwrap();
+        LocalRuntime::open_with_worker(
+            tmp.to_path_buf(),
+            Box::new(ScriptedWorker::new(statuses)),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn runtime_emits_nlap_events() {
@@ -278,10 +583,98 @@ mod tests {
         assert_eq!(graph.commitments[0].status, CommitmentStatus::Fulfilled);
         assert_eq!(graph.intentions.len(), 1);
         assert_eq!(graph.intentions[0].status, IntentionStatus::Completed);
+        assert!(graph.intention_revisions.is_empty());
         assert_eq!(
             graph.intentions[0].planned_task_ids.len(),
             graph.tasks.len()
         );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn failed_task_replans_once_and_can_recover() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-replan-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut rt =
+            runtime_with_worker(&tmp, vec![TaskStatus::Failed, TaskStatus::Completed]);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let goal_id = rt.handle_user_message("ship feature X", &mut buf).unwrap();
+        let text = String::from_utf8(buf.into_inner()).unwrap();
+        assert!(text.contains("task_failed"));
+        assert!(text.contains("intention_revised"));
+        assert!(text.contains("commitment_fulfilled"));
+
+        let graph = rt.store().get_goal_graph(goal_id).unwrap();
+        assert_eq!(graph.goal.status, GoalStatus::Completed);
+        assert_eq!(graph.intentions.len(), 2);
+        assert_eq!(graph.intentions[0].status, IntentionStatus::Failed);
+        assert_eq!(graph.intentions[1].status, IntentionStatus::Completed);
+        assert_eq!(graph.intention_revisions.len(), 1);
+        assert_eq!(
+            graph.intention_revisions[0].decision,
+            IntentionRevisionDecision::Replan
+        );
+        assert_eq!(
+            graph.intention_revisions[0].replacement_intention_id,
+            Some(graph.intentions[1].id)
+        );
+        assert_eq!(graph.commitments[0].status, CommitmentStatus::Fulfilled);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn blocked_task_suspends_commitment_and_goal() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-blocked-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut rt = runtime_with_worker(&tmp, vec![TaskStatus::Blocked]);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let goal_id = rt.handle_user_message("ship feature X", &mut buf).unwrap();
+        let text = String::from_utf8(buf.into_inner()).unwrap();
+        assert!(text.contains("task_blocked"));
+        assert!(text.contains("commitment_suspended"));
+        assert!(text.contains("goal_blocked"));
+
+        let graph = rt.store().get_goal_graph(goal_id).unwrap();
+        assert_eq!(graph.goal.status, GoalStatus::Blocked);
+        assert_eq!(graph.intentions[0].status, IntentionStatus::Blocked);
+        assert_eq!(graph.commitments[0].status, CommitmentStatus::Suspended);
+        assert_eq!(graph.intention_revisions.len(), 1);
+        assert_eq!(
+            graph.intention_revisions[0].decision,
+            IntentionRevisionDecision::Suspend
+        );
+        assert!(graph.intention_revisions[0]
+            .replacement_intention_id
+            .is_none());
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn repeated_failure_abandons_commitment_after_bounded_replan() {
+        let tmp = std::env::temp_dir().join(format!("nulang-agent-failed-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut rt = runtime_with_worker(&tmp, vec![TaskStatus::Failed, TaskStatus::Failed]);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let goal_id = rt.handle_user_message("ship feature X", &mut buf).unwrap();
+        let text = String::from_utf8(buf.into_inner()).unwrap();
+        assert!(text.contains("commitment_abandoned"));
+        assert!(text.contains("goal_failed"));
+
+        let graph = rt.store().get_goal_graph(goal_id).unwrap();
+        assert_eq!(graph.goal.status, GoalStatus::Failed);
+        assert_eq!(graph.intentions.len(), 2);
+        assert_eq!(graph.intentions[0].status, IntentionStatus::Failed);
+        assert_eq!(graph.intentions[1].status, IntentionStatus::Failed);
+        assert_eq!(graph.intention_revisions.len(), 2);
+        assert_eq!(
+            graph.intention_revisions[0].decision,
+            IntentionRevisionDecision::Replan
+        );
+        assert_eq!(
+            graph.intention_revisions[1].decision,
+            IntentionRevisionDecision::Abandon
+        );
+        assert_eq!(graph.commitments[0].status, CommitmentStatus::Abandoned);
         let _ = std::fs::remove_dir_all(tmp);
     }
 }
