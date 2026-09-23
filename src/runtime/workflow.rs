@@ -375,15 +375,38 @@ pub(crate) fn append_timer_fired(
     actor_id: u64,
     name: &str,
 ) -> std::io::Result<()> {
+    // TimerFired semantically advances the waiting workflow. Stage that
+    // state mutation before building the transition snapshot so the event and
+    // step_index become durable together. If storage rejects the transition,
+    // restore the live value before the caller re-arms the timer.
+    let previous_step_index = rt
+        .actors
+        .get(&actor_id)
+        .and_then(|actor| actor.get_state_field("step_index"))
+        .and_then(|value| value.as_int());
+    if let Some(step_index) = previous_step_index {
+        if let Some(actor) = rt.actors.get_mut(&actor_id) {
+            actor.set_state_field("step_index", Value::int(step_index + 1));
+        }
+    }
+
     let sequence = next_sequence(rt, actor_id);
-    commit_workflow_event(
+    let result = commit_workflow_event(
         rt,
         actor_id,
         WorkflowEvent::TimerFired {
             sequence,
             name: name.to_string(),
         },
-    )
+    );
+    if result.is_err() {
+        if let Some(step_index) = previous_step_index {
+            if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                actor.set_state_field("step_index", Value::int(step_index));
+            }
+        }
+    }
+    result
 }
 
 pub(crate) fn append_signal_received(
