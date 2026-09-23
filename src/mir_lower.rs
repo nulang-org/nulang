@@ -43,13 +43,19 @@ fn serialize_migration_metadata(migrations: &[crate::ast::MigrationDecl]) -> Str
     let metadata: Vec<_> = ordered
         .into_iter()
         .map(|migration| {
-            let events: Vec<_> = migration
+            let mut event_handlers: Vec<_> = migration
                 .event_migrations
                 .iter()
-                .map(|(name, params, _body)| {
+                .map(|(name, params, _body)| (name.as_str(), params.len()))
+                .collect();
+            event_handlers.sort_unstable();
+
+            let events: Vec<_> = event_handlers
+                .into_iter()
+                .map(|(name, arity)| {
                     serde_json::json!({
                         "name": name,
-                        "arity": params.len(),
+                        "arity": arity,
                     })
                 })
                 .collect();
