@@ -1444,7 +1444,7 @@ impl PersistenceStore for LibsqlStore {
 
         // Serialize everything before opening the transaction. Once the first
         // SQL write happens, only database operations remain fallible and any
-        // error rolls the whole transaction back.
+        // error rolls the entire transition back.
         let snapshot_data = transition
             .snapshot
             .as_ref()
@@ -2203,6 +2203,626 @@ impl PersistenceStore for LibsqlStore {
             }
             Ok(())
         })
+    }
+
+}
+
+// ---------------------------------------------------------------------------
+// RocksDbStore — production LSM-tree persistence backend
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "rocksdb")]
+pub struct RocksDbStore {
+    db: rocksdb::DB,
+}
+
+#[cfg(feature = "rocksdb")]
+impl RocksDbStore {
+    const CF_SNAPSHOTS: &'static str = "snapshots";
+    const CF_JOURNAL: &'static str = "journal";
+    const CF_WORKFLOW_EVENTS: &'static str = "workflow_events";
+    const CF_EVENTS: &'static str = "events";
+
+    /// Open (or create) a RocksDB-backed store at `path`.
+    pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        // Each actor's data is logically separated by key prefix; column
+        // families keep the four streams isolated so iteration and deletion
+        // stay cheap.
+        let cfs = vec![
+            rocksdb::ColumnFamilyDescriptor::new(Self::CF_SNAPSHOTS, rocksdb::Options::default()),
+            rocksdb::ColumnFamilyDescriptor::new(Self::CF_JOURNAL, rocksdb::Options::default()),
+            rocksdb::ColumnFamilyDescriptor::new(
+                Self::CF_WORKFLOW_EVENTS,
+                rocksdb::Options::default(),
+            ),
+            rocksdb::ColumnFamilyDescriptor::new(Self::CF_EVENTS, rocksdb::Options::default()),
+        ];
+        let db = rocksdb::DB::open_cf_descriptors(&opts, path, cfs)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(RocksDbStore { db })
+    }
+
+    fn actor_key(actor_id: u64) -> [u8; 8] {
+        actor_id.to_be_bytes()
+    }
+
+    fn actor_seq_key(actor_id: u64, sequence: u64) -> [u8; 16] {
+        let mut key = [0u8; 16];
+        key[..8].copy_from_slice(&actor_id.to_be_bytes());
+        key[8..].copy_from_slice(&sequence.to_be_bytes());
+        key
+    }
+
+    fn cf(&self, name: &str) -> io::Result<&rocksdb::ColumnFamily> {
+        self.db
+            .cf_handle(name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("missing CF {}", name)))
+    }
+}
+
+#[cfg(feature = "rocksdb")]
+impl PersistenceStore for RocksDbStore {
+    fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
+        let cf = self.cf(Self::CF_SNAPSHOTS)?;
+        let json = serde_json::to_string(&snapshot)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.db
+            .put_cf(cf, Self::actor_key(snapshot.actor_id), json.as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        // RocksDB's `put` is durable once flushed.  Sync the WAL so the
+        // snapshot survives a process crash before we report success.
+        self.db
+            .flush_wal(true)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        let cf = self.cf(Self::CF_SNAPSHOTS).ok()?;
+        let bytes = self.db.get_cf(cf, Self::actor_key(actor_id)).ok()??;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {
+        let cf = self.cf(Self::CF_JOURNAL)?;
+        let json = serde_json::to_string(&entry)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.db
+            .put_cf(
+                cf,
+                Self::actor_seq_key(actor_id, entry.sequence),
+                json.as_bytes(),
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        self.db
+            .flush_wal(true)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
+    fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+        let cf = match self.cf(Self::CF_JOURNAL) {
+            Ok(cf) => cf,
+            Err(_) => return Vec::new(),
+        };
+        let mut entries = Vec::new();
+        let start = Self::actor_seq_key(actor_id, 0);
+        let mut iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
+        );
+        while let Some(Ok((key, value))) = iter.next() {
+            if key.len() < 8 || key[..8] != Self::actor_key(actor_id) {
+                break;
+            }
+            if let Ok(entry) = serde_json::from_slice::<JournalEntry>(&value) {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
+    fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
+        let cf = self.cf(Self::CF_WORKFLOW_EVENTS)?;
+        let json = serde_json::to_string(&event)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.db
+            .put_cf(
+                cf,
+                Self::actor_seq_key(actor_id, event.sequence()),
+                json.as_bytes(),
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        self.db
+            .flush_wal(true)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
+    fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+        let cf = match self.cf(Self::CF_WORKFLOW_EVENTS) {
+            Ok(cf) => cf,
+            Err(_) => return Vec::new(),
+        };
+        let mut events = Vec::new();
+        let start = Self::actor_seq_key(actor_id, 0);
+        let mut iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
+        );
+        while let Some(Ok((key, value))) = iter.next() {
+            if key.len() < 8 || key[..8] != Self::actor_key(actor_id) {
+                break;
+            }
+            if let Ok(event) = serde_json::from_slice::<WorkflowEvent>(&value) {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
+        let cf = self.cf(Self::CF_EVENTS)?;
+        let json = serde_json::to_string(&entry)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.db
+            .put_cf(
+                cf,
+                Self::actor_seq_key(actor_id, entry.sequence),
+                json.as_bytes(),
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        self.db
+            .flush_wal(true)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
+    fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+        let cf = match self.cf(Self::CF_EVENTS) {
+            Ok(cf) => cf,
+            Err(_) => return Vec::new(),
+        };
+        let mut entries = Vec::new();
+        let start = Self::actor_seq_key(actor_id, 0);
+        let mut iter = self.db.iterator_cf(
+            cf,
+            rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
+        );
+        while let Some(Ok((key, value))) = iter.next() {
+            if key.len() < 8 || key[..8] != Self::actor_key(actor_id) {
+                break;
+            }
+            if let Ok(entry) = serde_json::from_slice::<EventEntry>(&value) {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
+    fn latest_sequence(&self, actor_id: u64) -> u64 {
+        let snapshot_seq = self
+            .load_snapshot(actor_id)
+            .map(|s| s.sequence)
+            .unwrap_or(0);
+        let journal_seq = self
+            .read_journal(actor_id)
+            .last()
+            .map(|e| e.sequence)
+            .unwrap_or(0);
+        let wf_event_seq = self
+            .read_workflow_events(actor_id)
+            .last()
+            .map(|e| e.sequence())
+            .unwrap_or(0);
+        let event_seq = self
+            .read_events(actor_id)
+            .last()
+            .map(|e| e.sequence)
+            .unwrap_or(0);
+        snapshot_seq
+            .max(journal_seq)
+            .max(wf_event_seq)
+            .max(event_seq)
+    }
+
+    fn clear(&mut self, actor_id: u64) -> io::Result<()> {
+        for cf_name in [
+            Self::CF_SNAPSHOTS,
+            Self::CF_JOURNAL,
+            Self::CF_WORKFLOW_EVENTS,
+            Self::CF_EVENTS,
+        ] {
+            let cf = self.cf(cf_name)?;
+            // Start from the bare actor prefix.  Snapshot keys are exactly 8
+            // bytes; journal/event keys are 16 bytes (actor || sequence).
+            // Both layouts sort contiguously under the actor prefix.
+            let actor_key = Self::actor_key(actor_id);
+            let mut iter = self.db.iterator_cf(
+                cf,
+                rocksdb::IteratorMode::From(&actor_key, rocksdb::Direction::Forward),
+            );
+            let mut keys = Vec::new();
+            while let Some(Ok((key, _))) = iter.next() {
+                if key.len() < 8 || key[..8] != actor_key {
+                    break;
+                }
+                keys.push(key.to_vec());
+            }
+            for key in keys {
+                self.db
+                    .delete_cf(cf, &key)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            }
+        }
+        self.db
+            .flush_wal(true)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PostgresStore — production relational persistence backend
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "postgres")]
+pub struct PostgresStore {
+    conn: std::sync::Mutex<postgres::Client>,
+}
+
+#[cfg(feature = "postgres")]
+impl PostgresStore {
+    /// Open a PostgreSQL-backed store using a libpq-style connection string.
+    ///
+    /// Example: `host=localhost user=postgres password=secret dbname=nulang`.
+    /// TLS is disabled (`NoTls`); use a connection string with SSL parameters
+    /// and a TLS-enabled client for production deployments that require it.
+    pub fn new(config: &str) -> io::Result<Self> {
+        let client = postgres::Client::connect(config, postgres::NoTls)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        let store = PostgresStore {
+            conn: std::sync::Mutex::new(client),
+        };
+        store.ensure_tables()?;
+        Ok(store)
+    }
+
+    fn ensure_tables(&self) -> io::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS snapshots (
+                actor_id BIGINT PRIMARY KEY,
+                sequence BIGINT NOT NULL,
+                state TEXT NOT NULL,
+                waiting_signal TEXT,
+                crdt_snapshot TEXT,
+                crdt_field_map TEXT,
+                authority_tokens TEXT
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS authority_tokens TEXT",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS journal (
+                actor_id BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                behavior_id INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (actor_id, sequence)
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS workflow_events (
+                actor_id BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                event TEXT NOT NULL,
+                PRIMARY KEY (actor_id, sequence)
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS events (
+                actor_id BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                field_name TEXT NOT NULL,
+                event_name TEXT NOT NULL,
+                args TEXT NOT NULL,
+                value TEXT NOT NULL DEFAULT '1',
+                PRIMARY KEY (actor_id, sequence)
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl PersistenceStore for PostgresStore {
+    fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
+        let state_json = serde_json::to_string(&snapshot.state)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let crdt_json = serde_json::to_string(&snapshot.crdt_snapshot)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let crdt_field_map_json = serde_json::to_string(&snapshot.crdt_field_map)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let authority_json = serde_json::to_string(&snapshot.authority_tokens)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (actor_id) DO UPDATE SET
+               sequence = EXCLUDED.sequence,
+               state = EXCLUDED.state,
+               waiting_signal = EXCLUDED.waiting_signal,
+               crdt_snapshot = EXCLUDED.crdt_snapshot,
+               crdt_field_map = EXCLUDED.crdt_field_map,
+               authority_tokens = EXCLUDED.authority_tokens",
+            &[
+                &(snapshot.actor_id as i64),
+                &(snapshot.sequence as i64),
+                &state_json,
+                &snapshot.waiting_signal.as_deref(),
+                &crdt_json.as_str(),
+                &crdt_field_map_json.as_str(),
+                &authority_json.as_str(),
+            ],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        let mut conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_one(
+                "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens
+                 FROM snapshots WHERE actor_id = $1",
+                &[&(actor_id as i64)],
+            )
+            .ok()?;
+        let sequence: i64 = row.get(0);
+        let state_json: String = row.get(1);
+        let waiting_signal: Option<String> = row.get(2);
+        let crdt_json: Option<String> = row.get(3);
+        let crdt_field_map_json: Option<String> = row.get(4);
+        let authority_json: Option<String> = row.get(5);
+        let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> =
+            crdt_json.and_then(|j| serde_json::from_str(&j).ok());
+        let crdt_field_map: Option<HashMap<String, u64>> =
+            crdt_field_map_json.and_then(|j| serde_json::from_str(&j).ok());
+        let authority_tokens: BTreeSet<String> = match authority_json {
+            Some(json) => match serde_json::from_str(&json) {
+                Ok(tokens) => tokens,
+                Err(err) => {
+                    warn!(
+                        "nulang-persist: invalid authority metadata for actor {}: {}",
+                        actor_id, err
+                    );
+                    return None;
+                }
+            },
+            None => BTreeSet::new(),
+        };
+        let state: HashMap<String, PersistedValue> = serde_json::from_str(&state_json).ok()?;
+        Some(ActorSnapshot {
+            actor_id,
+            sequence: sequence as u64,
+            state,
+            waiting_signal,
+            crdt_snapshot,
+            crdt_field_map,
+            authority_tokens,
+        })
+    }
+
+    fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> io::Result<()> {
+        let payload_json = serde_json::to_string(&entry.payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO journal (actor_id, sequence, behavior_id, payload)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (actor_id, sequence) DO UPDATE SET
+               behavior_id = EXCLUDED.behavior_id,
+               payload = EXCLUDED.payload",
+            &[
+                &(actor_id as i64),
+                &(entry.sequence as i64),
+                &(entry.behavior_id as i32),
+                &payload_json,
+            ],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
+    }
+
+    fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+        let mut conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match conn.query(
+            "SELECT sequence, behavior_id, payload FROM journal
+             WHERE actor_id = $1 ORDER BY sequence ASC",
+            &[&(actor_id as i64)],
+        ) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.iter()
+            .filter_map(|row| {
+                let seq: i64 = row.get(0);
+                let bid: i32 = row.get(1);
+                let payload_json: String = row.get(2);
+                let payload: Vec<PersistedValue> = serde_json::from_str(&payload_json).ok()?;
+                Some(JournalEntry {
+                    sequence: seq as u64,
+                    behavior_id: bid as u16,
+                    payload,
+                })
+            })
+            .collect()
+    }
+
+    fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
+        let event_json = serde_json::to_string(&event)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO workflow_events (actor_id, sequence, event)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (actor_id, sequence) DO UPDATE SET
+               event = EXCLUDED.event",
+            &[&(actor_id as i64), &(event.sequence() as i64), &event_json],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
+    }
+
+    fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+        let mut conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match conn.query(
+            "SELECT event FROM workflow_events
+             WHERE actor_id = $1 ORDER BY sequence ASC",
+            &[&(actor_id as i64)],
+        ) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.iter()
+            .filter_map(|row| {
+                let event_json: String = row.get(0);
+                serde_json::from_str(&event_json).ok()
+            })
+            .collect()
+    }
+
+    fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
+        let args_json = serde_json::to_string(&entry.args)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let value_json = serde_json::to_string(&entry.value)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO events (actor_id, sequence, field_name, event_name, args, value)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (actor_id, sequence) DO UPDATE SET
+               field_name = EXCLUDED.field_name,
+               event_name = EXCLUDED.event_name,
+               args = EXCLUDED.args,
+               value = EXCLUDED.value",
+            &[
+                &(actor_id as i64),
+                &(entry.sequence as i64),
+                &entry.field_name,
+                &entry.event_name,
+                &args_json,
+                &value_json,
+            ],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
+    }
+
+    fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+        let mut conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match conn.query(
+            "SELECT sequence, field_name, event_name, args, value FROM events
+             WHERE actor_id = $1 ORDER BY sequence ASC",
+            &[&(actor_id as i64)],
+        ) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.iter()
+            .filter_map(|row| {
+                let seq: i64 = row.get(0);
+                let field_name: String = row.get(1);
+                let event_name: String = row.get(2);
+                let args_json: String = row.get(3);
+                let args: Vec<PersistedValue> = serde_json::from_str(&args_json).ok()?;
+                let value_json: String = row.get(4);
+                let value: PersistedValue = serde_json::from_str(&value_json).ok()?;
+                Some(EventEntry {
+                    sequence: seq as u64,
+                    field_name,
+                    event_name,
+                    args,
+                    value,
+                })
+            })
+            .collect()
+    }
+
+    fn latest_sequence(&self, actor_id: u64) -> u64 {
+        let mut conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        let snapshot_seq: Option<i64> = conn
+            .query_opt(
+                "SELECT sequence FROM snapshots WHERE actor_id = $1",
+                &[&(actor_id as i64)],
+            )
+            .ok()
+            .flatten()
+            .map(|row| row.get(0));
+        let journal_seq: Option<i64> = conn
+            .query_opt(
+                "SELECT sequence FROM journal WHERE actor_id = $1 ORDER BY sequence DESC LIMIT 1",
+                &[&(actor_id as i64)],
+            )
+            .ok()
+            .flatten()
+            .map(|row| row.get(0));
+        let wf_event_seq: Option<i64> = conn
+            .query_opt(
+                "SELECT sequence FROM workflow_events WHERE actor_id = $1 ORDER BY sequence DESC LIMIT 1",
+                &[&(actor_id as i64)],
+            )
+            .ok()
+            .flatten()
+            .map(|row| row.get(0));
+        let event_seq: Option<i64> = conn
+            .query_opt(
+                "SELECT sequence FROM events WHERE actor_id = $1 ORDER BY sequence DESC LIMIT 1",
+                &[&(actor_id as i64)],
+            )
+            .ok()
+            .flatten()
+            .map(|row| row.get(0));
+        snapshot_seq
+            .unwrap_or(0)
+            .max(journal_seq.unwrap_or(0))
+            .max(wf_event_seq.unwrap_or(0))
+            .max(event_seq.unwrap_or(0)) as u64
+    }
+
+    fn clear(&mut self, actor_id: u64) -> io::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        for table in ["snapshots", "journal", "workflow_events", "events"] {
+            conn.execute(
+                &format!("DELETE FROM {} WHERE actor_id = $1", table),
+                &[&(actor_id as i64)],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+        Ok(())
     }
 
     fn query(&self, sql: &str, params: &[Value]) -> io::Result<Vec<String>> {
