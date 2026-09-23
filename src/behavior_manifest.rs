@@ -203,6 +203,7 @@ impl BehaviorManifest {
         &self,
         artifact_bytes: &[u8],
     ) -> Result<(), BehaviorManifestError> {
+        self.validate()?;
         let actual = artifact_digest(artifact_bytes);
         if actual != self.artifact.digest {
             return Err(BehaviorManifestError::ArtifactDigestMismatch {
