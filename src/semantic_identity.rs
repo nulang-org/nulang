@@ -1615,4 +1615,106 @@ mod tests {
             semantic_id_for_mir(&wasm, []).unwrap()
         );
     }
+
+    #[test]
+    fn effect_site_identity_ignores_formatting_and_source_lines() {
+        let compact = lower(
+            "actor Assistant { behavior ask(prompt: String) { perform Inference.ask(prompt) } }",
+        );
+        let formatted = lower(
+            "// source presentation only\nactor Assistant {\n  behavior ask(prompt: String) {\n    perform Inference.ask(prompt)\n  }\n}\n",
+        );
+
+        let first = effect_sites_for_mir(&compact);
+        let second = effect_sites_for_mir(&formatted);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].owner_name, "Assistant.ask");
+        assert_eq!(first[0].effect_operation, "Inference.ask");
+        assert_eq!(first[0].operation_ordinal, 0);
+    }
+
+    #[test]
+    fn unrelated_definition_change_does_not_renumber_effect_site() {
+        let first = lower(
+            "fn unrelated() -> Int { 1 }\nactor Assistant { behavior ask(prompt: String) { perform Inference.ask(prompt) } }",
+        );
+        let changed = lower(
+            "fn unrelated() -> Int { 999 }\nactor Assistant { behavior ask(prompt: String) { perform Inference.ask(prompt) } }",
+        );
+
+        let first_site = effect_sites_for_mir(&first)
+            .into_iter()
+            .find(|site| site.owner_name == "Assistant.ask")
+            .unwrap();
+        let changed_site = effect_sites_for_mir(&changed)
+            .into_iter()
+            .find(|site| site.owner_name == "Assistant.ask")
+            .unwrap();
+        assert_eq!(first_site.id, changed_site.id);
+    }
+
+    #[test]
+    fn same_operation_sites_receive_distinct_stable_ordinals() {
+        let module = lower(
+            "actor Assistant { behavior ask(prompt: String) { perform Inference.ask(prompt); perform Inference.ask(prompt) } }",
+        );
+        let sites: Vec<_> = effect_sites_for_mir(&module)
+            .into_iter()
+            .filter(|site| site.owner_name == "Assistant.ask")
+            .collect();
+
+        assert_eq!(sites.len(), 2);
+        assert_eq!(sites[0].operation_ordinal, 0);
+        assert_eq!(sites[1].operation_ordinal, 1);
+        assert_ne!(sites[0].id, sites[1].id);
+    }
+
+    #[test]
+    fn owner_kind_and_owner_name_domain_separate_effect_sites() {
+        let function = effect_site_id(
+            "app",
+            EffectSiteOwnerKind::Function,
+            "ask",
+            "Inference.ask",
+            0,
+        );
+        let behavior = effect_site_id(
+            "app",
+            EffectSiteOwnerKind::Behavior,
+            "ask",
+            "Inference.ask",
+            0,
+        );
+        let other_behavior = effect_site_id(
+            "app",
+            EffectSiteOwnerKind::Behavior,
+            "Other.ask",
+            "Inference.ask",
+            0,
+        );
+
+        assert_ne!(function, behavior);
+        assert_ne!(behavior, other_behavior);
+        assert_eq!(function.to_string().parse::<EffectSiteId>().unwrap(), function);
+    }
+
+    #[test]
+    fn different_effect_operation_does_not_share_site_identity() {
+        let inference = effect_site_id(
+            "app",
+            EffectSiteOwnerKind::Behavior,
+            "Assistant.ask",
+            "Inference.ask",
+            0,
+        );
+        let http = effect_site_id(
+            "app",
+            EffectSiteOwnerKind::Behavior,
+            "Assistant.ask",
+            "Http.post",
+            0,
+        );
+        assert_ne!(inference, http);
+    }
 }
