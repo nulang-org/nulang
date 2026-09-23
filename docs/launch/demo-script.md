@@ -164,7 +164,7 @@ fn main() {
 }
 ```
 
-**Observed output: `7`.** The `apply` handler is the sole authority for the
+**Expected output after the 2026-09-22 semantic correction: `7`.** The `apply` handler is the sole authority for the
 domain-state transition: the two messages add 3 and 4, while `emit` journals
 the event without inventing an additional mutation. This matches the
 `persist_07` conformance expectation. The point to land:
@@ -231,6 +231,6 @@ agg) at 1000px width, or terminalizer's `render`. Keep the GIF under ~5 MB.
 - [x] Build compiler (`cargo build --no-default-features`, Rust 1.95.0) — ok
 - [x] `nulang --check chat_server.nula` — "Type check passed."
 - [x] `nulang chat_server.nula` — observed output recorded above, exit 0
-- [x] Entity segment — corrected semantics produce output `7`, exit 0
+- [ ] Re-record entity segment after semantic correction — expected output `7`
 - [x] Attempted durable-state-across-supervised-restart variant — **failed
       (state resets to fresh)**; documented above, demo redesigned around it
