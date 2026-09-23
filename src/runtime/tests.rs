@@ -3571,7 +3571,11 @@ fn test_workflow_command_failure_requeues_without_execution() {
         Some(0),
         "handler must not run before durable command acceptance"
     );
-    assert_eq!(actor.mailbox.len(), 1, "unaccepted command must be requeued");
+    assert_eq!(
+        actor.mailbox.len(),
+        1,
+        "unaccepted command must be requeued"
+    );
     assert_eq!(rt.persistence.latest_sequence(actor_id), 1);
     assert!(rt.persistence.read_journal(actor_id).is_empty());
 }
