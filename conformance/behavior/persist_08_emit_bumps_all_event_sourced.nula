@@ -1,3 +1,4 @@
+// Historical test id: emit must not mutate unrelated event-sourced state.
 entity Counter {
     state count: Int = 0
     state other: Int = 100
