@@ -161,11 +161,6 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
             .filter(|(_, model)| **model == StateModel::EventSourced)
             .map(|(name, _)| name.clone())
             .collect();
-        for name in &event_sourced_names {
-            if let Some(n) = actor.get_state_field(name).and_then(|v| v.as_int()) {
-                actor.set_state_field(name, Value::int(n + 1));
-            }
-        }
         // Persist events for EventSourced fields (non-workflow actors).
         if !is_workflow && !event_sourced_names.is_empty() {
             let module = actor.bytecode_module.as_ref();
