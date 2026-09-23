@@ -123,7 +123,7 @@ fn run_ready_actor_turn(rt: &mut Runtime, actor_id: u64) {
         Some(actor_id),
         "expected actor {actor_id} to own the next ready token"
     );
-    run_ready_actor_turn(&mut rt, actor_id);
+    rt.step_actor(actor_id);
     rt.finish_actor_turn(actor_id);
 }
 
