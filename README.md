@@ -3,7 +3,7 @@
 </p>
 <h1 align="center">Nulang</h1>
 <p align="center">
-  An actor-based language with algebraic effects, capability-based types, durable actors, and experimental distribution for building resilient software.
+  A typed language for concurrent, durable, and distributed software with algebraic effects, reference capabilities, actors, and durable execution.
 </p>
 <p align="center">
   <a href="https://nulang.org">Website</a> •
@@ -24,10 +24,13 @@
 
 ## What is Nulang?
 
-Nulang is an actor-based programming language with algebraic effects and
-capability-based types. It fuses Erlang-style fault-tolerant actors with a
-Hindley-Milner type system, reference capabilities (`iso`/`trn`/`ref`/`val`/`box`/`tag`/`lineariso`),
-and row-polymorphic algebraic effects. The compiler pipeline (AST → HIR → MIR)
+Nulang is a programming language for concurrent, durable, and distributed
+software. Its semantic core combines a Hindley-Milner type system, reference
+capabilities (`iso`/`trn`/`ref`/`val`/`box`/`tag`/`lineariso`), and
+row-polymorphic algebraic effects. Erlang-style fault-tolerant actors are the
+first-class abstraction for independently addressable isolated state; ordinary
+local computation remains ordinary computation rather than being modeled as an
+actor. The compiler pipeline (AST → HIR → MIR)
 uses the register-based bytecode VM as the semantic reference implementation.
 Hot regions can tier into a Cranelift JIT; WASM is the canonical portable/cloud
 execution target; and native AOT remains a secondary backend until full semantic
@@ -120,7 +123,7 @@ perform IO.print("Hello, " + name + "!")
 ## Feature Highlights
 
 - **Algebraic effects** — `perform Effect.op(args)` / `handle body with { | Effect.op(x) => ... }` with resume semantics. Effect dependencies are explicit in function signatures via `!` rows.
-- **Capability-based types** — `iso`, `trn`, `ref`, `val`, `box`, `tag`, and `lineariso` guarantee memory safety and data-race freedom. Checked at compile time; erased at runtime.
+- **Reference-capability types** — `iso`, `trn`, `ref`, `val`, `box`, `tag`, and `lineariso` govern aliasing, mutation, ownership, and cross-actor sendability. They are distinct from external authority grants.
 - **Hindley-Milner type inference** — full Algorithm W with row-polymorphic records, variant types, and algebraic effect rows.
 - **Actors** — `spawn`, `send`/`!`, `ask`, selective `receive` with `after` timeout, links, monitors, supervision trees, process groups, and actor priority scheduling.
 - **Typed actor protocols** — structural `ActorRef[P]` contracts can restrict public actor APIs to required behaviors. Compiler-derived protocol fingerprints, a trusted schema registry, directional compatibility checks, and pre-mailbox admission are implemented as *Experimental* protocol hardening.
@@ -157,6 +160,7 @@ perform IO.print("Hello, " + name + "!")
 | [`docs/FABRIC.md`](docs/FABRIC.md) | Experimental distributed messaging and durable stream substrate |
 | [`docs/RESP_CACHE_ARCHITECTURE.md`](docs/RESP_CACHE_ARCHITECTURE.md) | Experimental RESP-compatible cache architecture and cluster-routing invariants |
 | [`editors/vscode/`](editors/vscode/) | VS Code extension (syntax highlighting, language essentials, snippets) — build a `.vsix` or install manually |
+| [`RFC/0024-orthogonal-execution-model.md`](RFC/0024-orthogonal-execution-model.md) | Orthogonal model for local computation, scoped tasks, actors, persistence, and identity |
 | [`RFC/`](RFC/) | RFC proposals (format stability, frozen core, deprecation cycles, roadmap) |
 
 ### Docs auto-sync and DeepWiki
