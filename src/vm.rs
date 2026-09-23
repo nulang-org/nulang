@@ -3617,7 +3617,7 @@ impl VM {
         let self_ptr = self as *mut VM;
         unsafe {
             crate::jit::runtime::set_jit_callbacks(
-                self.actor_callbacks.as_mut() as *mut dyn ActorVmCallbacks,
+                self.actor_callbacks.as_mut() as *mut dyn ActorVmCallbacks
             );
             crate::jit::runtime::set_jit_vm(self_ptr, module_idx);
         }
