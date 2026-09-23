@@ -465,10 +465,7 @@ fn artifact_digest(bytes: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(bytes).to_hex())
 }
 
-fn validate_blake3_digest(
-    field: &'static str,
-    value: &str,
-) -> Result<(), BehaviorManifestError> {
+fn validate_blake3_digest(field: &'static str, value: &str) -> Result<(), BehaviorManifestError> {
     let Some(hex) = value.strip_prefix("blake3:") else {
         return Err(BehaviorManifestError::InvalidDigest {
             field,
