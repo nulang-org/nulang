@@ -97,6 +97,8 @@ pub struct GcStats {
     pub foreign_refs_sent: u64,
     /// Foreign reference receives.
     pub foreign_refs_received: u64,
+    pub ownership_handoffs: u64,
+    pub refcount_ops_elided: u64,
     /// Cycles detected by the ORCA cycle detector (`orca_cycle::CycleDetector`).
     pub cycles_detected: u64,
     /// Total bytes allocated.
@@ -114,6 +116,8 @@ impl Default for GcStats {
             local_refs_dropped: 0,
             foreign_refs_sent: 0,
             foreign_refs_received: 0,
+            ownership_handoffs: 0,
+            refcount_ops_elided: 0,
             cycles_detected: 0,
             bytes_allocated: 0,
             bytes_freed: 0,
@@ -368,6 +372,42 @@ impl OrcaGc {
             object_header: header_ptr,
             delta: -1, // target will decrement foreign_count on receipt
         }
+    }
+
+    pub unsafe fn transfer_local_to_foreign_hold(
+        &mut self,
+        heap: &dyn OrcaHeap,
+        payload_ptr: *mut u8,
+    ) -> bool {
+        let header = &mut *heap.header_ptr(payload_ptr);
+        if header.actor_id != self.actor_id || header.ref_count == 0 {
+            return false;
+        }
+        header.ref_count -= 1;
+        header.foreign_count += 1;
+        self.stats.local_refs_dropped += 1;
+        self.stats.foreign_refs_sent += 1;
+        self.stats.foreign_refs_received += 1;
+        self.stats.ownership_handoffs += 1;
+        self.stats.refcount_ops_elided += 2;
+        true
+    }
+
+    pub unsafe fn rollback_local_to_foreign_hold(
+        &mut self,
+        heap: &dyn OrcaHeap,
+        payload_ptr: *mut u8,
+    ) {
+        let header = &mut *heap.header_ptr(payload_ptr);
+        debug_assert_eq!(header.actor_id, self.actor_id);
+        debug_assert!(header.foreign_count > 0);
+        header.foreign_count -= 1;
+        header.ref_count += 1;
+        self.stats.local_refs_dropped = self.stats.local_refs_dropped.saturating_sub(1);
+        self.stats.foreign_refs_sent = self.stats.foreign_refs_sent.saturating_sub(1);
+        self.stats.foreign_refs_received = self.stats.foreign_refs_received.saturating_sub(1);
+        self.stats.ownership_handoffs = self.stats.ownership_handoffs.saturating_sub(1);
+        self.stats.refcount_ops_elided = self.stats.refcount_ops_elided.saturating_sub(2);
     }
 
     /// Receive a reference from another actor (ORCA protocol).
