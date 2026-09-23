@@ -1658,14 +1658,20 @@ impl Runtime {
                         }
                     }
                     let seq = self.next_sequence(actor_id);
-                    let _ = self.persistence.append_workflow_event(
+                    if let Err(error) = workflow::commit_workflow_event(
+                        self,
                         actor_id,
                         WorkflowEvent::StepCompleted {
                             sequence: seq,
                             step_name,
                         },
-                    );
-                    self.checkpoint_actor(actor_id);
+                    ) {
+                        tracing::warn!(
+                            actor_id,
+                            %error,
+                            "nulang-persist: resumed workflow completion was not durably committed"
+                        );
+                    }
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
@@ -3899,8 +3905,11 @@ impl Runtime {
                     if aot_target.is_some() {
                         crate::aot::clear_aot_dispatch();
                     }
-                    // Snapshot durable state after the message is processed.
-                    self.checkpoint_actor(actor_id);
+                    // Workflow state is snapshotted with StepCompleted below;
+                    // only plain persistent actors checkpoint here.
+                    if !self.actor_is_workflow(actor_id) {
+                        self.checkpoint_actor(actor_id);
+                    }
                     processed = true;
                 }
             }
@@ -3950,7 +3959,9 @@ impl Runtime {
                 self.suspend_enabled = saved_suspend;
                 match result {
                     Ok(_) => {
-                        self.checkpoint_actor(actor_id);
+                        if !self.actor_is_workflow(actor_id) {
+                            self.checkpoint_actor(actor_id);
+                        }
                         processed = true;
                     }
                     Err(crate::types::NuError::Suspended(_)) => {
@@ -3964,24 +3975,30 @@ impl Runtime {
                         processed = false;
                     }
                     Err(e) => {
-                        self.checkpoint_actor(actor_id);
-                        // A workflow step failed: record the failure (durable
-                        // StepFailed event — SPEC2 §10 known-issue #5: step
-                        // failures were silent, exit 0, no diagnostic), then
-                        // run saga compensations for previously completed
-                        // steps in reverse order.
+                        // Workflow failure metadata and the resulting state
+                        // must share the atomic tail. Plain persistent actors
+                        // retain their compatibility checkpoint path.
                         if self.actor_is_workflow(actor_id) {
                             let seq = self.next_sequence(actor_id);
                             let step_name = self.step_name_for(actor_id, behavior_idx);
-                            let _ = self.persistence.append_workflow_event(
+                            match workflow::commit_workflow_event(
+                                self,
                                 actor_id,
                                 WorkflowEvent::StepFailed {
                                     sequence: seq,
                                     step_name,
                                     error: format!("{}", e),
                                 },
-                            );
-                            self.run_saga_compensation(actor_id, behavior_idx);
+                            ) {
+                                Ok(()) => self.run_saga_compensation(actor_id, behavior_idx),
+                                Err(error) => tracing::warn!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-persist: workflow failure was not durably committed"
+                                ),
+                            }
+                        } else {
+                            self.checkpoint_actor(actor_id);
                         }
                         processed = false;
                     }
@@ -3991,18 +4008,9 @@ impl Runtime {
                 && self.actor_is_workflow(actor_id)
                 && !self.is_internal_behavior(actor_id, behavior_idx)
             {
-                let seq = self.next_sequence(actor_id);
-                let step_name = self.step_name_for(actor_id, behavior_idx);
-                let _ = self.persistence.append_workflow_event(
-                    actor_id,
-                    WorkflowEvent::StepCompleted {
-                        sequence: seq,
-                        step_name,
-                    },
-                );
                 // Synthetic parallel steps do not increment step_index in their
                 // bytecode (so signal-waiting branches do not double-increment);
-                // advance it here when the step completes.
+                // stage that state change before the atomic completion snapshot.
                 if self.is_parallel_step(actor_id, behavior_idx) {
                     if let Some(actor) = self.actors.get_mut(&actor_id) {
                         if let Some(n) =
@@ -4012,7 +4020,22 @@ impl Runtime {
                         }
                     }
                 }
-                self.checkpoint_actor(actor_id);
+                let seq = self.next_sequence(actor_id);
+                let step_name = self.step_name_for(actor_id, behavior_idx);
+                if let Err(error) = workflow::commit_workflow_event(
+                    self,
+                    actor_id,
+                    WorkflowEvent::StepCompleted {
+                        sequence: seq,
+                        step_name,
+                    },
+                ) {
+                    tracing::warn!(
+                        actor_id,
+                        %error,
+                        "nulang-persist: workflow completion was not durably committed"
+                    );
+                }
             }
             let actor = match self.actors.get_mut(&actor_id) {
                 Some(a) => a,
@@ -4529,14 +4552,20 @@ impl Runtime {
                             }
                         }
                         let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        if let Err(error) = crate::runtime::workflow::commit_workflow_event(
+                            &mut *self_ptr,
                             actor_id,
                             crate::runtime::WorkflowEvent::StepCompleted {
                                 sequence: seq,
                                 step_name: suspended.step_name.clone(),
                             },
-                        );
-                        (*self_ptr).checkpoint_actor(actor_id);
+                        ) {
+                            tracing::warn!(
+                                actor_id,
+                                %error,
+                                "nulang-persist: timer-resumed workflow completion was not durably committed"
+                            );
+                        }
                     }
                 }
                 Err(crate::types::NuError::Suspended(_)) => {
@@ -4622,14 +4651,20 @@ impl Runtime {
                             }
                         }
                         let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        if let Err(error) = crate::runtime::workflow::commit_workflow_event(
+                            &mut *self_ptr,
                             actor_id,
                             WorkflowEvent::StepCompleted {
                                 sequence: seq,
                                 step_name: suspended.step_name,
                             },
-                        );
-                        (*self_ptr).checkpoint_actor(actor_id);
+                        ) {
+                            tracing::warn!(
+                                actor_id,
+                                %error,
+                                "nulang-persist: receive-resumed workflow completion was not durably committed"
+                            );
+                        }
                     }
                 }
                 Err(crate::types::NuError::Suspended(VmSuspension::ReceiveWait)) => {
@@ -4767,7 +4802,18 @@ impl Runtime {
                 return;
             }
             snapshot.waiting_signal = waiting_signal;
-            let _ = self.persistence.save_snapshot(snapshot);
+            let result = if self.actor_is_workflow(actor_id) {
+                workflow::commit_workflow_snapshot(self, actor_id, snapshot)
+            } else {
+                self.persistence.save_snapshot(snapshot)
+            };
+            if let Err(error) = result {
+                tracing::warn!(
+                    actor_id,
+                    %error,
+                    "nulang-persist: suspension marker was not durably committed"
+                );
+            }
         }
     }
 
