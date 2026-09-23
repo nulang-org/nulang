@@ -1262,8 +1262,7 @@ mod tests {
         assert_eq!(committed.intentions.len(), 2);
         assert_eq!(committed.intentions[1].status, IntentionStatus::Active);
         assert_eq!(
-            ordered_tasks_for_intention(&committed.tasks, &committed.intentions[1])
-                .unwrap()[0]
+            ordered_tasks_for_intention(&committed.tasks, &committed.intentions[1]).unwrap()[0]
                 .status,
             TaskStatus::Created
         );
@@ -1294,11 +1293,15 @@ mod tests {
         assert_eq!(completed.intentions[1].status, IntentionStatus::Completed);
         assert_eq!(completed.commitments[0].status, CommitmentStatus::Fulfilled);
 
+        let first_attempt_text = String::from_utf8_lossy(&failing.bytes);
+        assert!(first_attempt_text.contains("commitment_resumed"));
+        assert!(first_attempt_text.contains("goal_resumed"));
+
         let recovered_text = String::from_utf8(recovered_out.into_inner()).unwrap();
         assert!(recovered_text.contains("goal_resumed"));
-        assert!(recovered_text.contains("commitment_resumed"));
+        assert!(!recovered_text.contains("commitment_resumed"));
         assert!(recovered_text.contains("task_completed"));
-        for line in recovered_text.lines() {
+        for line in first_attempt_text.lines().chain(recovered_text.lines()) {
             let envelope: SwarmEventEnvelope = serde_json::from_str(line).unwrap();
             assert_eq!(envelope.conversation_id, original_conversation_id);
         }
