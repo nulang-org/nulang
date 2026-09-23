@@ -1813,10 +1813,12 @@ fn emit_wasm_behavior_manifest(
         &mut checker,
         &ast.decls,
     )?;
-    let json = manifest.to_canonical_json().map_err(|error| NuError::VMError {
-        msg: format!("cannot serialize Behavior Manifest: {error}"),
-        span: Span::default(),
-    })?;
+    let json = manifest
+        .to_canonical_json()
+        .map_err(|error| NuError::VMError {
+            msg: format!("cannot serialize Behavior Manifest: {error}"),
+            span: Span::default(),
+        })?;
 
     let out = PathBuf::from(format!("{wasm_file}.behavior.json"));
     std::fs::write(&out, json).map_err(|error| NuError::VMError {
