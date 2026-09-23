@@ -1750,6 +1750,60 @@ fn source_declares_import(source: &str) -> NuResult<bool> {
 }
 
 #[cfg(feature = "wasm-backend")]
+fn standalone_package_identity(file_path: Option<&str>) -> (String, String) {
+    let name = std::env::var("NULANG_PACKAGE_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            file_path
+                .and_then(|path| std::path::Path::new(path).file_stem())
+                .and_then(|stem| stem.to_str())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "standalone".to_string());
+    let version = std::env::var("NULANG_PACKAGE_VERSION")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "0.0.0".to_string());
+    (name, version)
+}
+
+#[cfg(feature = "wasm-backend")]
+fn emit_wasm_cyclonedx_sbom(
+    file_path: Option<&str>,
+    wasm_file: &str,
+) -> NuResult<PathBuf> {
+    let (package_name, package_version) = standalone_package_identity(file_path);
+    let sbom = serde_json::json!({
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.6",
+        "version": 1,
+        "metadata": {
+            "component": {
+                "type": "application",
+                "name": package_name,
+                "version": package_version,
+                "properties": [{
+                    "name": "nulang:language-version",
+                    "value": nulang::format::constants::LANGUAGE_VERSION_STR
+                }]
+            }
+        },
+        "components": []
+    });
+    let bytes = serde_json::to_vec_pretty(&sbom).map_err(|error| NuError::VMError {
+        msg: format!("cannot serialize CycloneDX SBOM: {error}"),
+        span: Span::default(),
+    })?;
+    let out = PathBuf::from(format!("{wasm_file}.cdx.json"));
+    std::fs::write(&out, bytes).map_err(|error| NuError::VMError {
+        msg: format!("failed to write CycloneDX SBOM '{}': {error}", out.display()),
+        span: Span::default(),
+    })?;
+    Ok(out)
+}
+
+#[cfg(feature = "wasm-backend")]
 fn emit_wasm_behavior_manifest(
     source: &str,
     file_path: Option<&str>,
@@ -1782,20 +1836,7 @@ fn emit_wasm_behavior_manifest(
     checker.set_resource_grants(with_capabilities);
     checker.check_module(&ast.decls)?;
 
-    let package_name = std::env::var("NULANG_PACKAGE_NAME")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            file_path
-                .and_then(|path| std::path::Path::new(path).file_stem())
-                .and_then(|stem| stem.to_str())
-                .map(ToOwned::to_owned)
-        })
-        .unwrap_or_else(|| "standalone".to_string());
-    let package_version = std::env::var("NULANG_PACKAGE_VERSION")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "0.0.0".to_string());
+    let (package_name, package_version) = standalone_package_identity(file_path);
 
     let manifest = nulang::behavior_manifest::BehaviorManifest::from_checked_module(
         nulang::behavior_manifest::ManifestBuildInput {
@@ -1872,8 +1913,10 @@ fn run_source(
                 &ast,
                 with_capabilities,
             )? {
+                let sbom_path = emit_wasm_cyclonedx_sbom(file_path, wasm_file)?;
                 if verbose {
                     println!("Wrote {}", manifest_path.display());
+                    println!("Wrote {}", sbom_path.display());
                 }
             }
             println!("Wrote {} ({} bytes)", wasm_file, wasm_bytes.len());
