@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### Deduplicated actor ready queue and adaptive turns — 2026-09-23
+- **Actor scheduling now has explicit shard-owned `Idle → Queued → Running` ownership** (`src/runtime/actor.rs`, `src/runtime/mod.rs`), so bursts of sends append mailbox work without injecting duplicate ready tokens. Production, cross-shard delivery, timer wakeups, supervisor restarts, and internal manual pumps use the same claim/finish transition helpers.
+- **Mailbox turns adapt to runnable-peer pressure**: contended actors keep the existing 16-message quantum, while an effectively solo actor may drain up to 256 messages before returning to the scheduler; peer pressure is rechecked every 16 messages and the actor reduction budget remains the hard preemption ceiling.
+- **GC/CRDT/dehydration cadence is charged by messages actually processed rather than actor-turn count**, preventing larger solo batches from stretching maintenance intervals.
+- **Actor benchmarks retain the existing named-send history and add a numeric behavior-id enqueue signal**, making scheduler/mailbox changes visible without conflating them with behavior-name resolution.
+
 ### RFC 0008 migration compatibility substrate — 2026-09-23
 - **Entity migration graphs are now validated before lowering** (`src/typechecker.rs`). Schema versions must be positive; migration steps must advance exactly one version, cannot duplicate an origin or target beyond the current schema, and must form a complete 1→current chain. Invalid skipped-version and downgrade conformance cases now fail compilation instead of silently running.
 - **Migration compatibility metadata now survives HIR→MIR lowering** (`src/mir_lower.rs`, `src/bytecode.rs`) instead of being replaced with an empty `ActorMeta.migrations` payload.
