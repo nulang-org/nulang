@@ -234,9 +234,7 @@ impl LocalRuntime {
                     reason,
                 } => {
                     let revision = IntentionRevision::new(
-                        goal_id,
-                        commitment.id,
-                        intention.id,
+                        &intention,
                         None,
                         terminal_task.id,
                         TaskStatus::Blocked,
@@ -306,9 +304,7 @@ impl LocalRuntime {
                         &replacement_tasks,
                     );
                     let revision = IntentionRevision::new(
-                        goal_id,
-                        commitment.id,
-                        intention.id,
+                        &intention,
                         Some(replacement.id),
                         terminal_task.id,
                         TaskStatus::Failed,
@@ -355,9 +351,7 @@ impl LocalRuntime {
                     reason,
                 } => {
                     let revision = IntentionRevision::new(
-                        goal_id,
-                        commitment.id,
-                        intention.id,
+                        &intention,
                         None,
                         terminal_task.id,
                         TaskStatus::Failed,
