@@ -769,50 +769,88 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        if let Err(e) = check_source(
+        let warnings = match check_source(
             &source,
             Some(&path),
-            opts.verbose,
+            opts.verbose && !opts.json,
             opts.all_errors,
             &opts.with_capabilities,
-            opts.deny_warnings,
+            !opts.json,
         ) {
-            let code = exit_code(&e);
-            if opts.json {
-                // Machine-readable mode: the JSON report is the ONLY output on
-                // stdout; nothing human-rendered is printed.
-                let diags = if opts.all_errors {
+            Ok(warnings) => warnings,
+            Err(e) => {
+                let code = exit_code(&e);
+                if opts.json {
+                    // Machine-readable mode: the JSON report is the ONLY output
+                    // on stdout; nothing human-rendered is printed.
+                    let diags = if opts.all_errors {
+                        let all = collect_all_frontend_errors(&source, Some(&path));
+                        if all.is_empty() {
+                            nulang::json_diagnostics::diagnostics_from_error(&e)
+                        } else {
+                            all.iter()
+                                .flat_map(nulang::json_diagnostics::diagnostics_from_error)
+                                .collect()
+                        }
+                    } else {
+                        nulang::json_diagnostics::diagnostics_from_error(&e)
+                    };
+                    let report = nulang::json_diagnostics::JsonReport::new(
+                        "check",
+                        Some(path.clone()),
+                        diags,
+                    );
+                    print!("{}", report.to_json_string());
+                } else if opts.all_errors {
                     let all = collect_all_frontend_errors(&source, Some(&path));
                     if all.is_empty() {
-                        nulang::json_diagnostics::diagnostics_from_error(&e)
+                        print_error(&e, use_color);
                     } else {
-                        all.iter()
-                            .flat_map(nulang::json_diagnostics::diagnostics_from_error)
-                            .collect()
+                        for err in &all {
+                            print_error(err, use_color);
+                        }
                     }
                 } else {
-                    nulang::json_diagnostics::diagnostics_from_error(&e)
-                };
+                    print_error(&e, use_color);
+                }
+                std::process::exit(code);
+            }
+        };
+
+        // Strict check mode is applied after warning collection so JSON can
+        // preserve the actual warning diagnostics as well as the escalation.
+        if opts.deny_warnings && !warnings.is_empty() {
+            let e = nulang::types::NuError::parse_error(
+                format!(
+                    "aborting due to {} warning{} (--deny-warnings)",
+                    warnings.len(),
+                    if warnings.len() == 1 { "" } else { "s" }
+                ),
+                warnings[0].span,
+            );
+            let code = exit_code(&e);
+            if opts.json {
+                let mut diags: Vec<_> = warnings
+                    .iter()
+                    .map(nulang::json_diagnostics::diagnostic_from_warning)
+                    .collect();
+                diags.extend(nulang::json_diagnostics::diagnostics_from_error(&e));
                 let report =
                     nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), diags);
                 print!("{}", report.to_json_string());
-            } else if opts.all_errors {
-                let all = collect_all_frontend_errors(&source, Some(&path));
-                if all.is_empty() {
-                    print_error(&e, use_color);
-                } else {
-                    for err in &all {
-                        print_error(err, use_color);
-                    }
-                }
             } else {
                 print_error(&e, use_color);
             }
             std::process::exit(code);
         }
+
         if opts.json {
+            let diags = warnings
+                .iter()
+                .map(nulang::json_diagnostics::diagnostic_from_warning)
+                .collect();
             let report =
-                nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), Vec::new());
+                nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), diags);
             print!("{}", report.to_json_string());
         } else {
             println!("Type check passed.");
@@ -1562,6 +1600,35 @@ fn run_frontend(
     with_capabilities: &[String],
     deny_warnings: bool,
 ) -> NuResult<(nulang::ast::AstModule, nulang::typechecker::TypeChecker)> {
+    let (ast, type_checker, _warnings) = run_frontend_collect_warnings(
+        source,
+        file_path,
+        verbose,
+        with_capabilities,
+        deny_warnings,
+        true,
+    )?;
+    Ok((ast, type_checker))
+}
+
+/// Shared frontend with an explicit warning sink.
+///
+/// Ordinary compile/run callers request human warning rendering and preserve
+/// the historical `--deny-warnings` behavior through `run_frontend`.
+/// Machine-readable check mode disables human warning rendering and consumes
+/// the returned warning vector directly, avoiding a second parse/typecheck.
+fn run_frontend_collect_warnings(
+    source: &str,
+    file_path: Option<&str>,
+    verbose: bool,
+    with_capabilities: &[String],
+    deny_warnings: bool,
+    emit_warnings: bool,
+) -> NuResult<(
+    nulang::ast::AstModule,
+    nulang::typechecker::TypeChecker,
+    Vec<nulang::types::NuWarning>,
+)> {
     let ps = nulang::prelude_source::PRELUDE_SOURCE;
     let mut pl = Lexer::new(ps);
     nulang::types::set_source_map_with_file(ps, Some("<prelude>"));
@@ -1575,11 +1642,13 @@ fn run_frontend(
     let mut ast = parser.parse_module()?;
     // Surface non-fatal frontend warnings (e.g. RFC 0015 deprecations).
     // Warnings never fail compilation unless --deny-warnings is passed.
-    let warnings = parser.take_warnings();
+    let mut warnings = parser.take_warnings();
     if !warnings.is_empty() {
-        let use_color = std::io::stderr().is_terminal();
-        for w in &warnings {
-            eprintln!("{}", nulang::diagnostic::format_warning(w, use_color));
+        if emit_warnings {
+            let use_color = std::io::stderr().is_terminal();
+            for w in &warnings {
+                eprintln!("{}", nulang::diagnostic::format_warning(w, use_color));
+            }
         }
         if deny_warnings {
             return Err(nulang::types::NuError::parse_error(
@@ -1628,27 +1697,28 @@ fn run_frontend(
     let module_type = type_checker.check_module(&ast)?;
 
     // Semantic warnings are emitted only after successful type inference so
-    // they can use resolved types. Like parser warnings, they are advisory by
-    // default and become fatal under --deny-warnings. Keep them on the
-    // TypeChecker so tooling/check-mode callers can inspect the same result.
-    if !type_checker.warnings.is_empty() {
-        let use_color = std::io::stderr().is_terminal();
-        for warning in &type_checker.warnings {
-            eprintln!(
-                "{}",
-                nulang::diagnostic::format_warning(warning, use_color)
-            );
+    // they can use resolved finite-domain types. They follow the same
+    // compatibility contract as parser warnings: warning-by-default, strict
+    // under --deny-warnings.
+    let type_warnings = type_checker.take_warnings();
+    if !type_warnings.is_empty() {
+        if emit_warnings {
+            let use_color = std::io::stderr().is_terminal();
+            for w in &type_warnings {
+                eprintln!("{}", nulang::diagnostic::format_warning(w, use_color));
+            }
         }
         if deny_warnings {
             return Err(nulang::types::NuError::parse_error(
                 format!(
                     "aborting due to {} warning{} (--deny-warnings)",
-                    type_checker.warnings.len(),
-                    if type_checker.warnings.len() == 1 { "" } else { "s" }
+                    type_warnings.len(),
+                    if type_warnings.len() == 1 { "" } else { "s" }
                 ),
-                type_checker.warnings[0].span,
+                type_warnings[0].span,
             ));
         }
+        warnings.extend(type_warnings);
     }
 
     if verbose {
@@ -1755,7 +1825,7 @@ fn run_frontend(
         }
     }
 
-    Ok((ast, type_checker))
+    Ok((ast, type_checker, warnings))
 }
 
 #[cfg_attr(not(feature = "wasm-backend"), allow(unused_variables))]
@@ -2323,16 +2393,25 @@ fn check_source(
     verbose: bool,
     _all_errors: bool,
     with_capabilities: &[String],
-    deny_warnings: bool,
-) -> NuResult<()> {
-    let (_ast, _tc) = run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
+    emit_warnings: bool,
+) -> NuResult<Vec<nulang::types::NuWarning>> {
+    // Check mode owns warning escalation so JSON can report the actual warning
+    // diagnostics before adding the strict-mode failure diagnostic.
+    let (_ast, _tc, warnings) = run_frontend_collect_warnings(
+        source,
+        file_path,
+        verbose,
+        with_capabilities,
+        false,
+        emit_warnings,
+    )?;
 
     if verbose {
         println!("Effect check passed.");
         println!("Capability analysis passed.");
     }
 
-    Ok(())
+    Ok(warnings)
 }
 
 /// Run the full frontend in multi-error mode and return every collected
