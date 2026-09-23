@@ -6,7 +6,9 @@
 //! to keep the god-object at a manageable size.
 
 use crate::bytecode::Constant;
-use crate::primitives::ActorRole;
+use crate::primitives::{
+    ActorRole, DurableWait, DurableWaitKind, DurableWakeResult,
+};
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{EventEntry, PersistedValue, WorkflowEvent};
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
@@ -294,24 +296,92 @@ pub(crate) fn append_saga_compensated(
 // Signal delivery
 // ---------------------------------------------------------------------------
 
-/// Deliver a signal to a workflow actor. If the actor is currently suspended
-/// waiting for this signal, its execution is resumed.
-pub(crate) fn signal_workflow(
+/// Return the durable waits currently observable for an actor-backed workflow.
+///
+/// This adapter derives semantic wait identities from already-persisted state;
+/// it does not alter snapshot or journal formats.
+pub(crate) fn durable_waits(rt: &Runtime, actor_id: u64) -> Vec<DurableWait> {
+    let Some(actor) = rt.actors.get(&actor_id) else {
+        return Vec::new();
+    };
+    if !matches!(actor.role(), Ok(ActorRole::Workflow)) {
+        return Vec::new();
+    }
+
+    let generation = actor
+        .get_state_field("step_index")
+        .and_then(|value| value.as_int())
+        .unwrap_or(0)
+        .max(0) as u64;
+
+    let mut waits = Vec::new();
+    if let Some(marker) = actor.waiting_signal.as_deref() {
+        if marker == super::LLM_SUSPEND_MARKER {
+            waits.push(DurableWait::new(
+                actor_id,
+                generation,
+                DurableWaitKind::ExternalEffect,
+                "LLM.ask",
+            ));
+        } else {
+            waits.push(DurableWait::new(
+                actor_id,
+                generation,
+                DurableWaitKind::Signal,
+                marker,
+            ));
+        }
+    }
+
+    // Match recovery semantics: a fired timer name is no longer pending.
+    // Timer-set sequence is the timer wait's semantic generation because it is
+    // already durable and unique across repeated sets of the same name.
+    let timer_events = rt.persistence.read_timer_events(actor_id);
+    let fired: std::collections::HashSet<String> = timer_events
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::TimerFired { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    for event in timer_events {
+        if let WorkflowEvent::TimerSet {
+            sequence,
+            name,
+            duration_ms,
+        } = event
+        {
+            if !fired.contains(&name) {
+                waits.push(DurableWait::timer(
+                    actor_id,
+                    sequence,
+                    name,
+                    duration_ms,
+                ));
+            }
+        }
+    }
+
+    waits.sort_by_key(|wait| (wait.generation, wait.id));
+    waits
+}
+
+/// Fallible durable signal delivery.
+///
+/// Persistence is the commit boundary. An in-memory signal is installed and a
+/// suspended step is resumed only after the journal append/checkpoint succeeds.
+pub(crate) fn try_signal_workflow(
     rt: &mut Runtime,
     actor_id: u64,
     name: &str,
     payload: Option<String>,
-) {
-    let _ = append_signal_received(rt, actor_id, name, payload.clone());
+) -> std::io::Result<bool> {
+    append_signal_received(rt, actor_id, name, payload.clone())?;
 
     let should_resume = {
         if let Some(actor) = rt.actors.get_mut(&actor_id) {
             actor.received_signals.push((name.to_string(), payload));
-            actor
-                .waiting_signal
-                .as_ref()
-                .map(|s| s == name)
-                .unwrap_or(false)
+            actor.waiting_signal.as_deref() == Some(name)
         } else {
             false
         }
@@ -320,6 +390,57 @@ pub(crate) fn signal_workflow(
     if should_resume {
         rt.resume_suspended_workflow_step(actor_id);
     }
+    Ok(should_resume)
+}
+
+/// Deliver a signal to a workflow actor. If the actor is currently suspended
+/// waiting for this signal, its execution is resumed.
+///
+/// This compatibility wrapper remains best-effort, but unlike the old path it
+/// never applies an in-memory wake after a failed durable append.
+pub(crate) fn signal_workflow(
+    rt: &mut Runtime,
+    actor_id: u64,
+    name: &str,
+    payload: Option<String>,
+) {
+    if let Err(error) = try_signal_workflow(rt, actor_id, name, payload) {
+        tracing::warn!(
+            actor_id,
+            signal = name,
+            %error,
+            "nulang-workflow: durable signal delivery failed"
+        );
+    }
+}
+
+/// Resolve an exact externally-wakeable durable wait.
+///
+/// A repeated wake for a wait that is no longer current is idempotent and
+/// returns `AlreadyResolved`. Timer and external-effect waits are observable
+/// through the same contract but can only be resolved by their owning runtime
+/// subsystem.
+pub(crate) fn wake_durable_wait(
+    rt: &mut Runtime,
+    wait: &DurableWait,
+    payload: Option<String>,
+) -> std::io::Result<DurableWakeResult> {
+    if !rt.actors.contains_key(&wait.owner_id) {
+        return Ok(DurableWakeResult::OwnerMissing);
+    }
+    if wait.kind != DurableWaitKind::Signal {
+        return Ok(DurableWakeResult::NotExternallyWakeable);
+    }
+
+    let current = durable_waits(rt, wait.owner_id)
+        .into_iter()
+        .any(|candidate| candidate.id == wait.id);
+    if !current {
+        return Ok(DurableWakeResult::AlreadyResolved);
+    }
+
+    try_signal_workflow(rt, wait.owner_id, &wait.key, payload)?;
+    Ok(DurableWakeResult::Woken)
 }
 
 /// Register a read-only query handler on a workflow actor.
