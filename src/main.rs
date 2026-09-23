@@ -1627,6 +1627,30 @@ fn run_frontend(
     let mut type_checker = TypeChecker::new();
     let module_type = type_checker.check_module(&ast)?;
 
+    // Semantic warnings are emitted only after successful type inference so
+    // they can use resolved types. Like parser warnings, they are advisory by
+    // default and become fatal under --deny-warnings. Keep them on the
+    // TypeChecker so tooling/check-mode callers can inspect the same result.
+    if !type_checker.warnings.is_empty() {
+        let use_color = std::io::stderr().is_terminal();
+        for warning in &type_checker.warnings {
+            eprintln!(
+                "{}",
+                nulang::diagnostic::format_warning(warning, use_color)
+            );
+        }
+        if deny_warnings {
+            return Err(nulang::types::NuError::parse_error(
+                format!(
+                    "aborting due to {} warning{} (--deny-warnings)",
+                    type_checker.warnings.len(),
+                    if type_checker.warnings.len() == 1 { "" } else { "s" }
+                ),
+                type_checker.warnings[0].span,
+            ));
+        }
+    }
+
     if verbose {
         println!("=== Inferred Type ===");
         println!("{}\n", type_to_string(&module_type));
