@@ -12,8 +12,6 @@ use tracing::warn;
 
 mod actor;
 mod blocking_executor;
-mod foreign_call;
-mod foreign_executor;
 pub mod cache;
 pub mod cache_cluster;
 pub mod cache_dispatch;
@@ -21,6 +19,8 @@ pub mod cache_pipeline;
 pub mod cache_routing;
 #[cfg(feature = "cache-server")]
 pub mod cache_server;
+mod foreign_call;
+mod foreign_executor;
 mod gc;
 pub mod heap;
 pub(crate) mod heap_serialize;
@@ -92,8 +92,6 @@ mod tests;
 
 pub use actor::*;
 pub use blocking_executor::*;
-pub use foreign_call::*;
-pub use foreign_executor::*;
 pub use cache::*;
 pub use cache_cluster::*;
 pub use cache_dispatch::*;
@@ -108,6 +106,8 @@ pub use crdt::*;
 pub use crdt_manager::*;
 pub use crdt_reg::{LWWRegister, MVRegister, RGAElement, RGA};
 pub use distributed::*;
+pub use foreign_call::*;
+pub use foreign_executor::*;
 pub use gc::{ForeignRefOp, GcStats, OrcaCoordinator, OrcaGc, OrcaHeap};
 pub use grain::*;
 pub use heap::*;
