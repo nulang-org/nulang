@@ -103,10 +103,13 @@ pub fn plan_evaluation(
             continue;
         }
 
+        // Absence from a point-in-time node snapshot is not proof of death.
+        // Fail closed and retain ownership until membership explicitly marks
+        // the node Removed (or an operator intentionally drains it).
         let valid = working_nodes
             .get(&current.node_id)
             .map(|node| retention_rejections(deployment, node).is_empty())
-            .unwrap_or(false);
+            .unwrap_or(true);
         if !valid {
             superseded.push(SupersededAllocation {
                 allocation: current,
@@ -242,6 +245,14 @@ pub fn plan_evaluation(
 }
 
 fn retention_rejections(deployment: &DeploymentSpec, node: &NodeDescriptor) -> Vec<Rejection> {
+    // Suspicion/unreachability is not a fencing event. Replacing an allocation
+    // while its old node may still be alive can create two live owners. Keep
+    // the current epoch until the node is confirmed Removed or deliberately
+    // Draining. Once the node is healthy again, normal placement constraints
+    // may trigger a controlled replacement.
+    if matches!(node.state, NodeState::Suspect | NodeState::Unreachable) {
+        return Vec::new();
+    }
     common_rejections(deployment, node, false, 0)
 }
 
@@ -707,6 +718,90 @@ mod tests {
         assert_eq!(plan.superseded.len(), 1);
         assert_eq!(plan.superseded[0].allocation.epoch, 4);
         assert_eq!(plan.superseded[0].reason, SupersededReason::Duplicate);
+    }
+
+    #[test]
+    fn test_suspect_allocation_is_retained_to_avoid_split_brain() {
+        let spec = deployment(1);
+        let mut suspect = node(1, "us-east", "a", 4_000, 4_096);
+        suspect.state = NodeState::Suspect;
+        let existing = ObservedAllocation {
+            deployment_id: "api".into(),
+            revision: 2,
+            replica: 0,
+            node_id: 1,
+            epoch: 9,
+            state: AllocationState::Running,
+        };
+
+        let plan = plan_evaluation(
+            &evaluation(),
+            &spec,
+            &[suspect, node(2, "us-east", "b", 4_000, 4_096)],
+            &[existing],
+        )
+        .unwrap();
+
+        assert_eq!(plan.retained.len(), 1);
+        assert_eq!(plan.retained[0].epoch, 9);
+        assert!(plan.placements.is_empty());
+        assert!(plan.superseded.is_empty());
+    }
+
+    #[test]
+    fn test_removed_allocation_is_replaced_with_next_epoch() {
+        let spec = deployment(1);
+        let mut removed = node(1, "us-east", "a", 4_000, 4_096);
+        removed.state = NodeState::Removed;
+        let existing = ObservedAllocation {
+            deployment_id: "api".into(),
+            revision: 2,
+            replica: 0,
+            node_id: 1,
+            epoch: 9,
+            state: AllocationState::Running,
+        };
+
+        let plan = plan_evaluation(
+            &evaluation(),
+            &spec,
+            &[removed, node(2, "us-east", "b", 4_000, 4_096)],
+            &[existing],
+        )
+        .unwrap();
+
+        assert_eq!(plan.placements.len(), 1);
+        assert_eq!(plan.placements[0].node_id, 2);
+        assert_eq!(plan.placements[0].epoch, 10);
+        assert_eq!(
+            plan.superseded[0].reason,
+            SupersededReason::PlacementInvalid
+        );
+    }
+
+    #[test]
+    fn test_missing_node_is_not_treated_as_confirmed_dead() {
+        let spec = deployment(1);
+        let existing = ObservedAllocation {
+            deployment_id: "api".into(),
+            revision: 2,
+            replica: 0,
+            node_id: 99,
+            epoch: 3,
+            state: AllocationState::Running,
+        };
+
+        let plan = plan_evaluation(
+            &evaluation(),
+            &spec,
+            &[node(2, "us-east", "b", 4_000, 4_096)],
+            &[existing],
+        )
+        .unwrap();
+
+        assert_eq!(plan.retained.len(), 1);
+        assert_eq!(plan.retained[0].node_id, 99);
+        assert!(plan.placements.is_empty());
     }
 
     #[test]

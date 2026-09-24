@@ -54,6 +54,13 @@ allocation is considered superseded even if it still reports `Running`.
 The commit/execution layer must enforce the same epoch so delayed commands or
 partitioned zombie workers cannot regain ownership.
 
+Node suspicion is deliberately **not** a fencing event. An allocation on a
+`Suspect`, `Unreachable`, or temporarily absent node remains authoritative;
+the planner will not create a replacement epoch until membership explicitly
+marks the node `Removed` or an operator places it in `Draining`. This mirrors
+the runtime's confirmed-removal safety rule and trades temporary availability
+for prevention of two live owners during a partition.
+
 ## Explainable placement
 
 Hard constraints are evaluated before ranking. If no node is feasible the plan
