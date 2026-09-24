@@ -10,7 +10,7 @@ use crate::primitives::ActorRole;
 use crate::runtime::actor::{Actor, ActorBackend, BehaviorEntry};
 use crate::runtime::persistence::{ActorSnapshot, PersistedValue, StateModel, WorkflowEvent};
 use crate::runtime::timer_fired_handler;
-use crate::runtime::Runtime;
+use crate::runtime::{RecoveryIdentityPolicy, Runtime};
 use crate::runtime::{bytecode_step_placeholder, fresh_actor_id, map_ast_state_model};
 use crate::vm::Value;
 
@@ -25,7 +25,7 @@ pub(crate) fn spawn_actor_with_models(
     persistent: bool,
     workflow: Option<&str>,
 ) -> u64 {
-    match try_spawn_actor_with_models(rt, init, state_models, persistent, workflow, None) {
+    match try_spawn_actor_with_models(rt, init, state_models, persistent, workflow, None, None) {
         Ok(id) => id,
         Err(error) => {
             tracing::warn!(%error, "actor spawn failed before publication");
@@ -41,6 +41,7 @@ pub(crate) fn try_spawn_actor_with_models(
     persistent: bool,
     workflow: Option<&str>,
     initial_authority: Option<&AuthorityManifest>,
+    definition_semantic_id: Option<crate::content_identity::SemanticId>,
 ) -> std::io::Result<u64> {
     try_spawn_actor_with_id(
         rt,
@@ -50,6 +51,7 @@ pub(crate) fn try_spawn_actor_with_models(
         persistent,
         workflow,
         initial_authority,
+        definition_semantic_id,
     )
 }
 
@@ -82,7 +84,7 @@ pub(crate) fn spawn_actor_with_id(
     persistent: bool,
     workflow: Option<&str>,
 ) -> u64 {
-    match try_spawn_actor_with_id(rt, id, init, state_models, persistent, workflow, None) {
+    match try_spawn_actor_with_id(rt, id, init, state_models, persistent, workflow, None, None) {
         Ok(id) => id,
         Err(error) => {
             tracing::warn!(actor_id = id, %error, "actor spawn failed before publication");
@@ -99,6 +101,7 @@ fn try_spawn_actor_with_id(
     persistent: bool,
     workflow: Option<&str>,
     initial_authority: Option<&AuthorityManifest>,
+    definition_semantic_id: Option<crate::content_identity::SemanticId>,
 ) -> std::io::Result<u64> {
     let restart_snapshot = if persistent && workflow.is_none() {
         match preflight_persistent_snapshot(rt, id) {
@@ -116,7 +119,26 @@ fn try_spawn_actor_with_id(
         None
     };
 
+    let verified_definition_semantic_id = match restart_snapshot.as_ref() {
+        Some((snapshot, _)) => Runtime::verify_snapshot_definition_semantic_identity(
+            id,
+            snapshot,
+            definition_semantic_id,
+            RecoveryIdentityPolicy::LegacyCompatible,
+        )
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "refusing to activate persistent actor with incompatible definition identity: {error}"
+                ),
+            )
+        })?,
+        None => definition_semantic_id,
+    };
+
     let mut actor = Actor::new(id, format!("actor_{}", id), 0);
+    actor.definition_semantic_id = verified_definition_semantic_id;
     let state_fields = init();
     for (name, value) in state_fields {
         actor.set_state_field(name, value);
@@ -320,6 +342,7 @@ fn try_spawn_from_module(
         },
         None => ActorRole::Plain,
     };
+    let definition_semantic_id = module.actor_semantic_id_for_behavior(behavior_idx);
 
     let id = if let Some(meta) = meta {
         let state_models: HashMap<String, StateModel> = meta
@@ -346,6 +369,7 @@ fn try_spawn_from_module(
                 None
             },
             initial_authority,
+            definition_semantic_id,
         )?
     } else {
         try_spawn_actor_with_models(
@@ -355,6 +379,7 @@ fn try_spawn_from_module(
             false,
             None,
             initial_authority,
+            definition_semantic_id,
         )?
     };
     let offsets: Vec<usize> = bytecode_offsets_for_role(module, role);
@@ -373,6 +398,7 @@ fn try_spawn_from_module(
             .collect()
     };
     if let Some(actor) = rt.actors.get_mut(&id) {
+        actor.definition_semantic_id = definition_semantic_id;
         actor.bytecode_module = Some(module.clone());
         actor.bytecode_offsets = offsets.clone();
         actor.compensation_offsets = compensation_offsets.clone();
@@ -446,7 +472,14 @@ fn try_spawn_from_module(
     if matches!(role, ActorRole::Workflow) {
         layout_workflow_behavior_table(rt, id);
     }
-    register_recovery_module(rt, id, module.clone(), offsets, compensation_offsets);
+    register_recovery_module(
+        rt,
+        id,
+        module.clone(),
+        offsets,
+        compensation_offsets,
+        definition_semantic_id,
+    );
     Ok(Value::actor_ref(id))
 }
 
@@ -535,9 +568,18 @@ pub(crate) fn register_recovery_module(
     module: crate::bytecode::CodeModule,
     offsets: Vec<usize>,
     compensation_offsets: Vec<Option<usize>>,
+    definition_semantic_id: Option<crate::content_identity::SemanticId>,
 ) {
     rt.recovery_modules
         .insert(actor_id, (module, offsets, compensation_offsets));
+    match definition_semantic_id {
+        Some(id) => {
+            rt.recovery_definition_semantic_ids.insert(actor_id, id);
+        }
+        None => {
+            rt.recovery_definition_semantic_ids.remove(&actor_id);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -665,6 +707,7 @@ mod authority_tests {
             true,
             Some("FailingWorkflow"),
             None,
+            None,
         );
 
         assert!(result.is_err());
@@ -696,6 +739,7 @@ mod authority_tests {
             true,
             Some("FailingWorkflow"),
             None,
+            None,
         );
 
         assert!(result.is_err());
@@ -724,6 +768,7 @@ mod authority_tests {
             true,
             Some("AuthorityWorkflow"),
             Some(&requested),
+            None,
         )
         .unwrap();
 
@@ -830,12 +875,56 @@ mod authority_tests {
     }
 
     #[test]
+    fn persistent_restart_rejects_semantic_mismatch_before_init_or_publish() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let mut rt = Runtime::new();
+        let actor_id = 910_010;
+        let persisted =
+            crate::content_identity::SemanticId::from_canonical_bytes(b"persisted-definition", []);
+        let current =
+            crate::content_identity::SemanticId::from_canonical_bytes(b"current-definition", []);
+        rt.persistence
+            .save_snapshot(ActorSnapshot {
+                actor_id,
+                semantic_id: Some(persisted.to_string()),
+                ..ActorSnapshot::default()
+            })
+            .unwrap();
+
+        let init_ran = Rc::new(Cell::new(false));
+        let init_flag = Rc::clone(&init_ran);
+        let result = try_spawn_actor_with_id(
+            &mut rt,
+            actor_id,
+            Box::new(move || {
+                init_flag.set(true);
+                vec![]
+            }),
+            std::collections::HashMap::new(),
+            true,
+            None,
+            None,
+            Some(current),
+        );
+
+        assert!(result.is_err(), "semantic mismatch must fail the restart");
+        assert!(!init_ran.get(), "semantic mismatch must abort before init");
+        assert!(
+            !rt.actors.contains_key(&actor_id),
+            "semantic mismatch must not publish a runnable actor"
+        );
+    }
+
+    #[test]
     fn legacy_restart_restores_snapshot_authority() {
         let mut rt = Runtime::new();
         let actor_id = 910_001;
         rt.persistence
             .save_snapshot(ActorSnapshot {
                 actor_id,
+                semantic_id: None,
                 sequence: 7,
                 authority_tokens: std::collections::BTreeSet::from([
                     "Secret::Read(RESTART_KEY)".to_string()
@@ -877,6 +966,7 @@ mod authority_tests {
         rt.persistence
             .save_snapshot(ActorSnapshot {
                 actor_id,
+                semantic_id: None,
                 authority_tokens: std::collections::BTreeSet::from([
                     "Net::TcpOut(malformed)".to_string()
                 ]),

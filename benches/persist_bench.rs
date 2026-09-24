@@ -19,6 +19,7 @@ fn snapshot_with_payload(payload_bytes: usize) -> ActorSnapshot {
     ActorSnapshot {
         actor_id: 1,
         sequence: 1,
+        semantic_id: None,
         state,
         waiting_signal: None,
         crdt_snapshot: None,
@@ -31,6 +32,7 @@ fn empty_snapshot() -> ActorSnapshot {
     ActorSnapshot {
         actor_id: 1,
         sequence: 0,
+        semantic_id: None,
         state: HashMap::new(),
         waiting_signal: None,
         crdt_snapshot: None,
