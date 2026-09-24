@@ -199,10 +199,7 @@ fn stage_existing_workflow_event(
     event: WorkflowEvent,
 ) -> std::io::Result<()> {
     let stage = rt.workflow_transitions.get_mut(&actor_id).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "workflow event staged without an active durable transition",
-        )
+        std::io::Error::other("workflow event staged without an active durable transition")
     })?;
     if event.sequence() != stage.sequence {
         return Err(std::io::Error::new(
@@ -455,11 +452,14 @@ pub(crate) fn stage_step_failed(
 /// `commit_workflow_transition`. This remains for non-workflow persistent
 /// actors and compatibility call sites that have not moved to RFC 0022.
 pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::Result<()> {
-    let actor = match rt.actors.get(&actor_id) {
-        Some(actor) if actor.persistent => actor,
-        _ => return Ok(()),
-    };
-    let _ = actor;
+    if !rt
+        .actors
+        .get(&actor_id)
+        .map(|actor| actor.persistent)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
 
     let sequence = rt.persistence.latest_sequence(actor_id) + 1;
     let snapshot = build_actor_snapshot(rt, actor_id, sequence)?.expect("persistent actor snapshot");
