@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Stateful blocking foreign executor — 2026-09-23
+- **Foreign backends can now be owned behind a dedicated bounded worker and invoked with fully-owned request envelopes** (`src/runtime/foreign_executor.rs`), keeping blocking backend execution off cooperative actor scheduler threads while preserving mutable interpreter/module state across calls.
+- **The scheduler-facing path remains non-blocking and never acquires the backend mutex**; one worker per backend instance serializes access deliberately. This slice still does not change VM suspension/resumption or route source-level Python/FFI effects through the executor.
+
 ### Owned Python foreign execution — 2026-09-23
 - **The Python foreign backend now opts into the worker-safe `ForeignInterop::call_owned` contract**, consuming only owned semantic values and opaque registry handles while preserving the existing synchronous VM-`Value` compatibility path.
 - **Owned Python arguments/results convert through the registry without VM, actor-heap, or module string-pool access**; unsupported custom backends continue to fail closed unless they explicitly implement the owned-call contract.
