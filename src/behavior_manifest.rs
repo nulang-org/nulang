@@ -576,6 +576,175 @@ fn migration_steps(schema: &ActorStateSchema) -> Vec<BehaviorMigrationStep> {
     steps
 }
 
+fn effect_inventory_from_hir(module: &hir::Module) -> BehaviorEffectInventory {
+    let mut host_operations: BTreeMap<String, BehaviorHostOperation> = BTreeMap::new();
+    let mut unclassified_operations: BTreeSet<BehaviorEffectOperation> = BTreeSet::new();
+
+    fn record_operation(
+        effect: &str,
+        operation: &str,
+        host_operations: &mut BTreeMap<String, BehaviorHostOperation>,
+        unclassified_operations: &mut BTreeSet<BehaviorEffectOperation>,
+    ) {
+        if let Some(descriptor) = lookup_host_operation(effect, operation) {
+            let authority_requirement = match descriptor.authority {
+                HostAuthorityRequirement::CheckedEffectRow(required_effect) => {
+                    BehaviorAuthorityRequirement {
+                        kind: "checked-effect-row".to_string(),
+                        effect: required_effect.to_string(),
+                    }
+                }
+            };
+            let canonical_id = descriptor.canonical_id();
+            host_operations
+                .entry(canonical_id.clone())
+                .or_insert_with(|| BehaviorHostOperation {
+                    canonical_id,
+                    replay: descriptor.replay.manifest_class().to_string(),
+                    authority_requirement,
+                });
+        } else {
+            unclassified_operations.insert(BehaviorEffectOperation {
+                effect: effect.to_string(),
+                operation: operation.to_string(),
+            });
+        }
+    }
+
+    fn collect_rvalue(
+        value: &hir::RValue,
+        host_operations: &mut BTreeMap<String, BehaviorHostOperation>,
+        unclassified_operations: &mut BTreeSet<BehaviorEffectOperation>,
+    ) {
+        match value {
+            hir::RValue::Perform { effect, op, .. } => {
+                record_operation(effect, op, host_operations, unclassified_operations);
+            }
+            hir::RValue::Closure { body, .. } | hir::RValue::RecClosure { body, .. } => {
+                collect_body(body, host_operations, unclassified_operations);
+            }
+            hir::RValue::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_body(then_body, host_operations, unclassified_operations);
+                if let Some(else_body) = else_body {
+                    collect_body(else_body, host_operations, unclassified_operations);
+                }
+            }
+            hir::RValue::Match { arms, .. } => {
+                for (_, guard, body) in arms {
+                    if let Some(guard) = guard {
+                        collect_body(guard, host_operations, unclassified_operations);
+                    }
+                    collect_body(body, host_operations, unclassified_operations);
+                }
+            }
+            hir::RValue::For { body, .. } | hir::RValue::Block(body) => {
+                collect_body(body, host_operations, unclassified_operations);
+            }
+            hir::RValue::While { cond, body, .. } => {
+                collect_body(cond, host_operations, unclassified_operations);
+                collect_body(body, host_operations, unclassified_operations);
+            }
+            hir::RValue::Handle { body, handlers, .. } => {
+                collect_body(body, host_operations, unclassified_operations);
+                for handler in handlers {
+                    collect_body(
+                        &handler.body,
+                        host_operations,
+                        unclassified_operations,
+                    );
+                }
+            }
+            hir::RValue::Receive { arms, after, .. } => {
+                for (_, _, guard, body) in arms {
+                    if let Some(guard) = guard {
+                        collect_body(guard, host_operations, unclassified_operations);
+                    }
+                    collect_body(body, host_operations, unclassified_operations);
+                }
+                if let Some((timeout, body)) = after {
+                    collect_body(timeout, host_operations, unclassified_operations);
+                    collect_body(body, host_operations, unclassified_operations);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_body(
+        body: &hir::Body,
+        host_operations: &mut BTreeMap<String, BehaviorHostOperation>,
+        unclassified_operations: &mut BTreeSet<BehaviorEffectOperation>,
+    ) {
+        for statement in &body.stmts {
+            match statement {
+                hir::Stmt::Let { value, .. } | hir::Stmt::Assign { value, .. } => {
+                    collect_rvalue(value, host_operations, unclassified_operations);
+                }
+                hir::Stmt::StateSet { .. }
+                | hir::Stmt::Emit { .. }
+                | hir::Stmt::ParallelMarker { .. } => {}
+            }
+        }
+    }
+
+    fn collect_decls(
+        decls: &[hir::Decl],
+        host_operations: &mut BTreeMap<String, BehaviorHostOperation>,
+        unclassified_operations: &mut BTreeSet<BehaviorEffectOperation>,
+    ) {
+        for decl in decls {
+            match decl {
+                hir::Decl::Function(function) => {
+                    collect_body(
+                        &function.body,
+                        host_operations,
+                        unclassified_operations,
+                    );
+                }
+                hir::Decl::Actor(actor) => {
+                    for behavior in &actor.behaviors {
+                        collect_body(
+                            &behavior.body,
+                            host_operations,
+                            unclassified_operations,
+                        );
+                        if let Some(compensate) = &behavior.compensate {
+                            collect_body(
+                                compensate,
+                                host_operations,
+                                unclassified_operations,
+                            );
+                        }
+                    }
+                }
+                hir::Decl::Module { decls, .. } => {
+                    collect_decls(decls, host_operations, unclassified_operations);
+                }
+                hir::Decl::Constant { body, .. } => {
+                    collect_body(body, host_operations, unclassified_operations);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    collect_decls(
+        &module.decls,
+        &mut host_operations,
+        &mut unclassified_operations,
+    );
+
+    BehaviorEffectInventory {
+        coverage: BehaviorEffectCoverage::TypedHirPerformSites,
+        host_operations: host_operations.into_values().collect(),
+        unclassified_operations: unclassified_operations.into_iter().collect(),
+    }
+}
+
 fn classify_persistence(actor: &hir::ActorDef) -> BehaviorPersistence {
     let mut durable = false;
     let mut event_sourced = false;
