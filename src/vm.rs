@@ -6229,13 +6229,17 @@ mod vm_tests {
     #[derive(Debug)]
     struct ReadyValueCallbacks {
         heap: ActorHeap,
+        gc: crate::runtime::OrcaGc,
     }
 
     impl ReadyValueCallbacks {
         fn new() -> Self {
             let mut heap = ActorHeap::new(1024 * 1024);
             heap.set_actor_id(0);
-            Self { heap }
+            Self {
+                heap,
+                gc: crate::runtime::OrcaGc::new(0),
+            }
         }
     }
 
@@ -6243,6 +6247,42 @@ mod vm_tests {
         fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
             self.heap.alloc(size, type_tag)
         }
+
+        fn drop_ref(&mut self, ptr: *mut u8) {
+            unsafe {
+                self.gc.drop_local_ref(&mut self.heap, ptr);
+            }
+        }
+
+        fn retain_ref(&mut self, ptr: *mut u8) {
+            unsafe {
+                self.gc.local_ref(&self.heap, ptr);
+            }
+        }
+
+        fn array_len(&self, ptr: *mut u8) -> Option<usize> {
+            unsafe {
+                let header = &*ActorHeap::header_of(ptr);
+                if header.type_tag == HeapTypeTag::Array {
+                    let payload_size = header.size.saturating_sub(ActorHeap::HEADER_SIZE);
+                    Some(payload_size / std::mem::size_of::<Value>())
+                } else {
+                    None
+                }
+            }
+        }
+
+        fn spawn_actor(
+            &mut self,
+            _module: &CodeModule,
+            _spawn_pc: usize,
+            _behavior_idx: usize,
+            _init: Vec<(String, Value)>,
+        ) -> Value {
+            Value::actor_ref(0)
+        }
+
+        fn send_message(&mut self, _target: Value, _behavior_id: u16, _args: &[Value]) {}
 
         fn perform_async(
             &mut self,
