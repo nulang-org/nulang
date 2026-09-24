@@ -321,6 +321,11 @@ impl DurableEffectRecord {
                         operation_id: spec.id,
                     }
                 }
+                DeliverySemantics::NoAutomaticRetry => {
+                    DurableEffectRecoveryAction::RefuseAutomaticRedispatch {
+                        operation_id: spec.id,
+                    }
+                }
             },
         }
     }
@@ -381,6 +386,9 @@ pub enum DurableEffectRecoveryAction<'a> {
     RetryWithDeduplication { operation_id: DurableEffectId },
     /// The configured backend owns the recovery guarantee and must decide.
     DelegateToBackend,
+    /// The original dispatch may have committed externally but completion is
+    /// not durably known. Automatic redispatch is forbidden by contract.
+    RefuseAutomaticRedispatch { operation_id: DurableEffectId },
 }
 
 /// Invalid durable compensation transition.
@@ -701,6 +709,21 @@ mod tests {
         assert_eq!(
             compensation.recovery_action_for_request(b"refund").unwrap(),
             DurableEffectRecoveryAction::ReplayRecordedResult(b"refunded")
+        );
+    }
+
+    #[test]
+    fn nonreplayable_prepared_effect_refuses_automatic_redispatch() {
+        let record = DurableEffectRecord::prepare(
+            spec(DeliverySemantics::NoAutomaticRetry),
+            b"call",
+        );
+        let id = record.spec().id;
+        assert_eq!(
+            record.recovery_action_for_request(b"call").unwrap(),
+            DurableEffectRecoveryAction::RefuseAutomaticRedispatch {
+                operation_id: id,
+            }
         );
     }
 
