@@ -51,6 +51,14 @@ version + migration.*
 
 ## Stable tier
 
+### Sender-side durable workflow outbox staging — 2026-09-24
+- **Local workflow-to-workflow sends now participate in the sender's atomic transition.** A workflow handler no longer publishes those messages directly to the receiver mailbox; it stages stable outbox records and makes them visible only after the next committed workflow boundary.
+- **Staging is nested-resume safe.** The runtime keeps a per-execution stack of workflow turn contexts so deferred receive wakes and resumed actors cannot steal or flush another workflow's staged sends.
+- **Suspension is now an atomic workflow boundary.** The suspension marker snapshot is committed through the RFC 0022 transition path, and any sends produced before suspension commit in the same transition instead of escaping eagerly.
+- **Recovery and resumed continuations preserve the rule.** Accepted-command replay, signal resume, LLM resume, Timer.sleep resume, selective-receive resume, and JIT safepoint continuation all retain staged-outbox semantics.
+- **Failure remains fail-closed for uncommitted sends.** Sends staged after the last durable boundary are discarded if the workflow segment fails before commit; ending a turn with uncommitted staged messages emits a warning.
+- **Scope remains explicit.** Automatic staging currently applies only to local workflow receivers. Non-workflow and cross-node/cross-shard delivery remain follow-up work.
+
 ### Atomic durable workflow message acceptance and scheduler delivery — 2026-09-24
 - **Committed durable outbox messages can now cross the local workflow receiver boundary without a deduplication crash window.** The receiver's stable RFC 0022 message identity and accepted command journal entry commit in the same DurableTransition; only then may the sender outbox be acknowledged.
 - **Workflow mailbox entries carry a receiver-local durable acceptance marker.** Normal FIFO/backpressure semantics remain intact, while scheduler dispatch skips a second command-journal append for an already accepted durable message.
