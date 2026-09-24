@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Optional Pony and CAF actor baselines — 2026-09-23
+- **The same-host cross-runtime harness now supports opt-in Pony and C++ Actor Framework fixtures** for the existing counting, ping-pong, thread-ring, and fork-join workloads, preserving the same logical-message accounting and machine-readable record format.
+- **Pony and CAF remain outside the default runtime set**, so ordinary CI and contributors do not acquire new toolchain dependencies; when explicitly selected they run under the same process-wide CPU-affinity policy and report Pony/CMake/C++ toolchain metadata.
+
 ### Same-host actor optimization A/B gate — 2026-09-23
 - **Performance pull requests can now compare the candidate to their exact base SHA on the same runner and logical CPU** (`scripts/nulang_ab_bench.py`, `.github/workflows/nulang-ab-bench.yml`). Build work is excluded from timing, execution order alternates by round, and the JSON artifact records raw samples, medians, throughput/latency deltas, toolchains, and CPU affinity.
 - **Stacked performance work is measured incrementally by construction**, and Nulang-only probes cover the small-message payload boundary plus AOT actor dispatch without contaminating the cross-language baseline.
