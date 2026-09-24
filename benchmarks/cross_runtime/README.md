@@ -13,7 +13,7 @@ already implemented by Nulang's `src/benchmarks.rs` harness:
 The companion implementations use only each platform's standard message
 primitive:
 
-- **Nulang** — real `Runtime` + bytecode actors from `src/benchmarks.rs`
+- **Nulang** — real `Runtime` + bytecode actors from the standalone `nulang-savina` runner
 - **Rust** — `std::sync::mpsc` channels + native threads
 - **Go** — channels + goroutines
 - **Erlang/BEAM** — native processes + mailboxes

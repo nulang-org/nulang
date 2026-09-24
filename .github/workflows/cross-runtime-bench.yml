@@ -26,6 +26,9 @@ on:
       - 'benchmarks/README.md'
       - 'scripts/cross_runtime_bench.py'
       - 'src/benchmarks.rs'
+      - 'src/bin/nulang_savina.rs'
+      - 'benchmarks/SAVINA.md'
+      - 'Cargo.toml'
 
 concurrency:
   group: cross-runtime-bench-${{ github.ref }}
