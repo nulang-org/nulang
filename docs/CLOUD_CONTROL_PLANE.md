@@ -123,8 +123,18 @@ epoch race cannot mutate allocations or enqueue commands.
 serialized to a sibling temporary file, fsynced, renamed over the previous
 state, and the parent directory is fsynced on Unix. It is suitable for local
 controllers and recovery tests, not multi-controller production deployment.
-Production backends should implement the same contract with database
-transactions and compare-and-set semantics.
+For multi-controller deployments the optional `postgres` feature provides
+`PostgresControlStore`. Each scheduling region/cell uses a named scope row.
+Mutations run inside a PostgreSQL transaction and lock that row with
+`SELECT ... FOR UPDATE`; epoch validation, plan persistence, allocation
+ownership, and outbox updates therefore serialize across controller processes.
+The row also carries a monotonic version for diagnostics.
+
+The PostgreSQL backend deliberately stores one serialized control-state document
+per scope in the first implementation. This minimizes schema and migration
+surface while preserving transactional correctness. If profiling later shows
+row contention or state-size pressure, the contract can be normalized into
+separate tables without changing scheduler/reconciler semantics.
 
 `reconcile_once` provides the first idempotent reconciler turn. Recovery of an
 already committed evaluation returns the durable plan rather than recomputing it
@@ -132,9 +142,9 @@ against a newer node snapshot.
 
 ## Next implementation slices
 
-1. Production transactional `ControlStore` backend (PostgreSQL first).
-2. Node-side allocation executor honoring epoch fencing and durable outbox ACKs.
-3. Reconciliation event loop for deployment/node/allocation changes.
+1. Node-side allocation executor honoring epoch fencing and durable outbox ACKs.
+2. Reconciliation event loop for deployment/node/allocation changes.
+3. PostgreSQL state normalization only if measured contention/state size justifies it.
 4. Fabric-backed service directory with generation-tagged health advertisements.
 5. Workload identity and short-lived mTLS credentials bound to node/workload
    identity.
