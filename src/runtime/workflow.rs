@@ -82,11 +82,7 @@ pub(crate) fn begin_workflow_command(
     Ok(())
 }
 
-fn pending_command_at_sequence(
-    rt: &Runtime,
-    actor_id: u64,
-    sequence: u64,
-) -> Option<JournalEntry> {
+fn pending_command_at_sequence(rt: &Runtime, actor_id: u64, sequence: u64) -> Option<JournalEntry> {
     rt.pending_workflow_commands
         .get(&actor_id)
         .map(|pending| JournalEntry {
