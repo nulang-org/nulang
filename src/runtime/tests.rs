@@ -3697,6 +3697,35 @@ fn test_workflow_command_joins_first_atomic_transition() {
 }
 
 #[test]
+fn test_recovered_workflow_command_is_not_rejournaled() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "RecoveredCommandWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    workflow::begin_workflow_command(&mut rt, actor_id, 3, &[Value::int(21)]).unwrap();
+    rt.actors.get_mut(&actor_id).unwrap().waiting_signal = Some("resume".to_string());
+    workflow::commit_suspension_marker(&mut rt, actor_id).unwrap();
+
+    let command = rt.persistence.read_journal(actor_id).pop().unwrap();
+    assert_eq!(command.sequence, 2);
+    workflow::restore_workflow_command(&mut rt, actor_id, &command);
+
+    // The mailbox replay of the same already-durable command is admitted,
+    // but the next command-caused transition must not append it a second time.
+    workflow::begin_workflow_command(&mut rt, actor_id, 3, &[Value::int(21)]).unwrap();
+    rt.append_saga_compensated(actor_id, "step_a").unwrap();
+
+    assert_eq!(rt.persistence.read_journal(actor_id).len(), 1);
+    assert!(!rt.pending_workflow_commands.contains_key(&actor_id));
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 3);
+}
+
+#[test]
 fn test_workflow_suspension_commits_command_but_not_partial_state() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
