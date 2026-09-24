@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Compiler-latency benchmark baseline — 2026-09-24
+- **Criterion now measures Nulang compilation separately from execution** (`benches/compiler_bench.rs`): frontend-to-MIR and source-to-bytecode at 20/100/500 generated functions, plus bounded source-to-Cranelift-AOT cases. This restores the evidence base needed before accepting further compiler/JIT complexity.
+
+
 ### CI playground dependency and formatting repair — 2026-09-24
 - **Browser-playground compilation now includes the shared content-identity module and its pure-Rust `hex` dependency** (`crates/nulang-playground`), matching `semantic_identity.rs`'s current dependency graph. Runtime worker-pool files were also normalized to the repository's rustfmt output so the format gate reflects semantics rather than stale layout.
 
