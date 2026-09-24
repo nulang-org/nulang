@@ -139,7 +139,13 @@ pub fn infer_reg_types(module: &CodeModule, pc: usize) -> TypeMetadata {
     let mut states: Vec<Option<[KnownType; 256]>> = vec![None; n];
     let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     let mut in_queue: Vec<bool> = vec![false; n];
-    states[0] = Some([KnownType::Unknown; 256]);
+    let entry_state = module
+        .jit_type_seeds
+        .iter()
+        .find(|(offset, _)| *offset == start)
+        .map(|(_, meta)| meta.regs)
+        .unwrap_or([KnownType::Unknown; 256]);
+    states[0] = Some(entry_state);
     queue.push_back(start);
     in_queue[0] = true;
 
@@ -214,6 +220,43 @@ pub fn infer_reg_types(module: &CodeModule, pc: usize) -> TypeMetadata {
         }
     }
     meta
+}
+
+/// Whether type inference for `pc` starts from a compiler-owned entry seed.
+///
+/// This repeats only the tiny anchor lookup used by `infer_reg_types`; it is
+/// queried once at tier-up so JitSession can attach a runtime tag guard only
+/// when source-level signature facts actually participated in the proof.
+pub(crate) fn compiler_type_seed_applies(module: &CodeModule, pc: usize) -> bool {
+    if pc >= module.instructions.len() || module.jit_type_seeds.is_empty() {
+        return false;
+    }
+
+    let mut anchors: Vec<usize> = Vec::with_capacity(module.function_table.len() + 2);
+    anchors.push(0);
+    anchors.extend(module.function_table.iter().copied());
+    anchors.extend(module.behaviors.iter().map(|b| b.code_offset));
+    for table in &module.handler_tables {
+        anchors.extend(table.bindings.iter().map(|b| b.handler_offset));
+    }
+    if let Some(entry) = module.entry_point {
+        anchors.push(entry);
+    }
+    anchors.retain(|&a| a < module.instructions.len());
+    anchors.sort_unstable();
+    anchors.dedup();
+
+    let start = anchors
+        .iter()
+        .copied()
+        .rev()
+        .find(|&a| a <= pc)
+        .unwrap_or(0);
+
+    module
+        .jit_type_seeds
+        .iter()
+        .any(|(offset, seed)| *offset == start && !seed.is_empty())
 }
 
 /// Apply one instruction's register-write effect to a type state.
