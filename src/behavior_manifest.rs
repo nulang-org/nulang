@@ -11,6 +11,10 @@ use crate::artifact_identity::ArtifactIdentityManifest;
 use crate::content_identity::{ArtifactId, SemanticId, SourceId};
 use crate::format::constants::LANGUAGE_VERSION_STR;
 use crate::hir;
+use crate::host_effect_abi::{
+    lookup_host_operation, lookup_host_operation_by_canonical_id, HostAuthorityRequirement,
+};
+use crate::protocol::ProtocolId;
 use crate::semantic_schema::{
     actor_state_schemas_from_hir, canonical_actor_state_schema_bytes, ActorStateSchema,
 };
@@ -28,6 +32,12 @@ pub struct BehaviorManifest {
     pub schema: String,
     pub package: BehaviorPackage,
     pub artifact: BehaviorArtifact,
+    /// Compiler-derived inventory of explicit typed-HIR `perform` sites.
+    ///
+    /// This is evidence, not authorization: authority requirements describe
+    /// the checked compiler boundary and never grant runtime access.
+    #[serde(default)]
+    pub effects: BehaviorEffectInventory,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actors: Vec<BehaviorActor>,
 }
@@ -62,9 +72,66 @@ pub struct BehaviorActor {
     pub persistence: BehaviorPersistence,
     pub schema_version: u32,
     pub state_schema_semantic_id: String,
+    /// Exact compiler-owned protocol identity when source behavior signatures
+    /// were complete enough to prove a stable structural contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_id: Option<String>,
     pub migration_identity: MigrationIdentityCoverage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub migrations: Vec<BehaviorMigrationStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorEffectInventory {
+    pub coverage: BehaviorEffectCoverage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_operations: Vec<BehaviorHostOperation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unclassified_operations: Vec<BehaviorEffectOperation>,
+}
+
+impl Default for BehaviorEffectInventory {
+    fn default() -> Self {
+        Self {
+            coverage: BehaviorEffectCoverage::NotEmitted,
+            host_operations: Vec::new(),
+            unclassified_operations: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BehaviorEffectCoverage {
+    /// Older/foreign v0alpha1 manifest: no compiler effect inventory is claimed.
+    NotEmitted,
+    /// Every explicit typed-HIR `perform Effect.op` site was inspected.
+    /// Registry-known host operations are classified below; custom/handled
+    /// operations remain visible in `unclassified_operations`.
+    TypedHirPerformSites,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorHostOperation {
+    /// Versioned compiler-owned host ABI identity.
+    pub canonical_id: String,
+    /// RFC 0020 replay contract spelling owned by `host_effect_abi`.
+    pub replay: String,
+    /// Authorization provenance required by the compiler-owned host contract.
+    /// This is a requirement/evidence record, not a runtime authority grant.
+    pub authority_requirement: BehaviorAuthorityRequirement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorAuthorityRequirement {
+    pub kind: String,
+    pub effect: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BehaviorEffectOperation {
+    pub effect: String,
+    pub operation: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
