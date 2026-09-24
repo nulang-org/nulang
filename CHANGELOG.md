@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Owned foreign-call worker boundary — 2026-09-23
+- **Foreign calls can now be marshalled into worker-safe owned envelopes before leaving the actor scheduler thread** (`src/runtime/foreign_call.rs`). Primitive values cross by semantic value, strings cross by resolved UTF-8 content, and supported backend objects cross only as opaque backend-tagged ids.
+- **Actor references, heap pointers, closures, unresolved string ids, and other runtime-local VM representations fail closed** instead of crossing worker threads. The request/result types are statically asserted `Send + 'static`; this slice does not yet execute a backend or suspend/resume actors.
+
 ### Standalone Savina actor benchmark runner — 2026-09-23
 - **Savina-style actor workloads now have a dedicated minimal benchmark path** (`src/bin/nulang_savina.rs`, `benchmarks/SAVINA.md`). Counting, ping-pong, thread-ring, fork-join, and Skynet can run with `--no-default-features` under the non-LTO `savina` profile and emit stable JSONL records for repeated measurements. CI smoke-tests the runner and archives five-repetition output on main benchmark runs. The existing Criterion profile and historical regression baselines are unchanged.
 

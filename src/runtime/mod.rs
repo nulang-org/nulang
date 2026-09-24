@@ -12,6 +12,7 @@ use tracing::warn;
 
 mod actor;
 mod blocking_executor;
+mod foreign_call;
 pub mod cache;
 pub mod cache_cluster;
 pub mod cache_dispatch;
@@ -90,6 +91,7 @@ mod tests;
 
 pub use actor::*;
 pub use blocking_executor::*;
+pub use foreign_call::*;
 pub use cache::*;
 pub use cache_cluster::*;
 pub use cache_dispatch::*;
