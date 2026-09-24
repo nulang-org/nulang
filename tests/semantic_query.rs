@@ -113,7 +113,6 @@ fn callers_and_callees_form_a_direct_call_graph() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-
 #[test]
 fn context_query_returns_local_semantic_slice() {
     let dir = temp_dir("context");
