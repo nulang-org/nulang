@@ -26,6 +26,7 @@ pub mod heap;
 pub(crate) mod heap_serialize;
 mod mailbox;
 mod scheduler;
+mod service_directory;
 pub use heap_serialize::*;
 mod cluster;
 mod distributed;
@@ -53,6 +54,9 @@ pub use fabric_stream_cluster::{
 pub use fabric_stream_epoch::{
     FabricStreamAutoFailoverReport, FabricStreamEpochPullReport, FabricStreamEpochRepairReport,
     FabricStreamEpochTransitionStatus,
+};
+pub use service_directory::{
+    ServiceAdvertisement, ServiceAdvertisementSnapshot, ServiceHealth, ServiceProtocol,
 };
 #[cfg(feature = "ai-runtime")]
 mod agent;
