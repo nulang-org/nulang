@@ -72,6 +72,13 @@ pub enum CommitOutcome {
     AlreadyCommitted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocationObservationOutcome {
+    Applied,
+    AlreadyObserved,
+    StaleIgnored,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
     Io(String),
@@ -88,6 +95,7 @@ pub enum StoreError {
     },
     CommandNotFound(String),
     CommandClaim(String),
+    AllocationObservation(String),
 }
 
 impl fmt::Display for StoreError {
@@ -116,6 +124,9 @@ impl fmt::Display for StoreError {
             Self::CommandClaim(message) => {
                 write!(f, "allocation command claim error: {message}")
             }
+            Self::AllocationObservation(message) => {
+                write!(f, "allocation observation error: {message}")
+            }
         }
     }
 }
@@ -131,6 +142,14 @@ pub trait ControlStore: Send + Sync {
     fn committed_plan(&self, evaluation_id: &str) -> Result<Option<PlacementPlan>, StoreError>;
 
     fn allocations_for(&self, deployment_id: &str) -> Result<Vec<ObservedAllocation>, StoreError>;
+
+    /// Apply node/runtime status to an allocation that the control plane
+    /// already owns. Observations may advance state but can never create a new
+    /// owner, move an epoch to another node, or resurrect a terminal epoch.
+    fn observe_allocation(
+        &self,
+        allocation: &ObservedAllocation,
+    ) -> Result<AllocationObservationOutcome, StoreError>;
 
     /// Atomically commit the plan, allocation ownership changes, and execution
     /// outbox commands. Implementations must compare current allocation epochs
@@ -392,6 +411,45 @@ impl PersistedState {
             .collect()
     }
 
+    fn observe_allocation(
+        &mut self,
+        observed: &ObservedAllocation,
+    ) -> Result<AllocationObservationOutcome, StoreError> {
+        let max_epoch = self.max_epoch(&observed.deployment_id, observed.replica);
+
+        let Some(existing_index) = self
+            .allocations
+            .iter()
+            .position(|allocation| same_allocation_identity(allocation, observed))
+        else {
+            if observed.epoch < max_epoch {
+                return Ok(AllocationObservationOutcome::StaleIgnored);
+            }
+            return Err(StoreError::AllocationObservation(format!(
+                "unowned allocation observation for {} replica {} epoch {} node {}; current max epoch is {}",
+                observed.deployment_id,
+                observed.replica,
+                observed.epoch,
+                observed.node_id,
+                max_epoch
+            )));
+        };
+
+        let current = self.allocations[existing_index].state;
+        if current == observed.state {
+            return Ok(AllocationObservationOutcome::AlreadyObserved);
+        }
+        if !valid_observed_state_transition(current, observed.state) {
+            return Err(StoreError::AllocationObservation(format!(
+                "invalid allocation state transition for {} replica {} epoch {}: {:?} -> {:?}",
+                observed.deployment_id, observed.replica, observed.epoch, current, observed.state
+            )));
+        }
+
+        self.allocations[existing_index].state = observed.state;
+        Ok(AllocationObservationOutcome::Applied)
+    }
+
     fn claim_next_command(
         &mut self,
         owner: &str,
@@ -578,6 +636,18 @@ fn same_allocation_identity(left: &ObservedAllocation, right: &ObservedAllocatio
         && left.epoch == right.epoch
 }
 
+fn valid_observed_state_transition(current: AllocationState, next: AllocationState) -> bool {
+    matches!(
+        (current, next),
+        (AllocationState::Starting, AllocationState::Running)
+            | (AllocationState::Starting, AllocationState::Failed)
+            | (AllocationState::Starting, AllocationState::Stopped)
+            | (AllocationState::Running, AllocationState::Failed)
+            | (AllocationState::Running, AllocationState::Stopped)
+            | (AllocationState::Failed, AllocationState::Stopped)
+    )
+}
+
 fn start_command(evaluation: &Evaluation, allocation: &ObservedAllocation) -> AllocationCommand {
     AllocationCommand {
         command_id: format!(
@@ -665,6 +735,16 @@ impl ControlStore for MemoryControlStore {
             .filter(|allocation| allocation.deployment_id == deployment_id)
             .cloned()
             .collect())
+    }
+
+    fn observe_allocation(
+        &self,
+        allocation: &ObservedAllocation,
+    ) -> Result<AllocationObservationOutcome, StoreError> {
+        self.state
+            .lock()
+            .expect("control-store mutex poisoned")
+            .observe_allocation(allocation)
     }
 
     fn commit_plan(
@@ -801,6 +881,13 @@ impl ControlStore for JsonFileControlStore {
             .filter(|allocation| allocation.deployment_id == deployment_id)
             .cloned()
             .collect())
+    }
+
+    fn observe_allocation(
+        &self,
+        allocation: &ObservedAllocation,
+    ) -> Result<AllocationObservationOutcome, StoreError> {
+        self.mutate(|state| state.observe_allocation(allocation))
     }
 
     fn commit_plan(
@@ -1010,6 +1097,13 @@ impl ControlStore for PostgresControlStore {
             .into_iter()
             .filter(|allocation| allocation.deployment_id == deployment_id)
             .collect())
+    }
+
+    fn observe_allocation(
+        &self,
+        allocation: &ObservedAllocation,
+    ) -> Result<AllocationObservationOutcome, StoreError> {
+        self.mutate(|state| state.observe_allocation(allocation))
     }
 
     fn commit_plan(
@@ -1237,6 +1331,74 @@ mod tests {
         store.acknowledge_command(&command.command_id).unwrap();
         store.acknowledge_command(&command.command_id).unwrap();
         assert!(store.pending_commands().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_allocation_observation_advances_only_owned_epoch() {
+        let store = MemoryControlStore::default();
+        let eval = evaluation("eval-observe");
+        store.record_evaluation(&eval).unwrap();
+        let plan = plan_evaluation(&eval, &deployment(), &[node(1)], &[]).unwrap();
+        store.commit_plan(&eval, &plan).unwrap();
+
+        let mut allocation = store.allocations_for("api").unwrap().pop().unwrap();
+        assert_eq!(allocation.state, AllocationState::Starting);
+
+        allocation.state = AllocationState::Running;
+        assert_eq!(
+            store.observe_allocation(&allocation).unwrap(),
+            AllocationObservationOutcome::Applied
+        );
+        assert_eq!(
+            store.observe_allocation(&allocation).unwrap(),
+            AllocationObservationOutcome::AlreadyObserved
+        );
+
+        allocation.state = AllocationState::Starting;
+        assert!(matches!(
+            store.observe_allocation(&allocation),
+            Err(StoreError::AllocationObservation(_))
+        ));
+
+        let stale = ObservedAllocation {
+            epoch: 0,
+            state: AllocationState::Running,
+            ..allocation.clone()
+        };
+        assert_eq!(
+            store.observe_allocation(&stale).unwrap(),
+            AllocationObservationOutcome::StaleIgnored
+        );
+
+        let unowned = ObservedAllocation {
+            node_id: 99,
+            epoch: allocation.epoch,
+            state: AllocationState::Running,
+            ..allocation
+        };
+        assert!(matches!(
+            store.observe_allocation(&unowned),
+            Err(StoreError::AllocationObservation(_))
+        ));
+    }
+
+    #[test]
+    fn test_terminal_allocation_cannot_be_resurrected_by_late_status() {
+        let store = MemoryControlStore::default();
+        let eval = evaluation("eval-terminal");
+        store.record_evaluation(&eval).unwrap();
+        let plan = plan_evaluation(&eval, &deployment(), &[node(1)], &[]).unwrap();
+        store.commit_plan(&eval, &plan).unwrap();
+
+        let mut allocation = store.allocations_for("api").unwrap().pop().unwrap();
+        allocation.state = AllocationState::Failed;
+        store.observe_allocation(&allocation).unwrap();
+
+        allocation.state = AllocationState::Running;
+        assert!(matches!(
+            store.observe_allocation(&allocation),
+            Err(StoreError::AllocationObservation(_))
+        ));
     }
 
     #[test]
