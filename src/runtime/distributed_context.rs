@@ -1557,4 +1557,187 @@ mod tests {
             FabricTarget::Local { actor_id: id, .. } if id == actor_id
         ));
     }
+    fn service_endpoint(
+        node_id: NodeId,
+        epoch: u64,
+        health: ServiceHealth,
+    ) -> ServiceAdvertisement {
+        ServiceAdvertisement {
+            node_id,
+            service: "api".into(),
+            deployment_id: "api-deploy".into(),
+            replica: 0,
+            allocation_epoch: epoch,
+            host: "127.0.0.1".into(),
+            port: 8080,
+            protocol: crate::runtime::ServiceProtocol::Http,
+            health,
+        }
+    }
+
+    #[test]
+    fn fabric_service_directory_replicates_across_local_shards() {
+        let mut shards = Runtime::new_fabric_sharded(2);
+        for shard in &mut shards {
+            shard.distributed.enabled = true;
+            shard.distributed.node_id = Some(NodeId(10));
+        }
+
+        assert!(shards[0]
+            .fabric_advertise_service(service_endpoint(
+                NodeId(10),
+                1,
+                ServiceHealth::Serving,
+            ))
+            .unwrap());
+
+        assert_eq!(shards[1].fabric_sync(), 1);
+        let resolved = shards[1].fabric_resolve_service("api").unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].allocation_epoch, 1);
+        assert_eq!(shards[1].fabric_service_endpoint_count(), 1);
+    }
+
+    #[test]
+    fn fabric_service_health_update_removes_endpoint_from_resolution() {
+        let mut runtime = Runtime::new();
+        runtime.distributed.enabled = true;
+        runtime.distributed.node_id = Some(NodeId(10));
+
+        runtime
+            .fabric_advertise_service(service_endpoint(
+                NodeId(10),
+                1,
+                ServiceHealth::Serving,
+            ))
+            .unwrap();
+        assert_eq!(runtime.fabric_resolve_service("api").unwrap().len(), 1);
+
+        runtime
+            .fabric_advertise_service(service_endpoint(
+                NodeId(10),
+                1,
+                ServiceHealth::Unhealthy,
+            ))
+            .unwrap();
+        assert!(runtime.fabric_resolve_service("api").unwrap().is_empty());
+        assert_eq!(runtime.fabric_service_endpoint_count(), 1);
+    }
+
+    #[test]
+    fn fabric_service_newer_allocation_epoch_replaces_old_endpoint() {
+        let mut runtime = Runtime::new();
+        runtime.distributed.enabled = true;
+        runtime.distributed.node_id = Some(NodeId(10));
+
+        runtime
+            .fabric_advertise_service(service_endpoint(
+                NodeId(10),
+                3,
+                ServiceHealth::Serving,
+            ))
+            .unwrap();
+        runtime
+            .fabric_advertise_service(service_endpoint(
+                NodeId(10),
+                4,
+                ServiceHealth::Serving,
+            ))
+            .unwrap();
+
+        let resolved = runtime.fabric_resolve_service("api").unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].allocation_epoch, 4);
+        assert!(runtime
+            .fabric_advertise_service(service_endpoint(
+                NodeId(10),
+                3,
+                ServiceHealth::Serving,
+            ))
+            .is_err());
+    }
+
+    #[test]
+    fn fabric_service_remote_snapshot_rejects_stale_generation() {
+        let mut target = Runtime::new();
+        target.distributed.enabled = true;
+        target.distributed.node_id = Some(NodeId(20));
+
+        let current = ServiceAdvertisementSnapshot {
+            node_id: NodeId(10),
+            generation: 2,
+            services: vec![service_endpoint(
+                NodeId(10),
+                2,
+                ServiceHealth::Serving,
+            )],
+        };
+        assert_eq!(
+            target
+                .fabric_replace_remote_service_advertisements(current)
+                .unwrap(),
+            1
+        );
+
+        let stale = ServiceAdvertisementSnapshot {
+            node_id: NodeId(10),
+            generation: 1,
+            services: vec![service_endpoint(
+                NodeId(10),
+                1,
+                ServiceHealth::Serving,
+            )],
+        };
+        assert_eq!(
+            target
+                .fabric_replace_remote_service_advertisements(stale)
+                .unwrap(),
+            0
+        );
+
+        let stored = target.distributed.services.resolve("api").unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].allocation_epoch, 2);
+        assert_eq!(target.fabric_remote_service_endpoint_count(), 1);
+    }
+
+    #[test]
+    fn fabric_remote_node_cleanup_removes_service_endpoints_and_generation() {
+        let mut target = Runtime::new();
+        target.distributed.enabled = true;
+        target.distributed.node_id = Some(NodeId(20));
+
+        target
+            .fabric_replace_remote_service_advertisements(ServiceAdvertisementSnapshot {
+                node_id: NodeId(10),
+                generation: 7,
+                services: vec![service_endpoint(
+                    NodeId(10),
+                    1,
+                    ServiceHealth::Serving,
+                )],
+            })
+            .unwrap();
+        assert_eq!(target.fabric_remote_service_endpoint_count(), 1);
+
+        assert_eq!(target.fabric_remove_remote_node(NodeId(10)), 0);
+        assert_eq!(target.fabric_remote_service_endpoint_count(), 0);
+
+        target
+            .fabric_replace_remote_service_advertisements(ServiceAdvertisementSnapshot {
+                node_id: NodeId(10),
+                generation: 1,
+                services: vec![service_endpoint(
+                    NodeId(10),
+                    2,
+                    ServiceHealth::Serving,
+                )],
+            })
+            .unwrap();
+        assert_eq!(
+            target.distributed.services.resolve("api").unwrap()[0].allocation_epoch,
+            2
+        );
+    }
+
 }
