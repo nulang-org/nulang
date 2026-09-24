@@ -29,6 +29,7 @@ use crate::bytecode::{
 };
 use crate::mir;
 use crate::semantic_identity::{effect_sites_for_mir, EffectSiteOwnerKind, MirEffectSite};
+use crate::type_metadata::{type_to_known_type, KnownType, TypeMetadata};
 use crate::types::{NuError, NuResult, PrimitiveType, Span, Type};
 use rustc_hash::FxHashMap;
 use std::collections::HashSet;
@@ -44,6 +45,25 @@ const SPILL_TEMP: u8 = 12;
 const SPILL_TEMP2: u8 = 13;
 #[allow(dead_code)]
 const SPILL_TEMP3: u8 = 14;
+
+/// Build in-memory ABI-entry type facts for primitive parameters.
+///
+/// These facts seed static JIT analysis only. Dynamic VM/FFI/message entry is
+/// still validated by a live representation guard before seed-dependent native
+/// code can execute.
+fn jit_entry_type_seed(func: &mir::Function) -> TypeMetadata {
+    let mut meta = TypeMetadata::new();
+    for (arg_reg, param) in func.params.iter().enumerate() {
+        let Some(local) = func.locals.iter().find(|local| local.id == *param) else {
+            continue;
+        };
+        let known = type_to_known_type(&local.ty);
+        if known != KnownType::Unknown {
+            meta.set_type(arg_reg, known);
+        }
+    }
+    meta
+}
 
 fn not_yet_implemented(feature: &str, span: Span) -> NuError {
     NuError::NotYetImplemented {
@@ -749,6 +769,11 @@ impl MirCodegen {
         self.module.instructions = saved_instructions;
         let code_len = function_code.len();
         self.module.instructions.extend(function_code);
+
+        let jit_seed = jit_entry_type_seed(func);
+        if !jit_seed.is_empty() {
+            self.module.jit_type_seeds.push((function_start, jit_seed));
+        }
 
         // Publish the debugger's pc<->line map and per-function debug info.
         for (rel, line) in func_lines {
