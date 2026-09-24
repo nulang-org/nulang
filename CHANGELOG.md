@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### Sharded Savina fork-join measurement fixture — 2026-09-24
+- **The standalone Savina runner now has an explicit `--shards N` fork-join mode backed by real `Runtime::new_sharded` instances and one scheduler thread per shard.** Eight bytecode workers are placed on their owning shards; thread creation, bytecode attachment, and warmup stay outside the timed region.
+- **Multicore fork-join uses a 512-task in-flight producer window below the 1024-entry cross-shard bus capacity.** This prevents a 50,000-task preload from turning bounded-channel backpressure into silently missing work while preserving the existing 50,000 task + 50,000 acknowledgement logical-message count.
+- **Benchmark output schema 2 records the actual shard count, and the cross-runtime harness exposes `--nulang-shards 1..8` only with host CPU mode.** Single-core mode remains one-shard by construction; non-fork-join Nulang workloads remain single-shard, and the report records that topology explicitly.
+
 ### Backend-neutral JIT region planning — 2026-09-24
 - **Native compilation eligibility is now separated from Cranelift code generation.** `src/jit/region_planner.rs` owns region boundaries, non-suspending direct-call folding, recursion safety, cached per-module analyses, and type metadata production.
 - **`JitSession` now consumes a `RegionPlan` for initial compilation and Tier-2 replacement instead of recomputing language/runtime safety rules itself.** This creates a reusable planning boundary for MIR, a custom baseline emitter, or another future native backend without duplicating call/effect/recursion semantics.
