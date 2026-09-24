@@ -334,18 +334,22 @@ pub fn python_object_id_to_owned_foreign(
             return Ok(OwnedForeignValue::Bool(value));
         }
         if let Ok(value) = obj.cast::<PyInt>() {
-            let value: i64 = value.extract().unwrap_or_else(|_| {
+            let value = value.extract::<i64>().unwrap_or_else(|_| {
                 let text = value.str().map(|s| s.to_string()).unwrap_or_default();
-                if text.starts_with('-') { i64::MIN } else { i64::MAX }
+                if text.starts_with('-') {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                }
             });
             return Ok(OwnedForeignValue::Int(value));
         }
         if let Ok(value) = obj.cast::<PyFloat>() {
-            let value: f64 = value.extract().map_err(|e| e.to_string())?;
+            let value = value.extract::<f64>().map_err(|e| e.to_string())?;
             return Ok(OwnedForeignValue::Float(value));
         }
         if let Ok(value) = obj.cast::<PyString>() {
-            let value: String = value.extract().map_err(|e| e.to_string())?;
+            let value = value.extract::<String>().map_err(|e| e.to_string())?;
             return Ok(OwnedForeignValue::String(value));
         }
 

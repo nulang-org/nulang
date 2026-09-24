@@ -47,9 +47,7 @@ impl BlockingForeignExecutor {
         })
     }
 
-    pub fn try_recv(
-        &self,
-    ) -> Result<BlockingCompletion<ForeignCallResult>, TryRecvError> {
+    pub fn try_recv(&self) -> Result<BlockingCompletion<ForeignCallResult>, TryRecvError> {
         self.executor.try_recv()
     }
 
@@ -133,8 +131,7 @@ mod tests {
         let first = executor
             .try_submit(ForeignCallRequest::new("fake", "one", vec![]))
             .unwrap();
-        let first_result =
-            recv_until(&executor, Instant::now() + Duration::from_secs(1));
+        let first_result = recv_until(&executor, Instant::now() + Duration::from_secs(1));
         assert_eq!(
             first_result,
             BlockingCompletion::Finished {
@@ -146,8 +143,7 @@ mod tests {
         let second = executor
             .try_submit(ForeignCallRequest::new("fake", "two", vec![]))
             .unwrap();
-        let second_result =
-            recv_until(&executor, Instant::now() + Duration::from_secs(1));
+        let second_result = recv_until(&executor, Instant::now() + Duration::from_secs(1));
         assert_eq!(
             second_result,
             BlockingCompletion::Finished {
