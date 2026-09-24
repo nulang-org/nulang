@@ -29,7 +29,7 @@ use std::ffi::{c_char, CStr, CString};
 #[cfg(feature = "native-codegen")]
 use crate::backends::TieredAction;
 use crate::backends::{create_default_jit, JitBackend};
-use crate::bytecode::{CodeModule, Constant, EffectSiteMetadata, Instruction, OpCode};
+use crate::bytecode::{CodeModule, Constant, Instruction, OpCode};
 use crate::ffi::{call_native, CType, Signature, FFI_REGISTRY};
 use crate::runtime::heap::{ActorHeap, TypeTag as HeapTypeTag};
 use crate::types::{NuError, NuResult, Span, VmSuspension};
@@ -129,15 +129,16 @@ pub enum PerformAsyncResult {
 
 /// Exact compiler/runtime provenance for one effect dispatch.
 ///
-/// `pc` is artifact-local lookup metadata only; durable identity must come
-/// from `site.id`, which is compiler-owned and stable across backend-local
-/// instruction layout changes. Legacy or hand-built modules may have no
-/// semantic site metadata, in which case `site` is `None`.
-#[derive(Debug, Clone, Copy)]
-pub struct EffectInvocationContext<'a> {
-    pub module_idx: usize,
-    pub pc: usize,
-    pub site: Option<&'a EffectSiteMetadata>,
+/// `semantic_site_id` is compiler-owned and backend-independent; it is the
+/// only field suitable as input to durable logical identity. `artifact_pc`
+/// is optional backend-local diagnostic provenance (present for bytecode,
+/// absent for native backends). Legacy or hand-built artifacts may have no
+/// semantic site identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectInvocationContext {
+    pub module_idx: Option<usize>,
+    pub artifact_pc: Option<usize>,
+    pub semantic_site_id: Option<[u8; 32]>,
 }
 
 /// Callback interface that supplies real actor-runtime behavior for the VM's
@@ -315,7 +316,7 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// understand compiler metadata.
     fn perform_builtin_effect_at_site(
         &mut self,
-        context: EffectInvocationContext<'_>,
+        context: EffectInvocationContext,
         effect_name: &str,
         op_name: Option<&str>,
         module: &CodeModule,
@@ -387,7 +388,7 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// compatible until they propagate equivalent site context.
     fn perform_async_at_site(
         &mut self,
-        context: EffectInvocationContext<'_>,
+        context: EffectInvocationContext,
         effect_op: &str,
         constants: &[Constant],
         args: &[Value],
@@ -4048,9 +4049,9 @@ impl VM {
             let result = match self.modules.get(module_idx) {
                 Some(module) => self.actor_callbacks.perform_builtin_effect_at_site(
                     EffectInvocationContext {
-                        module_idx,
-                        pc: performing_pc,
-                        site: module.effect_site_at(performing_pc),
+                        module_idx: Some(module_idx),
+                        artifact_pc: Some(performing_pc),
+                        semantic_site_id: module.effect_site_at(performing_pc).map(|site| site.id),
                     },
                     &effect_name,
                     op_name.as_deref(),
@@ -4135,9 +4136,9 @@ impl VM {
             let result = match self.modules.get(module_idx) {
                 Some(module) => self.actor_callbacks.perform_builtin_effect_at_site(
                     EffectInvocationContext {
-                        module_idx,
-                        pc: performing_pc,
-                        site: module.effect_site_at(performing_pc),
+                        module_idx: Some(module_idx),
+                        artifact_pc: Some(performing_pc),
+                        semantic_site_id: module.effect_site_at(performing_pc).map(|site| site.id),
                     },
                     &effect_name,
                     op_name.as_deref(),
@@ -4398,9 +4399,11 @@ impl VM {
         let module = self.modules.get(module_idx);
         let constants = module.map(|m| &m.constants[..]).unwrap_or(&[]);
         let context = EffectInvocationContext {
-            module_idx,
-            pc: performing_pc,
-            site: module.and_then(|m| m.effect_site_at(performing_pc)),
+            module_idx: Some(module_idx),
+            artifact_pc: Some(performing_pc),
+            semantic_site_id: module
+                .and_then(|m| m.effect_site_at(performing_pc))
+                .map(|site| site.id),
         };
         match self
             .actor_callbacks
