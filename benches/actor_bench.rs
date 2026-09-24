@@ -164,9 +164,7 @@ fn roundtrip_count(rt: &Runtime, actor_id: u64) -> i64 {
 
 fn local_roundtrip_fixture() -> (Runtime, u64) {
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_actor(Box::new(|| {
-        vec![("count".to_string(), Value::int(0))]
-    }));
+    let actor_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
     register_roundtrip_counter(&mut rt, actor_id);
     // Consume the spawn-time ready token so the timed section measures only
     // the message burst plus handler execution.
@@ -176,13 +174,10 @@ fn local_roundtrip_fixture() -> (Runtime, u64) {
 
 fn cross_shard_roundtrip_fixture() -> (Runtime, Runtime, u64) {
     let mut shards = Runtime::new_sharded(2);
-    let mut actor_id = shards[1].spawn_actor(Box::new(|| {
-        vec![("count".to_string(), Value::int(0))]
-    }));
+    let mut actor_id =
+        shards[1].spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
     while actor_id % 2 != 1 {
-        actor_id = shards[1].spawn_actor(Box::new(|| {
-            vec![("count".to_string(), Value::int(0))]
-        }));
+        actor_id = shards[1].spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
     }
     register_roundtrip_counter(&mut shards[1], actor_id);
     shards[1].run_scheduler();
