@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Bounded JIT register marshaling — 2026-09-24
+- **VM↔JIT transitions now reuse a detached boxed scratch register file and copy only the compiler-known active register prefix** (`src/vm.rs`). MIR function and behavior local-count metadata bound the common path; synthetic/legacy/ambiguous code remains conservative, and reserved direct-call register r254 is preserved explicitly. The scratch allocation is moved out of `VM` during native execution so the existing re-entrant ownership boundary remains intact.
+
+
 ### Consuming local-send ownership proof — 2026-09-24
 - **MIR now identifies fresh, single-definition heap-owning values whose sole use is a same-node actor send**, establishing a conservative proof surface for a later ORCA ownership handoff.
 - The analysis is intentionally metadata-only in this slice: it changes no bytecode, mailbox representation, reference count, or runtime behavior. Parameters, captures, handler bindings, multi-use values, and remote sends remain ineligible.
