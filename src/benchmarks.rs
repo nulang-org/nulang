@@ -189,7 +189,7 @@ fn bench_ab_aot_actor_drain() {
         .actors
         .get(&actor_id)
         .and_then(|actor| actor.get_state_field("total"))
-        .and_then(Value::as_int);
+        .and_then(|value| value.as_int());
     assert_eq!(total, Some(N as i64), "AOT actor must process every message");
     report_ab("aot_actor_drain", N as u64, elapsed);
 }
