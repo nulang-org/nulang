@@ -166,11 +166,15 @@ fn declared_actor_protocol_id(name: &str, behaviors: &[ast::Behavior]) -> Option
             params.push(lower_runtime_type(param.ty.as_ref()?));
         }
         let response = lower_runtime_type(behavior.ret_type.as_ref()?);
+        let effect = behavior.effect.as_ref()?;
+        if !matches!(effect, EffectRow::Closed(_)) {
+            return None;
+        }
         let member = crate::protocol::ProtocolMember::behavior(
             behavior.name.clone(),
             params,
             response,
-            behavior.effect.clone().unwrap_or_else(EffectRow::empty),
+            effect.clone(),
             behavior.cap,
         )
         .ok()?;
@@ -2862,9 +2866,12 @@ mod tests {
             name: "get".to_string(),
             params: vec![],
             body: Expr::Literal(Literal::Int(1), span),
+            // Return type is explicit, but the effect contract is not. The
+            // compiler must not silently promote an inferred/default-empty row
+            // into a stable distributed protocol contract.
             effect: None,
             cap: Capability::Ref,
-            ret_type: None,
+            ret_type: Some(Type::int()),
             span,
         };
         let module = ast::AstModule {
