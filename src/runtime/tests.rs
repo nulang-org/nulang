@@ -10,6 +10,7 @@ use crate::runtime::heap::{ActorHeap, TypeTag};
 use crate::vm::{Frame, Value};
 #[cfg(feature = "tcp")]
 use std::collections::HashSet;
+#[cfg(feature = "tcp")]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
