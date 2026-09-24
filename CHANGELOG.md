@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Compiler-latency benchmark baseline — 2026-09-24
+- **Criterion now measures Nulang compilation separately from execution** (`benches/compiler_bench.rs`): frontend-to-MIR and source-to-bytecode at 20/100/500 generated functions, plus bounded source-to-Cranelift-AOT cases. This restores the evidence base needed before replaying JIT tiering, register-marshaling, and compiler-analysis optimizations.
+
 ### Python bool marshal type inference — 2026-09-24
 - **Default-feature builds now make PyO3 boolean extraction explicit with `extract::<bool>()`**, avoiding a compiler inference failure in the Python marshal path without changing conversion semantics.
 
