@@ -124,29 +124,49 @@ fn publish_committed_snapshot(rt: &mut Runtime, actor_id: u64, snapshot: &ActorS
 /// events should use `commit_workflow_event` so the event and resulting actor
 /// snapshot share one atomic persistence boundary.
 pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::Result<()> {
+    let persistent = rt
+        .actors
+        .get(&actor_id)
+        .map(|actor| actor.persistent)
+        .unwrap_or(false);
+    if !persistent {
+        return Ok(());
+    }
+
+    // Once a workflow has an atomic durable tail, every later workflow-owned
+    // persistence operation must advance that same tail. A legacy snapshot
+    // write here would create history that commit_transition cannot fence.
+    if actor_is_workflow(rt, actor_id) {
+        return commit_workflow_transition(rt, actor_id, Vec::new());
+    }
+
     let sequence = next_sequence(rt, actor_id);
     let Some(snapshot) = build_actor_snapshot(rt, actor_id, sequence)? else {
         return Ok(());
     };
-
     rt.persistence.save_snapshot(snapshot.clone())?;
     publish_committed_snapshot(rt, actor_id, &snapshot);
     Ok(())
 }
 
-/// Commit one workflow event and the actor state produced by the same logical
-/// turn as a single durable transition.
+/// Commit workflow-owned durable state through the canonical atomic boundary.
 ///
-/// Activation epoch 1 is the local-runtime epoch until placement leases become
-/// the source of truth. Keeping this value here avoids spreading provisional
-/// fencing semantics across workflow call sites.
-pub(crate) fn commit_workflow_event(
+/// An empty event vector is a state-only workflow checkpoint. Non-empty
+/// vectors must all belong to the same logical sequence. Phase B can later
+/// extend this helper to stage the input command, domain events, effects, and
+/// outbox messages without changing callers again.
+fn commit_workflow_transition(
     rt: &mut Runtime,
     actor_id: u64,
-    event: WorkflowEvent,
+    workflow_events: Vec<WorkflowEvent>,
 ) -> std::io::Result<()> {
-    let sequence = event.sequence();
     let expected_previous_sequence = rt.persistence.latest_sequence(actor_id);
+    let sequence = match workflow_events.first() {
+        Some(event) => event.sequence(),
+        None => expected_previous_sequence
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("durable workflow sequence overflow"))?,
+    };
     let expected_sequence = expected_previous_sequence
         .checked_add(1)
         .ok_or_else(|| std::io::Error::other("durable workflow sequence overflow"))?;
@@ -154,8 +174,17 @@ pub(crate) fn commit_workflow_event(
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "workflow event sequence {sequence} does not follow durable tail {expected_previous_sequence}"
+                "workflow transition sequence {sequence} does not follow durable tail {expected_previous_sequence}"
             ),
+        ));
+    }
+    if workflow_events
+        .iter()
+        .any(|event| event.sequence() != sequence)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "all workflow events in one durable transition must share a sequence",
         ));
     }
 
@@ -168,7 +197,7 @@ pub(crate) fn commit_workflow_event(
         expected_previous_sequence,
         command: None,
         snapshot: snapshot.clone(),
-        workflow_events: vec![event],
+        workflow_events,
         domain_events: Vec::new(),
         durable_effects: Vec::new(),
         outbox: Vec::new(),
@@ -181,6 +210,16 @@ pub(crate) fn commit_workflow_event(
         actor.sequence = sequence;
     }
     Ok(())
+}
+
+/// Commit one workflow event and the actor state produced by the same logical
+/// turn as a single durable transition.
+pub(crate) fn commit_workflow_event(
+    rt: &mut Runtime,
+    actor_id: u64,
+    event: WorkflowEvent,
+) -> std::io::Result<()> {
+    commit_workflow_transition(rt, actor_id, vec![event])
 }
 
 /// Snapshot the durable and CRDT state of a persistent actor.
@@ -269,16 +308,10 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
         }
     }
     if is_workflow {
-        if event == "ParallelBranchCompleted" && args.len() == 2 {
+        let workflow_event = if event == "ParallelBranchCompleted" && args.len() == 2 {
             let parallel_step_name =
                 resolve_string_constant(rt, actor_id, &args[0]).unwrap_or_default();
             let branch_name = resolve_string_constant(rt, actor_id, &args[1]).unwrap_or_default();
-            let _ = rt.persistence.append_parallel_branch_completed(
-                actor_id,
-                seq,
-                parallel_step_name,
-                branch_name,
-            );
             if let Some(actor) = rt.actors.get_mut(&actor_id) {
                 let current = actor
                     .get_state_field("parallel_progress")
@@ -286,25 +319,35 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                     .unwrap_or(0);
                 actor.set_state_field("parallel_progress", Value::int(current + 1));
             }
+            WorkflowEvent::ParallelBranchCompleted {
+                sequence: seq,
+                parallel_step_name,
+                branch_name,
+            }
         } else {
             let module = rt
                 .actors
                 .get(&actor_id)
-                .and_then(|a| a.bytecode_module.as_ref());
+                .and_then(|actor| actor.bytecode_module.as_ref());
             let payload: Vec<PersistedValue> = args
                 .iter()
-                .map(|v| PersistedValue::from_value_resolved(v, module))
+                .map(|value| PersistedValue::from_value_resolved(value, module))
                 .collect();
-            let _ = rt.persistence.append_workflow_event(
+            WorkflowEvent::Custom {
+                sequence: seq,
+                name: event.to_string(),
+                args: payload,
+            }
+        };
+
+        if let Err(error) = commit_workflow_event(rt, actor_id, workflow_event) {
+            tracing::error!(
                 actor_id,
-                WorkflowEvent::Custom {
-                    sequence: seq,
-                    name: event.to_string(),
-                    args: payload,
-                },
+                event,
+                %error,
+                "nulang-workflow: durable event transition failed"
             );
         }
-        checkpoint_actor(rt, actor_id);
     }
 }
 
