@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Dense terminal Tier-2 JIT state — 2026-09-24
+- **Post-compilation tiering state now lives beside each dense compiled-region cache entry** (`src/jit/mod.rs`) instead of a separate hash map. Untyped regions become terminal after the threshold; typed regions receive one real SIMD replacement attempt through a distinct Tier-2 symbol, and both success and static rejection stop further promotion bookkeeping.
+
+
 ### Consuming local-send ownership proof — 2026-09-24
 - **MIR now identifies fresh, single-definition heap-owning values whose sole use is a same-node actor send**, establishing a conservative proof surface for a later ORCA ownership handoff.
 - The analysis is intentionally metadata-only in this slice: it changes no bytecode, mailbox representation, reference count, or runtime behavior. Parameters, captures, handler bindings, multi-use values, and remote sends remain ineligible.
