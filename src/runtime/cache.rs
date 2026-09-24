@@ -59,6 +59,7 @@ struct ArenaSlab {
 #[derive(Debug)]
 struct ByteArena {
     slabs: Vec<ArenaSlab>,
+    reusable_slabs: Vec<u32>,
     free: Vec<Vec<ArenaBlock>>,
     reserved_bytes: usize,
     target_slab_bytes: usize,
@@ -69,6 +70,7 @@ impl ByteArena {
         assert!(max_reserved_bytes > 0);
         Self {
             slabs: Vec::new(),
+            reusable_slabs: Vec::new(),
             free: (0..FREE_LIST_COUNT).map(|_| Vec::new()).collect(),
             reserved_bytes: 0,
             target_slab_bytes: ARENA_SLAB_TARGET_BYTES.min(max_reserved_bytes),
@@ -102,28 +104,40 @@ impl ByteArena {
                 let slab_bytes = capacity
                     .checked_mul(blocks)
                     .expect("cache arena slab size overflow");
-                let slab_id = self.slabs.len();
-                assert!(
-                    slab_id <= u32::MAX as usize,
-                    "cache arena has too many slabs"
-                );
-
-                self.slabs.push(ArenaSlab {
-                    bytes: vec![0u8; slab_bytes].into_boxed_slice(),
-                    block_size: capacity as u32,
-                    live_blocks: 0,
-                });
+                let slab_id = if let Some(slab_id) = self.reusable_slabs.pop() {
+                    let slab = &mut self.slabs[slab_id as usize];
+                    debug_assert!(slab.bytes.is_empty());
+                    debug_assert_eq!(slab.live_blocks, 0);
+                    *slab = ArenaSlab {
+                        bytes: vec![0u8; slab_bytes].into_boxed_slice(),
+                        block_size: capacity as u32,
+                        live_blocks: 0,
+                    };
+                    slab_id
+                } else {
+                    let slab_id = self.slabs.len();
+                    assert!(
+                        slab_id <= u32::MAX as usize,
+                        "cache arena has too many slabs"
+                    );
+                    self.slabs.push(ArenaSlab {
+                        bytes: vec![0u8; slab_bytes].into_boxed_slice(),
+                        block_size: capacity as u32,
+                        live_blocks: 0,
+                    });
+                    slab_id as u32
+                };
                 self.reserved_bytes = self.reserved_bytes.saturating_add(slab_bytes);
 
                 for block in (1..blocks).rev() {
                     self.free[class].push(ArenaBlock {
-                        slab: slab_id as u32,
+                        slab: slab_id,
                         block: block as u32,
                     });
                 }
 
                 ArenaBlock {
-                    slab: slab_id as u32,
+                    slab: slab_id,
                     block: 0,
                 }
             }
@@ -176,13 +190,57 @@ impl ByteArena {
     }
 
     fn slab_count(&self) -> usize {
-        self.slabs.len()
+        self.slabs
+            .iter()
+            .filter(|slab| !slab.bytes.is_empty())
+            .count()
+    }
+
+    /// Reclaim backing memory for slabs that no longer contain live blocks.
+    ///
+    /// Normal delete churn keeps empty slabs hot for reuse. This cold-path
+    /// operation is invoked only when admission would otherwise exceed the
+    /// configured arena limit (or explicitly through CacheStore::trim_arena).
+    fn reclaim_empty_slabs(&mut self) -> usize {
+        if self.slabs.is_empty() {
+            return 0;
+        }
+
+        let mut reclaim = vec![false; self.slabs.len()];
+        let mut reclaimed = 0usize;
+
+        for (slab_id, slab) in self.slabs.iter_mut().enumerate() {
+            if slab.live_blocks != 0 || slab.bytes.is_empty() {
+                continue;
+            }
+
+            reclaim[slab_id] = true;
+            reclaimed = reclaimed.saturating_add(slab.bytes.len());
+            slab.bytes = Vec::new().into_boxed_slice();
+            slab.block_size = 0;
+            self.reusable_slabs.push(slab_id as u32);
+        }
+
+        if reclaimed == 0 {
+            return 0;
+        }
+
+        for blocks in &mut self.free {
+            blocks.retain(|block| !reclaim[block.slab as usize]);
+        }
+        self.reserved_bytes = self.reserved_bytes.saturating_sub(reclaimed);
+        reclaimed
     }
 
     fn metadata_reserved_bytes(&self) -> usize {
         self.slabs
             .capacity()
             .saturating_mul(std::mem::size_of::<ArenaSlab>())
+            .saturating_add(
+                self.reusable_slabs
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
             .saturating_add(
                 self.free
                     .capacity()
@@ -788,6 +846,18 @@ impl CacheStore {
         Ok(())
     }
 
+    fn prepare_bytes_batch(
+        &mut self,
+        pairs: &[(&[u8], &[u8])],
+    ) -> Result<(), CacheWriteError> {
+        match self.validate_bytes_batch(pairs) {
+            Err(CacheWriteError::ArenaLimitReached) if self.arena.reclaim_empty_slabs() != 0 => {
+                self.validate_bytes_batch(pairs)
+            }
+            result => result,
+        }
+    }
+
     fn prepare_bytes_write(&mut self, key: &[u8], value: &[u8]) -> Result<(), CacheWriteError> {
         if key.len() > self.config.max_key_bytes {
             return Err(CacheWriteError::KeyTooLarge);
@@ -799,10 +869,17 @@ impl CacheStore {
         loop {
             match self.validate_bytes_write(key, value) {
                 Ok(()) => return Ok(()),
-                Err(error @ CacheWriteError::EntryLimitReached)
-                | Err(error @ CacheWriteError::ArenaLimitReached) => {
+                Err(CacheWriteError::ArenaLimitReached) => {
+                    if self.arena.reclaim_empty_slabs() != 0 {
+                        continue;
+                    }
                     if !self.eviction.enabled() || !self.evict_one() {
-                        return Err(error);
+                        return Err(CacheWriteError::ArenaLimitReached);
+                    }
+                }
+                Err(CacheWriteError::EntryLimitReached) => {
+                    if !self.eviction.enabled() || !self.evict_one() {
+                        return Err(CacheWriteError::EntryLimitReached);
                     }
                 }
                 Err(error) => return Err(error),
@@ -835,10 +912,17 @@ impl CacheStore {
         loop {
             match self.validate_integer_write(key) {
                 Ok(()) => return Ok(()),
-                Err(error @ CacheWriteError::EntryLimitReached)
-                | Err(error @ CacheWriteError::ArenaLimitReached) => {
+                Err(CacheWriteError::ArenaLimitReached) => {
+                    if self.arena.reclaim_empty_slabs() != 0 {
+                        continue;
+                    }
                     if !self.eviction.enabled() || !self.evict_one() {
-                        return Err(error);
+                        return Err(CacheWriteError::ArenaLimitReached);
+                    }
+                }
+                Err(CacheWriteError::EntryLimitReached) => {
+                    if !self.eviction.enabled() || !self.evict_one() {
+                        return Err(CacheWriteError::EntryLimitReached);
                     }
                 }
                 Err(error) => return Err(error),
@@ -1199,7 +1283,7 @@ impl CacheStore {
         ttl_ms: Option<u64>,
         now_ms: u64,
     ) -> Result<(), CacheWriteError> {
-        self.validate_bytes_batch(pairs)?;
+        self.prepare_bytes_batch(pairs)?;
         for &(key, value) in pairs {
             self.set_bytes_unchecked(key, value, ttl_ms, now_ms);
         }
@@ -1409,6 +1493,15 @@ impl CacheStore {
         self.stats
     }
 
+    /// Release backing storage for arena slabs with no live blocks.
+    ///
+    /// Deletes normally retain empty slabs for fast same-class reuse. Call this
+    /// at an explicit memory-pressure boundary; write admission also invokes it
+    /// automatically before eviction or an arena-capacity error.
+    pub fn trim_arena(&mut self) -> usize {
+        self.arena.reclaim_empty_slabs()
+    }
+
     pub fn memory_stats(&self) -> CacheMemoryStats {
         let arena_reserved_bytes = self.arena.reserved_bytes();
         let arena_metadata_reserved_bytes = self.arena.metadata_reserved_bytes();
@@ -1544,6 +1637,53 @@ mod tests {
         for (slice, payload) in held {
             assert_eq!(arena.get(slice), payload.as_slice());
         }
+    }
+
+    #[test]
+    fn empty_slabs_are_reclaimed_only_on_pressure() {
+        let mut store = CacheStore::with_config(CacheConfig {
+            max_key_bytes: 64,
+            max_value_bytes: 1024,
+            max_entries: 8,
+            max_arena_bytes: ARENA_SLAB_TARGET_BYTES,
+        });
+
+        store.try_set_bytes(b"a", &[1; 100], None, 0).unwrap();
+        assert_eq!(
+            store.memory_stats().arena_reserved_bytes,
+            ARENA_SLAB_TARGET_BYTES
+        );
+        assert!(store.delete(b"a"));
+
+        // Delete churn retains the empty slab until pressure requires another
+        // incompatible size class.
+        assert_eq!(
+            store.memory_stats().arena_reserved_bytes,
+            ARENA_SLAB_TARGET_BYTES
+        );
+
+        store.try_set_bytes(b"b", &[2; 200], None, 0).unwrap();
+        let stats = store.memory_stats();
+        assert_eq!(stats.arena_reserved_bytes, ARENA_SLAB_TARGET_BYTES);
+        assert_eq!(stats.arena_slab_count, 1);
+        assert_eq!(store.get(b"b", 0), Some(CacheValueView::Bytes(&[2; 200])));
+    }
+
+    #[test]
+    fn explicit_trim_releases_empty_slab_backing_memory_and_reuses_id() {
+        let mut arena = ByteArena::new(ARENA_SLAB_TARGET_BYTES);
+        let slice = arena.alloc(&[7; 100]);
+        assert_eq!(arena.slabs.len(), 1);
+        arena.release(slice);
+
+        assert_eq!(arena.reclaim_empty_slabs(), ARENA_SLAB_TARGET_BYTES);
+        assert_eq!(arena.reserved_bytes(), 0);
+        assert_eq!(arena.slab_count(), 0);
+
+        let replacement = arena.alloc(&[8; 200]);
+        assert_eq!(replacement.slab, 0);
+        assert_eq!(arena.slabs.len(), 1);
+        assert_eq!(arena.slab_count(), 1);
     }
 
     #[test]
