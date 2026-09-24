@@ -298,6 +298,48 @@ fn at_least_once_contract_exposes_duplicate_external_mutation() {
 }
 
 #[test]
+fn stale_activation_cannot_publish_late_provider_result_after_ownership_moves() {
+    let request = b"order=42&amount=1000";
+    let original = effect_spec(
+        "checkout/order-42",
+        "Payment.charge",
+        EffectBoundary::External,
+        DeliverySemantics::EffectivelyOnceWithDeduplication,
+    );
+    let original_id = original.id;
+    let successor = effect_spec(
+        "checkout/order-43",
+        "Payment.charge",
+        EffectBoundary::External,
+        DeliverySemantics::EffectivelyOnceWithDeduplication,
+    );
+    let mut store = MemoryStore::new();
+
+    // Activation 1 durably prepares the provider call.
+    {
+        let mut first_owner = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+        first_owner.begin(original, request).unwrap();
+    }
+
+    // Ownership moves to activation 2 and advances durable history.
+    {
+        let mut new_owner = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 2);
+        new_owner.begin(successor, b"order=43&amount=2000").unwrap();
+    }
+    assert_eq!(store.latest_sequence(ACTOR_ID), 2);
+
+    // A late provider response from activation 1 must be fenced out rather
+    // than becoming the terminal receipt for the old owner.
+    let mut stale_owner = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+    assert!(matches!(
+        stale_owner.complete(original_id, request, b"late-result".to_vec()),
+        Err(DurableEffectRuntimeError::Storage(ref error))
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+    assert_eq!(store.latest_sequence(ACTOR_ID), 2);
+}
+
+#[test]
 fn backend_defined_semantics_remain_delegated_after_restart() {
     let request = b"message";
     let spec = effect_spec(
