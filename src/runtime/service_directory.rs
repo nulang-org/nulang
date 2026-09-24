@@ -301,7 +301,9 @@ impl ServiceDirectory {
 
 fn validate_identifier(label: &str, value: &str) -> Result<(), String> {
     if value.is_empty() || value.trim() != value {
-        return Err(format!("{label} must be non-empty and must not have surrounding whitespace"));
+        return Err(format!(
+            "{label} must be non-empty and must not have surrounding whitespace"
+        ));
     }
     if value.chars().any(char::is_control) {
         return Err(format!("{label} must not contain control characters"));
@@ -334,9 +336,7 @@ fn validate_snapshot(snapshot: &ServiceAdvertisementSnapshot) -> Result<(), Stri
         if !endpoint_keys.insert(endpoint_key) {
             return Err(format!(
                 "duplicate service endpoint in snapshot for {} replica {} epoch {}",
-                advertisement.deployment_id,
-                advertisement.replica,
-                advertisement.allocation_epoch
+                advertisement.deployment_id, advertisement.replica, advertisement.allocation_epoch
             ));
         }
 
@@ -619,15 +619,7 @@ mod tests {
             node_id: NodeId(7),
             generation: 1,
             services: vec![
-                endpoint(
-                    7,
-                    "api",
-                    "api-deploy",
-                    0,
-                    1,
-                    8080,
-                    ServiceHealth::Serving,
-                ),
+                endpoint(7, "api", "api-deploy", 0, 1, 8080, ServiceHealth::Serving),
                 endpoint(
                     7,
                     "metrics",
