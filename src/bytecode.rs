@@ -694,6 +694,10 @@ pub struct CodeModule {
     /// `#[serde(default)]` — old `.nbc` artifacts deserialize without it.
     #[serde(default)]
     pub function_local_counts: Vec<usize>,
+    /// Compiler-owned primitive entry facts for tiered JIT inference.
+    /// These are in-memory optimization hints, never serialized trust.
+    #[serde(skip)]
+    pub(crate) jit_type_seeds: Vec<(usize, crate::type_metadata::TypeMetadata)>,
     pub exports: Vec<(String, usize)>, // name -> constant/function index
     /// Entry point for inline __main (None if no __main, defaults to 0 in VM)
     pub entry_point: Option<usize>,
@@ -749,6 +753,7 @@ impl CodeModule {
             behaviors: Vec::new(),
             function_table: Vec::new(),
             function_local_counts: Vec::new(),
+            jit_type_seeds: Vec::new(),
             exports: Vec::new(),
             entry_point: None,
             spawn_init_overrides: Vec::new(),
