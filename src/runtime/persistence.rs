@@ -1622,7 +1622,21 @@ impl PersistenceStore for JsonFileStore {
             ));
         }
 
-        let record = JsonDurableTransitionRecord::from_transition(&transition, digest)?;
+        for delivery in &transition.inbox {
+            if records.iter().any(|record| {
+                record.inbox.iter().any(|accepted| {
+                    accepted.destination_actor_id == delivery.destination_actor_id
+                        && accepted.id == delivery.id
+                })
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "durable inbox identity was already accepted",
+                ));
+            }
+        }
+
+        let record = JsonDurableTransitionRecord::from_transition(&transition, digest)?
         self.append_transition_record(transition.actor_id, &record, valid_len)?;
 
         Ok(DurableCommit {
