@@ -197,6 +197,79 @@ fn bench_ab_aot_actor_drain() {
     report_ab("aot_actor_drain", N as u64, elapsed);
 }
 
+
+/// Same-shard fresh-heap payload transfer.
+///
+/// Each producer turn allocates one fresh array and immediately sends it to a
+/// different local actor. The array local has one definition and one use, so
+/// this is the narrow workload targeted by the consuming-send ownership proof.
+/// The timed region includes allocation, local-send admission, scheduler
+/// delivery, and receiver handling; setup/compilation stay outside the timer.
+#[test]
+fn bench_ab_owned_payload_handoff() {
+    const N: i64 = 100_000;
+    let source = r#"
+        actor Producer {
+            state sink = nil
+            behavior setup(s) { self.sink = s }
+            behavior emit(n) {
+                if n > 0 then {
+                    let payload = [n, n + 1, n + 2, n + 3] in {
+                        send self.sink take(payload)
+                        send self emit(n - 1)
+                    }
+                }
+            }
+        }
+        actor Sink {
+            state count = 0
+            behavior take(payload) {
+                self.count = self.count + 1
+            }
+        }
+        let producer = spawn Producer {} in
+        let sink = spawn Sink {} in {
+            send producer setup(sink)
+            producer
+        }
+    "#;
+
+    let rt = Rc::new(RefCell::new(Runtime::new()));
+    let producer = compile_run_with_runtime(source, rt.clone())
+        .as_actor_id()
+        .expect("spawn returns producer actor ref");
+    let sink = {
+        let rt = rt.borrow();
+        rt.actors
+            .keys()
+            .copied()
+            .find(|&id| id != producer)
+            .expect("sink spawned")
+    };
+
+    // Deliver setup outside the measured region.
+    rt.borrow_mut().run_scheduler();
+
+    let start = Instant::now();
+    rt.borrow_mut()
+        .send_message(producer, "emit", &[Value::int(N)]);
+    rt.borrow_mut().run_scheduler();
+    let elapsed = start.elapsed();
+
+    let count = rt
+        .borrow()
+        .actors
+        .get(&sink)
+        .and_then(|actor| actor.get_state_field("count"))
+        .and_then(|value| value.as_int());
+    assert_eq!(count, Some(N), "sink must receive every fresh payload");
+
+    // One operation is one fresh heap allocation + eligible local ownership
+    // transfer + receiver delivery. The producer's self-send is supporting
+    // control flow and is intentionally not counted as a transfer operation.
+    report_ab("owned_payload_handoff", N as u64, elapsed);
+}
+
 /// Counting: one actor, main thread floods it with N messages.
 /// Measures single-actor mailbox throughput + scheduler drain.
 #[test]
