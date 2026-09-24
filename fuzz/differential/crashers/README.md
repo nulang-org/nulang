@@ -14,8 +14,8 @@ scripts/difffuzz.sh
 or directly:
 
 ```sh
-cargo run --release --bin nula_difffuzz -- --seed-range 0..22400
-cargo run --release --bin nula_difffuzz -- --seed-range 100000..108000
+cargo run --release --locked --no-default-features --features difffuzz --bin nula_difffuzz -- --seeds 22400 --seed-base 0
+cargo run --release --locked --no-default-features --features difffuzz --bin nula_difffuzz -- --seeds 8000 --seed-base 100000
 ```
 
 The seed ranges used in the campaign are **0..22400** and **100000..108000**,
