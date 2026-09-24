@@ -3984,7 +3984,7 @@ mod optimize_tests {
 
         let mut prefix = mir::FunctionBuilder::new("prefix", None);
         let prefix_value = prefix.add_temp(Type::int());
-        prefix.assign(prefix_value, mir::RValue::Use(mir::Operand::Constant(mir::Constant::Int(1))));
+        prefix.assign(prefix_value, mir::RValue::Const(Constant::Int(1)));
         prefix.terminate(mir::Terminator::Return(Some(prefix_value)));
         module.functions.push(prefix.build());
 
