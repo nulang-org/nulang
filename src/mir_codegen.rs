@@ -4077,6 +4077,46 @@ mod optimize_tests {
     }
 
     #[test]
+    fn test_source_fresh_array_send_emits_consuming_site() {
+        let source = r#"
+            actor Sink {
+                behavior take(xs) { unit }
+            }
+            actor Producer {
+                state sink = nil
+                behavior wire(s) { self.sink = s }
+                behavior produce() {
+                    let xs = [1, 2, 3] in
+                        send self.sink take(xs)
+                }
+            }
+            let sink = spawn Sink {} in
+            let producer = spawn Producer {} in {
+                send producer wire(sink)
+                producer
+            }
+        "#;
+
+        let tokens = crate::lexer::Lexer::new(source).lex().expect("lex");
+        let ast = crate::parser::Parser::new(tokens)
+            .parse_module()
+            .expect("parse");
+        let mut type_checker = crate::typechecker::TypeChecker::new();
+        type_checker.check_module(&ast).expect("typecheck");
+        let hir =
+            crate::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
+        let mut mir = crate::mir_lower::lower_module(&hir).expect("MIR lower");
+        let code = compile_mir(&mut mir, "source_consuming_send").expect("codegen");
+
+        assert!(
+            code.send_ownership_sites
+                .iter()
+                .any(|site| site.candidate_mask & 1 != 0),
+            "fresh source-level array payload should produce a consuming send site"
+        );
+    }
+
+    #[test]
     fn test_codegen_records_runtime_only_consuming_send_site() {
         let arr_ty = Type::Array(Box::new(Type::int()));
         let mut b = mir::FunctionBuilder::new("send_site", None);
