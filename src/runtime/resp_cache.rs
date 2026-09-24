@@ -55,9 +55,7 @@ pub fn command_slot(command: RespCommand<'_>) -> RespCommandSlot {
         || name.eq_ignore_ascii_case(b"TTL")
     {
         return if command.argc() == 1 {
-            RespCommandSlot::Slot(redis_slot(
-                command.arg0().expect("validated routing key"),
-            ))
+            RespCommandSlot::Slot(redis_slot(command.arg0().expect("validated routing key")))
         } else {
             RespCommandSlot::Unkeyed
         };
@@ -65,9 +63,7 @@ pub fn command_slot(command: RespCommand<'_>) -> RespCommandSlot {
 
     if name.eq_ignore_ascii_case(b"SET") {
         return if command.argc() == 2 || command.argc() == 4 {
-            RespCommandSlot::Slot(redis_slot(
-                command.arg0().expect("validated routing key"),
-            ))
+            RespCommandSlot::Slot(redis_slot(command.arg0().expect("validated routing key")))
         } else {
             RespCommandSlot::Unkeyed
         };
@@ -75,9 +71,7 @@ pub fn command_slot(command: RespCommand<'_>) -> RespCommandSlot {
 
     if name.eq_ignore_ascii_case(b"EXPIRE") {
         return if command.argc() == 2 {
-            RespCommandSlot::Slot(redis_slot(
-                command.arg0().expect("validated routing key"),
-            ))
+            RespCommandSlot::Slot(redis_slot(command.arg0().expect("validated routing key")))
         } else {
             RespCommandSlot::Unkeyed
         };
