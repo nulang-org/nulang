@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Explicit Python owned-value extraction types — 2026-09-24
+- **Python→owned foreign-value marshaling now supplies explicit PyO3 extraction types** (`src/python/marshal.rs`) for Bool/Int/Float/String conversions, restoring default-feature and CodeQL builds where generic `extract` inference failed inside error-handling closures.
+
+
 ### Durable external-effect crash-window release gate — 2026-09-23
 - **The deterministic crash-window matrix now exercises the real `DurableEffectCoordinator` over `MemoryStore` using compiler-owned semantic effect-site IDs**, covering intent-only recovery, provider-commit/receipt-loss deduplication, completed-receipt replay, request/specification drift, stale-owner completion fencing, explicit at-least-once duplication, and backend-defined delegation.
 - **The public durability guarantee boundary is documented explicitly** (`docs/DURABILITY_GUARANTEES.md`): Nulang does not claim arbitrary exactly-once external execution; effectively-once behavior requires a real provider/backend deduplication contract and the same stable operation identity across recovery.
