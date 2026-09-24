@@ -4025,6 +4025,28 @@ impl PostgresStore {
                 payload TEXT NOT NULL,
                 PRIMARY KEY (actor_id, sequence, ordinal)
             )",
+            "CREATE TABLE IF NOT EXISTS durable_outbox_acks (
+                actor_id BIGINT NOT NULL,
+                sender_epoch BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                PRIMARY KEY (actor_id, sender_epoch, sequence, ordinal)
+            )",
+            "CREATE TABLE IF NOT EXISTS durable_inbox (
+                destination_actor_id BIGINT NOT NULL,
+                sender_actor_id BIGINT NOT NULL,
+                sender_epoch BIGINT NOT NULL,
+                transition_sequence BIGINT NOT NULL,
+                outbox_ordinal INTEGER NOT NULL,
+                receiver_sequence BIGINT NOT NULL,
+                PRIMARY KEY (
+                    destination_actor_id,
+                    sender_actor_id,
+                    sender_epoch,
+                    transition_sequence,
+                    outbox_ordinal
+                )
+            )",
         ] {
             conn.execute(ddl, &[])
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -4035,6 +4057,130 @@ impl PostgresStore {
 
 #[cfg(feature = "postgres")]
 impl PersistenceStore for PostgresStore {
+    fn read_pending_outbox(&self, limit: usize) -> io::Result<Vec<DurableOutboxRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let rows = conn
+            .query(
+                "SELECT o.actor_id, t.activation_epoch, o.sequence, o.ordinal,
+                        o.destination_actor_id, o.behavior_id, o.payload
+                 FROM durable_outbox o
+                 JOIN durable_transitions t
+                   ON t.actor_id = o.actor_id AND t.sequence = o.sequence
+                 LEFT JOIN durable_outbox_acks a
+                   ON a.actor_id = o.actor_id
+                  AND a.sender_epoch = t.activation_epoch
+                  AND a.sequence = o.sequence
+                  AND a.ordinal = o.ordinal
+                 WHERE a.actor_id IS NULL
+                 ORDER BY o.actor_id ASC, t.activation_epoch ASC,
+                          o.sequence ASC, o.ordinal ASC
+                 LIMIT $1",
+                &[&(limit as i64)],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| {
+                let payload_json: String = row.get(6);
+                let payload = serde_json::from_str(&payload_json)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Ok(DurableOutboxRecord {
+                    id: DurableMessageId {
+                        sender_actor_id: row.get::<_, i64>(0) as u64,
+                        sender_epoch: row.get::<_, i64>(1) as u64,
+                        transition_sequence: row.get::<_, i64>(2) as u64,
+                        outbox_ordinal: row.get::<_, i32>(3) as u32,
+                    },
+                    destination_actor_id: row.get::<_, i64>(4) as u64,
+                    behavior_id: row.get::<_, i32>(5) as u16,
+                    payload,
+                })
+            })
+            .collect()
+    }
+
+    fn acknowledge_outbox(&mut self, id: DurableMessageId) -> io::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "INSERT INTO durable_outbox_acks
+                 (actor_id, sender_epoch, sequence, ordinal)
+                 SELECT o.actor_id, t.activation_epoch, o.sequence, o.ordinal
+                 FROM durable_outbox o
+                 JOIN durable_transitions t
+                   ON t.actor_id = o.actor_id AND t.sequence = o.sequence
+                 WHERE o.actor_id = $1
+                   AND t.activation_epoch = $2
+                   AND o.sequence = $3
+                   AND o.ordinal = $4
+                 ON CONFLICT DO NOTHING",
+                &[
+                    &(id.sender_actor_id as i64),
+                    &(id.sender_epoch as i64),
+                    &(id.transition_sequence as i64),
+                    &(id.outbox_ordinal as i32),
+                ],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        if changed == 0 {
+            let exists = conn
+                .query_opt(
+                    "SELECT 1
+                     FROM durable_outbox o
+                     JOIN durable_transitions t
+                       ON t.actor_id = o.actor_id AND t.sequence = o.sequence
+                     WHERE o.actor_id = $1
+                       AND t.activation_epoch = $2
+                       AND o.sequence = $3
+                       AND o.ordinal = $4",
+                    &[
+                        &(id.sender_actor_id as i64),
+                        &(id.sender_epoch as i64),
+                        &(id.transition_sequence as i64),
+                        &(id.outbox_ordinal as i32),
+                    ],
+                )
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                .is_some();
+            if !exists {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "durable outbox message identity does not exist",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn lookup_inbox_delivery(
+        &self,
+        destination_actor_id: u64,
+        id: DurableMessageId,
+    ) -> io::Result<Option<u64>> {
+        let mut conn = self.conn.lock().unwrap();
+        conn.query_opt(
+            "SELECT receiver_sequence FROM durable_inbox
+             WHERE destination_actor_id = $1
+               AND sender_actor_id = $2
+               AND sender_epoch = $3
+               AND transition_sequence = $4
+               AND outbox_ordinal = $5",
+            &[
+                &(destination_actor_id as i64),
+                &(id.sender_actor_id as i64),
+                &(id.sender_epoch as i64),
+                &(id.transition_sequence as i64),
+                &(id.outbox_ordinal as i32),
+            ],
+        )
+        .map(|row| row.map(|row| row.get::<_, i64>(0) as u64))
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
     fn load_durable_tail(&self, actor_id: u64) -> io::Result<Option<DurableTail>> {
         let mut conn = self.conn.lock().unwrap();
         let row = conn
@@ -4346,6 +4492,49 @@ impl PersistenceStore for PostgresStore {
                     &(message.destination_actor_id as i64),
                     &(message.behavior_id as i32),
                     payload_json,
+                ],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+
+        for delivery in &transition.inbox {
+            if tx
+                .query_opt(
+                    "SELECT receiver_sequence FROM durable_inbox
+                     WHERE destination_actor_id = $1
+                       AND sender_actor_id = $2
+                       AND sender_epoch = $3
+                       AND transition_sequence = $4
+                       AND outbox_ordinal = $5",
+                    &[
+                        &(delivery.destination_actor_id as i64),
+                        &(delivery.id.sender_actor_id as i64),
+                        &(delivery.id.sender_epoch as i64),
+                        &(delivery.id.transition_sequence as i64),
+                        &(delivery.id.outbox_ordinal as i32),
+                    ],
+                )
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                .is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "durable inbox identity was already accepted",
+                ));
+            }
+
+            tx.execute(
+                "INSERT INTO durable_inbox
+                 (destination_actor_id, sender_actor_id, sender_epoch,
+                  transition_sequence, outbox_ordinal, receiver_sequence)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    &(delivery.destination_actor_id as i64),
+                    &(delivery.id.sender_actor_id as i64),
+                    &(delivery.id.sender_epoch as i64),
+                    &(delivery.id.transition_sequence as i64),
+                    &(delivery.id.outbox_ordinal as i32),
+                    &(transition.sequence as i64),
                 ],
             )
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -4721,6 +4910,13 @@ impl PersistenceStore for PostgresStore {
         let mut tx = conn
             .transaction()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        tx.execute(
+            "DELETE FROM durable_inbox
+             WHERE destination_actor_id = $1 OR sender_actor_id = $1",
+            &[&(actor_id as i64)],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
         for table in [
             "snapshots",
             "journal",
@@ -4730,6 +4926,7 @@ impl PersistenceStore for PostgresStore {
             "durable_domain_events",
             "durable_effect_records",
             "durable_outbox",
+            "durable_outbox_acks",
             "durable_transitions",
             "durable_tails",
         ] {
