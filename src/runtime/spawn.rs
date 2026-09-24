@@ -707,6 +707,7 @@ mod authority_tests {
             true,
             Some("FailingWorkflow"),
             None,
+            None,
         );
 
         assert!(result.is_err());
@@ -738,6 +739,7 @@ mod authority_tests {
             true,
             Some("FailingWorkflow"),
             None,
+            None,
         );
 
         assert!(result.is_err());
@@ -766,6 +768,7 @@ mod authority_tests {
             true,
             Some("AuthorityWorkflow"),
             Some(&requested),
+            None,
         )
         .unwrap();
 
