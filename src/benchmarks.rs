@@ -115,13 +115,12 @@ fn bench_ab_enqueue_payload_sweep() {
         // Drain outside the timed region so every iteration also exercises
         // valid handler delivery and leaves no queued work behind.
         rt.run_scheduler();
-        assert!(
-            rt.actors
-                .get(&actor_id)
-                .expect("actor still live")
-                .mailbox
-                .is_empty()
-        );
+        assert!(rt
+            .actors
+            .get(&actor_id)
+            .expect("actor still live")
+            .mailbox
+            .is_empty());
     }
 }
 
@@ -190,7 +189,11 @@ fn bench_ab_aot_actor_drain() {
         .get(&actor_id)
         .and_then(|actor| actor.get_state_field("total"))
         .and_then(|value| value.as_int());
-    assert_eq!(total, Some(N as i64), "AOT actor must process every message");
+    assert_eq!(
+        total,
+        Some(N as i64),
+        "AOT actor must process every message"
+    );
     report_ab("aot_actor_drain", N as u64, elapsed);
 }
 
