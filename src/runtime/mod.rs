@@ -1096,7 +1096,8 @@ impl Runtime {
         workflow::emit_event(self, actor_id, event, args)
     }
 
-    /// Append a `TimerSet` workflow event and checkpoint the actor.
+    /// Stage a `TimerSet` in the active workflow transition, or atomically
+    /// commit a standalone timer transition when no workflow turn is active.
     pub fn append_timer_set(
         &mut self,
         actor_id: u64,
@@ -1106,12 +1107,13 @@ impl Runtime {
         workflow::append_timer_set(self, actor_id, name, duration_ms)
     }
 
-    /// Append a `TimerFired` workflow event and checkpoint the actor.
+    /// Atomically persist a `TimerFired` workflow transition.
     pub fn append_timer_fired(&mut self, actor_id: u64, name: &str) -> std::io::Result<()> {
         workflow::append_timer_fired(self, actor_id, name)
     }
 
-    /// Append a `SignalReceived` workflow event and checkpoint the actor.
+    /// Stage signal acceptance in the active workflow transition, or atomically
+    /// commit it when no workflow turn is active.
     pub fn append_signal_received(
         &mut self,
         actor_id: u64,
@@ -1121,7 +1123,8 @@ impl Runtime {
         workflow::append_signal_received(self, actor_id, name, payload)
     }
 
-    /// Append a `SagaCompensated` workflow event and checkpoint the actor.
+    /// Stage saga compensation progress in the active workflow transition, or
+    /// atomically commit it when no workflow turn is active.
     pub fn append_saga_compensated(
         &mut self,
         actor_id: u64,
@@ -4376,9 +4379,10 @@ impl Runtime {
 
     /// Schedule a durable timer for a workflow actor.
     ///
-    /// Appends a `TimerSet` event, checkpoints state, and arms the runtime's
-    /// timer wheel. When the timer fires the runtime will append a
-    /// `TimerFired` event and deliver a `__timer_fired` message to the actor.
+    /// Stages `TimerSet` with the current durable workflow turn and publishes
+    /// the timer to the live wheel only after that transition commits. When it
+    /// fires, `TimerFired` is durably acknowledged before `__timer_fired`
+    /// delivery. Durable outbox delivery remains RFC 0022 Phase E.
     pub fn schedule_workflow_timer(&mut self, actor_id: u64, name: &str, duration_ms: u64) {
         workflow::schedule_workflow_timer(self, actor_id, name, duration_ms)
     }
@@ -5394,10 +5398,27 @@ impl Runtime {
         }
 
         if is_workflow {
-            // Replay workflow events that arrived after the snapshot.
+            // A completed transition's snapshot already includes all state
+            // produced by its same-sequence events, so normal recovery replays
+            // only later events. A suspended transition is different: RFC 0022
+            // commits the PRE-step durable image plus the suspension marker.
+            // Same-sequence SignalReceived/Custom/Parallel events therefore
+            // have to be replayed to reconstruct the deterministic inputs that
+            // let the step reach the persisted suspension point again.
+            let suspended_snapshot = self
+                .actors
+                .get(&actor_id)
+                .map(|actor| actor.waiting_signal.is_some())
+                .unwrap_or(false);
             let events_to_replay: Vec<_> = workflow_events
                 .iter()
-                .filter(|e| e.sequence() > snapshot.sequence)
+                .filter(|event| {
+                    if suspended_snapshot {
+                        event.sequence() >= snapshot.sequence
+                    } else {
+                        event.sequence() > snapshot.sequence
+                    }
+                })
                 .cloned()
                 .collect();
             let mut fired_timer_names: std::collections::HashSet<String> =
@@ -5458,7 +5479,33 @@ impl Runtime {
                     .map(|m| (current_step as usize) < m.behaviors.len())
                     .unwrap_or(false);
                 if has_behavior {
-                    self.send_message_by_id(actor_id, current_step, &[]);
+                    // Re-drive with the latest durable command payload for this
+                    // workflow step. Signal/timer/LLM resume transitions often
+                    // have no command of their own, so search backward through
+                    // committed commands instead of requiring one at the
+                    // suspension snapshot's exact sequence.
+                    let command_payload = self
+                        .persistence
+                        .read_journal(actor_id)
+                        .into_iter()
+                        .filter(|entry| {
+                            entry.sequence <= snapshot.sequence
+                                && entry.behavior_id == current_step
+                        })
+                        .max_by_key(|entry| entry.sequence)
+                        .map(|entry| entry.payload)
+                        .unwrap_or_default();
+                    let resume_payload = self
+                        .actors
+                        .get_mut(&actor_id)
+                        .map(|actor| {
+                            command_payload
+                                .iter()
+                                .map(|value| value.to_value_on_heap(actor))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    self.send_message_by_id(actor_id, current_step, &resume_payload);
                 }
             }
         } else {
