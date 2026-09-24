@@ -773,10 +773,7 @@ mod tests {
         assert_eq!(plan.placements.len(), 1);
         assert_eq!(plan.placements[0].node_id, 2);
         assert_eq!(plan.placements[0].epoch, 10);
-        assert_eq!(
-            plan.superseded[0].reason,
-            SupersededReason::PlacementInvalid
-        );
+        assert_eq!(plan.superseded[0].reason, SupersededReason::PlacementInvalid);
     }
 
     #[test]
