@@ -1334,5 +1334,7 @@ mod foundationdb_trace_tests {
             event,
             ClusterTraceEvent::RoundOrder { round: 0, .. }
         )));
+        first.clear_trace();
+        assert!(first.trace().is_empty());
     }
 }
