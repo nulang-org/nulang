@@ -53,7 +53,7 @@ mobile-runtime = []
 # Enables the standalone Savina-style actor benchmark runner without pulling optional subsystems.
 savina-bench = []
 python = ["dep:pyo3"]
-sqlite = ["dep:libsql"]
+sqlite = ["dep:libsql", "dep:tokio"]
 lsp = ["dep:tower-lsp", "dep:tokio", "dep:futures", "dep:tower-service"]
 ai-runtime = ["dep:nulang-ai", "dep:nulang-ai-local", "dep:uuid", "dep:reqwest", "dep:tokio"]
 wasm-backend = ["native-codegen", "dep:wasm-encoder", "dep:wasmtime", "dep:wat", "dep:borsh"]
