@@ -1091,7 +1091,7 @@ impl Runtime {
         workflow::emit_event(self, actor_id, event, args)
     }
 
-    /// Append a `TimerSet` workflow event and checkpoint the actor.
+    /// Atomically commit a `TimerSet` workflow event with the resulting actor snapshot.
     pub fn append_timer_set(
         &mut self,
         actor_id: u64,
@@ -1101,12 +1101,12 @@ impl Runtime {
         workflow::append_timer_set(self, actor_id, name, duration_ms)
     }
 
-    /// Append a `TimerFired` workflow event and checkpoint the actor.
+    /// Atomically commit a `TimerFired` workflow event with the resulting actor snapshot.
     pub fn append_timer_fired(&mut self, actor_id: u64, name: &str) -> std::io::Result<()> {
         workflow::append_timer_fired(self, actor_id, name)
     }
 
-    /// Append a `SignalReceived` workflow event and checkpoint the actor.
+    /// Atomically commit a `SignalReceived` workflow event with the resulting actor snapshot.
     pub fn append_signal_received(
         &mut self,
         actor_id: u64,
@@ -1116,7 +1116,7 @@ impl Runtime {
         workflow::append_signal_received(self, actor_id, name, payload)
     }
 
-    /// Append a `SagaCompensated` workflow event and checkpoint the actor.
+    /// Atomically commit a `SagaCompensated` workflow event with the resulting actor snapshot.
     pub fn append_saga_compensated(
         &mut self,
         actor_id: u64,
