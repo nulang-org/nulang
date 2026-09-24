@@ -4,8 +4,8 @@
 //! represent a specific operation. End-to-end lifecycle benchmarks are named
 //! accordingly so their timings are not misread as message throughput.
 
-use criterion::{black_box, criterion_group, BatchSize, Criterion, Throughput};
-use nulang::runtime::Runtime;
+use criterion::{black_box, criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
+use nulang::runtime::{Mailbox, Message, MessagePayload, MessagePriority, Runtime};
 use nulang::vm::Value;
 
 const MESSAGE_BATCH: usize = 100;
@@ -170,10 +170,100 @@ fn bench_message_drain(c: &mut Criterion) {
     group.finish();
 }
 
+fn selective_receive_mailbox(depth: usize, hit_behavior: u16) -> Mailbox {
+    let mut mailbox = Mailbox::new(0);
+    for _ in 0..depth.saturating_sub(1) {
+        mailbox
+            .push_local(Message {
+                behavior_id: 1,
+                payload: MessagePayload::from_slice(&[Value::int(1)]),
+                sender: 0,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            })
+            .unwrap();
+    }
+    mailbox
+        .push_local(Message {
+            behavior_id: hit_behavior,
+            payload: MessagePayload::from_slice(&[Value::int(42)]),
+            sender: 0,
+            priority: MessagePriority::Normal,
+            trace_id: None,
+        })
+        .unwrap();
+    mailbox
+}
+
+fn bench_selective_receive(c: &mut Criterion) {
+    const HIT: u16 = 60_000;
+
+    let mut group = c.benchmark_group("actor/selective_receive_depth");
+    for depth in [64usize, 1024, 16_384] {
+        group.bench_with_input(BenchmarkId::from_parameter(depth), &depth, |b, &depth| {
+            b.iter_batched(
+                || selective_receive_mailbox(depth, HIT),
+                |mut mailbox| black_box(mailbox.receive_match(black_box(&[HIT]))),
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+
+    let mut group = c.benchmark_group("actor/selective_receive_arms");
+    for arm_count in [1usize, 8, 32] {
+        let mut behavior_ids: Vec<u16> = (10_000..10_000 + arm_count as u16).collect();
+        behavior_ids.push(HIT);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(arm_count),
+            &arm_count,
+            |b, _| {
+                b.iter_batched(
+                    || selective_receive_mailbox(4096, HIT),
+                    |mut mailbox| {
+                        black_box(mailbox.receive_match(black_box(behavior_ids.as_slice())))
+                    },
+                    BatchSize::SmallInput,
+                )
+            },
+        );
+    }
+    group.finish();
+
+    let mut group = c.benchmark_group("actor/selective_receive_guard_retry");
+    group.bench_function("32_rejections", |b| {
+        b.iter_batched(
+            || {
+                let mut mailbox = Mailbox::new(0);
+                for sender in 0..32u64 {
+                    mailbox
+                        .push_local(Message {
+                            behavior_id: HIT,
+                            payload: MessagePayload::from_slice(&[Value::int(sender as i64)]),
+                            sender,
+                            priority: MessagePriority::Normal,
+                            trace_id: None,
+                        })
+                        .unwrap();
+                }
+                mailbox
+            },
+            |mut mailbox| {
+                for _ in 0..32 {
+                    black_box(mailbox.receive_match(black_box(&[HIT])));
+                }
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_spawn_idle_batch,
     bench_spawn_send_receive,
     bench_message_enqueue,
-    bench_message_drain
+    bench_message_drain,
+    bench_selective_receive
 );
