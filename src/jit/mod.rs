@@ -668,8 +668,20 @@ impl JitSession {
             );
         }
 
-        // Analyze for vectorizable patterns
+        // Analyze for vectorizable patterns. The SIMD compiler falls back to
+        // scalar when it cannot determine a trip count; keep tier metadata
+        // honest by taking the typed/scalar path explicitly in that case.
         let simd_region = analyze_region(instructions, start_offset, num_instrs, type_metadata)?;
+        if simd_region.trip_count_hint.is_none() {
+            return self.compile_region_typed(
+                module_idx,
+                start_offset,
+                num_instrs,
+                instructions,
+                type_metadata,
+                &std::collections::HashMap::new(),
+            );
+        }
 
         let func_name = format!("nulang_simd_{}_{}", module_idx, start_offset);
         let started = std::time::Instant::now();
@@ -721,6 +733,9 @@ impl JitSession {
 
         let started = std::time::Instant::now();
         let simd_region = analyze_region(instructions, start_offset, num_instrs, type_metadata)?;
+        if simd_region.trip_count_hint.is_none() {
+            return None;
+        }
         let func_name = self.next_promotion_name("nulang_simd_promote", module_idx, start_offset);
 
         match compile_simd_region(
