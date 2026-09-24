@@ -10,8 +10,6 @@ use crate::runtime::heap::{ActorHeap, TypeTag};
 use crate::vm::{Frame, Value};
 #[cfg(feature = "tcp")]
 use std::collections::HashSet;
-#[cfg(feature = "tcp")]
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn noop_test_behavior(_actor: &mut Actor, _args: &[Value]) {}
