@@ -331,6 +331,73 @@ fn commit_external_workflow_event(
     commit_workflow_transition(rt, actor_id, vec![event], false, false)
 }
 
+/// Persist a suspended workflow boundary without committing the step's
+/// partially-mutated live state.
+///
+/// The new snapshot is derived from the previous committed snapshot, changing
+/// only its sequence and wait marker. Any pending driving command joins this
+/// transition so a crash after suspension cannot forget which mailbox command
+/// entered the wait.
+pub(crate) fn commit_suspension_marker(
+    rt: &mut Runtime,
+    actor_id: u64,
+) -> std::io::Result<()> {
+    let waiting_signal = match rt.actors.get(&actor_id) {
+        Some(actor) if actor.persistent => actor.waiting_signal.clone(),
+        _ => return Ok(()),
+    };
+    let Some(mut snapshot) = rt.persistence.load_snapshot(actor_id) else {
+        return Ok(());
+    };
+
+    if snapshot.waiting_signal == waiting_signal
+        && !rt.pending_workflow_commands.contains_key(&actor_id)
+    {
+        return Ok(());
+    }
+
+    let expected_previous_sequence = rt.persistence.latest_sequence(actor_id);
+    let sequence = expected_previous_sequence
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("durable workflow sequence overflow"))?;
+    snapshot.sequence = sequence;
+    snapshot.waiting_signal = waiting_signal;
+
+    let command = pending_command_at_sequence(rt, actor_id, sequence);
+    let committed_pending_command = command.is_some();
+    let transition = DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id,
+        activation_epoch: 1,
+        sequence,
+        expected_previous_sequence,
+        command,
+        snapshot: Some(snapshot.clone()),
+        workflow_events: Vec::new(),
+        domain_events: Vec::new(),
+        durable_effects: Vec::new(),
+        outbox: Vec::new(),
+    };
+
+    if let Err(error) = rt.persistence.commit_transition(transition) {
+        mark_workflow_commit_failure(rt, actor_id);
+        return Err(error);
+    }
+
+    if committed_pending_command {
+        rt.pending_workflow_commands.remove(&actor_id);
+    }
+
+    // The persisted state is intentionally the pre-step baseline. Do not clear
+    // dirty fields on the live actor: its in-memory continuation still owns
+    // those partial mutations until completion or activation recovery.
+    rt.maybe_shadow_replicate(actor_id, &snapshot);
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.sequence = sequence;
+    }
+    Ok(())
+}
+
 /// Snapshot the durable and CRDT state of a persistent actor.
 ///
 /// This wrapper intentionally preserves the legacy best-effort API for call
