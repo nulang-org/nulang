@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Local owned-payload actor benchmark — 2026-09-24
+- **The actor A/B harness now includes a source-level fresh heap-payload send workload** (`bench_ab_local_owned_payload_send`), where a producer allocates an array and uses it exactly once in a behavior-internal send to a sink. This provides an identical baseline/candidate signal for compiler/runtime ownership-handoff work without benchmarking private runtime helpers.
+
 ### CI playground dependency and formatting repair — 2026-09-24
 - **Browser-playground compilation now includes the shared content-identity module and its pure-Rust `hex` dependency** (`crates/nulang-playground`), matching `semantic_identity.rs`'s current dependency graph. Runtime worker-pool files were also normalized to the repository's rustfmt output so the format gate reflects semantics rather than stale layout.
 
