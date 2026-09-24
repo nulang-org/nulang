@@ -64,6 +64,20 @@ host-mode fork-join results must not be presented as a fair multicore
 comparison. These are language/runtime baselines, not a universal framework
 ranking; see the cross-runtime README for the full interpretation constraints.
 
+## RESP cache tail latency
+
+`scripts/cache_resp_latency.py` measures the feature-gated `nulang-cache`
+process over a real TCP connection and compares it with Valkey on the same
+GitHub Actions runner. The cache compatibility workflow records sequential
+GET-hit and depth-32 pipelined GET-hit p50/p95/p99/p99.9 latency as a JSON
+artifact.
+
+The merge gate uses `max(absolute floor, Valkey × ratio)` thresholds rather
+than a tiny fixed microsecond budget. Shared CI hosts can have millisecond-scale
+scheduler outliers; the relative comparison catches large Nulang-specific tail
+regressions while the absolute floor prevents an exceptionally fast Valkey run
+from making harmless differences flaky.
+
 ## Same-runner Nulang A/B
 
 `scripts/nulang_ab_bench.py` compares the current checkout against an exact
