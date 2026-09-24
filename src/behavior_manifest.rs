@@ -201,6 +201,7 @@ impl BehaviorManifest {
                 persistence: classify_persistence(actor),
                 schema_version: schema.version,
                 state_schema_semantic_id: state_schema_semantic_id(&schema).to_string(),
+                protocol_id: actor.protocol_id.clone(),
                 migration_identity: MigrationIdentityCoverage::TopologyOnly,
                 migrations: migration_steps(&schema),
             });
@@ -225,6 +226,7 @@ impl BehaviorManifest {
                 backend: artifact.backend().to_string(),
                 flags: artifact.flags().map(str::to_string).collect(),
             },
+            effects: effect_inventory_from_hir(hir),
             actors,
         };
         manifest.normalize();
