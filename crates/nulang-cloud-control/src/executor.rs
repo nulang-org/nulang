@@ -1,6 +1,4 @@
-use crate::store::{
-    AllocationCommand, AllocationCommandKind, ControlStore, StoreError,
-};
+use crate::store::{AllocationCommand, AllocationCommandKind, ControlStore, StoreError};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,13 +305,7 @@ mod tests {
     #[test]
     fn test_fresh_start_is_applied_and_acknowledged() {
         let store = MemoryControlStore::default();
-        reconcile_once(
-            &store,
-            &evaluation("eval-1", 1),
-            &deployment(1),
-            &[node()],
-        )
-        .unwrap();
+        reconcile_once(&store, &evaluation("eval-1", 1), &deployment(1), &[node()]).unwrap();
 
         let sink = RecordingSink::default();
         let report = dispatch_pending(&store, &sink).unwrap();
@@ -330,20 +322,8 @@ mod tests {
     #[test]
     fn test_superseding_evaluation_stops_old_epoch_before_new_start() {
         let store = MemoryControlStore::default();
-        reconcile_once(
-            &store,
-            &evaluation("eval-1", 1),
-            &deployment(1),
-            &[node()],
-        )
-        .unwrap();
-        reconcile_once(
-            &store,
-            &evaluation("eval-2", 2),
-            &deployment(2),
-            &[node()],
-        )
-        .unwrap();
+        reconcile_once(&store, &evaluation("eval-1", 1), &deployment(1), &[node()]).unwrap();
+        reconcile_once(&store, &evaluation("eval-2", 2), &deployment(2), &[node()]).unwrap();
 
         let sink = RecordingSink::default();
         dispatch_pending(&store, &sink).unwrap();
@@ -361,20 +341,8 @@ mod tests {
     #[test]
     fn test_failed_stop_blocks_replacement_start() {
         let store = MemoryControlStore::default();
-        reconcile_once(
-            &store,
-            &evaluation("eval-1", 1),
-            &deployment(1),
-            &[node()],
-        )
-        .unwrap();
-        reconcile_once(
-            &store,
-            &evaluation("eval-2", 2),
-            &deployment(2),
-            &[node()],
-        )
-        .unwrap();
+        reconcile_once(&store, &evaluation("eval-1", 1), &deployment(1), &[node()]).unwrap();
+        reconcile_once(&store, &evaluation("eval-2", 2), &deployment(2), &[node()]).unwrap();
 
         let sink = RecordingSink {
             applied: Mutex::new(Vec::new()),
@@ -391,9 +359,10 @@ mod tests {
                 }
             )
         }));
-        assert!(report.records.iter().any(|record| {
-            record.outcome == DispatchOutcome::BlockedByStopFailure
-        }));
+        assert!(report
+            .records
+            .iter()
+            .any(|record| { record.outcome == DispatchOutcome::BlockedByStopFailure }));
         assert!(sink.applied.lock().unwrap().is_empty());
         assert!(!store.pending_commands().unwrap().is_empty());
     }
