@@ -66,7 +66,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
     match args.first().map(String::as_str) {
         Some("symbols") => cmd_symbols(args.get(1..).unwrap_or(&[])),
         Some("symbol") => cmd_symbol(args.get(1..).unwrap_or(&[])),
-        Some("type" | "references" | "callers" | "callees") => {
+        Some("type" | "references" | "callers" | "callees" | "context") => {
             crate::semantic_query::run(args)
         },
         Some("help") | Some("-h") | Some("--help") | None => {
@@ -74,7 +74,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
             Ok(())
         }
         Some(other) => Err(query_err(format!(
-            "unknown query subcommand '{other}'; try: symbols, symbol, type, references, callers, callees"
+            "unknown query subcommand '{other}'; try: symbols, symbol, type, references, callers, callees, context"
         ))),
     }
 }
@@ -88,7 +88,8 @@ fn print_help() {
            nulang query type <name> <file> [--json]\n\
            nulang query references <name> <file> [--json]\n\
            nulang query callers <name> <file> [--json]\n\
-           nulang query callees <owner> <file> [--json]\n"
+           nulang query callees <owner> <file> [--json]\n\
+           nulang query context <name> <file> [--json]\n"
     );
 }
 
