@@ -80,6 +80,12 @@ pub struct ServiceAdvertisementSnapshot {
 pub(crate) struct ServiceDirectory {
     advertisements: Vec<ServiceAdvertisement>,
     remote_generations: HashMap<NodeId, u64>,
+    // Highest allocation epoch ever accepted for one node/deployment/replica
+    // during the node's current lifetime. Endpoint withdrawal must not erase
+    // this fence or an old workload could later resurrect through service
+    // discovery. Confirmed node removal clears the node's watermarks so a
+    // genuine same-NodeId restart can begin a fresh lifetime.
+    allocation_epochs: HashMap<(NodeId, String, u32), u64>,
 }
 
 impl ServiceDirectory {
@@ -89,12 +95,15 @@ impl ServiceDirectory {
     ) -> Result<bool, String> {
         advertisement.validate()?;
 
+        let allocation_key = (
+            advertisement.node_id,
+            advertisement.deployment_id.clone(),
+            advertisement.replica,
+        );
         let max_epoch = self
-            .advertisements
-            .iter()
-            .filter(|existing| existing.same_workload_identity(&advertisement))
-            .map(|existing| existing.allocation_epoch)
-            .max()
+            .allocation_epochs
+            .get(&allocation_key)
+            .copied()
             .unwrap_or(0);
 
         if advertisement.allocation_epoch < max_epoch {
@@ -112,6 +121,11 @@ impl ServiceDirectory {
                 !existing.same_workload_identity(&advertisement)
                     || existing.allocation_epoch >= advertisement.allocation_epoch
             });
+            self.allocation_epochs
+                .insert(allocation_key, advertisement.allocation_epoch);
+        } else if max_epoch == 0 {
+            self.allocation_epochs
+                .insert(allocation_key, advertisement.allocation_epoch);
         }
 
         if let Some(existing) = self
@@ -189,11 +203,44 @@ impl ServiceDirectory {
 
         validate_snapshot(&snapshot)?;
 
+        // A newer metadata generation is not permission to move allocation
+        // ownership backwards. Keep an epoch watermark independently of the
+        // visible endpoint set so omission/withdrawal cannot erase fencing.
+        for advertisement in &snapshot.services {
+            let key = (
+                snapshot.node_id,
+                advertisement.deployment_id.clone(),
+                advertisement.replica,
+            );
+            if let Some(current) = self.allocation_epochs.get(&key) {
+                if advertisement.allocation_epoch < *current {
+                    return Err(format!(
+                        "stale service snapshot for {} replica {} epoch {}; current epoch is {}",
+                        advertisement.deployment_id,
+                        advertisement.replica,
+                        advertisement.allocation_epoch,
+                        current
+                    ));
+                }
+            }
+        }
+
         let before = self.advertisements.len();
         self.advertisements
             .retain(|advertisement| advertisement.node_id != snapshot.node_id);
         let removed = before - self.advertisements.len();
         let inserted = snapshot.services.len();
+        for advertisement in &snapshot.services {
+            let key = (
+                snapshot.node_id,
+                advertisement.deployment_id.clone(),
+                advertisement.replica,
+            );
+            self.allocation_epochs
+                .entry(key)
+                .and_modify(|current| *current = (*current).max(advertisement.allocation_epoch))
+                .or_insert(advertisement.allocation_epoch);
+        }
         self.advertisements.extend(snapshot.services);
         self.remote_generations
             .insert(snapshot.node_id, snapshot.generation);
@@ -206,6 +253,8 @@ impl ServiceDirectory {
         self.advertisements
             .retain(|advertisement| advertisement.node_id != node_id);
         let generation_removed = self.remote_generations.remove(&node_id).is_some();
+        self.allocation_epochs
+            .retain(|(owner, _, _), _| *owner != node_id);
         (before - self.advertisements.len(), generation_removed)
     }
 
@@ -412,6 +461,81 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].allocation_epoch, 2);
         assert_eq!(resolved[0].port, 9090);
+    }
+
+    #[test]
+    fn withdrawn_local_endpoint_cannot_resurrect_at_lower_epoch() {
+        let mut directory = ServiceDirectory::default();
+        directory
+            .upsert_local(endpoint(
+                1,
+                "api",
+                "api-deploy",
+                0,
+                5,
+                8080,
+                ServiceHealth::Serving,
+            ))
+            .unwrap();
+        assert_eq!(
+            directory.remove_local_allocation(NodeId(1), "api-deploy", 0, 5),
+            1
+        );
+        assert!(directory
+            .upsert_local(endpoint(
+                1,
+                "api",
+                "api-deploy",
+                0,
+                4,
+                8080,
+                ServiceHealth::Serving,
+            ))
+            .is_err());
+    }
+
+    #[test]
+    fn newer_remote_generation_cannot_regress_allocation_epoch_after_omission() {
+        let mut directory = ServiceDirectory::default();
+        directory
+            .replace_remote_node(ServiceAdvertisementSnapshot {
+                node_id: NodeId(7),
+                generation: 1,
+                services: vec![endpoint(
+                    7,
+                    "api",
+                    "api-deploy",
+                    0,
+                    5,
+                    8080,
+                    ServiceHealth::Serving,
+                )],
+            })
+            .unwrap();
+        directory
+            .replace_remote_node(ServiceAdvertisementSnapshot {
+                node_id: NodeId(7),
+                generation: 2,
+                services: Vec::new(),
+            })
+            .unwrap();
+
+        assert!(directory
+            .replace_remote_node(ServiceAdvertisementSnapshot {
+                node_id: NodeId(7),
+                generation: 3,
+                services: vec![endpoint(
+                    7,
+                    "api",
+                    "api-deploy",
+                    0,
+                    4,
+                    8080,
+                    ServiceHealth::Serving,
+                )],
+            })
+            .is_err());
+        assert!(directory.resolve("api").unwrap().is_empty());
     }
 
     #[test]
