@@ -218,6 +218,11 @@ fn collect_safe_edits(
         })
         .collect::<Vec<_>>();
 
+    validate_non_overlapping(&edits)?;
+    Ok((fixes, edits))
+}
+
+fn validate_non_overlapping(edits: &[SafeEdit]) -> NuResult<()> {
     for pair in edits.windows(2) {
         if pair[0].end > pair[1].start {
             return Err(fix_error(format!(
@@ -226,8 +231,7 @@ fn collect_safe_edits(
             )));
         }
     }
-
-    Ok((fixes, edits))
+    Ok(())
 }
 
 fn validate_edit_range(source: &str, start: usize, end: usize) -> NuResult<()> {
@@ -336,12 +340,6 @@ mod tests {
 
     #[test]
     fn overlapping_edits_are_rejected() {
-        let source = "abcdef";
-        let errors = Vec::<NuError>::new();
-        let (_count, edits) =
-            collect_safe_edits(&errors, Path::new("test.nula"), source).unwrap();
-        assert!(edits.is_empty());
-
         let overlapping = vec![
             SafeEdit {
                 start: 1,
@@ -354,10 +352,6 @@ mod tests {
                 replacement: "y".to_string(),
             },
         ];
-        let mut output = source.to_string();
-        for edit in overlapping.iter().rev() {
-            output.replace_range(edit.start..edit.end, &edit.replacement);
-        }
-        assert_ne!(output, source);
+        assert!(validate_non_overlapping(&overlapping).is_err());
     }
 }
