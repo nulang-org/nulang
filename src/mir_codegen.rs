@@ -2886,8 +2886,11 @@ fn plan_consuming_send_args(func: &mir::Function) -> ConsumingSendPlan {
     let ptr_ty: Vec<bool> = func
         .locals
         .iter()
-        .map(|l| may_hold_heap_ptr(&l.ty))
+        .map(|local| may_hold_heap_ptr(&local.ty))
         .collect();
+
+    // Values entering from outside MIR assignments cannot be proven to carry
+    // one local ownership token.
     let mut excluded = vec![false; nlocals];
     for id in func.params.iter().chain(&func.captures) {
         excluded[id.0 as usize] = true;
@@ -2900,23 +2903,84 @@ fn plan_consuming_send_args(func: &mir::Function) -> ConsumingSendPlan {
         }
     }
 
+    // The consuming proof is intentionally stronger than ordinary liveness:
+    // every local in the chain must have one definition and one total use.
+    // This rules out competing reads/copies without requiring a second alias
+    // analysis. A single-use Load may then transfer the ownership proof to its
+    // destination exactly like plan_drops' ownership-transfer path.
     let mut def_count = vec![0usize; nlocals];
     let mut use_count = vec![0usize; nlocals];
-    let mut owning_def = vec![false; nlocals];
     for block in &func.blocks {
         for stmt in &block.stmts {
-            for (u, _) in stmt_uses(stmt) {
-                use_count[u] += 1;
+            for (local, _) in stmt_uses(stmt) {
+                use_count[local] += 1;
             }
-            if let mir::Stmt::Assign { dst, op } = stmt {
-                let d = dst.0 as usize;
-                def_count[d] += 1;
-                let self_read = rvalue_uses(op).iter().any(|(u, _)| *u == d);
-                owning_def[d] = def_count[d] == 1 && rvalue_is_owning(op) && !self_read;
+            if let mir::Stmt::Assign { dst, .. } = stmt {
+                def_count[dst.0 as usize] += 1;
             }
         }
-        for (u, _) in terminator_uses(&block.terminator) {
-            use_count[u] += 1;
+        for (local, _) in terminator_uses(&block.terminator) {
+            use_count[local] += 1;
+        }
+    }
+
+    let mut direct_owning = vec![false; nlocals];
+    let mut transfer_source: Vec<Option<usize>> = vec![None; nlocals];
+
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            let mir::Stmt::Assign { dst, op } = stmt else {
+                continue;
+            };
+            let d = dst.0 as usize;
+            if def_count[d] != 1 {
+                continue;
+            }
+
+            let self_read = rvalue_uses(op).iter().any(|(local, _)| *local == d);
+            if self_read {
+                continue;
+            }
+
+            if rvalue_is_owning(op) {
+                direct_owning[d] = true;
+                continue;
+            }
+
+            if let mir::RValue::Load(src) = op {
+                let source = src.0 as usize;
+                if source != d && def_count[source] == 1 && use_count[source] == 1 {
+                    transfer_source[d] = Some(source);
+                }
+            }
+        }
+    }
+
+    // Ownership can flow through arbitrarily long single-use Load chains.
+    let mut candidate = vec![false; nlocals];
+    loop {
+        let mut changed = false;
+        for local in 0..nlocals {
+            if candidate[local]
+                || !ptr_ty[local]
+                || excluded[local]
+                || def_count[local] != 1
+                || use_count[local] != 1
+            {
+                continue;
+            }
+
+            let owns = direct_owning[local]
+                || transfer_source[local]
+                    .map(|source| candidate[source])
+                    .unwrap_or(false);
+            if owns {
+                candidate[local] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
 
@@ -2935,23 +2999,18 @@ fn plan_consuming_send_args(func: &mir::Function) -> ConsumingSendPlan {
             else {
                 continue;
             };
+
             let owned: Vec<_> = args
                 .iter()
                 .copied()
-                .filter(|arg| {
-                    let a = arg.0 as usize;
-                    ptr_ty[a]
-                        && !excluded[a]
-                        && def_count[a] == 1
-                        && use_count[a] == 1
-                        && owning_def[a]
-                })
+                .filter(|arg| candidate[arg.0 as usize])
                 .collect();
             if !owned.is_empty() {
                 plan.args_by_stmt.insert((bi, si), owned);
             }
         }
     }
+
     plan
 }
 
