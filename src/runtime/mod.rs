@@ -3697,12 +3697,9 @@ impl Runtime {
             let behavior_idx = msg.behavior_id as usize;
 
             if self.actor_is_workflow(actor_id) {
-                if let Err(error) = workflow::begin_workflow_command(
-                    self,
-                    actor_id,
-                    msg.behavior_id,
-                    &msg.payload,
-                ) {
+                if let Err(error) =
+                    workflow::begin_workflow_command(self, actor_id, msg.behavior_id, &msg.payload)
+                {
                     tracing::error!(
                         actor_id,
                         %error,
