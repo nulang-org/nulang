@@ -3601,6 +3601,12 @@ impl VM {
             return false;
         }
 
+        // Capture the active module address before native entry. The direct
+        // frame-register path exposes this immutable, disjoint module context
+        // to string-aware helpers instead of exposing the parent VM itself.
+        // Non-reentrant execution cannot grow/reallocate `self.modules`.
+        let module_ptr = self.modules.get(module_idx).map(|module| module as *const CodeModule);
+
         // Detach the raw-bit constant cache as well. No slice into VM-owned
         // storage may survive a re-entrant &mut VM call.
         let constants = if module_idx < self.jit_constants.len() {
@@ -3637,6 +3643,8 @@ impl VM {
             );
             if requires_vm_reentry {
                 crate::jit::runtime::set_jit_vm(self_ptr, module_idx);
+            } else if let Some(module_ptr) = module_ptr {
+                crate::jit::runtime::set_jit_string_module(module_ptr);
             }
         }
 
@@ -3651,6 +3659,9 @@ impl VM {
             // - JIT_VM is intentionally not installed on this path, so native
             //   helpers cannot create a reference to the parent VM that aliases
             //   this exclusive register borrow;
+            // - string-aware helpers use a separate immutable CodeModule
+            //   pointer, which is disjoint from `frames` and cannot move on
+            //   this non-reentrant path;
             // - execution is synchronous and the borrow ends on return.
             let regs = unsafe {
                 &mut *(&mut self.frames[frame_idx].regs as *mut [Value; 256]
@@ -3661,6 +3672,8 @@ impl VM {
 
         if requires_vm_reentry {
             crate::jit::runtime::clear_jit_vm();
+        } else {
+            crate::jit::runtime::clear_jit_string_module();
         }
         crate::jit::runtime::clear_jit_callbacks();
 
@@ -7115,6 +7128,54 @@ mod vm_tests {
             "JIT hot loop should match interpreter"
         );
         assert_eq!(hot_result.as_int(), Some(6), "sum 0..4 = 6");
+    }
+
+    /// String-aware scalar JIT helpers must retain constant-pool semantics on
+    /// the zero-copy register path. This loop tiers up after the hot threshold;
+    /// without the disjoint module context, compiled ICmpEq resolves both
+    /// interned strings as missing and the final value becomes false.
+    #[cfg(feature = "native-codegen")]
+    #[test]
+    fn test_jit_direct_frame_string_equality_keeps_module_context() {
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        use crate::typechecker::TypeChecker;
+
+        let source = r#"
+            var i = 0;
+            var equal = false;
+            while i < 2000 {
+                equal = "same" == "same";
+                i = i + 1;
+            };
+            equal
+        "#;
+
+        let mut type_checker = TypeChecker::new();
+        let tokens = Lexer::new(source).lex().expect("lex");
+        let ast = Parser::new(tokens).parse_module().expect("parse");
+        type_checker.check_module(&ast).expect("typecheck");
+        let hir = crate::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
+        let mut mir = crate::mir_lower::lower_module(&hir).expect("mir lower");
+        let module = crate::mir_codegen::compile_mir(&mut mir, "jit_string_context")
+            .expect("compile");
+
+        let mut vm = VM::new();
+        vm.load_module(module);
+        let result = vm.run().expect("run");
+        assert_eq!(
+            result.as_bool(),
+            Some(true),
+            "hot string equality must preserve interned-string resolution"
+        );
+        assert!(
+            vm.jit_session
+                .as_ref()
+                .map(|jit| jit.compiled_count())
+                .unwrap_or(0)
+                > 0,
+            "string equality loop must tier up for this regression to be meaningful"
+        );
     }
 
     /// Regression test: a hot loop whose body is long enough to JIT and whose
