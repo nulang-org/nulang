@@ -128,6 +128,93 @@ fn activation_epoch(rt: &Runtime, actor_id: u64) -> u64 {
     rt.respawn_opted.get(&actor_id).copied().unwrap_or(1)
 }
 
+fn resequence_workflow_event(event: WorkflowEvent, sequence: u64) -> WorkflowEvent {
+    match event {
+        WorkflowEvent::WorkflowStarted { name, state, .. } => {
+            WorkflowEvent::WorkflowStarted { sequence, name, state }
+        }
+        WorkflowEvent::StepCompleted { step_name, .. } => {
+            WorkflowEvent::StepCompleted { sequence, step_name }
+        }
+        WorkflowEvent::TimerSet {
+            name, duration_ms, ..
+        } => WorkflowEvent::TimerSet {
+            sequence,
+            name,
+            duration_ms,
+        },
+        WorkflowEvent::TimerFired { name, .. } => WorkflowEvent::TimerFired { sequence, name },
+        WorkflowEvent::SignalReceived { name, payload, .. } => {
+            WorkflowEvent::SignalReceived {
+                sequence,
+                name,
+                payload,
+            }
+        }
+        WorkflowEvent::SagaCompensated { step_name, .. } => {
+            WorkflowEvent::SagaCompensated { sequence, step_name }
+        }
+        WorkflowEvent::ParallelBranchCompleted {
+            parallel_step_name,
+            branch_name,
+            ..
+        } => WorkflowEvent::ParallelBranchCompleted {
+            sequence,
+            parallel_step_name,
+            branch_name,
+        },
+        WorkflowEvent::StepFailed {
+            step_name, error, ..
+        } => WorkflowEvent::StepFailed {
+            sequence,
+            step_name,
+            error,
+        },
+        WorkflowEvent::Custom { name, args, .. } => WorkflowEvent::Custom {
+            sequence,
+            name,
+            args,
+        },
+    }
+}
+
+fn stage_workflow_event(rt: &mut Runtime, actor_id: u64, event: WorkflowEvent) {
+    rt.pending_workflow_events
+        .entry(actor_id)
+        .or_default()
+        .push(event);
+}
+
+fn take_staged_workflow_events(
+    rt: &mut Runtime,
+    actor_id: u64,
+    sequence: u64,
+) -> (Vec<WorkflowEvent>, Vec<(String, u64)>) {
+    let events = rt
+        .pending_workflow_events
+        .remove(&actor_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|event| resequence_workflow_event(event, sequence))
+        .collect::<Vec<_>>();
+    let timers = events
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::TimerSet {
+                name, duration_ms, ..
+            } => Some((name.clone(), *duration_ms)),
+            _ => None,
+        })
+        .collect();
+    (events, timers)
+}
+
+fn arm_committed_timers(rt: &mut Runtime, actor_id: u64, timers: Vec<(String, u64)>) {
+    for (name, duration_ms) in timers {
+        rt.rearm_timer(actor_id, &name, duration_ms);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Checkpoint
 // ---------------------------------------------------------------------------
@@ -235,7 +322,7 @@ pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::
     // persistence operation must advance that same tail. A legacy snapshot
     // write here would create history that commit_transition cannot fence.
     if actor_is_workflow(rt, actor_id) {
-        return commit_workflow_transition(rt, actor_id, Vec::new(), true, true);
+        return commit_workflow_boundary(rt, actor_id, Vec::new(), true, true);
     }
 
     let sequence = next_sequence(rt, actor_id);
@@ -342,14 +429,46 @@ fn commit_workflow_transition(
     Ok(())
 }
 
+fn commit_workflow_boundary(
+    rt: &mut Runtime,
+    actor_id: u64,
+    terminal_events: Vec<WorkflowEvent>,
+    include_pending_command: bool,
+    include_snapshot: bool,
+) -> std::io::Result<()> {
+    let sequence = terminal_events
+        .first()
+        .map(WorkflowEvent::sequence)
+        .unwrap_or_else(|| next_sequence(rt, actor_id));
+    let (mut events, timers) = take_staged_workflow_events(rt, actor_id, sequence);
+    events.extend(
+        terminal_events
+            .into_iter()
+            .map(|event| resequence_workflow_event(event, sequence)),
+    );
+
+    let result = commit_workflow_transition(
+        rt,
+        actor_id,
+        events,
+        include_pending_command,
+        include_snapshot,
+    );
+    if result.is_ok() {
+        arm_committed_timers(rt, actor_id, timers);
+    }
+    result
+}
+
 /// Commit one workflow event and the actor state produced by the same logical
-/// turn as a single durable transition.
+/// turn as a single durable transition. Events emitted by the running VM turn
+/// are folded into the same transition.
 pub(crate) fn commit_workflow_event(
     rt: &mut Runtime,
     actor_id: u64,
     event: WorkflowEvent,
 ) -> std::io::Result<()> {
-    commit_workflow_transition(rt, actor_id, vec![event], true, true)
+    commit_workflow_boundary(rt, actor_id, vec![event], true, true)
 }
 
 /// Commit an externally-driven workflow event without attributing a suspended
@@ -382,6 +501,7 @@ pub(crate) fn commit_suspension_marker(rt: &mut Runtime, actor_id: u64) -> std::
 
     if snapshot.waiting_signal == waiting_signal
         && !rt.pending_workflow_commands.contains_key(&actor_id)
+        && !rt.pending_workflow_events.contains_key(&actor_id)
     {
         return Ok(());
     }
@@ -395,6 +515,7 @@ pub(crate) fn commit_suspension_marker(rt: &mut Runtime, actor_id: u64) -> std::
 
     let command = pending_command_at_sequence(rt, actor_id, sequence);
     let committed_pending_command = command.is_some();
+    let (workflow_events, timers) = take_staged_workflow_events(rt, actor_id, sequence);
     let transition = DurableTransition {
         version: DURABLE_TRANSITION_VERSION,
         actor_id,
@@ -403,7 +524,7 @@ pub(crate) fn commit_suspension_marker(rt: &mut Runtime, actor_id: u64) -> std::
         expected_previous_sequence,
         command,
         snapshot: Some(snapshot.clone()),
-        workflow_events: Vec::new(),
+        workflow_events,
         domain_events: Vec::new(),
         durable_effects: Vec::new(),
         outbox: Vec::new(),
@@ -417,6 +538,7 @@ pub(crate) fn commit_suspension_marker(rt: &mut Runtime, actor_id: u64) -> std::
     if committed_pending_command {
         rt.pending_workflow_commands.remove(&actor_id);
     }
+    arm_committed_timers(rt, actor_id, timers);
 
     // The persisted state is intentionally the pre-step baseline. Do not clear
     // dirty fields on the live actor: its in-memory continuation still owns
@@ -546,7 +668,9 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
             }
         };
 
-        if let Err(error) = commit_workflow_event(rt, actor_id, workflow_event) {
+        if rt.vm_execution_depth > 0 {
+            stage_workflow_event(rt, actor_id, workflow_event);
+        } else if let Err(error) = commit_workflow_event(rt, actor_id, workflow_event) {
             tracing::error!(
                 actor_id,
                 event,
@@ -714,6 +838,19 @@ pub(crate) fn schedule_workflow_timer(
     duration_ms: u64,
 ) {
     if actor_is_workflow(rt, actor_id) {
+        if rt.vm_execution_depth > 0 {
+            stage_workflow_event(
+                rt,
+                actor_id,
+                WorkflowEvent::TimerSet {
+                    sequence: next_sequence(rt, actor_id),
+                    name: name.to_string(),
+                    duration_ms,
+                },
+            );
+            return;
+        }
+
         match append_timer_set(rt, actor_id, name, duration_ms) {
             Ok(()) => rt.rearm_timer(actor_id, name, duration_ms),
             Err(error) => {
