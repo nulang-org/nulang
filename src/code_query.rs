@@ -61,16 +61,20 @@ fn query_err(msg: impl Into<String>) -> NuError {
 /// Supported commands:
 /// - `symbols <file> [--name <substring>] [--json]`
 /// - `symbol <name> <file> [--json]`
+/// - semantic queries: `type`, `references`, `callers`, `callees`
 pub fn run(args: &[String]) -> NuResult<()> {
     match args.first().map(String::as_str) {
         Some("symbols") => cmd_symbols(args.get(1..).unwrap_or(&[])),
         Some("symbol") => cmd_symbol(args.get(1..).unwrap_or(&[])),
+        Some("type" | "references" | "callers" | "callees") => {
+            crate::semantic_query::run(args)
+        },
         Some("help") | Some("-h") | Some("--help") | None => {
             print_help();
             Ok(())
         }
         Some(other) => Err(query_err(format!(
-            "unknown query subcommand '{other}'; try: symbols, symbol"
+            "unknown query subcommand '{other}'; try: symbols, symbol, type, references, callers, callees"
         ))),
     }
 }
@@ -80,7 +84,11 @@ fn print_help() {
         "nulang query — machine-readable source inspection\n\n\
          Usage:\n\
            nulang query symbols <file> [--name <substring>] [--json]\n\
-           nulang query symbol <name> <file> [--json]\n"
+           nulang query symbol <name> <file> [--json]\n\
+           nulang query type <name> <file> [--json]\n\
+           nulang query references <name> <file> [--json]\n\
+           nulang query callers <name> <file> [--json]\n\
+           nulang query callees <owner> <file> [--json]\n"
     );
 }
 
