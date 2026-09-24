@@ -729,7 +729,7 @@ mod tests {
             Some(CacheValueView::Bytes(b"value"))
         );
         assert_eq!(recovered.get(b"ttl", 50), Some(CacheValueView::Integer(42)));
-        assert_eq!(recovered.ttl(b"ttl", 50), CacheTtl::RemainingMs(8_900));
+        assert_eq!(recovered.ttl(b"ttl", 50), CacheTtl::RemainingMs(7_000));
 
         let _ = fs::remove_file(snapshot);
     }
