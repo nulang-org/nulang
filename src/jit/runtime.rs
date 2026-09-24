@@ -822,18 +822,14 @@ mod aot_helper_state_tests {
     fn nested_aot_helper_state_round_trip_restores_outer_context() {
         JIT_CALLBACKS.with(|cell| unsafe { *cell.get() = CbPair(11, 22) });
         AOT_CONSTANTS.with(|cell| {
-            *cell.borrow_mut() = Some(vec![crate::bytecode::Constant::String(
-                "outer".to_string(),
-            )]);
+            *cell.borrow_mut() = Some(vec![crate::bytecode::Constant::String("outer".to_string())]);
         });
 
         let saved = save_aot_helper_thread_state();
 
         JIT_CALLBACKS.with(|cell| unsafe { *cell.get() = CbPair(33, 44) });
         AOT_CONSTANTS.with(|cell| {
-            *cell.borrow_mut() = Some(vec![crate::bytecode::Constant::String(
-                "inner".to_string(),
-            )]);
+            *cell.borrow_mut() = Some(vec![crate::bytecode::Constant::String("inner".to_string())]);
         });
 
         restore_aot_helper_thread_state(saved);
