@@ -208,10 +208,7 @@ impl Parser {
         self.parse_module_with_options(true)
     }
 
-    fn parse_module_with_options(
-        &mut self,
-        preserve_top_level_lets: bool,
-    ) -> NuResult<AstModule> {
+    fn parse_module_with_options(&mut self, preserve_top_level_lets: bool) -> NuResult<AstModule> {
         self.diagnostics.clear();
         let mut decls = Vec::new();
         let mut pending_lets: Vec<Decl> = Vec::new();
