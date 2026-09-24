@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Backend-neutral logical reduction telemetry — 2026-09-23
+- **Interpreter and Cranelift execution now report one comparable logical bytecode-work counter** (`src/vm.rs`): interpreted instructions charge one unit and executed compiled regions charge their static bytecode length. This is telemetry only; actor scheduling/fairness remains unchanged until benchmark-derived budgets are established.
+- **Regression coverage pins both exact interpreter accounting and post-tier-up JIT accounting**, giving scheduler experiments a shared unit without conflating the existing message-turn budget, JIT safepoints, or Cloud Wasmtime fuel.
+
 ### Same-host actor optimization A/B gate — 2026-09-23
 - **Performance pull requests can now compare the candidate to their exact base SHA on the same runner and logical CPU** (`scripts/nulang_ab_bench.py`, `.github/workflows/nulang-ab-bench.yml`). Build work is excluded from timing, execution order alternates by round, and the JSON artifact records raw samples, medians, throughput/latency deltas, toolchains, and CPU affinity.
 - **Stacked performance work is measured incrementally by construction**, and Nulang-only probes cover the small-message payload boundary plus AOT actor dispatch without contaminating the cross-language baseline.
