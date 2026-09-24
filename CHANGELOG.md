@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Linear-time JIT module call analysis — 2026-09-24
+- **JIT direct-call safety now builds one lazily cached call graph per module** (`src/jit/mod.rs`). Suspension gating uses reverse reachability and recursion gating uses iterative SCC traversal, replacing duplicated bytecode rescans plus the former n×n reachability matrix/Floyd-Warshall pass.
+
+
 ### Consuming local-send ownership proof — 2026-09-24
 - **MIR now identifies fresh, single-definition heap-owning values whose sole use is a same-node actor send**, establishing a conservative proof surface for a later ORCA ownership handoff.
 - The analysis is intentionally metadata-only in this slice: it changes no bytecode, mailbox representation, reference count, or runtime behavior. Parameters, captures, handler bindings, multi-use values, and remote sends remain ineligible.
