@@ -92,7 +92,6 @@ pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::
     let semantic_id = actor.definition_semantic_id.map(|id| id.to_string());
     let snapshot = crate::runtime::persistence::ActorSnapshot {
         actor_id,
-        semantic_id: None,
         sequence: seq,
         semantic_id,
         state,
