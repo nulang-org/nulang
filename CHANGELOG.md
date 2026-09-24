@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### Agent-native source queries and repairable diagnostics — 2026-09-24
+- **Core tooling now exposes `nulang query symbols` and `nulang query symbol` without the optional AI runtime**, returning stable JSON declaration metadata including qualified names, source spans, signatures, effect/capability annotations, and visibility where available.
+- **JSON diagnostics now carry stable machine-oriented `kind` values, structured `data`, exact UTF-8 byte offsets, and `fixes`**, while preserving the existing error code/message/notes/suggestion surface. An unbound identifier with exactly one close in-scope candidate emits a `machine_applicable` replacement edit.
+- Integration tests pin the query schema and the diagnostic repair contract so coding agents can consume compiler output without scraping human prose.
+
 ### CI playground dependency and formatting repair — 2026-09-24
 - **Browser-playground compilation now includes the shared content-identity module and its pure-Rust `hex` dependency** (`crates/nulang-playground`), matching `semantic_identity.rs`'s current dependency graph. Runtime worker-pool files were also normalized to the repository's rustfmt output so the format gate reflects semantics rather than stale layout.
 
