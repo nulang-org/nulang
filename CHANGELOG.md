@@ -58,6 +58,9 @@ version + migration.*
 - **MIR now identifies fresh, single-definition heap-owning values whose sole use is a same-node actor send**, establishing a conservative proof surface for a later ORCA ownership handoff.
 - The analysis is intentionally metadata-only in this slice: it changes no bytecode, mailbox representation, reference count, or runtime behavior. Parameters, captures, handler bindings, multi-use values, and remote sends remain ineligible.
 
+### Bounded JIT register marshaling — 2026-09-24
+- **VM↔JIT transitions now reuse a detached boxed scratch register file and copy only the compiler-known active register prefix** (`src/vm.rs`). MIR function and behavior local-count metadata bound the common path; synthetic/legacy/ambiguous code remains conservative, and reserved direct-call register r254 is preserved explicitly. The scratch allocation is moved out of `VM` during native execution so the existing re-entrant ownership boundary remains intact.
+
 ### Durable external-effect crash-window release gate — 2026-09-23
 - **The deterministic crash-window matrix now exercises the real `DurableEffectCoordinator` over `MemoryStore` using compiler-owned semantic effect-site IDs**, covering intent-only recovery, provider-commit/receipt-loss deduplication, completed-receipt replay, request/specification drift, stale-owner completion fencing, explicit at-least-once duplication, and backend-defined delegation.
 - **The public durability guarantee boundary is documented explicitly** (`docs/DURABILITY_GUARANTEES.md`): Nulang does not claim arbitrary exactly-once external execution; effectively-once behavior requires a real provider/backend deduplication contract and the same stable operation identity across recovery.
