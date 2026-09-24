@@ -3667,6 +3667,71 @@ fn test_workflow_checkpoint_and_event_share_atomic_sequence_tail() {
 }
 
 #[test]
+fn test_workflow_command_joins_first_atomic_transition() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "CommandWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    workflow::begin_workflow_command(&mut rt, actor_id, 7, &[Value::int(42)]).unwrap();
+    rt.append_timer_set(actor_id, "deadline", 1000).unwrap();
+
+    let journal = rt.persistence.read_journal(actor_id);
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].sequence, 2);
+    assert_eq!(journal[0].behavior_id, 7);
+    assert!(matches!(
+        journal[0].payload.as_slice(),
+        [PersistedValue::Int(42)]
+    ));
+    assert!(!rt.pending_workflow_commands.contains_key(&actor_id));
+
+    // Later transitions in the same activation must not duplicate the command.
+    rt.append_timer_fired(actor_id, "deadline").unwrap();
+    assert_eq!(rt.persistence.read_journal(actor_id).len(), 1);
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 3);
+}
+
+#[test]
+fn test_workflow_commit_failure_discards_unrecoverable_activation() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "FailClosedWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+    assert!(rt.actors.contains_key(&actor_id));
+
+    // JsonFileStore intentionally does not implement RFC 0022 atomic
+    // transitions. Swap it in after creation to inject an Unsupported commit
+    // at signal delivery without weakening the contract through a fallback.
+    let path = std::env::temp_dir().join(format!(
+        "nulang-workflow-fail-closed-{}-{}",
+        std::process::id(),
+        actor_id
+    ));
+    let _ = std::fs::remove_dir_all(&path);
+    rt.persistence = Box::new(JsonFileStore::new(&path).unwrap());
+
+    rt.signal_workflow(actor_id, "resume", None);
+
+    assert!(
+        !rt.actors.contains_key(&actor_id),
+        "a workflow whose durable commit failed must not continue with mutated in-memory state"
+    );
+    assert!(!rt.workflow_commit_failures.contains(&actor_id));
+    assert!(!rt.pending_workflow_commands.contains_key(&actor_id));
+
+    let _ = std::fs::remove_dir_all(path);
+}
+
+#[test]
 fn test_workflow_recovery_handles_new_event_variants() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
