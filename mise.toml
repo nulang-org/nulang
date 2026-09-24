@@ -8,7 +8,7 @@ idiomatic_version_file_enable_tools = ["rust"]
 [tools]
 # Shared Cargo action cache + scheduler across linked worktrees and parallel
 # coding agents. Cargo remains the command developers invoke.
-mr-boxington = "latest"
+mr-boxington = "1.12.0"
 
 [wrappers.cargo]
 command = "mbx"
