@@ -762,6 +762,7 @@ mod tests {
             payload: MessagePayload::from_slice(&[Value::int(42)]),
             sender: 99,
             priority: MessagePriority::Normal,
+            ownership_handoff_mask: 0,
             trace_id: None,
         };
         assert!(actor.send(msg.clone()).is_ok());

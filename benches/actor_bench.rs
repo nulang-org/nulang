@@ -179,6 +179,7 @@ fn selective_receive_mailbox(depth: usize, hit_behavior: u16) -> Mailbox {
                 payload: MessagePayload::from_slice(&[Value::int(1)]),
                 sender: 0,
                 priority: MessagePriority::Normal,
+                ownership_handoff_mask: 0,
                 trace_id: None,
             })
             .unwrap();
@@ -189,6 +190,7 @@ fn selective_receive_mailbox(depth: usize, hit_behavior: u16) -> Mailbox {
             payload: MessagePayload::from_slice(&[Value::int(42)]),
             sender: 0,
             priority: MessagePriority::Normal,
+            ownership_handoff_mask: 0,
             trace_id: None,
         })
         .unwrap();
@@ -242,6 +244,7 @@ fn bench_selective_receive(c: &mut Criterion) {
                             payload: MessagePayload::from_slice(&[Value::int(sender as i64)]),
                             sender,
                             priority: MessagePriority::Normal,
+                            ownership_handoff_mask: 0,
                             trace_id: None,
                         })
                         .unwrap();

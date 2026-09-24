@@ -601,6 +601,7 @@ impl AddressResolver {
                     payload: MessagePayload::from_vec(payload),
                     sender: sender_actor,
                     priority,
+                    ownership_handoff_mask: 0,
                     trace_id,
                 };
                 Some((

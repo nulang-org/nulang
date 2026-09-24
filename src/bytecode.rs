@@ -681,6 +681,19 @@ pub struct EffectSiteMetadata {
     pub effect_operation: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendOwnershipSource {
+    Register(u8),
+    Spill(u16),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendOwnershipSite {
+    pub pc: usize,
+    pub candidate_mask: u16,
+    pub sources: Vec<(u8, SendOwnershipSource)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodeModule {
     pub name: String,
@@ -738,6 +751,13 @@ pub struct CodeModule {
     /// change.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effect_sites: Vec<EffectSiteMetadata>,
+    /// Runtime-only ownership proofs for compiler-generated local sends.
+    ///
+    /// This is intentionally excluded from frozen NBC v1 serialization:
+    /// older artifacts remain compatible and simply use the conservative
+    /// send protocol.
+    #[serde(skip)]
+    pub send_ownership_sites: Vec<SendOwnershipSite>,
 }
 
 impl CodeModule {
@@ -762,7 +782,13 @@ impl CodeModule {
             debug_functions: Vec::new(),
             export_table: Vec::new(),
             effect_sites: Vec::new(),
+            send_ownership_sites: Vec::new(),
         }
+    }
+
+    #[inline]
+    pub fn send_ownership_site(&self, pc: usize) -> Option<&SendOwnershipSite> {
+        self.send_ownership_sites.iter().find(|site| site.pc == pc)
     }
 
     pub fn add_actor_meta(&mut self, meta: ActorMeta) -> usize {
