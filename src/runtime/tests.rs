@@ -3543,6 +3543,64 @@ fn test_workflow_atomic_transition_rolls_back_everything_on_rejected_commit() {
 }
 
 #[test]
+fn test_workflow_recovery_replays_same_sequence_inputs_for_suspended_transition() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "MultiSignalWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    assert!(
+        super::workflow::begin_workflow_transition(&mut rt, actor_id, None).unwrap()
+    );
+    super::workflow::append_signal_received(
+        &mut rt,
+        actor_id,
+        "first",
+        Some("payload".to_string()),
+    )
+    .unwrap();
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor
+            .received_signals
+            .push(("first".to_string(), Some("payload".to_string())));
+        actor.waiting_signal = Some("second".to_string());
+    }
+
+    super::workflow::commit_workflow_transition(&mut rt, actor_id, true).unwrap();
+    let suspended_sequence = rt.persistence.load_snapshot(actor_id).unwrap().sequence;
+
+    // Simulate a process restart. The snapshot deliberately contains the
+    // pre-step state, so the SignalReceived event at the SAME atomic sequence
+    // must be replayed to reconstruct deterministic step inputs.
+    rt.actors.remove(&actor_id);
+    rt.recover_actor(actor_id).unwrap();
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(actor.waiting_signal.as_deref(), Some("second"));
+    assert!(
+        actor
+            .received_signals
+            .iter()
+            .any(|(name, payload)| name == "first" && payload.as_deref() == Some("payload"))
+    );
+    assert!(
+        rt.persistence
+            .read_workflow_events(actor_id)
+            .iter()
+            .any(|event| matches!(
+                event,
+                WorkflowEvent::SignalReceived { sequence, name, .. }
+                    if *sequence == suspended_sequence && name == "first"
+            ))
+    );
+}
+
+#[test]
 fn test_workflow_actor_recovery_replays_step_index() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
