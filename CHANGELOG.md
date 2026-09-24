@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### MIR aggregate escape-analysis substrate — 2026-09-24
+- **A conservative, analysis-only MIR pass now classifies aggregate allocation escape behavior** (`src/mir_escape.rs`) across returns, calls, closures, effects, FFI, actor boundaries, state/events, aliases, mutation, and nested aggregates. It also exposes the narrower immutable tuple/record projection-only candidate set needed for later scalar replacement. This slice changes no generated code or runtime semantics.
+
+
 ### Consuming local-send ownership proof — 2026-09-24
 - **MIR now identifies fresh, single-definition heap-owning values whose sole use is a same-node actor send**, establishing a conservative proof surface for a later ORCA ownership handoff.
 - The analysis is intentionally metadata-only in this slice: it changes no bytecode, mailbox representation, reference count, or runtime behavior. Parameters, captures, handler bindings, multi-use values, and remote sends remain ineligible.
