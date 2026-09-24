@@ -1639,6 +1639,65 @@ fn test_tier2_replaces_baseline_with_typed_code() {
 ///
 /// Regression test for commit fcdca62 (op3→op2 in the ArrLen handler).
 #[test]
+fn test_tier2_replaces_typed_region_with_simd_code() {
+    if !crate::jit::simd_compiler::is_simd_supported() {
+        return;
+    }
+
+    let mut module = CodeModule::new("tier2_simd_replace");
+    // R0/R1/R2 are source/source/destination arrays, R3 is the induction
+    // variable, and R7 carries a runtime trip count from ArrLen.
+    module.emit(Instruction::new2(OpCode::ArrLen, 0, 7));
+    module.emit(Instruction::new3(OpCode::ArrLoad, 0, 3, 4));
+    module.emit(Instruction::new3(OpCode::ArrLoad, 1, 3, 5));
+    module.emit(Instruction::new3(OpCode::IAdd, 4, 5, 6));
+    module.emit(Instruction::new3(OpCode::ArrStore, 2, 3, 6));
+    module.emit(Instruction::new1(OpCode::IInc, 3));
+    module.emit(Instruction::new3(OpCode::ICmpLt, 3, 7, 8));
+    let back: i16 = -6; // pc7 -> pc1
+    module.emit(Instruction::new3(
+        OpCode::JmpT,
+        8,
+        ((back as u16) >> 8) as u8,
+        (back as u16 & 0xFF) as u8,
+    ));
+    module.entry_point = Some(0);
+
+    let mut jit = make_jit();
+    let old_ptr = std::ptr::NonNull::<u8>::dangling().as_ptr() as *const u8;
+    jit.store_compiled_with_metadata(
+        0,
+        0,
+        old_ptr,
+        module.instructions.len(),
+        CompilationTier::Typed,
+        0,
+    );
+    jit.typed_regions.insert((0, 0));
+
+    for _ in 0..TIER2_THRESHOLD {
+        jit.record_tier2_and_maybe_promote(0, 0, &module);
+    }
+
+    let after = jit.compiled_entry(0, 0).expect("SIMD-promoted cache entry");
+    assert_eq!(
+        after.tier,
+        CompilationTier::Simd,
+        "typed vectorizable region should promote to SIMD"
+    );
+    assert_ne!(
+        after.ptr, old_ptr,
+        "SIMD promotion must replace the installed function pointer"
+    );
+    assert_eq!(
+        jit.compiled_count(),
+        1,
+        "SIMD replacement must reuse the existing cache slot"
+    );
+}
+
+
+#[test]
 fn test_arrlen_scalar_register_destination() {
     use crate::vm::VM;
 
