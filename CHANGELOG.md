@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### CI playground dependency and formatting repair — 2026-09-24
+- **Browser-playground compilation now includes the shared content-identity module and its pure-Rust `hex` dependency** (`crates/nulang-playground`), matching `semantic_identity.rs`'s current dependency graph. Runtime worker-pool files were also normalized to the repository's rustfmt output so the format gate reflects semantics rather than stale layout.
+
+
 ### Python bool marshal type inference — 2026-09-24
 - **Default-feature builds now make PyO3 boolean extraction explicit with `extract::<bool>()`**, avoiding a compiler inference failure in the Python marshal path without changing conversion semantics.
 
