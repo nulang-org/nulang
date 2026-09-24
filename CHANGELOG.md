@@ -52,7 +52,7 @@ version + migration.*
 ## Stable tier
 
 ### Durable external-effect crash-window release gate — 2026-09-23
-- **The deterministic crash-window matrix now exercises the real `DurableEffectCoordinator` over `MemoryStore` using compiler-owned semantic effect-site IDs**, covering intent-only recovery, provider-commit/receipt-loss deduplication, completed-receipt replay, request/specification drift, explicit at-least-once duplication, and backend-defined delegation.
+- **The deterministic crash-window matrix now exercises the real `DurableEffectCoordinator` over `MemoryStore` using compiler-owned semantic effect-site IDs**, covering intent-only recovery, provider-commit/receipt-loss deduplication, completed-receipt replay, request/specification drift, stale-owner completion fencing, explicit at-least-once duplication, and backend-defined delegation.
 - **The public durability guarantee boundary is documented explicitly** (`docs/DURABILITY_GUARANTEES.md`): Nulang does not claim arbitrary exactly-once external execution; effectively-once behavior requires a real provider/backend deduplication contract and the same stable operation identity across recovery.
 - **`scripts/test-durability-guarantees.sh` is now a focused minimal-feature release gate** spanning semantic-site artifact propagation, persistence recovery, the crash matrix, and lower-level durable-effect unit contracts.
 
