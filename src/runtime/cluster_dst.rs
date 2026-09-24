@@ -30,6 +30,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::dst::DeterministicRng;
 use crate::runtime::network::DeterministicNetworkTransport;
 use crate::runtime::{ActorAddress, NodeId, Runtime};
@@ -49,7 +51,7 @@ const STEPS_BUDGET: u64 = 100_000;
 /// Keeping faults as data rather than ad-hoc test control flow makes a failing
 /// run reproducible from a compact seed + fault script, mirroring the
 /// FoundationDB simulation approach.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ClusterFault {
     Partition { from: usize, to: usize },
     Heal { node: usize },
@@ -61,7 +63,7 @@ pub(crate) enum ClusterFault {
 /// One fault scheduled for the beginning of a simulation round.
 ///
 /// Round zero is the first call to `step_round`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ScheduledFault {
     pub round: u64,
     pub fault: ClusterFault,
@@ -72,7 +74,7 @@ pub(crate) struct ScheduledFault {
 /// The trace intentionally records *decisions* rather than every packet so a
 /// failing run is cheap to persist while still capturing the seeded execution
 /// order and every injected fault.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ClusterTraceEvent {
     FaultScheduled { round: u64, fault: ClusterFault },
     FaultApplied { round: u64, fault: ClusterFault },
@@ -1334,6 +1336,10 @@ mod foundationdb_trace_tests {
             event,
             ClusterTraceEvent::RoundOrder { round: 0, .. }
         )));
+        let encoded = serde_json::to_vec(second.trace()).unwrap();
+        let decoded: Vec<ClusterTraceEvent> = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, second.trace());
+
         first.clear_trace();
         assert!(first.trace().is_empty());
     }
