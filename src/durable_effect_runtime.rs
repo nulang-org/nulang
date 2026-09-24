@@ -196,6 +196,7 @@ impl<'a> DurableEffectCoordinator<'a> {
             domain_events: Vec::new(),
             durable_effects: vec![record],
             outbox: Vec::new(),
+            inbox: Vec::new(),
         };
         Ok(self.store.commit_transition(transition)?)
     }
