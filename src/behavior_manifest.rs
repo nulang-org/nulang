@@ -387,6 +387,10 @@ impl BehaviorManifest {
     fn normalize(&mut self) {
         self.artifact.flags.sort();
         self.artifact.flags.dedup();
+        self.effects
+            .host_operations
+            .sort_by(|left, right| left.canonical_id.cmp(&right.canonical_id));
+        self.effects.unclassified_operations.sort();
         self.actors
             .sort_by(|left, right| left.name.cmp(&right.name));
         for actor in &mut self.actors {
@@ -443,6 +447,72 @@ impl BehaviorManifest {
             });
         }
 
+        match self.effects.coverage {
+            BehaviorEffectCoverage::NotEmitted
+                if !self.effects.host_operations.is_empty()
+                    || !self.effects.unclassified_operations.is_empty() =>
+            {
+                return Err(BehaviorManifestError::InvalidEffectInventory(
+                    "coverage is not-emitted but effect entries are present".to_string(),
+                ));
+            }
+            BehaviorEffectCoverage::NotEmitted | BehaviorEffectCoverage::TypedHirPerformSites => {}
+        }
+
+        let mut host_ids = BTreeSet::new();
+        for operation in &self.effects.host_operations {
+            if !host_ids.insert(operation.canonical_id.clone()) {
+                return Err(BehaviorManifestError::InvalidEffectInventory(format!(
+                    "duplicate canonical host operation '{}'",
+                    operation.canonical_id
+                )));
+            }
+            let descriptor = lookup_host_operation_by_canonical_id(&operation.canonical_id)
+                .ok_or_else(|| {
+                    BehaviorManifestError::InvalidEffectInventory(format!(
+                        "unknown canonical host operation '{}'",
+                        operation.canonical_id
+                    ))
+                })?;
+            if operation.replay != descriptor.replay.manifest_class() {
+                return Err(BehaviorManifestError::InvalidEffectInventory(format!(
+                    "host operation '{}' replay class '{}' does not match compiler contract '{}'",
+                    operation.canonical_id,
+                    operation.replay,
+                    descriptor.replay.manifest_class()
+                )));
+            }
+            let (expected_kind, expected_effect) = match descriptor.authority {
+                HostAuthorityRequirement::CheckedEffectRow(effect) => {
+                    ("checked-effect-row", effect)
+                }
+            };
+            if operation.authority_requirement.kind != expected_kind
+                || operation.authority_requirement.effect != expected_effect
+            {
+                return Err(BehaviorManifestError::InvalidEffectInventory(format!(
+                    "host operation '{}' authority requirement does not match compiler contract",
+                    operation.canonical_id
+                )));
+            }
+        }
+
+        let mut unclassified = BTreeSet::new();
+        for operation in &self.effects.unclassified_operations {
+            if !unclassified.insert((operation.effect.clone(), operation.operation.clone())) {
+                return Err(BehaviorManifestError::InvalidEffectInventory(format!(
+                    "duplicate unclassified effect operation '{}.{}'",
+                    operation.effect, operation.operation
+                )));
+            }
+            if lookup_host_operation(&operation.effect, &operation.operation).is_some() {
+                return Err(BehaviorManifestError::InvalidEffectInventory(format!(
+                    "compiler-known host operation '{}.{}' must be emitted as a canonical host operation",
+                    operation.effect, operation.operation
+                )));
+            }
+        }
+
         let mut actor_names = BTreeSet::new();
         for actor in &self.actors {
             if !actor_names.insert(actor.name.clone()) {
@@ -458,6 +528,9 @@ impl BehaviorManifest {
                 "actors[].state_schema_semantic_id",
                 &actor.state_schema_semantic_id,
             )?;
+            if let Some(protocol_id) = &actor.protocol_id {
+                parse_identity::<ProtocolId>("actors[].protocol_id", protocol_id)?;
+            }
 
             let mut origins = BTreeSet::new();
             for step in &actor.migrations {
