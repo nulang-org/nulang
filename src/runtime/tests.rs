@@ -7370,7 +7370,6 @@ fn p0_cross_shard_named_send_resolves_only_on_owner() {
     );
 }
 
-
 fn workflow_broken_json_store() -> (JsonFileStore, std::path::PathBuf) {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
