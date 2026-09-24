@@ -7,11 +7,16 @@
 //! into a deterministic placement plan that can be persisted, validated, fenced,
 //! and then committed by a higher-level reconciler.
 
+pub mod executor;
 pub mod model;
 pub mod reconciler;
 pub mod scheduler;
 pub mod store;
 
+pub use executor::{
+    dispatch_pending, AllocationCommandSink, CommandApplyError, DispatchOutcome, DispatchRecord,
+    DispatchReport,
+};
 pub use model::*;
 pub use reconciler::{reconcile_once, ReconcileError, ReconcileResult};
 pub use scheduler::plan_evaluation;
