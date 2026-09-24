@@ -9,7 +9,7 @@ use crate::bytecode::Constant;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{
-    ActorSnapshot, DurableTransition, EventEntry, PersistedValue, WorkflowEvent,
+    ActorSnapshot, DurableTransition, EventEntry, JournalEntry, PersistedValue, WorkflowEvent,
     DURABLE_TRANSITION_VERSION,
 };
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
@@ -28,6 +28,76 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
         .get(&actor_id)
         .map(|a| matches!(a.role(), Ok(ActorRole::Workflow)))
         .unwrap_or(false)
+}
+
+/// The command currently driving a workflow activation.
+///
+/// The command is held only until the first durable transition produced by
+/// that activation. It is then persisted in DurableTransition::command with
+/// the same sequence as the state/event commit. This closes the historical
+/// window where the runtime consumed a mailbox message before any durable
+/// record established which command caused the resulting workflow state.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingWorkflowCommand {
+    pub behavior_id: u16,
+    pub payload: Vec<PersistedValue>,
+}
+
+/// Stage the mailbox command that is about to execute a workflow behavior.
+///
+/// A suspended workflow owns its activation until it resumes, so a second
+/// command must never replace an uncommitted trigger.
+pub(crate) fn begin_workflow_command(
+    rt: &mut Runtime,
+    actor_id: u64,
+    behavior_id: u16,
+    payload: &[Value],
+) -> std::io::Result<()> {
+    if !actor_is_workflow(rt, actor_id) {
+        return Ok(());
+    }
+    if rt.pending_workflow_commands.contains_key(&actor_id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "workflow activation already has an uncommitted driving command",
+        ));
+    }
+
+    let module = rt
+        .actors
+        .get(&actor_id)
+        .and_then(|actor| actor.bytecode_module.as_ref());
+    let persisted_payload = payload
+        .iter()
+        .map(|value| PersistedValue::from_value_resolved(value, module))
+        .collect();
+
+    rt.pending_workflow_commands.insert(
+        actor_id,
+        PendingWorkflowCommand {
+            behavior_id,
+            payload: persisted_payload,
+        },
+    );
+    Ok(())
+}
+
+fn pending_command_at_sequence(
+    rt: &Runtime,
+    actor_id: u64,
+    sequence: u64,
+) -> Option<JournalEntry> {
+    rt.pending_workflow_commands
+        .get(&actor_id)
+        .map(|pending| JournalEntry {
+            sequence,
+            behavior_id: pending.behavior_id,
+            payload: pending.payload.clone(),
+        })
+}
+
+fn mark_workflow_commit_failure(rt: &mut Runtime, actor_id: u64) {
+    rt.workflow_commit_failures.insert(actor_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -171,31 +241,42 @@ fn commit_workflow_transition(
         .checked_add(1)
         .ok_or_else(|| std::io::Error::other("durable workflow sequence overflow"))?;
     if sequence != expected_sequence {
-        return Err(std::io::Error::new(
+        let error = std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "workflow transition sequence {sequence} does not follow durable tail {expected_previous_sequence}"
             ),
-        ));
+        );
+        mark_workflow_commit_failure(rt, actor_id);
+        return Err(error);
     }
     if workflow_events
         .iter()
         .any(|event| event.sequence() != sequence)
     {
-        return Err(std::io::Error::new(
+        let error = std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "all workflow events in one durable transition must share a sequence",
-        ));
+        );
+        mark_workflow_commit_failure(rt, actor_id);
+        return Err(error);
     }
 
-    let snapshot = build_actor_snapshot(rt, actor_id, sequence)?;
+    let snapshot = match build_actor_snapshot(rt, actor_id, sequence) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            mark_workflow_commit_failure(rt, actor_id);
+            return Err(error);
+        }
+    };
+    let command = pending_command_at_sequence(rt, actor_id, sequence);
     let transition = DurableTransition {
         version: DURABLE_TRANSITION_VERSION,
         actor_id,
         activation_epoch: 1,
         sequence,
         expected_previous_sequence,
-        command: None,
+        command,
         snapshot: snapshot.clone(),
         workflow_events,
         domain_events: Vec::new(),
@@ -203,7 +284,16 @@ fn commit_workflow_transition(
         outbox: Vec::new(),
     };
 
-    rt.persistence.commit_transition(transition)?;
+    if let Err(error) = rt.persistence.commit_transition(transition) {
+        mark_workflow_commit_failure(rt, actor_id);
+        return Err(error);
+    }
+
+    // The command is no longer merely in-flight once the durable transition
+    // that it caused has committed.
+    rt.pending_workflow_commands.remove(&actor_id);
+    rt.workflow_commit_failures.remove(&actor_id);
+
     if let Some(snapshot) = snapshot.as_ref() {
         publish_committed_snapshot(rt, actor_id, snapshot);
     } else if let Some(actor) = rt.actors.get_mut(&actor_id) {
@@ -507,9 +597,20 @@ pub(crate) fn schedule_workflow_timer(
     duration_ms: u64,
 ) {
     if actor_is_workflow(rt, actor_id) {
-        let _ = append_timer_set(rt, actor_id, name, duration_ms);
+        match append_timer_set(rt, actor_id, name, duration_ms) {
+            Ok(()) => rt.rearm_timer(actor_id, name, duration_ms),
+            Err(error) => {
+                tracing::error!(
+                    actor_id,
+                    timer = name,
+                    %error,
+                    "nulang-workflow: refusing to arm timer after durable TimerSet commit failure"
+                );
+            }
+        }
+    } else {
+        rt.rearm_timer(actor_id, name, duration_ms);
     }
-    rt.rearm_timer(actor_id, name, duration_ms);
 }
 
 // ---------------------------------------------------------------------------
