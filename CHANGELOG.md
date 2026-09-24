@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Owned-payload actor A/B probe — 2026-09-24
+- **The same-runner actor A/B suite now includes a workload that directly exercises consuming local-send ownership:** each producer turn allocates a fresh array, immediately sends it to a distinct same-shard actor, and verifies receiver delivery. The probe reports one operation per eligible fresh-payload transfer, making ownership-handoff optimizations measurable instead of inferring their value from integer-only actor workloads.
+
 ### CI playground dependency and formatting repair — 2026-09-24
 - **Browser-playground compilation now includes the shared content-identity module and its pure-Rust `hex` dependency** (`crates/nulang-playground`), matching `semantic_identity.rs`'s current dependency graph. Runtime worker-pool files were also normalized to the repository's rustfmt output so the format gate reflects semantics rather than stale layout.
 
