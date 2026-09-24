@@ -61,9 +61,8 @@ pub fn run(args: &[String]) -> NuResult<()> {
             "automatic fixes require --safe; only machine-applicable compiler edits are supported",
         ));
     }
-    let file = file.ok_or_else(|| {
-        fix_error("usage: nulang fix --safe [--dry-run] [--json] <file>")
-    })?;
+    let file =
+        file.ok_or_else(|| fix_error("usage: nulang fix --safe [--dry-run] [--json] <file>"))?;
     let report = fix_file(Path::new(file), dry_run)?;
 
     if json {
