@@ -1597,9 +1597,7 @@ fn float_locals(func: &mir::Function) -> Vec<bool> {
                 };
                 let result = match op {
                     mir::RValue::Const(Constant::Float(_)) => true,
-                    mir::RValue::Load(src) | mir::RValue::MoveOut(src) => {
-                        is_float[src.0 as usize]
-                    }
+                    mir::RValue::Load(src) | mir::RValue::MoveOut(src) => is_float[src.0 as usize],
                     mir::RValue::Unary(crate::ast::UnOp::Neg, src) => is_float[src.0 as usize],
                     mir::RValue::Binary(op, l, r)
                         if matches!(
@@ -2607,8 +2605,7 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
                         transfer_sources[d].push(s);
                         transfer_edges.push((d, s));
                     }
-                    _ if rvalue_is_owning(op)
-                        && !rvalue_uses(op).iter().any(|(u, _)| *u == d) => {}
+                    _ if rvalue_is_owning(op) && !rvalue_uses(op).iter().any(|(u, _)| *u == d) => {}
                     _ => {
                         // Ordinary Load/call/field access/etc. does not prove
                         // a unique counted owner for the destination.
