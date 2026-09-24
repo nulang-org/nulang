@@ -2046,6 +2046,104 @@ fn collect_rvalue_field_and_consts(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug)]
+    struct EffectCaptureCallbacks {
+        seen: Arc<Mutex<Vec<crate::vm::EffectInvocationContext>>>,
+    }
+
+    impl crate::vm::ActorVmCallbacks for EffectCaptureCallbacks {
+        fn alloc(
+            &mut self,
+            _size: usize,
+            _type_tag: crate::runtime::heap::TypeTag,
+        ) -> Option<*mut u8> {
+            None
+        }
+
+        fn drop_ref(&mut self, _ptr: *mut u8) {}
+
+        fn retain_ref(&mut self, _ptr: *mut u8) {}
+
+        fn array_len(&self, _ptr: *mut u8) -> Option<usize> {
+            None
+        }
+
+        fn spawn_actor(
+            &mut self,
+            _module: &crate::bytecode::CodeModule,
+            _spawn_pc: usize,
+            _behavior_idx: usize,
+            _init: Vec<(String, crate::vm::Value)>,
+        ) -> crate::vm::Value {
+            crate::vm::Value::nil()
+        }
+
+        fn send_message(
+            &mut self,
+            _target: crate::vm::Value,
+            _behavior_id: u16,
+            _args: &[crate::vm::Value],
+        ) {
+        }
+
+        fn perform_builtin_effect_at_site(
+            &mut self,
+            context: crate::vm::EffectInvocationContext,
+            _effect_name: &str,
+            _op_name: Option<&str>,
+            _module: &crate::bytecode::CodeModule,
+            _regs: &[crate::vm::Value],
+        ) -> Option<crate::vm::Value> {
+            self.seen.lock().unwrap().push(context);
+            Some(crate::vm::Value::unit())
+        }
+    }
+
+    #[test]
+    fn native_effect_helpers_preserve_distinct_semantic_sites() {
+        let source = r#"
+            fn main() {
+                perform IO.print("first")
+                perform IO.print("second")
+            }
+        "#;
+        let tokens = crate::lexer::Lexer::new(source).lex().unwrap();
+        let ast = crate::parser::Parser::new(tokens).parse_module().unwrap();
+        let mut tc = crate::typechecker::TypeChecker::new();
+        tc.check_module(&ast).unwrap();
+        let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+        let mir = crate::mir_lower::lower_module(&hir).unwrap();
+        let aot = super::AotModule::compile(&mir).expect("AOT compile");
+
+        assert_eq!(aot.effect_site_ids.len(), 2);
+        assert_ne!(aot.effect_site_ids[0], aot.effect_site_ids[1]);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut callbacks = EffectCaptureCallbacks { seen: seen.clone() };
+        unsafe {
+            crate::jit::runtime::aot_set_constants(&aot.constants);
+            crate::jit::runtime::set_jit_callbacks(&mut callbacks);
+        }
+        super::set_aot_module_ctx(&aot);
+
+        let ptr = aot.compiled_funcs[aot.entry_idx.expect("main entry")];
+        let func: extern "C" fn() -> u64 = unsafe { std::mem::transmute(ptr) };
+        let _ = func();
+
+        crate::jit::runtime::clear_jit_callbacks();
+        crate::jit::runtime::aot_clear_constants();
+        super::clear_aot_module_ctx();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].artifact_pc, None);
+        assert_eq!(seen[1].artifact_pc, None);
+        assert_eq!(seen[0].semantic_site_id, Some(aot.effect_site_ids[0]));
+        assert_eq!(seen[1].semantic_site_id, Some(aot.effect_site_ids[1]));
+    }
+
     /// End-to-end: `"hello" + 2 + 3` must concatenate with coercion ("hello23"),
     /// not fall through to integer arithmetic on the string's tag bits. Replicates
     /// `AotModule::run`'s heap + constants setup but keeps the heap alive so the
