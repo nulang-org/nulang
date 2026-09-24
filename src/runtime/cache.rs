@@ -847,11 +847,7 @@ impl CacheStore {
 
     fn maybe_compact_eviction_queues(&mut self) {
         let queued = self.eviction.small.len().saturating_add(self.eviction.main.len());
-        let threshold = self
-            .config
-            .max_entries
-            .saturating_mul(4)
-            .saturating_add(64);
+        let threshold = self.index_len.max(64).saturating_mul(4).saturating_add(64);
         if queued <= threshold {
             return;
         }
