@@ -1367,6 +1367,7 @@ impl Runtime {
                             payload: MessagePayload::from_slice(&[]),
                             sender,
                             priority: MessagePriority::System,
+                            ownership_handoff_mask: 0,
                             trace_id: None,
                         },
                         "grain hydration failed (cross-shard)",
@@ -1381,6 +1382,7 @@ impl Runtime {
             payload: MessagePayload::from_vec(payload),
             sender,
             priority: MessagePriority::Normal,
+            ownership_handoff_mask: 0,
             trace_id: trace_id.clone(),
         };
         if let Some(actor) = self.actors.get_mut(&target_id) {
@@ -1391,6 +1393,7 @@ impl Runtime {
                         payload: MessagePayload::from_slice(&[]),
                         sender,
                         priority: MessagePriority::System,
+                        ownership_handoff_mask: 0,
                         trace_id: None,
                     },
                     "mailbox full (cross-shard)",
@@ -1403,6 +1406,7 @@ impl Runtime {
                     payload: MessagePayload::from_slice(&[]),
                     sender,
                     priority: MessagePriority::System,
+                    ownership_handoff_mask: 0,
                     trace_id: None,
                 },
                 "target actor not found (cross-shard)",
