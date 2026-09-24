@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Normalized HIR semantic boundary — 2026-09-24
+- **HIR now contains executable/typed semantic declarations rather than placeholder variants for source-only or compile-time-only forms.** Agent and workflow syntax still lower to actors; database, signal, given, class, and named-handler metadata are filtered before HIR, including inside nested modules; CRDT schemas continue to lower to their existing runtime-neutral constant representation.
+- MIR no longer carries unreachable agent/workflow/database/CRDT declaration branches, reducing downstream semantic states without changing source syntax or runtime formats.
+
 ### Orthogonal actor semantic normalization — 2026-09-24
 - **Runtime semantic decisions now consume an additive `ActorSemantics` view instead of treating agent/workflow/organization/virtual flags as one mutually-exclusive role.** Surface origin, persistence, and activation are normalized independently; virtual activation can compose with workflow/agent/organization provenance.
 - **The strict legacy `ActorRole` decoder and raw metadata booleans remain for persisted/wire compatibility only.** No source syntax, bytecode format, persistence format, authority enforcement, or RFC 0024 execution-domain semantics change in this slice.

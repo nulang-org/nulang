@@ -18,6 +18,17 @@ use crate::tool_schema::{function_to_tool_schema, ToolSchema};
 use crate::types::{Capability, EffectRow, Span, Type, TypeVar};
 use rustc_hash::FxHashMap;
 
+fn emits_hir_decl(decl: &Decl) -> bool {
+    !matches!(
+        decl,
+        Decl::NamedHandler { .. }
+            | Decl::Class { .. }
+            | Decl::Database { .. }
+            | Decl::Signal { .. }
+            | Decl::Given { .. }
+    )
+}
+
 pub fn lower_module(
     ast: &ast::AstModule,
     inferred_decl_types: &FxHashMap<String, Type>,
@@ -75,10 +86,9 @@ pub fn lower_module(
     });
 
     for decl in &ast.decls {
-        if matches!(decl, Decl::NamedHandler { .. } | Decl::Class { .. }) {
-            continue;
+        if emits_hir_decl(decl) {
+            module.decls.push(lower_decl(decl, &tools));
         }
-        module.decls.push(lower_decl(decl, &tools));
     }
 
     CURRENT_CLASS_TABLES.with(|cell| {
@@ -409,7 +419,11 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
         } => hir::Decl::Module {
             name: name.clone(),
             exports: exports.clone(),
-            decls: decls.iter().map(|d| lower_decl(d, tools)).collect(),
+            decls: decls
+                .iter()
+                .filter(|d| emits_hir_decl(d))
+                .map(|d| lower_decl(d, tools))
+                .collect(),
             span: *span,
         },
         Decl::Import { path, items, span } => hir::Decl::Import {
@@ -431,13 +445,7 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
             }
         }
         Decl::Signal { .. } => {
-            // Signals are compile-time metadata for the reactivity pass and are
-            // inlined at use sites in `lower_expr`. They produce no HIR decl.
-            return hir::Decl::Import {
-                path: String::new(),
-                items: Vec::new(),
-                span: Span::default(),
-            };
+            unreachable!("Signal should be filtered by lower_module")
         }
         Decl::Workflow {
             name, items, span, ..
@@ -541,35 +549,11 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
             // lower_decl; this arm exists only for exhaustiveness.
             unreachable!("NamedHandler should be filtered by lower_module")
         }
-        Decl::Database { name, tables, span } => hir::Decl::Database {
-            name: name.clone(),
-            tables: tables
-                .iter()
-                .map(|table| ast::DatabaseTable {
-                    name: table.name.clone(),
-                    columns: table
-                        .columns
-                        .iter()
-                        .map(|column| ast::DatabaseColumn {
-                            name: column.name.clone(),
-                            col_type: lower_runtime_type(&column.col_type),
-                            modifiers: column.modifiers.clone(),
-                            span: column.span,
-                        })
-                        .collect(),
-                    span: table.span,
-                })
-                .collect(),
-            span: *span,
-        },
-        Decl::Given { span, .. } => {
-            // Given declarations are resolved to call-site arguments
-            // during typechecking and do not produce HIR nodes.
-            hir::Decl::Constant {
-                name: "_unused_given".to_string(),
-                body: hir::Body::new(),
-                span: *span,
-            }
+        Decl::Database { .. } => {
+            unreachable!("Database should be filtered by lower_module")
+        }
+        Decl::Given { .. } => {
+            unreachable!("Given should be filtered by lower_module")
         }
     }
 }
@@ -2746,6 +2730,45 @@ mod tests {
         };
         let hir = lower_module(&ast, &FxHashMap::default());
         assert_eq!(hir.decls.len(), 1);
+    }
+
+    #[test]
+    fn compile_time_only_declarations_do_not_cross_hir_boundary() {
+        let span = Span::default();
+        let database = Decl::Database {
+            name: "Db".to_string(),
+            tables: vec![],
+            span,
+        };
+        let signal = Decl::Signal {
+            name: "count".to_string(),
+            ty: Type::int(),
+            init: Expr::Literal(Literal::Int(0), span),
+            span,
+        };
+        let given = Decl::Given {
+            name: "ctx".to_string(),
+            ty: Some(Type::int()),
+            value: Expr::Literal(Literal::Int(1), span),
+            span,
+        };
+        let nested = Decl::Module {
+            name: "Nested".to_string(),
+            exports: vec![],
+            decls: vec![database.clone(), signal.clone(), given.clone()],
+            span,
+        };
+        let ast = ast::AstModule {
+            name: "test".to_string(),
+            decls: vec![database, signal, given, nested],
+        };
+
+        let hir = lower_module(&ast, &FxHashMap::default());
+        assert_eq!(hir.decls.len(), 1);
+        match &hir.decls[0] {
+            hir::Decl::Module { decls, .. } => assert!(decls.is_empty()),
+            other => panic!("expected normalized module, got {other:?}"),
+        }
     }
 
     #[test]
