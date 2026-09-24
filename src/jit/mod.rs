@@ -170,8 +170,8 @@ impl JitSession {
     /// Returns `None` if the host platform is not supported or ISA finalization
     /// fails, printing a warning to stderr.
     pub fn new() -> Option<Self> {
-        let baseline_module = Self::new_cranelift_module("none")?;
-        let optimized_module = Self::new_cranelift_module("speed")?;
+        let baseline_module = Self::new_cranelift_module("none", "single_pass")?;
+        let optimized_module = Self::new_cranelift_module("speed", "backtracking")?;
         let baseline_ctx = baseline_module.make_context();
         let optimized_ctx = optimized_module.make_context();
 
@@ -193,7 +193,7 @@ impl JitSession {
         })
     }
 
-    fn new_cranelift_module(opt_level: &str) -> Option<JITModule> {
+    fn new_cranelift_module(opt_level: &str, regalloc_algorithm: &str) -> Option<JITModule> {
         let mut flag_builder = settings::builder();
         // Enable baseline SIMD support (SSE2 on x86_64, NEON on aarch64).
         let _ = flag_builder.set("enable_simd", "true");
@@ -201,6 +201,13 @@ impl JitSession {
             eprintln!(
                 "JIT: invalid Cranelift opt_level '{}': {} — JIT disabled",
                 opt_level, e
+            );
+            return None;
+        }
+        if let Err(e) = flag_builder.set("regalloc_algorithm", regalloc_algorithm) {
+            eprintln!(
+                "JIT: invalid Cranelift regalloc_algorithm '{}': {} — JIT disabled",
+                regalloc_algorithm, e
             );
             return None;
         }
@@ -380,8 +387,9 @@ impl JitSession {
     /// higher-tier replacement when the threshold is crossed.
     ///
     /// First-tier regions are compiled by a low-latency Cranelift module
-    /// (`opt_level=none`). Once hot enough they are replaced by code from the
-    /// speed-optimized module. Type-directed specialization is preserved when
+    /// (`opt_level=none`, `regalloc_algorithm=single_pass`). Once hot enough
+    /// they are replaced by code from the speed/backtracking module.
+    /// Type-directed specialization is preserved when
     /// available; an already-optimized typed region is subsequently eligible
     /// for SIMD replacement. Promotion is best-effort: failures leave the
     /// current machine code installed.
