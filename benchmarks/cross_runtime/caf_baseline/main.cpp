@@ -1,9 +1,11 @@
 #include <caf/all.hpp>
+#include <caf/caf_main.hpp>
 
 #include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -45,7 +47,7 @@ behavior counter_actor(event_based_actor* self, actor parent) {
     [=](inc_atom) mutable {
       ++*count;
       if (*count == count_n)
-        self->mail(done_atom_v, *count).send(parent);
+        self->mail(done_atom::value, *count).send(parent);
     },
     [=](stop_atom) { self->quit(); },
   };
@@ -56,7 +58,7 @@ behavior pong_actor(event_based_actor* self, actor ping) {
   return {
     [=](recv_atom) mutable {
       ++*count;
-      self->mail(ack_atom_v, *count).send(ping);
+      self->mail(ack_atom::value, *count).send(ping);
     },
     [=](stop_atom) { self->quit(); },
   };
@@ -69,14 +71,14 @@ behavior ping_actor(event_based_actor* self, actor parent) {
     [=](kick_atom, uint64_t n, const actor& target) mutable {
       *remaining = n;
       *pong = target;
-      self->mail(recv_atom_v).send(*pong);
+      self->mail(recv_atom::value).send(*pong);
     },
     [=](ack_atom, uint64_t count) mutable {
       --*remaining;
       if (*remaining == 0)
-        self->mail(done_atom_v, count).send(parent);
+        self->mail(done_atom::value, count).send(parent);
       else
-        self->mail(recv_atom_v).send(*pong);
+        self->mail(recv_atom::value).send(*pong);
     },
     [=](stop_atom) { self->quit(); },
   };
@@ -87,13 +89,13 @@ behavior ring_actor(event_based_actor* self, actor parent) {
   return {
     [=](setup_atom, const actor& target) mutable {
       *next = target;
-      self->mail(ready_atom_v).send(parent);
+      self->mail(ready_atom::value).send(parent);
     },
     [=](token_atom, uint64_t remaining, uint64_t count) {
       if (remaining > 0)
-        self->mail(token_atom_v, remaining - 1, count + 1).send(*next);
+        self->mail(token_atom::value, remaining - 1, count + 1).send(*next);
       else
-        self->mail(done_atom_v, count).send(parent);
+        self->mail(done_atom::value, count).send(parent);
     },
     [=](stop_atom) { self->quit(); },
   };
@@ -105,7 +107,7 @@ behavior sink_actor(event_based_actor* self, actor parent) {
     [=](ack_atom) mutable {
       ++*count;
       if (*count == tasks)
-        self->mail(done_atom_v, *count).send(parent);
+        self->mail(done_atom::value, *count).send(parent);
     },
     [=](stop_atom) { self->quit(); },
   };
@@ -113,7 +115,7 @@ behavior sink_actor(event_based_actor* self, actor parent) {
 
 behavior worker_actor(event_based_actor* self, actor sink) {
   return {
-    [=](task_atom) { self->mail(ack_atom_v).send(sink); },
+    [=](task_atom) { self->mail(ack_atom::value).send(sink); },
     [=](stop_atom) { self->quit(); },
   };
 }
@@ -123,14 +125,14 @@ void counting(actor_system& sys, scoped_actor& self) {
   auto counter = sys.spawn(counter_actor, parent);
   auto start = std::chrono::steady_clock::now();
   for (uint64_t i = 0; i < count_n; ++i)
-    self->mail(inc_atom_v).send(counter);
+    self->mail(inc_atom::value).send(counter);
 
   uint64_t count = 0;
   self->receive([&](done_atom, uint64_t value) { count = value; });
   auto elapsed = elapsed_ns(start);
   if (count != count_n)
-    CAF_RAISE_ERROR(std::runtime_error, "CAF counting lost messages");
-  self->mail(stop_atom_v).send(counter);
+    throw std::runtime_error("CAF counting lost messages");
+  self->mail(stop_atom::value).send(counter);
   report("counting", count_n, elapsed);
 }
 
@@ -140,16 +142,16 @@ void ping_pong(actor_system& sys, scoped_actor& self) {
   auto pong = sys.spawn(pong_actor, ping);
 
   auto start = std::chrono::steady_clock::now();
-  self->mail(kick_atom_v, ping_n, pong).send(ping);
+  self->mail(kick_atom::value, ping_n, pong).send(ping);
 
   uint64_t count = 0;
   self->receive([&](done_atom, uint64_t value) { count = value; });
   auto elapsed = elapsed_ns(start);
   if (count != ping_n)
-    CAF_RAISE_ERROR(std::runtime_error, "CAF ping-pong lost messages");
+    throw std::runtime_error("CAF ping-pong lost messages");
 
-  self->mail(stop_atom_v).send(ping);
-  self->mail(stop_atom_v).send(pong);
+  self->mail(stop_atom::value).send(ping);
+  self->mail(stop_atom::value).send(pong);
   report("ping_pong", (2 * ping_n) + 1, elapsed);
 }
 
@@ -161,23 +163,23 @@ void thread_ring(actor_system& sys, scoped_actor& self) {
     nodes.emplace_back(sys.spawn(ring_actor, parent));
 
   for (size_t i = 0; i < ring_n; ++i)
-    self->mail(setup_atom_v, nodes[(i + 1) % ring_n]).send(nodes[i]);
+    self->mail(setup_atom::value, nodes[(i + 1) % ring_n]).send(nodes[i]);
 
   size_t ready = 0;
   while (ready < ring_n)
     self->receive([&](ready_atom) { ++ready; });
 
   auto start = std::chrono::steady_clock::now();
-  self->mail(token_atom_v, hops, uint64_t{0}).send(nodes[0]);
+  self->mail(token_atom::value, hops, uint64_t{0}).send(nodes[0]);
 
   uint64_t total = 0;
   self->receive([&](done_atom, uint64_t value) { total = value; });
   auto elapsed = elapsed_ns(start);
   if (total != hops)
-    CAF_RAISE_ERROR(std::runtime_error, "CAF thread ring returned wrong hop count");
+    throw std::runtime_error("CAF thread ring returned wrong hop count");
 
   for (auto& node : nodes)
-    self->mail(stop_atom_v).send(node);
+    self->mail(stop_atom::value).send(node);
   report("thread_ring", hops, elapsed);
 }
 
@@ -192,29 +194,27 @@ void fork_join(actor_system& sys, scoped_actor& self) {
 
   auto start = std::chrono::steady_clock::now();
   for (uint64_t i = 0; i < tasks; ++i)
-    self->mail(task_atom_v).send(workers[i % worker_count]);
+    self->mail(task_atom::value).send(workers[i % worker_count]);
 
   uint64_t count = 0;
   self->receive([&](done_atom, uint64_t value) { count = value; });
   auto elapsed = elapsed_ns(start);
   if (count != tasks)
-    CAF_RAISE_ERROR(std::runtime_error, "CAF fork-join lost tasks");
+    throw std::runtime_error("CAF fork-join lost tasks");
 
   for (auto& worker : workers)
-    self->mail(stop_atom_v).send(worker);
-  self->mail(stop_atom_v).send(sink);
+    self->mail(stop_atom::value).send(worker);
+  self->mail(stop_atom::value).send(sink);
   report("fork_join", 2 * tasks, elapsed);
 }
 
-int main() {
-  actor_system_config cfg;
-  actor_system sys{cfg};
+void caf_main(actor_system& sys) {
   scoped_actor self{sys};
 
   counting(sys, self);
   ping_pong(sys, self);
   thread_ring(sys, self);
   fork_join(sys, self);
-
-  return 0;
 }
+
+CAF_MAIN()
