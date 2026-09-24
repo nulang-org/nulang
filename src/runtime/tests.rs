@@ -74,6 +74,7 @@ fn test_migration_preserves_authority_manifest() {
     .unwrap();
     let snapshot = ActorSnapshot {
         actor_id,
+        semantic_id: None,
         authority_tokens: manifest.canonical_token_set(),
         ..ActorSnapshot::default()
     };
@@ -92,6 +93,7 @@ fn test_migration_rejects_malformed_authority_before_insertion() {
     let nbc = module.to_nbc(None).unwrap();
     let mut snapshot = ActorSnapshot {
         actor_id,
+        semantic_id: None,
         ..ActorSnapshot::default()
     };
     snapshot
