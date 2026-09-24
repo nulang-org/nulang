@@ -184,6 +184,8 @@ fn try_spawn_actor_with_id(
             },
         );
         if let Err(error) = commit {
+            rt.pending_workflow_commands.remove(&id);
+            rt.workflow_commit_failures.remove(&id);
             rt.actors.remove(&id);
             if let Some(ref mut mgr) = rt.crdt_manager {
                 mgr.unregister_actor_fields(id);
