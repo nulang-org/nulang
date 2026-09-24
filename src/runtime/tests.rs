@@ -3627,6 +3627,43 @@ fn test_runtime_append_workflow_timer_signal_saga_events() {
     assert!(
         matches!(&events[4], WorkflowEvent::SagaCompensated { step_name, .. } if step_name == "authorize_payment")
     );
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 5);
+    assert_eq!(rt.persistence.load_snapshot(actor_id).unwrap().sequence, 5);
+}
+
+#[test]
+fn test_workflow_checkpoint_and_event_share_atomic_sequence_tail() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "AtomicTailWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 1);
+
+    // A state-only workflow checkpoint must advance the same atomic durable
+    // tail used by later workflow events; otherwise the next event would be
+    // fenced as a sequence gap.
+    rt.checkpoint_actor(actor_id);
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 2);
+    assert_eq!(rt.persistence.load_snapshot(actor_id).unwrap().sequence, 2);
+
+    rt.append_timer_set(actor_id, "deadline", 250).unwrap();
+
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 3);
+    assert_eq!(rt.persistence.load_snapshot(actor_id).unwrap().sequence, 3);
+    let timers = rt.persistence.read_timer_events(actor_id);
+    assert!(matches!(
+        timers.as_slice(),
+        [WorkflowEvent::TimerSet {
+            sequence: 3,
+            name,
+            duration_ms: 250,
+        }] if name == "deadline"
+    ));
 }
 
 #[test]
