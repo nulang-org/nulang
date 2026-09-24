@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Conservative immutable MIR scalar replacement — 2026-09-24
+- **Projection-only compiler-generated tuples and records can now be eliminated before bytecode emission** (`src/mir_escape.rs`, `src/mir_scalar_replace.rs`, `src/mir_codegen.rs`). The first transform is intentionally same-basic-block and immutable-only; aliases, mutation, cross-block projections, unstable source locals, and ordinary named debugger-visible locals fail closed. Criterion coverage tracks a record hot loop and bytecode regressions pin allocation removal.
+
+
 ### MIR aggregate escape-analysis substrate — 2026-09-24
 - **A conservative, analysis-only MIR pass now classifies aggregate allocation escape behavior** (`src/mir_escape.rs`) across returns, calls, closures, effects, FFI, actor boundaries, state/events, aliases, mutation, and nested aggregates. It also exposes the narrower immutable tuple/record projection-only candidate set needed for later scalar replacement. This slice changes no generated code or runtime semantics.
 
