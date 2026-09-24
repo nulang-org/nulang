@@ -56,7 +56,7 @@ pub fn command_slot(command: RespCommand<'_>) -> RespCommandSlot {
     {
         return if command.argc() == 1 {
             RespCommandSlot::Slot(redis_slot(
-                command.args().next().expect("validated routing key"),
+                command.arg0().expect("validated routing key"),
             ))
         } else {
             RespCommandSlot::Unkeyed
@@ -66,7 +66,7 @@ pub fn command_slot(command: RespCommand<'_>) -> RespCommandSlot {
     if name.eq_ignore_ascii_case(b"SET") {
         return if command.argc() == 2 || command.argc() == 4 {
             RespCommandSlot::Slot(redis_slot(
-                command.args().next().expect("validated routing key"),
+                command.arg0().expect("validated routing key"),
             ))
         } else {
             RespCommandSlot::Unkeyed
@@ -76,7 +76,7 @@ pub fn command_slot(command: RespCommand<'_>) -> RespCommandSlot {
     if name.eq_ignore_ascii_case(b"EXPIRE") {
         return if command.argc() == 2 {
             RespCommandSlot::Slot(redis_slot(
-                command.args().next().expect("validated routing key"),
+                command.arg0().expect("validated routing key"),
             ))
         } else {
             RespCommandSlot::Unkeyed
@@ -174,7 +174,7 @@ pub fn execute_command(
 fn execute_ping(command: RespCommand<'_>, out: &mut Vec<u8>) {
     match command.argc() {
         0 => write_simple(out, b"PONG"),
-        1 => write_bulk(out, command.args().next().expect("validated argument")),
+        1 => write_bulk(out, command.arg0().expect("validated argument")),
         _ => wrong_arity(out, b"ping"),
     }
 }
@@ -185,7 +185,7 @@ fn execute_get(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, ou
         return;
     }
 
-    let key = command.args().next().expect("validated argument");
+    let key = command.arg0().expect("validated argument");
     write_value(store.get(key, now_ms), out);
 }
 
@@ -195,12 +195,12 @@ fn execute_set(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, ou
         return;
     }
 
-    let mut args = command.args();
-    let key = args.next().expect("validated key");
-    let value = args.next().expect("validated value");
+    let key = command.arg0().expect("validated key");
+    let value = command.arg1().expect("validated value");
     let ttl_ms = if command.argc() == 4 {
-        let option = args.next().expect("validated option");
-        let raw_ttl = args.next().expect("validated ttl");
+        let mut tail = command.args_after_two();
+        let option = tail.next().expect("validated option");
+        let raw_ttl = tail.next().expect("validated ttl");
         let Some(amount) = parse_i64(raw_ttl) else {
             write_error(out, ERR_INTEGER);
             return;
@@ -281,7 +281,7 @@ fn execute_incr(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, o
         return;
     }
 
-    let key = command.args().next().expect("validated argument");
+    let key = command.arg0().expect("validated argument");
     match store.increment(key, 1, now_ms) {
         Ok(value) => write_integer(out, value),
         Err(CacheIncrementError::NotInteger | CacheIncrementError::Overflow) => {
@@ -302,9 +302,8 @@ fn execute_expire(
         return;
     }
 
-    let mut args = command.args();
-    let key = args.next().expect("validated key");
-    let Some(seconds) = parse_i64(args.next().expect("validated ttl")) else {
+    let key = command.arg0().expect("validated key");
+    let Some(seconds) = parse_i64(command.arg1().expect("validated ttl")) else {
         write_error(out, ERR_INTEGER);
         return;
     };
@@ -327,7 +326,7 @@ fn execute_ttl(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, ou
         return;
     }
 
-    let key = command.args().next().expect("validated argument");
+    let key = command.arg0().expect("validated argument");
     let ttl = match store.ttl(key, now_ms) {
         CacheTtl::Missing => -2,
         CacheTtl::Persistent => -1,
