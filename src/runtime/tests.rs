@@ -7369,3 +7369,113 @@ fn p0_cross_shard_named_send_resolves_only_on_owner() {
         "unknown cross-shard behavior must not execute behavior zero"
     );
 }
+
+
+fn workflow_broken_json_store() -> (JsonFileStore, std::path::PathBuf) {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "nulang-workflow-fail-{}-{nonce}",
+        std::process::id()
+    ));
+    let store = JsonFileStore::new(&path).unwrap();
+    std::fs::remove_dir_all(&path).unwrap();
+    std::fs::write(&path, b"not a directory").unwrap();
+    (store, path)
+}
+
+#[test]
+fn workflow_timer_is_not_armed_when_durable_timer_set_fails() {
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "fail_closed_timer",
+            Box::new(|| vec![]),
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+
+    let (store, path) = workflow_broken_json_store();
+    rt.persistence = Box::new(store);
+
+    assert!(rt
+        .schedule_workflow_timer(actor_id, "payment_timeout", 10)
+        .is_err());
+    assert!(
+        rt.timer_wheel.is_empty(),
+        "a live timer must not be armed when its durable TimerSet fails"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn workflow_signal_is_not_made_visible_when_durable_append_fails() {
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "fail_closed_signal",
+            Box::new(|| vec![]),
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+    rt.actors.get_mut(&actor_id).unwrap().waiting_signal = Some("go".to_string());
+
+    let (store, path) = workflow_broken_json_store();
+    rt.persistence = Box::new(store);
+
+    assert!(rt.signal_workflow(actor_id, "go", None).is_err());
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert!(
+        actor.received_signals.is_empty(),
+        "a signal must not become visible in memory when its durable append fails"
+    );
+    assert_eq!(actor.waiting_signal.as_deref(), Some("go"));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn workflow_timer_fire_is_not_delivered_when_durable_fire_append_fails() {
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "fail_closed_timer_fire",
+            Box::new(|| vec![("fired".to_string(), Value::int(0))]),
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.register_behavior("__timer_fired", |actor, _args| {
+            let current = actor
+                .get_state_field("fired")
+                .and_then(|value| value.as_int())
+                .unwrap_or(0);
+            actor.set_state_field("fired", Value::int(current + 1));
+        });
+    }
+
+    rt.schedule_workflow_timer(actor_id, "payment_timeout", 0)
+        .unwrap();
+    assert_eq!(rt.timer_wheel.len(), 1);
+
+    let (store, path) = workflow_broken_json_store();
+    rt.persistence = Box::new(store);
+    rt.tick_timers_at(std::time::Instant::now() + std::time::Duration::from_secs(1));
+    rt.run_scheduler();
+
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("fired")
+            .and_then(|value| value.as_int()),
+        Some(0),
+        "timer delivery must be suppressed when TimerFired cannot be durably recorded"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
