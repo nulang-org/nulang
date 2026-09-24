@@ -695,8 +695,7 @@ impl PostgresControlStore {
             )
             .map_err(|error| StoreError::Backend(error.to_string()))?;
         let encoded: String = row.get(0);
-        serde_json::from_str(&encoded)
-            .map_err(|error| StoreError::Serialization(error.to_string()))
+        serde_json::from_str(&encoded).map_err(|error| StoreError::Serialization(error.to_string()))
     }
 
     fn mutate<T>(
@@ -763,10 +762,7 @@ impl ControlStore for PostgresControlStore {
         Ok(self.load_state()?.plans.get(evaluation_id).cloned())
     }
 
-    fn allocations_for(
-        &self,
-        deployment_id: &str,
-    ) -> Result<Vec<ObservedAllocation>, StoreError> {
+    fn allocations_for(&self, deployment_id: &str) -> Result<Vec<ObservedAllocation>, StoreError> {
         Ok(self
             .load_state()?
             .allocations
