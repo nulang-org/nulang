@@ -892,6 +892,7 @@ pub enum BehaviorManifestError {
         field: &'static str,
         message: String,
     },
+    InvalidEffectInventory(String),
     DuplicateActor(String),
     ArtifactIdentityMismatch {
         expected: ArtifactId,
@@ -928,6 +929,9 @@ impl fmt::Display for BehaviorManifestError {
             }
             Self::InvalidIdentity { field, message } => {
                 write!(f, "invalid {field} in behavior manifest: {message}")
+            }
+            Self::InvalidEffectInventory(message) => {
+                write!(f, "invalid behavior manifest effect inventory: {message}")
             }
             Self::DuplicateActor(actor) => {
                 write!(f, "behavior manifest contains duplicate actor '{actor}'")
