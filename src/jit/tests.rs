@@ -1531,7 +1531,15 @@ fn test_tier2_counter_increments() {
     let dummy_ptr: *const u8 = std::ptr::null();
     // Use a terminal tier so the counter test does not attempt compilation
     // against the intentionally empty module.
-    jit.store_compiled_with_metadata(0, 100, dummy_ptr, 5, CompilationTier::Simd, 0);
+    jit.store_compiled_with_metadata(
+        0,
+        100,
+        dummy_ptr,
+        5,
+        CompilationTier::Simd,
+        CodegenOptimization::Optimized,
+        0,
+    );
 
     // Counter starts at 0 (not yet in map), increments each call.
     for i in 0..TIER2_THRESHOLD - 1 {
@@ -1559,8 +1567,24 @@ fn test_tier2_counters_are_per_session() {
     let mut jit_b = make_jit();
     let module = CodeModule::new("tier2_session");
     let dummy_ptr: *const u8 = std::ptr::null();
-    jit_a.store_compiled_with_metadata(0, 200, dummy_ptr, 3, CompilationTier::Simd, 0);
-    jit_b.store_compiled_with_metadata(0, 200, dummy_ptr, 3, CompilationTier::Simd, 0);
+    jit_a.store_compiled_with_metadata(
+        0,
+        200,
+        dummy_ptr,
+        3,
+        CompilationTier::Simd,
+        CodegenOptimization::Optimized,
+        0,
+    );
+    jit_b.store_compiled_with_metadata(
+        0,
+        200,
+        dummy_ptr,
+        3,
+        CompilationTier::Simd,
+        CodegenOptimization::Optimized,
+        0,
+    );
 
     // Heat session A to threshold.
     for _ in 0..TIER2_THRESHOLD {
@@ -1603,6 +1627,11 @@ fn test_tier2_replaces_baseline_with_typed_code() {
         jit.compiled_tier(0, start),
         Some(CompilationTier::Baseline)
     );
+    assert_eq!(
+        jit.compiled_optimization(0, start),
+        Some(CodegenOptimization::Fast),
+        "first-tier native compilation should use the low-latency Cranelift module"
+    );
     assert!(
         jit.compiled_region_compile_time_ns(0, start).is_some(),
         "initial compilation should record compiler wall time"
@@ -1616,6 +1645,11 @@ fn test_tier2_replaces_baseline_with_typed_code() {
 
     let after = jit.compiled_entry(0, start).expect("promoted cache entry");
     assert_eq!(after.tier, CompilationTier::Typed);
+    assert_eq!(
+        after.optimization,
+        CodegenOptimization::Optimized,
+        "Tier-2 replacement should use Cranelift speed optimization"
+    );
     assert_ne!(
         after.ptr, before.ptr,
         "tier promotion must install a newly compiled function, not return the cached baseline"
@@ -1664,6 +1698,7 @@ fn test_tier2_replaces_typed_region_with_simd_code() {
         old_ptr,
         module.instructions.len(),
         CompilationTier::Typed,
+        CodegenOptimization::Optimized,
         0,
     );
     jit.typed_regions.insert((0, 0));
@@ -1678,6 +1713,7 @@ fn test_tier2_replaces_typed_region_with_simd_code() {
         CompilationTier::Simd,
         "typed vectorizable region should promote to SIMD"
     );
+    assert_eq!(after.optimization, CodegenOptimization::Optimized);
     assert_ne!(
         after.ptr, old_ptr,
         "SIMD promotion must replace the installed function pointer"
