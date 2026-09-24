@@ -47,6 +47,9 @@ pub(crate) struct WorkflowTransitionStage {
     pub(crate) workflow_events: Vec<WorkflowEvent>,
     pub(crate) base_snapshot: Option<ActorSnapshot>,
     pub(crate) timers_to_arm: Vec<(String, u64)>,
+    pub(crate) received_signals_len: usize,
+    pub(crate) compensated_steps_len: usize,
+    pub(crate) event_log_len: usize,
 }
 
 /// Snapshot durable actor-owned state at an explicitly supplied transition
@@ -148,6 +151,17 @@ pub(crate) fn begin_workflow_transition(
         )
     })?;
     let activation_epoch = rt.respawn_opted.get(&actor_id).copied().unwrap_or(1);
+    let (received_signals_len, compensated_steps_len, event_log_len) = rt
+        .actors
+        .get(&actor_id)
+        .map(|actor| {
+            (
+                actor.received_signals.len(),
+                actor.compensated_steps.len(),
+                actor.event_log.len(),
+            )
+        })
+        .unwrap_or((0, 0, 0));
     let command = command.map(|(behavior_id, payload)| JournalEntry {
         sequence,
         behavior_id,
@@ -164,6 +178,9 @@ pub(crate) fn begin_workflow_transition(
             workflow_events: Vec::new(),
             base_snapshot: rt.persistence.load_snapshot(actor_id),
             timers_to_arm: Vec::new(),
+            received_signals_len,
+            compensated_steps_len,
+            event_log_len,
         },
     );
     Ok(true)
@@ -289,6 +306,67 @@ pub(crate) fn commit_workflow_transition(
         rt.rearm_timer(actor_id, &name, duration_ms);
     }
     Ok(())
+}
+
+/// Discard an uncommitted workflow turn and restore the last durable image.
+///
+/// This is the runtime half of RFC 0022's COMMIT-NOTHING branch: no deferred
+/// timers are published, durable fields and CRDT replicas are restored, and
+/// suspended VM state produced by the failed turn is dropped so execution
+/// cannot continue from mutations the store rejected.
+pub(crate) fn rollback_workflow_transition(rt: &mut Runtime, actor_id: u64) {
+    let Some(stage) = rt.workflow_transitions.remove(&actor_id) else {
+        return;
+    };
+    let Some(snapshot) = stage.base_snapshot else {
+        // A workflow without a prior durable image cannot be safely resumed
+        // after a rejected first transition. Drop any live suspension; the
+        // caller may re-drive from workflow creation.
+        if let Some(actor) = rt.actors.get_mut(&actor_id) {
+            actor.suspended_execution = None;
+            actor.waiting_signal = None;
+            actor.dirty_fields.clear();
+            actor.received_signals.truncate(stage.received_signals_len);
+            actor.compensated_steps.truncate(stage.compensated_steps_len);
+            actor.event_log.truncate(stage.event_log_len);
+        }
+        return;
+    };
+
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        for (name, persisted) in &snapshot.state {
+            let restored = persisted.to_value_on_heap(actor);
+            actor.state_data.insert(name.clone(), restored);
+        }
+        actor.sequence = snapshot.sequence;
+        actor.waiting_signal = snapshot.waiting_signal.clone();
+        actor.suspended_execution = None;
+        actor.dirty_fields.clear();
+        actor.received_signals.truncate(stage.received_signals_len);
+        actor.compensated_steps.truncate(stage.compensated_steps_len);
+        actor.event_log.truncate(stage.event_log_len);
+    }
+
+    if let (Some(manager), Some(crdt_snapshot), Some(field_map)) = (
+        rt.crdt_manager.as_mut(),
+        snapshot.crdt_snapshot.as_ref(),
+        snapshot.crdt_field_map.as_ref(),
+    ) {
+        let owned: std::collections::HashSet<u64> = field_map.values().copied().collect();
+        let restored = crdt_snapshot
+            .iter()
+            .filter(|(id, _, _)| owned.contains(id))
+            .filter_map(|(id, ty, bytes)| {
+                crate::ast::CrdtType::from_u8(*ty).map(|crdt_type| {
+                    (
+                        crate::runtime::crdt_manager::CrdtId(*id),
+                        (crdt_type, bytes.clone()),
+                    )
+                })
+            })
+            .collect();
+        manager.restore(restored);
+    }
 }
 
 pub(crate) fn stage_step_completed(
