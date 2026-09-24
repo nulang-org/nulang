@@ -1709,15 +1709,16 @@ impl PersistenceStore for LibsqlStore {
             {
                 tx.execute(
                     "INSERT INTO snapshots
-                     (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens, semantic_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                      ON CONFLICT(actor_id) DO UPDATE SET
                        sequence=excluded.sequence,
                        state=excluded.state,
                        waiting_signal=excluded.waiting_signal,
                        crdt_snapshot=excluded.crdt_snapshot,
                        crdt_field_map=excluded.crdt_field_map,
-                       authority_tokens=excluded.authority_tokens",
+                       authority_tokens=excluded.authority_tokens,
+                       semantic_id=excluded.semantic_id",
                     libsql::params![
                         snapshot.actor_id as i64,
                         snapshot.sequence as i64,
@@ -1725,7 +1726,8 @@ impl PersistenceStore for LibsqlStore {
                         snapshot.waiting_signal.as_deref(),
                         crdt_json.as_str(),
                         crdt_field_map_json.as_str(),
-                        authority_json.as_str()
+                        authority_json.as_str(),
+                        snapshot.semantic_id.as_deref()
                     ],
                 )
                 .await
@@ -3804,6 +3806,18 @@ mod durable_transition_tests {
     }
 
     #[test]
+    fn transition_digest_includes_snapshot_semantic_identity() {
+        let mut identified = transition(10, 1, 1);
+        identified.snapshot.as_mut().unwrap().semantic_id = Some(
+            crate::content_identity::SemanticId::from_canonical_bytes(b"identified", [])
+                .to_string(),
+        );
+        let legacy = transition(10, 1, 1);
+
+        assert_ne!(identified.digest().unwrap(), legacy.digest().unwrap());
+    }
+
+    #[test]
     fn transition_digest_is_independent_of_hashmap_insertion_order() {
         let mut first = transition(10, 1, 1);
         first.snapshot = Some(snapshot(10, 1, &[("a", 1), ("b", 2), ("c", 3)]));
@@ -3892,6 +3906,23 @@ mod libsql_atomic_transition_tests {
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }],
         }
+    }
+
+    #[test]
+    fn libsql_atomic_transition_preserves_snapshot_semantic_identity() {
+        let mut store = LibsqlStore::in_memory().unwrap();
+        let semantic_id =
+            crate::content_identity::SemanticId::from_canonical_bytes(b"atomic-snapshot", [])
+                .to_string();
+        let mut value = transition(42, 1, 1);
+        value.snapshot.as_mut().unwrap().semantic_id = Some(semantic_id.clone());
+
+        store.commit_transition(value).unwrap();
+
+        assert_eq!(
+            store.load_snapshot(42).unwrap().semantic_id,
+            Some(semantic_id)
+        );
     }
 
     #[test]
