@@ -25,7 +25,7 @@
 
 use crate::bytecode::{
     CodeModule, Constant, DebugFunctionInfo, EffectSiteMetadata, ForeignFunctionDef,
-    HandlerBinding, HandlerTable, Instruction, OpCode,
+    HandlerBinding, HandlerTable, Instruction, OpCode, SendOwnershipSite, SendOwnershipSource,
 };
 use crate::mir;
 use crate::semantic_identity::{effect_sites_for_mir, EffectSiteOwnerKind, MirEffectSite};
@@ -587,6 +587,7 @@ impl MirCodegen {
         // Conservative liveness-based placement of `Drop` instructions (see
         // the module docs and `plan_drops`).
         let drop_plan = plan_drops(func);
+        let consuming_send_plan = plan_consuming_send_args(func);
 
         // Source-line map: `(block id, statement index) -> line`, translated
         // to bytecode PCs below so the debugger can place breakpoints and
@@ -652,7 +653,50 @@ impl MirCodegen {
                     }
                     _ => None,
                 };
+                let stmt_code_start = self.module.instructions.len();
                 self.compile_stmt(stmt, func, &mut handle_patches, effect_site)?;
+
+                if let Some(consuming) = consuming_send_plan.args_by_stmt.get(&(bi, si)) {
+                    if let mir::Stmt::Assign {
+                        op:
+                            mir::RValue::Send {
+                                args,
+                                remote: false,
+                                ..
+                            },
+                        ..
+                    } = stmt
+                    {
+                        if let Some((offset, _)) = self.module.instructions[stmt_code_start..]
+                            .iter()
+                            .enumerate()
+                            .find(|(_, instr)| instr.opcode == OpCode::Send)
+                        {
+                            let mut candidate_mask = 0u16;
+                            let mut sources = Vec::new();
+                            for (arg_idx, arg) in args.iter().enumerate() {
+                                if arg_idx >= u16::BITS as usize || !consuming.contains(arg) {
+                                    continue;
+                                }
+                                candidate_mask |= 1u16 << arg_idx;
+                                let source = if let Some(&slot) = self.spill_map.get(&arg.0) {
+                                    SendOwnershipSource::Spill(slot)
+                                } else {
+                                    SendOwnershipSource::Register((LOCAL_BASE + arg.0) as u8)
+                                };
+                                sources.push((arg_idx as u8, source));
+                            }
+                            if candidate_mask != 0 {
+                                self.module.send_ownership_sites.push(SendOwnershipSite {
+                                    pc: stmt_code_start + offset,
+                                    candidate_mask,
+                                    sources,
+                                });
+                            }
+                        }
+                    }
+                }
+
                 if let Some(src) = drop_plan.ownership_transfer.get(&(bi, si)) {
                     self.clear_local_after_transfer(*src);
                 }
@@ -2842,8 +2886,11 @@ fn plan_consuming_send_args(func: &mir::Function) -> ConsumingSendPlan {
     let ptr_ty: Vec<bool> = func
         .locals
         .iter()
-        .map(|l| may_hold_heap_ptr(&l.ty))
+        .map(|local| may_hold_heap_ptr(&local.ty))
         .collect();
+
+    // Values entering from outside MIR assignments cannot be proven to carry
+    // one local ownership token.
     let mut excluded = vec![false; nlocals];
     for id in func.params.iter().chain(&func.captures) {
         excluded[id.0 as usize] = true;
@@ -2856,23 +2903,84 @@ fn plan_consuming_send_args(func: &mir::Function) -> ConsumingSendPlan {
         }
     }
 
+    // The consuming proof is intentionally stronger than ordinary liveness:
+    // every local in the chain must have one definition and one total use.
+    // This rules out competing reads/copies without requiring a second alias
+    // analysis. A single-use Load may then transfer the ownership proof to its
+    // destination exactly like plan_drops' ownership-transfer path.
     let mut def_count = vec![0usize; nlocals];
     let mut use_count = vec![0usize; nlocals];
-    let mut owning_def = vec![false; nlocals];
     for block in &func.blocks {
         for stmt in &block.stmts {
-            for (u, _) in stmt_uses(stmt) {
-                use_count[u] += 1;
+            for (local, _) in stmt_uses(stmt) {
+                use_count[local] += 1;
             }
-            if let mir::Stmt::Assign { dst, op } = stmt {
-                let d = dst.0 as usize;
-                def_count[d] += 1;
-                let self_read = rvalue_uses(op).iter().any(|(u, _)| *u == d);
-                owning_def[d] = def_count[d] == 1 && rvalue_is_owning(op) && !self_read;
+            if let mir::Stmt::Assign { dst, .. } = stmt {
+                def_count[dst.0 as usize] += 1;
             }
         }
-        for (u, _) in terminator_uses(&block.terminator) {
-            use_count[u] += 1;
+        for (local, _) in terminator_uses(&block.terminator) {
+            use_count[local] += 1;
+        }
+    }
+
+    let mut direct_owning = vec![false; nlocals];
+    let mut transfer_source: Vec<Option<usize>> = vec![None; nlocals];
+
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            let mir::Stmt::Assign { dst, op } = stmt else {
+                continue;
+            };
+            let d = dst.0 as usize;
+            if def_count[d] != 1 {
+                continue;
+            }
+
+            let self_read = rvalue_uses(op).iter().any(|(local, _)| *local == d);
+            if self_read {
+                continue;
+            }
+
+            if rvalue_is_owning(op) {
+                direct_owning[d] = true;
+                continue;
+            }
+
+            if let mir::RValue::Load(src) = op {
+                let source = src.0 as usize;
+                if source != d && def_count[source] == 1 && use_count[source] == 1 {
+                    transfer_source[d] = Some(source);
+                }
+            }
+        }
+    }
+
+    // Ownership can flow through arbitrarily long single-use Load chains.
+    let mut candidate = vec![false; nlocals];
+    loop {
+        let mut changed = false;
+        for local in 0..nlocals {
+            if candidate[local]
+                || !ptr_ty[local]
+                || excluded[local]
+                || def_count[local] != 1
+                || use_count[local] != 1
+            {
+                continue;
+            }
+
+            let owns = direct_owning[local]
+                || transfer_source[local]
+                    .map(|source| candidate[source])
+                    .unwrap_or(false);
+            if owns {
+                candidate[local] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
 
@@ -2891,23 +2999,18 @@ fn plan_consuming_send_args(func: &mir::Function) -> ConsumingSendPlan {
             else {
                 continue;
             };
+
             let owned: Vec<_> = args
                 .iter()
                 .copied()
-                .filter(|arg| {
-                    let a = arg.0 as usize;
-                    ptr_ty[a]
-                        && !excluded[a]
-                        && def_count[a] == 1
-                        && use_count[a] == 1
-                        && owning_def[a]
-                })
+                .filter(|arg| candidate[arg.0 as usize])
                 .collect();
             if !owned.is_empty() {
                 plan.args_by_stmt.insert((bi, si), owned);
             }
         }
     }
+
     plan
 }
 
@@ -3935,6 +4038,122 @@ mod optimize_tests {
     }
 
     #[test]
+    fn test_codegen_send_ownership_site_pc_is_absolute_across_functions() {
+        let mut module = mir::Module::new("send_site_absolute");
+
+        let mut prefix = mir::FunctionBuilder::new("prefix", None);
+        let prefix_value = prefix.add_temp(Type::int());
+        prefix.assign(prefix_value, mir::RValue::Const(Constant::Int(1)));
+        prefix.terminate(mir::Terminator::Return(Some(prefix_value)));
+        module.functions.push(prefix.build());
+
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut sender = mir::FunctionBuilder::new("sender", None);
+        let target = sender.add_param("target", Type::unit());
+        let payload = sender.add_temp(arr_ty);
+        let sent = sender.add_temp(Type::unit());
+        sender.assign(payload, mir::RValue::ArrayLit(vec![]));
+        sender.assign(
+            sent,
+            mir::RValue::Send {
+                actor: target,
+                behavior_idx: 0,
+                args: vec![payload],
+                remote: false,
+            },
+        );
+        sender.terminate(mir::Terminator::Return(None));
+        module.functions.push(sender.build());
+
+        let code = compile_mir(&mut module, "send_site_absolute").unwrap();
+        assert_eq!(code.send_ownership_sites.len(), 1);
+        let site = &code.send_ownership_sites[0];
+        assert!(site.pc < code.instructions.len());
+        assert_eq!(code.instructions[site.pc].opcode, OpCode::Send);
+        assert!(
+            site.pc > code.function_table[0],
+            "send site in the second function must point past the first function"
+        );
+    }
+
+    #[test]
+    fn test_source_fresh_array_send_emits_consuming_site() {
+        let source = r#"
+            actor Sink {
+                behavior take(xs) { unit }
+            }
+            actor Producer {
+                state sink = nil
+                behavior wire(s) { self.sink = s }
+                behavior produce() {
+                    let xs = [1, 2, 3] in
+                        send self.sink take(xs)
+                }
+            }
+            let sink = spawn Sink {} in
+            let producer = spawn Producer {} in {
+                send producer wire(sink)
+                producer
+            }
+        "#;
+
+        let tokens = crate::lexer::Lexer::new(source).lex().expect("lex");
+        let ast = crate::parser::Parser::new(tokens)
+            .parse_module()
+            .expect("parse");
+        let mut type_checker = crate::typechecker::TypeChecker::new();
+        type_checker.check_module(&ast).expect("typecheck");
+        let hir =
+            crate::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
+        let mut mir = crate::mir_lower::lower_module(&hir).expect("MIR lower");
+        let code = compile_mir(&mut mir, "source_consuming_send").expect("codegen");
+
+        assert!(
+            code.send_ownership_sites
+                .iter()
+                .any(|site| site.candidate_mask & 1 != 0),
+            "fresh source-level array payload should produce a consuming send site"
+        );
+    }
+
+    #[test]
+    fn test_codegen_records_runtime_only_consuming_send_site() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("send_site", None);
+        let target = b.add_param("target", Type::unit());
+        let payload = b.add_temp(arr_ty);
+        let sent = b.add_temp(Type::unit());
+
+        b.assign(payload, mir::RValue::ArrayLit(vec![]));
+        b.assign(
+            sent,
+            mir::RValue::Send {
+                actor: target,
+                behavior_idx: 0,
+                args: vec![payload],
+                remote: false,
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("send_site");
+        module.functions.push(b.build());
+        let code = compile_mir(&mut module, "send_site").unwrap();
+
+        assert_eq!(code.send_ownership_sites.len(), 1);
+        let site = &code.send_ownership_sites[0];
+        assert_eq!(site.candidate_mask, 1);
+        assert_eq!(
+            site.sources,
+            vec![(
+                0,
+                SendOwnershipSource::Register((LOCAL_BASE + payload.0) as u8),
+            )]
+        );
+        assert_eq!(code.instructions[site.pc].opcode, OpCode::Send);
+    }
+
+    #[test]
     fn test_consuming_send_plan_marks_unique_fresh_local_payload() {
         let arr_ty = Type::Array(Box::new(Type::int()));
         let mut b = mir::FunctionBuilder::new("send_unique", None);
@@ -3954,6 +4173,90 @@ mod optimize_tests {
         b.terminate(mir::Terminator::Return(None));
         let plan = plan_consuming_send_args(&b.build());
         assert_eq!(plan.args_by_stmt.get(&(0, 1)), Some(&vec![payload]));
+    }
+
+    #[test]
+    fn test_consuming_send_plan_propagates_through_single_use_load() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("send_loaded_unique", None);
+        let target = b.add_param("target", Type::unit());
+        let payload = b.add_temp(arr_ty.clone());
+        let moved = b.add_temp(arr_ty);
+        let sent = b.add_temp(Type::unit());
+
+        b.assign(payload, mir::RValue::ArrayLit(vec![]));
+        b.assign(moved, mir::RValue::Load(payload));
+        b.assign(
+            sent,
+            mir::RValue::Send {
+                actor: target,
+                behavior_idx: 0,
+                args: vec![moved],
+                remote: false,
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+
+        let plan = plan_consuming_send_args(&b.build());
+        assert_eq!(plan.args_by_stmt.get(&(0, 2)), Some(&vec![moved]));
+    }
+
+    #[test]
+    fn test_consuming_send_plan_propagates_through_load_chain() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("send_loaded_chain", None);
+        let target = b.add_param("target", Type::unit());
+        let payload = b.add_temp(arr_ty.clone());
+        let moved_once = b.add_temp(arr_ty.clone());
+        let moved_twice = b.add_temp(arr_ty);
+        let sent = b.add_temp(Type::unit());
+
+        b.assign(payload, mir::RValue::ArrayLit(vec![]));
+        b.assign(moved_once, mir::RValue::Load(payload));
+        b.assign(moved_twice, mir::RValue::Load(moved_once));
+        b.assign(
+            sent,
+            mir::RValue::Send {
+                actor: target,
+                behavior_idx: 0,
+                args: vec![moved_twice],
+                remote: false,
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+
+        let plan = plan_consuming_send_args(&b.build());
+        assert_eq!(plan.args_by_stmt.get(&(0, 3)), Some(&vec![moved_twice]));
+    }
+
+    #[test]
+    fn test_consuming_send_plan_rejects_load_chain_with_competing_source_use() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("send_loaded_shared", None);
+        let target = b.add_param("target", Type::unit());
+        let payload = b.add_temp(arr_ty.clone());
+        let len = b.add_temp(Type::int());
+        let moved = b.add_temp(arr_ty);
+        let sent = b.add_temp(Type::unit());
+
+        b.assign(payload, mir::RValue::ArrayLit(vec![]));
+        b.assign(len, mir::RValue::ArrayLen(payload));
+        b.assign(moved, mir::RValue::Load(payload));
+        b.assign(
+            sent,
+            mir::RValue::Send {
+                actor: target,
+                behavior_idx: 0,
+                args: vec![moved],
+                remote: false,
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+
+        assert!(
+            plan_consuming_send_args(&b.build()).args_by_stmt.is_empty(),
+            "a transfer source with another use must remain conservative"
+        );
     }
 
     #[test]

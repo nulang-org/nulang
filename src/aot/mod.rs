@@ -1299,6 +1299,7 @@ impl crate::vm::ActorVmCallbacks for AotActorCallbacks {
                 payload: crate::runtime::MessagePayload::from_slice(args),
                 sender: (*self.actor).id,
                 priority: crate::runtime::MessagePriority::Normal,
+                ownership_handoff_mask: 0,
                 trace_id: None,
             });
         }

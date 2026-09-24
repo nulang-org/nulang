@@ -496,6 +496,7 @@ fn stress_mailbox_never_drops_system_messages() {
             payload: MessagePayload::from_slice(&[Value::int(i)]),
             sender: 0,
             priority: MessagePriority::Normal,
+            ownership_handoff_mask: 0,
             trace_id: None,
         };
         if let Some(a) = rt.actors.get_mut(&actor) {
@@ -510,6 +511,7 @@ fn stress_mailbox_never_drops_system_messages() {
             payload: MessagePayload::from_slice(&[Value::int(1000 + i)]),
             sender: 0,
             priority: MessagePriority::System,
+            ownership_handoff_mask: 0,
             trace_id: None,
         };
         if let Some(a) = rt.actors.get_mut(&actor) {
@@ -524,6 +526,7 @@ fn stress_mailbox_never_drops_system_messages() {
             payload: MessagePayload::from_slice(&[Value::int(2000 + i)]),
             sender: 0,
             priority: MessagePriority::Bulk,
+            ownership_handoff_mask: 0,
             trace_id: None,
         };
         if let Some(a) = rt.actors.get_mut(&actor) {
@@ -1413,6 +1416,7 @@ fn stress_mailbox_system_priority_preservation() {
             payload: MessagePayload::from_slice(&[Value::int(i)]),
             sender: 0,
             priority: MessagePriority::Normal,
+            ownership_handoff_mask: 0,
             trace_id: None,
         };
         if let Some(a) = rt.actors.get_mut(&actor) {
@@ -1426,6 +1430,7 @@ fn stress_mailbox_system_priority_preservation() {
             payload: MessagePayload::from_slice(&[Value::int(1000 + i)]),
             sender: 0,
             priority: MessagePriority::System,
+            ownership_handoff_mask: 0,
             trace_id: None,
         };
         if let Some(a) = rt.actors.get_mut(&actor) {

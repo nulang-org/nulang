@@ -229,6 +229,21 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// Send a message to an actor by behavior table index.
     fn send_message(&mut self, target: Value, behavior_id: u16, args: &[Value]);
 
+    /// Attempt a compiler-proven consuming send. The callback returns the
+    /// subset of candidate payload bits whose ownership token was actually
+    /// consumed. Conservative hosts may use the default ordinary send path.
+    fn send_message_consuming(
+        &mut self,
+        target: Value,
+        behavior_id: u16,
+        args: &[Value],
+        candidate_mask: u16,
+    ) -> u16 {
+        let _ = candidate_mask;
+        self.send_message(target, behavior_id, args);
+        0
+    }
+
     /// Synchronously ask an actor and return its response.
     /// Default implementation sends the message and returns nil.
     fn ask_actor(&mut self, target: Value, behavior_id: u16, args: &[Value]) -> Value {
@@ -5142,8 +5157,39 @@ impl VM {
                     .map(|b| (b.param_count, behavior_idx as u16))
                     .unwrap_or((0, 0));
                 let args: Vec<Value> = (0..param_count).map(|i| frame.regs[i]).collect();
-                self.actor_callbacks
-                    .send_message(actor_val, behavior_id, &args);
+                let send_pc = frame.pc.saturating_sub(1);
+                let ownership_site = self
+                    .modules
+                    .get(module_idx)
+                    .and_then(|module| module.send_ownership_site(send_pc))
+                    .cloned();
+
+                if let Some(site) = ownership_site {
+                    let consumed = self.actor_callbacks.send_message_consuming(
+                        actor_val,
+                        behavior_id,
+                        &args,
+                        site.candidate_mask,
+                    );
+                    for (arg_idx, source) in site.sources {
+                        if consumed & (1u16 << arg_idx) == 0 {
+                            continue;
+                        }
+                        match source {
+                            crate::bytecode::SendOwnershipSource::Register(reg) => {
+                                frame.regs[reg as usize] = Value::nil();
+                            }
+                            crate::bytecode::SendOwnershipSource::Spill(slot) => {
+                                if let Some(value) = frame.spilled.get_mut(slot as usize) {
+                                    *value = Value::nil();
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    self.actor_callbacks
+                        .send_message(actor_val, behavior_id, &args);
+                }
                 return Ok(());
             }
             OpCode::Ask => {
@@ -6292,6 +6338,92 @@ mod vm_tests {
         ) -> PerformAsyncResult {
             PerformAsyncResult::ReadyValue(Value::int(73))
         }
+    }
+
+    #[derive(Debug)]
+    struct ConsumingSendTestCallbacks {
+        consume: bool,
+    }
+
+    impl ActorVmCallbacks for ConsumingSendTestCallbacks {
+        fn alloc(&mut self, _size: usize, _type_tag: HeapTypeTag) -> Option<*mut u8> {
+            None
+        }
+
+        fn drop_ref(&mut self, _ptr: *mut u8) {}
+
+        fn retain_ref(&mut self, _ptr: *mut u8) {}
+
+        fn array_len(&self, _ptr: *mut u8) -> Option<usize> {
+            None
+        }
+
+        fn spawn_actor(
+            &mut self,
+            _module: &CodeModule,
+            _spawn_pc: usize,
+            _behavior_idx: usize,
+            _init: Vec<(String, Value)>,
+        ) -> Value {
+            Value::actor_ref(0)
+        }
+
+        fn send_message(&mut self, _target: Value, _behavior_id: u16, _args: &[Value]) {}
+
+        fn send_message_consuming(
+            &mut self,
+            _target: Value,
+            _behavior_id: u16,
+            _args: &[Value],
+            candidate_mask: u16,
+        ) -> u16 {
+            if self.consume {
+                candidate_mask
+            } else {
+                0
+            }
+        }
+    }
+
+    fn run_consuming_send_source_clear(consume: bool) -> Value {
+        let mut module = CodeModule::new("consuming_send_clear");
+        module.add_behavior(BehaviorTableEntry {
+            name: "sink".into(),
+            param_count: 1,
+            code_offset: 0,
+            local_count: 0,
+            effect_mask: 0,
+            compensate_offset: None,
+            content_hash: None,
+            source_location: None,
+            parallel_branches: None,
+        });
+
+        module.emit(Instruction::new1(OpCode::Const1, 15));
+        module.emit(Instruction::new1(OpCode::Const1, 0));
+        module.emit(Instruction::new1(OpCode::Const1, 14));
+        let send_pc = module.emit(Instruction::new3(OpCode::Send, 14, 0, 0));
+        module.emit(Instruction::new2(OpCode::Move, 15, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+        module
+            .send_ownership_sites
+            .push(crate::bytecode::SendOwnershipSite {
+                pc: send_pc,
+                candidate_mask: 1,
+                sources: vec![(0, crate::bytecode::SendOwnershipSource::Register(15))],
+            });
+
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+        vm.set_actor_callbacks(Box::new(ConsumingSendTestCallbacks { consume }));
+        vm.run().unwrap()
+    }
+
+    #[test]
+    fn test_send_clears_source_only_when_callback_consumes() {
+        assert!(run_consuming_send_source_clear(true).is_nil());
+        assert_eq!(run_consuming_send_source_clear(false).as_int(), Some(1));
     }
 
     #[test]
