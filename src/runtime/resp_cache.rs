@@ -579,7 +579,11 @@ mod tests {
         });
 
         assert_eq!(
-            run(&mut store, b"*3\r\n$3\r\nSET\r\n$9\r\ntoolong!!\r\n$1\r\nv\r\n", 0),
+            run(
+                &mut store,
+                b"*3\r\n$3\r\nSET\r\n$9\r\ntoolong!!\r\n$1\r\nv\r\n",
+                0
+            ),
             b"-ERR cache key exceeds configured maximum\r\n"
         );
         assert!(store.is_empty());
