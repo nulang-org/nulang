@@ -935,6 +935,18 @@ impl Runtime {
             return Ok(0);
         }
 
+        // Do not fan an already-stale remote generation out to lagging local
+        // shards. Accepted snapshots are still broadcast even when they make
+        // zero endpoint changes (for example an authoritative empty snapshot).
+        if self
+            .distributed
+            .services
+            .remote_generation(snapshot.node_id)
+            .is_some_and(|current| snapshot.generation <= current)
+        {
+            return Ok(0);
+        }
+
         let changed = self
             .distributed
             .services
