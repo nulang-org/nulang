@@ -4,7 +4,7 @@
 //! snapshot of durable actor state and an append-only journal of messages.
 //! On recovery the runtime loads the latest snapshot and replays the journal.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -265,6 +265,31 @@ pub struct DurableOutboxMessage {
     pub payload: Vec<PersistedValue>,
 }
 
+/// Stable RFC 0022 identity for one durable outbound message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct DurableMessageId {
+    pub sender_actor_id: u64,
+    pub sender_epoch: u64,
+    pub transition_sequence: u64,
+    pub outbox_ordinal: u32,
+}
+
+/// One committed durable outbound message that has not yet been acknowledged.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DurableOutboxRecord {
+    pub id: DurableMessageId,
+    pub destination_actor_id: u64,
+    pub behavior_id: u16,
+    pub payload: Vec<PersistedValue>,
+}
+
+/// One stable durable-message identity accepted atomically by a receiver turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct DurableInboxDelivery {
+    pub id: DurableMessageId,
+    pub destination_actor_id: u64,
+}
+
 /// One logical durable actor/workflow/entity transition.
 #[derive(Debug, Clone)]
 pub struct DurableTransition {
@@ -279,6 +304,7 @@ pub struct DurableTransition {
     pub domain_events: Vec<EventEntry>,
     pub durable_effects: Vec<DurableEffectPersistenceRecord>,
     pub outbox: Vec<DurableOutboxMessage>,
+    pub inbox: Vec<DurableInboxDelivery>,
 }
 
 /// Durable tail used for epoch/sequence fencing and idempotent commit retry.
@@ -395,6 +421,22 @@ impl DurableTransition {
                 ));
             }
         }
+
+        let mut inbox_ids = HashSet::new();
+        for delivery in &self.inbox {
+            if delivery.destination_actor_id != self.actor_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "durable inbox delivery destination does not match transition actor",
+                ));
+            }
+            if !inbox_ids.insert(delivery.id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "duplicate durable inbox identity in transition",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -415,6 +457,8 @@ impl DurableTransition {
             domain_events: &'a [EventEntry],
             durable_effects: Vec<Vec<u8>>,
             outbox: &'a [DurableOutboxMessage],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            inbox: Option<&'a [DurableInboxDelivery]>,
         }
 
         let durable_effects = self
@@ -439,6 +483,7 @@ impl DurableTransition {
             domain_events: &self.domain_events,
             durable_effects,
             outbox: &self.outbox,
+            inbox: (!self.inbox.is_empty()).then_some(self.inbox.as_slice()),
         })
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
@@ -506,6 +551,37 @@ pub trait PersistenceStore: Send + Sync {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "durable effect recovery reads are not supported by this persistence backend",
+        ))
+    }
+
+    /// Read committed durable outbox messages that have not yet been
+    /// acknowledged. Stable identities make retries safe after crashes.
+    fn read_pending_outbox(&self, _limit: usize) -> io::Result<Vec<DurableOutboxRecord>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable outbox reads are not supported by this persistence backend",
+        ))
+    }
+
+    /// Idempotently acknowledge a durable outbox message after receiver
+    /// acceptance is durable.
+    fn acknowledge_outbox(&mut self, _id: DurableMessageId) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable outbox acknowledgement is not supported by this persistence backend",
+        ))
+    }
+
+    /// Return the receiver transition sequence that atomically accepted this
+    /// stable durable-message identity, if any.
+    fn lookup_inbox_delivery(
+        &self,
+        _destination_actor_id: u64,
+        _id: DurableMessageId,
+    ) -> io::Result<Option<u64>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable inbox lookup is not supported by this persistence backend",
         ))
     }
 
@@ -670,6 +746,8 @@ pub struct MemoryStore {
     events: HashMap<u64, Vec<EventEntry>>,
     durable_tails: HashMap<u64, DurableTail>,
     committed_transitions: HashMap<u64, Vec<DurableTransition>>,
+    delivered_outbox: HashSet<DurableMessageId>,
+    durable_inbox: HashMap<(u64, DurableMessageId), u64>,
 }
 
 impl MemoryStore {
@@ -690,6 +768,56 @@ impl MemoryStore {
 }
 
 impl PersistenceStore for MemoryStore {
+    fn read_pending_outbox(&self, limit: usize) -> io::Result<Vec<DurableOutboxRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut records = Vec::new();
+        for transitions in self.committed_transitions.values() {
+            for transition in transitions {
+                for message in &transition.outbox {
+                    let id = DurableMessageId {
+                        sender_actor_id: transition.actor_id,
+                        sender_epoch: transition.activation_epoch,
+                        transition_sequence: transition.sequence,
+                        outbox_ordinal: message.ordinal,
+                    };
+                    if !self.delivered_outbox.contains(&id) {
+                        records.push(DurableOutboxRecord {
+                            id,
+                            destination_actor_id: message.destination_actor_id,
+                            behavior_id: message.behavior_id,
+                            payload: message.payload.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        records.sort_by_key(|record| {
+            (
+                record.id.sender_actor_id,
+                record.id.sender_epoch,
+                record.id.transition_sequence,
+                record.id.outbox_ordinal,
+            )
+        });
+        records.truncate(limit);
+        Ok(records)
+    }
+
+    fn acknowledge_outbox(&mut self, id: DurableMessageId) -> io::Result<()> {
+        self.delivered_outbox.insert(id);
+        Ok(())
+    }
+
+    fn lookup_inbox_delivery(
+        &self,
+        destination_actor_id: u64,
+        id: DurableMessageId,
+    ) -> io::Result<Option<u64>> {
+        Ok(self.durable_inbox.get(&(destination_actor_id, id)).copied())
+    }
+
     fn load_durable_tail(&self, actor_id: u64) -> io::Result<Option<DurableTail>> {
         Ok(self.durable_tails.get(&actor_id).copied())
     }
@@ -787,6 +915,18 @@ impl PersistenceStore for MemoryStore {
             ));
         }
 
+        for delivery in &transition.inbox {
+            if self
+                .durable_inbox
+                .contains_key(&(delivery.destination_actor_id, delivery.id))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "durable inbox identity was already accepted",
+                ));
+            }
+        }
+
         if let Some(snapshot) = &transition.snapshot {
             self.snapshots.insert(transition.actor_id, snapshot.clone());
         }
@@ -815,6 +955,12 @@ impl PersistenceStore for MemoryStore {
             digest,
         };
         self.durable_tails.insert(transition.actor_id, tail);
+        for delivery in &transition.inbox {
+            self.durable_inbox.insert(
+                (delivery.destination_actor_id, delivery.id),
+                transition.sequence,
+            );
+        }
         self.committed_transitions
             .entry(transition.actor_id)
             .or_default()
@@ -910,6 +1056,11 @@ impl PersistenceStore for MemoryStore {
         self.events.remove(&actor_id);
         self.durable_tails.remove(&actor_id);
         self.committed_transitions.remove(&actor_id);
+        self.delivered_outbox
+            .retain(|id| id.sender_actor_id != actor_id);
+        self.durable_inbox.retain(|(destination, id), _| {
+            *destination != actor_id && id.sender_actor_id != actor_id
+        });
         Ok(())
     }
 }
@@ -931,6 +1082,8 @@ struct JsonDurableTransitionRecord {
     domain_events: Vec<EventEntry>,
     durable_effects: Vec<Vec<u8>>,
     outbox: Vec<DurableOutboxMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    inbox: Vec<DurableInboxDelivery>,
     digest: [u8; 32],
 }
 
@@ -956,6 +1109,7 @@ impl JsonDurableTransitionRecord {
                 })
                 .collect::<io::Result<Vec<_>>>()?,
             outbox: transition.outbox.clone(),
+            inbox: transition.inbox.clone(),
             digest,
         })
     }
@@ -980,6 +1134,7 @@ impl JsonDurableTransitionRecord {
                 })
                 .collect::<io::Result<Vec<_>>>()?,
             outbox: self.outbox.clone(),
+            inbox: self.inbox.clone(),
         };
         transition.validate_structure()?;
         let digest = transition.digest()?;
