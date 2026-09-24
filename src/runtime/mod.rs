@@ -4518,6 +4518,16 @@ impl Runtime {
     /// set a flag and relied on `poll_llm_completions` (ai-runtime only) to
     /// resume - the single-arg form permanently hung without that feature.
     fn fire_timer_sleep_wake(&mut self, actor_id: u64) {
+        if self.actor_is_workflow(actor_id) {
+            if let Err(error) = workflow::begin_workflow_transition(self, actor_id, None) {
+                tracing::warn!(
+                    actor_id,
+                    %error,
+                    "nulang-persist: failed to begin Timer.sleep resume transition"
+                );
+                return;
+            }
+        }
         if let Some(actor) = self.actors.get_mut(&actor_id) {
             actor.timer_sleep_fired = true;
         }
@@ -4533,9 +4543,16 @@ impl Runtime {
             return;
         };
         if self.vm.is_none() {
-            // VM not available; restore suspension and requeue.
+            // VM not available; restore suspension and commit only the durable
+            // wake boundary, retaining the pre-step state for re-drive.
             if let Some(actor) = self.actors.get_mut(&actor_id) {
                 actor.suspended_execution = Some(suspended);
+            }
+            if self.actor_is_workflow(actor_id) {
+                if let Err(error) = workflow::commit_workflow_transition(self, actor_id, true) {
+                    tracing::warn!(actor_id, %error, "nulang-persist: Timer.sleep wake transition rejected");
+                    workflow::rollback_workflow_transition(self, actor_id);
+                }
             }
             self.enqueue_actor(actor_id);
             return;
@@ -4572,15 +4589,18 @@ impl Runtime {
                                 actor.set_state_field("step_index", Value::int(n + 1));
                             }
                         }
-                        let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        let committed = workflow::stage_step_completed(
+                            &mut *self_ptr,
                             actor_id,
-                            crate::runtime::WorkflowEvent::StepCompleted {
-                                sequence: seq,
-                                step_name: suspended.step_name.clone(),
-                            },
-                        );
-                        (*self_ptr).checkpoint_actor(actor_id);
+                            suspended.step_name.clone(),
+                        )
+                        .and_then(|_| {
+                            workflow::commit_workflow_transition(&mut *self_ptr, actor_id, false)
+                        });
+                        if let Err(error) = committed {
+                            tracing::warn!(actor_id, %error, "nulang-persist: Timer.sleep completion rejected");
+                            workflow::rollback_workflow_transition(&mut *self_ptr, actor_id);
+                        }
                     }
                 }
                 Err(crate::types::NuError::Suspended(_)) => {
@@ -4594,6 +4614,14 @@ impl Runtime {
                                     behavior_idx: suspended.behavior_idx,
                                     step_name: suspended.step_name.clone(),
                                 });
+                        }
+                    }
+                    if (*self_ptr).actor_is_workflow(actor_id) {
+                        if let Err(error) =
+                            workflow::commit_workflow_transition(&mut *self_ptr, actor_id, true)
+                        {
+                            tracing::warn!(actor_id, %error, "nulang-persist: Timer.sleep re-suspend rejected");
+                            workflow::rollback_workflow_transition(&mut *self_ptr, actor_id);
                         }
                     }
                 }
