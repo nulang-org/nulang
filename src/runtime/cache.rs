@@ -26,7 +26,8 @@ const MIN_ARENA_EXP: usize = 5; // 32 bytes
 const MAX_ARENA_EXP: usize = 30; // 1 GiB blocks are the largest representable class
 const FREE_LIST_COUNT: usize = MAX_ARENA_EXP - MIN_ARENA_EXP + 1;
 const DEFAULT_INDEX_CAPACITY: usize = 64;
-const DEFAULT_WHEEL_BUCKETS: usize = 4_096;
+const DEFAULT_WHEEL_BUCKETS: usize = 256;
+const DEFAULT_WHEEL_LEVELS: usize = 5;
 const DEFAULT_WHEEL_TICK_MS: u64 = 10;
 const DEFAULT_MAX_KEY_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_VALUE_BYTES: usize = 64 * 1024 * 1024;
@@ -465,25 +466,86 @@ impl S3Fifo {
 #[derive(Debug)]
 struct ExpirationWheel {
     tick_ms: u64,
-    buckets: Vec<Vec<ExpirationRef>>,
+    buckets_per_level: usize,
+    levels: Vec<Vec<Vec<ExpirationRef>>>,
     last_tick: Option<u64>,
 }
 
 impl ExpirationWheel {
     fn new(bucket_count: usize, tick_ms: u64) -> Self {
-        assert!(bucket_count > 0);
+        assert!(bucket_count > 1);
+        assert!(bucket_count.is_power_of_two());
         assert!(tick_ms > 0);
         Self {
             tick_ms,
-            buckets: (0..bucket_count).map(|_| Vec::new()).collect(),
+            buckets_per_level: bucket_count,
+            levels: (0..DEFAULT_WHEEL_LEVELS)
+                .map(|_| (0..bucket_count).map(|_| Vec::new()).collect())
+                .collect(),
             last_tick: None,
         }
     }
 
+    fn bits_per_level(&self) -> u32 {
+        self.buckets_per_level.trailing_zeros()
+    }
+
     fn schedule(&mut self, item: ExpirationRef, now_ms: u64) {
-        self.last_tick.get_or_insert(now_ms / self.tick_ms);
-        let bucket = ((item.expires_at_ms / self.tick_ms) % self.buckets.len() as u64) as usize;
-        self.buckets[bucket].push(item);
+        let now_tick = now_ms / self.tick_ms;
+        let expires_tick = item.expires_at_ms / self.tick_ms;
+        self.last_tick.get_or_insert(now_tick);
+
+        let delta = expires_tick.saturating_sub(now_tick);
+        let bits = self.bits_per_level();
+        let mut level = 0usize;
+        while level + 1 < self.levels.len() {
+            let shift = bits.saturating_mul((level + 1) as u32);
+            let span = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+            if delta < span {
+                break;
+            }
+            level += 1;
+        }
+
+        let shift = bits.saturating_mul(level as u32);
+        let coarse_tick = expires_tick >> shift;
+        let bucket = (coarse_tick & (self.buckets_per_level as u64 - 1)) as usize;
+        self.levels[level][bucket].push(item);
+    }
+
+    fn drain_level_range(
+        level: &mut [Vec<ExpirationRef>],
+        bucket_count: usize,
+        start_tick: u64,
+        end_tick: u64,
+        include_start: bool,
+        out: &mut Vec<ExpirationRef>,
+    ) {
+        if end_tick < start_tick {
+            return;
+        }
+
+        let first = if include_start {
+            start_tick
+        } else {
+            start_tick.saturating_add(1)
+        };
+        if first > end_tick {
+            return;
+        }
+
+        let elapsed = end_tick.saturating_sub(first).saturating_add(1);
+        if elapsed >= bucket_count as u64 {
+            for bucket in level {
+                out.append(bucket);
+            }
+            return;
+        }
+
+        let mask = bucket_count as u64 - 1;
+        for tick in first..=end_tick {
+            out.append(&mut level[(tick & mask) as usize]);
+        }
     }
 
     fn drain_candidates(&mut self, now_ms: u64, out: &mut Vec<ExpirationRef>) {
@@ -493,25 +555,62 @@ impl ExpirationWheel {
             return;
         };
 
-        let bucket_count = self.buckets.len() as u64;
-        let elapsed = current.saturating_sub(last);
+        let bits = self.bits_per_level();
+        for level_index in (0..self.levels.len()).rev() {
+            let shift = bits.saturating_mul(level_index as u32);
+            let last_coarse = last >> shift;
+            let current_coarse = current >> shift;
 
-        if elapsed >= bucket_count {
-            for bucket in &mut self.buckets {
-                out.append(bucket);
-            }
-        } else {
-            // Include the current bucket even when no full tick elapsed so
-            // sub-tick TTLs can be reaped by an explicit purge call.
-            // Revisit the previous tick as well. A sub-tick TTL may have
-            // been scheduled into that bucket after the prior purge and can
-            // become due before the clock advances into the next bucket.
-            for tick in last..=current {
-                let idx = (tick % bucket_count) as usize;
-                out.append(&mut self.buckets[idx]);
+            if level_index == 0 {
+                // Revisit the current base bucket so sub-tick expirations
+                // scheduled after the previous sweep can still be observed.
+                Self::drain_level_range(
+                    &mut self.levels[level_index],
+                    self.buckets_per_level,
+                    last_coarse,
+                    current_coarse,
+                    true,
+                    out,
+                );
+            } else if current_coarse > last_coarse {
+                Self::drain_level_range(
+                    &mut self.levels[level_index],
+                    self.buckets_per_level,
+                    last_coarse,
+                    current_coarse,
+                    false,
+                    out,
+                );
             }
         }
+
         self.last_tick = Some(current);
+    }
+
+    fn reserved_bytes(&self) -> usize {
+        self.levels
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Vec<Vec<ExpirationRef>>>())
+            .saturating_add(
+                self.levels
+                    .iter()
+                    .map(|level| {
+                        level
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<Vec<ExpirationRef>>())
+                            .saturating_add(
+                                level
+                                    .iter()
+                                    .map(|bucket| {
+                                        bucket
+                                            .capacity()
+                                            .saturating_mul(std::mem::size_of::<ExpirationRef>())
+                                    })
+                                    .sum::<usize>(),
+                            )
+                    })
+                    .sum::<usize>(),
+            )
     }
 }
 
@@ -1321,25 +1420,12 @@ impl CacheStore {
             .capacity()
             .saturating_mul(std::mem::size_of::<u32>());
         let expiry_reserved_bytes = self
-            .expiry_scratch
-            .capacity()
-            .saturating_mul(std::mem::size_of::<ExpirationRef>())
+            .expiry
+            .reserved_bytes()
             .saturating_add(
-                self.expiry
-                    .buckets
+                self.expiry_scratch
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<Vec<ExpirationRef>>()),
-            )
-            .saturating_add(
-                self.expiry
-                    .buckets
-                    .iter()
-                    .map(|bucket| {
-                        bucket
-                            .capacity()
-                            .saturating_mul(std::mem::size_of::<ExpirationRef>())
-                    })
-                    .sum::<usize>(),
+                    .saturating_mul(std::mem::size_of::<ExpirationRef>()),
             );
         let eviction_reserved_bytes = self
             .eviction
@@ -1485,6 +1571,29 @@ mod tests {
             store.get(b"b", 0),
             Some(CacheValueView::Bytes(b.as_slice()))
         );
+    }
+
+    #[test]
+    fn hierarchical_ttl_wheel_does_not_revisit_long_ttls_each_base_rotation() {
+        let mut wheel = ExpirationWheel::new(DEFAULT_WHEEL_BUCKETS, DEFAULT_WHEEL_TICK_MS);
+        let item = ExpirationRef {
+            slot: 1,
+            generation: 1,
+            expires_at_ms: 24 * 60 * 60 * 1_000,
+        };
+        wheel.schedule(item, 0);
+
+        let mut candidates = Vec::new();
+        wheel.drain_candidates(
+            DEFAULT_WHEEL_BUCKETS as u64 * DEFAULT_WHEEL_TICK_MS,
+            &mut candidates,
+        );
+        assert!(candidates.is_empty());
+
+        wheel.drain_candidates(item.expires_at_ms, &mut candidates);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].slot, item.slot);
+        assert_eq!(candidates[0].generation, item.generation);
     }
 
     #[test]
