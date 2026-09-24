@@ -38,6 +38,112 @@ fn test_recursive_scc_analysis_handles_long_acyclic_chain() {
 }
 
 #[test]
+fn test_infer_reg_types_uses_compiler_owned_entry_seed() {
+    use crate::jit::typed_compiler::{
+        compiler_type_seed_applies, infer_reg_types, KnownType, TypeMetadata,
+    };
+
+    let mut module = CodeModule::new("compiler_type_seed");
+    module.function_table = vec![0];
+    module.emit(Instruction::new2(OpCode::Move, 0, 15));
+    module.emit(Instruction::new3(OpCode::IAdd, 15, 15, 16));
+    module.emit(Instruction::new1(OpCode::RetVal, 16));
+
+    assert_eq!(infer_reg_types(&module, 1).get_type(15), KnownType::Unknown);
+
+    let mut seed = TypeMetadata::new();
+    seed.set_type(0, KnownType::Int);
+    module.jit_type_seeds.push((0, seed));
+
+    assert!(compiler_type_seed_applies(&module, 1));
+    assert_eq!(infer_reg_types(&module, 1).get_type(15), KnownType::Int);
+}
+
+#[test]
+fn test_mir_codegen_publishes_typed_parameter_jit_seed() {
+    use crate::hir_lower::lower_module;
+    use crate::jit::typed_compiler::{infer_reg_types, KnownType};
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+
+    let source = "fn bump(x: Int) -> Int { x + 1 }; fn main() -> Int { bump(41) }";
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_param_seed").expect("codegen");
+
+    let bump_offset = module.function_offset_by_name("bump").expect("bump offset");
+    let seed = module
+        .jit_type_seeds
+        .iter()
+        .find(|(offset, _)| *offset == bump_offset)
+        .map(|(_, seed)| seed)
+        .expect("typed parameter seed");
+    assert_eq!(seed.get_type(0), KnownType::Int);
+
+    let prologue = module.instructions[bump_offset];
+    assert_eq!(prologue.opcode, OpCode::Move);
+    assert_eq!(infer_reg_types(&module, bump_offset + 1).get_type(prologue.op2 as usize), KnownType::Int);
+}
+
+#[test]
+fn test_compiler_seed_guard_deopts_dynamic_type_mismatch() {
+    use crate::backends::JitBackend;
+    use crate::jit::typed_compiler::{KnownType, TypeMetadata};
+    use crate::vm::Value;
+
+    let mut jit = make_jit();
+    let module = CodeModule {
+        instructions: vec![
+            Instruction::new3(OpCode::IAdd, 0, 1, 2),
+            Instruction::new3(OpCode::IAdd, 2, 1, 3),
+            Instruction::new1(OpCode::RetVal, 3),
+        ],
+        ..CodeModule::new("seed_guard")
+    };
+
+    let mut meta = TypeMetadata::new();
+    meta.set_type(0, KnownType::Int);
+    meta.set_type(1, KnownType::Int);
+    assert!(unsafe {
+        jit.compile_region_typed(
+            0,
+            0,
+            3,
+            &module.instructions,
+            Some(&meta),
+            &std::collections::HashMap::new(),
+        )
+    }
+    .is_some());
+    jit.install_type_guard(0, 0, &meta);
+
+    let mut regs = [0u64; 256];
+    regs[0] = Value::float(1.5).to_bits();
+    regs[1] = Value::int(2).to_bits();
+    assert_eq!(
+        JitBackend::execute_compiled(&mut jit, 0, 0, &mut regs, &[]),
+        TieredAction::Interpret
+    );
+    assert_eq!(regs[2], 0);
+
+    regs[0] = Value::int(20).to_bits();
+    regs[1] = Value::int(1).to_bits();
+    assert_eq!(
+        JitBackend::execute_compiled(&mut jit, 0, 0, &mut regs, &[]),
+        TieredAction::RanJit
+    );
+    let result = unsafe { Value::from_bits(regs[3]) };
+    assert_eq!(result.as_int(), Some(22));
+}
+
+#[test]
 fn test_jit_session_creation() {
     let jit = JitSession::new().expect("JIT must be available");
     assert_eq!(jit.compiled_count(), 0);
