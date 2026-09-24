@@ -846,10 +846,7 @@ impl CacheStore {
         Ok(())
     }
 
-    fn prepare_bytes_batch(
-        &mut self,
-        pairs: &[(&[u8], &[u8])],
-    ) -> Result<(), CacheWriteError> {
+    fn prepare_bytes_batch(&mut self, pairs: &[(&[u8], &[u8])]) -> Result<(), CacheWriteError> {
         match self.validate_bytes_batch(pairs) {
             Err(CacheWriteError::ArenaLimitReached) if self.arena.reclaim_empty_slabs() != 0 => {
                 self.validate_bytes_batch(pairs)
