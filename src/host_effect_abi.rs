@@ -11,6 +11,8 @@
 //! positional tagged-value argument ABI. Custom effects retain their legacy
 //! source tag until they opt into an explicit versioned host contract.
 
+use crate::primitives::DeliverySemantics;
+
 /// Experimental host-effect ABI schema identity.
 ///
 /// This is intentionally independent from the Nulang language version and from
@@ -74,6 +76,24 @@ impl HostReplayClass {
             Self::ExternalIdempotent => "external-idempotent",
             Self::ExternalRequiresIdempotencyKey => "external-requires-idempotency-key",
             Self::ExternalNonreplayable => "external-nonreplayable",
+        }
+    }
+
+    /// Translate replay classification into durable redispatch semantics only
+    /// when the compiler-owned class is sufficient to do so without guessing.
+    ///
+    /// `JournalResult` deliberately returns `None`: it says what to do after
+    /// a completion is durably recorded, but does not specify whether an
+    /// ambiguously Prepared operation may be retried. Pure/local operations do
+    /// not belong on the durable external-effect path.
+    pub const fn durable_delivery_semantics(self) -> Option<DeliverySemantics> {
+        match self {
+            Self::ExternalIdempotent => Some(DeliverySemantics::AtLeastOnce),
+            Self::ExternalRequiresIdempotencyKey => {
+                Some(DeliverySemantics::EffectivelyOnceWithDeduplication)
+            }
+            Self::ExternalNonreplayable => Some(DeliverySemantics::NoAutomaticRetry),
+            Self::Pure | Self::LocalReplaySafe | Self::JournalResult => None,
         }
     }
 }
@@ -543,6 +563,26 @@ mod tests {
         assert_eq!(
             HostReplayClass::ExternalNonreplayable.manifest_class(),
             "external-nonreplayable"
+        );
+    }
+
+    #[test]
+    fn external_replay_classes_map_to_durable_delivery_without_strengthening() {
+        assert_eq!(
+            HostReplayClass::ExternalIdempotent.durable_delivery_semantics(),
+            Some(DeliverySemantics::AtLeastOnce)
+        );
+        assert_eq!(
+            HostReplayClass::ExternalRequiresIdempotencyKey.durable_delivery_semantics(),
+            Some(DeliverySemantics::EffectivelyOnceWithDeduplication)
+        );
+        assert_eq!(
+            HostReplayClass::ExternalNonreplayable.durable_delivery_semantics(),
+            Some(DeliverySemantics::NoAutomaticRetry)
+        );
+        assert_eq!(
+            HostReplayClass::JournalResult.durable_delivery_semantics(),
+            None
         );
     }
 
