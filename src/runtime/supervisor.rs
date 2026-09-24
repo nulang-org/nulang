@@ -132,6 +132,8 @@ pub struct RestartTemplate {
     pub state_models: HashMap<String, StateModel>,
     /// Native behavior handlers (name, handler).
     pub behaviors: Vec<(String, fn(&mut Actor, &[Value]))>,
+    /// Definition-scoped semantic identity captured from the child.
+    pub definition_semantic_id: Option<crate::content_identity::SemanticId>,
     /// Bytecode module backing the child's bytecode behaviors, if any.
     pub bytecode_module: Option<crate::bytecode::CodeModule>,
     /// Bytecode behavior offsets by behavior id.
@@ -334,6 +336,29 @@ impl Supervisor {
             None
         };
 
+        let verified_definition_semantic_id = if let Some(ref snap) = snapshot {
+            match Runtime::verify_snapshot_definition_semantic_identity(
+                old_actor_id,
+                snap,
+                template.definition_semantic_id,
+                RecoveryIdentityPolicy::LegacyCompatible,
+            ) {
+                Ok(id) => id,
+                Err(error) => {
+                    warn!(
+                        supervisor = %self.name,
+                        child = %spec.id,
+                        %error,
+                        "refusing supervised restart with incompatible definition identity"
+                    );
+                    return None;
+                }
+            }
+        } else {
+            template.definition_semantic_id
+        };
+        new_actor.definition_semantic_id = verified_definition_semantic_id;
+
         if let Some(ref snap) = snapshot {
             for (name, value) in &snap.state {
                 let v = value.to_value_on_heap(&mut new_actor);
@@ -365,11 +390,13 @@ impl Supervisor {
         new_actor.parent = Some(self.id);
         if let Some(module) = &template.bytecode_module {
             new_actor.bytecode_module = Some(module.clone());
-            runtime.register_recovery_module(
+            super::spawn::register_recovery_module(
+                runtime,
                 new_id,
                 module.clone(),
                 template.bytecode_offsets.clone(),
                 template.compensation_offsets.clone(),
+                verified_definition_semantic_id,
             );
         }
         let role = match new_actor.role() {
