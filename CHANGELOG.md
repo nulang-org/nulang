@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### Native semantic effect-site provenance — 2026-09-24
+- **AOT/native effect helpers now receive a compiler-assigned semantic-site index and resolve it through the active `AotModule` to the same backend-independent 32-byte digest used by bytecode.** Native dispatch reports no fabricated bytecode PC, and operation names remain descriptive rather than identity-bearing.
+- Native codegen builds the statement-to-site map in natural MIR order before reverse-postorder block emission, so control-flow traversal cannot perturb identity. Both synchronous `Perform` and generic `PerformAsync` use the site-aware callback contract.
+- A native regression executes two identical `IO.print` operations and pins that they arrive with distinct semantic-site digests despite sharing the same operation name.
+
 ### Site-aware effect callback provenance — 2026-09-24
 - **Bytecode `Perform` and `PerformAsync` dispatch now carry an optional backend-local artifact PC plus the validated compiler-owned semantic-site digest into the VM→runtime callback boundary.** The semantic digest is backend-independent and copyable; new callback methods default to the existing behavior so embedders remain source-compatible without reconstructing identity from names or PCs.
 - Focused regression tests prove synchronous built-in and generic async callbacks receive the exact semantic-site digest attached to the executing opcode. Native/JIT adapters can use the same context with no fake bytecode PC while they adopt equivalent provenance.

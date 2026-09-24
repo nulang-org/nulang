@@ -24,6 +24,7 @@ use cranelift_module::Module;
 
 use crate::mir;
 use crate::runtime::heap::TypeTag as HeapTypeTag;
+use crate::semantic_identity::{effect_sites_for_mir, EffectSiteOwnerKind};
 use crate::types::{NuResult, Span};
 
 /// Compiled AOT module ready for execution.
@@ -50,6 +51,10 @@ pub struct AotModule {
     field_map: std::collections::HashMap<String, u8>,
     /// Constant pool (String literals), for runtime string resolution.
     constants: Vec<crate::bytecode::Constant>,
+    /// Compiler-owned semantic effect-site digests in canonical MIR site order.
+    /// Native code passes an index into this table to runtime helpers; bytecode
+    /// PCs are deliberately not part of the native identity contract.
+    effect_site_ids: Vec<[u8; 32]>,
     /// The bytecode `CodeModule` compiled from the same MIR, retained so a
     /// native behavior can spawn real Runtime actors through
     /// `Runtime::spawn_from_module` (which needs a CodeModule). Built
@@ -84,6 +89,15 @@ impl AotModule {
 
         let mut jit_module = JITModule::new(jit_builder);
         let mut builder_context = FunctionBuilderContext::new();
+
+        // Capture backend-independent effect identity before native codegen.
+        // Generated helper calls carry only an index into this immutable table;
+        // operation names and native instruction layout never define identity.
+        let semantic_effect_sites = effect_sites_for_mir(mir_module);
+        let effect_site_ids: Vec<[u8; 32]> = semantic_effect_sites
+            .iter()
+            .map(|site| *site.id.as_bytes())
+            .collect();
 
         // Pre-scan: build module-wide field name → slot index map and
         // constant pool for string literals.
@@ -167,6 +181,14 @@ impl AotModule {
         let mut entry_idx: Option<usize> = None;
 
         for (idx, func) in mir_module.functions.iter().enumerate() {
+            let effect_site_indices: Vec<usize> = semantic_effect_sites
+                .iter()
+                .enumerate()
+                .filter(|(_, site)| {
+                    site.owner_kind == EffectSiteOwnerKind::Function && site.owner_name == func.name
+                })
+                .map(|(site_index, _)| site_index)
+                .collect();
             // For all-Int functions: compile unboxed body first, then
             // generate a boxing wrapper as the boxed entry point. The
             // original boxed body is never compiled.
@@ -185,6 +207,7 @@ impl AotModule {
                     idx,
                     ub_fid,
                     codegen::CompileMode::Unboxed,
+                    &effect_site_indices,
                 )
                 .map_err(|e| crate::types::NuError::VMError {
                     msg: format!("AOT compilation of unboxed '{}' failed: {}", func.name, e),
@@ -216,6 +239,7 @@ impl AotModule {
                     idx,
                     func_ids[idx],
                     codegen::CompileMode::Boxed,
+                    &effect_site_indices,
                 )
                 .map_err(|e| crate::types::NuError::VMError {
                     msg: format!("AOT compilation of '{}' failed: {}", func.name, e),
@@ -236,6 +260,14 @@ impl AotModule {
         let mut behavior_names: Vec<String> = Vec::new();
         let mut behavior_entry_fids: Vec<cranelift_module::FuncId> = Vec::new();
         for (idx, func) in mir_module.behaviors.iter().enumerate() {
+            let effect_site_indices: Vec<usize> = semantic_effect_sites
+                .iter()
+                .enumerate()
+                .filter(|(_, site)| {
+                    site.owner_kind == EffectSiteOwnerKind::Behavior && site.owner_name == func.name
+                })
+                .map(|(site_index, _)| site_index)
+                .collect();
             let func_name = format!("nulang_behavior_{}", idx);
             let mut sig = jit_module.make_signature();
             for _ in &func.params {
@@ -275,6 +307,7 @@ impl AotModule {
                 idx,
                 fid,
                 codegen::CompileMode::Boxed,
+                &effect_site_indices,
             )
             .map_err(|e| crate::types::NuError::VMError {
                 msg: format!("AOT compilation of behavior '{}' failed: {}", func.name, e),
@@ -326,6 +359,7 @@ impl AotModule {
             entry_idx,
             field_map,
             constants,
+            effect_site_ids,
             code_module,
         })
     }
@@ -765,6 +799,17 @@ pub fn aot_module_constants() -> &'static [crate::bytecode::Constant] {
     }
 }
 
+/// Resolve a compiler-owned semantic effect-site digest from the active native
+/// module. Generated code passes the canonical site-table index as an immediate.
+pub fn aot_effect_site_id(site_index: u64) -> Option<[u8; 32]> {
+    let module = AOT_MODULE_CTX.with(|c| *c.borrow());
+    if module.is_null() {
+        return None;
+    }
+    // SAFETY: the armed module outlives the dispatched native call.
+    unsafe { (*module).effect_site_ids.get(site_index as usize).copied() }
+}
+
 /// Native-code entry point for captured-closure dispatch: resolve a compiled
 /// function pointer by MIR function index from the armed module context.
 /// Returns the pointer as u64 (0 when no module is armed or the index is out
@@ -919,7 +964,7 @@ macro_rules! define_aot_perform {
     ($name:ident, $($arg:ident),*) => {
         /// Perform a builtin effect from AOT-compiled code.
         #[no_mangle]
-        pub unsafe extern "C" fn $name(eff_raw: u64, op_raw: u64 $(, $arg: u64)*) -> u64 {
+        pub unsafe extern "C" fn $name(site_index: u64, eff_raw: u64, op_raw: u64 $(, $arg: u64)*) -> u64 {
             let effect = crate::jit::runtime::resolve_string_coerce(eff_raw).unwrap_or_default();
             let op = crate::jit::runtime::resolve_string_coerce(op_raw).unwrap_or_default();
             let regs = [$(unsafe { crate::vm::Value::from_bits($arg) }),*];
@@ -941,11 +986,17 @@ macro_rules! define_aot_perform {
             } else {
                 unsafe { &(*module).constants }
             };
+            let context = crate::vm::EffectInvocationContext {
+                module_idx: None,
+                artifact_pc: None,
+                semantic_site_id: aot_effect_site_id(site_index),
+            };
             let handled = crate::jit::runtime::try_with_callbacks(|cb| {
                 if module.is_null() {
                     cb.perform_builtin_effect(&effect, Some(&op), constants, &regs)
                 } else {
-                    cb.perform_builtin_effect_in_module(
+                    cb.perform_builtin_effect_at_site(
+                        context,
                         &effect,
                         Some(&op),
                         unsafe { &*module },
@@ -1995,6 +2046,104 @@ fn collect_rvalue_field_and_consts(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug)]
+    struct EffectCaptureCallbacks {
+        seen: Arc<Mutex<Vec<crate::vm::EffectInvocationContext>>>,
+    }
+
+    impl crate::vm::ActorVmCallbacks for EffectCaptureCallbacks {
+        fn alloc(
+            &mut self,
+            _size: usize,
+            _type_tag: crate::runtime::heap::TypeTag,
+        ) -> Option<*mut u8> {
+            None
+        }
+
+        fn drop_ref(&mut self, _ptr: *mut u8) {}
+
+        fn retain_ref(&mut self, _ptr: *mut u8) {}
+
+        fn array_len(&self, _ptr: *mut u8) -> Option<usize> {
+            None
+        }
+
+        fn spawn_actor(
+            &mut self,
+            _module: &crate::bytecode::CodeModule,
+            _spawn_pc: usize,
+            _behavior_idx: usize,
+            _init: Vec<(String, crate::vm::Value)>,
+        ) -> crate::vm::Value {
+            crate::vm::Value::nil()
+        }
+
+        fn send_message(
+            &mut self,
+            _target: crate::vm::Value,
+            _behavior_id: u16,
+            _args: &[crate::vm::Value],
+        ) {
+        }
+
+        fn perform_builtin_effect_at_site(
+            &mut self,
+            context: crate::vm::EffectInvocationContext,
+            _effect_name: &str,
+            _op_name: Option<&str>,
+            _module: &crate::bytecode::CodeModule,
+            _regs: &[crate::vm::Value],
+        ) -> Option<crate::vm::Value> {
+            self.seen.lock().unwrap().push(context);
+            Some(crate::vm::Value::unit())
+        }
+    }
+
+    #[test]
+    fn native_effect_helpers_preserve_distinct_semantic_sites() {
+        let source = r#"
+            fn main() {
+                perform IO.print("first")
+                perform IO.print("second")
+            }
+        "#;
+        let tokens = crate::lexer::Lexer::new(source).lex().unwrap();
+        let ast = crate::parser::Parser::new(tokens).parse_module().unwrap();
+        let mut tc = crate::typechecker::TypeChecker::new();
+        tc.check_module(&ast).unwrap();
+        let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+        let mir = crate::mir_lower::lower_module(&hir).unwrap();
+        let aot = super::AotModule::compile(&mir).expect("AOT compile");
+
+        assert_eq!(aot.effect_site_ids.len(), 2);
+        assert_ne!(aot.effect_site_ids[0], aot.effect_site_ids[1]);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut callbacks = EffectCaptureCallbacks { seen: seen.clone() };
+        unsafe {
+            crate::jit::runtime::aot_set_constants(&aot.constants);
+            crate::jit::runtime::set_jit_callbacks(&mut callbacks);
+        }
+        super::set_aot_module_ctx(&aot);
+
+        let ptr = aot.compiled_funcs[aot.entry_idx.expect("main entry")];
+        let func: extern "C" fn() -> u64 = unsafe { std::mem::transmute(ptr) };
+        let _ = func();
+
+        crate::jit::runtime::clear_jit_callbacks();
+        crate::jit::runtime::aot_clear_constants();
+        super::clear_aot_module_ctx();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].artifact_pc, None);
+        assert_eq!(seen[1].artifact_pc, None);
+        assert_eq!(seen[0].semantic_site_id, Some(aot.effect_site_ids[0]));
+        assert_eq!(seen[1].semantic_site_id, Some(aot.effect_site_ids[1]));
+    }
+
     /// End-to-end: `"hello" + 2 + 3` must concatenate with coercion ("hello23"),
     /// not fall through to integer arithmetic on the string's tag bits. Replicates
     /// `AotModule::run`'s heap + constants setup but keeps the heap alive so the
