@@ -26,12 +26,16 @@ benchmarks, from neighbor CPU/cache contention) that a naive fixed
 threshold would be flaky, failing pushes for noise rather than real
 regressions. The gate instead computes, per benchmark, the median and
 median absolute deviation (MAD, an outlier-resistant spread estimate)
-across the last 10 `main`-branch results, then flags a regression only
-when the latest value exceeds `median + 6×MAD` (floored at 20% of the
-median, so an unusually stable run of samples doesn't turn a trivial
-delta into a false positive). A benchmark needs at least 3 prior samples
-in the window before it's gated at all — new or rarely-run benchmarks are
-reported as skipped, not failed, until enough history accumulates.
+across the last 10 `main`-branch results, ordered by the Git commit
+timestamp encoded by each result filename, then flags a regression only when
+the latest value exceeds `median + 6×MAD` (floored at 20% of the median, so
+an unusually stable run of samples doesn't turn a trivial delta into a false
+positive). Filesystem mtimes are deliberately not used for normal CI ordering:
+history files are materialized from the automation branch during a run, so
+their copy time is not their benchmark time. A benchmark needs at least 3
+prior samples in the window before it's gated at all — new or rarely-run
+benchmarks are reported as skipped, not failed, until enough history
+accumulates.
 
 This intentionally does not need a dedicated non-shared runner: the
 noise-adaptive threshold is the fix, not the infrastructure change.
