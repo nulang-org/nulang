@@ -51,6 +51,13 @@ version + migration.*
 
 ## Stable tier
 
+### Semantic effect-site artifact metadata — 2026-09-23
+- **Bytecode artifacts now carry an additive `effect_sites` metadata sidecar** mapping the exact `Perform` / `PerformDirect` / `PerformAsync` instruction PC to the compiler-owned semantic effect-site digest and qualified operation. Opcode bytes and NBC format version remain unchanged.
+- **MIR codegen captures semantic sites before optimization and consumes them while emitting effects.** If optimization ever removes or reorders observable effect operations, codegen fails instead of silently attaching an incorrect durable identity.
+- Effect metadata is attached after argument staging, so the recorded PC points at the effect opcode itself rather than preceding spill/move instructions.
+- NBC round-trip tests pin metadata preservation, legacy artifacts without the field default to an empty sidecar, and formatting-only source changes preserve the semantic site digest.
+- NBC encode/decode now rejects unsorted, duplicate, out-of-range, or non-effect effect-site PCs so binary-search lookup cannot silently accept malformed durability metadata.
+
 ### Type-preserving async effect completions — 2026-09-23
 - **`PerformAsyncResult` now has an additive `ReadyValue(Value)` completion path** so asynchronous host effects can resume with integers, floats, booleans, actor-safe opaque handles, or other already-materialized VM values without coercing them through strings.
 - **The interpreter stores `ReadyValue` directly and the native JIT/AOT helper returns its raw value bits**, while the existing `Ready(Option<String>)` and `Pending` contracts remain unchanged. A VM regression pins non-string result preservation.
