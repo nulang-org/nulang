@@ -1477,7 +1477,7 @@ mod tests {
         let b = vec![2u8; 100];
         store.set_bytes(b"a", &a, None, 0);
         let reserved = store.memory_stats().arena_reserved_bytes;
-        assert_eq!(reserved, 128);
+        assert_eq!(reserved, ARENA_SLAB_TARGET_BYTES);
         assert!(store.delete(b"a"));
         store.set_bytes(b"b", &b, None, 0);
         assert_eq!(store.memory_stats().arena_reserved_bytes, reserved);
