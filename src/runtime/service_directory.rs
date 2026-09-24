@@ -189,6 +189,10 @@ impl ServiceDirectory {
         })
     }
 
+    pub(crate) fn remote_generation(&self, node_id: NodeId) -> Option<u64> {
+        self.remote_generations.get(&node_id).copied()
+    }
+
     pub(crate) fn replace_remote_node(
         &mut self,
         snapshot: ServiceAdvertisementSnapshot,
