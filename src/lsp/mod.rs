@@ -2352,8 +2352,6 @@ impl NulangLanguageServer {
     }
 }
 
-/// Convert a `NuError` into zero or more LSP `Diagnostic`s.
-/// For `NuError::Multiple`, each sub-error becomes its own diagnostic.
 /// Convert a compiler warning into an LSP diagnostic while preserving its
 /// stable warning code and source span.
 fn nu_warning_to_diagnostic(warning: NuWarning) -> Diagnostic {
@@ -2384,6 +2382,8 @@ fn nu_warning_to_diagnostic(warning: NuWarning) -> Diagnostic {
     }
 }
 
+/// Convert a `NuError` into zero or more LSP `Diagnostic`s.
+/// For `NuError::Multiple`, each sub-error becomes its own diagnostic.
 fn nu_error_to_diagnostic(err: NuError) -> Vec<Diagnostic> {
     match err {
         NuError::Multiple(errors) => {
