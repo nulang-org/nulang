@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Complete Python marshal extraction typing — 2026-09-24
+- **Owned Python→Nulang foreign-value conversion now uses explicit PyO3 extraction targets for Int, Float, and String** (`src/python/marshal.rs`), completing the Bool fix from #930. This prevents Rust/CodeQL builds from failing generic `extract` inference one branch at a time without changing conversion semantics.
+
+
 ### Python bool marshal type inference — 2026-09-24
 - **Default-feature builds now make PyO3 boolean extraction explicit with `extract::<bool>()`**, avoiding a compiler inference failure in the Python marshal path without changing conversion semantics.
 
