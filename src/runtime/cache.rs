@@ -1622,7 +1622,11 @@ impl CacheStore {
         entries: &[CacheSnapshotEntry],
         now_ms: u64,
     ) -> Result<Self, CacheWriteError> {
-        let mut store = Self::with_config_and_eviction(config, eviction_policy);
+        // Recovery must never silently evict older snapshot entries merely
+        // because the configured steady-state policy permits eviction. Restore
+        // fail-closed first, then enable the requested policy once every entry
+        // has been admitted.
+        let mut store = Self::with_config_and_eviction(config, CacheEvictionPolicy::None);
         for entry in entries {
             if entry.remaining_ttl_ms == Some(0) {
                 continue;
@@ -1646,6 +1650,7 @@ impl CacheStore {
                 }
             }
         }
+        store.eviction.policy = eviction_policy;
         Ok(store)
     }
 
@@ -1810,6 +1815,34 @@ mod tests {
         );
         assert_eq!(restored.ttl(b"ttl", 1_000), CacheTtl::RemainingMs(4_900));
         assert_eq!(restored.get(b"expired", 1_000), None);
+    }
+
+    #[test]
+    fn snapshot_restore_fails_closed_instead_of_evicting_entries() {
+        let entries = vec![
+            CacheSnapshotEntry {
+                key: b"a".to_vec(),
+                value: CacheSnapshotValue::Integer(1),
+                remaining_ttl_ms: None,
+            },
+            CacheSnapshotEntry {
+                key: b"b".to_vec(),
+                value: CacheSnapshotValue::Integer(2),
+                remaining_ttl_ms: None,
+            },
+        ];
+        let result = CacheStore::from_snapshot(
+            CacheConfig {
+                max_key_bytes: 64,
+                max_value_bytes: 64,
+                max_entries: 1,
+                max_arena_bytes: 1024,
+            },
+            CacheEvictionPolicy::S3Fifo,
+            &entries,
+            0,
+        );
+        assert!(matches!(result, Err(CacheWriteError::EntryLimitReached)));
     }
 
     #[test]
