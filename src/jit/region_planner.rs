@@ -46,12 +46,7 @@ pub(crate) struct RegionPlanner {
 }
 
 impl RegionPlanner {
-    pub(crate) fn plan(
-        &mut self,
-        module_idx: usize,
-        pc: usize,
-        module: &CodeModule,
-    ) -> RegionPlan {
+    pub(crate) fn plan(&mut self, module_idx: usize, pc: usize, module: &CodeModule) -> RegionPlan {
         if !self.may_suspend.contains_key(&module_idx) {
             self.may_suspend
                 .insert(module_idx, compute_may_suspend(module));
@@ -564,4 +559,3 @@ mod planner_tests {
         assert!(plan.native_calls.is_empty());
     }
 }
-
