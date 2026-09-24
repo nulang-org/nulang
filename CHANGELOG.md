@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### RESP cache memory/TTL hardening and Valkey differential gate — 2026-09-24
+- **The experimental RESP cache now uses keyed hashing, bounded admission, S3-FIFO eviction, segmented size-class slabs, and pressure-triggered empty-slab reclamation** instead of relying on one relocatable arena backing buffer.
+- **Expiration now uses a five-level hierarchical timing wheel**, preventing long-lived TTLs from being reconsidered on each base-wheel rotation while preserving lazy expiry and generation fencing.
+- **RESP parsing caches the first two validated arguments on the command frame**, removing repeated bulk-header decoding from the common GET/SET/INCR/EXPIRE/TTL/PING path without changing the generic multi-key iterator.
+- **A feature-gated `nulang-cache` process and path-scoped CI oracle compare the supported RESP core over TCP against Valkey 9.1**, including binary values, counters, TTL/expiry, same-slot MGET/MSET, deletion, and pipelining.
+
 ### JIT tier replacement and compile-time observability — 2026-09-24
 - **Tier-2 promotion now replaces the installed machine-code entry instead of returning the already-cached lower-tier function.** Compiled regions carry an explicit `Baseline` / `Typed` / `Simd` tier plus a `Fast` / `Optimized` codegen policy, and promotion uses fresh Cranelift symbols while preserving the same cache slot.
 - **First-tier native code now uses a low-latency Cranelift module with `opt_level=none` and `regalloc_algorithm=single_pass`; hot replacement uses a separate `opt_level=speed` + backtracking-register-allocation module.** Baseline code can retain folded direct calls while being recompiled at the optimized level; typed code preserves type-directed guard stripping across promotion and can subsequently promote to SIMD when the loop analyzer accepts it.
