@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### Persistent agent query daemon — 2026-09-24
+- **`nulang query serve` now exposes the core semantic query engine as newline-delimited JSON-RPC 2.0 over stdio**, with namespaced methods for type, references, callers, callees, context, cache invalidation, and cache clearing.
+- **The daemon caches parsed/typechecked semantic indexes by BLAKE3 source digest**, so repeated queries against unchanged files avoid parser, import-resolution, and typechecker work while still re-reading source bytes to observe edits immediately.
+- The reusable semantic query API is transport-independent; the CLI and daemon share the same query/index implementation, establishing the boundary a later MCP adapter can wrap without duplicating compiler logic.
+- Unit tests cover multi-request sessions, cache refresh after source changes, and notification semantics.
+
 ### Agent-native source queries and repairable diagnostics — 2026-09-24
 - **Core tooling now exposes `nulang query symbols` and `nulang query symbol` without the optional AI runtime**, returning stable JSON declaration metadata including qualified names, source spans, signatures, effect/capability annotations, and visibility where available.
 - **JSON diagnostics now carry stable machine-oriented `kind` values, structured `data`, exact UTF-8 byte offsets, and `fixes`**, while preserving the existing error code/message/notes/suggestion surface. An unbound identifier with exactly one close in-scope candidate emits a `machine_applicable` replacement edit.
