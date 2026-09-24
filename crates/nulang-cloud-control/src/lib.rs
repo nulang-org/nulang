@@ -14,8 +14,8 @@ pub mod scheduler;
 pub mod store;
 
 pub use executor::{
-    dispatch_pending, AllocationCommandSink, CommandApplyError, DispatchOutcome, DispatchRecord,
-    DispatchReport,
+    dispatch_pending, dispatch_pending_as, AllocationCommandSink, CommandApplyError,
+    DispatchOutcome, DispatchRecord, DispatchReport,
 };
 pub use model::*;
 pub use reconciler::{reconcile_once, ReconcileError, ReconcileResult};
