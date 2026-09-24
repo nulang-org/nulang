@@ -1,0 +1,80 @@
+name: Nulang actor A/B benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Git ref or SHA to compare against
+        required: false
+        default: main
+      runs:
+        description: Measured runs per variant
+        required: false
+        default: '5'
+      warmup:
+        description: Warm-up runs per variant
+        required: false
+        default: '1'
+      profile:
+        description: Cargo feature profile
+        required: false
+        default: core-native
+        type: choice
+        options:
+          - core-native
+          - default
+  pull_request:
+    paths:
+      - '.github/workflows/nulang-ab-bench.yml'
+      - 'scripts/nulang_ab_bench.py'
+      - 'src/runtime/**'
+      - 'src/aot/**'
+      - 'src/jit/**'
+      - 'src/benchmarks.rs'
+      - 'benches/actor_bench.rs'
+
+concurrency:
+  group: nulang-ab-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: Exact base vs candidate actor A/B
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run same-host A/B
+        env:
+          BASE_REF: "${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.base_ref }}"
+          RUNS: "${{ github.event_name == 'pull_request' && '3' || inputs.runs }}"
+          WARMUP: "${{ github.event_name == 'pull_request' && '1' || inputs.warmup }}"
+          PROFILE: "${{ github.event_name == 'pull_request' && 'core-native' || inputs.profile }}"
+        run: |
+          args=(
+            --base-ref "$BASE_REF"
+            --runs "$RUNS"
+            --warmup "$WARMUP"
+            --cpu-mode single
+            --output nulang-ab-results.json
+          )
+          if [[ "$PROFILE" == "core-native" ]]; then
+            args+=(--no-default-features --features native-codegen)
+          fi
+          python3 scripts/nulang_ab_bench.py "${args[@]}"
+
+      - name: Upload A/B results
+        uses: actions/upload-artifact@v6
+        with:
+          name: nulang-ab-results-${{ github.sha }}
+          path: nulang-ab-results.json
+          if-no-files-found: error
