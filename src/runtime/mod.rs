@@ -6900,6 +6900,18 @@ impl Runtime {
         actor_id: u64,
         snapshot: &crate::runtime::persistence::ActorSnapshot,
     ) {
+        // Frozen NBC v1 cannot prove the compiler semantic sidecar on the
+        // receiving node. Do not advertise an acknowledged shadow replica for
+        // identified history until the transport carries a verifiable artifact
+        // manifest; silently downgrading to legacy provenance would defeat the
+        // recovery gate.
+        if snapshot.semantic_id.is_some() {
+            warn!(
+                actor_id,
+                "nulang-respawn: identified actor cannot use legacy NBC v1 shadow transport"
+            );
+            return;
+        }
         let Some(&epoch) = self.respawn_opted.get(&actor_id) else {
             return;
         };
