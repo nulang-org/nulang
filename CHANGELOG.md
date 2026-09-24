@@ -51,6 +51,13 @@ version + migration.*
 
 ## Stable tier
 
+### Atomic workflow turns (RFC 0022 Phase B) — 2026-09-24
+- **Normal workflow execution now stages the delivered command, durable state snapshot, workflow events, timers, signals, saga records, and emitted workflow events into one `DurableTransition`** and commits through `PersistenceStore::commit_transition`, removing the journal/event→checkpoint crash window.
+- **Durable timers are published to the live timer wheel only after their containing transition commits.** Suspended workflows commit the pre-step durable image plus their suspension marker, preserving deterministic re-drive semantics without persisting partial step mutations.
+- **Signal, timer, selective-receive, and LLM resume paths use the same atomic transition boundary.** A rejected commit restores the last durable actor state and actor-owned CRDT replicas and discards the rejected continuation.
+- Regression tests pin one-sequence command/event/state commits and COMMIT-NOTHING rollback behavior, including suppression of staged timer publication.
+
+
 ### JIT tier replacement and compile-time observability — 2026-09-24
 - **Tier-2 promotion now replaces the installed machine-code entry instead of returning the already-cached lower-tier function.** Compiled regions carry an explicit `Baseline` / `Typed` / `Simd` tier plus a `Fast` / `Optimized` codegen policy, and promotion uses fresh Cranelift symbols while preserving the same cache slot.
 - **First-tier native code now uses a low-latency Cranelift module with `opt_level=none` and `regalloc_algorithm=single_pass`; hot replacement uses a separate `opt_level=speed` + backtracking-register-allocation module.** Baseline code can retain folded direct calls while being recompiled at the optimized level; typed code preserves type-directed guard stripping across promotion and can subsequently promote to SIMD when the loop analyzer accepts it.
