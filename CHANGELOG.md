@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Preserve observable MIR panic through DCE — 2026-09-24
+- **MIR dead-store elimination now treats `RValue::Panic` as observable/divergent** (`src/mir_codegen.rs`), so an unused panic result cannot cause a reachable contract/precondition failure to be optimized away. A focused optimizer regression pins the behavior.
+
 ### Python bool marshal type inference — 2026-09-24
 - **Default-feature builds now make PyO3 boolean extraction explicit with `extract::<bool>()`**, avoiding a compiler inference failure in the Python marshal path without changing conversion semantics.
 
