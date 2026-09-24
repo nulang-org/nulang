@@ -5091,13 +5091,89 @@ impl Runtime {
             .unwrap_or(false)
     }
 
+    /// Verify the definition-scoped semantic provenance of one snapshot.
+    ///
+    /// Identified histories always require an exact definition identity match.
+    /// LegacyCompatible permits a pre-identity snapshot to load, but returns
+    /// None so the live actor remains explicitly unverified until an explicit
+    /// migration establishes provenance.
+    pub(crate) fn verify_snapshot_definition_semantic_identity(
+        actor_id: u64,
+        snapshot: &ActorSnapshot,
+        current: Option<crate::content_identity::SemanticId>,
+        identity_policy: RecoveryIdentityPolicy,
+    ) -> Result<Option<crate::content_identity::SemanticId>, String> {
+        match snapshot.semantic_id.as_deref() {
+            Some(persisted) => {
+                let persisted = persisted
+                    .parse::<crate::content_identity::SemanticId>()
+                    .map_err(|error| {
+                        format!(
+                            "actor {actor_id} has malformed definition semantic identity: {error}"
+                        )
+                    })?;
+                match current {
+                    Some(current) if current == persisted => Ok(Some(current)),
+                    Some(current) => Err(format!(
+                        "actor {actor_id} persisted definition semantic identity {persisted} does not match recovery definition {current}"
+                    )),
+                    None => Err(format!(
+                        "actor {actor_id} persisted definition semantic identity {persisted} has no identified recovery definition"
+                    )),
+                }
+            }
+            None if identity_policy == RecoveryIdentityPolicy::Strict => Err(format!(
+                "actor {actor_id} legacy snapshot has no definition semantic identity"
+            )),
+            None => Ok(None),
+        }
+    }
+
     /// Recover a persistent actor from the latest snapshot and replay the journal.
     ///
     /// For workflow actors the durable workflow event journal is replayed
     /// instead of the message journal, restoring the current step index and
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
+        self.recover_actor_with_identity_policy(actor_id, RecoveryIdentityPolicy::LegacyCompatible)
+    }
+
+    /// Recover a persistent actor under an explicit semantic-identity policy.
+    ///
+    /// Any snapshot that already carries strong semantic identity is always
+    /// fail-closed: recovery code must carry the same compiler-derived ID.
+    /// LegacyCompatible exists only for pre-identity histories and never
+    /// upgrades them to verified provenance.
+    pub fn recover_actor_with_identity_policy(
+        &mut self,
+        actor_id: u64,
+        identity_policy: RecoveryIdentityPolicy,
+    ) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
+
+        let recovery_definition_semantic_id = self
+            .recovery_definition_semantic_ids
+            .get(&actor_id)
+            .copied();
+        let verified_definition_semantic_id =
+            match Self::verify_snapshot_definition_semantic_identity(
+                actor_id,
+                &snapshot,
+                recovery_definition_semantic_id,
+                identity_policy,
+            ) {
+                Ok(id) => id,
+                Err(error) => {
+                    warn!("nulang-recover: refusing {error}");
+                    return None;
+                }
+            };
+        if verified_definition_semantic_id.is_none() {
+            warn!(
+                "nulang-recover: actor {} uses legacy snapshot without verified definition provenance",
+                actor_id
+            );
+        }
         let authority_manifest =
             match crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens) {
                 Ok(manifest) => manifest,
@@ -5122,6 +5198,7 @@ impl Runtime {
             .unwrap_or(false);
 
         let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
+        actor.definition_semantic_id = verified_definition_semantic_id;
         actor.persistent = true;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
