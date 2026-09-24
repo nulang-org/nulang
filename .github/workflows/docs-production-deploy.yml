@@ -106,23 +106,41 @@ jobs:
             --commit-hash="$DEPLOY_SHA" \
             --commit-message="Production deploy $DEPLOY_SHA"
 
-      - name: Verify production matches the selected commit
+      - name: Verify Pages project and custom domain match the selected commit
         shell: bash
         run: |
           for attempt in {1..12}; do
+            project_ok=false
+            domain_ok=false
+
+            if curl -fsS --max-time 15 https://nulang-docs.pages.dev/ -o /tmp/nulang-pages-homepage.html; then
+              project_sha="$(sha256sum /tmp/nulang-pages-homepage.html | awk '{print $1}')"
+              if [ "$project_sha" = "$EXPECTED_HOMEPAGE_SHA" ]; then
+                project_ok=true
+              else
+                echo "Pages project digest is stale: $project_sha (expected $EXPECTED_HOMEPAGE_SHA)."
+              fi
+            fi
+
             if curl -fsS --max-time 15 https://nulang.org/ -o /tmp/nulang-homepage.html &&
                curl -fsS --max-time 15 https://nulang.org/playground/nulang_playground.wasm -o /tmp/nulang_playground.wasm &&
                test -s /tmp/nulang_playground.wasm; then
-              production_sha="$(sha256sum /tmp/nulang-homepage.html | awk '{print $1}')"
-              if [ "$production_sha" = "$EXPECTED_HOMEPAGE_SHA" ]; then
-                echo "nulang.org matches the selected commit and the browser compiler is reachable."
-                exit 0
+              domain_sha="$(sha256sum /tmp/nulang-homepage.html | awk '{print $1}')"
+              if [ "$domain_sha" = "$EXPECTED_HOMEPAGE_SHA" ]; then
+                domain_ok=true
+              else
+                echo "Custom-domain digest is stale: $domain_sha (expected $EXPECTED_HOMEPAGE_SHA)."
               fi
-              echo "Homepage digest is still stale: $production_sha (expected $EXPECTED_HOMEPAGE_SHA)."
             fi
+
+            if [ "$project_ok" = true ] && [ "$domain_ok" = true ]; then
+              echo "Cloudflare Pages and nulang.org both match the selected commit; browser compiler is reachable."
+              exit 0
+            fi
+
             echo "Production not ready yet (attempt $attempt/12)."
             sleep 5
           done
 
-          echo "::error::Production did not converge to the selected commit or the browser compiler is unavailable."
+          echo "::error::Pages project and custom domain did not both converge to the selected commit."
           exit 1
