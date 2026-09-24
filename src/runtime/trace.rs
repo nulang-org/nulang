@@ -240,10 +240,13 @@ mod tests {
 
     #[test]
     fn test_dispatch_creates_root_when_trace_collection_is_enabled() {
-        let root = TraceContext::for_dispatch(None, true).expect("TRACE collection creates root");
-        assert_ne!(root.trace_id(), 0);
-        assert_ne!(root.span_id(), 0);
-        assert_eq!(root.parent_span_id(), 0);
+        for incoming in [None, Some("malformed")] {
+            let root =
+                TraceContext::for_dispatch(incoming, true).expect("TRACE collection creates root");
+            assert_ne!(root.trace_id(), 0);
+            assert_ne!(root.span_id(), 0);
+            assert_eq!(root.parent_span_id(), 0);
+        }
     }
 
     #[test]
