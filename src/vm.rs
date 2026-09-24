@@ -6406,11 +6406,13 @@ mod vm_tests {
         module.emit(Instruction::new2(OpCode::Move, 15, 0));
         module.emit(Instruction::new0(OpCode::Halt));
         module.entry_point = Some(0);
-        module.send_ownership_sites.push(crate::bytecode::SendOwnershipSite {
-            pc: send_pc,
-            candidate_mask: 1,
-            sources: vec![(0, crate::bytecode::SendOwnershipSource::Register(15))],
-        });
+        module
+            .send_ownership_sites
+            .push(crate::bytecode::SendOwnershipSite {
+                pc: send_pc,
+                candidate_mask: 1,
+                sources: vec![(0, crate::bytecode::SendOwnershipSource::Register(15))],
+            });
 
         let mut vm = VM::new_without_jit();
         vm.load_module(module);
