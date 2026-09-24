@@ -591,7 +591,7 @@ mod tests {
         assert_eq!(
             run(
                 &mut store,
-                b"*5\r\n$4\r\nMSET\r\n$5\r\na{1}\r\n$1\r\n1\r\n$5\r\nb{1}\r\n$1\r\n2\r\n",
+                b"*5\r\n$4\r\nMSET\r\n$4\r\na{1}\r\n$1\r\n1\r\n$4\r\nb{1}\r\n$1\r\n2\r\n",
                 0
             ),
             b"-OOM cache capacity exceeded\r\n"
