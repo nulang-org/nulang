@@ -106,9 +106,18 @@ Current backends:
 
 The durability layer includes an atomic durable-transition contract. Backends
 that cannot satisfy a required atomic operation must fail closed rather than
-silently emulate it with a sequence of individually visible writes.
+silently emulate it with a sequence of individually visible writes. PostgreSQL
+implements the atomic transition/tail-fencing contract. Local durable outbox
+delivery can atomically accept a committed message into a workflow receiver
+(inbox identity + command journal) and redeliver across the acceptance/mailbox
+crash window.
 
 Important boundaries:
+
+- durable outbox delivery is currently proven only for local workflow
+  receivers; ordinary actor sends are not yet automatically staged into the
+  sender transition, generic persistent actors are deferred, and cross-node
+  durable delivery remains incomplete;
 
 - persistent actors/entities/workflows are implemented and recoverable, but
   the higher-level durable semantic model is still being stabilized;

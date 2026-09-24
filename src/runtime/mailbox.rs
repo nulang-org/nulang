@@ -136,6 +136,12 @@ pub struct Message {
     pub priority: MessagePriority,
     /// W3C traceparent for distributed tracing.
     pub trace_id: Option<String>,
+    /// Stable durable-delivery identity when this mailbox entry was already
+    /// accepted into the receiver's durable transition log.
+    ///
+    /// The scheduler uses this marker only to avoid journaling the accepted
+    /// command a second time. It is not part of the public wire protocol yet.
+    pub durable_id: Option<crate::runtime::persistence::DurableMessageId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -497,6 +503,20 @@ impl Mailbox {
         self.len() == 0
     }
 
+    /// True when a scheduler-local mailbox entry already carries this durable
+    /// receiver-acceptance identity. Durable outbox delivery always uses the
+    /// local lane, so checking the local live/staged queues is sufficient and
+    /// does not disturb concurrent producer queues.
+    pub fn contains_durable_id(&self, id: crate::runtime::persistence::DurableMessageId) -> bool {
+        self.local_queue
+            .iter()
+            .any(|message| message.durable_id == Some(id))
+            || self
+                .local_skip_buffer
+                .iter()
+                .any(|(message, _)| message.durable_id == Some(id))
+    }
+
     /// Snapshot the mailbox without changing logical ownership/counting.
     pub fn drain(&mut self) -> Vec<Message> {
         let mut snapshot = Vec::with_capacity(self.len());
@@ -600,6 +620,7 @@ mod tests {
             sender,
             priority: MessagePriority::Normal,
             trace_id: None,
+            durable_id: None,
         }
     }
 
@@ -686,6 +707,7 @@ mod tests {
                 sender: i as u64,
                 priority: MessagePriority::System,
                 trace_id: None,
+                durable_id: None,
             })
             .unwrap();
         }
@@ -784,6 +806,7 @@ mod transactional_receive_tests {
             sender,
             priority,
             trace_id: None,
+            durable_id: None,
         }
     }
 

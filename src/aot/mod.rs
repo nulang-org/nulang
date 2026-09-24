@@ -1300,6 +1300,7 @@ impl crate::vm::ActorVmCallbacks for AotActorCallbacks {
                 sender: (*self.actor).id,
                 priority: crate::runtime::MessagePriority::Normal,
                 trace_id: None,
+                durable_id: None,
             });
         }
     }

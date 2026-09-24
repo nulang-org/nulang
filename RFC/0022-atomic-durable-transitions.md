@@ -553,12 +553,18 @@ No runtime call site changes yet.
 - Add receiver-side deduplication.
 
 Implementation status (2026-09-24): transition-level outbox persistence is
-live in the atomic storage contract, and PostgreSQL now exposes stable
-RFC-identity pending/acknowledgement plus receiver-dedup persistence primitives.
-The runtime dispatcher is deliberately still pending: inbox dedup acceptance
-must be committed atomically with the receiver's command/state transition so a
-crash cannot persist "seen" before the message has actually become durable
-receiver progress.
+live in the atomic storage contract, and PostgreSQL exposes stable RFC-identity
+pending/acknowledgement storage. Local workflow receivers now atomically commit
+the inbox identity together with the accepted command journal entry before
+sender acknowledgement; scheduler quiescence and a bounded maintenance cadence
+redeliver pending records. A crash after acceptance but before mailbox
+publication is repaired by requeueing the accepted command, while workflow
+recovery handles a crash after acceptance but before handler completion.
+
+This remains a partial Phase E implementation: ordinary source/runtime actor
+sends are not yet automatically staged into the sender's current transition,
+plain persistent actors are deferred until generic turn-level atomicity is
+complete, and durable cross-node transport is not yet wired.
 
 #### Phase F — distributed ownership
 

@@ -192,6 +192,7 @@ pub(crate) fn reap_living_actor(rt: &mut Runtime, actor_id: u64, reason: ExitRea
                     sender: actor_id,
                     priority: MessagePriority::System,
                     trace_id: None,
+                    durable_id: None,
                 };
                 if let Some(actor) = rt.actors.get_mut(&linked_id) {
                     let _ = actor.mailbox.push_local(exit_msg);
@@ -342,6 +343,7 @@ pub(crate) fn send_down_message(
         sender: target_id,
         priority: MessagePriority::System,
         trace_id: None,
+        durable_id: None,
     };
     if let Some(watcher) = rt.actors.get_mut(&watcher_id) {
         let _ = watcher.mailbox.push_local(down_msg);

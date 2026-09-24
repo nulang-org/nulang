@@ -602,6 +602,7 @@ impl AddressResolver {
                     sender: sender_actor,
                     priority,
                     trace_id,
+                    durable_id: None,
                 };
                 Some((
                     target_actor,

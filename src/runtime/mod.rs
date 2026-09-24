@@ -190,6 +190,12 @@ const DEHYDRATE_CHECK_INTERVAL: u64 = 50;
 /// live runtime must keep retrying rather than lose the timer until restart.
 const DURABLE_TIMER_COMMIT_RETRY_MS: u64 = 100;
 
+/// Bound persistence polling for committed durable outbox work. Quiescence
+/// always gets one pump; sustained scheduler load pumps at this cadence so a
+/// permanently busy ready queue cannot starve durable delivery.
+const DURABLE_OUTBOX_PUMP_INTERVAL: u64 = 64;
+const DURABLE_OUTBOX_PUMP_BATCH: usize = 64;
+
 /// Choose the `waiting_signal` value for a freshly captured suspension:
 /// the awaited signal's name for a signal wait, or the reserved LLM
 /// marker for a workflow step suspended on a background LLM call (plain
@@ -309,6 +315,17 @@ pub(crate) enum MessageAdmission {
     Accepted,
     Backpressured,
     Rejected,
+}
+
+/// Result of one bounded durable-outbox delivery pump.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DurableOutboxPumpReport {
+    pub scanned: usize,
+    pub accepted: usize,
+    pub duplicates: usize,
+    pub acknowledged: usize,
+    pub backpressured: usize,
+    pub deferred: usize,
 }
 
 pub struct Runtime {
@@ -1373,6 +1390,7 @@ impl Runtime {
                             sender,
                             priority: MessagePriority::System,
                             trace_id: None,
+                            durable_id: None,
                         },
                         "grain hydration failed (cross-shard)",
                     );
@@ -1387,6 +1405,7 @@ impl Runtime {
             sender,
             priority: MessagePriority::Normal,
             trace_id: trace_id.clone(),
+            durable_id: None,
         };
         if let Some(actor) = self.actors.get_mut(&target_id) {
             if let Err(_dropped) = actor.mailbox.push_local(msg) {
@@ -1397,6 +1416,7 @@ impl Runtime {
                         sender,
                         priority: MessagePriority::System,
                         trace_id: None,
+                        durable_id: None,
                     },
                     "mailbox full (cross-shard)",
                 );
@@ -1409,6 +1429,7 @@ impl Runtime {
                     sender,
                     priority: MessagePriority::System,
                     trace_id: None,
+                    durable_id: None,
                 },
                 "target actor not found (cross-shard)",
             );
@@ -2608,6 +2629,7 @@ impl Runtime {
                             sender: self.current_actor.unwrap_or(0),
                             priority: MessagePriority::System,
                             trace_id: out_trace.clone(),
+                            durable_id: None,
                         },
                         "grain hydration failed",
                     );
@@ -2623,6 +2645,7 @@ impl Runtime {
                             sender: self.current_actor.unwrap_or(0),
                             priority: MessagePriority::System,
                             trace_id: out_trace.clone(),
+                            durable_id: None,
                         },
                         "grain hydration failed",
                     );
@@ -2632,6 +2655,168 @@ impl Runtime {
         }
 
         self.deliver_local_message(target_id, behavior_id, args, out_trace);
+    }
+
+    /// Scheduler-facing wrapper around the durable outbox pump.
+    ///
+    /// Stores that have not implemented Phase E return Unsupported and are
+    /// silently skipped. Other errors are surfaced as telemetry while leaving
+    /// the committed sender outbox intact for a later retry.
+    fn pump_durable_outbox_for_scheduler(&mut self) {
+        match self.pump_durable_outbox(DURABLE_OUTBOX_PUMP_BATCH) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "nulang-persist: durable outbox scheduler pump failed; messages remain pending"
+                );
+            }
+        }
+    }
+
+    /// Move committed durable outbox records into local workflow mailboxes.
+    ///
+    /// Receiver acceptance is committed before mailbox publication. Sender
+    /// acknowledgement happens only after the receiver has either durably
+    /// accepted and queued the command or is proven to have already accepted
+    /// it. A crash after acceptance is safe because workflow recovery replays
+    /// journal entries newer than the last snapshot.
+    pub fn pump_durable_outbox(
+        &mut self,
+        limit: usize,
+    ) -> std::io::Result<DurableOutboxPumpReport> {
+        let records = self.persistence.read_pending_outbox(limit)?;
+        let mut report = DurableOutboxPumpReport {
+            scanned: records.len(),
+            ..DurableOutboxPumpReport::default()
+        };
+
+        for record in records {
+            let actor_id = record.destination_actor_id;
+
+            // Phase E is enabled first for workflows because their accepted
+            // command + completion/suspension paths already remain on the RFC
+            // 0022 atomic tail. Plain persistent actors still have legacy
+            // event/checkpoint paths and therefore fail closed here.
+            let Some(actor) = self.actors.get(&actor_id) else {
+                report.deferred += 1;
+                continue;
+            };
+            if !actor.persistent || !actor.is_workflow {
+                report.deferred += 1;
+                continue;
+            }
+            let behavior_idx = record.behavior_id as usize;
+            if self.is_internal_behavior(actor_id, behavior_idx)
+                || (!self.has_native_handler(actor_id, behavior_idx)
+                    && !self.has_bytecode_handler(actor_id, behavior_idx))
+            {
+                report.deferred += 1;
+                continue;
+            }
+
+            // Avoid accepting work that cannot currently enter the bounded
+            // mailbox. A concurrent producer can still win the final slot;
+            // that race is handled after the atomic acceptance below.
+            let has_capacity = {
+                let actor = self.actors.get(&actor_id).expect("actor checked above");
+                actor.mailbox.capacity() == 0 || actor.mailbox.len() < actor.mailbox.capacity()
+            };
+            if !has_capacity {
+                report.backpressured += 1;
+                continue;
+            }
+
+            let existing_sequence = self
+                .persistence
+                .lookup_inbox_delivery(actor_id, record.id)?;
+
+            let accepted_sequence = if let Some(sequence) = existing_sequence {
+                report.duplicates += 1;
+                sequence
+            } else {
+                match workflow::commit_durable_inbox_command(
+                    self,
+                    actor_id,
+                    record.id,
+                    record.behavior_id,
+                    record.payload.clone(),
+                ) {
+                    Ok(sequence) => {
+                        report.accepted += 1;
+                        sequence
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        match self
+                            .persistence
+                            .lookup_inbox_delivery(actor_id, record.id)?
+                        {
+                            Some(sequence) => {
+                                report.duplicates += 1;
+                                sequence
+                            }
+                            None => return Err(error),
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+
+            let already_queued = self
+                .actors
+                .get(&actor_id)
+                .map(|actor| actor.mailbox.contains_durable_id(record.id))
+                .unwrap_or(false);
+            let progressed_after_acceptance = self
+                .persistence
+                .load_snapshot(actor_id)
+                .map(|snapshot| snapshot.sequence > accepted_sequence)
+                .unwrap_or(false);
+
+            if !already_queued && !progressed_after_acceptance {
+                let values = {
+                    let actor = self
+                        .actors
+                        .get_mut(&actor_id)
+                        .expect("durable receiver disappeared after acceptance");
+                    record
+                        .payload
+                        .iter()
+                        .map(|value| value.to_value_on_heap(actor))
+                        .collect::<Vec<_>>()
+                };
+                let message = Message {
+                    behavior_id: record.behavior_id,
+                    payload: MessagePayload::from_vec(values),
+                    sender: record.id.sender_actor_id,
+                    priority: MessagePriority::Normal,
+                    trace_id: None,
+                    durable_id: Some(record.id),
+                };
+                let queued = self
+                    .actors
+                    .get_mut(&actor_id)
+                    .expect("durable receiver disappeared before enqueue")
+                    .mailbox
+                    .push_local(message)
+                    .is_ok();
+                if !queued {
+                    // Receiver acceptance remains durable and the sender
+                    // outbox intentionally remains pending. A later pump can
+                    // requeue the accepted command without creating a second
+                    // receiver journal entry.
+                    report.backpressured += 1;
+                    continue;
+                }
+                self.enqueue_actor(actor_id);
+            }
+
+            self.persistence.acknowledge_outbox(record.id)?;
+            report.acknowledged += 1;
+        }
+
+        Ok(report)
     }
 
     /// Deliver a message to a local actor's mailbox, track cross-actor
@@ -2650,6 +2835,7 @@ impl Runtime {
             sender: self.current_actor.unwrap_or(0),
             priority: MessagePriority::Normal,
             trace_id: out_trace.clone(),
+            durable_id: None,
         };
         let admission = if let Some(actor) = self.actors.get_mut(&target_id) {
             if actor.mailbox.push_local(msg).is_ok() {
@@ -2671,6 +2857,7 @@ impl Runtime {
                         sender: self.current_actor.unwrap_or(0),
                         priority: MessagePriority::System,
                         trace_id: out_trace.clone(),
+                        durable_id: None,
                     },
                     "mailbox full",
                 );
@@ -2684,6 +2871,7 @@ impl Runtime {
                     sender: self.current_actor.unwrap_or(0),
                     priority: MessagePriority::System,
                     trace_id: out_trace.clone(),
+                    durable_id: None,
                 },
                 "target actor not found",
             );
@@ -2901,6 +3089,7 @@ impl Runtime {
                 sender: 0, // DLQ system message has no sender
                 priority: MessagePriority::System,
                 trace_id: None,
+                durable_id: None,
             });
         }
     }
@@ -3019,6 +3208,14 @@ impl Runtime {
             let actor_id = match self.claim_next_ready_actor() {
                 Some(actor_id) => actor_id,
                 None => {
+                    // Give committed durable outbox work a chance to create
+                    // runnable receiver work before declaring the runtime
+                    // quiescent. Unsupported backends are a no-op here.
+                    self.pump_durable_outbox_for_scheduler();
+                    if self.scheduler.has_ready_work() {
+                        continue;
+                    }
+
                     if self.llm_inflight_count() == 0 && self.timer_wheel.is_empty() {
                         if let Some(ref mut cb) = self.idle_callback {
                             cb();
@@ -3103,6 +3300,10 @@ impl Runtime {
             }
             if previous_ticks / CRDT_SYNC_INTERVAL_TICKS != ticks / CRDT_SYNC_INTERVAL_TICKS {
                 self.sync_crdts();
+            }
+            if previous_ticks / DURABLE_OUTBOX_PUMP_INTERVAL != ticks / DURABLE_OUTBOX_PUMP_INTERVAL
+            {
+                self.pump_durable_outbox_for_scheduler();
             }
         }
 
@@ -3233,6 +3434,15 @@ impl Runtime {
                     }
                 }
                 None => {
+                    // Durable outbox delivery is deterministic for a fixed
+                    // committed store, so pump it before declaring the run
+                    // quiescent. If it queues a receiver, restart selection
+                    // without consuming an RNG draw.
+                    self.pump_durable_outbox_for_scheduler();
+                    if self.actors.values().any(|actor| !actor.mailbox.is_empty()) {
+                        continue;
+                    }
+
                     // No actor is ready. With a virtual clock installed and
                     // timers pending, advance the clock to the next
                     // deadline and re-tick — the fired timer re-enqueues
@@ -3920,7 +4130,7 @@ impl Runtime {
                 // Accept workflow commands on the same RFC 0022 atomic tail
                 // used by their completion/failure transitions. Plain
                 // persistent actors retain the compatibility journal path.
-                if self.actor_is_persistent(actor_id) {
+                if self.actor_is_persistent(actor_id) && msg.durable_id.is_none() {
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
                     let result = if self.actor_is_workflow(actor_id) {
                         workflow::commit_workflow_command(self, actor_id, msg.behavior_id, payload)
@@ -3961,7 +4171,7 @@ impl Runtime {
                 // Workflow command acceptance is atomic and fenced before
                 // execution. This leaves an accepted command replayable if the
                 // process dies before StepCompleted/StepFailed commits.
-                if self.actor_is_persistent(actor_id) {
+                if self.actor_is_persistent(actor_id) && msg.durable_id.is_none() {
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
                     let result = if self.actor_is_workflow(actor_id) {
                         workflow::commit_workflow_command(self, actor_id, msg.behavior_id, payload)

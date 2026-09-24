@@ -497,6 +497,7 @@ fn stress_mailbox_never_drops_system_messages() {
             sender: 0,
             priority: MessagePriority::Normal,
             trace_id: None,
+            durable_id: None,
         };
         if let Some(a) = rt.actors.get_mut(&actor) {
             let _ = a.mailbox.push(msg);
@@ -511,6 +512,7 @@ fn stress_mailbox_never_drops_system_messages() {
             sender: 0,
             priority: MessagePriority::System,
             trace_id: None,
+            durable_id: None,
         };
         if let Some(a) = rt.actors.get_mut(&actor) {
             let _ = a.mailbox.push(msg);
@@ -525,6 +527,7 @@ fn stress_mailbox_never_drops_system_messages() {
             sender: 0,
             priority: MessagePriority::Bulk,
             trace_id: None,
+            durable_id: None,
         };
         if let Some(a) = rt.actors.get_mut(&actor) {
             let _ = a.mailbox.push(msg);
@@ -1414,6 +1417,7 @@ fn stress_mailbox_system_priority_preservation() {
             sender: 0,
             priority: MessagePriority::Normal,
             trace_id: None,
+            durable_id: None,
         };
         if let Some(a) = rt.actors.get_mut(&actor) {
             let _ = a.mailbox.push(msg);
@@ -1427,6 +1431,7 @@ fn stress_mailbox_system_priority_preservation() {
             sender: 0,
             priority: MessagePriority::System,
             trace_id: None,
+            durable_id: None,
         };
         if let Some(a) = rt.actors.get_mut(&actor) {
             let _ = a.mailbox.push(msg);
