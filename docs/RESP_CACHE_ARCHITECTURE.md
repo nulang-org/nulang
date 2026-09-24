@@ -150,16 +150,33 @@ all bounded by configuration.
 
 ## Durability
 
-Durability is not implicit in the cache kernel. Add it above the mutation path
-as explicit acknowledgement classes:
+Durability remains outside the cache kernel. `src/runtime/cache_persistence.rs`
+now provides the first durable substrate:
+
+- versioned, BLAKE3-checksummed snapshots;
+- sequence-numbered, checksummed append-only WAL records;
+- torn-tail detection/truncation without accepting checksum corruption;
+- WAL base sequences for safe post-snapshot rotation;
+- atomic snapshot publication through file sync + rename;
+- recovery that loads the snapshot and replays only newer WAL records;
+- wall-clock expiry on disk, translated back to the recovered process's
+  monotonic cache clock so restart downtime does not extend TTLs.
+
+The persistence format records canonical cache mutations rather than RESP
+frames. `CacheStore` itself remains thread-confined and filesystem-free.
+
+The acknowledgement model is still intentionally layered above this substrate:
 
 - memory: acknowledge after local mutation;
 - async journal: enqueue WAL append before acknowledgement;
-- journal: acknowledge after local durable WAL;
+- journal: acknowledge after a configured local WAL durability point;
 - replica: acknowledge after a configured replica;
 - quorum: acknowledge after consensus/quorum.
 
-The default cache path must remain able to run without WAL or consensus work.
+The WAL API already distinguishes buffered append from `sync_data`, but the
+RESP mutation path does not yet select or advertise a durability class. Online
+snapshot/WAL rotation, replication, and failover remain follow-up work. The
+default cache path must continue to run without WAL or consensus work.
 
 ## Performance gates
 
@@ -202,7 +219,10 @@ surface.
 3. Add a separate transparent proxy endpoint only for non-cluster clients;
    keep the per-shard production listeners redirect-only.
 4. Connect remote transparent handoffs to a cache-specific cluster transport.
-5. Add packed aggregate structures and durability acknowledgement modes.
-6. Expand RESP compatibility and add Nulang-native leases, locks, semaphores,
+5. Wire explicit memory / async-journal / journal acknowledgement modes into
+   cache mutations, then add online snapshot/WAL rotation.
+6. Add cache replication, recovery bootstrap, and failover fencing.
+7. Add packed aggregate structures, then expand RESP compatibility and add
+   Nulang-native leases, locks, semaphores,
    fencing tokens, queues, and stored functions where they fit the product
    boundary.
