@@ -297,7 +297,8 @@ impl JitSession {
 
     /// Tier currently installed for a compiled region.
     pub fn compiled_tier(&self, module_idx: usize, offset: usize) -> Option<CompilationTier> {
-        self.compiled_entry(module_idx, offset).map(|region| region.tier)
+        self.compiled_entry(module_idx, offset)
+            .map(|region| region.tier)
     }
 
     /// Optimization policy used for the currently installed version.
@@ -311,11 +312,7 @@ impl JitSession {
     }
 
     /// Compiler wall time for the currently installed version of a region.
-    pub fn compiled_region_compile_time_ns(
-        &self,
-        module_idx: usize,
-        offset: usize,
-    ) -> Option<u64> {
+    pub fn compiled_region_compile_time_ns(&self, module_idx: usize, offset: usize) -> Option<u64> {
         self.compiled_entry(module_idx, offset)
             .map(|region| region.compile_time_ns)
     }
@@ -427,13 +424,7 @@ impl JitSession {
                 );
                 if !meta.is_empty() && native_calls.is_empty() {
                     let _ = unsafe {
-                        self.promote_region_typed(
-                            module_idx,
-                            pc,
-                            region.len,
-                            instructions,
-                            &meta,
-                        )
+                        self.promote_region_typed(module_idx, pc, region.len, instructions, &meta)
                     };
                 } else {
                     let _ = unsafe {
@@ -451,13 +442,7 @@ impl JitSession {
                 let meta = typed_compiler::infer_reg_types(module, pc);
                 if !meta.is_empty() {
                     let _ = unsafe {
-                        self.promote_region_typed(
-                            module_idx,
-                            pc,
-                            region.len,
-                            instructions,
-                            &meta,
-                        )
+                        self.promote_region_typed(module_idx, pc, region.len, instructions, &meta)
                     };
                 }
             }
@@ -465,26 +450,14 @@ impl JitSession {
                 let meta = typed_compiler::infer_reg_types(module, pc);
                 let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
                 let _ = unsafe {
-                    self.promote_region_simd(
-                        module_idx,
-                        pc,
-                        region.len,
-                        instructions,
-                        meta_ref,
-                    )
+                    self.promote_region_simd(module_idx, pc, region.len, instructions, meta_ref)
                 };
             }
             (CodegenOptimization::Optimized, CompilationTier::Typed) => {
                 let meta = typed_compiler::infer_reg_types(module, pc);
                 let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
                 let _ = unsafe {
-                    self.promote_region_simd(
-                        module_idx,
-                        pc,
-                        region.len,
-                        instructions,
-                        meta_ref,
-                    )
+                    self.promote_region_simd(module_idx, pc, region.len, instructions, meta_ref)
                 };
             }
             (CodegenOptimization::Optimized, CompilationTier::Baseline)
@@ -732,7 +705,8 @@ impl JitSession {
     /// to advance pc after a JIT run instead of re-scanning the
     /// instruction stream.
     pub fn compiled_region_len(&self, module_idx: usize, offset: usize) -> Option<usize> {
-        self.compiled_entry(module_idx, offset).map(|region| region.len)
+        self.compiled_entry(module_idx, offset)
+            .map(|region| region.len)
     }
 
     /// Return the number of compiled regions.
