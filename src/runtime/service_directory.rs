@@ -192,11 +192,13 @@ impl ServiceDirectory {
         let before = self.advertisements.len();
         self.advertisements
             .retain(|advertisement| advertisement.node_id != snapshot.node_id);
+        let removed = before - self.advertisements.len();
+        let inserted = snapshot.services.len();
         self.advertisements.extend(snapshot.services);
         self.remote_generations
             .insert(snapshot.node_id, snapshot.generation);
 
-        Ok(before.abs_diff(self.advertisements.len()))
+        Ok(removed + inserted)
     }
 
     pub(crate) fn remove_remote_node(&mut self, node_id: NodeId) -> (usize, bool) {
