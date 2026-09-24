@@ -8,7 +8,9 @@ use crate::ast::{Decl, Expr, Pattern, WorkflowItem};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::typechecker::TypeChecker;
-use crate::types::{set_source_map_with_file, Capability, EffectRow, NuError, NuResult, Span, Type};
+use crate::types::{
+    set_source_map_with_file, Capability, EffectRow, NuError, NuResult, Span, Type,
+};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::Path;
@@ -184,10 +186,7 @@ fn emit_report(report: &SemanticQueryReport, json: bool) -> NuResult<()> {
                     symbol.qualified_name,
                     symbol.inferred_type.as_deref().unwrap_or("<unknown>"),
                     symbol.inferred_effects.as_deref().unwrap_or("<unknown>"),
-                    symbol
-                        .inferred_capability
-                        .as_deref()
-                        .unwrap_or("<unknown>"),
+                    symbol.inferred_capability.as_deref().unwrap_or("<unknown>"),
                     symbol.span.file,
                     symbol.span.line,
                     symbol.span.col
@@ -238,27 +237,13 @@ fn analyze_file(path: &Path) -> NuResult<SemanticIndex> {
     let _ = checker.check_module(&typed_ast);
 
     let mut symbols = Vec::new();
-    collect_semantic_symbols(
-        &ast.decls,
-        "",
-        &checker,
-        &file,
-        &source,
-        &mut symbols,
-    );
+    collect_semantic_symbols(&ast.decls, "", &checker, &file, &source, &mut symbols);
 
     let mut declared = HashSet::new();
     collect_value_names(&ast.decls, &mut declared);
 
     let mut references = Vec::new();
-    collect_decl_references(
-        &ast.decls,
-        "",
-        &declared,
-        &file,
-        &source,
-        &mut references,
-    );
+    collect_decl_references(&ast.decls, "", &declared, &file, &source, &mut references);
 
     Ok(SemanticIndex {
         file,
@@ -297,9 +282,7 @@ fn collect_semantic_symbols(
                     source,
                 ));
             }
-            Decl::Given {
-                name, ty, span, ..
-            } => {
+            Decl::Given { name, ty, span, .. } => {
                 out.push(semantic_symbol(
                     name,
                     prefix,
@@ -376,9 +359,7 @@ fn collect_semantic_symbols(
                     source,
                 ));
             }
-            Decl::Module {
-                name, decls, ..
-            } => {
+            Decl::Module { name, decls, .. } => {
                 let nested = qualify(prefix, name);
                 collect_semantic_symbols(decls, &nested, checker, file, source, out);
             }
@@ -482,15 +463,7 @@ fn collect_decl_references(
                 let mut ensures_bound = bound.clone();
                 ensures_bound.insert("result".to_string());
                 for expr in ensures {
-                    walk_expr(
-                        expr,
-                        &ensures_bound,
-                        declared,
-                        &owner,
-                        file,
-                        source,
-                        out,
-                    );
+                    walk_expr(expr, &ensures_bound, declared, &owner, file, source, out);
                 }
                 walk_expr(body, &bound, declared, &owner, file, source, out);
             }
@@ -723,9 +696,7 @@ fn collect_decl_references(
                     );
                 }
             }
-            Decl::NamedHandler {
-                name, handlers, ..
-            } => {
+            Decl::NamedHandler { name, handlers, .. } => {
                 let owner = qualify(prefix, name);
                 for handler in handlers {
                     let bound = handler.params.iter().cloned().collect();
@@ -744,11 +715,7 @@ fn collect_decl_references(
                 let owner = qualify(prefix, name);
                 for method in methods {
                     if let Some(body) = &method.default_body {
-                        let bound = method
-                            .params
-                            .iter()
-                            .map(|(name, _)| name.clone())
-                            .collect();
+                        let bound = method.params.iter().map(|(name, _)| name.clone()).collect();
                         walk_expr(
                             body,
                             &bound,
@@ -767,11 +734,7 @@ fn collect_decl_references(
                 ..
             } => {
                 for method in methods {
-                    let bound = method
-                        .params
-                        .iter()
-                        .map(|(name, _)| name.clone())
-                        .collect();
+                    let bound = method.params.iter().map(|(name, _)| name.clone()).collect();
                     walk_expr(
                         &method.body,
                         &bound,
@@ -783,9 +746,7 @@ fn collect_decl_references(
                     );
                 }
             }
-            Decl::LetBinding {
-                name, value, ..
-            } => walk_expr(
+            Decl::LetBinding { name, value, .. } => walk_expr(
                 value,
                 &HashSet::new(),
                 declared,
@@ -803,9 +764,7 @@ fn collect_decl_references(
                 source,
                 out,
             ),
-            Decl::Given {
-                name, value, ..
-            } => walk_expr(
+            Decl::Given { name, value, .. } => walk_expr(
                 value,
                 &HashSet::new(),
                 declared,
@@ -838,7 +797,17 @@ fn walk_expr(
     match expr {
         Expr::Literal(..) | Expr::SelfRef(_) | Expr::Panic(..) => {}
         Expr::Var(name, span) => {
-            record_reference(name, *span, "reference", bound, declared, owner, file, source, out);
+            record_reference(
+                name,
+                *span,
+                "reference",
+                bound,
+                declared,
+                owner,
+                file,
+                source,
+                out,
+            );
         }
         Expr::FString(items, _) | Expr::Tuple(items, _) | Expr::Array(items, _) => {
             for item in items {
@@ -852,7 +821,9 @@ fn walk_expr(
         }
         Expr::App { func, args, .. } => {
             if let Expr::Var(name, span) = func.as_ref() {
-                record_reference(name, *span, "call", bound, declared, owner, file, source, out);
+                record_reference(
+                    name, *span, "call", bound, declared, owner, file, source, out,
+                );
             } else {
                 walk_expr(func, bound, declared, owner, file, source, out);
             }
@@ -1003,15 +974,7 @@ fn walk_expr(
             for handler in handlers {
                 let mut nested = bound.clone();
                 nested.extend(handler.params.iter().cloned());
-                walk_expr(
-                    &handler.body,
-                    &nested,
-                    declared,
-                    owner,
-                    file,
-                    source,
-                    out,
-                );
+                walk_expr(&handler.body, &nested, declared, owner, file, source, out);
             }
         }
         Expr::Migrate { actor, node, .. } => {
