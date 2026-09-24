@@ -51,6 +51,13 @@ version + migration.*
 
 ## Stable tier
 
+### Agent-native source queries and repairable diagnostics — 2026-09-24
+- **Core tooling now exposes `nulang query symbols` and `nulang query symbol` without the optional AI runtime**, returning stable JSON declaration metadata including qualified names, source spans, signatures, effect/capability annotations, and visibility where available.
+- **JSON diagnostics now carry stable machine-oriented `kind` values, structured `data`, exact UTF-8 byte offsets, and `fixes`**, while preserving the existing error code/message/notes/suggestion surface. An unbound identifier with exactly one close in-scope candidate emits a `machine_applicable` replacement edit.
+- Integration tests pin the query schema and the diagnostic repair contract so coding agents can consume compiler output without scraping human prose.
+- **The semantic query layer now exposes inferred declaration types/effects/capabilities plus direct references, callers, and callees** through `nulang query type|references|callers|callees`. Reference analysis is lexical-scope-aware, so shadowed locals and pattern bindings do not become false module references; imported modules are resolved only on the cloned AST used for type inference so local source spans stay exact.
+- **`nulang query context` returns a compact semantic neighborhood for one declaration**, combining inferred symbol facts with inbound references and outbound direct calls so agents can gather relevant context without scanning an entire file or rebuilding a call graph client-side.
+
 ### Backend-neutral JIT region planning — 2026-09-24
 - **Native compilation eligibility is now separated from Cranelift code generation.** `src/jit/region_planner.rs` owns region boundaries, non-suspending direct-call folding, recursion safety, cached per-module analyses, and type metadata production.
 - **`JitSession` now consumes a `RegionPlan` for initial compilation and Tier-2 replacement instead of recomputing language/runtime safety rules itself.** This creates a reusable planning boundary for MIR, a custom baseline emitter, or another future native backend without duplicating call/effect/recursion semantics.
