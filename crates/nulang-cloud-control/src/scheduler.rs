@@ -3,7 +3,6 @@ use crate::model::{
     ObservedAllocation, PlacementPlan, PlanError, PlannedAllocation, Rejection, RejectionCode,
     ScoreBreakdown, SupersededAllocation, SupersededReason,
 };
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 /// Build a deterministic placement plan from desired state and an observed cluster snapshot.
