@@ -54,6 +54,9 @@ version + migration.*
 ### Python bool marshal type inference — 2026-09-24
 - **Default-feature builds now make PyO3 boolean extraction explicit with `extract::<bool>()`**, avoiding a compiler inference failure in the Python marshal path without changing conversion semantics.
 
+### Transitive effect provenance reporting — 2026-09-24
+- **`nulang effects [--json] <file>` now reports each module-level function's transitive effect row with deterministic shortest provenance paths** (`src/effect_checker.rs`, `src/main.rs`). The checker reuses ordinary effect inference and shadowing semantics, distinguishes body-derived effects from declaration-only contracts, and keeps output name-sorted for stable tooling.
+
 ### Consuming local-send ownership proof — 2026-09-24
 - **MIR now identifies fresh, single-definition heap-owning values whose sole use is a same-node actor send**, establishing a conservative proof surface for a later ORCA ownership handoff.
 - The analysis is intentionally metadata-only in this slice: it changes no bytecode, mailbox representation, reference count, or runtime behavior. Parameters, captures, handler bindings, multi-use values, and remote sends remain ineligible.
