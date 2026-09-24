@@ -135,7 +135,6 @@ use super::{
     BytecodeRuntimeCallbacks, Runtime,
 };
 use crate::primitives::ActorRole;
-use crate::runtime::persistence::WorkflowEvent;
 use crate::vm::Value;
 
 /// Drain completed background LLM calls and resume any actors waiting for
@@ -428,17 +427,43 @@ pub(crate) fn prune_episodic_memory(rt: &mut Runtime, actor_id: u64, max_tokens:
 /// response. The re-executed `LlmAsk` picks the response up from
 /// `actor.llm_completed` via the VM callback.
 pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
+    if rt.actor_is_workflow(actor_id) {
+        if let Err(error) =
+            crate::runtime::workflow::begin_workflow_transition(rt, actor_id, None)
+        {
+            tracing::warn!(
+                actor_id,
+                %error,
+                "nulang-persist: failed to begin LLM-resume workflow transition"
+            );
+            return;
+        }
+    }
+
     let suspended = match rt.actors.get_mut(&actor_id) {
         Some(actor) => actor.suspended_execution.take(),
         None => return,
     };
-    let Some(suspended) = suspended else { return };
+    let Some(suspended) = suspended else {
+        crate::runtime::workflow::rollback_workflow_transition(rt, actor_id);
+        return;
+    };
 
     if rt.vm.is_none() {
-        // No VM available; put the suspension back so a later message
-        // can re-trigger the step.
         if let Some(actor) = rt.actors.get_mut(&actor_id) {
             actor.suspended_execution = Some(suspended);
+        }
+        if rt.actor_is_workflow(actor_id) {
+            if let Err(error) =
+                crate::runtime::workflow::commit_workflow_transition(rt, actor_id, true)
+            {
+                tracing::warn!(
+                    actor_id,
+                    %error,
+                    "nulang-persist: LLM completion transition rejected before resume"
+                );
+                crate::runtime::workflow::rollback_workflow_transition(rt, actor_id);
+            }
         }
         return;
     }
@@ -446,8 +471,6 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
     let self_ptr: *mut Runtime = rt;
     unsafe {
         let vm = (*self_ptr).vm.as_mut().unwrap();
-        // Re-install callbacks bound to THIS actor: other actors may have
-        // run on the shared VM while this one was suspended.
         vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::new(self_ptr, actor_id)));
         vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks { runtime: self_ptr }));
         vm.restore_suspended_state(suspended.vm_state);
@@ -458,11 +481,6 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         (*self_ptr).suspend_enabled = saved_suspend;
         match result {
             Ok(_) => {
-                // The suspended step ran to completion. For workflow
-                // actors record the completion the same way
-                // resume_suspended_workflow_step does: clear the
-                // suspension marker, advance step_index, append
-                // StepCompleted, and checkpoint.
                 if (*self_ptr).actor_is_workflow(actor_id) {
                     if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                         actor.waiting_signal = None;
@@ -472,21 +490,32 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                             actor.set_state_field("step_index", Value::int(n + 1));
                         }
                     }
-                    let seq = (*self_ptr).next_sequence(actor_id);
-                    let _ = (*self_ptr).persistence.append_workflow_event(
+                    let committed = crate::runtime::workflow::stage_step_completed(
+                        &mut *self_ptr,
                         actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            step_name: suspended.step_name,
-                        },
-                    );
-                    (*self_ptr).checkpoint_actor(actor_id);
+                        suspended.step_name.clone(),
+                    )
+                    .and_then(|_| {
+                        crate::runtime::workflow::commit_workflow_transition(
+                            &mut *self_ptr,
+                            actor_id,
+                            false,
+                        )
+                    });
+                    if let Err(error) = committed {
+                        tracing::warn!(
+                            actor_id,
+                            %error,
+                            "nulang-persist: LLM-resumed workflow completion rejected"
+                        );
+                        crate::runtime::workflow::rollback_workflow_transition(
+                            &mut *self_ptr,
+                            actor_id,
+                        );
+                    }
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
-                // Suspended again (e.g. a chained `perform LLM.ask` or a
-                // signal wait): re-capture the VM state so the next
-                // completion or signal can resume it.
                 if let Some(vm_state) = vm.take_suspended_state() {
                     let signal_name = vm.suspended_signal_name.take();
                     let receive_timeout = vm.suspended_receive_timeout.take();
@@ -497,27 +526,74 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                             Some(crate::runtime::actor::SuspendedExecution {
                                 vm_state,
                                 behavior_idx: suspended.behavior_idx,
-                                step_name: suspended.step_name,
+                                step_name: suspended.step_name.clone(),
                             });
                     }
-                    // A chained receive-after suspend arms its timeout
-                    // here; a no-op for the other sentinels.
                     (*self_ptr).maybe_schedule_receive_wait(actor_id, receive_timeout);
                 }
+                if (*self_ptr).actor_is_workflow(actor_id) {
+                    if let Err(error) =
+                        crate::runtime::workflow::commit_workflow_transition(
+                            &mut *self_ptr,
+                            actor_id,
+                            true,
+                        )
+                    {
+                        tracing::warn!(
+                            actor_id,
+                            %error,
+                            "nulang-persist: LLM-resumed suspension transition rejected"
+                        );
+                        crate::runtime::workflow::rollback_workflow_transition(
+                            &mut *self_ptr,
+                            actor_id,
+                        );
+                    }
+                }
             }
-            // Other errors: the send-path result is discarded anyway,
-            // matching step_actor semantics.
-            Err(_) => {}
+            Err(error) => {
+                if (*self_ptr).actor_is_workflow(actor_id) {
+                    let staged = crate::runtime::workflow::stage_step_failed(
+                        &mut *self_ptr,
+                        actor_id,
+                        suspended.step_name.clone(),
+                        format!("{}", error),
+                    );
+                    if let Err(stage_error) = staged {
+                        tracing::warn!(
+                            actor_id,
+                            error = %stage_error,
+                            "nulang-persist: failed to stage LLM-resumed workflow failure"
+                        );
+                        crate::runtime::workflow::rollback_workflow_transition(
+                            &mut *self_ptr,
+                            actor_id,
+                        );
+                    } else {
+                        (*self_ptr)
+                            .run_saga_compensation(actor_id, suspended.behavior_idx);
+                        if let Err(commit_error) =
+                            crate::runtime::workflow::commit_workflow_transition(
+                                &mut *self_ptr,
+                                actor_id,
+                                false,
+                            )
+                        {
+                            tracing::warn!(
+                                actor_id,
+                                error = %commit_error,
+                                "nulang-persist: LLM-resumed failure transition rejected"
+                            );
+                            crate::runtime::workflow::rollback_workflow_transition(
+                                &mut *self_ptr,
+                                actor_id,
+                            );
+                        }
+                    }
+                }
+            }
         }
-        // End the VM-execution window only after any suspend-state
-        // re-capture above: draining deferred wakes runs other actors
-        // on the shared VM, which would clobber the frames an
-        // un-captured suspend still needs. Runs on every path, so
-        // wakes of other actors are not lost when THIS one suspends.
         (*self_ptr).vm_exec_end();
     }
-    // The suspension resolved (completed or failed): if messages queued
-    // up while the behavior was suspended, schedule the actor to drain
-    // them — step_actor leaves mail untouched while a suspension is live.
     rt.requeue_if_mail_pending(actor_id);
 }
