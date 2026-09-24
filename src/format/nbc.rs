@@ -34,7 +34,7 @@
 //! metadata encoding would be an additive v2 extension with a migration in
 //! [`crate::format::migrate`].
 
-use crate::bytecode::{CodeModule, Constant, Instruction};
+use crate::bytecode::{CodeModule, Constant, Instruction, OpCode};
 use crate::format::constants::{
     FormatError, BYTECODE_MAGIC, BYTECODE_MAX_VERSION, BYTECODE_VERSION, LANGUAGE_VERSION,
     NBC_HEADER_LEN,
@@ -56,6 +56,38 @@ pub struct NbcArtifact {
 }
 
 impl CodeModule {
+    fn validate_effect_site_metadata(&self) -> Result<(), FormatError> {
+        let mut previous_pc = None;
+        for (index, site) in self.effect_sites.iter().enumerate() {
+            if let Some(previous) = previous_pc {
+                if site.pc <= previous {
+                    return Err(FormatError::BodyDecode(format!(
+                        "effect-site metadata must be strictly ordered by unique pc: entry #{index} has pc {} after {previous}",
+                        site.pc
+                    )));
+                }
+            }
+            let instruction = self.instructions.get(site.pc).ok_or_else(|| {
+                FormatError::BodyDecode(format!(
+                    "effect-site metadata pc {} is outside the {}-instruction module",
+                    site.pc,
+                    self.instructions.len()
+                ))
+            })?;
+            if !matches!(
+                instruction.opcode,
+                OpCode::Perform | OpCode::PerformDirect | OpCode::PerformAsync
+            ) {
+                return Err(FormatError::BodyDecode(format!(
+                    "effect-site metadata pc {} points at non-effect opcode {:?}",
+                    site.pc, instruction.opcode
+                )));
+            }
+            previous_pc = Some(site.pc);
+        }
+        Ok(())
+    }
+
     /// Serialize this module to a `.nbc` byte vector.
     ///
     /// `source_hash` is an optional BLAKE3 digest of the originating source
@@ -77,6 +109,7 @@ impl CodeModule {
                 }
             }
         }
+        self.validate_effect_site_metadata()?;
 
         let mut buf = Vec::with_capacity(NBC_HEADER_LEN + self.instructions.len() * 4 + 256);
 
@@ -191,6 +224,7 @@ impl CodeModule {
         let mut module: CodeModule = serde_json::from_slice(meta_bytes)
             .map_err(|e| FormatError::BodyDecode(e.to_string()))?;
         module.instructions = instructions;
+        module.validate_effect_site_metadata()?;
 
         Ok(NbcArtifact {
             module,
@@ -204,7 +238,7 @@ impl CodeModule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bytecode::{CodeModule, Constant, Instruction, OpCode};
+    use crate::bytecode::{CodeModule, Constant, EffectSiteMetadata, Instruction, OpCode};
 
     fn sample_module() -> CodeModule {
         let mut m = CodeModule::new("test");
@@ -213,6 +247,48 @@ mod tests {
         m.emit(Instruction::new1(OpCode::ConstU, 0));
         m.emit(Instruction::new0(OpCode::Halt));
         m
+    }
+
+    #[test]
+    fn effect_site_metadata_validation_rejects_unsorted_duplicate_and_invalid_pcs() {
+        let mut module = sample_module();
+        module.instructions.insert(0, Instruction::new0(OpCode::PerformAsync));
+        module.effect_sites = vec![
+            EffectSiteMetadata {
+                pc: 0,
+                id: [1; 32],
+                effect_operation: "Inference.ask".to_string(),
+            },
+            EffectSiteMetadata {
+                pc: 0,
+                id: [2; 32],
+                effect_operation: "Inference.ask".to_string(),
+            },
+        ];
+        assert!(matches!(
+            module.validate_effect_site_metadata(),
+            Err(FormatError::BodyDecode(message)) if message.contains("strictly ordered")
+        ));
+
+        module.effect_sites = vec![EffectSiteMetadata {
+            pc: module.instructions.len(),
+            id: [3; 32],
+            effect_operation: "Inference.ask".to_string(),
+        }];
+        assert!(matches!(
+            module.validate_effect_site_metadata(),
+            Err(FormatError::BodyDecode(message)) if message.contains("outside")
+        ));
+
+        module.effect_sites = vec![EffectSiteMetadata {
+            pc: 1,
+            id: [4; 32],
+            effect_operation: "Inference.ask".to_string(),
+        }];
+        assert!(matches!(
+            module.validate_effect_site_metadata(),
+            Err(FormatError::BodyDecode(message)) if message.contains("non-effect opcode")
+        ));
     }
 
     #[test]
