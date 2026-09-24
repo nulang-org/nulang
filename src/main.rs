@@ -8,6 +8,7 @@
 //!   nulang --lsp
 //!   nulang --dap [FILE]
 //!   nulang agent <init|run|chat|goals|graph>
+//!   nulang query <symbols|symbol> ...
 //!   nulang nula <new|build|build-wasm|test|run|add|remove|publish|deploy|watch|doc>
 //!   nulang fmt [--check] [<file>]
 //!
@@ -238,6 +239,14 @@ fn main() {
     // actor node (shard 0, network-enabled).
     if args[1] == "node" {
         if let Err(e) = run_node_cmd(&args[2..]) {
+            print_error(&e, true);
+            std::process::exit(exit_code(&e));
+        }
+        return;
+    }
+
+    if args[1] == "query" {
+        if let Err(e) = nulang::code_query::run(&args[2..]) {
             print_error(&e, true);
             std::process::exit(exit_code(&e));
         }
