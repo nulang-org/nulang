@@ -2685,6 +2685,18 @@ impl Runtime {
                     continue;
                 }
 
+                // IsoArena allocations are activation-scoped and do not carry
+                // ActorHeap/OrcaHeader layout. They require promotion/copy,
+                // never ORCA token transfer.
+                if self
+                    .actors
+                    .get(&sender_id)
+                    .map(|actor| actor.iso_arena.contains(ptr))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+
                 let header = unsafe { crate::runtime::heap::ActorHeap::header_of(ptr) };
                 let owner_id = unsafe { (*header).actor_id };
                 if owner_id != sender_id {
@@ -3690,7 +3702,25 @@ impl Runtime {
                 Some(actor) => std::mem::take(&mut actor.held_objects),
                 None => std::collections::HashSet::new(),
             };
+        let receiver_sentinel = self
+            .actors
+            .get_mut(&actor_id)
+            .and_then(|actor| actor.cycle_sentinel());
+
         for (owner_id, header) in holds {
+            if let Some(sentinel) = receiver_sentinel {
+                // Conservative sends may already have removed this edge when
+                // their in-flight decrement was processed. Removal is
+                // idempotent; consuming handoffs keep the edge until the
+                // receiver releases its direct hold.
+                self.cycle_detector.remove_foreign_ref(
+                    actor_id,
+                    sentinel,
+                    owner_id,
+                    header,
+                );
+            }
+
             if let Some(owner) = self.actors.get_mut(&owner_id) {
                 owner.orca_gc.process_foreign_op(
                     &mut owner.heap,
