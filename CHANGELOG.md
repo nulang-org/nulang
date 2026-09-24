@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Differential overflow oracle fail-closed — 2026-09-24
+- **Cross-backend differential campaigns no longer whitelist 48-bit overflow mismatches as a known divergence class** (`src/difffuzz.rs`, `src/bin/nula_difffuzz.rs`). Once a backend accepts a program, any VM/JIT/AOT/WASM disagreement is an ordinary fatal divergence, is written to the main crasher directory, and makes the standalone campaign exit nonzero.
+
 ### Python bool marshal type inference — 2026-09-24
 - **Default-feature builds now make PyO3 boolean extraction explicit with `extract::<bool>()`**, avoiding a compiler inference failure in the Python marshal path without changing conversion semantics.
 
