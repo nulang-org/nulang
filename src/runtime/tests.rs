@@ -225,6 +225,7 @@ fn test_mailbox_push_pop() {
         payload: MessagePayload::from_slice(&[Value::int(42)]),
         sender: 1,
         priority: MessagePriority::Normal,
+        ownership_handoff_mask: 0,
         trace_id: None,
     };
     assert!(mb.push(msg.clone()).is_ok());
@@ -268,6 +269,7 @@ fn test_delivery_establishes_child_context_and_inherits() {
                 payload: MessagePayload::from_slice(&[]),
                 sender: 0,
                 priority: MessagePriority::Normal,
+                ownership_handoff_mask: 0,
                 trace_id: Some(incoming.to_string()),
             })
             .unwrap();
