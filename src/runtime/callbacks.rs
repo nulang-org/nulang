@@ -710,9 +710,12 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         let Some(actor_id) = target.as_actor_id() else {
             return 0;
         };
-        self.runtime
-            .borrow_mut()
-            .send_message_by_id_consuming(actor_id, behavior_id, args, candidate_mask)
+        self.runtime.borrow_mut().send_message_by_id_consuming(
+            actor_id,
+            behavior_id,
+            args,
+            candidate_mask,
+        )
     }
 
     fn ask_actor(
