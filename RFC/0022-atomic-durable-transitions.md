@@ -561,10 +561,17 @@ redeliver pending records. A crash after acceptance but before mailbox
 publication is repaired by requeueing the accepted command, while workflow
 recovery handles a crash after acceptance but before handler completion.
 
-This remains a partial Phase E implementation: ordinary source/runtime actor
-sends are not yet automatically staged into the sender's current transition,
-plain persistent actors are deferred until generic turn-level atomicity is
-complete, and durable cross-node transport is not yet wired.
+This remains a partial Phase E implementation. Sends performed by an active
+local workflow turn to another local workflow receiver are now staged in the
+sender's current transition and remain invisible until that transition commits.
+The staging context survives nested actor resumes, recovery replay, and JIT
+safepoint yields, and suspension boundaries atomically commit the marker
+snapshot together with any staged sends.
+
+The remaining gaps are deliberate: sends to plain persistent/non-workflow
+actors still use their existing immediate path, generic persistent actors are
+deferred until turn-level atomicity is complete, and durable cross-node/
+cross-shard transport is not yet wired.
 
 #### Phase F — distributed ownership
 
