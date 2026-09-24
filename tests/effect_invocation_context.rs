@@ -1,10 +1,6 @@
-use nulang::bytecode::{
-    CodeModule, Constant, EffectSiteMetadata, Instruction, OpCode,
-};
+use nulang::bytecode::{CodeModule, Constant, EffectSiteMetadata, Instruction, OpCode};
 use nulang::runtime::heap::TypeTag as HeapTypeTag;
-use nulang::vm::{
-    ActorVmCallbacks, EffectInvocationContext, PerformAsyncResult, VM, Value,
-};
+use nulang::vm::{ActorVmCallbacks, EffectInvocationContext, PerformAsyncResult, Value, VM};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Default)]
@@ -68,8 +64,7 @@ impl ActorVmCallbacks for CaptureCallbacks {
         _args: &[Value],
     ) -> PerformAsyncResult {
         let site = context.site.expect("compiler-owned site metadata");
-        self.seen.lock().unwrap().asynchronous =
-            Some((context.pc, site.id, effect_op.to_string()));
+        self.seen.lock().unwrap().asynchronous = Some((context.pc, site.id, effect_op.to_string()));
         PerformAsyncResult::Ready(None)
     }
 }
@@ -98,11 +93,7 @@ fn perform_callback_receives_exact_semantic_site_context() {
     let seen = Arc::new(Mutex::new(Seen::default()));
     let callbacks = CaptureCallbacks { seen: seen.clone() };
     let mut vm = VM::new_without_jit();
-    vm.load_module(module_with_effect(
-        OpCode::Perform,
-        "Host.echo",
-        [0x11; 32],
-    ));
+    vm.load_module(module_with_effect(OpCode::Perform, "Host.echo", [0x11; 32]));
     vm.set_actor_callbacks(Box::new(callbacks));
 
     vm.run().expect("effect should be handled");
