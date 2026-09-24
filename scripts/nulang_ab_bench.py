@@ -55,12 +55,22 @@ def command_output(
     proc = subprocess.run(
         command,
         cwd=cwd,
-        check=True,
+        check=False,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         preexec_fn=preexec_fn,
     )
+    if proc.returncode != 0:
+        # Preserve captured Cargo/compiler diagnostics in CI logs. Raising with
+        # check=True here hides the output that explains candidate build
+        # failures and makes the A/B gate non-actionable.
+        sys.stderr.write(proc.stdout)
+        raise subprocess.CalledProcessError(
+            proc.returncode,
+            command,
+            output=proc.stdout,
+        )
     return proc.stdout
 
 
