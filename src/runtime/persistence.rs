@@ -1945,6 +1945,7 @@ impl PersistenceStore for LibsqlStore {
             let state: HashMap<String, PersistedValue> = serde_json::from_str(&state_json).ok()?;
             Some(ActorSnapshot {
                 actor_id,
+                semantic_id: None,
                 sequence: sequence as u64,
                 semantic_id,
                 state,
@@ -2705,6 +2706,7 @@ impl PersistenceStore for PostgresStore {
         let state: HashMap<String, PersistedValue> = serde_json::from_str(&state_json).ok()?;
         Some(ActorSnapshot {
             actor_id,
+            semantic_id: None,
             sequence: sequence as u64,
             semantic_id,
             state,
@@ -3679,6 +3681,7 @@ mod durable_transition_tests {
         }
         ActorSnapshot {
             actor_id,
+            semantic_id: None,
             sequence,
             state,
             ..ActorSnapshot::default()
@@ -3852,6 +3855,7 @@ mod libsql_atomic_transition_tests {
         state.insert("count".to_string(), PersistedValue::Int(count));
         ActorSnapshot {
             actor_id,
+            semantic_id: None,
             sequence,
             state,
             ..ActorSnapshot::default()
