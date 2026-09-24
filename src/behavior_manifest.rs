@@ -1067,7 +1067,7 @@ mod tests {
     use crate::ast::{Expr, Literal, MigrationDecl, StateModel};
     use crate::content_identity::SemanticId;
     use crate::hir::{ActorDef, Module, Operand};
-    use crate::types::{PrimitiveType, Span, Type};
+    use crate::types::{Capability, EffectRow, PrimitiveType, Span, Type};
 
     fn artifact() -> ArtifactIdentityManifest {
         ArtifactIdentityManifest::new(
@@ -1209,6 +1209,153 @@ mod tests {
         assert_eq!(actor.migrations[0].from, 1);
         assert_eq!(actor.migrations[0].to, 2);
         assert!(actor.migrations[0].state);
+    }
+
+    #[test]
+    fn typed_hir_emits_host_replay_authority_and_unclassified_effect_evidence() {
+        let mut hir = typed_hir(1);
+        hir.decls.push(hir::Decl::Function(hir::FunctionDef {
+            name: "effects".to_string(),
+            type_params: Vec::new(),
+            params: Vec::new(),
+            dict_params: Vec::new(),
+            ret: Type::unit(),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+            body: hir::Body {
+                stmts: vec![
+                    hir::Stmt::Let {
+                        name: "known".to_string(),
+                        ty: Type::string(),
+                        value: hir::RValue::Perform {
+                            effect: "Http".to_string(),
+                            op: "get".to_string(),
+                            args: vec![Operand::Literal(
+                                Literal::String("https://example.com".to_string()),
+                                Type::string(),
+                            )],
+                            ty: Type::string(),
+                        },
+                        span: Span::default(),
+                    },
+                    hir::Stmt::Let {
+                        name: "custom".to_string(),
+                        ty: Type::unit(),
+                        value: hir::RValue::Perform {
+                            effect: "Custom".to_string(),
+                            op: "ping".to_string(),
+                            args: Vec::new(),
+                            ty: Type::unit(),
+                        },
+                        span: Span::default(),
+                    },
+                ],
+                terminator: hir::Terminator::FnReturn(Some(Operand::Unit)),
+            },
+            public: false,
+            placement: None,
+            span: Span::default(),
+        }));
+
+        let manifest = BehaviorManifest::from_typed_hir(
+            "demo",
+            "0.1.0",
+            &artifact(),
+            b"compiled-nbc",
+            &hir,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manifest.effects.coverage,
+            BehaviorEffectCoverage::TypedHirPerformSites
+        );
+        assert_eq!(manifest.effects.host_operations.len(), 1);
+        let known = &manifest.effects.host_operations[0];
+        let expected = lookup_host_operation("Http", "get").unwrap();
+        assert_eq!(known.canonical_id, expected.canonical_id());
+        assert_eq!(known.replay, "journal-result");
+        assert_eq!(known.authority_requirement.kind, "checked-effect-row");
+        assert_eq!(known.authority_requirement.effect, "Http");
+        assert_eq!(
+            manifest.effects.unclassified_operations,
+            vec![BehaviorEffectOperation {
+                effect: "Custom".to_string(),
+                operation: "ping".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn typed_hir_propagates_only_proven_protocol_identity() {
+        let mut hir = typed_hir(1);
+        let protocol_id = crate::protocol::ProtocolSchema::new(
+            "Counter",
+            std::iter::empty::<crate::protocol::ProtocolMember>(),
+        )
+        .unwrap()
+        .id()
+        .to_string();
+        let hir::Decl::Actor(actor) = &mut hir.decls[0] else {
+            panic!("fixture actor missing");
+        };
+        actor.protocol_id = Some(protocol_id.clone());
+
+        let manifest = BehaviorManifest::from_typed_hir(
+            "demo",
+            "0.1.0",
+            &artifact(),
+            b"compiled-nbc",
+            &hir,
+        )
+        .unwrap();
+        assert_eq!(manifest.actors[0].protocol_id.as_deref(), Some(protocol_id.as_str()));
+    }
+
+    #[test]
+    fn tampered_host_contract_evidence_is_rejected() {
+        let mut hir = typed_hir(1);
+        hir.decls.push(hir::Decl::Function(hir::FunctionDef {
+            name: "effects".to_string(),
+            type_params: Vec::new(),
+            params: Vec::new(),
+            dict_params: Vec::new(),
+            ret: Type::unit(),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+            body: hir::Body {
+                stmts: vec![hir::Stmt::Let {
+                    name: "known".to_string(),
+                    ty: Type::string(),
+                    value: hir::RValue::Perform {
+                        effect: "Http".to_string(),
+                        op: "get".to_string(),
+                        args: Vec::new(),
+                        ty: Type::string(),
+                    },
+                    span: Span::default(),
+                }],
+                terminator: hir::Terminator::FnReturn(Some(Operand::Unit)),
+            },
+            public: false,
+            placement: None,
+            span: Span::default(),
+        }));
+
+        let mut manifest = BehaviorManifest::from_typed_hir(
+            "demo",
+            "0.1.0",
+            &artifact(),
+            b"compiled-nbc",
+            &hir,
+        )
+        .unwrap();
+        manifest.effects.host_operations[0].replay = "pure".to_string();
+
+        assert!(matches!(
+            manifest.to_json(),
+            Err(BehaviorManifestError::InvalidEffectInventory(_))
+        ));
     }
 
     #[test]
