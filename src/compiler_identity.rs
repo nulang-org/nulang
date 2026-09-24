@@ -153,6 +153,18 @@ mod tests {
     }
 
     #[test]
+    fn frozen_nbc_roundtrip_does_not_self_assert_semantic_identity() {
+        let (hir, mut mir) = empty_program();
+        let typed = compile_typed_bytecode(&hir, &mut mir, [], "typed").unwrap();
+        assert!(typed.semantic_id.is_some());
+
+        let bytes = typed.to_nbc(None).unwrap();
+        let decoded = crate::bytecode::CodeModule::from_nbc(&bytes).unwrap().module;
+        assert!(decoded.semantic_id.is_none());
+        assert!(decoded.actor_semantic_ids.is_empty());
+    }
+
+    #[test]
     fn typed_bytecode_actor_sidecar_aligns_with_actor_metadata() {
         use crate::ast::{Literal, StateModel};
         use crate::bytecode::ActorMeta;
