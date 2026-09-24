@@ -707,9 +707,19 @@ impl ActorHeap {
         debug_assert!(self.limit.is_null());
 
         let requested = self.total_size.max(min_capacity);
-        let (base, actual_size) = HEAP_POOL
-            .with(|pool| pool.borrow_mut().acquire(requested))
-            .unwrap_or_else(|| {
+        // A tiered heap (growth_floor > initial capacity) needs its compact
+        // first block to be a real size tier, not merely a minimum request.
+        // Otherwise best-fit reuse can hand a 16 KiB recycled growth block to
+        // every new 4 KiB actor and erase the density win indefinitely.
+        let pooled = HEAP_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if self.growth_floor > self.total_size && requested == self.total_size {
+                pool.acquire_exact(requested)
+            } else {
+                pool.acquire(requested)
+            }
+        });
+        let (base, actual_size) = pooled.unwrap_or_else(|| {
                 let layout = std::alloc::Layout::from_size_align(requested, ALIGN)
                     .expect("invalid ActorHeap layout");
                 let base = unsafe { std::alloc::alloc(layout) };
@@ -1002,6 +1012,17 @@ impl HeapPool {
         best_idx.map(|i| self.blocks.swap_remove(i))
     }
 
+    /// Acquire a recycled block whose allocation size exactly matches
+    /// `size`. Tiered actor heaps use this for their compact first block so a
+    /// pooled steady-state 16 KiB block cannot silently turn a 4 KiB request
+    /// back into a 16 KiB actor footprint.
+    fn acquire_exact(&mut self, size: usize) -> Option<(*mut u8, usize)> {
+        self.blocks
+            .iter()
+            .position(|&(_base, block_size)| block_size == size)
+            .map(|index| self.blocks.swap_remove(index))
+    }
+
     /// Return a block to the pool for reuse.
     ///
     /// The block will only be retained if its size is ≤ `size_threshold`.
@@ -1285,6 +1306,33 @@ fn test_free_list_reuse() {
 
     // Free list should be empty now.
     assert_eq!(heap.free_list_count(), 0);
+}
+
+#[test]
+fn test_heap_pool_exact_acquire_does_not_substitute_larger_block() {
+    let mut pool = HeapPool::new(8, 128 * 1024);
+    let small_layout = std::alloc::Layout::from_size_align(4 * 1024, ALIGN).unwrap();
+    let large_layout = std::alloc::Layout::from_size_align(16 * 1024, ALIGN).unwrap();
+    let small = unsafe { std::alloc::alloc(small_layout) };
+    let large = unsafe { std::alloc::alloc(large_layout) };
+    assert!(!small.is_null() && !large.is_null());
+
+    pool.release(large, 16 * 1024);
+    assert!(
+        pool.acquire_exact(4 * 1024).is_none(),
+        "a larger pooled block must not satisfy an exact compact-tier request"
+    );
+
+    pool.release(small, 4 * 1024);
+    let (base, size) = pool
+        .acquire_exact(4 * 1024)
+        .expect("exact-size pooled block should be reused");
+    assert_eq!(base, small);
+    assert_eq!(size, 4 * 1024);
+
+    // The acquired small block is no longer owned by the pool.
+    unsafe { std::alloc::dealloc(base, small_layout) };
+    // The 16 KiB block remains in the pool and is released by HeapPool::drop.
 }
 
 #[test]
