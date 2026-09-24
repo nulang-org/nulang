@@ -226,6 +226,7 @@ fn test_mailbox_push_pop() {
         sender: 1,
         priority: MessagePriority::Normal,
         trace_id: None,
+        durable_id: None,
     };
     assert!(mb.push(msg.clone()).is_ok());
     assert_eq!(mb.len(), 1);
@@ -269,6 +270,7 @@ fn test_delivery_establishes_child_context_and_inherits() {
                 sender: 0,
                 priority: MessagePriority::Normal,
                 trace_id: Some(incoming.to_string()),
+                durable_id: None,
             })
             .unwrap();
     }
@@ -3462,6 +3464,249 @@ fn test_workflow_actor_step_event_and_checkpoint() {
         snapshot.state.get("step_index"),
         Some(&PersistedValue::Int(1))
     );
+}
+
+fn stage_test_durable_outbox(
+    rt: &mut Runtime,
+    sender_actor_id: u64,
+    destination_actor_id: u64,
+    behavior_id: u16,
+) -> DurableMessageId {
+    let id = DurableMessageId {
+        sender_actor_id,
+        sender_epoch: 1,
+        transition_sequence: 1,
+        outbox_ordinal: 0,
+    };
+    rt.persistence
+        .commit_transition(DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: sender_actor_id,
+            activation_epoch: 1,
+            sequence: 1,
+            expected_previous_sequence: 0,
+            command: None,
+            snapshot: None,
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![DurableOutboxMessage {
+                destination_actor_id,
+                ordinal: 0,
+                behavior_id,
+                payload: vec![],
+            }],
+            inbox: vec![],
+        })
+        .unwrap();
+    id
+}
+
+#[test]
+fn test_durable_outbox_pump_accepts_once_and_executes_without_rejournal() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "DurableReceiver",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", |actor, _args| {
+            let current = actor
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int())
+                .unwrap_or(0);
+            actor.set_state_field("step_index", Value::int(current + 1));
+        });
+
+    let sender_actor_id = 90_001;
+    let id = stage_test_durable_outbox(&mut rt, sender_actor_id, actor_id, 1);
+
+    let report = rt.pump_durable_outbox(8).unwrap();
+    assert_eq!(report.accepted, 1);
+    assert_eq!(report.acknowledged, 1);
+    assert_eq!(
+        rt.persistence.lookup_inbox_delivery(actor_id, id).unwrap(),
+        Some(2)
+    );
+    assert_eq!(rt.persistence.read_journal(actor_id).len(), 1);
+    assert_eq!(rt.actors.get(&actor_id).unwrap().mailbox.len(), 1);
+
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
+        Some(1)
+    );
+    // The scheduler recognized the preaccepted durable marker and did not
+    // append the same command a second time.
+    assert_eq!(rt.persistence.read_journal(actor_id).len(), 1);
+    assert!(rt.persistence.read_pending_outbox(8).unwrap().is_empty());
+}
+
+#[test]
+fn test_run_scheduler_automatically_pumps_durable_outbox() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "AutoPumpReceiver",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", |actor, _args| {
+            let current = actor
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int())
+                .unwrap_or(0);
+            actor.set_state_field("step_index", Value::int(current + 1));
+        });
+
+    let sender_actor_id = 90_005;
+    stage_test_durable_outbox(&mut rt, sender_actor_id, actor_id, 1);
+
+    // No explicit pump call: scheduler quiescence must discover the committed
+    // outbox, atomically accept it at the receiver, enqueue it, and continue.
+    rt.run_scheduler();
+
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
+        Some(1)
+    );
+    assert_eq!(rt.persistence.read_journal(actor_id).len(), 1);
+    assert!(rt.persistence.read_pending_outbox(8).unwrap().is_empty());
+}
+
+#[test]
+fn test_durable_outbox_pump_requeues_preaccepted_crash_window() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "CrashWindowReceiver",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", |actor, _args| {
+            let current = actor
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int())
+                .unwrap_or(0);
+            actor.set_state_field("step_index", Value::int(current + 1));
+        });
+
+    let sender_actor_id = 90_002;
+    let id = stage_test_durable_outbox(&mut rt, sender_actor_id, actor_id, 1);
+
+    // Simulate crash window: receiver acceptance committed, but mailbox
+    // publication and sender acknowledgement never happened.
+    let accepted_sequence =
+        workflow::commit_durable_inbox_command(&mut rt, actor_id, id, 1, vec![]).unwrap();
+    assert_eq!(accepted_sequence, 2);
+    assert_eq!(rt.actors.get(&actor_id).unwrap().mailbox.len(), 0);
+
+    let report = rt.pump_durable_outbox(8).unwrap();
+    assert_eq!(report.duplicates, 1);
+    assert_eq!(report.acknowledged, 1);
+    assert_eq!(rt.actors.get(&actor_id).unwrap().mailbox.len(), 1);
+
+    run_ready_actor_turn(&mut rt, actor_id);
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
+        Some(1)
+    );
+    assert_eq!(rt.persistence.read_journal(actor_id).len(), 1);
+}
+
+#[test]
+fn test_durable_outbox_pump_leaves_sender_pending_when_mailbox_is_full() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "BackpressuredReceiver",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", noop_test_behavior);
+
+    // Replace the default unbounded mailbox with a single-slot mailbox and
+    // occupy that slot before the durable pump runs.
+    rt.actors.get_mut(&actor_id).unwrap().mailbox = Mailbox::new(1);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .mailbox
+        .push_local(Message {
+            behavior_id: 1,
+            payload: MessagePayload::from_slice(&[]),
+            sender: 0,
+            priority: MessagePriority::Normal,
+            trace_id: None,
+            durable_id: None,
+        })
+        .unwrap();
+
+    let sender_actor_id = 90_003;
+    let id = stage_test_durable_outbox(&mut rt, sender_actor_id, actor_id, 1);
+    let report = rt.pump_durable_outbox(8).unwrap();
+
+    assert_eq!(report.backpressured, 1);
+    assert_eq!(report.accepted, 0);
+    assert_eq!(report.acknowledged, 0);
+    assert_eq!(
+        rt.persistence.lookup_inbox_delivery(actor_id, id).unwrap(),
+        None
+    );
+    assert_eq!(rt.persistence.read_pending_outbox(8).unwrap().len(), 1);
+}
+
+#[test]
+fn test_durable_outbox_pump_defers_plain_persistent_actor() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", noop_test_behavior);
+
+    let sender_actor_id = 90_004;
+    let id = stage_test_durable_outbox(&mut rt, sender_actor_id, actor_id, 0);
+    let report = rt.pump_durable_outbox(8).unwrap();
+
+    assert_eq!(report.deferred, 1);
+    assert_eq!(report.accepted, 0);
+    assert_eq!(report.acknowledged, 0);
+    assert_eq!(
+        rt.persistence.lookup_inbox_delivery(actor_id, id).unwrap(),
+        None
+    );
+    assert_eq!(rt.persistence.read_pending_outbox(8).unwrap().len(), 1);
 }
 
 #[test]
