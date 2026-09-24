@@ -5,7 +5,7 @@
 //! accordingly so their timings are not misread as message throughput.
 
 use criterion::{black_box, criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
-use nulang::runtime::{Mailbox, Message, MessagePayload, MessagePriority, Runtime};
+use nulang::runtime::{Mailbox, Message, MessagePayload, MessagePriority, Runtime, TypeTag};
 use nulang::vm::Value;
 
 const MESSAGE_BATCH: usize = 100;
@@ -50,6 +50,41 @@ fn bench_spawn_idle_batch(c: &mut Criterion) {
             }
             black_box(rt.actor_count());
         })
+    });
+
+    group.finish();
+}
+
+/// Cost of materializing the first small heap block for already-spawned actors.
+/// Actor creation itself remains setup so this tracks the lazy-heap boundary.
+fn bench_first_heap_alloc_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("actor/first_heap_alloc");
+    group.throughput(Throughput::Elements(IDLE_ACTOR_BATCH as u64));
+
+    group.bench_function("1000", |b| {
+        b.iter_batched(
+            || {
+                let mut rt = Runtime::new();
+                let ids: Vec<u64> = (0..IDLE_ACTOR_BATCH)
+                    .map(|_| rt.spawn_actor(Box::new(|| vec![])))
+                    .collect();
+                (rt, ids)
+            },
+            |(mut rt, ids)| {
+                for actor_id in ids {
+                    let ptr = rt
+                        .actors
+                        .get_mut(&actor_id)
+                        .expect("spawned actor")
+                        .heap
+                        .alloc(8, TypeTag::Raw)
+                        .expect("first actor heap allocation");
+                    black_box(ptr);
+                }
+                black_box(rt);
+            },
+            BatchSize::SmallInput,
+        )
     });
 
     group.finish();
@@ -262,6 +297,7 @@ fn bench_selective_receive(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_spawn_idle_batch,
+    bench_first_heap_alloc_batch,
     bench_spawn_send_receive,
     bench_message_enqueue,
     bench_message_drain,
