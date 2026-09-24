@@ -417,6 +417,43 @@ impl CacheStore {
         Ok(())
     }
 
+    fn validate_bytes_batch(&self, pairs: &[(&[u8], &[u8])]) -> Result<(), CacheWriteError> {
+        let mut new_entries = 0usize;
+        let mut arena_lengths = Vec::with_capacity(pairs.len().saturating_mul(2));
+
+        for (index, &(key, value)) in pairs.iter().enumerate() {
+            if key.len() > self.config.max_key_bytes {
+                return Err(CacheWriteError::KeyTooLarge);
+            }
+            if value.len() > self.config.max_value_bytes {
+                return Err(CacheWriteError::ValueTooLarge);
+            }
+
+            let hash = self.hash(key);
+            let exists_in_store = self.find_slot(key, hash).is_some();
+            let exists_earlier_in_batch = pairs[..index]
+                .iter()
+                .any(|(previous_key, _)| *previous_key == key);
+            if !exists_in_store && !exists_earlier_in_batch {
+                new_entries = new_entries.saturating_add(1);
+                arena_lengths.push(key.len());
+            }
+            // Conservatively account for every value in the batch. Sequential
+            // replacements may release an older block earlier, so this is an
+            // upper bound on peak arena growth rather than an underestimate.
+            arena_lengths.push(value.len());
+        }
+
+        if self.index_len.saturating_add(new_entries) > self.config.max_entries {
+            return Err(CacheWriteError::EntryLimitReached);
+        }
+        let additional = self.arena.additional_reserved_for(&arena_lengths);
+        if self.arena.reserved_bytes().saturating_add(additional) > self.config.max_arena_bytes {
+            return Err(CacheWriteError::ArenaLimitReached);
+        }
+        Ok(())
+    }
+
     fn validate_integer_write(&self, key: &[u8]) -> Result<(), CacheWriteError> {
         if key.len() > self.config.max_key_bytes {
             return Err(CacheWriteError::KeyTooLarge);
@@ -619,6 +656,11 @@ impl CacheStore {
         self.stats.sets += 1;
     }
 
+    fn set_bytes_unchecked(&mut self, key: &[u8], value: &[u8], ttl_ms: Option<u64>, now_ms: u64) {
+        let value = CacheValue::Bytes(PackedBytes::pack(value, &mut self.arena));
+        self.set_value(key, value, ttl_ms, now_ms);
+    }
+
     pub fn try_set_bytes(
         &mut self,
         key: &[u8],
@@ -627,8 +669,20 @@ impl CacheStore {
         now_ms: u64,
     ) -> Result<(), CacheWriteError> {
         self.validate_bytes_write(key, value)?;
-        let value = CacheValue::Bytes(PackedBytes::pack(value, &mut self.arena));
-        self.set_value(key, value, ttl_ms, now_ms);
+        self.set_bytes_unchecked(key, value, ttl_ms, now_ms);
+        Ok(())
+    }
+
+    pub fn try_set_many_bytes(
+        &mut self,
+        pairs: &[(&[u8], &[u8])],
+        ttl_ms: Option<u64>,
+        now_ms: u64,
+    ) -> Result<(), CacheWriteError> {
+        self.validate_bytes_batch(pairs)?;
+        for &(key, value) in pairs {
+            self.set_bytes_unchecked(key, value, ttl_ms, now_ms);
+        }
         Ok(())
     }
 
@@ -1064,6 +1118,22 @@ mod tests {
             Err(CacheWriteError::EntryLimitReached)
         );
         assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn mset_style_batch_rejects_before_partial_mutation() {
+        let mut store = CacheStore::with_config(CacheConfig {
+            max_key_bytes: 64,
+            max_value_bytes: 64,
+            max_entries: 1,
+            max_arena_bytes: 1024,
+        });
+        let pairs = [(b"a".as_slice(), b"1".as_slice()), (b"b".as_slice(), b"2".as_slice())];
+        assert_eq!(
+            store.try_set_many_bytes(&pairs, None, 0),
+            Err(CacheWriteError::EntryLimitReached)
+        );
+        assert!(store.is_empty());
     }
 
     #[test]
