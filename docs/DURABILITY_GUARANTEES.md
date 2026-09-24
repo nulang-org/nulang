@@ -65,6 +65,46 @@ blanket exactly-once guarantee for an uncooperative provider.
 The configured backend owns retry, deduplication, and commit semantics. Nulang
 delegates rather than inferring a stronger guarantee.
 
+## Durable actor code identity
+
+Durable state is valid only relative to the actor/entity/workflow definition
+that produced it. Nulang therefore treats definition identity as part of the
+recovery boundary, independently of external-effect delivery semantics.
+
+For snapshots that carry a compiler-derived definition `SemanticId`:
+
+- local recovery requires the current recovery definition to carry exactly the
+  same definition ID;
+- a malformed persisted ID, a different current definition ID, or an
+  unidentified recovery module fails closed before actor activation;
+- deterministic persistent restart, virtual-actor hydration, supervised
+  restart, and explicit `recover_actor` use the same verification rule;
+- whole-program `SemanticId` is not the durable compatibility key, so
+  unrelated program changes do not invalidate an unchanged durable actor
+  definition;
+- the snapshot's semantic identity participates in the canonical
+  `DurableTransition` digest and survives atomic libSQL commits.
+
+Snapshots created before definition identity was persisted are legacy history.
+`RecoveryIdentityPolicy::Strict` rejects them. The compatibility policy may
+load them, but the resulting actor remains explicitly unverified: recovery does
+not copy the current definition ID into the live actor and thereby manufacture
+provenance the old snapshot never had.
+
+### Cross-node limitation
+
+Frozen NBC v1 does not serialize the in-memory compiler semantic sidecar.
+Consequently, an identified durable actor cannot currently be proven against
+code received through the legacy NBC migration/shadow transport. Nulang fails
+closed at that boundary: identified migration is refused, an identified
+snapshot received over NBC v1 is rejected, and identified actors are not
+replicated as node-loss shadows through that transport.
+
+Restoring cross-node availability without weakening this invariant requires a
+versioned transport/artifact manifest that binds the transferred executable to
+its compiler-derived semantic identity. Immutable `ArtifactId` retention is a
+separate prerequisite under #333.
+
 ## What is not yet a production-wide guarantee
 
 Passing this gate does **not** prove that every `perform`, workflow activity,
