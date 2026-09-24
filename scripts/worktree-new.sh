@@ -23,7 +23,7 @@ fi
 repo_root="$(git rev-parse --show-toplevel)"
 repo_name="$(basename "$repo_root")"
 slug="${name//\//-}"
-worktree_root="${NULANG_WORKTREE_ROOT:-$(dirname "$repo_root")/.worktrees/$repo_name}"
+worktree_base="${NULANG_WORKTREE_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/worktrees}"\nworktree_root="$worktree_base/$repo_name"
 worktree_path="$worktree_root/$slug"
 
 if [[ -e "$worktree_path" ]]; then
