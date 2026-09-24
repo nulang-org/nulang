@@ -1206,9 +1206,9 @@ mod simd_compiler_tests {
         ];
 
         let ptr = compile_simd_region(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.optimized_module,
+            &mut jit.optimized_builder_context,
+            &mut jit.optimized_ctx,
             "test_simd_i64x2",
             &instructions,
             &region,
@@ -1235,9 +1235,9 @@ mod simd_compiler_tests {
         ];
 
         let ptr = compile_simd_region(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.optimized_module,
+            &mut jit.optimized_builder_context,
+            &mut jit.optimized_ctx,
             "test_simd_f64x2",
             &instructions,
             &region,
@@ -1291,9 +1291,9 @@ mod simd_compiler_tests {
         ];
 
         let ptr = compile_simd_region(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.optimized_module,
+            &mut jit.optimized_builder_context,
+            &mut jit.optimized_ctx,
             "test_simd_fallback",
             &instructions,
             &region,
@@ -1398,9 +1398,9 @@ mod simd_compiler_tests {
         ];
 
         let ptr = compile_simd_region(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.optimized_module,
+            &mut jit.optimized_builder_context,
+            &mut jit.optimized_ctx,
             "test_simd_epilogue",
             &instructions,
             &region,
@@ -1427,9 +1427,9 @@ mod simd_compiler_tests {
         ];
 
         let ptr = compile_simd_region(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.optimized_module,
+            &mut jit.optimized_builder_context,
+            &mut jit.optimized_ctx,
             "test_simd_sub",
             &instructions,
             &sub_region,
@@ -1458,9 +1458,9 @@ mod simd_compiler_tests {
         };
 
         let ptr2 = compile_simd_region(
-            &mut jit2.module,
-            &mut jit2.builder_context,
-            &mut jit2.ctx,
+            &mut jit2.optimized_module,
+            &mut jit2.optimized_builder_context,
+            &mut jit2.optimized_ctx,
             "test_simd_mul",
             &instructions,
             &mul_region,
@@ -1501,9 +1501,9 @@ mod simd_compiler_tests {
         ];
 
         let ptr = compile_simd_region(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.optimized_module,
+            &mut jit.optimized_builder_context,
+            &mut jit.optimized_ctx,
             "test_simd_i32x4",
             &instructions,
             &region,
@@ -1583,9 +1583,9 @@ mod simd_compiler_tests {
         ];
 
         let ptr = compile_simd_region(
-            &mut jit.module,
-            &mut jit.builder_context,
-            &mut jit.ctx,
+            &mut jit.optimized_module,
+            &mut jit.optimized_builder_context,
+            &mut jit.optimized_ctx,
             "test_no_hint_fallback",
             &instructions,
             &region,
