@@ -139,7 +139,6 @@ fn cmd_symbol(args: &[String]) -> NuResult<()> {
     report
         .symbols
         .retain(|s| s.name == requested || s.qualified_name == requested);
-    report.ok = !report.symbols.is_empty();
     emit_report(&report, json)
 }
 
