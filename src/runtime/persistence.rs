@@ -1197,6 +1197,54 @@ impl JsonFileStore {
         self.actor_dir(actor_id).join("transitions.log")
     }
 
+    fn outbox_acks_path(&self, actor_id: u64) -> PathBuf {
+        self.actor_dir(actor_id).join("outbox_acks.json")
+    }
+
+    fn read_outbox_acks(&self, actor_id: u64) -> io::Result<HashSet<DurableMessageId>> {
+        let path = self.outbox_acks_path(actor_id);
+        let data = match fs::read(&path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
+            Err(error) => return Err(error),
+        };
+        let ids: Vec<DurableMessageId> = serde_json::from_slice(&data)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(ids.into_iter().collect())
+    }
+
+    fn write_outbox_acks(
+        &self,
+        actor_id: u64,
+        acknowledgements: &HashSet<DurableMessageId>,
+    ) -> io::Result<()> {
+        let dir = self.actor_dir(actor_id);
+        fs::create_dir_all(&dir)?;
+        let path = self.outbox_acks_path(actor_id);
+        let tmp_path = dir.join("outbox_acks.json.tmp");
+        let mut ids: Vec<_> = acknowledgements.iter().copied().collect();
+        ids.sort_by_key(|id| {
+            (
+                id.sender_actor_id,
+                id.sender_epoch,
+                id.transition_sequence,
+                id.outbox_ordinal,
+            )
+        });
+        let bytes = serde_json::to_vec(&ids)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        {
+            let mut file = fs::File::create(&tmp_path)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp_path, &path)?;
+        if let Ok(dir_file) = fs::File::open(&dir) {
+            let _ = dir_file.sync_all();
+        }
+        Ok(())
+    }
+
     fn load_legacy_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
         let path = self.snapshot_path(actor_id);
         let data = fs::read_to_string(&path).ok()?;
@@ -1393,6 +1441,109 @@ impl JsonFileStore {
 }
 
 impl PersistenceStore for JsonFileStore {
+    fn read_pending_outbox(&self, limit: usize) -> io::Result<Vec<DurableOutboxRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut records = Vec::new();
+        let entries = match fs::read_dir(&self.base_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(actor_id) = name
+                .strip_prefix("actor_")
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                continue;
+            };
+
+            let acknowledgements = self.read_outbox_acks(actor_id)?;
+            let (transitions, _) = self.read_transition_records(actor_id)?;
+            for transition in transitions {
+                for message in transition.outbox {
+                    let id = DurableMessageId {
+                        sender_actor_id: transition.actor_id,
+                        sender_epoch: transition.activation_epoch,
+                        transition_sequence: transition.sequence,
+                        outbox_ordinal: message.ordinal,
+                    };
+                    if !acknowledgements.contains(&id) {
+                        records.push(DurableOutboxRecord {
+                            id,
+                            destination_actor_id: message.destination_actor_id,
+                            behavior_id: message.behavior_id,
+                            payload: message.payload,
+                        });
+                    }
+                }
+            }
+        }
+
+        records.sort_by_key(|record| {
+            (
+                record.id.sender_actor_id,
+                record.id.sender_epoch,
+                record.id.transition_sequence,
+                record.id.outbox_ordinal,
+            )
+        });
+        records.truncate(limit);
+        Ok(records)
+    }
+
+    fn acknowledge_outbox(&mut self, id: DurableMessageId) -> io::Result<()> {
+        let (records, _) = self.read_transition_records(id.sender_actor_id)?;
+        let exists = records.iter().any(|transition| {
+            transition.activation_epoch == id.sender_epoch
+                && transition.sequence == id.transition_sequence
+                && transition
+                    .outbox
+                    .iter()
+                    .any(|message| message.ordinal == id.outbox_ordinal)
+        });
+        if !exists {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "durable outbox message identity does not exist",
+            ));
+        }
+
+        let mut acknowledgements = self.read_outbox_acks(id.sender_actor_id)?;
+        if acknowledgements.insert(id) {
+            self.write_outbox_acks(id.sender_actor_id, &acknowledgements)?;
+        }
+        Ok(())
+    }
+
+    fn lookup_inbox_delivery(
+        &self,
+        destination_actor_id: u64,
+        id: DurableMessageId,
+    ) -> io::Result<Option<u64>> {
+        let (records, _) = self.read_transition_records(destination_actor_id)?;
+        Ok(records.into_iter().find_map(|record| {
+            record
+                .inbox
+                .iter()
+                .any(|delivery| {
+                    delivery.destination_actor_id == destination_actor_id && delivery.id == id
+                })
+                .then_some(record.sequence)
+        }))
+    }
+
     fn load_durable_tail(&self, actor_id: u64) -> io::Result<Option<DurableTail>> {
         let (records, _) = self.read_transition_records(actor_id)?;
         Ok(records.last().map(JsonDurableTransitionRecord::tail))
