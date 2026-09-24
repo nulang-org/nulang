@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### Atomic workflow transition path — 2026-09-24
+- **Workflow creation, completion/failure markers, timers, signals, saga markers, and custom workflow events now enter persistence through the existing `DurableTransition` contract together with the resulting durable actor snapshot.** The runtime no longer performs the corresponding split `append_workflow_event(...); checkpoint_actor(...)` writes.
+- **Workflow-only checkpoints advance the same fenced atomic sequence tail.** Scheduler paths no longer insert legacy message-journal entries ahead of atomic workflow commits, preventing mixed legacy/atomic history from creating sequence gaps.
+- **Signal delivery now fails closed when its durable transition cannot commit.** Unsupported persistence backends keep returning `Unsupported` rather than silently falling back to weaker crash semantics; MemoryStore and libSQL retain the atomic implementations already defined by RFC 0022.
+- This is a **partial RFC 0022 Phase B implementation**, not the final per-turn staging model: input commands, all events/effects/outbox consequences in one step-level transition, and activation discard/recovery after every commit failure remain follow-up work.
+
 ### JIT tier replacement and compile-time observability — 2026-09-24
 - **Tier-2 promotion now replaces the installed machine-code entry instead of returning the already-cached lower-tier function.** Compiled regions carry an explicit `Baseline` / `Typed` / `Simd` tier plus a `Fast` / `Optimized` codegen policy, and promotion uses fresh Cranelift symbols while preserving the same cache slot.
 - **First-tier native code now uses a low-latency Cranelift module with `opt_level=none` and `regalloc_algorithm=single_pass`; hot replacement uses a separate `opt_level=speed` + backtracking-register-allocation module.** Baseline code can retain folded direct calls while being recompiled at the optimized level; typed code preserves type-directed guard stripping across promotion and can subsequently promote to SIMD when the loop analyzer accepts it.
