@@ -924,6 +924,7 @@ mod authority_tests {
         rt.persistence
             .save_snapshot(ActorSnapshot {
                 actor_id,
+                semantic_id: None,
                 sequence: 7,
                 authority_tokens: std::collections::BTreeSet::from([
                     "Secret::Read(RESTART_KEY)".to_string()
@@ -965,6 +966,7 @@ mod authority_tests {
         rt.persistence
             .save_snapshot(ActorSnapshot {
                 actor_id,
+                semantic_id: None,
                 authority_tokens: std::collections::BTreeSet::from([
                     "Net::TcpOut(malformed)".to_string()
                 ]),
