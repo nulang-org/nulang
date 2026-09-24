@@ -51,6 +51,13 @@ version + migration.*
 
 ## Stable tier
 
+### Atomic workflow turns (RFC 0022 Phase B) — 2026-09-24
+- **Normal workflow execution now stages the delivered command, durable state snapshot, workflow events, timers, signals, saga records, and emitted workflow events into one `DurableTransition`** and commits through `PersistenceStore::commit_transition`, removing the journal/event→checkpoint crash window.
+- **Durable timers are published to the live timer wheel only after their containing transition commits.** Suspended workflows commit the pre-step durable image plus their suspension marker, preserving deterministic re-drive semantics without persisting partial step mutations.
+- **Signal, timer, selective-receive, and LLM resume paths use the same atomic transition boundary.** A rejected commit restores the last durable actor state and actor-owned CRDT replicas and discards the rejected continuation.
+- Regression tests pin one-sequence command/event/state commits and COMMIT-NOTHING rollback behavior, including suppression of staged timer publication.
+
+
 ### CI playground dependency and formatting repair — 2026-09-24
 - **Browser-playground compilation now includes the shared content-identity module and its pure-Rust `hex` dependency** (`crates/nulang-playground`), matching `semantic_identity.rs`'s current dependency graph. Runtime worker-pool files were also normalized to the repository's rustfmt output so the format gate reflects semantics rather than stale layout.
 
