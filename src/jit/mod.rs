@@ -382,10 +382,12 @@ impl JitSession {
     /// Record one execution of an already-compiled region and attempt
     /// higher-tier replacement when the threshold is crossed.
     ///
-    /// Baseline regions are recompiled through the type-directed path when
-    /// register types are provable and the region contains no folded direct
-    /// calls. Typed regions are eligible for SIMD replacement. Promotion is
-    /// best-effort: failures leave the current machine code installed.
+    /// First-tier regions are compiled by a low-latency Cranelift module
+    /// (`opt_level=none`). Once hot enough they are replaced by code from the
+    /// speed-optimized module. Type-directed specialization is preserved when
+    /// available; an already-optimized typed region is subsequently eligible
+    /// for SIMD replacement. Promotion is best-effort: failures leave the
+    /// current machine code installed.
     pub fn record_tier2_and_maybe_promote(
         &mut self,
         module_idx: usize,
