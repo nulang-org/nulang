@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### Backend-neutral JIT compile telemetry and benchmark harness — 2026-09-24
+- **`JitBackend` now exposes aggregate Fast-vs-Optimized compiler counts and wall time through `JitCompileStats`, with `VM::jit_compile_stats` providing the same backend-neutral surface to tools and benchmarks.** The counters measure successful native compilation only, keeping compiler latency separate from interpreter warm-up and generated-code execution.
+- **`nulang-jit-bench` adds a JSONL-capable correctness-checked benchmark runner for numeric, call-heavy, and branch-heavy loops.** Each workload reports fresh-VM execution, warm execution, installed/typed regions, first-run compiler work, and additional warm-run compiler work.
+- **The harness is intentionally backend-agnostic.** Future MIR, copy-and-patch, or custom emitters can implement the same telemetry contract and be compared on identical workloads without adding backend-specific benchmark code.
+
+
 ### Native JIT codegen backend boundary — 2026-09-24
 - **`JitSession` no longer owns Cranelift modules or reusable Cranelift contexts.** `src/jit/native_codegen.rs` introduces `NativeCodegenBackend`, `NativeCompileRequest`, and specialization requests for scalar, typed, and SIMD lowering.
 - **`CraneliftCodegen` now exclusively owns both compiler tiers.** Fast code still uses `opt_level=none` + single-pass register allocation, optimized code still uses `opt_level=speed` + backtracking, but tier/cache orchestration only sees native entry pointers and compile success/failure.
