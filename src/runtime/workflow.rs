@@ -338,10 +338,7 @@ fn commit_external_workflow_event(
 /// only its sequence and wait marker. Any pending driving command joins this
 /// transition so a crash after suspension cannot forget which mailbox command
 /// entered the wait.
-pub(crate) fn commit_suspension_marker(
-    rt: &mut Runtime,
-    actor_id: u64,
-) -> std::io::Result<()> {
+pub(crate) fn commit_suspension_marker(rt: &mut Runtime, actor_id: u64) -> std::io::Result<()> {
     let waiting_signal = match rt.actors.get(&actor_id) {
         Some(actor) if actor.persistent => actor.waiting_signal.clone(),
         _ => return Ok(()),
