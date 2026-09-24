@@ -684,6 +684,7 @@ mod tests {
             apply_handlers: Vec::new(),
             version: 1,
             migrations: Vec::new(),
+            protocol_id: None,
             is_organization: false,
             is_workflow: false,
             is_agent: false,
