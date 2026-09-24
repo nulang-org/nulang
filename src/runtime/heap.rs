@@ -720,14 +720,14 @@ impl ActorHeap {
             }
         });
         let (base, actual_size) = pooled.unwrap_or_else(|| {
-                let layout = std::alloc::Layout::from_size_align(requested, ALIGN)
-                    .expect("invalid ActorHeap layout");
-                let base = unsafe { std::alloc::alloc(layout) };
-                if base.is_null() {
-                    std::alloc::handle_alloc_error(layout);
-                }
-                (base, requested)
-            });
+            let layout = std::alloc::Layout::from_size_align(requested, ALIGN)
+                .expect("invalid ActorHeap layout");
+            let base = unsafe { std::alloc::alloc(layout) };
+            if base.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            (base, requested)
+        });
 
         self.base = base;
         self.current = base;
@@ -753,10 +753,7 @@ impl ActorHeap {
     /// Returns `None` only when the global allocator fails.
     fn grow_bump_block(&mut self, min_capacity: usize) -> Option<()> {
         debug_assert!(!self.base.is_null(), "grow requires an active bump block");
-        let new_size = self
-            .total_size
-            .max(self.growth_floor)
-            .max(min_capacity);
+        let new_size = self.total_size.max(self.growth_floor).max(min_capacity);
         // Reuse only an exact-size pooled block. The configured growth floor
         // is a real memory tier, not merely a minimum: accepting a larger
         // best-fit block here would make actor footprint depend on unrelated
@@ -1373,7 +1370,10 @@ fn test_tiered_heap_keeps_small_initial_capacity_and_larger_growth_floor() {
     let heap = ActorHeap::new_with_growth_floor(4 * 1024, 16 * 1024);
     assert_eq!(heap.total_size, 4 * 1024);
     assert_eq!(heap.growth_floor, 16 * 1024);
-    assert!(heap.base.is_null(), "tiered heap must remain lazy at construction");
+    assert!(
+        heap.base.is_null(),
+        "tiered heap must remain lazy at construction"
+    );
 }
 
 #[test]
