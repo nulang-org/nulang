@@ -114,11 +114,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
 }
 
 /// Run one semantic query against a source file.
-pub fn query_file(
-    command: &str,
-    requested: &str,
-    path: &Path,
-) -> NuResult<SemanticQueryReport> {
+pub fn query_file(command: &str, requested: &str, path: &Path) -> NuResult<SemanticQueryReport> {
     let index = analyze_file(path)?;
     query_index(command, requested, &index)
 }
