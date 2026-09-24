@@ -30,8 +30,8 @@
 //! branches.
 
 mod compiler;
-mod region_planner;
 pub mod helpers;
+mod region_planner;
 pub mod runtime;
 pub mod simd_analyzer;
 pub mod simd_compiler;
