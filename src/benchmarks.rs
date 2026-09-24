@@ -61,6 +61,139 @@ fn report(name: &str, messages: u64, elapsed: std::time::Duration) {
     );
 }
 
+/// Report a Nulang-only A/B probe. These records are intentionally distinct
+/// from `[cross-bench]` so the Rust/Go/Erlang comparison remains limited to
+/// matched workloads.
+fn report_ab(name: &str, operations: u64, elapsed: std::time::Duration) {
+    println!(
+        "[ab-bench] benchmark={name} operations={operations} elapsed_ns={}",
+        elapsed.as_nanos()
+    );
+}
+
+fn ab_noop_handler(_actor: &mut crate::runtime::Actor, _args: &[Value]) {}
+
+/// Local enqueue hot-path sweep around the inline-payload boundary.
+///
+/// 0/1/4 values are the common small-message cases; 5 crosses the proposed
+/// four-value inline threshold; 16 is a larger shared-payload control. The
+/// timed body includes message construction, mailbox admission, and ready-queue
+/// publication but excludes handler execution.
+#[test]
+fn bench_ab_enqueue_payload_sweep() {
+    const N: usize = 100_000;
+
+    for arity in [0usize, 1, 4, 5, 16] {
+        let mut rt = Runtime::new();
+        let actor_id = rt.spawn_actor(Box::new(Vec::new));
+        rt.actors
+            .get_mut(&actor_id)
+            .expect("spawned actor")
+            .register_behavior("handle", ab_noop_handler);
+        // Remove spawn-time ready state so the first measured send starts from
+        // the same idle actor state for every arity.
+        rt.run_scheduler();
+
+        let args: Vec<Value> = (0..arity).map(|i| Value::int(i as i64)).collect();
+        let start = Instant::now();
+        for _ in 0..N {
+            rt.send_message_by_id(actor_id, 0, &args);
+        }
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            rt.actors
+                .get(&actor_id)
+                .expect("actor still live")
+                .mailbox
+                .len(),
+            N,
+            "enqueue probe must admit every message"
+        );
+        report_ab(&format!("enqueue_payload_{arity}"), N as u64, elapsed);
+
+        // Drain outside the timed region so every iteration also exercises
+        // valid handler delivery and leaves no queued work behind.
+        rt.run_scheduler();
+        assert!(
+            rt.actors
+                .get(&actor_id)
+                .expect("actor still live")
+                .mailbox
+                .is_empty()
+        );
+    }
+}
+
+#[cfg(feature = "native-codegen")]
+#[test]
+fn bench_ab_aot_actor_drain() {
+    use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
+
+    const N: usize = 50_000;
+    let source = r#"
+        actor Counter {
+            state total: Int = 0
+            behavior Add(n: Int) { self.total = self.total + n }
+        }
+        fn main() { 0 }
+    "#;
+
+    let tokens = Lexer::new(source).lex().expect("bench: lex failed");
+    let ast = Parser::new(tokens)
+        .parse_module()
+        .expect("bench: parse failed");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("bench: typecheck failed");
+    let mut ec = EffectChecker::new();
+    ec.check_module(&ast.decls)
+        .expect("bench: effect check failed");
+    let mut ca = CapabilityAnalyzer::new();
+    let ctx = CapContext::new();
+    for decl in crate::effect_checker::flatten_decls(&ast.decls) {
+        if let crate::ast::Decl::Function { body, .. } = decl {
+            ca.infer_cap(&ctx, body)
+                .expect("bench: capability analysis failed");
+        }
+    }
+
+    let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = crate::mir_lower::lower_module(&hir).expect("bench: MIR lower failed");
+    let aot = crate::aot::AotModule::compile(&mir).expect("bench: AOT compile failed");
+    let code =
+        crate::mir_codegen::compile_mir(&mut mir, "bench-ab-aot").expect("bench: codegen failed");
+
+    let mut rt = Runtime::new();
+    rt.register_aot_module(aot);
+    let actor_id = rt
+        .spawn_from_module(&code, 0, Vec::new())
+        .as_actor_id()
+        .expect("bench: actor spawn failed");
+
+    // One untimed delivery verifies native wiring and warms the dispatch path.
+    rt.send_message_by_id(actor_id, 0, &[Value::int(1)]);
+    rt.run_scheduler();
+    rt.actors
+        .get_mut(&actor_id)
+        .expect("actor live after warmup")
+        .set_state_field("total", Value::int(0));
+
+    for _ in 0..N {
+        rt.send_message_by_id(actor_id, 0, &[Value::int(1)]);
+    }
+    let start = Instant::now();
+    rt.run_scheduler();
+    let elapsed = start.elapsed();
+
+    let total = rt
+        .actors
+        .get(&actor_id)
+        .and_then(|actor| actor.get_state_field("total"))
+        .and_then(Value::as_int);
+    assert_eq!(total, Some(N as i64), "AOT actor must process every message");
+    report_ab("aot_actor_drain", N as u64, elapsed);
+}
+
 /// Counting: one actor, main thread floods it with N messages.
 /// Measures single-actor mailbox throughput + scheduler drain.
 #[test]
