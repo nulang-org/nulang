@@ -829,11 +829,7 @@ impl Runtime {
         let (removed, generation_removed) = self.distributed.fabric.remove_remote_node(node_id);
         let (services_removed, service_generation_removed) =
             self.distributed.services.remove_remote_node(node_id);
-        if removed > 0
-            || generation_removed
-            || services_removed > 0
-            || service_generation_removed
-        {
+        if removed > 0 || generation_removed || services_removed > 0 || service_generation_removed {
             self.fabric_broadcast_control(FabricControl::RemoveRemoteNode(node_id));
         }
         removed
@@ -1596,11 +1592,7 @@ mod tests {
         }
 
         assert!(shards[0]
-            .fabric_advertise_service(service_endpoint(
-                NodeId(10),
-                1,
-                ServiceHealth::Serving,
-            ))
+            .fabric_advertise_service(service_endpoint(NodeId(10), 1, ServiceHealth::Serving,))
             .unwrap());
 
         assert_eq!(shards[1].fabric_sync(), 1);
@@ -1617,20 +1609,12 @@ mod tests {
         runtime.distributed.node_id = Some(NodeId(10));
 
         runtime
-            .fabric_advertise_service(service_endpoint(
-                NodeId(10),
-                1,
-                ServiceHealth::Serving,
-            ))
+            .fabric_advertise_service(service_endpoint(NodeId(10), 1, ServiceHealth::Serving))
             .unwrap();
         assert_eq!(runtime.fabric_resolve_service("api").unwrap().len(), 1);
 
         runtime
-            .fabric_advertise_service(service_endpoint(
-                NodeId(10),
-                1,
-                ServiceHealth::Unhealthy,
-            ))
+            .fabric_advertise_service(service_endpoint(NodeId(10), 1, ServiceHealth::Unhealthy))
             .unwrap();
         assert!(runtime.fabric_resolve_service("api").unwrap().is_empty());
         assert_eq!(runtime.fabric_service_endpoint_count(), 1);
@@ -1643,29 +1627,17 @@ mod tests {
         runtime.distributed.node_id = Some(NodeId(10));
 
         runtime
-            .fabric_advertise_service(service_endpoint(
-                NodeId(10),
-                3,
-                ServiceHealth::Serving,
-            ))
+            .fabric_advertise_service(service_endpoint(NodeId(10), 3, ServiceHealth::Serving))
             .unwrap();
         runtime
-            .fabric_advertise_service(service_endpoint(
-                NodeId(10),
-                4,
-                ServiceHealth::Serving,
-            ))
+            .fabric_advertise_service(service_endpoint(NodeId(10), 4, ServiceHealth::Serving))
             .unwrap();
 
         let resolved = runtime.fabric_resolve_service("api").unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].allocation_epoch, 4);
         assert!(runtime
-            .fabric_advertise_service(service_endpoint(
-                NodeId(10),
-                3,
-                ServiceHealth::Serving,
-            ))
+            .fabric_advertise_service(service_endpoint(NodeId(10), 3, ServiceHealth::Serving,))
             .is_err());
     }
 
@@ -1678,11 +1650,7 @@ mod tests {
         let current = ServiceAdvertisementSnapshot {
             node_id: NodeId(10),
             generation: 2,
-            services: vec![service_endpoint(
-                NodeId(10),
-                2,
-                ServiceHealth::Serving,
-            )],
+            services: vec![service_endpoint(NodeId(10), 2, ServiceHealth::Serving)],
         };
         assert_eq!(
             target
@@ -1694,11 +1662,7 @@ mod tests {
         let stale = ServiceAdvertisementSnapshot {
             node_id: NodeId(10),
             generation: 1,
-            services: vec![service_endpoint(
-                NodeId(10),
-                1,
-                ServiceHealth::Serving,
-            )],
+            services: vec![service_endpoint(NodeId(10), 1, ServiceHealth::Serving)],
         };
         assert_eq!(
             target
@@ -1723,11 +1687,7 @@ mod tests {
             .fabric_replace_remote_service_advertisements(ServiceAdvertisementSnapshot {
                 node_id: NodeId(10),
                 generation: 7,
-                services: vec![service_endpoint(
-                    NodeId(10),
-                    1,
-                    ServiceHealth::Serving,
-                )],
+                services: vec![service_endpoint(NodeId(10), 1, ServiceHealth::Serving)],
             })
             .unwrap();
         assert_eq!(target.fabric_remote_service_endpoint_count(), 1);
@@ -1739,11 +1699,7 @@ mod tests {
             .fabric_replace_remote_service_advertisements(ServiceAdvertisementSnapshot {
                 node_id: NodeId(10),
                 generation: 1,
-                services: vec![service_endpoint(
-                    NodeId(10),
-                    2,
-                    ServiceHealth::Serving,
-                )],
+                services: vec![service_endpoint(NodeId(10), 2, ServiceHealth::Serving)],
             })
             .unwrap();
         assert_eq!(
@@ -1751,5 +1707,4 @@ mod tests {
             2
         );
     }
-
 }
