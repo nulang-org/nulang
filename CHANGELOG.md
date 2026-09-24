@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### Same-shard actor-send ORCA ownership handoff — 2026-09-24
+- **Compiler-proven fresh, single-use heap payloads can now hand their local ORCA ownership token directly to a successfully admitted same-shard receiver.** Source modules carry runtime-only send-site ownership metadata; the runtime validates actual locality/owner state and returns the exact consumed mask; the VM clears only sources whose handoff succeeded.
+- **Fallbacks remain conservative.** Self-send, missing/migrated/hibernated/cross-shard targets, old NBC artifacts, unsupported callback hosts, backpressure, and non-proven values keep the existing send protocol. `IsoArena` allocations are excluded defensively, and the existing arena escape analysis already rejects message-send escape sites.
+- **Message payload layout is unchanged.** The 0–4 value inline `MessagePayload` fast path remains intact; a `u16` handoff mask records which payload slots already own their receiver hold. Transactional selective receive preserves that mask through commit so handed-off pointers are not retained twice.
+- **Handoff accounting and lifecycle are observable and rollback-safe.** `GcStats` exposes successful ownership handoffs and estimated refcount operations elided; failed mailbox admission restores the sender token and statistics; receiver release removes the cycle-detector edge and releases the direct foreign hold.
+
 ### Consuming local-send ownership proof — 2026-09-24
 - **MIR now identifies fresh, single-definition heap-owning values whose sole use is a same-node actor send**, establishing a conservative proof surface for a later ORCA ownership handoff.
 - The analysis is intentionally metadata-only in this slice: it changes no bytecode, mailbox representation, reference count, or runtime behavior. Parameters, captures, handler bindings, multi-use values, and remote sends remain ineligible.
