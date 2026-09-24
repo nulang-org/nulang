@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Cross-shard runtime channel — 2026-09-24
+- **The bounded shard bus now uses Crossbeam channels** (`src/runtime/mod.rs`) instead of `std::sync::mpsc::sync_channel`. Capacity remains 1024 messages per shard, non-blocking admission/backpressure semantics are unchanged, and the change reuses Nulang's existing `crossbeam` dependency. Production and deterministic drain paths preserve the same FIFO channel semantics.
+
 ### Owned Python foreign execution — 2026-09-23
 - **The Python foreign backend now opts into the worker-safe `ForeignInterop::call_owned` contract**, consuming only owned semantic values and opaque registry handles while preserving the existing synchronous VM-`Value` compatibility path.
 - **Owned Python arguments/results convert through the registry without VM, actor-heap, or module string-pool access**; unsupported custom backends continue to fail closed unless they explicitly implement the owned-call contract.
