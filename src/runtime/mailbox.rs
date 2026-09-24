@@ -610,6 +610,7 @@ mod tests {
             payload: MessagePayload::from_slice(&[Value::int(42)]),
             sender,
             priority: MessagePriority::Normal,
+            ownership_handoff_mask: 0,
             trace_id: None,
         }
     }
@@ -696,6 +697,7 @@ mod tests {
                 payload: MessagePayload::from_slice(&[Value::int(i)]),
                 sender: i as u64,
                 priority: MessagePriority::System,
+                ownership_handoff_mask: 0,
                 trace_id: None,
             })
             .unwrap();
@@ -789,6 +791,7 @@ mod transactional_receive_tests {
     use super::*;
 
     fn msg(behavior_id: u16, sender: u64, priority: MessagePriority) -> Message {
+    ownership_handoff_mask: 0,
         Message {
             behavior_id,
             payload: MessagePayload::from_slice(&[Value::int(sender as i64)]),
