@@ -176,8 +176,12 @@ Core surface forms (`src/ast.rs`, `src/parser.rs`):
   §6.3).
 
 There is no `switch` and no `case` keyword — `match` arms are introduced by
-`|`. Pattern matching is typed but **not** exhaustiveness-checked today: a
-non-exhaustive `match` compiles and may fail at runtime.
+`|`. Pattern matching is typed and receives a conservative finite-domain
+coverage pass after type inference. Closed variants and `Bool` can produce
+`W0201` (provably non-exhaustive) and `W0202` (provably redundant arm) without
+changing default Nulang 1.x program validity; `--deny-warnings` opts into
+strict rejection. Unsupported/infinite domains and unproven structured cases
+retain the runtime non-exhaustive-match fallback.
 
 ### 2.2 HM Type Inference
 
