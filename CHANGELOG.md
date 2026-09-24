@@ -51,6 +51,13 @@ version + migration.*
 
 ## Stable tier
 
+### Atomic durable workflow message acceptance and scheduler delivery — 2026-09-24
+- **Committed durable outbox messages can now cross the local workflow receiver boundary without a deduplication crash window.** The receiver's stable RFC 0022 message identity and accepted command journal entry commit in the same DurableTransition; only then may the sender outbox be acknowledged.
+- **Workflow mailbox entries carry a receiver-local durable acceptance marker.** Normal FIFO/backpressure semantics remain intact, while scheduler dispatch skips a second command-journal append for an already accepted durable message.
+- **The scheduler pumps durable outbox work at quiescence and on a bounded maintenance cadence.** A crash after receiver acceptance but before mailbox publication/acknowledgement is recovered by requeueing the already accepted command; a crash after acceptance before handler completion is recovered by the existing workflow journal replay path.
+- **Delivery fails closed outside the proven boundary.** Full mailboxes leave sender outbox records pending, plain persistent actors are deferred until generic turn-level atomicity is complete, and cross-node durable delivery remains follow-up work.
+- **Transition v1 digest compatibility is preserved.** Empty receiver-inbox metadata is omitted from serialization/digest input, so historical no-inbox transition digests remain byte-for-byte stable.
+
 ### PostgreSQL atomic transitions and durable messaging persistence — 2026-09-24
 - **PostgresStore now implements the RFC 0022 atomic transition contract** with one SQL transaction covering the durable tail, snapshot, accepted command, workflow/domain events, durable-effect records, and staged outbox messages.
 - **Per-actor tail rows are locked and fenced by activation epoch, predecessor sequence, and transition digest.** Exact retries are idempotent; stale owners, sequence gaps, and conflicting same-position commits fail closed.
