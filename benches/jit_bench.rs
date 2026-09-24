@@ -78,6 +78,33 @@ fn bench_jit_hot_loop(c: &mut Criterion) {
     });
 }
 
+fn bench_jit_typed_parameter_loop(c: &mut Criterion) {
+    let source = r#"
+        fn accumulate(seed: Int, limit: Int) -> Int {
+            var sum = seed;
+            var i = 0;
+            while i < limit {
+                sum = sum + i;
+                i = i + 1
+            };
+            sum
+        }
+        fn main() -> Int { accumulate(1, 100000) }
+    "#;
+    let module = compile(source);
+    c.bench_function("jit/typed_parameter_loop_warm", |b| {
+        b.iter_batched(
+            || {
+                let mut vm = fresh_vm(&module);
+                let _ = vm.run();
+                vm
+            },
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+}
+
 /// A hot loop that calls a function each iteration. `Call`/`TailCall` are not
 /// in the JIT compilable opcode set, so `find_compilable_region` fragments at
 /// the call: the loop's arithmetic around the call is JIT-compiled, but the
@@ -165,6 +192,7 @@ fn bench_jit_tiering_profitability(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_jit_hot_loop,
+    bench_jit_typed_parameter_loop,
     bench_jit_function_call_loop,
     bench_jit_tiering_profitability
 );
