@@ -55,6 +55,9 @@ boundary:
 - slab growth, free space, metadata, index, and slot reservation are exposed
   through cache memory statistics;
 - the key index is a contiguous open-addressed table;
+- index growth and tombstone compaction migrate a bounded bucket batch per
+  mutation; reads probe the active table and then the old table until the
+  migration completes, avoiding shard-wide rebuild pauses;
 - entry slots are recycled with generations;
 - stale expiration records cannot delete a recycled slot.
 
