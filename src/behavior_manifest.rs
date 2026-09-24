@@ -1162,6 +1162,7 @@ mod tests {
                 backend: "bytecode".to_string(),
                 flags: Vec::new(),
             },
+            effects: BehaviorEffectInventory::default(),
             actors: vec![actor],
         }
     }
@@ -1172,6 +1173,7 @@ mod tests {
             persistence: BehaviorPersistence::Durable,
             schema_version: version,
             state_schema_semantic_id: schema_id(schema_seed),
+            protocol_id: None,
             migration_identity: MigrationIdentityCoverage::TopologyOnly,
             migrations: if version == 1 {
                 Vec::new()
