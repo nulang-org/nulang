@@ -197,6 +197,80 @@ fn bench_ab_aot_actor_drain() {
     report_ab("aot_actor_drain", N as u64, elapsed);
 }
 
+/// Fresh heap payload sent once from one actor behavior to another.
+///
+/// This is the source-level A/B signal for consuming same-shard sends. The
+/// baseline runtime uses the conservative ORCA send/receive protocol; a
+/// candidate ownership-handoff runtime executes the exact same source through
+/// compiler-generated send-site metadata. Compilation and wiring are untimed.
+#[test]
+fn bench_ab_local_owned_payload_send() {
+    const N: usize = 20_000;
+    let source = r#"
+        actor Sink {
+            state count = 0
+            behavior take(xs) {
+                self.count = self.count + 1
+            }
+        }
+        actor Producer {
+            state sink = nil
+            behavior wire(s) { self.sink = s }
+            behavior produce() {
+                let xs = [1, 2, 3] in
+                    send self.sink take(xs)
+            }
+        }
+        let sink = spawn Sink {} in
+        let producer = spawn Producer {} in {
+            send producer wire(sink)
+            producer
+        }
+    "#;
+
+    let rt = Rc::new(RefCell::new(Runtime::new()));
+    let producer_id = compile_run_with_runtime(source, rt.clone())
+        .as_actor_id()
+        .expect("producer spawn failed");
+
+    // Untimed wiring phase.
+    rt.borrow_mut().run_scheduler();
+
+    let sink_id = {
+        let rt_ref = rt.borrow();
+        rt_ref
+            .actors
+            .keys()
+            .copied()
+            .find(|&id| id != producer_id)
+            .expect("sink spawned")
+    };
+
+    let produce_id = rt
+        .borrow()
+        .behavior_id_for(producer_id, "produce")
+        .expect("emit behavior");
+
+    let start = Instant::now();
+    {
+        let mut runtime = rt.borrow_mut();
+        for _ in 0..N {
+            runtime.send_message_by_id(producer_id, produce_id, &[]);
+        }
+        runtime.run_scheduler();
+    }
+    let elapsed = start.elapsed();
+
+    let count = rt
+        .borrow()
+        .actors
+        .get(&sink_id)
+        .and_then(|actor| actor.get_state_field("count"))
+        .and_then(|value| value.as_int());
+    assert_eq!(count, Some(N as i64), "sink must receive every fresh payload");
+    report_ab("local_owned_payload_send", N as u64, elapsed);
+}
+
 /// Counting: one actor, main thread floods it with N messages.
 /// Measures single-actor mailbox throughput + scheduler drain.
 #[test]
