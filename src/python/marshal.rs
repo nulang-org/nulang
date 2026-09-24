@@ -330,7 +330,7 @@ pub fn python_object_id_to_owned_foreign(
             return Ok(OwnedForeignValue::Unit);
         }
         if let Ok(value) = obj.cast::<PyBool>() {
-            let value: bool = value.extract().map_err(|e| e.to_string())?;
+            let value = value.extract::<bool>().map_err(|e| e.to_string())?;
             return Ok(OwnedForeignValue::Bool(value));
         }
         if let Ok(value) = obj.cast::<PyInt>() {
