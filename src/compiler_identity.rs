@@ -153,6 +153,57 @@ mod tests {
     }
 
     #[test]
+    fn typed_bytecode_actor_sidecar_aligns_with_actor_metadata() {
+        use crate::ast::{Literal, StateModel};
+        use crate::bytecode::ActorMeta;
+        use crate::types::{PrimitiveType, Span, Type};
+
+        let int = Type::Primitive(PrimitiveType::Int);
+        let actor = hir::ActorDef {
+            name: "Counter".to_string(),
+            type_params: Vec::new(),
+            persistent: true,
+            state_fields: vec![(
+                "value".to_string(),
+                StateModel::Durable,
+                int.clone(),
+                hir::Operand::Literal(Literal::Int(0), int),
+            )],
+            behaviors: Vec::new(),
+            init: Vec::new(),
+            events: Vec::new(),
+            apply_handlers: Vec::new(),
+            version: 1,
+            migrations: Vec::new(),
+            is_organization: false,
+            is_workflow: false,
+            is_agent: false,
+            virtual_: false,
+            tools: Vec::new(),
+            semantic_memory_dimensions: None,
+            procedural_memory_namespace: None,
+            fallback_config: String::new(),
+            retry_config: String::new(),
+            span: Span::default(),
+        };
+        let hir = hir::Module {
+            name: "typed".to_string(),
+            decls: vec![hir::Decl::Actor(actor)],
+        };
+        let mut mir = mir::Module::new("typed");
+        mir.actor_metadata.push(ActorMeta::new("Counter"));
+
+        let module = compile_typed_bytecode(&hir, &mut mir, [], "typed").unwrap();
+        assert_eq!(module.actor_metadata.len(), 1);
+        assert_eq!(module.actor_semantic_ids.len(), 1);
+        assert_eq!(
+            module.actor_semantic_id("Counter"),
+            module.actor_semantic_id_at(0)
+        );
+        assert!(module.actor_semantic_id_at(0).is_some());
+    }
+
+    #[test]
     fn backend_configuration_changes_artifact_but_not_semantic_identity() {
         let (hir, mir) = empty_program();
         let native = artifact_identity_for_typed_program(
