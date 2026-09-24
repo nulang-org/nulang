@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Typed bytecode semantic identity sidecars — 2026-09-24
+- **Production typed compilation now attaches compiler-proven whole-program and actor-definition `SemanticId` sidecars to in-memory `CodeModule` values**. Definition identities remain parallel to `actor_metadata`, preserving namespace-distinct ownership even when short actor names collide.
+- **Frozen NBC v1 is unchanged.** Raw/legacy NBC loads and low-level `mir_codegen::compile_mir` remain explicitly unproven; the CLI, REPL, DAP, and FFI typed frontend paths use `compile_typed_bytecode` so later durable recovery code can distinguish proven current semantics from legacy code.
+
 ### Python bool marshal type inference — 2026-09-24
 - **Default-feature builds now make PyO3 boolean extraction explicit with `extract::<bool>()`**, avoiding a compiler inference failure in the Python marshal path without changing conversion semantics.
 
