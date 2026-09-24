@@ -130,12 +130,15 @@ fn activation_epoch(rt: &Runtime, actor_id: u64) -> u64 {
 
 fn resequence_workflow_event(event: WorkflowEvent, sequence: u64) -> WorkflowEvent {
     match event {
-        WorkflowEvent::WorkflowStarted { name, state, .. } => {
-            WorkflowEvent::WorkflowStarted { sequence, name, state }
-        }
-        WorkflowEvent::StepCompleted { step_name, .. } => {
-            WorkflowEvent::StepCompleted { sequence, step_name }
-        }
+        WorkflowEvent::WorkflowStarted { name, state, .. } => WorkflowEvent::WorkflowStarted {
+            sequence,
+            name,
+            state,
+        },
+        WorkflowEvent::StepCompleted { step_name, .. } => WorkflowEvent::StepCompleted {
+            sequence,
+            step_name,
+        },
         WorkflowEvent::TimerSet {
             name, duration_ms, ..
         } => WorkflowEvent::TimerSet {
@@ -144,16 +147,15 @@ fn resequence_workflow_event(event: WorkflowEvent, sequence: u64) -> WorkflowEve
             duration_ms,
         },
         WorkflowEvent::TimerFired { name, .. } => WorkflowEvent::TimerFired { sequence, name },
-        WorkflowEvent::SignalReceived { name, payload, .. } => {
-            WorkflowEvent::SignalReceived {
-                sequence,
-                name,
-                payload,
-            }
-        }
-        WorkflowEvent::SagaCompensated { step_name, .. } => {
-            WorkflowEvent::SagaCompensated { sequence, step_name }
-        }
+        WorkflowEvent::SignalReceived { name, payload, .. } => WorkflowEvent::SignalReceived {
+            sequence,
+            name,
+            payload,
+        },
+        WorkflowEvent::SagaCompensated { step_name, .. } => WorkflowEvent::SagaCompensated {
+            sequence,
+            step_name,
+        },
         WorkflowEvent::ParallelBranchCompleted {
             parallel_step_name,
             branch_name,
