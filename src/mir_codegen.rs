@@ -1617,12 +1617,15 @@ fn float_locals(func: &mir::Function) -> Vec<bool> {
 // and behavior before bytecode emission. Four transforms in one fixpoint
 // loop (capped at MAX_OPT_ITERATIONS rounds):
 //
-//   1. constant folding     — arithmetic/comparison on Const operands
+//   1. scalar copy propagation — block-local aliases of definitely-scalar
+//                             values are rewritten with reassignment kills;
+//   2. constant folding     — arithmetic/comparison on Const operands
 //                             (int, float, bool, string concat) and Unary;
-//   2. identity folding     — x+0, x*1, x|0, x&&true, x*0, ... collapses;
-//   3. jump threading       — trampoline blocks (0 stmts + Jump) are
+//   3. identity folding     — x+0, x*1, x|0, x&&true, x*0, ... collapses;
+//   4. constant-branch folding — locally-proven Bool branches collapse;
+//   5. jump threading       — trampoline blocks (0 stmts + Jump) are
 //                             bypassed and marked unreachable;
-//   4. dead-store elimination — stores whose dst is never read anywhere in
+//   6. dead-store elimination — stores whose dst is never read anywhere in
 //                             the function are dropped (function-wide read
 //                             set — block-local liveness alone would be
 //                             unsound across loop back-edges and joins).
@@ -1649,12 +1652,14 @@ const MAX_OPT_ITERATIONS: usize = 10;
 /// module-level constant pooling; unused by the current transforms.
 fn optimize_function(func: &mut mir::Function, _module_consts: &mut Vec<mir::RValue>) {
     for _ in 0..MAX_OPT_ITERATIONS {
+        let copied = copy_propagate_block_locals(func);
         let const_locals = collect_const_locals(func);
         let is_float = float_locals(func);
         let folded = fold_function(func, &const_locals, &is_float);
+        let branch_folded = fold_constant_branches(func);
         let threaded = thread_jumps(func);
         let dce = dead_store_elim(func);
-        if !folded && !threaded && !dce {
+        if !copied && !folded && !branch_folded && !threaded && !dce {
             break;
         }
     }
@@ -1900,6 +1905,278 @@ fn fold_one_const(
         (false, BinOp::Or, Nil) if guard => Some(RValue::Load(other)),
         _ => None,
     }
+}
+
+/// Resolve one block-local scalar alias to its canonical source.
+fn resolve_scalar_alias(
+    mut id: mir::LocalId,
+    aliases: &FxHashMap<mir::LocalId, mir::LocalId>,
+) -> mir::LocalId {
+    let mut seen = HashSet::new();
+    while let Some(&next) = aliases.get(&id) {
+        if next == id || !seen.insert(id) {
+            break;
+        }
+        id = next;
+    }
+    id
+}
+
+fn rewrite_alias_id(
+    id: &mut mir::LocalId,
+    aliases: &FxHashMap<mir::LocalId, mir::LocalId>,
+) -> bool {
+    let resolved = resolve_scalar_alias(*id, aliases);
+    if resolved != *id {
+        *id = resolved;
+        true
+    } else {
+        false
+    }
+}
+
+fn rewrite_rvalue_aliases(
+    rv: &mut mir::RValue,
+    aliases: &FxHashMap<mir::LocalId, mir::LocalId>,
+) -> bool {
+    use mir::RValue;
+    let mut changed = false;
+    let mut rewrite = |id: &mut mir::LocalId| {
+        changed |= rewrite_alias_id(id, aliases);
+    };
+
+    match rv {
+        RValue::Const(_)
+        | RValue::Panic(_)
+        | RValue::SignalWait { .. }
+        | RValue::Receive
+        | RValue::ReceiveMatch { .. }
+        | RValue::ReceiveCommit
+        | RValue::SelfRef
+        | RValue::StateGet { .. } => {}
+        RValue::Load(x)
+        | RValue::ArrayLen(x)
+        | RValue::Unary(_, x)
+        | RValue::Resume(x)
+        | RValue::CapabilityCheck { val: x } => rewrite(x),
+        RValue::LoadFieldNamed { obj, .. } | RValue::LoadFieldPos { obj, .. } => rewrite(obj),
+        RValue::ArrayLoad { arr, idx }
+        | RValue::Binary(_, arr, idx)
+        | RValue::StringEq(arr, idx)
+        | RValue::StrConcat(arr, idx)
+        | RValue::Migrate {
+            actor: arr,
+            node: idx,
+        } => {
+            rewrite(arr);
+            rewrite(idx);
+        }
+        RValue::ArrayLit(xs) | RValue::Tuple(xs) => {
+            for x in xs {
+                rewrite(x);
+            }
+        }
+        RValue::Call { func, args } => {
+            if let mir::FuncRef::Local(f) = func {
+                rewrite(f);
+            }
+            for x in args {
+                rewrite(x);
+            }
+        }
+        RValue::Closure { captures, .. } => {
+            for x in captures {
+                rewrite(x);
+            }
+        }
+        RValue::Record(fields) => {
+            for (_, x) in fields {
+                rewrite(x);
+            }
+        }
+        RValue::RecordUpdate { base, overrides } => {
+            rewrite(base);
+            for (_, x) in overrides {
+                rewrite(x);
+            }
+        }
+        RValue::Perform { args, .. }
+        | RValue::PerformAsync { args, .. }
+        | RValue::FFICall { args, .. } => {
+            for x in args {
+                rewrite(x);
+            }
+        }
+        RValue::ReceiveWait { timeout, .. } => rewrite(timeout),
+        RValue::Spawn {
+            init, target_node, ..
+        } => {
+            if let Some(node) = target_node {
+                rewrite(node);
+            }
+            for (_, init_rv) in init {
+                changed |= rewrite_rvalue_aliases(init_rv, aliases);
+            }
+        }
+        RValue::Send { actor, args, .. } | RValue::Ask { actor, args, .. } => {
+            rewrite(actor);
+            for x in args {
+                rewrite(x);
+            }
+        }
+    }
+
+    changed
+}
+
+fn rewrite_stmt_aliases(
+    stmt: &mut mir::Stmt,
+    aliases: &FxHashMap<mir::LocalId, mir::LocalId>,
+) -> bool {
+    use mir::Stmt;
+    let mut changed = false;
+    match stmt {
+        Stmt::Assign { op, .. } => changed |= rewrite_rvalue_aliases(op, aliases),
+        Stmt::StoreFieldNamed { obj, src, .. } => {
+            changed |= rewrite_alias_id(obj, aliases);
+            changed |= rewrite_alias_id(src, aliases);
+        }
+        Stmt::ArrayStore { arr, idx, src } => {
+            changed |= rewrite_alias_id(arr, aliases);
+            changed |= rewrite_alias_id(idx, aliases);
+            changed |= rewrite_alias_id(src, aliases);
+        }
+        Stmt::Emit { args, .. } => {
+            for x in args {
+                changed |= rewrite_alias_id(x, aliases);
+            }
+        }
+        Stmt::StateSet { src, .. } => changed |= rewrite_alias_id(src, aliases),
+        Stmt::EnterHandle { .. } | Stmt::PopHandler | Stmt::ParallelMarker { .. } => {}
+    }
+    changed
+}
+
+fn rewrite_terminator_aliases(
+    term: &mut mir::Terminator,
+    aliases: &FxHashMap<mir::LocalId, mir::LocalId>,
+) -> bool {
+    match term {
+        mir::Terminator::Return(Some(x))
+        | mir::Terminator::Resume(x)
+        | mir::Terminator::Branch { cond: x, .. } => rewrite_alias_id(x, aliases),
+        mir::Terminator::Return(None)
+        | mir::Terminator::Jump(_)
+        | mir::Terminator::Unterminated => false,
+    }
+}
+
+fn kill_scalar_aliases(aliases: &mut FxHashMap<mir::LocalId, mir::LocalId>, dst: mir::LocalId) {
+    aliases.remove(&dst);
+    aliases.retain(|_, src| *src != dst);
+}
+
+/// Propagate definitely-scalar copies within each basic block.
+///
+/// The pass deliberately stops at block boundaries instead of assuming
+/// dominance. Heap-capable locals are excluded so rewriting/removing a Load
+/// cannot alter ORCA ownership/drop planning. Side-effecting assignments clear
+/// aliases because receive/effect-like operations can have implicit VM writes.
+fn copy_propagate_block_locals(func: &mut mir::Function) -> bool {
+    let scalar: Vec<bool> = func
+        .locals
+        .iter()
+        .map(|l| !may_hold_heap_ptr(&l.ty))
+        .collect();
+    let mut changed = false;
+
+    for block in &mut func.blocks {
+        let mut aliases: FxHashMap<mir::LocalId, mir::LocalId> = FxHashMap::default();
+
+        for stmt in &mut block.stmts {
+            changed |= rewrite_stmt_aliases(stmt, &aliases);
+
+            if let mir::Stmt::Assign { dst, op } = stmt {
+                let side_effecting = rvalue_side_effecting(op);
+                if side_effecting {
+                    aliases.clear();
+                }
+
+                kill_scalar_aliases(&mut aliases, *dst);
+
+                if !side_effecting {
+                    if let mir::RValue::Load(src) = op {
+                        let d = dst.0 as usize;
+                        let s = src.0 as usize;
+                        if *src != *dst
+                            && scalar.get(d).copied().unwrap_or(false)
+                            && scalar.get(s).copied().unwrap_or(false)
+                        {
+                            aliases.insert(*dst, *src);
+                        }
+                    }
+                }
+            }
+        }
+
+        changed |= rewrite_terminator_aliases(&mut block.terminator, &aliases);
+    }
+
+    changed
+}
+
+/// Fold a branch when its Bool condition is proven inside the same block.
+///
+/// This intentionally does not prune the untaken block on current main:
+/// semantic effect-site identities are captured before MIR optimization, so
+/// removing an unreachable Perform site requires pruning-aware identity
+/// bookkeeping first.
+fn fold_constant_branches(func: &mut mir::Function) -> bool {
+    use crate::ast::UnOp;
+    let mut changed = false;
+
+    for block in &mut func.blocks {
+        let mut bools: FxHashMap<mir::LocalId, bool> = FxHashMap::default();
+
+        for stmt in &block.stmts {
+            let mir::Stmt::Assign { dst, op } = stmt else {
+                continue;
+            };
+
+            if rvalue_side_effecting(op) {
+                bools.clear();
+            }
+            bools.remove(dst);
+
+            let value = match op {
+                mir::RValue::Const(Constant::Bool(v)) => Some(*v),
+                mir::RValue::Load(src) => bools.get(src).copied(),
+                mir::RValue::Unary(UnOp::Not, src) => bools.get(src).copied().map(|v| !v),
+                _ => None,
+            };
+            if let Some(value) = value {
+                bools.insert(*dst, value);
+            }
+        }
+
+        let replacement = match &block.terminator {
+            mir::Terminator::Branch { then_, else_, .. } if then_ == else_ => {
+                Some(mir::Terminator::Jump(*then_))
+            }
+            mir::Terminator::Branch { cond, then_, else_ } => bools
+                .get(cond)
+                .copied()
+                .map(|value| mir::Terminator::Jump(if value { *then_ } else { *else_ })),
+            _ => None,
+        };
+
+        if let Some(term) = replacement {
+            block.terminator = term;
+            changed = true;
+        }
+    }
+
+    changed
 }
 
 /// Thread jumps through trampoline blocks: a block with zero statements and
@@ -3647,6 +3924,102 @@ mod optimize_tests {
                 } if msg == "boom"
             )),
             "reachable Panic is divergent/observable and must survive DCE"
+        );
+    }
+
+    #[test]
+    fn test_scalar_copy_propagation_removes_temp_move() {
+        let mut b = mir::FunctionBuilder::new("copy_prop", Some(crate::types::Type::int()));
+        let x = b.add_param("x", crate::types::Type::int());
+        let copied = b.add_temp(crate::types::Type::int());
+        let one = b.add_temp(crate::types::Type::int());
+        let out = b.add_temp(crate::types::Type::int());
+        b.assign(copied, mir::RValue::Load(x));
+        b.assign(one, mir::RValue::Const(Constant::Int(1)));
+        b.assign(
+            out,
+            mir::RValue::Binary(crate::ast::BinOp::Add, copied, one),
+        );
+        b.terminate(mir::Terminator::Return(Some(out)));
+
+        let mut func = b.build();
+        let mut consts = Vec::new();
+        optimize_function(&mut func, &mut consts);
+
+        assert!(
+            !func.blocks[0]
+                .stmts
+                .iter()
+                .any(|stmt| matches!(stmt, mir::Stmt::Assign { dst, .. } if *dst == copied)),
+            "anonymous scalar copy should be propagated and removed"
+        );
+        assert!(
+            func.blocks[0].stmts.iter().any(|stmt| matches!(
+                stmt,
+                mir::Stmt::Assign {
+                    dst,
+                    op: mir::RValue::Binary(crate::ast::BinOp::Add, lhs, _),
+                } if *dst == out && *lhs == x
+            )),
+            "consumer should read the original scalar source directly"
+        );
+    }
+
+    #[test]
+    fn test_scalar_copy_propagation_kills_alias_on_source_reassign() {
+        let mut b = mir::FunctionBuilder::new("copy_kill", Some(crate::types::Type::int()));
+        let x = b.add_param("x", crate::types::Type::int());
+        let copied = b.add_temp(crate::types::Type::int());
+        b.assign(copied, mir::RValue::Load(x));
+        b.assign(x, mir::RValue::Const(Constant::Int(7)));
+        b.terminate(mir::Terminator::Return(Some(copied)));
+
+        let mut func = b.build();
+        let mut consts = Vec::new();
+        optimize_function(&mut func, &mut consts);
+
+        assert_eq!(
+            func.blocks[0].terminator,
+            mir::Terminator::Return(Some(copied)),
+            "copy must retain the pre-reassignment value instead of aliasing the new source"
+        );
+    }
+
+    #[test]
+    fn test_constant_branch_fold_keeps_effect_site_blocks_intact() {
+        let mut b = mir::FunctionBuilder::new("branch_fold", Some(crate::types::Type::int()));
+        let then_block = b.create_block();
+        let else_block = b.create_block();
+        let cond = b.add_temp(crate::types::Type::bool());
+        b.assign(cond, mir::RValue::Const(Constant::Bool(true)));
+        b.terminate(mir::Terminator::Branch {
+            cond,
+            then_: then_block,
+            else_: else_block,
+        });
+
+        b.switch_to(then_block);
+        let yes = b.add_temp(crate::types::Type::int());
+        b.assign(yes, mir::RValue::Const(Constant::Int(1)));
+        b.terminate(mir::Terminator::Return(Some(yes)));
+
+        b.switch_to(else_block);
+        let no = b.add_temp(crate::types::Type::int());
+        b.assign(no, mir::RValue::Const(Constant::Int(2)));
+        b.terminate(mir::Terminator::Return(Some(no)));
+
+        let mut func = b.build();
+        let mut consts = Vec::new();
+        optimize_function(&mut func, &mut consts);
+
+        assert_eq!(
+            func.blocks[0].terminator,
+            mir::Terminator::Jump(then_block),
+            "constant true branch should collapse to the taken edge"
+        );
+        assert!(
+            !func.blocks[else_block.0 as usize].stmts.is_empty(),
+            "current optimizer must retain untaken block contents until semantic effect-site pruning is identity-aware"
         );
     }
 
