@@ -1003,6 +1003,28 @@ mod transactional_receive_tests {
     }
 
     #[test]
+    fn hybrid_receive_rebuilds_index_after_linear_staging() {
+        let mut mb = Mailbox::new(16);
+        mb.push_local(msg(100, 1, MessagePriority::Normal)).unwrap();
+
+        let indexed_arms = [1, 2, 3, 4, 5, 6, 7, 100];
+        let first = mb.receive_match(&indexed_arms).expect("indexed candidate");
+        assert_eq!(first.1[0].as_int(), Some(1));
+        mb.reset_receive_match();
+
+        mb.push_local(msg(200, 2, MessagePriority::Normal)).unwrap();
+        let linear = mb.receive_match(&[200]).expect("linear candidate");
+        assert_eq!(linear.1[0].as_int(), Some(2));
+        mb.reset_receive_match();
+
+        let indexed_arms = [10, 11, 12, 13, 14, 15, 16, 200];
+        let rebuilt = mb
+            .receive_match(&indexed_arms)
+            .expect("indexed path must rebuild after linear staging");
+        assert_eq!(rebuilt.1[0].as_int(), Some(2));
+    }
+
+    #[test]
     fn indexed_receive_sees_arrival_after_initial_miss() {
         let mut mb = Mailbox::new(8);
         mb.push_local(msg(1, 1, MessagePriority::Normal)).unwrap();
