@@ -1223,7 +1223,7 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             if rt
                 .actors
                 .get(&actor_id)
-                .map(|a| a.is_agent)
+                .map(|a| a.semantics().map(|s| s.is_agent()).unwrap_or(false))
                 .unwrap_or(false)
             {
                 return rt.complete_agent_llm(actor_id, prompt);
@@ -1584,7 +1584,7 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                 return None;
             }
             let actor = (*self.runtime).actors.get(&self.actor_id)?;
-            if !actor.is_workflow {
+            if !actor.semantics().map(|s| s.is_workflow()).unwrap_or(false) {
                 return Some(crate::vm::Value::unit());
             }
             let vm = (*self.runtime).vm.as_mut()?;
@@ -1916,7 +1916,7 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             if rt
                 .actors
                 .get(&self.actor_id)
-                .map(|a| a.is_agent)
+                .map(|a| a.semantics().map(|s| s.is_agent()).unwrap_or(false))
                 .unwrap_or(false)
             {
                 return rt.complete_agent_llm(self.actor_id, prompt);
@@ -1957,7 +1957,7 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                         let is_agent = rt
                             .actors
                             .get(&actor_id)
-                            .map(|a| a.is_agent)
+                            .map(|a| a.semantics().map(|s| s.is_agent()).unwrap_or(false))
                             .unwrap_or(false);
                         let content = if is_agent {
                             let module = rt
@@ -2024,7 +2024,7 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             let is_agent = rt
                 .actors
                 .get(&actor_id)
-                .map(|a| a.is_agent)
+                .map(|a| a.semantics().map(|s| s.is_agent()).unwrap_or(false))
                 .unwrap_or(false);
             let request = if is_agent {
                 agent::build_agent_llm_request(rt, actor_id, prompt)
