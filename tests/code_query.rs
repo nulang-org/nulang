@@ -124,7 +124,6 @@ fn query_symbols_name_filter_is_case_insensitive() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-
 #[test]
 fn query_symbol_preserves_top_level_let_binding() {
     let dir = temp_dir("top_level_let");
@@ -173,7 +172,9 @@ fn query_json_failure_stays_machine_readable() {
     assert_eq!(v["schema_version"], 1);
     assert_eq!(v["command"], "symbols");
     assert_eq!(v["ok"], false);
-    assert!(v["error"].as_str().is_some_and(|message| message.contains("cannot read")));
+    assert!(v["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("cannot read")));
     assert_eq!(v["symbols"].as_array().map(Vec::len), Some(0));
 
     let _ = std::fs::remove_dir_all(&dir);
