@@ -46,8 +46,7 @@ impl DeduplicatingProvider {
         }
 
         self.mutation_count += 1;
-        let result =
-            format!("provider-result:{}", String::from_utf8_lossy(request)).into_bytes();
+        let result = format!("provider-result:{}", String::from_utf8_lossy(request)).into_bytes();
         self.committed.insert(key, result.clone());
         result
     }
@@ -244,7 +243,9 @@ fn specification_drift_on_replay_fails_closed_before_provider_dispatch() {
 
     {
         let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
-        coordinator.begin(original, b"order=42&amount=1000").unwrap();
+        coordinator
+            .begin(original, b"order=42&amount=1000")
+            .unwrap();
     }
 
     let drifted = DurableEffectSpec::new(
