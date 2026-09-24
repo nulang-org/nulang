@@ -129,7 +129,12 @@ pub fn run_io<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> NuResult<()
             Err(error) => {
                 write_response(
                     &mut writer,
-                    &rpc_error(Value::Null, -32700, "Parse error", Some(json!(error.to_string()))),
+                    &rpc_error(
+                        Value::Null,
+                        -32700,
+                        "Parse error",
+                        Some(json!(error.to_string())),
+                    ),
                 )?;
                 continue;
             }
@@ -154,7 +159,12 @@ fn handle_request(session: &mut QuerySession, request: RpcRequest) -> (Value, bo
     let id = request.id.unwrap_or(Value::Null);
     if request.jsonrpc != JSONRPC_VERSION {
         return (
-            rpc_error(id, -32600, "Invalid Request", Some(json!("jsonrpc must be 2.0"))),
+            rpc_error(
+                id,
+                -32600,
+                "Invalid Request",
+                Some(json!("jsonrpc must be 2.0")),
+            ),
             false,
         );
     }
@@ -191,7 +201,12 @@ fn handle_request(session: &mut QuerySession, request: RpcRequest) -> (Value, bo
             };
             let Some(file) = params.get("file").and_then(Value::as_str) else {
                 return (
-                    rpc_error(id, -32602, "Invalid params", Some(json!("file is required"))),
+                    rpc_error(
+                        id,
+                        -32602,
+                        "Invalid params",
+                        Some(json!("file is required")),
+                    ),
                     false,
                 );
             };
@@ -310,7 +325,9 @@ mod tests {
         assert_eq!(session.cached_files(), 1);
 
         std::fs::write(&path, "fn answer() -> String { \"yes\" }\n").expect("rewrite source");
-        let second = session.query("type", "answer", &path).expect("second query");
+        let second = session
+            .query("type", "answer", &path)
+            .expect("second query");
         assert!(second.symbols[0]
             .inferred_type
             .as_deref()
