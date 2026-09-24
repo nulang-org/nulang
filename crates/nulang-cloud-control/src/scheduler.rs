@@ -58,7 +58,11 @@ pub fn plan_evaluation(
     // new placement decisions. A lower epoch is fenced even if it still says Running.
     for replica in 0..deployment.replicas {
         let existing = by_replica.get(&replica).cloned().unwrap_or_default();
-        let max_epoch = existing.iter().map(|allocation| allocation.epoch).max().unwrap_or(0);
+        let max_epoch = existing
+            .iter()
+            .map(|allocation| allocation.epoch)
+            .max()
+            .unwrap_or(0);
         next_epoch_by_replica.insert(replica, max_epoch.saturating_add(1));
 
         let authoritative = existing
@@ -73,7 +77,9 @@ pub fn plan_evaluation(
         {
             if authoritative
                 .as_ref()
-                .map(|current| current.epoch != allocation.epoch || current.node_id != allocation.node_id)
+                .map(|current| {
+                    current.epoch != allocation.epoch || current.node_id != allocation.node_id
+                })
                 .unwrap_or(true)
             {
                 superseded.push(SupersededAllocation {
@@ -124,7 +130,10 @@ pub fn plan_evaluation(
         if *replica < deployment.replicas {
             continue;
         }
-        for allocation in existing.iter().filter(|allocation| allocation.state.is_active()) {
+        for allocation in existing
+            .iter()
+            .filter(|allocation| allocation.state.is_active())
+        {
             superseded.push(SupersededAllocation {
                 allocation: allocation.clone(),
                 reason: SupersededReason::ScaleDown,
@@ -241,12 +250,7 @@ fn placement_rejections(
     node: &NodeDescriptor,
     deployment_replicas_on_node: u32,
 ) -> Vec<Rejection> {
-    common_rejections(
-        deployment,
-        node,
-        true,
-        deployment_replicas_on_node,
-    )
+    common_rejections(deployment, node, true, deployment_replicas_on_node)
 }
 
 fn common_rejections(
@@ -293,7 +297,12 @@ fn common_rejections(
         let allowed = node
             .zone
             .as_ref()
-            .map(|zone| constraints.allowed_zones.iter().any(|candidate| candidate == zone))
+            .map(|zone| {
+                constraints
+                    .allowed_zones
+                    .iter()
+                    .any(|candidate| candidate == zone)
+            })
             .unwrap_or(false);
         if !allowed {
             reasons.push(Rejection {
@@ -408,8 +417,7 @@ fn score_node(
         0
     };
 
-    let node_spread =
-        -(node_replica_counts.get(&node.node_id).copied().unwrap_or(0) as i64) * 500;
+    let node_spread = -(node_replica_counts.get(&node.node_id).copied().unwrap_or(0) as i64) * 500;
 
     let headroom = if preferences.prefer_headroom {
         let cpu_after = node
@@ -514,11 +522,15 @@ mod tests {
         assert_eq!(blocked.unscheduled_replicas, vec![0]);
         assert_eq!(blocked.considered_nodes, 2);
         assert_eq!(
-            blocked.rejection_counts.get(&RejectionCode::ArchitectureMismatch),
+            blocked
+                .rejection_counts
+                .get(&RejectionCode::ArchitectureMismatch),
             Some(&2)
         );
         assert_eq!(
-            blocked.rejection_counts.get(&RejectionCode::RegionNotAllowed),
+            blocked
+                .rejection_counts
+                .get(&RejectionCode::RegionNotAllowed),
             Some(&1)
         );
     }
@@ -564,9 +576,13 @@ mod tests {
             state: AllocationState::Running,
         };
 
-        let plan =
-            plan_evaluation(&evaluation(), &spec, &[node(1, "us-east", "a", 4_000, 4_096)], &[existing])
-                .unwrap();
+        let plan = plan_evaluation(
+            &evaluation(),
+            &spec,
+            &[node(1, "us-east", "a", 4_000, 4_096)],
+            &[existing],
+        )
+        .unwrap();
 
         assert_eq!(plan.retained.len(), 1);
         assert!(plan.placements.is_empty());
@@ -597,10 +613,7 @@ mod tests {
 
         assert_eq!(plan.placements[0].node_id, 2);
         assert_eq!(plan.placements[0].epoch, 8);
-        assert_eq!(
-            plan.superseded[0].reason,
-            SupersededReason::StaleRevision
-        );
+        assert_eq!(plan.superseded[0].reason, SupersededReason::StaleRevision);
     }
 
     #[test]
@@ -613,11 +626,15 @@ mod tests {
         let blocked = plan.blocked.expect("second replica must block");
         assert_eq!(blocked.unscheduled_replicas, vec![1]);
         assert_eq!(
-            blocked.rejection_counts.get(&RejectionCode::InsufficientCpu),
+            blocked
+                .rejection_counts
+                .get(&RejectionCode::InsufficientCpu),
             Some(&1)
         );
         assert_eq!(
-            blocked.rejection_counts.get(&RejectionCode::InsufficientMemory),
+            blocked
+                .rejection_counts
+                .get(&RejectionCode::InsufficientMemory),
             Some(&1)
         );
     }

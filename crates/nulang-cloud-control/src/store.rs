@@ -108,8 +108,7 @@ pub trait ControlStore: Send + Sync {
 
     fn committed_plan(&self, evaluation_id: &str) -> Result<Option<PlacementPlan>, StoreError>;
 
-    fn allocations_for(&self, deployment_id: &str)
-        -> Result<Vec<ObservedAllocation>, StoreError>;
+    fn allocations_for(&self, deployment_id: &str) -> Result<Vec<ObservedAllocation>, StoreError>;
 
     /// Atomically commit the plan, allocation ownership changes, and execution
     /// outbox commands. Implementations must compare current allocation epochs
@@ -189,9 +188,11 @@ impl PersistedState {
         self.validate_epochs(plan)?;
 
         for superseded in &plan.superseded {
-            if let Some(existing) = self.allocations.iter_mut().find(|allocation| {
-                same_allocation_identity(allocation, &superseded.allocation)
-            }) {
+            if let Some(existing) = self
+                .allocations
+                .iter_mut()
+                .find(|allocation| same_allocation_identity(allocation, &superseded.allocation))
+            {
                 if existing.state.is_active() {
                     existing.state = AllocationState::Stopped;
                 }
@@ -276,8 +277,7 @@ impl PersistedState {
             if superseded.reason == SupersededReason::Duplicate {
                 continue;
             }
-            let actual_epoch =
-                self.max_epoch(&plan.deployment_id, superseded.allocation.replica);
+            let actual_epoch = self.max_epoch(&plan.deployment_id, superseded.allocation.replica);
             if actual_epoch != superseded.allocation.epoch {
                 return Err(StoreError::StalePlan {
                     deployment_id: plan.deployment_id.clone(),
@@ -319,10 +319,7 @@ impl PersistedState {
     }
 }
 
-fn validate_plan_identity(
-    evaluation: &Evaluation,
-    plan: &PlacementPlan,
-) -> Result<(), StoreError> {
+fn validate_plan_identity(evaluation: &Evaluation, plan: &PlacementPlan) -> Result<(), StoreError> {
     if plan.evaluation_id != evaluation.evaluation_id
         || plan.deployment_id != evaluation.deployment_id
         || plan.revision != evaluation.revision
@@ -419,10 +416,7 @@ impl ControlStore for MemoryControlStore {
             .cloned())
     }
 
-    fn allocations_for(
-        &self,
-        deployment_id: &str,
-    ) -> Result<Vec<ObservedAllocation>, StoreError> {
+    fn allocations_for(&self, deployment_id: &str) -> Result<Vec<ObservedAllocation>, StoreError> {
         Ok(self
             .state
             .lock()
@@ -529,10 +523,7 @@ impl ControlStore for JsonFileControlStore {
             .cloned())
     }
 
-    fn allocations_for(
-        &self,
-        deployment_id: &str,
-    ) -> Result<Vec<ObservedAllocation>, StoreError> {
+    fn allocations_for(&self, deployment_id: &str) -> Result<Vec<ObservedAllocation>, StoreError> {
         Ok(self
             .state
             .lock()
@@ -572,8 +563,8 @@ fn persist_state(path: &Path, state: &PersistedState) -> Result<(), StoreError> 
         }
     }
 
-    let bytes = serde_json::to_vec(state)
-        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    let bytes =
+        serde_json::to_vec(state).map_err(|error| StoreError::Serialization(error.to_string()))?;
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
 
     {
@@ -718,14 +709,13 @@ mod tests {
 
         let eval = evaluation("eval-replace");
         store.record_evaluation(&eval).unwrap();
-        let plan =
-            plan_evaluation(&eval, &deployment(), &[node(1), node(2)], &[old]).unwrap();
+        let plan = plan_evaluation(&eval, &deployment(), &[node(1), node(2)], &[old]).unwrap();
         store.commit_plan(&eval, &plan).unwrap();
 
         let allocations = store.allocations_for("api").unwrap();
-        assert!(allocations
-            .iter()
-            .any(|allocation| allocation.epoch == 7 && allocation.state == AllocationState::Stopped));
+        assert!(allocations.iter().any(
+            |allocation| allocation.epoch == 7 && allocation.state == AllocationState::Stopped
+        ));
         assert!(allocations.iter().any(|allocation| {
             allocation.epoch == 8
                 && allocation.state == AllocationState::Starting
