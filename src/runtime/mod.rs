@@ -252,7 +252,7 @@ enum CrossShardMsg {
     DeliverMessage {
         target_id: u64,
         behavior_id: u16,
-        payload: Vec<Value>,
+        payload: MessagePayload,
         sender: u64,
         trace_id: Option<String>,
         grain_id: Option<GrainId>,
@@ -263,7 +263,7 @@ enum CrossShardMsg {
     DeliverNamedMessage {
         target_id: u64,
         behavior_name: String,
-        payload: Vec<Value>,
+        payload: MessagePayload,
         sender: u64,
         trace_id: Option<String>,
     },
@@ -1343,7 +1343,7 @@ impl Runtime {
         &mut self,
         target_id: u64,
         behavior_id: u16,
-        payload: Vec<Value>,
+        payload: MessagePayload,
         sender: u64,
         trace_id: Option<String>,
         grain_id: Option<GrainId>,
@@ -1378,7 +1378,7 @@ impl Runtime {
 
         let msg = Message {
             behavior_id,
-            payload: MessagePayload::from_vec(payload),
+            payload,
             sender,
             priority: MessagePriority::Normal,
             trace_id: trace_id.clone(),
@@ -1428,21 +1428,21 @@ impl Runtime {
     /// Drain all pending cross-shard messages into local mailboxes. Called
     /// at the top of every scheduler-loop iteration before dequeuing work.
     fn drain_cross_shard_messages(&mut self) {
-        let mut pending: Vec<CrossShardMsg> = Vec::new();
-        {
-            let rx = match self.cross_shard_rx.as_ref() {
-                Some(rx) => rx,
-                None => return,
-            };
-            loop {
+        loop {
+            // Limit the receiver borrow to this block so delivery can mutate
+            // the Runtime immediately. This avoids allocating a temporary
+            // Vec<CrossShardMsg> on every non-empty drain pass.
+            let msg = {
+                let rx = match self.cross_shard_rx.as_ref() {
+                    Some(rx) => rx,
+                    None => return,
+                };
                 match rx.try_recv() {
-                    Ok(msg) => pending.push(msg),
+                    Ok(msg) => msg,
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => break,
                 }
-            }
-        }
-        for msg in pending {
+            };
             match msg {
                 CrossShardMsg::DeliverMessage {
                     target_id,
@@ -1515,7 +1515,7 @@ impl Runtime {
                     self.deliver_cross_shard_message(
                         target_id,
                         behavior_id,
-                        payload,
+                        MessagePayload::from_vec(payload),
                         sender,
                         trace_id,
                         grain_id,
@@ -1559,7 +1559,7 @@ impl Runtime {
                     self.deliver_cross_shard_message(
                         target_id,
                         behavior_id,
-                        payload,
+                        MessagePayload::from_vec(payload),
                         sender,
                         trace_id,
                         None,
@@ -2205,7 +2205,7 @@ impl Runtime {
             tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessage {
                 target_id,
                 behavior_id,
-                payload: args,
+                payload: MessagePayload::from_vec(args),
                 sender: self.current_actor.unwrap_or(0),
                 trace_id: out_trace,
                 grain_id,
@@ -2278,7 +2278,7 @@ impl Runtime {
             tx[target_shard as usize].try_send(CrossShardMsg::DeliverNamedMessage {
                 target_id,
                 behavior_name: behavior_name.to_string(),
-                payload: args,
+                payload: MessagePayload::from_vec(args),
                 sender: self.current_actor.unwrap_or(0),
                 trace_id: out_trace,
             })
