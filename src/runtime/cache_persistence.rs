@@ -146,6 +146,8 @@ impl CacheWal {
         let checksum = blake3::hash(&checksum_input);
 
         self.file.write_all(&payload_len.to_le_bytes())?;
+        self.file
+            .write_all(&(payload_len ^ u32::MAX).to_le_bytes())?;
         self.file.write_all(&sequence.to_le_bytes())?;
         self.file.write_all(&payload)?;
         self.file.write_all(checksum.as_bytes())?;
@@ -410,7 +412,7 @@ fn scan_wal(bytes: &[u8]) -> io::Result<WalScan> {
 
     while position < bytes.len() {
         let record_start = position;
-        if bytes.len() - position < 4 {
+        if bytes.len() - position < 8 {
             return Ok(WalScan {
                 base_sequence,
                 last_sequence,
@@ -419,12 +421,21 @@ fn scan_wal(bytes: &[u8]) -> io::Result<WalScan> {
             });
         }
 
-        let payload_len = u32::from_le_bytes(
+        let payload_len_raw = u32::from_le_bytes(
             bytes[position..position + 4]
                 .try_into()
                 .expect("fixed cache WAL length slice"),
-        ) as usize;
-        position += 4;
+        );
+        let payload_len_check = u32::from_le_bytes(
+            bytes[position + 4..position + 8]
+                .try_into()
+                .expect("fixed cache WAL complemented-length slice"),
+        );
+        position += 8;
+        if payload_len_check != (payload_len_raw ^ u32::MAX) {
+            return Err(invalid_data("cache WAL record length header is corrupt"));
+        }
+        let payload_len = payload_len_raw as usize;
 
         let record_tail = 8usize
             .checked_add(payload_len)
@@ -575,6 +586,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temp, path)?;
+        #[cfg(unix)]
+        File::open(parent)?.sync_all()?;
         Ok(())
     })();
 
@@ -808,6 +821,31 @@ mod tests {
         let reopened = CacheWal::open(&wal_path).unwrap();
         assert_eq!(reopened.last_sequence(), 1);
         assert_eq!(fs::metadata(&wal_path).unwrap().len(), complete_len);
+
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn wal_rejects_corrupt_complete_length_header() {
+        let wal_path = test_path("corrupt-length");
+        let mut wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        wal.append(
+            &CacheWalMutation::SetInteger {
+                key: b"k".to_vec(),
+                value: 1,
+                expires_unix_ms: None,
+            },
+            CacheWalSync::Data,
+        )
+        .unwrap();
+        drop(wal);
+
+        let mut bytes = fs::read(&wal_path).unwrap();
+        bytes[WAL_HEADER_BYTES + 4] ^= 0x01;
+        fs::write(&wal_path, bytes).unwrap();
+
+        let error = CacheWal::open(&wal_path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         let _ = fs::remove_file(wal_path);
     }
