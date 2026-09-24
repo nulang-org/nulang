@@ -6993,6 +6993,42 @@ fn test_object_ref_cross_shard_copies_bytes() {
     );
 }
 
+#[test]
+fn test_cross_shard_bus_preserves_bounded_backpressure() {
+    let mut shards = Runtime::new_sharded(2);
+
+    // Pick a target whose actor id belongs to shard 1. The global actor-id
+    // counter may start at either parity depending on earlier tests.
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+
+    let payload = [Value::int(1)];
+    for _ in 0..1024 {
+        assert_eq!(
+            shards[0].fabric_admit_local(target, 0, &payload),
+            MessageAdmission::Accepted
+        );
+    }
+    assert_eq!(
+        shards[0].fabric_admit_local(target, 0, &payload),
+        MessageAdmission::Backpressured,
+        "the shard bus must preserve the 1024-message bounded admission contract"
+    );
+
+    shards[1].drain_cross_shard_messages();
+    assert_eq!(
+        shards[1]
+            .actors
+            .get(&target)
+            .expect("target actor")
+            .mailbox
+            .len(),
+        1024
+    );
+}
+
 // ========================================================================
 // Built-in Grain effects
 // ========================================================================

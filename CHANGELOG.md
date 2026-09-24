@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Cross-shard runtime channel — 2026-09-24
+- **The bounded shard bus now uses Crossbeam channels** (`src/runtime/mod.rs`) instead of `std::sync::mpsc::sync_channel`. Capacity remains 1024 messages per shard, non-blocking admission/backpressure semantics are unchanged, and the change reuses Nulang's existing `crossbeam` dependency. Production and deterministic drain paths preserve the same FIFO channel semantics. A focused regression pins the 1024-message admission limit and verifies that the next undrained cross-shard send reports backpressure.
+
 ### Durable external-effect crash-window release gate — 2026-09-23
 - **The deterministic crash-window matrix now exercises the real `DurableEffectCoordinator` over `MemoryStore` using compiler-owned semantic effect-site IDs**, covering intent-only recovery, provider-commit/receipt-loss deduplication, completed-receipt replay, request/specification drift, stale-owner completion fencing, explicit at-least-once duplication, and backend-defined delegation.
 - **The public durability guarantee boundary is documented explicitly** (`docs/DURABILITY_GUARANTEES.md`): Nulang does not claim arbitrary exactly-once external execution; effectively-once behavior requires a real provider/backend deduplication contract and the same stable operation identity across recovery.
