@@ -443,6 +443,9 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         return;
     }
 
+    let previous_actor = rt.current_actor;
+    rt.current_actor = Some(actor_id);
+    rt.begin_durable_workflow_turn(actor_id);
     let self_ptr: *mut Runtime = rt;
     unsafe {
         let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -509,11 +512,14 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                     // A chained receive-after suspend arms its timeout
                     // here; a no-op for the other sentinels.
                     (*self_ptr).maybe_schedule_receive_wait(actor_id, receive_timeout);
+                    (*self_ptr).persist_suspension_marker(actor_id);
                 }
             }
             // Other errors: the send-path result is discarded anyway,
             // matching step_actor semantics.
-            Err(_) => {}
+            Err(_) => {
+                (*self_ptr).discard_staged_workflow_outbox(actor_id);
+            }
         }
         // End the VM-execution window only after any suspend-state
         // re-capture above: draining deferred wakes runs other actors
@@ -522,6 +528,8 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         // wakes of other actors are not lost when THIS one suspends.
         (*self_ptr).vm_exec_end();
     }
+    rt.end_durable_workflow_turn(actor_id);
+    rt.current_actor = previous_actor;
     // The suspension resolved (completed or failed): if messages queued
     // up while the behavior was suspended, schedule the actor to drain
     // them — step_actor leaves mail untouched while a suspension is live.
