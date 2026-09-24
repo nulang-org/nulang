@@ -26,7 +26,7 @@ benchmarks, from neighbor CPU/cache contention) that a naive fixed
 threshold would be flaky, failing pushes for noise rather than real
 regressions. The gate instead computes, per benchmark, the median and
 median absolute deviation (MAD, an outlier-resistant spread estimate)
-across the last 10 `main`-branch results, ordered by the Git commit
+across the last 10 `main`-branch results, ordered by the producing Git commit
 timestamp encoded by each result filename, then flags a regression only when
 the latest value exceeds `median + 6×MAD` (floored at 20% of the median, so
 an unusually stable run of samples doesn't turn a trivial delta into a false
