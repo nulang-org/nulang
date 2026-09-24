@@ -945,9 +945,9 @@ mod tests {
                 hir::Decl::Actor(actor_def("Alpha", "value", field_ty)),
             ],
         };
-        let mut mir = mir::Module::new("typed");
-        mir.actor_metadata.push(ActorMeta::new("Zulu"));
-        mir.actor_metadata.push(ActorMeta::new("Alpha"));
+        let mir = crate::mir_lower::lower_module(&hir).unwrap();
+        assert_eq!(mir.actor_metadata[0].name, "Zulu");
+        assert_eq!(mir.actor_metadata[1].name, "Alpha");
 
         let schemas = actor_state_schemas_from_hir(&hir);
         assert_eq!(schemas[0].actor_name, "typed::Zulu");
