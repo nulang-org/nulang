@@ -52,7 +52,7 @@ version + migration.*
 ## Stable tier
 
 ### Inline cross-shard actor payloads — 2026-09-24
-- **Ordinary cross-shard actor messages now preserve the existing 0–4-value inline `MessagePayload` representation instead of converting through `Vec<Value>`.** Object-transfer variants remain mutable vectors until destination object ids are rewritten, then enter the mailbox through the same payload abstraction.
+- **Ordinary cross-shard actor messages now preserve the existing 0–4-value inline `MessagePayload` representation directly from the caller slice, without first materializing a `Vec<Value>`.** Object-transfer variants allocate a mutable vector only when destination object ids must be rewritten, then enter the mailbox through the same payload abstraction.
 - **Cross-shard receive draining now dispatches each message directly from the bounded shard channel instead of collecting an intermediate `Vec<CrossShardMsg>`.** This removes one allocation from each non-empty drain pass without changing admission, ordering, backpressure, grain hydration, or ORCA ownership semantics.
 - A two-shard regression test verifies that a one-value message remains inline at the destination mailbox.
 
