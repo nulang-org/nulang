@@ -12,7 +12,8 @@ use crate::primitives::{DeliverySemantics, EffectBoundary};
 use std::fmt;
 use std::str::FromStr;
 
-pub const DURABLE_EFFECT_PERSISTENCE_VERSION: u16 = 1;
+pub const DURABLE_EFFECT_PERSISTENCE_VERSION_V1: u16 = 1;
+pub const DURABLE_EFFECT_PERSISTENCE_VERSION: u16 = 2;
 
 /// A durable effect restored from the versioned persistence envelope.
 ///
@@ -66,31 +67,38 @@ impl DurableEffectPersistenceRecord {
         }
     }
 
-    /// Encode the stable versioned JSON representation.
+    /// Encode the latest stable versioned JSON representation.
     pub fn to_json(&self) -> Result<Vec<u8>, DurableEffectPersistenceError> {
-        let envelope = PersistedEnvelopeV1 {
+        let envelope = PersistedEnvelopeV2 {
             version: DURABLE_EFFECT_PERSISTENCE_VERSION,
-            record: PersistedRecordKindV1::from_runtime(self),
+            record: PersistedRecordKindV2::from_runtime(self),
         };
         serde_json::to_vec(&envelope).map_err(DurableEffectPersistenceError::from)
     }
 
     /// Decode a versioned durable-effect record.
     ///
-    /// Unknown versions fail closed. Callers must perform an explicit format
-    /// migration rather than asking an older runtime to guess at newer durable
-    /// semantics. Compensation identity is re-derived during decode so a
-    /// corrupted or inconsistent original-id/ordinal/operation tuple cannot be
-    /// accepted as a different logical compensation.
+    /// V1 remains readable. New writes use V2 because V2 is the first format
+    /// that can persist `NoAutomaticRetry` without lying about V1 semantics.
+    /// Unknown versions fail closed. Compensation identity is re-derived during
+    /// decode so a corrupted or inconsistent original-id/ordinal/operation
+    /// tuple cannot be accepted as a different logical compensation.
     pub fn from_json(bytes: &[u8]) -> Result<Self, DurableEffectPersistenceError> {
-        let envelope: PersistedEnvelopeV1 =
+        let probe: PersistedEnvelopeVersion =
             serde_json::from_slice(bytes).map_err(DurableEffectPersistenceError::from)?;
-        if envelope.version != DURABLE_EFFECT_PERSISTENCE_VERSION {
-            return Err(DurableEffectPersistenceError::UnsupportedVersion {
-                actual: envelope.version,
-            });
+        match probe.version {
+            DURABLE_EFFECT_PERSISTENCE_VERSION_V1 => {
+                let envelope: PersistedEnvelopeV1 =
+                    serde_json::from_slice(bytes).map_err(DurableEffectPersistenceError::from)?;
+                envelope.record.into_runtime()
+            }
+            DURABLE_EFFECT_PERSISTENCE_VERSION => {
+                let envelope: PersistedEnvelopeV2 =
+                    serde_json::from_slice(bytes).map_err(DurableEffectPersistenceError::from)?;
+                envelope.record.into_runtime()
+            }
+            actual => Err(DurableEffectPersistenceError::UnsupportedVersion { actual }),
         }
-        envelope.record.into_runtime()
     }
 }
 
@@ -113,7 +121,7 @@ impl fmt::Display for DurableEffectPersistenceError {
             Self::Json(message) => write!(f, "invalid durable effect persistence data: {message}"),
             Self::UnsupportedVersion { actual } => write!(
                 f,
-                "unsupported durable effect persistence version {actual}; runtime supports version {DURABLE_EFFECT_PERSISTENCE_VERSION}"
+                "unsupported durable effect persistence version {actual}; runtime reads v{DURABLE_EFFECT_PERSISTENCE_VERSION_V1} and v{DURABLE_EFFECT_PERSISTENCE_VERSION}, and writes v{DURABLE_EFFECT_PERSISTENCE_VERSION}"
             ),
             Self::InvalidEffectId(value) => {
                 write!(f, "invalid durable effect id in persistence data: {value}")
@@ -134,11 +142,49 @@ impl From<serde_json::Error> for DurableEffectPersistenceError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+struct PersistedEnvelopeVersion {
+    version: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct PersistedEnvelopeV1 {
     version: u16,
     record: PersistedRecordKindV1,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PersistedEnvelopeV2 {
+    version: u16,
+    record: PersistedRecordKindV2,
+}
+
+fn restore_compensation(
+    original_effect_id: String,
+    compensation_ordinal: u32,
+    effect: DurableEffectRecord,
+) -> Result<DurableEffectPersistenceRecord, DurableEffectPersistenceError> {
+    let original_effect_id = DurableEffectId::from_str(&original_effect_id)
+        .map_err(|_| DurableEffectPersistenceError::InvalidEffectId(original_effect_id.clone()))?;
+    let actual = effect.spec().id;
+    let expected =
+        original_effect_id.derive_compensation(compensation_ordinal, &effect.spec().effect_operation);
+    if actual != expected {
+        return Err(DurableEffectPersistenceError::CompensationIdentityMismatch {
+            expected,
+            actual,
+        });
+    }
+    Ok(DurableEffectPersistenceRecord::Compensation {
+        original_effect_id,
+        compensation_ordinal,
+        effect,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// V1 reader — historical semantics, retained for compatibility.
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", content = "value")]
@@ -152,23 +198,6 @@ enum PersistedRecordKindV1 {
 }
 
 impl PersistedRecordKindV1 {
-    fn from_runtime(record: &DurableEffectPersistenceRecord) -> Self {
-        match record {
-            DurableEffectPersistenceRecord::Effect(effect) => {
-                Self::Effect(PersistedEffectRecordV1::from_runtime(effect))
-            }
-            DurableEffectPersistenceRecord::Compensation {
-                original_effect_id,
-                compensation_ordinal,
-                effect,
-            } => Self::Compensation {
-                original_effect_id: original_effect_id.to_string(),
-                compensation_ordinal: *compensation_ordinal,
-                effect: PersistedEffectRecordV1::from_runtime(effect),
-            },
-        }
-    }
-
     fn into_runtime(self) -> Result<DurableEffectPersistenceRecord, DurableEffectPersistenceError> {
         match self {
             Self::Effect(effect) => Ok(DurableEffectPersistenceRecord::Effect(
@@ -178,29 +207,11 @@ impl PersistedRecordKindV1 {
                 original_effect_id,
                 compensation_ordinal,
                 effect,
-            } => {
-                let original_effect_id =
-                    DurableEffectId::from_str(&original_effect_id).map_err(|_| {
-                        DurableEffectPersistenceError::InvalidEffectId(original_effect_id.clone())
-                    })?;
-                let effect = effect.into_runtime()?;
-                let actual = effect.spec().id;
-                let expected = original_effect_id
-                    .derive_compensation(compensation_ordinal, &effect.spec().effect_operation);
-                if actual != expected {
-                    return Err(
-                        DurableEffectPersistenceError::CompensationIdentityMismatch {
-                            expected,
-                            actual,
-                        },
-                    );
-                }
-                Ok(DurableEffectPersistenceRecord::Compensation {
-                    original_effect_id,
-                    compensation_ordinal,
-                    effect,
-                })
-            }
+            } => restore_compensation(
+                original_effect_id,
+                compensation_ordinal,
+                effect.into_runtime()?,
+            ),
         }
     }
 }
@@ -220,13 +231,141 @@ enum PersistedEffectRecordV1 {
 }
 
 impl PersistedEffectRecordV1 {
+    fn into_runtime(self) -> Result<DurableEffectRecord, DurableEffectPersistenceError> {
+        match self {
+            Self::Prepared {
+                spec,
+                request_digest,
+            } => Ok(DurableEffectRecord::Prepared {
+                spec: spec.into_runtime()?,
+                request_digest,
+            }),
+            Self::Completed {
+                spec,
+                request_digest,
+                result,
+            } => Ok(DurableEffectRecord::Completed {
+                spec: spec.into_runtime()?,
+                request_digest,
+                result,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PersistedEffectSpecV1 {
+    id: String,
+    effect_operation: String,
+    boundary: PersistedEffectBoundary,
+    delivery: PersistedDeliverySemanticsV1,
+}
+
+impl PersistedEffectSpecV1 {
+    fn into_runtime(self) -> Result<DurableEffectSpec, DurableEffectPersistenceError> {
+        let id = DurableEffectId::from_str(&self.id)
+            .map_err(|_| DurableEffectPersistenceError::InvalidEffectId(self.id.clone()))?;
+        Ok(DurableEffectSpec::new(
+            id,
+            self.effect_operation,
+            self.boundary.into_runtime(),
+            self.delivery.into_runtime(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum PersistedDeliverySemanticsV1 {
+    AtLeastOnce,
+    EffectivelyOnceWithDeduplication,
+    BackendDefined,
+}
+
+impl PersistedDeliverySemanticsV1 {
+    fn into_runtime(self) -> DeliverySemantics {
+        match self {
+            Self::AtLeastOnce => DeliverySemantics::AtLeastOnce,
+            Self::EffectivelyOnceWithDeduplication => {
+                DeliverySemantics::EffectivelyOnceWithDeduplication
+            }
+            Self::BackendDefined => DeliverySemantics::BackendDefined,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// V2 writer/reader — adds NoAutomaticRetry.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "value")]
+enum PersistedRecordKindV2 {
+    Effect(PersistedEffectRecordV2),
+    Compensation {
+        original_effect_id: String,
+        compensation_ordinal: u32,
+        effect: PersistedEffectRecordV2,
+    },
+}
+
+impl PersistedRecordKindV2 {
+    fn from_runtime(record: &DurableEffectPersistenceRecord) -> Self {
+        match record {
+            DurableEffectPersistenceRecord::Effect(effect) => {
+                Self::Effect(PersistedEffectRecordV2::from_runtime(effect))
+            }
+            DurableEffectPersistenceRecord::Compensation {
+                original_effect_id,
+                compensation_ordinal,
+                effect,
+            } => Self::Compensation {
+                original_effect_id: original_effect_id.to_string(),
+                compensation_ordinal: *compensation_ordinal,
+                effect: PersistedEffectRecordV2::from_runtime(effect),
+            },
+        }
+    }
+
+    fn into_runtime(self) -> Result<DurableEffectPersistenceRecord, DurableEffectPersistenceError> {
+        match self {
+            Self::Effect(effect) => Ok(DurableEffectPersistenceRecord::Effect(
+                effect.into_runtime()?,
+            )),
+            Self::Compensation {
+                original_effect_id,
+                compensation_ordinal,
+                effect,
+            } => restore_compensation(
+                original_effect_id,
+                compensation_ordinal,
+                effect.into_runtime()?,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", content = "value")]
+enum PersistedEffectRecordV2 {
+    Prepared {
+        spec: PersistedEffectSpecV2,
+        request_digest: [u8; 32],
+    },
+    Completed {
+        spec: PersistedEffectSpecV2,
+        request_digest: [u8; 32],
+        result: Vec<u8>,
+    },
+}
+
+impl PersistedEffectRecordV2 {
     fn from_runtime(record: &DurableEffectRecord) -> Self {
         match record {
             DurableEffectRecord::Prepared {
                 spec,
                 request_digest,
             } => Self::Prepared {
-                spec: PersistedEffectSpecV1::from_runtime(spec),
+                spec: PersistedEffectSpecV2::from_runtime(spec),
                 request_digest: *request_digest,
             },
             DurableEffectRecord::Completed {
@@ -234,7 +373,7 @@ impl PersistedEffectRecordV1 {
                 request_digest,
                 result,
             } => Self::Completed {
-                spec: PersistedEffectSpecV1::from_runtime(spec),
+                spec: PersistedEffectSpecV2::from_runtime(spec),
                 request_digest: *request_digest,
                 result: result.clone(),
             },
@@ -264,20 +403,20 @@ impl PersistedEffectRecordV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct PersistedEffectSpecV1 {
+struct PersistedEffectSpecV2 {
     id: String,
     effect_operation: String,
-    boundary: PersistedEffectBoundaryV1,
-    delivery: PersistedDeliverySemanticsV1,
+    boundary: PersistedEffectBoundary,
+    delivery: PersistedDeliverySemanticsV2,
 }
 
-impl PersistedEffectSpecV1 {
+impl PersistedEffectSpecV2 {
     fn from_runtime(spec: &DurableEffectSpec) -> Self {
         Self {
             id: spec.id.to_string(),
             effect_operation: spec.effect_operation.clone(),
-            boundary: PersistedEffectBoundaryV1::from_runtime(spec.boundary),
-            delivery: PersistedDeliverySemanticsV1::from_runtime(spec.delivery),
+            boundary: PersistedEffectBoundary::from_runtime(spec.boundary),
+            delivery: PersistedDeliverySemanticsV2::from_runtime(spec.delivery),
         }
     }
 
@@ -294,13 +433,13 @@ impl PersistedEffectSpecV1 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum PersistedEffectBoundaryV1 {
+enum PersistedEffectBoundary {
     RuntimeOwned,
     BackendOwned,
     External,
 }
 
-impl PersistedEffectBoundaryV1 {
+impl PersistedEffectBoundary {
     fn from_runtime(boundary: EffectBoundary) -> Self {
         match boundary {
             EffectBoundary::RuntimeOwned => Self::RuntimeOwned,
@@ -319,13 +458,14 @@ impl PersistedEffectBoundaryV1 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum PersistedDeliverySemanticsV1 {
+enum PersistedDeliverySemanticsV2 {
     AtLeastOnce,
     EffectivelyOnceWithDeduplication,
     BackendDefined,
+    NoAutomaticRetry,
 }
 
-impl PersistedDeliverySemanticsV1 {
+impl PersistedDeliverySemanticsV2 {
     fn from_runtime(delivery: DeliverySemantics) -> Self {
         match delivery {
             DeliverySemantics::AtLeastOnce => Self::AtLeastOnce,
@@ -333,6 +473,7 @@ impl PersistedDeliverySemanticsV1 {
                 Self::EffectivelyOnceWithDeduplication
             }
             DeliverySemantics::BackendDefined => Self::BackendDefined,
+            DeliverySemantics::NoAutomaticRetry => Self::NoAutomaticRetry,
         }
     }
 
@@ -343,6 +484,7 @@ impl PersistedDeliverySemanticsV1 {
                 DeliverySemantics::EffectivelyOnceWithDeduplication
             }
             Self::BackendDefined => DeliverySemantics::BackendDefined,
+            Self::NoAutomaticRetry => DeliverySemantics::NoAutomaticRetry,
         }
     }
 }
