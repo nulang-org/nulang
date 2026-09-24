@@ -1367,6 +1367,7 @@ impl Runtime {
                             payload: MessagePayload::from_slice(&[]),
                             sender,
                             priority: MessagePriority::System,
+                            ownership_handoff_mask: 0,
                             trace_id: None,
                         },
                         "grain hydration failed (cross-shard)",
@@ -1381,6 +1382,7 @@ impl Runtime {
             payload: MessagePayload::from_vec(payload),
             sender,
             priority: MessagePriority::Normal,
+            ownership_handoff_mask: 0,
             trace_id: trace_id.clone(),
         };
         if let Some(actor) = self.actors.get_mut(&target_id) {
@@ -1391,6 +1393,7 @@ impl Runtime {
                         payload: MessagePayload::from_slice(&[]),
                         sender,
                         priority: MessagePriority::System,
+                        ownership_handoff_mask: 0,
                         trace_id: None,
                     },
                     "mailbox full (cross-shard)",
@@ -1403,6 +1406,7 @@ impl Runtime {
                     payload: MessagePayload::from_slice(&[]),
                     sender,
                     priority: MessagePriority::System,
+                    ownership_handoff_mask: 0,
                     trace_id: None,
                 },
                 "target actor not found (cross-shard)",
@@ -2055,7 +2059,7 @@ impl Runtime {
             let behavior_idx = msg.behavior_id as usize;
 
             // Hold heap pointers from the payload.
-            self.hold_payload_refs(actor_id, &msg.payload);
+            self.hold_payload_refs(actor_id, &msg.payload, msg.ownership_handoff_mask);
 
             if self.has_bytecode_handler(actor_id, behavior_idx) {
                 let prev = self.current_actor;
@@ -2460,6 +2464,51 @@ impl Runtime {
         self.current_actor = prev;
     }
 
+    /// Attempt a compiler-proven consuming send on the shard-local fast path.
+    ///
+    /// Returns the subset of candidate bits whose ownership token was
+    /// actually converted into a receiver hold. Every unsupported topology
+    /// falls back to the conservative send protocol and returns zero.
+    pub fn send_message_by_id_consuming(
+        &mut self,
+        target_id: u64,
+        behavior_id: u16,
+        args: &[Value],
+        candidate_mask: u16,
+    ) -> u16 {
+        if candidate_mask == 0
+            || self.current_actor.is_none()
+            || self.current_actor == Some(target_id)
+            || !self.actors.contains_key(&target_id)
+            || self.migrated_actors.contains_key(&target_id)
+        {
+            self.send_message_by_id(target_id, behavior_id, args);
+            return 0;
+        }
+
+        if self.shard_count > 1 && (target_id % self.shard_count as u64) as u16 != self.shard_idx {
+            self.send_message_by_id(target_id, behavior_id, args);
+            return 0;
+        }
+
+        if self
+            .actors
+            .get(&target_id)
+            .map(|actor| actor.is_hibernated())
+            .unwrap_or(true)
+        {
+            self.send_message_by_id(target_id, behavior_id, args);
+            return 0;
+        }
+
+        let out_trace = self
+            .current_trace
+            .as_ref()
+            .map(|trace| trace.to_traceparent());
+        self.deliver_local_message_inner(target_id, behavior_id, args, out_trace, candidate_mask)
+            .1
+    }
+
     #[tracing::instrument(level = "trace", skip(self, args))]
     pub fn send_message_by_id(&mut self, target_id: u64, behavior_id: u16, args: &[Value]) {
         // Stamp the outgoing message with the current handler's trace span (if
@@ -2569,6 +2618,7 @@ impl Runtime {
                             payload: MessagePayload::from_slice(args),
                             sender: self.current_actor.unwrap_or(0),
                             priority: MessagePriority::System,
+                            ownership_handoff_mask: 0,
                             trace_id: out_trace.clone(),
                         },
                         "grain hydration failed",
@@ -2584,6 +2634,7 @@ impl Runtime {
                             payload: MessagePayload::from_slice(args),
                             sender: self.current_actor.unwrap_or(0),
                             priority: MessagePriority::System,
+                            ownership_handoff_mask: 0,
                             trace_id: out_trace.clone(),
                         },
                         "grain hydration failed",
@@ -2606,11 +2657,72 @@ impl Runtime {
         args: &[Value],
         out_trace: Option<String>,
     ) -> MessageAdmission {
+        self.deliver_local_message_inner(target_id, behavior_id, args, out_trace, 0)
+            .0
+    }
+
+    fn deliver_local_message_inner(
+        &mut self,
+        target_id: u64,
+        behavior_id: u16,
+        args: &[Value],
+        out_trace: Option<String>,
+        candidate_mask: u16,
+    ) -> (MessageAdmission, u16) {
+        let sender_id = self.current_actor.unwrap_or(0);
+        let mut handed_off: Vec<(usize, u64, *mut crate::runtime::heap::OrcaHeader)> = Vec::new();
+
+        if sender_id != 0 && candidate_mask != 0 {
+            for (idx, arg) in args.iter().enumerate() {
+                if idx >= u16::BITS as usize || candidate_mask & (1u16 << idx) == 0 {
+                    continue;
+                }
+                let Some(ptr) = arg.as_ptr() else { continue };
+                if ptr.is_null() {
+                    continue;
+                }
+
+                // IsoArena allocations are activation-scoped and do not carry
+                // ActorHeap/OrcaHeader layout. They require promotion/copy,
+                // never ORCA token transfer.
+                if self
+                    .actors
+                    .get(&sender_id)
+                    .map(|actor| actor.iso_arena.contains(ptr))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+
+                let header = unsafe { crate::runtime::heap::ActorHeap::header_of(ptr) };
+                let owner_id = unsafe { (*header).actor_id };
+                if owner_id != sender_id {
+                    continue;
+                }
+                let Some(owner) = self.actors.get_mut(&owner_id) else {
+                    continue;
+                };
+
+                if unsafe {
+                    owner
+                        .orca_gc
+                        .transfer_local_to_foreign_hold(&owner.heap, ptr)
+                } {
+                    handed_off.push((idx, owner_id, header));
+                }
+            }
+        }
+
+        let handoff_mask = handed_off
+            .iter()
+            .fold(0u16, |mask, (idx, _, _)| mask | (1u16 << idx));
+
         let msg = Message {
             behavior_id,
             payload: MessagePayload::from_slice(args),
             sender: self.current_actor.unwrap_or(0),
             priority: MessagePriority::Normal,
+            ownership_handoff_mask: handoff_mask,
             trace_id: out_trace.clone(),
         };
         let admission = if let Some(actor) = self.actors.get_mut(&target_id) {
@@ -2632,6 +2744,7 @@ impl Runtime {
                         payload: MessagePayload::from_slice(args),
                         sender: self.current_actor.unwrap_or(0),
                         priority: MessagePriority::System,
+                        ownership_handoff_mask: 0,
                         trace_id: out_trace.clone(),
                     },
                     "mailbox full",
@@ -2645,6 +2758,7 @@ impl Runtime {
                     payload: MessagePayload::from_slice(args),
                     sender: self.current_actor.unwrap_or(0),
                     priority: MessagePriority::System,
+                    ownership_handoff_mask: 0,
                     trace_id: out_trace.clone(),
                 },
                 "target actor not found",
@@ -2653,10 +2767,28 @@ impl Runtime {
         };
 
         if admission != MessageAdmission::Accepted {
-            return admission;
+            for (idx, owner_id, _) in &handed_off {
+                let Some(ptr) = args[*idx].as_ptr() else {
+                    continue;
+                };
+                if let Some(owner) = self.actors.get_mut(owner_id) {
+                    unsafe {
+                        owner
+                            .orca_gc
+                            .rollback_local_to_foreign_hold(&owner.heap, ptr);
+                    }
+                }
+            }
+            return (admission, 0);
         }
 
-        for arg in args {
+        if let Some(receiver) = self.actors.get_mut(&target_id) {
+            for (_, owner_id, header) in &handed_off {
+                receiver.orca_gc.record_held_ref(*owner_id, *header);
+            }
+        }
+
+        for (arg_idx, arg) in args.iter().enumerate() {
             if let Some(ptr) = arg.as_ptr() {
                 if ptr.is_null() {
                     continue;
@@ -2674,24 +2806,24 @@ impl Runtime {
                     let source_header = unsafe { crate::runtime::heap::ActorHeap::header_of(ptr) };
                     let owner_id = unsafe { (*source_header).actor_id };
 
-                    if let Some(owner) = self.actors.get_mut(&owner_id) {
-                        let op = unsafe { owner.orca_gc.send_ref_to(&owner.heap, ptr, target_id) };
-                        self.coordinator.submit_op(op);
-                    } else {
-                        // The owner has exited: its heap is retired (kept
-                        // alive by the sender's hold), so the header is
-                        // still valid.  Bump the in-flight count directly
-                        // and queue the decrement op; `process_gc_ops`
-                        // applies it on the retired heap.
-                        // SAFETY: as above; the single scheduler thread is
-                        // the only mutator of any header.
-                        unsafe { (*source_header).foreign_count += 1 };
-                        self.coordinator.submit_op(ForeignRefOp {
-                            target_actor: target_id,
-                            owner_actor: owner_id,
-                            object_header: source_header,
-                            delta: -1,
-                        });
+                    let is_handoff =
+                        arg_idx < u16::BITS as usize && handoff_mask & (1u16 << arg_idx) != 0;
+
+                    if !is_handoff {
+                        if let Some(owner) = self.actors.get_mut(&owner_id) {
+                            let op =
+                                unsafe { owner.orca_gc.send_ref_to(&owner.heap, ptr, target_id) };
+                            self.coordinator.submit_op(op);
+                        } else {
+                            // Conservative forwarding from a retired owner.
+                            unsafe { (*source_header).foreign_count += 1 };
+                            self.coordinator.submit_op(ForeignRefOp {
+                                target_actor: target_id,
+                                owner_actor: owner_id,
+                                object_header: source_header,
+                                delta: -1,
+                            });
+                        }
                     }
                     // Register the cross-actor reference with the cycle detector.
                     // The receiving actor is represented by its pinned sentinel;
@@ -2739,7 +2871,7 @@ impl Runtime {
                 self.resume_suspended_receive_wait(target_id);
             }
         }
-        MessageAdmission::Accepted
+        (MessageAdmission::Accepted, handoff_mask)
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
@@ -2827,6 +2959,8 @@ impl Runtime {
             total.local_refs_dropped += stats.local_refs_dropped;
             total.foreign_refs_sent += stats.foreign_refs_sent;
             total.foreign_refs_received += stats.foreign_refs_received;
+            total.ownership_handoffs += stats.ownership_handoffs;
+            total.refcount_ops_elided += stats.refcount_ops_elided;
             total.cycles_detected += stats.cycles_detected;
             total.bytes_allocated += stats.bytes_allocated;
             total.bytes_freed += stats.bytes_freed;
@@ -2862,6 +2996,7 @@ impl Runtime {
                 payload: MessagePayload::from_slice(&[Value::int(1)]),
                 sender: 0, // DLQ system message has no sender
                 priority: MessagePriority::System,
+                ownership_handoff_mask: 0,
                 trace_id: None,
             });
         }
@@ -3501,8 +3636,8 @@ impl Runtime {
     /// object survives until the receiver exits - even if the sender drops
     /// its local references or exits first.  Holds are recorded on the
     /// receiver's `OrcaGc` and released by [`release_held_foreign_refs`].
-    fn hold_payload_refs(&mut self, receiver_id: u64, payload: &[Value]) {
-        for value in payload {
+    fn hold_payload_refs(&mut self, receiver_id: u64, payload: &[Value], handoff_mask: u16) {
+        for (idx, value) in payload.iter().enumerate() {
             if let Some(id) = value.as_object_id() {
                 // Object-store ref: increment the node-local refcount and
                 // record the hold on the receiving actor.
@@ -3512,6 +3647,13 @@ impl Runtime {
                 }
                 continue;
             }
+
+            if idx < u16::BITS as usize && handoff_mask & (1u16 << idx) != 0 {
+                // Admission already converted the sender's sole local token
+                // into this receiver hold and recorded it on receiver GC.
+                continue;
+            }
+
             let Some(ptr) = value.as_ptr() else { continue };
             if ptr.is_null() {
                 continue;
@@ -3554,7 +3696,21 @@ impl Runtime {
                 Some(actor) => std::mem::take(&mut actor.held_objects),
                 None => std::collections::HashSet::new(),
             };
+        let receiver_sentinel = self
+            .actors
+            .get_mut(&actor_id)
+            .and_then(|actor| actor.cycle_sentinel());
+
         for (owner_id, header) in holds {
+            if let Some(sentinel) = receiver_sentinel {
+                // Conservative sends may already have removed this edge when
+                // their in-flight decrement was processed. Removal is
+                // idempotent; consuming handoffs keep the edge until the
+                // receiver releases its direct hold.
+                self.cycle_detector
+                    .remove_foreign_ref(actor_id, sentinel, owner_id, header);
+            }
+
             if let Some(owner) = self.actors.get_mut(&owner_id) {
                 owner.orca_gc.process_foreign_op(
                     &mut owner.heap,
@@ -3680,7 +3836,7 @@ impl Runtime {
             // ORCA receiver protocol: hold every heap pointer in the
             // received payload so the owning objects (and any retired
             // owner heap) stay alive until this actor exits.
-            self.hold_payload_refs(actor_id, &msg.payload);
+            self.hold_payload_refs(actor_id, &msg.payload, msg.ownership_handoff_mask);
 
             // Establish the W3C trace context for this message: a child of
             // the sender's span when the message carries a traceparent (so
