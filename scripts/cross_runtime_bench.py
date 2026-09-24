@@ -28,6 +28,7 @@ RECORD_RE = re.compile(
     r"\[cross-bench\]\s+runtime=(?P<runtime>[a-z0-9_-]+)\s+"
     r"benchmark=(?P<benchmark>[a-z0-9_-]+)\s+"
     r"messages=(?P<messages>\d+)\s+elapsed_ns=(?P<elapsed_ns>\d+)"
+    r"(?:\s+shards=(?P<shards>\d+))?"
 )
 
 
@@ -80,10 +81,13 @@ def parse_records(output: str, expected_runtime: str) -> dict[str, dict[str, int
         name = match.group("benchmark")
         if name not in BENCHMARKS:
             continue
-        records[name] = {
+        row = {
             "messages": int(match.group("messages")),
             "elapsed_ns": int(match.group("elapsed_ns")),
         }
+        if match.group("shards") is not None:
+            row["shards"] = int(match.group("shards"))
+        records[name] = row
 
     missing = [name for name in BENCHMARKS if name not in records]
     if missing:
@@ -94,7 +98,9 @@ def parse_records(output: str, expected_runtime: str) -> dict[str, dict[str, int
     return records
 
 
-def build_commands(selected: list[str]) -> dict[str, list[str]]:
+def build_commands(
+    selected: list[str], nulang_fork_join_shards: int
+) -> dict[str, list[str]]:
     BUILD.mkdir(parents=True, exist_ok=True)
     commands: dict[str, list[str]] = {}
 
@@ -123,7 +129,13 @@ def build_commands(selected: list[str]) -> dict[str, list[str]]:
         )
         executable = "nulang-savina.exe" if os.name == "nt" else "nulang-savina"
         binary = Path(metadata["target_directory"]) / "savina" / executable
-        commands["nulang"] = [str(binary), "--format", "human"]
+        commands["nulang"] = [
+            str(binary),
+            "--format",
+            "human",
+            "--shards",
+            str(nulang_fork_join_shards),
+        ]
 
     if "rust" in selected:
         rustc = shutil.which("rustc")
@@ -209,7 +221,9 @@ def git_sha() -> str | None:
 
 
 def environment_metadata(
-    cpu_mode: str, cpu_affinity: set[int] | None
+    cpu_mode: str,
+    cpu_affinity: set[int] | None,
+    nulang_fork_join_shards: int,
 ) -> dict[str, object]:
     cpu_model = None
     cpuinfo = Path("/proc/cpuinfo")
@@ -246,7 +260,8 @@ def environment_metadata(
         "measurement_cpu_affinity": (
             sorted(cpu_affinity) if cpu_affinity is not None else None
         ),
-        "nulang_shards": 1,
+        "nulang_non_fork_join_shards": 1,
+        "nulang_fork_join_shards": nulang_fork_join_shards,
         "python": platform.python_version(),
         "rustc": maybe_version(["rustc", "--version"]) if shutil.which("rustc") else None,
         "cargo": maybe_version(["cargo", "--version"]) if shutil.which("cargo") else None,
@@ -309,8 +324,17 @@ def main() -> int:
         default="single",
         help=(
             "single pins every measured runtime process to the same logical CPU "
-            "(default, comparable to Nulang's single-shard harness); host leaves "
-            "the host scheduler unconstrained and is diagnostic only"
+            "(default one-core comparison); host leaves the host scheduler "
+            "unconstrained and can use Nulang's explicit sharded fork_join fixture"
+        ),
+    )
+    parser.add_argument(
+        "--nulang-shards",
+        type=int,
+        default=1,
+        help=(
+            "real Runtime shards used by Nulang fork_join in host mode "
+            "(1..8; other Nulang workloads remain single-shard)"
         ),
     )
     parser.add_argument("--output", type=Path, help="write full JSON report here")
@@ -318,6 +342,13 @@ def main() -> int:
 
     if args.runs < 1 or args.warmup < 0:
         parser.error("--runs must be >= 1 and --warmup must be >= 0")
+    if not 1 <= args.nulang_shards <= 8:
+        parser.error("--nulang-shards must be between 1 and 8")
+    if args.cpu_mode == "single" and args.nulang_shards != 1:
+        parser.error(
+            "--nulang-shards > 1 requires --cpu-mode host; pinning several "
+            "Runtime shards to one logical CPU is not a multicore comparison"
+        )
 
     selected = [item.strip() for item in args.runtimes.split(",") if item.strip()]
     unknown = sorted(set(selected) - {"nulang", "rust", "go", "erlang"})
@@ -328,17 +359,25 @@ def main() -> int:
     if cpu_affinity is not None:
         print(
             f"[topology] cpu_mode=single affinity={sorted(cpu_affinity)} "
-            "nulang_shards=1",
+            "nulang_fork_join_shards=1",
+            flush=True,
+        )
+    elif args.nulang_shards > 1:
+        print(
+            "[topology] cpu_mode=host affinity=unconstrained "
+            f"nulang_fork_join_shards={args.nulang_shards}; "
+            "other Nulang workloads remain single-shard",
             flush=True,
         )
     else:
         print(
-            "[topology] cpu_mode=host affinity=unconstrained nulang_shards=1 "
-            "(diagnostic; fork_join is not a fair multicore comparison)",
+            "[topology] cpu_mode=host affinity=unconstrained "
+            "nulang_fork_join_shards=1 "
+            "(diagnostic; no multicore Nulang fixture selected)",
             flush=True,
         )
 
-    commands = build_commands(selected)
+    commands = build_commands(selected, args.nulang_shards)
     samples: dict[str, dict[str, list[dict[str, int]]]] = {
         runtime: {name: [] for name in BENCHMARKS} for runtime in selected
     }
@@ -357,6 +396,15 @@ def main() -> int:
                 cpu_affinity=cpu_affinity,
             )
             records = parse_records(output, runtime)
+            if runtime == "nulang":
+                for name, row in records.items():
+                    expected_shards = args.nulang_shards if name == "fork_join" else 1
+                    actual_shards = row.get("shards")
+                    if actual_shards != expected_shards:
+                        raise RuntimeError(
+                            f"nulang/{name}: expected shards={expected_shards}, "
+                            f"runner reported {actual_shards}"
+                        )
             if measured:
                 for name, row in records.items():
                     samples[runtime][name].append(row)
@@ -369,7 +417,9 @@ def main() -> int:
         "methodology": "standard-runtime Savina-style messaging baselines",
         "warmup_runs": args.warmup,
         "measured_runs": args.runs,
-        "environment": environment_metadata(args.cpu_mode, cpu_affinity),
+        "environment": environment_metadata(
+            args.cpu_mode, cpu_affinity, args.nulang_shards
+        ),
         "samples": samples,
         "summary": summary,
     }
