@@ -127,6 +127,123 @@ pub enum RuntimePrimitive {
     Time,
 }
 
+/// Source-level provenance for actor-backed surface constructs.
+///
+/// This is diagnostic/lowering provenance, not an execution domain. Virtual
+/// activation is intentionally not represented here because it composes with
+/// every origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ActorSurfaceOrigin {
+    Actor,
+    Agent,
+    Workflow,
+    Organization,
+}
+
+/// Orthogonal semantic dimensions recoverable from legacy actor metadata.
+///
+/// This is an additive migration boundary for RFC 0024 Phase 3. It does not
+/// replace [`ExecutionSemantics`]: actor metadata still cannot faithfully
+/// reconstruct every identity or persistence mode. It only normalizes the
+/// dimensions currently encoded by compatibility booleans without treating
+/// virtual activation as a mutually-exclusive role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ActorSemantics {
+    pub persistence: PersistenceSemantics,
+    pub activation: ActorActivation,
+    pub origin: ActorSurfaceOrigin,
+}
+
+impl ActorSemantics {
+    pub fn from_legacy_flags(
+        persistent: bool,
+        is_workflow: bool,
+        is_agent: bool,
+        is_organization: bool,
+        is_virtual: bool,
+    ) -> Result<Self, ActorOriginConflict> {
+        let origins = [
+            (is_workflow, ActorSurfaceOrigin::Workflow),
+            (is_agent, ActorSurfaceOrigin::Agent),
+            (is_organization, ActorSurfaceOrigin::Organization),
+        ];
+
+        let mut origin = ActorSurfaceOrigin::Actor;
+        let mut count = 0usize;
+        for (enabled, candidate) in origins {
+            if enabled {
+                count += 1;
+                origin = candidate;
+            }
+        }
+
+        if count > 1 {
+            return Err(ActorOriginConflict {
+                is_workflow,
+                is_agent,
+                is_organization,
+            });
+        }
+
+        Ok(Self {
+            persistence: if persistent {
+                PersistenceSemantics::Durable
+            } else {
+                PersistenceSemantics::Ephemeral
+            },
+            activation: if is_virtual {
+                ActorActivation::Virtual
+            } else {
+                ActorActivation::Explicit
+            },
+            origin,
+        })
+    }
+
+    pub const fn is_durable(self) -> bool {
+        matches!(self.persistence, PersistenceSemantics::Durable)
+    }
+
+    pub const fn is_virtual(self) -> bool {
+        matches!(self.activation, ActorActivation::Virtual)
+    }
+
+    pub const fn is_workflow(self) -> bool {
+        matches!(self.origin, ActorSurfaceOrigin::Workflow)
+    }
+
+    pub const fn is_agent(self) -> bool {
+        matches!(self.origin, ActorSurfaceOrigin::Agent)
+    }
+
+    pub const fn is_organization(self) -> bool {
+        matches!(self.origin, ActorSurfaceOrigin::Organization)
+    }
+}
+
+/// Invalid legacy metadata that claims more than one actor surface origin.
+///
+/// Virtual activation is deliberately excluded: a virtual workflow/agent/entity
+/// is semantically valid because activation is an independent axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActorOriginConflict {
+    pub is_workflow: bool,
+    pub is_agent: bool,
+    pub is_organization: bool,
+}
+
+impl std::fmt::Display for ActorOriginConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "actor metadata has conflicting origins (workflow={}, agent={}, organization={})",
+            self.is_workflow, self.is_agent, self.is_organization
+        )
+    }
+}
+
+impl std::error::Error for ActorOriginConflict {}
+
 /// Legacy compatibility classifier carried by actor-backed lowered forms.
 ///
 /// `Agent`, `Workflow`, `Organization`, and `Virtual` describe how older
@@ -215,6 +332,18 @@ impl std::fmt::Display for ActorRoleConflict {
 impl std::error::Error for ActorRoleConflict {}
 
 impl crate::hir::ActorDef {
+    /// Return normalized actor semantics without conflating activation with
+    /// source provenance.
+    pub fn semantics(&self) -> Result<ActorSemantics, ActorOriginConflict> {
+        ActorSemantics::from_legacy_flags(
+            self.persistent,
+            self.is_workflow,
+            self.is_agent,
+            self.is_organization,
+            self.virtual_,
+        )
+    }
+
     /// Return the legacy compatibility role of this lowered actor.
     ///
     /// New HIR consumers should prefer this helper to testing the legacy flags
@@ -231,6 +360,17 @@ impl crate::hir::ActorDef {
 }
 
 impl crate::bytecode::ActorMeta {
+    /// Return orthogonal semantics encoded by compatibility metadata.
+    pub fn semantics(&self) -> Result<ActorSemantics, ActorOriginConflict> {
+        ActorSemantics::from_legacy_flags(
+            self.persistent,
+            self.is_workflow,
+            self.is_agent,
+            self.is_organization,
+            self.is_virtual,
+        )
+    }
+
     /// Return the compatibility role encoded in serialized actor metadata without
     /// changing the bytecode format.
     ///
@@ -248,6 +388,20 @@ impl crate::bytecode::ActorMeta {
 }
 
 impl crate::runtime::Actor {
+    /// Return normalized semantics available on a live actor.
+    ///
+    /// Live actors do not yet retain organization/virtual provenance, so those
+    /// dimensions remain plain/explicit until the versioned metadata migration.
+    pub fn semantics(&self) -> Result<ActorSemantics, ActorOriginConflict> {
+        ActorSemantics::from_legacy_flags(
+            self.persistent,
+            self.is_workflow,
+            self.is_agent,
+            false,
+            false,
+        )
+    }
+
     /// Return the compatibility role of a live runtime actor.
     ///
     /// Runtime actors currently persist only the legacy workflow/agent flags;
@@ -432,5 +586,32 @@ mod tests {
             .time_operation(),
             TimeOperation::ScheduledDelivery
         );
+    }
+}
+
+
+#[cfg(test)]
+mod orthogonal_actor_semantics_tests {
+    use super::*;
+
+    #[test]
+    fn virtual_activation_composes_with_surface_origin() {
+        let semantics =
+            ActorSemantics::from_legacy_flags(true, true, false, false, true).unwrap();
+        assert!(semantics.is_workflow());
+        assert!(semantics.is_virtual());
+        assert!(semantics.is_durable());
+    }
+
+    #[test]
+    fn conflicting_surface_origins_are_rejected() {
+        assert!(
+            ActorSemantics::from_legacy_flags(true, true, true, false, false).is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_actor_role_remains_strict_for_compatibility() {
+        assert!(ActorRole::from_flags(true, false, false, true).is_err());
     }
 }
