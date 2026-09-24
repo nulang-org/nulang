@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Explicit Python owned-value extraction types — 2026-09-24
+- **Python→owned foreign-value marshaling now supplies explicit PyO3 extraction types** (`src/python/marshal.rs`) for Bool/Int/Float/String conversions, restoring Rust/CodeQL builds where closure error inference could not determine the generic `extract` error type.
+
+
 ### Consuming local-send ownership proof — 2026-09-24
 - **MIR now identifies fresh, single-definition heap-owning values whose sole use is a same-node actor send**, establishing a conservative proof surface for a later ORCA ownership handoff.
 - The analysis is intentionally metadata-only in this slice: it changes no bytecode, mailbox representation, reference count, or runtime behavior. Parameters, captures, handler bindings, multi-use values, and remote sends remain ineligible.
