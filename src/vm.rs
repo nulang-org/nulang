@@ -122,6 +122,13 @@ pub enum PerformAsyncResult {
     /// result (interned into the module's constant pool by the VM), `None`
     /// means nil.
     Ready(Option<String>),
+    /// The effect completed with an already-materialized VM value.
+    ///
+    /// This keeps generic asynchronous host effects type-preserving when their
+    /// result is not naturally a string (for example an integer, boolean, or
+    /// opaque foreign-runtime handle). The value is produced on the scheduler
+    /// thread; worker threads must still cross the owned-value boundary first.
+    ReadyValue(Value),
     /// The effect was dispatched to a background worker; the VM suspends the
     /// current behavior and re-executes the `PerformAsync` instruction on resume.
     Pending,
@@ -331,12 +338,11 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// `effect_op` is the fully-qualified effect-and-operation name (e.g.
     /// `"Inference.ask"`). `args` are the staged argument values from
     /// registers r0..rN; `constants` is the performing module's constant
-    /// pool for resolving string-id arguments. Returns `Ready(content)` when
-    /// the effect completed synchronously (the VM interns the content string
-    /// into its module's constant pool), or `Pending` when the call was
-    /// dispatched to a background worker — the VM then suspends the current
-    /// behavior with a `PerformAsync` sentinel and re-executes the
-    /// instruction on resume.
+    /// pool for resolving string-id arguments. Returns `Ready(content)` for
+    /// string/nil results, `ReadyValue(value)` for a scheduler-materialized
+    /// non-string result, or `Pending` when the call was dispatched to a
+    /// background worker — the VM then suspends the current behavior with a
+    /// `PerformAsync` sentinel and re-executes the instruction on resume.
     ///
     /// The default implementation returns `Ready(None)` so the standalone VM
     /// always gets a nil result for any async effect.
@@ -4351,6 +4357,9 @@ impl VM {
                 };
                 self.frames[frame_idx].regs[dst_reg] = value;
             }
+            PerformAsyncResult::ReadyValue(value) => {
+                self.frames[frame_idx].regs[dst_reg] = value;
+            }
             PerformAsyncResult::Pending => {
                 self.frames[frame_idx].pc -= 1;
                 return Err(NuError::Suspended(VmSuspension::PerformAsync));
@@ -6216,6 +6225,60 @@ fn module_with_handler_table(bindings: Vec<crate::bytecode::HandlerBinding>) -> 
 mod vm_tests {
     use super::*;
     use crate::bytecode::{BehaviorTableEntry, HandlerBinding, HandlerTable, Instruction};
+
+    #[derive(Debug)]
+    struct ReadyValueCallbacks {
+        heap: ActorHeap,
+    }
+
+    impl ReadyValueCallbacks {
+        fn new() -> Self {
+            let mut heap = ActorHeap::new(1024 * 1024);
+            heap.set_actor_id(0);
+            Self { heap }
+        }
+    }
+
+    impl ActorVmCallbacks for ReadyValueCallbacks {
+        fn alloc(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
+            self.heap.alloc(size, type_tag)
+        }
+
+        fn perform_async(
+            &mut self,
+            _effect_op: &str,
+            _constants: &[Constant],
+            _args: &[Value],
+        ) -> PerformAsyncResult {
+            PerformAsyncResult::ReadyValue(Value::int(73))
+        }
+    }
+
+    #[test]
+    fn perform_async_ready_value_preserves_non_string_result() {
+        let mut vm = VM::new_without_jit();
+        let mut module = CodeModule::new("perform_async_ready_value");
+        let effect_idx = module.add_string_constant("Test.value");
+        vm.load_module(module);
+        vm.set_actor_callbacks(Box::new(ReadyValueCallbacks::new()));
+
+        let mut frame = Frame::new(None, 0);
+        frame.pc = 1;
+        vm.frames.push(frame);
+        vm.current_frame_idx = Some(0);
+
+        let instr = Instruction::new3(
+            OpCode::PerformAsync,
+            ((effect_idx >> 8) & 0xff) as u8,
+            (effect_idx & 0xff) as u8,
+            7,
+        );
+        vm.step_perform_async(0, 0, instr)
+            .expect("ReadyValue should complete without suspension");
+
+        assert_eq!(vm.frames[0].regs[7].as_int(), Some(73));
+        assert_eq!(vm.frames[0].pc, 1, "ReadyValue must not rewind the PC");
+    }
 
     /// A NULL C string return (nil from cstr_to_value) must pass through
     /// instead of erroring on the missing pointer.

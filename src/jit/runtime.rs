@@ -1736,6 +1736,7 @@ macro_rules! define_aot_perform_async {
                         Value::nil().as_raw()
                     }
                 }
+                Some(crate::vm::PerformAsyncResult::ReadyValue(value)) => value.as_raw(),
                 // Ready(None), unarmed callbacks, or Pending (no native
                 // suspension) all degrade to nil.
                 _ => Value::nil().as_raw(),
