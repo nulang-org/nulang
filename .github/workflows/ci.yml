@@ -365,6 +365,11 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
       - uses: actions/checkout@v7
+        with:
+          # History JSON filenames are the producing main-branch commit SHA.
+          # Full history lets the regression checker order those samples by
+          # Git commit time instead of unreliable filesystem mtimes.
+          fetch-depth: 0
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y python3-dev
