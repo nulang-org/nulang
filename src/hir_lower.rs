@@ -2733,6 +2733,45 @@ mod tests {
     }
 
     #[test]
+    fn compile_time_only_declarations_do_not_cross_hir_boundary() {
+        let span = Span::default();
+        let database = Decl::Database {
+            name: "Db".to_string(),
+            tables: vec![],
+            span,
+        };
+        let signal = Decl::Signal {
+            name: "count".to_string(),
+            ty: Type::int(),
+            init: Expr::Literal(Literal::Int(0), span),
+            span,
+        };
+        let given = Decl::Given {
+            name: "ctx".to_string(),
+            ty: Some(Type::int()),
+            value: Expr::Literal(Literal::Int(1), span),
+            span,
+        };
+        let nested = Decl::Module {
+            name: "Nested".to_string(),
+            exports: vec![],
+            decls: vec![database.clone(), signal.clone(), given.clone()],
+            span,
+        };
+        let ast = ast::AstModule {
+            name: "test".to_string(),
+            decls: vec![database, signal, given, nested],
+        };
+
+        let hir = lower_module(&ast, &FxHashMap::default());
+        assert_eq!(hir.decls.len(), 1);
+        match &hir.decls[0] {
+            hir::Decl::Module { decls, .. } => assert!(decls.is_empty()),
+            other => panic!("expected normalized module, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_lower_if_is_expression_positioned() {
         // `let x = if c then 1 else 2 in x` must keep the if as an RValue so
         // statements after it stay in evaluation order.
