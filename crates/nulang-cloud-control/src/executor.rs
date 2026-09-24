@@ -71,15 +71,47 @@ pub struct DispatchReport {
 /// way.
 ///
 /// This function is safe to retry after crashes when the sink obeys the
-/// idempotency contract. Until durable command claiming is added, deployments
-/// should run one logical dispatcher per control-store scope; multiple
-/// concurrent dispatchers remain functionally idempotent but do not provide a
-/// global Stop-before-Start ordering guarantee.
+/// idempotency contract. It is retained for single-dispatcher deployments.
+/// Active-active controllers should use dispatch_claimed_pending.
 pub fn dispatch_pending(
     store: &dyn ControlStore,
     sink: &dyn AllocationCommandSink,
 ) -> Result<DispatchReport, StoreError> {
-    let mut commands = store.pending_commands()?;
+    let commands = store.pending_commands()?;
+    dispatch_commands(store, sink, commands, |command_id| {
+        store.acknowledge_command(command_id)
+    })
+}
+
+/// Active-active dispatcher entry point.
+///
+/// Claims are durable and grouped by logical deployment replica, so a Stop and
+/// successor Start cannot be split between dispatchers. The caller supplies
+/// wall-clock input explicitly to keep the control-plane core deterministic.
+pub fn dispatch_claimed_pending(
+    store: &dyn ControlStore,
+    sink: &dyn AllocationCommandSink,
+    claimant: &str,
+    now_unix_ms: u64,
+    lease_ms: u64,
+    max_commands: usize,
+) -> Result<DispatchReport, StoreError> {
+    let commands =
+        store.claim_pending_commands(claimant, now_unix_ms, lease_ms, max_commands)?;
+    dispatch_commands(store, sink, commands, |command_id| {
+        store.acknowledge_claimed_command(command_id, claimant)
+    })
+}
+
+fn dispatch_commands<F>(
+    store: &dyn ControlStore,
+    sink: &dyn AllocationCommandSink,
+    mut commands: Vec<AllocationCommand>,
+    mut acknowledge: F,
+) -> Result<DispatchReport, StoreError>
+where
+    F: FnMut(&str) -> Result<(), StoreError>,
+{
     commands.sort_by(|left, right| {
         command_priority(left.kind)
             .cmp(&command_priority(right.kind))
@@ -106,7 +138,7 @@ pub fn dispatch_pending(
         match command.kind {
             AllocationCommandKind::Stop => match sink.apply(&command) {
                 Ok(()) => {
-                    store.acknowledge_command(&command.command_id)?;
+                    acknowledge(&command.command_id)?;
                     confirmed_stops.insert(allocation_key);
                     report.records.push(DispatchRecord {
                         command_id: command.command_id,
@@ -135,7 +167,7 @@ pub fn dispatch_pending(
 
                 if !store.start_command_is_authoritative(&command)? {
                     if confirmed_stops.contains(&allocation_key) {
-                        store.acknowledge_command(&command.command_id)?;
+                        acknowledge(&command.command_id)?;
                         report.records.push(DispatchRecord {
                             command_id: command.command_id,
                             outcome: DispatchOutcome::StaleStartFenced,
@@ -146,7 +178,7 @@ pub fn dispatch_pending(
                     let fence = compensating_stop(&command);
                     match sink.apply(&fence) {
                         Ok(()) => {
-                            store.acknowledge_command(&command.command_id)?;
+                            acknowledge(&command.command_id)?;
                             confirmed_stops.insert(allocation_key);
                             report.records.push(DispatchRecord {
                                 command_id: command.command_id,
@@ -169,7 +201,7 @@ pub fn dispatch_pending(
                 match sink.apply(&command) {
                     Ok(()) => {
                         if store.start_command_is_authoritative(&command)? {
-                            store.acknowledge_command(&command.command_id)?;
+                            acknowledge(&command.command_id)?;
                             report.records.push(DispatchRecord {
                                 command_id: command.command_id,
                                 outcome: DispatchOutcome::Applied,
@@ -178,7 +210,7 @@ pub fn dispatch_pending(
                             let fence = compensating_stop(&command);
                             match sink.apply(&fence) {
                                 Ok(()) => {
-                                    store.acknowledge_command(&command.command_id)?;
+                                    acknowledge(&command.command_id)?;
                                     confirmed_stops.insert(allocation_key);
                                     report.records.push(DispatchRecord {
                                         command_id: command.command_id,
@@ -356,6 +388,43 @@ mod tests {
             ]
         );
         assert!(store.pending_commands().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_claimed_dispatch_preserves_stop_before_start_and_acks_owner() {
+        let store = MemoryControlStore::default();
+        reconcile_once(
+            &store,
+            &evaluation("eval-1", 1),
+            &deployment(1),
+            &[node()],
+        )
+        .unwrap();
+        reconcile_once(
+            &store,
+            &evaluation("eval-2", 2),
+            &deployment(2),
+            &[node()],
+        )
+        .unwrap();
+
+        let sink = RecordingSink::default();
+        let report =
+            dispatch_claimed_pending(&store, &sink, "worker-a", 1_000, 10_000, 1).unwrap();
+
+        assert_eq!(report.records.len(), 3);
+        assert_eq!(
+            sink.applied.lock().unwrap().as_slice(),
+            &[
+                (AllocationCommandKind::Stop, 1),
+                (AllocationCommandKind::Start, 2),
+            ]
+        );
+        assert!(store.pending_commands().unwrap().is_empty());
+        assert!(store
+            .claim_pending_commands("worker-b", 1_001, 10_000, 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
