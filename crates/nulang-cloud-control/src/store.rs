@@ -60,6 +60,7 @@ pub enum CommitOutcome {
 pub enum StoreError {
     Io(String),
     Serialization(String),
+    Backend(String),
     UnknownEvaluation(String),
     EvaluationConflict(String),
     InvalidPlan(String),
@@ -79,6 +80,7 @@ impl fmt::Display for StoreError {
             Self::Serialization(message) => {
                 write!(f, "control-store serialization error: {message}")
             }
+            Self::Backend(message) => write!(f, "control-store backend error: {message}"),
             Self::UnknownEvaluation(id) => write!(f, "unknown evaluation {id}"),
             Self::EvaluationConflict(id) => {
                 write!(f, "evaluation {id} was reused with different content")
@@ -556,6 +558,195 @@ impl ControlStore for JsonFileControlStore {
     }
 }
 
+#[cfg(feature = "postgres")]
+pub struct PostgresControlStore {
+    conn: Mutex<postgres::Client>,
+    scope: String,
+}
+
+#[cfg(feature = "postgres")]
+impl PostgresControlStore {
+    /// Connect without TLS. This is intended for local development or a
+    /// network path whose encryption is provided externally. Production code
+    /// that requires PostgreSQL TLS should construct a connected
+    /// postgres::Client with the desired TLS connector and call from_client.
+    pub fn connect_no_tls(config: &str, scope: impl Into<String>) -> Result<Self, StoreError> {
+        let client = postgres::Client::connect(config, postgres::NoTls)
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        Self::from_client(client, scope)
+    }
+
+    /// Build a store from an already-connected PostgreSQL client.
+    ///
+    /// Scope is the serialization boundary for control-plane state. A region
+    /// or scheduling cell should normally use its own scope so independent
+    /// cells do not contend on one row.
+    pub fn from_client(
+        client: postgres::Client,
+        scope: impl Into<String>,
+    ) -> Result<Self, StoreError> {
+        let scope = scope.into();
+        if scope.trim().is_empty() {
+            return Err(StoreError::Backend(
+                "PostgreSQL control-store scope must not be empty".into(),
+            ));
+        }
+
+        let store = Self {
+            conn: Mutex::new(client),
+            scope,
+        };
+        store.ensure_schema()?;
+        Ok(store)
+    }
+
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    /// Monotonic state-row version, useful for controller diagnostics.
+    pub fn version(&self) -> Result<i64, StoreError> {
+        let mut conn = self.conn.lock().expect("control-store mutex poisoned");
+        let row = conn
+            .query_one(
+                "SELECT version FROM nulang_cloud_control_state WHERE scope = $1",
+                &[&self.scope],
+            )
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        Ok(row.get(0))
+    }
+
+    fn ensure_schema(&self) -> Result<(), StoreError> {
+        let default_json = serde_json::to_string(&PersistedState::default())
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        let mut conn = self.conn.lock().expect("control-store mutex poisoned");
+
+        conn.batch_execute(
+            "CREATE TABLE IF NOT EXISTS nulang_cloud_control_state (
+                scope TEXT PRIMARY KEY,
+                version BIGINT NOT NULL,
+                state_json TEXT NOT NULL
+            )",
+        )
+        .map_err(|error| StoreError::Backend(error.to_string()))?;
+
+        conn.execute(
+            "INSERT INTO nulang_cloud_control_state (scope, version, state_json)
+             VALUES ($1, 0, $2)
+             ON CONFLICT (scope) DO NOTHING",
+            &[&self.scope, &default_json],
+        )
+        .map_err(|error| StoreError::Backend(error.to_string()))?;
+
+        Ok(())
+    }
+
+    fn load_state(&self) -> Result<PersistedState, StoreError> {
+        let mut conn = self.conn.lock().expect("control-store mutex poisoned");
+        let row = conn
+            .query_one(
+                "SELECT state_json FROM nulang_cloud_control_state WHERE scope = $1",
+                &[&self.scope],
+            )
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        let encoded: String = row.get(0);
+        serde_json::from_str(&encoded)
+            .map_err(|error| StoreError::Serialization(error.to_string()))
+    }
+
+    fn mutate<T>(
+        &self,
+        mutate: impl FnOnce(&mut PersistedState) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let mut conn = self.conn.lock().expect("control-store mutex poisoned");
+        let mut transaction = conn
+            .transaction()
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+
+        // The row lock is the compare-and-set serialization point across
+        // controller processes. Validation and the resulting state write occur
+        // in this same database transaction.
+        let row = transaction
+            .query_one(
+                "SELECT state_json FROM nulang_cloud_control_state
+                 WHERE scope = $1
+                 FOR UPDATE",
+                &[&self.scope],
+            )
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        let encoded: String = row.get(0);
+        let mut state: PersistedState = serde_json::from_str(&encoded)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+
+        let output = mutate(&mut state)?;
+        let next_json = serde_json::to_string(&state)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+
+        let updated = transaction
+            .execute(
+                "UPDATE nulang_cloud_control_state
+                 SET version = version + 1, state_json = $2
+                 WHERE scope = $1",
+                &[&self.scope, &next_json],
+            )
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        if updated != 1 {
+            return Err(StoreError::Backend(format!(
+                "expected to update one control-state row for scope {}, updated {updated}",
+                self.scope
+            )));
+        }
+
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        Ok(output)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl ControlStore for PostgresControlStore {
+    fn record_evaluation(&self, evaluation: &Evaluation) -> Result<(), StoreError> {
+        self.mutate(|state| state.record_evaluation(evaluation))
+    }
+
+    fn evaluation(&self, evaluation_id: &str) -> Result<Option<EvaluationRecord>, StoreError> {
+        Ok(self.load_state()?.evaluations.get(evaluation_id).cloned())
+    }
+
+    fn committed_plan(&self, evaluation_id: &str) -> Result<Option<PlacementPlan>, StoreError> {
+        Ok(self.load_state()?.plans.get(evaluation_id).cloned())
+    }
+
+    fn allocations_for(
+        &self,
+        deployment_id: &str,
+    ) -> Result<Vec<ObservedAllocation>, StoreError> {
+        Ok(self
+            .load_state()?
+            .allocations
+            .into_iter()
+            .filter(|allocation| allocation.deployment_id == deployment_id)
+            .collect())
+    }
+
+    fn commit_plan(
+        &self,
+        evaluation: &Evaluation,
+        plan: &PlacementPlan,
+    ) -> Result<CommitOutcome, StoreError> {
+        self.mutate(|state| state.commit_plan(evaluation, plan))
+    }
+
+    fn pending_commands(&self) -> Result<Vec<AllocationCommand>, StoreError> {
+        Ok(self.load_state()?.pending_commands())
+    }
+
+    fn acknowledge_command(&self, command_id: &str) -> Result<(), StoreError> {
+        self.mutate(|state| state.acknowledge_command(command_id))
+    }
+}
+
 fn persist_state(path: &Path, state: &PersistedState) -> Result<(), StoreError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -776,6 +967,42 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn test_postgres_store_round_trip_when_configured() {
+        let Ok(url) = std::env::var("NULANG_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let scope = format!("cloud-control-test-{}-{unique}", std::process::id());
+        let store = PostgresControlStore::connect_no_tls(&url, scope.clone()).unwrap();
+
+        let eval = evaluation("eval-postgres");
+        let plan = plan_evaluation(&eval, &deployment(), &[node(7)], &[]).unwrap();
+        store.record_evaluation(&eval).unwrap();
+        assert_eq!(
+            store.commit_plan(&eval, &plan).unwrap(),
+            CommitOutcome::Applied
+        );
+        assert_eq!(store.committed_plan("eval-postgres").unwrap(), Some(plan));
+        assert_eq!(store.allocations_for("api").unwrap().len(), 1);
+        assert_eq!(store.pending_commands().unwrap().len(), 1);
+        assert!(store.version().unwrap() >= 2);
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM nulang_cloud_control_state WHERE scope = $1",
+                &[&scope],
+            )
+            .unwrap();
     }
 
     #[test]
