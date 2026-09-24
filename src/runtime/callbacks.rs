@@ -700,6 +700,24 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         }
     }
 
+    fn send_message_consuming(
+        &mut self,
+        target: crate::vm::Value,
+        behavior_id: u16,
+        args: &[crate::vm::Value],
+        candidate_mask: u16,
+    ) -> u16 {
+        let Some(actor_id) = target.as_actor_id() else {
+            return 0;
+        };
+        self.runtime.borrow_mut().send_message_by_id_consuming(
+            actor_id,
+            behavior_id,
+            args,
+            candidate_mask,
+        )
+    }
+
     fn ask_actor(
         &mut self,
         target: crate::vm::Value,
@@ -1250,7 +1268,7 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         let actor_id = rt.current_actor?;
         let msg = rt.actors.get_mut(&actor_id)?.mailbox.pop()?;
         // ORCA receiver protocol: hold heap pointers carried by the message.
-        rt.hold_payload_refs(actor_id, &*msg.payload);
+        rt.hold_payload_refs(actor_id, &*msg.payload, msg.ownership_handoff_mask);
         let val = msg
             .payload
             .first()
@@ -1285,9 +1303,9 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             let payload = rt
                 .actors
                 .get_mut(&actor_id)
-                .and_then(|actor| actor.mailbox.commit_receive_match());
-            if let Some(payload) = payload {
-                rt.hold_payload_refs(actor_id, &payload);
+                .and_then(|actor| actor.mailbox.commit_receive_match_with_handoff());
+            if let Some((payload, handoff_mask)) = payload {
+                rt.hold_payload_refs(actor_id, &payload, handoff_mask);
             }
         }
     }
@@ -1512,6 +1530,26 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             // target; the receive-wait wake is deferred while the shared
             // VM is executing (see `Runtime::pending_receive_wakes`).
             unsafe { (*self.runtime).send_message_by_id(target_id, behavior_id, args) }
+        }
+    }
+
+    fn send_message_consuming(
+        &mut self,
+        target: crate::vm::Value,
+        behavior_id: u16,
+        args: &[crate::vm::Value],
+        candidate_mask: u16,
+    ) -> u16 {
+        let Some(target_id) = target.as_actor_id() else {
+            return 0;
+        };
+        unsafe {
+            (*self.runtime).send_message_by_id_consuming(
+                target_id,
+                behavior_id,
+                args,
+                candidate_mask,
+            )
         }
     }
 
@@ -2163,7 +2201,11 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                 actor.mailbox.pop()?
             };
             // ORCA receiver protocol: hold heap pointers carried by the message.
-            (*self.runtime).hold_payload_refs(self.actor_id, &*msg.payload);
+            (*self.runtime).hold_payload_refs(
+                self.actor_id,
+                &*msg.payload,
+                msg.ownership_handoff_mask,
+            );
             let val = msg
                 .payload
                 .first()
@@ -2235,9 +2277,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             let payload = (*self.runtime)
                 .actors
                 .get_mut(&self.actor_id)
-                .and_then(|actor| actor.mailbox.commit_receive_match());
-            if let Some(payload) = payload {
-                (*self.runtime).hold_payload_refs(self.actor_id, &payload);
+                .and_then(|actor| actor.mailbox.commit_receive_match_with_handoff());
+            if let Some((payload, handoff_mask)) = payload {
+                (*self.runtime).hold_payload_refs(self.actor_id, &payload, handoff_mask);
             }
         }
     }

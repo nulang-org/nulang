@@ -134,6 +134,10 @@ pub struct Message {
     pub payload: MessagePayload,
     pub sender: u64,
     pub priority: MessagePriority,
+    /// Compiler-proven ownership tokens already converted into receiver holds.
+    /// Bit i corresponds to payload value i. Zero means the conservative ORCA
+    /// send/receive protocol applies to every payload value.
+    pub ownership_handoff_mask: u16,
     /// W3C traceparent for distributed tracing.
     pub trace_id: Option<String>,
 }
@@ -567,9 +571,9 @@ impl Mailbox {
     /// Commit exactly the most recently returned candidate and return its
     /// payload so the runtime can establish receiver-side ORCA ownership only
     /// after the pattern+guard succeeds.
-    pub fn commit_receive_match(&mut self) -> Option<Arc<Vec<Value>>> {
+    pub(crate) fn commit_receive_match_with_handoff(&mut self) -> Option<(Arc<Vec<Value>>, u16)> {
         let (lane, idx, payload) = self.active_match.take()?;
-        let _removed = match lane {
+        let removed = match lane {
             MatchLane::System => self.system_skip_buffer.remove(idx),
             MatchLane::Local => self.local_skip_buffer.remove(idx),
             MatchLane::Normal => self.skip_buffer.remove(idx),
@@ -577,7 +581,12 @@ impl Mailbox {
         self.release_slot();
         self.invalidate_receive_indexes();
         self.clear_tried_flags();
-        Some(payload)
+        Some((payload, removed.0.ownership_handoff_mask))
+    }
+
+    pub fn commit_receive_match(&mut self) -> Option<Arc<Vec<Value>>> {
+        self.commit_receive_match_with_handoff()
+            .map(|(payload, _)| payload)
     }
 
     /// Abort a selective-receive scan. No message is consumed and ownership
@@ -599,6 +608,7 @@ mod tests {
             payload: MessagePayload::from_slice(&[Value::int(42)]),
             sender,
             priority: MessagePriority::Normal,
+            ownership_handoff_mask: 0,
             trace_id: None,
         }
     }
@@ -685,6 +695,7 @@ mod tests {
                 payload: MessagePayload::from_slice(&[Value::int(i)]),
                 sender: i as u64,
                 priority: MessagePriority::System,
+                ownership_handoff_mask: 0,
                 trace_id: None,
             })
             .unwrap();
@@ -783,6 +794,7 @@ mod transactional_receive_tests {
             payload: MessagePayload::from_slice(&[Value::int(sender as i64)]),
             sender,
             priority,
+            ownership_handoff_mask: 0,
             trace_id: None,
         }
     }
