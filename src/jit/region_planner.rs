@@ -521,3 +521,47 @@ pub(crate) fn find_compilable_region_with_calls(
         (len, native_calls)
     }
 }
+
+#[cfg(test)]
+mod planner_tests {
+    use super::*;
+    use crate::bytecode::{Instruction, OpCode};
+
+    #[test]
+    fn test_region_planner_produces_typed_plan_for_hot_arithmetic_region() {
+        let mut module = CodeModule::new("planner_typed");
+        module.emit(Instruction::new1(OpCode::Const0, 0));
+        module.emit(Instruction::new1(OpCode::Const1, 1));
+        for _ in 0..8 {
+            module.emit(Instruction::new3(OpCode::IAdd, 0, 1, 0));
+        }
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+
+        let mut planner = RegionPlanner::default();
+        let plan = planner.plan(0, 2, &module);
+
+        assert_eq!(plan.len, 8);
+        assert!(plan.native_calls.is_empty());
+        assert!(
+            plan.type_metadata().is_some(),
+            "planner should preserve type facts for the backend"
+        );
+    }
+
+    #[test]
+    fn test_region_planner_rejects_short_straight_line_region() {
+        let mut module = CodeModule::new("planner_short");
+        module.emit(Instruction::new1(OpCode::Const0, 0));
+        module.emit(Instruction::new3(OpCode::IAdd, 0, 0, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+
+        let mut planner = RegionPlanner::default();
+        let plan = planner.plan(0, 0, &module);
+
+        assert_eq!(plan.len, 0);
+        assert!(plan.native_calls.is_empty());
+    }
+}
+
