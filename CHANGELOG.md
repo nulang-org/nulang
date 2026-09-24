@@ -99,8 +99,9 @@ version + migration.*
 - This changes no source syntax or bytecode format. Preserving the site ID through backend artifacts is the next integration step before receipt-backing `Provider.ask` / `Inference.ask`.
 
 ### Indexed selective receive — 2026-09-23
-- **Selective receive now lazily indexes staged mailbox lanes by behavior id**, avoiding repeated O(mailbox depth × arm count) scans while preserving system → local → normal precedence, FIFO candidate choice, first-arm semantics, and transactional guard retry/reset behavior.
-- Criterion coverage now measures mailbox depth, arm count, and repeated guard rejection; focused regressions pin index rebuilds after commit, new arrivals, duplicate arms, and cursor rewind on receive reset.
+- **Selective receive uses a hybrid lookup path**: clauses with fewer than 8 behavior arms scan each staged lane once across guard retries using three transaction-local cursors, while 8+ arm clauses retain lazy per-behavior indexes to avoid O(mailbox depth × arm count) matching.
+- The hybrid keeps system → local → normal precedence, FIFO candidate choice, first-arm semantics, and transactional guard retry/reset behavior. Linear-mode arrivals invalidate any older positional index so a later indexed receive rebuilds from authoritative staged buffers.
+- Criterion coverage measures mailbox depth, arm count, and repeated guard rejection; focused regressions pin index rebuilds after commit and mode switching, new arrivals, duplicate arms, and cursor rewind on receive reset.
 
 ### Bounded blocking host executor — 2026-09-23
 - **The actor runtime now exposes a fixed-size bounded executor for host work that must not run on cooperative scheduler threads** (`src/runtime/blocking_executor.rs`), with non-blocking admission, explicit queue-full/closed results, stable job ids, and bounded completion delivery.
