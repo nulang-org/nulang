@@ -522,6 +522,10 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         // wakes of other actors are not lost when THIS one suspends.
         (*self_ptr).vm_exec_end();
     }
+    if rt.workflow_commit_failures.contains(&actor_id) {
+        rt.discard_and_recover_failed_workflow(actor_id);
+        return;
+    }
     // The suspension resolved (completed or failed): if messages queued
     // up while the behavior was suspended, schedule the actor to drain
     // them — step_actor leaves mail untouched while a suspension is live.
