@@ -81,22 +81,50 @@ impl JsonReport {
 pub struct JsonDiagnostic {
     /// Stable error code (`E0101`-style), or null when the error has none.
     pub code: Option<String>,
+    /// Stable machine-oriented category such as `unbound_variable`.
+    pub kind: String,
     /// "error" | "warning" | "note"
     pub severity: String,
     pub message: String,
     pub span: Option<JsonSpan>,
+    /// Structured diagnostic payload. Consumers should prefer this over parsing
+    /// `message` or `notes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
     pub notes: Vec<String>,
+    /// Legacy human-oriented suggestion. Kept for compatibility.
     pub suggestion: Option<JsonSuggestion>,
+    /// Zero or more edits that tooling may offer or apply.
+    pub fixes: Vec<JsonFix>,
 }
 
-/// 1-indexed source span.
+/// 1-indexed source span plus exact UTF-8 byte offsets for edits.
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonSpan {
     pub file: String,
+    pub start_byte: u32,
+    pub end_byte: u32,
     pub line: usize,
     pub col: usize,
     pub end_line: usize,
     pub end_col: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonFix {
+    pub message: String,
+    /// `machine_applicable` means the edit is unambiguous and can be applied
+    /// without interpreting diagnostic prose.
+    pub applicability: String,
+    pub edits: Vec<JsonEdit>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonEdit {
+    pub file: String,
+    pub start_byte: u32,
+    pub end_byte: u32,
+    pub replacement: String,
 }
 
 /// A suggested fix. `message` mirrors the existing human-facing help text;
@@ -133,17 +161,133 @@ pub fn diagnostics_from_error(err: &NuError) -> Vec<JsonDiagnostic> {
 }
 
 fn diagnostic_from_single(err: &NuError) -> JsonDiagnostic {
+    let primary_span = err.primary_span();
     JsonDiagnostic {
         code: err.stable_code().map(|s| s.to_string()),
+        kind: diagnostic_kind(err).to_string(),
         severity: "error".to_string(),
         message: json_message(err),
-        span: err.primary_span().and_then(json_span),
+        span: primary_span.and_then(json_span),
+        data: diagnostic_data(err),
         notes: crate::diagnostic::diagnostic_notes(err),
         suggestion: err.suggestion().map(|msg| JsonSuggestion {
             message: msg.to_string(),
             replacement: None,
         }),
+        fixes: diagnostic_fixes(err, primary_span),
     }
+}
+
+fn diagnostic_kind(err: &NuError) -> &'static str {
+    match err.stable_code() {
+        Some("E0101") => "lex_error",
+        Some("E0102") => "parse_error",
+        Some("E0103") => "unclosed_delimiter",
+        Some("E0201") => "type_mismatch",
+        Some("E0202") => "unbound_variable",
+        Some("E0203") => "infinite_type",
+        Some("E0204") => "field_not_found",
+        Some("E0205") => "wrong_arity",
+        Some("E0206") => "empty_match",
+        Some("E0208") => "ffi_boundary_violation",
+        Some("E0301") => "missing_effect",
+        Some("E0302") => "unhandled_effect",
+        Some("E0401") => "sendability_violation",
+        Some("E0402") => "linear_use_after_consume",
+        Some("E0503") => "step_limit_exceeded",
+        Some("E0601") => "ffi_error",
+        Some("E0602") => "python_error",
+        Some("E0901") => "not_yet_implemented",
+        Some("E0902") => "package_error",
+        Some("E0200") => "type_error",
+        Some("E0300") => "effect_error",
+        Some("E0400") => "capability_error",
+        Some("E0501") => "runtime_error",
+        Some("E0502") => "vm_error",
+        _ => "unknown_error",
+    }
+}
+
+fn diagnostic_data(err: &NuError) -> Option<serde_json::Value> {
+    match err {
+        NuError::ParseError {
+            expected, found, ..
+        } if expected.is_some() || found.is_some() => Some(serde_json::json!({
+            "expected": expected,
+            "found": found,
+        })),
+        NuError::TypeError {
+            msg,
+            expected_type,
+            found_type,
+            similar_names,
+            ..
+        } => {
+            let mut data = serde_json::Map::new();
+            if let Some(name) = unbound_name(msg) {
+                data.insert("name".to_string(), serde_json::json!(name));
+            }
+            if let Some(expected) = expected_type {
+                data.insert("expected_type".to_string(), serde_json::json!(expected));
+            }
+            if let Some(found) = found_type {
+                data.insert("found_type".to_string(), serde_json::json!(found));
+            }
+            if let Some(names) = similar_names {
+                data.insert("candidates".to_string(), serde_json::json!(names));
+            }
+            if data.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Object(data))
+            }
+        }
+        NuError::EffectError {
+            missing_effects,
+            allowed_effects,
+            ..
+        } if missing_effects.is_some() || allowed_effects.is_some() => Some(serde_json::json!({
+            "missing_effects": missing_effects,
+            "allowed_effects": allowed_effects,
+        })),
+        NuError::CapError {
+            explanation: Some(explanation),
+            ..
+        } => Some(serde_json::json!({ "explanation": explanation })),
+        _ => None,
+    }
+}
+
+fn diagnostic_fixes(err: &NuError, primary_span: Option<Span>) -> Vec<JsonFix> {
+    let Some(span) = primary_span else {
+        return Vec::new();
+    };
+
+    match err {
+        NuError::TypeError {
+            msg,
+            similar_names: Some(names),
+            ..
+        } if unbound_name(msg).is_some() && names.len() == 1 => {
+            let replacement = names[0].clone();
+            let file = source_map_file().unwrap_or_else(|| "<input>".to_string());
+            vec![JsonFix {
+                message: format!("replace with `{replacement}`"),
+                applicability: "machine_applicable".to_string(),
+                edits: vec![JsonEdit {
+                    file,
+                    start_byte: span.start,
+                    end_byte: span.end,
+                    replacement,
+                }],
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn unbound_name(msg: &str) -> Option<&str> {
+    msg.strip_prefix("Unbound variable: '")?.strip_suffix(''')
 }
 
 /// The core message without position prefixes or structured-field suffixes.
@@ -178,6 +322,8 @@ fn json_span(span: Span) -> Option<JsonSpan> {
     let (end_line, end_col) = offset_line_col(&source, end);
     Some(JsonSpan {
         file,
+        start_byte: start,
+        end_byte: end,
         line,
         col,
         end_line,
@@ -209,11 +355,14 @@ fn offset_line_col(source: &str, offset: u32) -> (usize, usize) {
 pub fn diagnostic_from_message(message: String) -> JsonDiagnostic {
     JsonDiagnostic {
         code: None,
+        kind: "test_failure".to_string(),
         severity: "error".to_string(),
         message,
         span: None,
+        data: None,
         notes: Vec::new(),
         suggestion: None,
+        fixes: Vec::new(),
     }
 }
 
