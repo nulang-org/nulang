@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Native JIT codegen backend boundary — 2026-09-24
+- **`JitSession` no longer owns Cranelift modules or reusable Cranelift contexts.** `src/jit/native_codegen.rs` introduces `NativeCodegenBackend`, `NativeCompileRequest`, and specialization requests for scalar, typed, and SIMD lowering.
+- **`CraneliftCodegen` now exclusively owns both compiler tiers.** Fast code still uses `opt_level=none` + single-pass register allocation, optimized code still uses `opt_level=speed` + backtracking, but tier/cache orchestration only sees native entry pointers and compile success/failure.
+- **Existing typed/SIMD white-box compiler tests now reach Cranelift state through the codegen component.** A backend-boundary regression compiles equivalent scalar requests through both fast and optimized policies.
+
+
 
 > This changelog is organized by **stability tier** (see `GOVERNANCE.md` §2),
 > not by release. The tier determines what may change and how. The crate
