@@ -1527,12 +1527,15 @@ fn test_compute_recursive_classifies_cycles() {
 #[test]
 fn test_tier2_counter_increments() {
     let mut jit = make_jit();
+    let module = CodeModule::new("tier2_counter");
     let dummy_ptr: *const u8 = std::ptr::null();
-    jit.store_compiled(0, 100, dummy_ptr, 5);
+    // Use a terminal tier so the counter test does not attempt compilation
+    // against the intentionally empty module.
+    jit.store_compiled_with_metadata(0, 100, dummy_ptr, 5, CompilationTier::Simd, 0);
 
     // Counter starts at 0 (not yet in map), increments each call.
     for i in 0..TIER2_THRESHOLD - 1 {
-        jit.record_tier2_and_maybe_promote(0, 100, &[]);
+        jit.record_tier2_and_maybe_promote(0, 100, &module);
         assert_eq!(
             jit.tier2_counters.get(&(0, 100)).copied(),
             Some(i + 1),
@@ -1542,7 +1545,7 @@ fn test_tier2_counter_increments() {
         );
     }
     // Crossing threshold resets counter to 0.
-    jit.record_tier2_and_maybe_promote(0, 100, &[]);
+    jit.record_tier2_and_maybe_promote(0, 100, &module);
     assert_eq!(jit.tier2_counters.get(&(0, 100)).copied(), Some(0));
 
     // Reset clears all.
@@ -1554,19 +1557,77 @@ fn test_tier2_counter_increments() {
 fn test_tier2_counters_are_per_session() {
     let mut jit_a = make_jit();
     let mut jit_b = make_jit();
+    let module = CodeModule::new("tier2_session");
     let dummy_ptr: *const u8 = std::ptr::null();
-    jit_a.store_compiled(0, 200, dummy_ptr, 3);
-    jit_b.store_compiled(0, 200, dummy_ptr, 3);
+    jit_a.store_compiled_with_metadata(0, 200, dummy_ptr, 3, CompilationTier::Simd, 0);
+    jit_b.store_compiled_with_metadata(0, 200, dummy_ptr, 3, CompilationTier::Simd, 0);
 
     // Heat session A to threshold.
     for _ in 0..TIER2_THRESHOLD {
-        jit_a.record_tier2_and_maybe_promote(0, 200, &[]);
+        jit_a.record_tier2_and_maybe_promote(0, 200, &module);
     }
     assert_eq!(jit_a.tier2_counters.get(&(0, 200)).copied(), Some(0));
     // Session B is untouched — no counter entry.
     assert!(
         jit_b.tier2_counters.get(&(0, 200)).is_none(),
         "session B should have no counter since we never called record_tier2 on it"
+    );
+}
+
+#[test]
+fn test_tier2_replaces_baseline_with_typed_code() {
+    let mut module = CodeModule::new("tier2_replace");
+    module.emit(Instruction::new1(OpCode::Const0, 0));
+    module.emit(Instruction::new1(OpCode::Const1, 1));
+    for _ in 0..8 {
+        module.emit(Instruction::new3(OpCode::IAdd, 0, 1, 0));
+    }
+    module.emit(Instruction::new0(OpCode::Halt));
+    module.entry_point = Some(0);
+
+    let mut jit = make_jit();
+    let start = 2;
+    let len = 8;
+    let first = unsafe {
+        jit.compile_region(
+            0,
+            start,
+            len,
+            &module.instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("baseline region should compile");
+
+    assert_eq!(
+        jit.compiled_tier(0, start),
+        Some(CompilationTier::Baseline)
+    );
+    assert!(
+        jit.compiled_region_compile_time_ns(0, start).is_some(),
+        "initial compilation should record compiler wall time"
+    );
+    let before = jit.compiled_entry(0, start).expect("baseline cache entry");
+    assert_eq!(before.ptr, first as *const u8);
+
+    for _ in 0..TIER2_THRESHOLD {
+        jit.record_tier2_and_maybe_promote(0, start, &module);
+    }
+
+    let after = jit.compiled_entry(0, start).expect("promoted cache entry");
+    assert_eq!(after.tier, CompilationTier::Typed);
+    assert_ne!(
+        after.ptr, before.ptr,
+        "tier promotion must install a newly compiled function, not return the cached baseline"
+    );
+    assert_eq!(
+        jit.compiled_count(),
+        1,
+        "replacing a region must not increase the number of occupied cache slots"
+    );
+    assert!(
+        jit.is_typed_compiled(0, start),
+        "promoted region should be recorded as type-directed"
     );
 }
 
