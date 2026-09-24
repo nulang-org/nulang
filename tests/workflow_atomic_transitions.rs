@@ -192,6 +192,7 @@ fn atomic_transition_can_follow_transitional_legacy_journal_sequence() {
         domain_events: Vec::new(),
         durable_effects: Vec::new(),
         outbox: Vec::new(),
+        inbox: Vec::new(),
     };
     store.commit_transition(first).unwrap();
 
@@ -257,6 +258,7 @@ fn workflow_turn_reuses_persisted_activation_epoch_without_runtime_cache() {
             domain_events: Vec::new(),
             durable_effects: Vec::new(),
             outbox: Vec::new(),
+            inbox: Vec::new(),
         })
         .unwrap();
 
