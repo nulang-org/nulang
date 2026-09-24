@@ -1,0 +1,75 @@
+name: Cross-runtime actor benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Measured runs per runtime
+        required: false
+        default: '5'
+      warmup:
+        description: Warm-up runs per runtime
+        required: false
+        default: '1'
+      cpu_mode:
+        description: CPU topology for measured runtime processes
+        required: false
+        default: single
+        type: choice
+        options:
+          - single
+          - host
+  pull_request:
+    paths:
+      - '.github/workflows/cross-runtime-bench.yml'
+      - 'benchmarks/cross_runtime/**'
+      - 'benchmarks/README.md'
+      - 'scripts/cross_runtime_bench.py'
+      - 'src/benchmarks.rs'
+
+concurrency:
+  group: cross-runtime-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: Nulang vs Rust / Go / Erlang baselines
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.x'
+
+      - name: Install Erlang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y erlang-base erlang-dev
+
+      - name: Run cross-runtime baselines
+        env:
+          RUNS: "${{ inputs.runs || '3' }}"
+          WARMUP: "${{ inputs.warmup || '1' }}"
+          CPU_MODE: "${{ inputs.cpu_mode || 'single' }}"
+        run: |
+          python3 scripts/cross_runtime_bench.py \
+            --runs "$RUNS" \
+            --warmup "$WARMUP" \
+            --cpu-mode "$CPU_MODE" \
+            --output cross-runtime-results.json
+
+      - name: Upload results
+        uses: actions/upload-artifact@v6
+        with:
+          name: cross-runtime-results-${{ github.sha }}
+          path: cross-runtime-results.json
+          if-no-files-found: error
