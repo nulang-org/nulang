@@ -80,6 +80,7 @@ impl TurnOutcome {
             domain_events: self.domain_events,
             durable_effects: self.durable_effects,
             outbox: self.outbox,
+            inbox: Vec::new(),
         })
     }
 }

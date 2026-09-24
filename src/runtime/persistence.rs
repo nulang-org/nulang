@@ -4,7 +4,7 @@
 //! snapshot of durable actor state and an append-only journal of messages.
 //! On recovery the runtime loads the latest snapshot and replays the journal.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -265,6 +265,31 @@ pub struct DurableOutboxMessage {
     pub payload: Vec<PersistedValue>,
 }
 
+/// Stable RFC 0022 identity for one durable outbound message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct DurableMessageId {
+    pub sender_actor_id: u64,
+    pub sender_epoch: u64,
+    pub transition_sequence: u64,
+    pub outbox_ordinal: u32,
+}
+
+/// One committed durable outbound message that has not yet been acknowledged.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DurableOutboxRecord {
+    pub id: DurableMessageId,
+    pub destination_actor_id: u64,
+    pub behavior_id: u16,
+    pub payload: Vec<PersistedValue>,
+}
+
+/// One stable durable-message identity accepted atomically by a receiver turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct DurableInboxDelivery {
+    pub id: DurableMessageId,
+    pub destination_actor_id: u64,
+}
+
 /// One logical durable actor/workflow/entity transition.
 #[derive(Debug, Clone)]
 pub struct DurableTransition {
@@ -279,6 +304,7 @@ pub struct DurableTransition {
     pub domain_events: Vec<EventEntry>,
     pub durable_effects: Vec<DurableEffectPersistenceRecord>,
     pub outbox: Vec<DurableOutboxMessage>,
+    pub inbox: Vec<DurableInboxDelivery>,
 }
 
 /// Durable tail used for epoch/sequence fencing and idempotent commit retry.
@@ -395,6 +421,22 @@ impl DurableTransition {
                 ));
             }
         }
+
+        let mut inbox_ids = HashSet::new();
+        for delivery in &self.inbox {
+            if delivery.destination_actor_id != self.actor_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "durable inbox delivery destination does not match transition actor",
+                ));
+            }
+            if !inbox_ids.insert(delivery.id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "duplicate durable inbox identity in transition",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -415,6 +457,8 @@ impl DurableTransition {
             domain_events: &'a [EventEntry],
             durable_effects: Vec<Vec<u8>>,
             outbox: &'a [DurableOutboxMessage],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            inbox: Option<&'a [DurableInboxDelivery]>,
         }
 
         let durable_effects = self
@@ -439,6 +483,7 @@ impl DurableTransition {
             domain_events: &self.domain_events,
             durable_effects,
             outbox: &self.outbox,
+            inbox: (!self.inbox.is_empty()).then_some(self.inbox.as_slice()),
         })
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
@@ -506,6 +551,37 @@ pub trait PersistenceStore: Send + Sync {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "durable effect recovery reads are not supported by this persistence backend",
+        ))
+    }
+
+    /// Read committed durable outbox messages that have not yet been
+    /// acknowledged. Stable identities make retries safe after crashes.
+    fn read_pending_outbox(&self, _limit: usize) -> io::Result<Vec<DurableOutboxRecord>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable outbox reads are not supported by this persistence backend",
+        ))
+    }
+
+    /// Idempotently acknowledge a durable outbox message after receiver
+    /// acceptance is durable.
+    fn acknowledge_outbox(&mut self, _id: DurableMessageId) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable outbox acknowledgement is not supported by this persistence backend",
+        ))
+    }
+
+    /// Return the receiver transition sequence that atomically accepted this
+    /// stable durable-message identity, if any.
+    fn lookup_inbox_delivery(
+        &self,
+        _destination_actor_id: u64,
+        _id: DurableMessageId,
+    ) -> io::Result<Option<u64>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable inbox lookup is not supported by this persistence backend",
         ))
     }
 
@@ -670,6 +746,8 @@ pub struct MemoryStore {
     events: HashMap<u64, Vec<EventEntry>>,
     durable_tails: HashMap<u64, DurableTail>,
     committed_transitions: HashMap<u64, Vec<DurableTransition>>,
+    delivered_outbox: HashSet<DurableMessageId>,
+    durable_inbox: HashMap<(u64, DurableMessageId), u64>,
 }
 
 impl MemoryStore {
@@ -690,6 +768,56 @@ impl MemoryStore {
 }
 
 impl PersistenceStore for MemoryStore {
+    fn read_pending_outbox(&self, limit: usize) -> io::Result<Vec<DurableOutboxRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut records = Vec::new();
+        for transitions in self.committed_transitions.values() {
+            for transition in transitions {
+                for message in &transition.outbox {
+                    let id = DurableMessageId {
+                        sender_actor_id: transition.actor_id,
+                        sender_epoch: transition.activation_epoch,
+                        transition_sequence: transition.sequence,
+                        outbox_ordinal: message.ordinal,
+                    };
+                    if !self.delivered_outbox.contains(&id) {
+                        records.push(DurableOutboxRecord {
+                            id,
+                            destination_actor_id: message.destination_actor_id,
+                            behavior_id: message.behavior_id,
+                            payload: message.payload.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        records.sort_by_key(|record| {
+            (
+                record.id.sender_actor_id,
+                record.id.sender_epoch,
+                record.id.transition_sequence,
+                record.id.outbox_ordinal,
+            )
+        });
+        records.truncate(limit);
+        Ok(records)
+    }
+
+    fn acknowledge_outbox(&mut self, id: DurableMessageId) -> io::Result<()> {
+        self.delivered_outbox.insert(id);
+        Ok(())
+    }
+
+    fn lookup_inbox_delivery(
+        &self,
+        destination_actor_id: u64,
+        id: DurableMessageId,
+    ) -> io::Result<Option<u64>> {
+        Ok(self.durable_inbox.get(&(destination_actor_id, id)).copied())
+    }
+
     fn load_durable_tail(&self, actor_id: u64) -> io::Result<Option<DurableTail>> {
         Ok(self.durable_tails.get(&actor_id).copied())
     }
@@ -787,6 +915,18 @@ impl PersistenceStore for MemoryStore {
             ));
         }
 
+        for delivery in &transition.inbox {
+            if self
+                .durable_inbox
+                .contains_key(&(delivery.destination_actor_id, delivery.id))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "durable inbox identity was already accepted",
+                ));
+            }
+        }
+
         if let Some(snapshot) = &transition.snapshot {
             self.snapshots.insert(transition.actor_id, snapshot.clone());
         }
@@ -815,6 +955,12 @@ impl PersistenceStore for MemoryStore {
             digest,
         };
         self.durable_tails.insert(transition.actor_id, tail);
+        for delivery in &transition.inbox {
+            self.durable_inbox.insert(
+                (delivery.destination_actor_id, delivery.id),
+                transition.sequence,
+            );
+        }
         self.committed_transitions
             .entry(transition.actor_id)
             .or_default()
@@ -910,6 +1056,11 @@ impl PersistenceStore for MemoryStore {
         self.events.remove(&actor_id);
         self.durable_tails.remove(&actor_id);
         self.committed_transitions.remove(&actor_id);
+        self.delivered_outbox
+            .retain(|id| id.sender_actor_id != actor_id);
+        self.durable_inbox.retain(|(destination, id), _| {
+            *destination != actor_id && id.sender_actor_id != actor_id
+        });
         Ok(())
     }
 }
@@ -931,6 +1082,8 @@ struct JsonDurableTransitionRecord {
     domain_events: Vec<EventEntry>,
     durable_effects: Vec<Vec<u8>>,
     outbox: Vec<DurableOutboxMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    inbox: Vec<DurableInboxDelivery>,
     digest: [u8; 32],
 }
 
@@ -956,6 +1109,7 @@ impl JsonDurableTransitionRecord {
                 })
                 .collect::<io::Result<Vec<_>>>()?,
             outbox: transition.outbox.clone(),
+            inbox: transition.inbox.clone(),
             digest,
         })
     }
@@ -980,6 +1134,7 @@ impl JsonDurableTransitionRecord {
                 })
                 .collect::<io::Result<Vec<_>>>()?,
             outbox: self.outbox.clone(),
+            inbox: self.inbox.clone(),
         };
         transition.validate_structure()?;
         let digest = transition.digest()?;
@@ -1040,6 +1195,54 @@ impl JsonFileStore {
 
     fn transitions_path(&self, actor_id: u64) -> PathBuf {
         self.actor_dir(actor_id).join("transitions.log")
+    }
+
+    fn outbox_acks_path(&self, actor_id: u64) -> PathBuf {
+        self.actor_dir(actor_id).join("outbox_acks.json")
+    }
+
+    fn read_outbox_acks(&self, actor_id: u64) -> io::Result<HashSet<DurableMessageId>> {
+        let path = self.outbox_acks_path(actor_id);
+        let data = match fs::read(&path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
+            Err(error) => return Err(error),
+        };
+        let ids: Vec<DurableMessageId> = serde_json::from_slice(&data)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(ids.into_iter().collect())
+    }
+
+    fn write_outbox_acks(
+        &self,
+        actor_id: u64,
+        acknowledgements: &HashSet<DurableMessageId>,
+    ) -> io::Result<()> {
+        let dir = self.actor_dir(actor_id);
+        fs::create_dir_all(&dir)?;
+        let path = self.outbox_acks_path(actor_id);
+        let tmp_path = dir.join("outbox_acks.json.tmp");
+        let mut ids: Vec<_> = acknowledgements.iter().copied().collect();
+        ids.sort_by_key(|id| {
+            (
+                id.sender_actor_id,
+                id.sender_epoch,
+                id.transition_sequence,
+                id.outbox_ordinal,
+            )
+        });
+        let bytes = serde_json::to_vec(&ids)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        {
+            let mut file = fs::File::create(&tmp_path)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp_path, &path)?;
+        if let Ok(dir_file) = fs::File::open(&dir) {
+            let _ = dir_file.sync_all();
+        }
+        Ok(())
     }
 
     fn load_legacy_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
@@ -1238,6 +1441,109 @@ impl JsonFileStore {
 }
 
 impl PersistenceStore for JsonFileStore {
+    fn read_pending_outbox(&self, limit: usize) -> io::Result<Vec<DurableOutboxRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut records = Vec::new();
+        let entries = match fs::read_dir(&self.base_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(actor_id) = name
+                .strip_prefix("actor_")
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                continue;
+            };
+
+            let acknowledgements = self.read_outbox_acks(actor_id)?;
+            let (transitions, _) = self.read_transition_records(actor_id)?;
+            for transition in transitions {
+                for message in transition.outbox {
+                    let id = DurableMessageId {
+                        sender_actor_id: transition.actor_id,
+                        sender_epoch: transition.activation_epoch,
+                        transition_sequence: transition.sequence,
+                        outbox_ordinal: message.ordinal,
+                    };
+                    if !acknowledgements.contains(&id) {
+                        records.push(DurableOutboxRecord {
+                            id,
+                            destination_actor_id: message.destination_actor_id,
+                            behavior_id: message.behavior_id,
+                            payload: message.payload,
+                        });
+                    }
+                }
+            }
+        }
+
+        records.sort_by_key(|record| {
+            (
+                record.id.sender_actor_id,
+                record.id.sender_epoch,
+                record.id.transition_sequence,
+                record.id.outbox_ordinal,
+            )
+        });
+        records.truncate(limit);
+        Ok(records)
+    }
+
+    fn acknowledge_outbox(&mut self, id: DurableMessageId) -> io::Result<()> {
+        let (records, _) = self.read_transition_records(id.sender_actor_id)?;
+        let exists = records.iter().any(|transition| {
+            transition.activation_epoch == id.sender_epoch
+                && transition.sequence == id.transition_sequence
+                && transition
+                    .outbox
+                    .iter()
+                    .any(|message| message.ordinal == id.outbox_ordinal)
+        });
+        if !exists {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "durable outbox message identity does not exist",
+            ));
+        }
+
+        let mut acknowledgements = self.read_outbox_acks(id.sender_actor_id)?;
+        if acknowledgements.insert(id) {
+            self.write_outbox_acks(id.sender_actor_id, &acknowledgements)?;
+        }
+        Ok(())
+    }
+
+    fn lookup_inbox_delivery(
+        &self,
+        destination_actor_id: u64,
+        id: DurableMessageId,
+    ) -> io::Result<Option<u64>> {
+        let (records, _) = self.read_transition_records(destination_actor_id)?;
+        Ok(records.into_iter().find_map(|record| {
+            record
+                .inbox
+                .iter()
+                .any(|delivery| {
+                    delivery.destination_actor_id == destination_actor_id && delivery.id == id
+                })
+                .then_some(record.sequence)
+        }))
+    }
+
     fn load_durable_tail(&self, actor_id: u64) -> io::Result<Option<DurableTail>> {
         let (records, _) = self.read_transition_records(actor_id)?;
         Ok(records.last().map(JsonDurableTransitionRecord::tail))
@@ -1316,7 +1622,21 @@ impl PersistenceStore for JsonFileStore {
             ));
         }
 
-        let record = JsonDurableTransitionRecord::from_transition(&transition, digest)?;
+        for delivery in &transition.inbox {
+            if records.iter().any(|record| {
+                record.inbox.iter().any(|accepted| {
+                    accepted.destination_actor_id == delivery.destination_actor_id
+                        && accepted.id == delivery.id
+                })
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "durable inbox identity was already accepted",
+                ));
+            }
+        }
+
+        let record = JsonDurableTransitionRecord::from_transition(&transition, digest)?
         self.append_transition_record(transition.actor_id, &record, valid_len)?;
 
         Ok(DurableCommit {
@@ -1803,6 +2123,38 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_outbox_acks (
+                    actor_id INTEGER NOT NULL,
+                    sender_epoch INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    PRIMARY KEY (actor_id, sender_epoch, sequence, ordinal)
+                )",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_inbox (
+                    destination_actor_id INTEGER NOT NULL,
+                    sender_actor_id INTEGER NOT NULL,
+                    sender_epoch INTEGER NOT NULL,
+                    transition_sequence INTEGER NOT NULL,
+                    outbox_ordinal INTEGER NOT NULL,
+                    receiver_sequence INTEGER NOT NULL,
+                    PRIMARY KEY (
+                        destination_actor_id,
+                        sender_actor_id,
+                        sender_epoch,
+                        transition_sequence,
+                        outbox_ordinal
+                    )
+                )",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             Ok(())
         })
     }
@@ -1869,6 +2221,175 @@ impl LibsqlStore {
 
 #[cfg(feature = "sqlite")]
 impl PersistenceStore for LibsqlStore {
+    fn read_pending_outbox(&self, limit: usize) -> io::Result<Vec<DurableOutboxRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT o.actor_id, t.activation_epoch, o.sequence, o.ordinal,
+                            o.destination_actor_id, o.behavior_id, o.payload
+                     FROM durable_outbox o
+                     JOIN durable_transitions t
+                       ON t.actor_id = o.actor_id AND t.sequence = o.sequence
+                     LEFT JOIN durable_outbox_acks a
+                       ON a.actor_id = o.actor_id
+                      AND a.sender_epoch = t.activation_epoch
+                      AND a.sequence = o.sequence
+                      AND a.ordinal = o.ordinal
+                     WHERE a.actor_id IS NULL
+                     ORDER BY o.actor_id ASC, t.activation_epoch ASC,
+                              o.sequence ASC, o.ordinal ASC
+                     LIMIT ?1",
+                    libsql::params![limit as i64],
+                )
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+            let mut records = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+            {
+                let payload_json: String = row
+                    .get(6)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+                let payload = serde_json::from_str(&payload_json)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                records.push(DurableOutboxRecord {
+                    id: DurableMessageId {
+                        sender_actor_id: row.get::<i64>(0).map_err(|error| {
+                            io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                        })? as u64,
+                        sender_epoch: row.get::<i64>(1).map_err(|error| {
+                            io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                        })? as u64,
+                        transition_sequence: row.get::<i64>(2).map_err(|error| {
+                            io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                        })? as u64,
+                        outbox_ordinal: row.get::<i64>(3).map_err(|error| {
+                            io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                        })? as u32,
+                    },
+                    destination_actor_id: row.get::<i64>(4).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })? as u64,
+                    behavior_id: row.get::<i64>(5).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })? as u16,
+                    payload,
+                });
+            }
+            Ok(records)
+        })
+    }
+
+    fn acknowledge_outbox(&mut self, id: DurableMessageId) -> io::Result<()> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let changed = conn
+                .execute(
+                    "INSERT OR IGNORE INTO durable_outbox_acks
+                     (actor_id, sender_epoch, sequence, ordinal)
+                     SELECT o.actor_id, t.activation_epoch, o.sequence, o.ordinal
+                     FROM durable_outbox o
+                     JOIN durable_transitions t
+                       ON t.actor_id = o.actor_id AND t.sequence = o.sequence
+                     WHERE o.actor_id = ?1
+                       AND t.activation_epoch = ?2
+                       AND o.sequence = ?3
+                       AND o.ordinal = ?4",
+                    libsql::params![
+                        id.sender_actor_id as i64,
+                        id.sender_epoch as i64,
+                        id.transition_sequence as i64,
+                        id.outbox_ordinal as i64
+                    ],
+                )
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+            if changed == 0 {
+                let mut rows = conn
+                    .query(
+                        "SELECT 1
+                         FROM durable_outbox o
+                         JOIN durable_transitions t
+                           ON t.actor_id = o.actor_id AND t.sequence = o.sequence
+                         WHERE o.actor_id = ?1
+                           AND t.activation_epoch = ?2
+                           AND o.sequence = ?3
+                           AND o.ordinal = ?4
+                         LIMIT 1",
+                        libsql::params![
+                            id.sender_actor_id as i64,
+                            id.sender_epoch as i64,
+                            id.transition_sequence as i64,
+                            id.outbox_ordinal as i64
+                        ],
+                    )
+                    .await
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+                if rows
+                    .next()
+                    .await
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+                    .is_none()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "durable outbox message identity does not exist",
+                    ));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn lookup_inbox_delivery(
+        &self,
+        destination_actor_id: u64,
+        id: DurableMessageId,
+    ) -> io::Result<Option<u64>> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT receiver_sequence FROM durable_inbox
+                     WHERE destination_actor_id = ?1
+                       AND sender_actor_id = ?2
+                       AND sender_epoch = ?3
+                       AND transition_sequence = ?4
+                       AND outbox_ordinal = ?5",
+                    libsql::params![
+                        destination_actor_id as i64,
+                        id.sender_actor_id as i64,
+                        id.sender_epoch as i64,
+                        id.transition_sequence as i64,
+                        id.outbox_ordinal as i64
+                    ],
+                )
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+            match rows
+                .next()
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+            {
+                Some(row) => {
+                    let sequence: i64 = row.get(0).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?;
+                    Ok(Some(sequence as u64))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
     fn load_durable_tail(&self, actor_id: u64) -> io::Result<Option<DurableTail>> {
         let conn = self.conn();
         self.rt.block_on(async {
@@ -2246,6 +2767,57 @@ impl PersistenceStore for LibsqlStore {
                 )
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            }
+
+            for delivery in &transition.inbox {
+                let mut existing = tx
+                    .query(
+                        "SELECT receiver_sequence FROM durable_inbox
+                         WHERE destination_actor_id = ?1
+                           AND sender_actor_id = ?2
+                           AND sender_epoch = ?3
+                           AND transition_sequence = ?4
+                           AND outbox_ordinal = ?5",
+                        libsql::params![
+                            delivery.destination_actor_id as i64,
+                            delivery.id.sender_actor_id as i64,
+                            delivery.id.sender_epoch as i64,
+                            delivery.id.transition_sequence as i64,
+                            delivery.id.outbox_ordinal as i64
+                        ],
+                    )
+                    .await
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+                if existing
+                    .next()
+                    .await
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+                    .is_some()
+                {
+                    let _ = tx.rollback().await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "durable inbox identity was already accepted",
+                    ));
+                }
+                drop(existing);
+
+                tx.execute(
+                    "INSERT INTO durable_inbox
+                     (destination_actor_id, sender_actor_id, sender_epoch,
+                      transition_sequence, outbox_ordinal, receiver_sequence)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    libsql::params![
+                        delivery.destination_actor_id as i64,
+                        delivery.id.sender_actor_id as i64,
+                        delivery.id.sender_epoch as i64,
+                        delivery.id.transition_sequence as i64,
+                        delivery.id.outbox_ordinal as i64,
+                        transition.sequence as i64
+                    ],
+                )
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
             }
 
             tx.execute(
@@ -2700,6 +3272,14 @@ impl PersistenceStore for LibsqlStore {
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
         let conn = self.conn();
         self.rt.block_on(async {
+            conn.execute(
+                "DELETE FROM durable_inbox
+                 WHERE destination_actor_id = ?1 OR sender_actor_id = ?1",
+                libsql::params![actor_id as i64],
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
             for table in [
                 "snapshots",
                 "journal",
@@ -2709,6 +3289,7 @@ impl PersistenceStore for LibsqlStore {
                 "durable_domain_events",
                 "durable_effect_records",
                 "durable_outbox",
+                "durable_outbox_acks",
                 "durable_transitions",
                 "durable_tails",
             ] {
@@ -3444,6 +4025,28 @@ impl PostgresStore {
                 payload TEXT NOT NULL,
                 PRIMARY KEY (actor_id, sequence, ordinal)
             )",
+            "CREATE TABLE IF NOT EXISTS durable_outbox_acks (
+                actor_id BIGINT NOT NULL,
+                sender_epoch BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                PRIMARY KEY (actor_id, sender_epoch, sequence, ordinal)
+            )",
+            "CREATE TABLE IF NOT EXISTS durable_inbox (
+                destination_actor_id BIGINT NOT NULL,
+                sender_actor_id BIGINT NOT NULL,
+                sender_epoch BIGINT NOT NULL,
+                transition_sequence BIGINT NOT NULL,
+                outbox_ordinal INTEGER NOT NULL,
+                receiver_sequence BIGINT NOT NULL,
+                PRIMARY KEY (
+                    destination_actor_id,
+                    sender_actor_id,
+                    sender_epoch,
+                    transition_sequence,
+                    outbox_ordinal
+                )
+            )",
         ] {
             conn.execute(ddl, &[])
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -3454,6 +4057,130 @@ impl PostgresStore {
 
 #[cfg(feature = "postgres")]
 impl PersistenceStore for PostgresStore {
+    fn read_pending_outbox(&self, limit: usize) -> io::Result<Vec<DurableOutboxRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let rows = conn
+            .query(
+                "SELECT o.actor_id, t.activation_epoch, o.sequence, o.ordinal,
+                        o.destination_actor_id, o.behavior_id, o.payload
+                 FROM durable_outbox o
+                 JOIN durable_transitions t
+                   ON t.actor_id = o.actor_id AND t.sequence = o.sequence
+                 LEFT JOIN durable_outbox_acks a
+                   ON a.actor_id = o.actor_id
+                  AND a.sender_epoch = t.activation_epoch
+                  AND a.sequence = o.sequence
+                  AND a.ordinal = o.ordinal
+                 WHERE a.actor_id IS NULL
+                 ORDER BY o.actor_id ASC, t.activation_epoch ASC,
+                          o.sequence ASC, o.ordinal ASC
+                 LIMIT $1",
+                &[&(limit as i64)],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| {
+                let payload_json: String = row.get(6);
+                let payload = serde_json::from_str(&payload_json)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Ok(DurableOutboxRecord {
+                    id: DurableMessageId {
+                        sender_actor_id: row.get::<_, i64>(0) as u64,
+                        sender_epoch: row.get::<_, i64>(1) as u64,
+                        transition_sequence: row.get::<_, i64>(2) as u64,
+                        outbox_ordinal: row.get::<_, i32>(3) as u32,
+                    },
+                    destination_actor_id: row.get::<_, i64>(4) as u64,
+                    behavior_id: row.get::<_, i32>(5) as u16,
+                    payload,
+                })
+            })
+            .collect()
+    }
+
+    fn acknowledge_outbox(&mut self, id: DurableMessageId) -> io::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "INSERT INTO durable_outbox_acks
+                 (actor_id, sender_epoch, sequence, ordinal)
+                 SELECT o.actor_id, t.activation_epoch, o.sequence, o.ordinal
+                 FROM durable_outbox o
+                 JOIN durable_transitions t
+                   ON t.actor_id = o.actor_id AND t.sequence = o.sequence
+                 WHERE o.actor_id = $1
+                   AND t.activation_epoch = $2
+                   AND o.sequence = $3
+                   AND o.ordinal = $4
+                 ON CONFLICT DO NOTHING",
+                &[
+                    &(id.sender_actor_id as i64),
+                    &(id.sender_epoch as i64),
+                    &(id.transition_sequence as i64),
+                    &(id.outbox_ordinal as i32),
+                ],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        if changed == 0 {
+            let exists = conn
+                .query_opt(
+                    "SELECT 1
+                     FROM durable_outbox o
+                     JOIN durable_transitions t
+                       ON t.actor_id = o.actor_id AND t.sequence = o.sequence
+                     WHERE o.actor_id = $1
+                       AND t.activation_epoch = $2
+                       AND o.sequence = $3
+                       AND o.ordinal = $4",
+                    &[
+                        &(id.sender_actor_id as i64),
+                        &(id.sender_epoch as i64),
+                        &(id.transition_sequence as i64),
+                        &(id.outbox_ordinal as i32),
+                    ],
+                )
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                .is_some();
+            if !exists {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "durable outbox message identity does not exist",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn lookup_inbox_delivery(
+        &self,
+        destination_actor_id: u64,
+        id: DurableMessageId,
+    ) -> io::Result<Option<u64>> {
+        let mut conn = self.conn.lock().unwrap();
+        conn.query_opt(
+            "SELECT receiver_sequence FROM durable_inbox
+             WHERE destination_actor_id = $1
+               AND sender_actor_id = $2
+               AND sender_epoch = $3
+               AND transition_sequence = $4
+               AND outbox_ordinal = $5",
+            &[
+                &(destination_actor_id as i64),
+                &(id.sender_actor_id as i64),
+                &(id.sender_epoch as i64),
+                &(id.transition_sequence as i64),
+                &(id.outbox_ordinal as i32),
+            ],
+        )
+        .map(|row| row.map(|row| row.get::<_, i64>(0) as u64))
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }
+
     fn load_durable_tail(&self, actor_id: u64) -> io::Result<Option<DurableTail>> {
         let mut conn = self.conn.lock().unwrap();
         let row = conn
@@ -3765,6 +4492,49 @@ impl PersistenceStore for PostgresStore {
                     &(message.destination_actor_id as i64),
                     &(message.behavior_id as i32),
                     payload_json,
+                ],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+
+        for delivery in &transition.inbox {
+            if tx
+                .query_opt(
+                    "SELECT receiver_sequence FROM durable_inbox
+                     WHERE destination_actor_id = $1
+                       AND sender_actor_id = $2
+                       AND sender_epoch = $3
+                       AND transition_sequence = $4
+                       AND outbox_ordinal = $5",
+                    &[
+                        &(delivery.destination_actor_id as i64),
+                        &(delivery.id.sender_actor_id as i64),
+                        &(delivery.id.sender_epoch as i64),
+                        &(delivery.id.transition_sequence as i64),
+                        &(delivery.id.outbox_ordinal as i32),
+                    ],
+                )
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                .is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "durable inbox identity was already accepted",
+                ));
+            }
+
+            tx.execute(
+                "INSERT INTO durable_inbox
+                 (destination_actor_id, sender_actor_id, sender_epoch,
+                  transition_sequence, outbox_ordinal, receiver_sequence)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    &(delivery.destination_actor_id as i64),
+                    &(delivery.id.sender_actor_id as i64),
+                    &(delivery.id.sender_epoch as i64),
+                    &(delivery.id.transition_sequence as i64),
+                    &(delivery.id.outbox_ordinal as i32),
+                    &(transition.sequence as i64),
                 ],
             )
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -4140,6 +4910,13 @@ impl PersistenceStore for PostgresStore {
         let mut tx = conn
             .transaction()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        tx.execute(
+            "DELETE FROM durable_inbox
+             WHERE destination_actor_id = $1 OR sender_actor_id = $1",
+            &[&(actor_id as i64)],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
         for table in [
             "snapshots",
             "journal",
@@ -4149,6 +4926,7 @@ impl PersistenceStore for PostgresStore {
             "durable_domain_events",
             "durable_effect_records",
             "durable_outbox",
+            "durable_outbox_acks",
             "durable_transitions",
             "durable_tails",
         ] {
@@ -4277,6 +5055,7 @@ mod json_file_store_tests {
             domain_events: Vec::new(),
             durable_effects: Vec::new(),
             outbox: Vec::new(),
+            inbox: Vec::new(),
         };
         let expected_digest = transition.digest().unwrap();
 
@@ -4314,6 +5093,102 @@ mod json_file_store_tests {
     }
 
     #[test]
+    fn test_json_file_store_durable_message_acceptance_and_ack_survive_restart() {
+        let dir = fresh_dir("durable_message");
+        let mut store = JsonFileStore::new(&dir).unwrap();
+
+        let sender = DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: 10,
+            activation_epoch: 3,
+            sequence: 1,
+            expected_previous_sequence: 0,
+            command: None,
+            snapshot: None,
+            workflow_events: Vec::new(),
+            domain_events: Vec::new(),
+            durable_effects: Vec::new(),
+            outbox: vec![DurableOutboxMessage {
+                destination_actor_id: 20,
+                ordinal: 0,
+                behavior_id: 7,
+                payload: vec![PersistedValue::Int(42)],
+            }],
+            inbox: Vec::new(),
+        };
+        store.commit_transition(sender).unwrap();
+
+        let pending = store.read_pending_outbox(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].destination_actor_id, 20);
+        let message_id = pending[0].id;
+        assert_eq!(message_id.sender_actor_id, 10);
+        assert_eq!(message_id.sender_epoch, 3);
+        assert_eq!(message_id.transition_sequence, 1);
+        assert_eq!(message_id.outbox_ordinal, 0);
+
+        let receiver = DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: 20,
+            activation_epoch: 1,
+            sequence: 1,
+            expected_previous_sequence: 0,
+            command: Some(JournalEntry {
+                sequence: 1,
+                behavior_id: 7,
+                payload: vec![PersistedValue::Int(42)],
+            }),
+            snapshot: None,
+            workflow_events: Vec::new(),
+            domain_events: Vec::new(),
+            durable_effects: Vec::new(),
+            outbox: Vec::new(),
+            inbox: vec![DurableInboxDelivery {
+                id: message_id,
+                destination_actor_id: 20,
+            }],
+        };
+        store.commit_transition(receiver).unwrap();
+        assert_eq!(
+            store.lookup_inbox_delivery(20, message_id).unwrap(),
+            Some(1)
+        );
+
+        let duplicate = DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: 20,
+            activation_epoch: 1,
+            sequence: 2,
+            expected_previous_sequence: 1,
+            command: None,
+            snapshot: None,
+            workflow_events: Vec::new(),
+            domain_events: Vec::new(),
+            durable_effects: Vec::new(),
+            outbox: Vec::new(),
+            inbox: vec![DurableInboxDelivery {
+                id: message_id,
+                destination_actor_id: 20,
+            }],
+        };
+        let duplicate_error = store.commit_transition(duplicate).unwrap_err();
+        assert_eq!(duplicate_error.kind(), io::ErrorKind::AlreadyExists);
+
+        store.acknowledge_outbox(message_id).unwrap();
+        assert!(store.read_pending_outbox(10).unwrap().is_empty());
+
+        drop(store);
+        let store = JsonFileStore::new(&dir).unwrap();
+        assert!(store.read_pending_outbox(10).unwrap().is_empty());
+        assert_eq!(
+            store.lookup_inbox_delivery(20, message_id).unwrap(),
+            Some(1)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_json_file_store_truncates_torn_final_transition_before_retry() {
         let dir = fresh_dir("torn_atomic_transition");
         let mut store = JsonFileStore::new(&dir).unwrap();
@@ -4334,6 +5209,7 @@ mod json_file_store_tests {
             domain_events: Vec::new(),
             durable_effects: Vec::new(),
             outbox: Vec::new(),
+            inbox: Vec::new(),
         };
         store.commit_transition(first).unwrap();
 
@@ -4366,6 +5242,7 @@ mod json_file_store_tests {
             domain_events: Vec::new(),
             durable_effects: Vec::new(),
             outbox: Vec::new(),
+            inbox: Vec::new(),
         };
         store.commit_transition(second).unwrap();
 
@@ -5092,6 +5969,7 @@ mod durable_transition_tests {
                 behavior_id: 9,
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }],
+            inbox: Vec::new(),
         }
     }
 
@@ -5269,6 +6147,7 @@ mod libsql_atomic_transition_tests {
                 behavior_id: 4,
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }],
+            inbox: Vec::new(),
         }
     }
 
@@ -5389,6 +6268,47 @@ mod libsql_atomic_transition_tests {
             .unwrap();
         assert_eq!(transitions, vec!["[0]".to_string()]);
         assert_eq!(tails, vec!["[0]".to_string()]);
+    }
+
+    #[test]
+    fn libsql_durable_message_acceptance_is_atomic_and_acknowledgeable() {
+        let mut store = LibsqlStore::in_memory().unwrap();
+
+        let sender = transition(42, 3, 1);
+        store.commit_transition(sender).unwrap();
+
+        let pending = store.read_pending_outbox(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        let message_id = pending[0].id;
+        assert_eq!(message_id.sender_actor_id, 42);
+        assert_eq!(message_id.sender_epoch, 3);
+        assert_eq!(message_id.transition_sequence, 1);
+        assert_eq!(message_id.outbox_ordinal, 0);
+
+        let mut receiver = transition(43, 1, 1);
+        receiver.outbox.clear();
+        receiver.inbox = vec![DurableInboxDelivery {
+            id: message_id,
+            destination_actor_id: 43,
+        }];
+        store.commit_transition(receiver).unwrap();
+        assert_eq!(
+            store.lookup_inbox_delivery(43, message_id).unwrap(),
+            Some(1)
+        );
+
+        let mut duplicate = transition(43, 1, 2);
+        duplicate.outbox.clear();
+        duplicate.inbox = vec![DurableInboxDelivery {
+            id: message_id,
+            destination_actor_id: 43,
+        }];
+        let error = store.commit_transition(duplicate).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(store.latest_sequence(43), 1);
+
+        store.acknowledge_outbox(message_id).unwrap();
+        assert!(store.read_pending_outbox(10).unwrap().is_empty());
     }
 
     #[test]
