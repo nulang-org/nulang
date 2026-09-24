@@ -2320,7 +2320,10 @@ fn hot_reload_behavior(
     };
     // Rebuild bytecode offsets from the cached module (compressed to the
     // actor's own behaviors for workflow actors — local step ids).
-    let offsets = crate::runtime::spawn::bytecode_offsets_for(module, actor.is_workflow);
+    let offsets = crate::runtime::spawn::bytecode_offsets_for(
+        module,
+        actor.semantics().map(|s| s.is_workflow()).unwrap_or(false),
+    );
     actor.bytecode_module = Some(module.clone());
     actor.bytecode_offsets = offsets;
     warn!(
