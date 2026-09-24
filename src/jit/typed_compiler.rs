@@ -1010,7 +1010,6 @@ fn simple_cfg_ssa_plan(
         })
     };
 
-    let predecessor_counts = region_predecessor_counts(instructions, start_offset, end_offset);
 
     // First try the canonical if/else layout: the instruction immediately
     // before the taken target is an unconditional jump over the else arm.
@@ -1631,6 +1630,56 @@ pub fn is_opcode_supported_typed(op: OpCode) -> bool {
     )
 }
 
+/// Discover bytecode basic-block leaders for a typed JIT region.
+///
+/// Leaders are the region entry, in-region branch targets, and the instruction
+/// after any control-flow terminator. Straight-line instructions between
+/// leaders can therefore share one Cranelift block instead of paying an
+/// artificial jump/block boundary per bytecode instruction.
+pub(crate) fn typed_basic_block_leaders(
+    start_offset: usize,
+    end_offset: usize,
+    instructions: &[Instruction],
+) -> HashSet<usize> {
+    let mut leaders = HashSet::new();
+    if start_offset >= end_offset || start_offset >= instructions.len() {
+        return leaders;
+    }
+    leaders.insert(start_offset);
+
+    for pc in start_offset..end_offset.min(instructions.len()) {
+        let instr = instructions[pc];
+        let mark_target = |leaders: &mut HashSet<usize>, target: i64| {
+            if target >= start_offset as i64 && target < end_offset as i64 {
+                leaders.insert(target as usize);
+            }
+        };
+
+        match instr.opcode {
+            OpCode::Jmp => {
+                mark_target(&mut leaders, pc as i64 + i64::from(instr.simm16()));
+                if pc + 1 < end_offset {
+                    leaders.insert(pc + 1);
+                }
+            }
+            OpCode::JmpT | OpCode::JmpF => {
+                mark_target(&mut leaders, pc as i64 + i64::from(instr.offset16()));
+                if pc + 1 < end_offset {
+                    leaders.insert(pc + 1);
+                }
+            }
+            OpCode::Halt | OpCode::Ret | OpCode::RetVal => {
+                if pc + 1 < end_offset {
+                    leaders.insert(pc + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    leaders
+}
+
 /// Compile a bytecode region to native code with optional type-directed
 /// optimization (type guard stripping).
 ///
@@ -1705,10 +1754,15 @@ pub fn compile_bytecode_region_typed(
     // Register runtime helpers (always needed for fallback)
     let helpers = register_runtime_helpers(module, &mut builder);
 
-    // Create blocks for each instruction offset
+    // Build real bytecode basic blocks rather than one Cranelift block per
+    // instruction. The current loop/CFG SSA plans already use true branch
+    // targets and fallthroughs, all of which are leaders by construction.
+    let basic_block_leaders = typed_basic_block_leaders(start_offset, end_offset, instructions);
     let mut blocks: HashMap<usize, Block> = HashMap::new();
-    for i in start_offset..end_offset {
-        blocks.insert(i, builder.create_block());
+    let mut ordered_leaders: Vec<_> = basic_block_leaders.iter().copied().collect();
+    ordered_leaders.sort_unstable();
+    for leader in ordered_leaders {
+        blocks.insert(leader, builder.create_block());
     }
     if let (Some(plan), Some(&header)) = (&loop_ssa, blocks.get(&start_offset)) {
         for &(_, ty) in &plan.carried {
@@ -1788,53 +1842,68 @@ pub fn compile_bytecode_region_typed(
     let mut int_cache = NativeIntCache::default();
     let mut float_cache = NativeFloatCache::default();
 
-    // Compile each instruction
+    // Compile each instruction, switching Cranelift blocks only at true
+    // bytecode leaders. Every ordinary edge into a leader materializes native
+    // caches first; SSA-specialized edges carry their values as block params.
     for pc in start_offset..end_offset {
         let instr = instructions[pc];
-        let block = *blocks.get(&pc).unwrap();
-        builder.switch_to_block(block);
 
-        meta.regs = block_type_states[pc - start_offset].unwrap_or([KnownType::Unknown; 256]);
+        if basic_block_leaders.contains(&pc) {
+            let block = *blocks
+                .get(&pc)
+                .expect("basic-block leader must have a Cranelift block");
+            builder.switch_to_block(block);
 
-        if pc == start_offset {
-            if let Some(plan) = &loop_ssa {
-                let params = builder.block_params(block).to_vec();
-                for (&(reg, ty), &value) in plan.carried.iter().zip(params.iter()) {
-                    match ty {
-                        KnownType::Int => {
-                            int_cache.set(reg, value);
-                            float_cache.invalidate(reg);
-                        }
-                        KnownType::Float => {
-                            float_cache.set(reg, value);
-                            int_cache.invalidate(reg);
-                        }
-                        _ => unreachable!("loop SSA only threads Int/Float registers"),
-                    }
-                }
-            }
-        }
-
-        if let Some(plan) = &cfg_ssa {
-            if let Some(carried) = plan.carried_for_block(pc) {
+            // Values from a previous CLIF block are not implicitly live here.
+            // Special loop/CFG SSA paths rebuild their caches from block params
+            // below; ordinary edges have already materialized to the VM file.
+            if pc != start_offset {
                 int_cache.clear();
                 float_cache.clear();
-                let params = builder.block_params(block).to_vec();
-                for (&(reg, ty), &value) in carried.iter().zip(params.iter()) {
-                    match ty {
-                        KnownType::Int => {
-                            int_cache.set(reg, value);
-                            float_cache.invalidate(reg);
+            }
+
+            if pc == start_offset {
+                if let Some(plan) = &loop_ssa {
+                    let params = builder.block_params(block).to_vec();
+                    for (&(reg, ty), &value) in plan.carried.iter().zip(params.iter()) {
+                        match ty {
+                            KnownType::Int => {
+                                int_cache.set(reg, value);
+                                float_cache.invalidate(reg);
+                            }
+                            KnownType::Float => {
+                                float_cache.set(reg, value);
+                                int_cache.invalidate(reg);
+                            }
+                            _ => unreachable!("loop SSA only threads Int/Float registers"),
                         }
-                        KnownType::Float => {
-                            float_cache.set(reg, value);
-                            int_cache.invalidate(reg);
+                    }
+                }
+            }
+
+            if let Some(plan) = &cfg_ssa {
+                if let Some(carried) = plan.carried_for_block(pc) {
+                    int_cache.clear();
+                    float_cache.clear();
+                    let params = builder.block_params(block).to_vec();
+                    for (&(reg, ty), &value) in carried.iter().zip(params.iter()) {
+                        match ty {
+                            KnownType::Int => {
+                                int_cache.set(reg, value);
+                                float_cache.invalidate(reg);
+                            }
+                            KnownType::Float => {
+                                float_cache.set(reg, value);
+                                int_cache.invalidate(reg);
+                            }
+                            _ => unreachable!("CFG SSA only threads Int/Float registers"),
                         }
-                        _ => unreachable!("CFG SSA only threads Int/Float registers"),
                     }
                 }
             }
         }
+
+        meta.regs = block_type_states[pc - start_offset].unwrap_or([KnownType::Unknown; 256]);
 
         match instr.opcode {
             // -- Special --
@@ -3011,15 +3080,18 @@ pub fn compile_bytecode_region_typed(
                 }
             }
 
-            if let Some(&next_block) = blocks.get(&(pc + 1)) {
-                let next_preds = predecessor_counts[pc + 1 - start_offset];
-                if next_preds != 1 {
-                    flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
-                }
-                builder.ins().jump(next_block, &[]);
-            } else {
+            if pc + 1 >= end_offset {
                 flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                 builder.ins().jump(return_block, &[]);
+            } else if basic_block_leaders.contains(&(pc + 1)) {
+                // Ordinary cross-block fallthroughs synchronize the VM register
+                // file. The specialized CFG-SSA join path above is the only
+                // exception and carries values explicitly as block params.
+                flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
+                let next_block = *blocks
+                    .get(&(pc + 1))
+                    .expect("fallthrough leader must have a Cranelift block");
+                builder.ins().jump(next_block, &[]);
             }
         }
     }
@@ -3063,6 +3135,30 @@ mod typed_tests {
     /// Helper: Build a JIT session.
     fn make_jit() -> JitSession {
         JitSession::new().unwrap()
+    }
+
+    #[test]
+    fn test_typed_basic_block_leaders_coalesce_straight_line_code() {
+        // 0,1 are straight-line; 2 conditionally branches to 5, so both 3
+        // (fallthrough) and 5 (target) are leaders. 4 jumps to 6, making 5
+        // also a post-terminator leader and 6 a target.
+        let instructions = vec![
+            Instruction::new0(OpCode::Nop),                    // 0 leader
+            Instruction::new0(OpCode::Nop),                    // 1 same block
+            Instruction::new3(OpCode::JmpF, 0, 0, 3),          // 2 -> 5
+            Instruction::new0(OpCode::Nop),                    // 3 leader
+            Instruction::new2(OpCode::Jmp, 0, 2),              // 4 -> 6
+            Instruction::new0(OpCode::Nop),                    // 5 leader
+            Instruction::new0(OpCode::Halt),                   // 6 leader
+        ];
+
+        let leaders = typed_basic_block_leaders(0, instructions.len(), &instructions);
+        assert!(leaders.contains(&0));
+        assert!(!leaders.contains(&1), "straight-line instruction must not become a block");
+        assert!(!leaders.contains(&2), "branch instruction itself is not a new block");
+        assert!(leaders.contains(&3), "conditional fallthrough is a leader");
+        assert!(leaders.contains(&5), "conditional target/post-jump fallthrough is a leader");
+        assert!(leaders.contains(&6), "unconditional branch target is a leader");
     }
 
     // ------------------------------------------------------------------
