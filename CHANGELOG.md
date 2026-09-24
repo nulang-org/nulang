@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Compiler-latency benchmark baseline — 2026-09-24
+- **Criterion now measures Nulang compilation separately from execution** (`benches/compiler_bench.rs`): frontend-to-MIR and source-to-bytecode at 20/100/500 generated functions, plus bounded source-to-Cranelift-AOT cases. This restores the evidence base needed before replaying JIT tiering, register-marshaling, and compiler-analysis optimizations.
+
+
 ### Consuming local-send ownership proof — 2026-09-24
 - **MIR now identifies fresh, single-definition heap-owning values whose sole use is a same-node actor send**, establishing a conservative proof surface for a later ORCA ownership handoff.
 - The analysis is intentionally metadata-only in this slice: it changes no bytecode, mailbox representation, reference count, or runtime behavior. Parameters, captures, handler bindings, multi-use values, and remote sends remain ineligible.
