@@ -684,6 +684,19 @@ pub struct EffectSiteMetadata {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodeModule {
     pub name: String,
+    /// Compiler-derived backend-independent semantic identity for this typed
+    /// program. This is an in-memory sidecar only: frozen NBC v1 intentionally
+    /// does not serialize it. Modules loaded from legacy/raw NBC therefore
+    /// remain explicitly unproven (`None`) until a versioned artifact format
+    /// owns embedded identity.
+    #[serde(skip)]
+    pub semantic_id: Option<crate::content_identity::SemanticId>,
+    /// Definition-scoped semantic identities for actor/entity/workflow
+    /// declarations in this typed module, parallel to `actor_metadata`.
+    /// Positional ownership avoids collapsing namespace-distinct actors that
+    /// share a short runtime name. Frozen NBC v1 does not serialize these.
+    #[serde(skip)]
+    pub actor_semantic_ids: Vec<crate::content_identity::SemanticId>,
     pub constants: Vec<Constant>,
     pub instructions: Vec<Instruction>,
     pub behaviors: Vec<BehaviorTableEntry>,
@@ -744,6 +757,8 @@ impl CodeModule {
     pub fn new(name: impl Into<String>) -> Self {
         CodeModule {
             name: name.into(),
+            semantic_id: None,
+            actor_semantic_ids: Vec::new(),
             constants: Vec::new(),
             instructions: Vec::new(),
             behaviors: Vec::new(),
@@ -763,6 +778,43 @@ impl CodeModule {
             export_table: Vec::new(),
             effect_sites: Vec::new(),
         }
+    }
+
+    /// Compiler-proven definition identity at one actor-metadata index.
+    pub fn actor_semantic_id_at(
+        &self,
+        actor_index: usize,
+    ) -> Option<crate::content_identity::SemanticId> {
+        self.actor_semantic_ids.get(actor_index).copied()
+    }
+
+    /// Resolve definition identity from a behavior owned by exactly one actor.
+    pub fn actor_semantic_id_for_behavior(
+        &self,
+        behavior_idx: usize,
+    ) -> Option<crate::content_identity::SemanticId> {
+        self.actor_metadata
+            .iter()
+            .position(|meta| meta.behavior_indices.contains(&behavior_idx))
+            .and_then(|actor_index| self.actor_semantic_id_at(actor_index))
+    }
+
+    /// Name lookup is permitted only when the short runtime name is unique.
+    pub fn actor_semantic_id(
+        &self,
+        actor_name: &str,
+    ) -> Option<crate::content_identity::SemanticId> {
+        let mut matches = self
+            .actor_metadata
+            .iter()
+            .enumerate()
+            .filter(|(_, meta)| meta.name == actor_name)
+            .map(|(index, _)| index);
+        let actor_index = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        self.actor_semantic_id_at(actor_index)
     }
 
     pub fn add_actor_meta(&mut self, meta: ActorMeta) -> usize {
