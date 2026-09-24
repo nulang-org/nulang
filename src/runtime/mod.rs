@@ -1753,7 +1753,7 @@ impl Runtime {
                 let _ = self.send_cross_shard_named_message(
                     target_id,
                     behavior,
-                    args.to_vec(),
+                    args,
                     out_trace,
                 );
                 return;
@@ -2183,7 +2183,7 @@ impl Runtime {
         &mut self,
         target_id: u64,
         behavior_id: u16,
-        args: Vec<Value>,
+        args: &[Value],
         out_trace: Option<String>,
         grain_id: Option<GrainId>,
     ) -> MessageAdmission {
@@ -2205,7 +2205,7 @@ impl Runtime {
             tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessage {
                 target_id,
                 behavior_id,
-                payload: MessagePayload::from_vec(args),
+                payload: MessagePayload::from_slice(args),
                 sender: self.current_actor.unwrap_or(0),
                 trace_id: out_trace,
                 grain_id,
@@ -2220,7 +2220,7 @@ impl Runtime {
             tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessageWithObjects {
                 target_id,
                 behavior_id,
-                payload: args,
+                payload: args.to_vec(),
                 objects,
                 sender: self.current_actor.unwrap_or(0),
                 trace_id: out_trace,
@@ -2256,7 +2256,7 @@ impl Runtime {
         &mut self,
         target_id: u64,
         behavior_name: &str,
-        args: Vec<Value>,
+        args: &[Value],
         out_trace: Option<String>,
     ) -> MessageAdmission {
         let target_shard = (target_id % self.shard_count as u64) as u16;
@@ -2278,7 +2278,7 @@ impl Runtime {
             tx[target_shard as usize].try_send(CrossShardMsg::DeliverNamedMessage {
                 target_id,
                 behavior_name: behavior_name.to_string(),
-                payload: MessagePayload::from_vec(args),
+                payload: MessagePayload::from_slice(args),
                 sender: self.current_actor.unwrap_or(0),
                 trace_id: out_trace,
             })
@@ -2292,7 +2292,7 @@ impl Runtime {
             tx[target_shard as usize].try_send(CrossShardMsg::DeliverNamedMessageWithObjects {
                 target_id,
                 behavior_name: behavior_name.to_string(),
-                payload: args,
+                payload: args.to_vec(),
                 objects,
                 sender: self.current_actor.unwrap_or(0),
                 trace_id: out_trace,
@@ -2337,7 +2337,7 @@ impl Runtime {
                 return self.send_cross_shard_message(
                     target_id,
                     behavior_id,
-                    args.to_vec(),
+                    args,
                     out_trace,
                     None,
                 );
@@ -2383,7 +2383,7 @@ impl Runtime {
                 self.send_cross_shard_message(
                     stable_id,
                     behavior_id,
-                    args,
+                    &args,
                     out_trace,
                     Some(grain_id.clone()),
                 );
@@ -2525,7 +2525,7 @@ impl Runtime {
                 self.send_cross_shard_message(
                     target_id,
                     behavior_id,
-                    args.to_vec(),
+                    args,
                     out_trace.clone(),
                     None,
                 );
