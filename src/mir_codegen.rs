@@ -4136,6 +4136,90 @@ mod optimize_tests {
     }
 
     #[test]
+    fn test_consuming_send_plan_propagates_through_single_use_load() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("send_loaded_unique", None);
+        let target = b.add_param("target", Type::unit());
+        let payload = b.add_temp(arr_ty.clone());
+        let moved = b.add_temp(arr_ty);
+        let sent = b.add_temp(Type::unit());
+
+        b.assign(payload, mir::RValue::ArrayLit(vec![]));
+        b.assign(moved, mir::RValue::Load(payload));
+        b.assign(
+            sent,
+            mir::RValue::Send {
+                actor: target,
+                behavior_idx: 0,
+                args: vec![moved],
+                remote: false,
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+
+        let plan = plan_consuming_send_args(&b.build());
+        assert_eq!(plan.args_by_stmt.get(&(0, 2)), Some(&vec![moved]));
+    }
+
+    #[test]
+    fn test_consuming_send_plan_propagates_through_load_chain() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("send_loaded_chain", None);
+        let target = b.add_param("target", Type::unit());
+        let payload = b.add_temp(arr_ty.clone());
+        let moved_once = b.add_temp(arr_ty.clone());
+        let moved_twice = b.add_temp(arr_ty);
+        let sent = b.add_temp(Type::unit());
+
+        b.assign(payload, mir::RValue::ArrayLit(vec![]));
+        b.assign(moved_once, mir::RValue::Load(payload));
+        b.assign(moved_twice, mir::RValue::Load(moved_once));
+        b.assign(
+            sent,
+            mir::RValue::Send {
+                actor: target,
+                behavior_idx: 0,
+                args: vec![moved_twice],
+                remote: false,
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+
+        let plan = plan_consuming_send_args(&b.build());
+        assert_eq!(plan.args_by_stmt.get(&(0, 3)), Some(&vec![moved_twice]));
+    }
+
+    #[test]
+    fn test_consuming_send_plan_rejects_load_chain_with_competing_source_use() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("send_loaded_shared", None);
+        let target = b.add_param("target", Type::unit());
+        let payload = b.add_temp(arr_ty.clone());
+        let len = b.add_temp(Type::int());
+        let moved = b.add_temp(arr_ty);
+        let sent = b.add_temp(Type::unit());
+
+        b.assign(payload, mir::RValue::ArrayLit(vec![]));
+        b.assign(len, mir::RValue::ArrayLen(payload));
+        b.assign(moved, mir::RValue::Load(payload));
+        b.assign(
+            sent,
+            mir::RValue::Send {
+                actor: target,
+                behavior_idx: 0,
+                args: vec![moved],
+                remote: false,
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+
+        assert!(
+            plan_consuming_send_args(&b.build()).args_by_stmt.is_empty(),
+            "a transfer source with another use must remain conservative"
+        );
+    }
+
+    #[test]
     fn test_consuming_send_plan_rejects_payload_with_competing_use() {
         let arr_ty = Type::Array(Box::new(Type::int()));
         let mut b = mir::FunctionBuilder::new("send_shared", None);
