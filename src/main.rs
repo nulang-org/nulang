@@ -1596,13 +1596,7 @@ fn run_effects_cmd(args: &[String]) -> NuResult<()> {
     // introspective and must be able to *report* FS/Net/OS effects without
     // requiring execution permissions.
     let report_grants = vec!["fs".to_string(), "net".to_string(), "os".to_string()];
-    let (ast, _) = run_frontend(
-        &source,
-        Some(file),
-        false,
-        &report_grants,
-        false,
-    )?;
+    let (ast, _) = run_frontend(&source, Some(file), false, &report_grants, false)?;
 
     let mut checker = EffectChecker::new();
     checker.set_resource_grants(&report_grants);
