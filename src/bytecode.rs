@@ -669,6 +669,18 @@ pub struct ExportTableEntry {
     pub type_sig: String,
 }
 
+/// Compiler-owned semantic identity attached to one bytecode effect opcode.
+///
+/// `id` is the raw `EffectSiteId` digest produced from backend-independent
+/// MIR. The bytecode PC is artifact-local lookup metadata only and does not
+/// participate in identity derivation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectSiteMetadata {
+    pub pc: usize,
+    pub id: [u8; 32],
+    pub effect_operation: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodeModule {
     pub name: String,
@@ -719,6 +731,13 @@ pub struct CodeModule {
     pub debug_functions: Vec<DebugFunctionInfo>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub export_table: Vec<ExportTableEntry>,
+    /// Exact bytecode effect-opcode PC -> compiler-owned semantic site ID.
+    ///
+    /// This is additive NBC JSON metadata. Old artifacts omit it and load with
+    /// an empty vector; opcode bytes and the frozen NBC format version do not
+    /// change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effect_sites: Vec<EffectSiteMetadata>,
 }
 
 impl CodeModule {
@@ -742,6 +761,7 @@ impl CodeModule {
             line_table: Vec::new(),
             debug_functions: Vec::new(),
             export_table: Vec::new(),
+            effect_sites: Vec::new(),
         }
     }
 
@@ -786,6 +806,14 @@ impl CodeModule {
             .iter()
             .find(|&&(_, l)| l >= line)
             .map(|&(pc, l)| (pc, l))
+    }
+
+    /// Semantic effect-site metadata for exactly this bytecode PC.
+    pub fn effect_site_at(&self, pc: usize) -> Option<&EffectSiteMetadata> {
+        self.effect_sites
+            .binary_search_by_key(&pc, |site| site.pc)
+            .ok()
+            .map(|index| &self.effect_sites[index])
     }
 
     pub fn add_constant(&mut self, c: Constant) -> usize {
