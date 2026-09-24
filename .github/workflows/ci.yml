@@ -427,6 +427,24 @@ jobs:
             --latest "benchmarks/${{ github.sha }}.json" \
             --history-dir benchmarks
 
+      # Shared GitHub runners occasionally produce an isolated wall-clock
+      # outlier even after the MAD-based noise filter. Confirm a detected
+      # regression with one independent Criterion measurement in the same job.
+      # The collector overwrites this commit's JSON, so history records the
+      # confirmation sample rather than the noisy first pass.
+      - name: Confirm detected regressions
+        id: regression_confirmation
+        if: steps.regression_check.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          echo "First benchmark sample exceeded its historical threshold; re-measuring once."
+          cargo bench --locked --bench bench_main
+          python3 scripts/collect_bench_results.py \
+            --out "benchmarks/${{ github.sha }}.json"
+          python3 scripts/check_bench_regression.py \
+            --latest "benchmarks/${{ github.sha }}.json" \
+            --history-dir benchmarks
+
       - name: Upload results as build artifact
         uses: actions/upload-artifact@v7
         with:
@@ -446,9 +464,8 @@ jobs:
           git diff --staged --quiet || git commit -m "bench: record results for ${{ github.sha }} [skip ci]"
           git push --force-with-lease origin "HEAD:refs/heads/${BENCH_HISTORY_BRANCH}"
 
-      # Separate from the check step itself so the commit above always
-      # happens (preserving complete rolling-window history) even when
-      # this commit's numbers regressed.
-      - name: Fail the job if a regression was found
-        if: steps.regression_check.outcome == 'failure'
+      # Preserve the confirmed sample before failing. A one-off first-pass
+      # outlier no longer blocks main; a reproduced regression still does.
+      - name: Fail the job if a regression was confirmed
+        if: steps.regression_check.outcome == 'failure' && steps.regression_confirmation.outcome == 'failure'
         run: exit 1

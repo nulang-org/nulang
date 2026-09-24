@@ -37,8 +37,15 @@ prior samples in the window before it's gated at all — new or rarely-run
 benchmarks are reported as skipped, not failed, until enough history
 accumulates.
 
+If the first sample exceeds its noise-adjusted threshold, CI performs one
+independent Criterion re-measurement in the same job and applies the same gate
+again. Only a regression reproduced by that confirmation sample fails `main`.
+The confirmation result becomes the canonical JSON persisted for that commit,
+so a known first-pass outlier does not contaminate the rolling history.
+
 This intentionally does not need a dedicated non-shared runner: the
-noise-adaptive threshold is the fix, not the infrastructure change.
+noise-adaptive threshold plus confirmation measurement filters isolated shared-
+runner outliers without weakening the regression threshold.
 
 ## Cross-runtime Savina baselines
 
