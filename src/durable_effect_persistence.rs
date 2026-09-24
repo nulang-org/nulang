@@ -582,6 +582,55 @@ mod tests {
     }
 
     #[test]
+    fn v1_records_remain_readable_after_v2_write_upgrade() {
+        let persisted = DurableEffectPersistenceRecord::from_effect(completed_effect());
+        let bytes = persisted.to_json().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["version"] = serde_json::Value::from(DURABLE_EFFECT_PERSISTENCE_VERSION_V1);
+        let v1_bytes = serde_json::to_vec(&value).unwrap();
+
+        let restored = DurableEffectPersistenceRecord::from_json(&v1_bytes).unwrap();
+        assert_eq!(
+            restored
+                .effect()
+                .recovery_action_for_request(b"order=7&amount=10")
+                .unwrap(),
+            DurableEffectRecoveryAction::ReplayRecordedResult(b"charged")
+        );
+    }
+
+    #[test]
+    fn v2_round_trip_preserves_no_automatic_retry_semantics() {
+        let spec = DurableEffectSpec::new(
+            DurableEffectId::derive(42, "voice-call", 0, "Comms.call"),
+            "Comms.call",
+            EffectBoundary::External,
+            DeliverySemantics::NoAutomaticRetry,
+        );
+        let id = spec.id;
+        let persisted = DurableEffectPersistenceRecord::from_effect(
+            DurableEffectRecord::prepare(spec, b"call"),
+        );
+        let bytes = persisted.to_json().unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["version"].as_u64(),
+            Some(DURABLE_EFFECT_PERSISTENCE_VERSION as u64)
+        );
+
+        let restored = DurableEffectPersistenceRecord::from_json(&bytes).unwrap();
+        assert_eq!(
+            restored
+                .effect()
+                .recovery_action_for_request(b"call")
+                .unwrap(),
+            DurableEffectRecoveryAction::RefuseAutomaticRedispatch {
+                operation_id: id,
+            }
+        );
+    }
+
+    #[test]
     fn unknown_persistence_version_fails_closed() {
         let persisted = DurableEffectPersistenceRecord::from_effect(completed_effect());
         let bytes = persisted.to_json().unwrap();
