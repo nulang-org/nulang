@@ -50,6 +50,22 @@ pub struct AllocationCommand {
     pub state: AllocationCommandState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocationCommandClaim {
+    pub command: AllocationCommand,
+    pub owner: String,
+    pub generation: u64,
+    pub expires_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AllocationCommandClaimRecord {
+    owner: String,
+    generation: u64,
+    expires_at_unix_ms: u64,
+    active: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitOutcome {
     Applied,
@@ -71,6 +87,7 @@ pub enum StoreError {
         actual_epoch: u64,
     },
     CommandNotFound(String),
+    CommandClaim(String),
 }
 
 impl fmt::Display for StoreError {
@@ -96,6 +113,9 @@ impl fmt::Display for StoreError {
                 "stale placement plan for {deployment_id} replica {replica}: expected epoch {expected_epoch}, current epoch {actual_epoch}"
             ),
             Self::CommandNotFound(id) => write!(f, "allocation command {id} was not found"),
+            Self::CommandClaim(message) => {
+                write!(f, "allocation command claim error: {message}")
+            }
         }
     }
 }
@@ -159,7 +179,29 @@ pub trait ControlStore: Send + Sync {
             }))
     }
 
-    /// Idempotently mark a durable outbox command acknowledged.
+    /// Atomically claim the next safe command for one dispatcher.
+    ///
+    /// An unresolved Stop for a logical replica blocks claiming a Start for
+    /// that same replica, even when another dispatcher currently owns the Stop
+    /// lease. Reclaims increment a durable generation so a stale lease holder
+    /// cannot ACK after losing ownership.
+    fn claim_next_command(
+        &self,
+        owner: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+    ) -> Result<Option<AllocationCommandClaim>, StoreError>;
+
+    /// ACK only when the durable claim generation still belongs to this
+    /// dispatcher. An already-acknowledged command is idempotently successful.
+    fn acknowledge_claimed_command(&self, claim: &AllocationCommandClaim)
+        -> Result<(), StoreError>;
+
+    /// Release a matching active claim after a delivery failure. A stale owner
+    /// cannot release a newer dispatcher's claim.
+    fn release_command_claim(&self, claim: &AllocationCommandClaim) -> Result<(), StoreError>;
+
+    /// Legacy single-dispatcher acknowledgement path.
     fn acknowledge_command(&self, command_id: &str) -> Result<(), StoreError>;
 }
 
@@ -173,6 +215,8 @@ struct PersistedState {
     allocations: Vec<ObservedAllocation>,
     #[serde(default)]
     commands: BTreeMap<String, AllocationCommand>,
+    #[serde(default)]
+    command_claims: BTreeMap<String, AllocationCommandClaimRecord>,
 }
 
 impl PersistedState {
@@ -348,12 +392,169 @@ impl PersistedState {
             .collect()
     }
 
+    fn claim_next_command(
+        &mut self,
+        owner: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+    ) -> Result<Option<AllocationCommandClaim>, StoreError> {
+        if owner.trim().is_empty() {
+            return Err(StoreError::CommandClaim(
+                "dispatcher owner must not be empty".into(),
+            ));
+        }
+        if lease_ms == 0 {
+            return Err(StoreError::CommandClaim(
+                "dispatcher lease must be greater than zero".into(),
+            ));
+        }
+        let expires_at_unix_ms = now_unix_ms
+            .checked_add(lease_ms)
+            .ok_or_else(|| StoreError::CommandClaim("dispatcher lease expiry overflow".into()))?;
+
+        let mut candidates = self.pending_commands();
+        candidates.sort_by(|left, right| {
+            command_priority(left.kind)
+                .cmp(&command_priority(right.kind))
+                .then_with(|| left.deployment_id.cmp(&right.deployment_id))
+                .then_with(|| left.replica.cmp(&right.replica))
+                .then_with(|| left.epoch.cmp(&right.epoch))
+                .then_with(|| left.command_id.cmp(&right.command_id))
+        });
+
+        for command in candidates {
+            if command.kind == AllocationCommandKind::Start
+                && self.commands.values().any(|candidate| {
+                    candidate.state == AllocationCommandState::Pending
+                        && candidate.kind == AllocationCommandKind::Stop
+                        && candidate.deployment_id == command.deployment_id
+                        && candidate.replica == command.replica
+                })
+            {
+                continue;
+            }
+
+            let claim_available = self
+                .command_claims
+                .get(&command.command_id)
+                .map(|claim| !claim.active || claim.expires_at_unix_ms <= now_unix_ms)
+                .unwrap_or(true);
+            if !claim_available {
+                continue;
+            }
+
+            let record = self
+                .command_claims
+                .entry(command.command_id.clone())
+                .or_default();
+            record.generation = record.generation.checked_add(1).ok_or_else(|| {
+                StoreError::CommandClaim(format!(
+                    "claim generation overflow for {}",
+                    command.command_id
+                ))
+            })?;
+            record.owner = owner.to_owned();
+            record.expires_at_unix_ms = expires_at_unix_ms;
+            record.active = true;
+
+            return Ok(Some(AllocationCommandClaim {
+                command,
+                owner: record.owner.clone(),
+                generation: record.generation,
+                expires_at_unix_ms,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    fn acknowledge_claimed_command(
+        &mut self,
+        claim: &AllocationCommandClaim,
+    ) -> Result<(), StoreError> {
+        let Some(command) = self.commands.get(&claim.command.command_id) else {
+            return Err(StoreError::CommandNotFound(
+                claim.command.command_id.clone(),
+            ));
+        };
+        if command.state == AllocationCommandState::Acknowledged {
+            return Ok(());
+        }
+
+        let Some(current) = self.command_claims.get_mut(&claim.command.command_id) else {
+            return Err(StoreError::CommandClaim(format!(
+                "{} has no durable claim",
+                claim.command.command_id
+            )));
+        };
+        if !current.active || current.owner != claim.owner || current.generation != claim.generation
+        {
+            return Err(StoreError::CommandClaim(format!(
+                "{} claim {} owned by {} is stale; current claim is generation {} owned by {}",
+                claim.command.command_id,
+                claim.generation,
+                claim.owner,
+                current.generation,
+                current.owner
+            )));
+        }
+
+        self.commands
+            .get_mut(&claim.command.command_id)
+            .expect("command existence checked above")
+            .state = AllocationCommandState::Acknowledged;
+        current.active = false;
+        Ok(())
+    }
+
+    fn release_command_claim(&mut self, claim: &AllocationCommandClaim) -> Result<(), StoreError> {
+        let Some(command) = self.commands.get(&claim.command.command_id) else {
+            return Err(StoreError::CommandNotFound(
+                claim.command.command_id.clone(),
+            ));
+        };
+        if command.state == AllocationCommandState::Acknowledged {
+            return Ok(());
+        }
+
+        let Some(current) = self.command_claims.get_mut(&claim.command.command_id) else {
+            return Err(StoreError::CommandClaim(format!(
+                "{} has no durable claim",
+                claim.command.command_id
+            )));
+        };
+        if !current.active || current.owner != claim.owner || current.generation != claim.generation
+        {
+            return Err(StoreError::CommandClaim(format!(
+                "{} claim {} owned by {} cannot release current generation {} owned by {}",
+                claim.command.command_id,
+                claim.generation,
+                claim.owner,
+                current.generation,
+                current.owner
+            )));
+        }
+
+        current.active = false;
+        Ok(())
+    }
+
     fn acknowledge_command(&mut self, command_id: &str) -> Result<(), StoreError> {
         let Some(command) = self.commands.get_mut(command_id) else {
             return Err(StoreError::CommandNotFound(command_id.to_owned()));
         };
         command.state = AllocationCommandState::Acknowledged;
+        if let Some(claim) = self.command_claims.get_mut(command_id) {
+            claim.active = false;
+        }
         Ok(())
+    }
+}
+
+fn command_priority(kind: AllocationCommandKind) -> u8 {
+    match kind {
+        AllocationCommandKind::Stop => 0,
+        AllocationCommandKind::Start => 1,
     }
 }
 
@@ -485,6 +686,35 @@ impl ControlStore for MemoryControlStore {
             .pending_commands())
     }
 
+    fn claim_next_command(
+        &self,
+        owner: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+    ) -> Result<Option<AllocationCommandClaim>, StoreError> {
+        self.state
+            .lock()
+            .expect("control-store mutex poisoned")
+            .claim_next_command(owner, now_unix_ms, lease_ms)
+    }
+
+    fn acknowledge_claimed_command(
+        &self,
+        claim: &AllocationCommandClaim,
+    ) -> Result<(), StoreError> {
+        self.state
+            .lock()
+            .expect("control-store mutex poisoned")
+            .acknowledge_claimed_command(claim)
+    }
+
+    fn release_command_claim(&self, claim: &AllocationCommandClaim) -> Result<(), StoreError> {
+        self.state
+            .lock()
+            .expect("control-store mutex poisoned")
+            .release_command_claim(claim)
+    }
+
     fn acknowledge_command(&self, command_id: &str) -> Result<(), StoreError> {
         self.state
             .lock()
@@ -587,6 +817,26 @@ impl ControlStore for JsonFileControlStore {
             .lock()
             .expect("control-store mutex poisoned")
             .pending_commands())
+    }
+
+    fn claim_next_command(
+        &self,
+        owner: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+    ) -> Result<Option<AllocationCommandClaim>, StoreError> {
+        self.mutate(|state| state.claim_next_command(owner, now_unix_ms, lease_ms))
+    }
+
+    fn acknowledge_claimed_command(
+        &self,
+        claim: &AllocationCommandClaim,
+    ) -> Result<(), StoreError> {
+        self.mutate(|state| state.acknowledge_claimed_command(claim))
+    }
+
+    fn release_command_claim(&self, claim: &AllocationCommandClaim) -> Result<(), StoreError> {
+        self.mutate(|state| state.release_command_claim(claim))
     }
 
     fn acknowledge_command(&self, command_id: &str) -> Result<(), StoreError> {
@@ -772,6 +1022,26 @@ impl ControlStore for PostgresControlStore {
 
     fn pending_commands(&self) -> Result<Vec<AllocationCommand>, StoreError> {
         Ok(self.load_state()?.pending_commands())
+    }
+
+    fn claim_next_command(
+        &self,
+        owner: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+    ) -> Result<Option<AllocationCommandClaim>, StoreError> {
+        self.mutate(|state| state.claim_next_command(owner, now_unix_ms, lease_ms))
+    }
+
+    fn acknowledge_claimed_command(
+        &self,
+        claim: &AllocationCommandClaim,
+    ) -> Result<(), StoreError> {
+        self.mutate(|state| state.acknowledge_claimed_command(claim))
+    }
+
+    fn release_command_claim(&self, claim: &AllocationCommandClaim) -> Result<(), StoreError> {
+        self.mutate(|state| state.release_command_claim(claim))
     }
 
     fn acknowledge_command(&self, command_id: &str) -> Result<(), StoreError> {
@@ -967,6 +1237,100 @@ mod tests {
         store.acknowledge_command(&command.command_id).unwrap();
         store.acknowledge_command(&command.command_id).unwrap();
         assert!(store.pending_commands().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_claim_generation_fences_stale_dispatcher_and_stop_blocks_start() {
+        let store = MemoryControlStore::default();
+        let old = ObservedAllocation {
+            deployment_id: "api".into(),
+            revision: 1,
+            replica: 0,
+            node_id: 1,
+            epoch: 7,
+            state: AllocationState::Running,
+        };
+        store.seed_allocation(old.clone());
+
+        let eval = evaluation("eval-claims");
+        store.record_evaluation(&eval).unwrap();
+        let plan = plan_evaluation(&eval, &deployment(), &[node(1), node(2)], &[old]).unwrap();
+        store.commit_plan(&eval, &plan).unwrap();
+
+        let first = store
+            .claim_next_command("dispatcher-a", 100, 10)
+            .unwrap()
+            .expect("first dispatcher should claim Stop");
+        assert_eq!(first.command.kind, AllocationCommandKind::Stop);
+        assert_eq!(first.generation, 1);
+
+        assert!(
+            store
+                .claim_next_command("dispatcher-b", 105, 10)
+                .unwrap()
+                .is_none(),
+            "Start must remain blocked while the Stop is unresolved"
+        );
+
+        let replacement = store
+            .claim_next_command("dispatcher-b", 111, 10)
+            .unwrap()
+            .expect("expired Stop claim should be reclaimable");
+        assert_eq!(replacement.command.command_id, first.command.command_id);
+        assert_eq!(replacement.generation, 2);
+        assert!(matches!(
+            store.acknowledge_claimed_command(&first),
+            Err(StoreError::CommandClaim(_))
+        ));
+
+        store.acknowledge_claimed_command(&replacement).unwrap();
+        let start = store
+            .claim_next_command("dispatcher-b", 112, 10)
+            .unwrap()
+            .expect("Start should become claimable after Stop ACK");
+        assert_eq!(start.command.kind, AllocationCommandKind::Start);
+    }
+
+    #[test]
+    fn test_json_store_persists_command_claim_generation() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "nulang-cloud-claims-{}-{unique}.json",
+            std::process::id()
+        ));
+
+        let first_generation;
+        {
+            let store = JsonFileControlStore::open(&path).unwrap();
+            let eval = evaluation("eval-claim-durable");
+            store.record_evaluation(&eval).unwrap();
+            let plan = plan_evaluation(&eval, &deployment(), &[node(9)], &[]).unwrap();
+            store.commit_plan(&eval, &plan).unwrap();
+            let claim = store
+                .claim_next_command("dispatcher-a", 100, 10)
+                .unwrap()
+                .unwrap();
+            first_generation = claim.generation;
+        }
+
+        let reopened = JsonFileControlStore::open(&path).unwrap();
+        assert!(
+            reopened
+                .claim_next_command("dispatcher-b", 105, 10)
+                .unwrap()
+                .is_none(),
+            "unexpired claim must survive controller restart"
+        );
+        let reclaimed = reopened
+            .claim_next_command("dispatcher-b", 111, 10)
+            .unwrap()
+            .expect("expired durable claim must be reclaimable");
+        assert_eq!(reclaimed.generation, first_generation + 1);
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
