@@ -1265,7 +1265,7 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         let actor_id = rt.current_actor?;
         let msg = rt.actors.get_mut(&actor_id)?.mailbox.pop()?;
         // ORCA receiver protocol: hold heap pointers carried by the message.
-        rt.hold_payload_refs(actor_id, &*msg.payload);
+        rt.hold_payload_refs(actor_id, &*msg.payload, msg.ownership_handoff_mask);
         let val = msg
             .payload
             .first()
@@ -2198,7 +2198,11 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                 actor.mailbox.pop()?
             };
             // ORCA receiver protocol: hold heap pointers carried by the message.
-            (*self.runtime).hold_payload_refs(self.actor_id, &*msg.payload);
+            (*self.runtime).hold_payload_refs(
+                self.actor_id,
+                &*msg.payload,
+                msg.ownership_handoff_mask,
+            );
             let val = msg
                 .payload
                 .first()
