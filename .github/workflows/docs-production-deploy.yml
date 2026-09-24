@@ -6,15 +6,23 @@ name: Docs Production Deploy
 # in docs/wrangler.toml. This workflow exists so a stale/disconnected Git
 # integration does not leave production pinned to an old commit.
 #
-# Required GitHub Actions secrets:
-#   CLOUDFLARE_PAGES_API_TOKEN
-#   CLOUDFLARE_ACCOUNT_ID
+# GitHub Actions secret:
+#   CLOUDFLARE_PAGES_API_TOKEN (preferred) or CLOUDFLARE_API_TOKEN
 #
-# The API token should use the account-level Cloudflare Pages Write/Edit
-# permission, scoped to the Nulang Cloudflare account.
+# The token should use the account-level Cloudflare Pages Write/Edit
+# permission, scoped to the Nulang Cloudflare account. CLOUDFLARE_ACCOUNT_ID
+# is optional because the repository already publishes the account ID used by
+# the Pages/Email integration.
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'playground/web/**'
+      - 'crates/nulang-playground/**'
+      - '.github/workflows/docs-production-deploy.yml'
 
 concurrency:
   group: docs-production-deploy
@@ -80,25 +88,40 @@ jobs:
           test -s docs/dist/playground/nulang_playground.wasm
           echo "EXPECTED_HOMEPAGE_SHA=$(sha256sum docs/dist/index.html | awk '{print $1}')" >> "$GITHUB_ENV"
 
-      - name: Validate Cloudflare deployment credentials
+      - name: Detect Cloudflare deployment credentials
+        id: cloudflare
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PAGES_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PAGES_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
-            echo "::error::Missing GitHub Actions secret CLOUDFLARE_PAGES_API_TOKEN."
-            exit 1
-          fi
-          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-            echo "::error::Missing GitHub Actions secret CLOUDFLARE_ACCOUNT_ID."
-            exit 1
+          account_id="${CLOUDFLARE_ACCOUNT_ID:-ad5ebd496c88731aa7a6b4cfca58e612}"
+          echo "account_id=$account_id" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "Cloudflare deployment credentials are available."
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No Cloudflare Pages API token is configured in GitHub Actions."
           fi
 
+      - name: Fail manual deploy when credentials are missing
+        if: github.event_name == 'workflow_dispatch' && steps.cloudflare.outputs.available != 'true'
+        run: |
+          echo "::error::Configure CLOUDFLARE_PAGES_API_TOKEN (preferred) or CLOUDFLARE_API_TOKEN before a manual production deploy."
+          exit 1
+
+      - name: Explain skipped automatic deploy
+        if: github.event_name == 'push' && steps.cloudflare.outputs.available != 'true'
+        run: |
+          echo "::warning::Site build passed, but production deployment was skipped because no Cloudflare Pages API token is configured."
+
       - name: Deploy to Cloudflare Pages
+        if: steps.cloudflare.outputs.available == 'true'
         working-directory: docs
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PAGES_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PAGES_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ steps.cloudflare.outputs.account_id }}
         run: |
           npx --yes wrangler@4 pages deploy dist \
             --project-name=nulang-docs \
@@ -107,6 +130,7 @@ jobs:
             --commit-message="Production deploy $DEPLOY_SHA"
 
       - name: Verify Pages project and custom domain match the selected commit
+        if: steps.cloudflare.outputs.available == 'true'
         shell: bash
         run: |
           for attempt in {1..12}; do
