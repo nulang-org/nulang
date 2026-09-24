@@ -197,6 +197,21 @@ impl Parser {
 
     #[tracing::instrument(level = "debug", skip(self))]
     pub fn parse_module(&mut self) -> NuResult<AstModule> {
+        self.parse_module_with_options(false)
+    }
+
+    /// Parse a module without desugaring module-level `let` declarations into
+    /// the synthetic `__main` function. This is for source-inspection tooling
+    /// that must report declarations as written; compilation continues to use
+    /// `Parser::parse_module`.
+    pub fn parse_module_preserving_top_level_lets(&mut self) -> NuResult<AstModule> {
+        self.parse_module_with_options(true)
+    }
+
+    fn parse_module_with_options(
+        &mut self,
+        preserve_top_level_lets: bool,
+    ) -> NuResult<AstModule> {
         self.diagnostics.clear();
         let mut decls = Vec::new();
         let mut pending_lets: Vec<Decl> = Vec::new();
@@ -218,9 +233,16 @@ impl Parser {
             let decl_start = self.pos;
             match self.parse_decl() {
                 Ok(mut decl) => {
-                    // Collect LetBinding decls — they'll be wrapped into main's body.
+                    // Compilation desugars module-level bindings into main's
+                    // body. Source-query tooling can retain the declarations
+                    // verbatim so symbols such as `let answer = 42` remain
+                    // addressable by name.
                     if matches!(decl, Decl::LetBinding { .. }) {
-                        pending_lets.push(decl);
+                        if preserve_top_level_lets {
+                            decls.push(decl);
+                        } else {
+                            pending_lets.push(decl);
+                        }
                     } else {
                         // If this is fn main() and we have pending lets, wrap them in.
                         if let Decl::Function { name, ref body, .. } = &decl {
