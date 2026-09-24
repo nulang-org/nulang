@@ -15,11 +15,17 @@ An experimental v0alpha1 durability/admission subset is implemented in
 implementation covers compiler artifact identity, an exact BLAKE3 digest binding
 to the emitted bytecode bytes, durable actor persistence classification,
 state-schema semantic identity, schema versions, migration topology,
-deterministic manifest hashing, and structural upgrade preflight.
+a compiler-derived union of typed effect families. Typed function/behavior rows
+are authoritative; executable constant bodies are also scanned for direct
+effects, and any call/runtime helper whose effect row cannot be proven from
+checked HIR marks the inventory incomplete. The explicit completeness bit also
+fails closed for open rows. Deterministic manifest hashing and structural
+upgrade preflight remain unchanged.
 
 This does **not** resolve the RFC or complete its full proposed surface:
-effects, authority inventories, interfaces, resources, provenance attestations,
-and canonical migration-body identity remain follow-up work. Migration identity
+operation-level effect classification/replay metadata, authority inventories,
+interfaces, resources, provenance attestations, and canonical migration-body
+identity remain follow-up work. Migration identity
 is explicitly marked `topology-only` until migration expressions have a
 canonical semantic representation.
 
