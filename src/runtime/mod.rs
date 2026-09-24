@@ -185,6 +185,11 @@ const LLM_SUSPEND_MARKER: &str = "__llm_ask_pending__";
 /// dehydration.
 const DEHYDRATE_CHECK_INTERVAL: u64 = 50;
 
+/// Backoff before retrying a durable workflow timer whose TimerFired commit
+/// could not be persisted. The durable TimerSet remains authoritative, so the
+/// live runtime must keep retrying rather than lose the timer until restart.
+const DURABLE_TIMER_COMMIT_RETRY_MS: u64 = 100;
+
 /// Choose the `waiting_signal` value for a freshly captured suspension:
 /// the awaited signal's name for a signal wait, or the reserved LLM
 /// marker for a workflow step suspended on a background LLM call (plain
@@ -1663,14 +1668,23 @@ impl Runtime {
                         }
                     }
                     let seq = self.next_sequence(actor_id);
-                    let _ = self.persistence.append_workflow_event(
+                    if let Err(error) = workflow::commit_workflow_event(
+                        self,
                         actor_id,
                         WorkflowEvent::StepCompleted {
                             sequence: seq,
                             step_name,
                         },
-                    );
-                    self.checkpoint_actor(actor_id);
+                    ) {
+                        tracing::warn!(
+                            actor_id,
+                            %error,
+                            "nulang-persist: signal-resumed workflow completion was not durably committed"
+                        );
+                        if let Some(actor) = self.actors.get_mut(&actor_id) {
+                            actor.state = ActorState::Suspended;
+                        }
+                    }
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
@@ -1710,10 +1724,34 @@ impl Runtime {
                     self.maybe_schedule_receive_wait(actor_id, receive_timeout);
                 }
             }
-            Err(_) => {
-                // Step failed after resumption: run saga compensations.
+            Err(error) => {
+                // A resumed workflow failure is itself durable progress. Do
+                // not run compensation unless the failure marker and current
+                // state commit on the same fenced atomic tail.
                 if self.actor_is_workflow(actor_id) {
-                    self.run_saga_compensation(actor_id, behavior_idx);
+                    let seq = self.next_sequence(actor_id);
+                    let failed_step = self.step_name_for(actor_id, behavior_idx);
+                    match workflow::commit_workflow_event(
+                        self,
+                        actor_id,
+                        WorkflowEvent::StepFailed {
+                            sequence: seq,
+                            step_name: failed_step,
+                            error: error.to_string(),
+                        },
+                    ) {
+                        Ok(()) => self.run_saga_compensation(actor_id, behavior_idx),
+                        Err(commit_error) => {
+                            tracing::warn!(
+                                actor_id,
+                                %commit_error,
+                                "nulang-persist: signal-resumed workflow failure was not durably committed"
+                            );
+                            if let Some(actor) = self.actors.get_mut(&actor_id) {
+                                actor.state = ActorState::Suspended;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3879,80 +3917,120 @@ impl Runtime {
 
             let mut processed = false;
             if self.has_native_handler(actor_id, behavior_idx) {
-                // Journal the message before handling so recovery can replay it.
+                // Accept workflow commands on the same RFC 0022 atomic tail
+                // used by their completion/failure transitions. Plain
+                // persistent actors retain the compatibility journal path.
                 if self.actor_is_persistent(actor_id) {
-                    let seq = self.next_sequence(actor_id);
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                    let _ = self.persistence.append_journal(
-                        actor_id,
-                        JournalEntry {
-                            sequence: seq,
-                            behavior_id: msg.behavior_id,
-                            payload,
-                        },
-                    );
+                    let result = if self.actor_is_workflow(actor_id) {
+                        workflow::commit_workflow_command(self, actor_id, msg.behavior_id, payload)
+                    } else {
+                        let sequence = self.next_sequence(actor_id);
+                        self.persistence.append_journal(
+                            actor_id,
+                            JournalEntry {
+                                sequence,
+                                behavior_id: msg.behavior_id,
+                                payload,
+                            },
+                        )
+                    };
+                    if let Err(error) = result {
+                        if self.actor_is_workflow(actor_id) {
+                            tracing::warn!(
+                                actor_id,
+                                behavior_id = msg.behavior_id,
+                                %error,
+                                "nulang-persist: refusing to execute workflow command without durable acceptance"
+                            );
+                            if let Some(actor) = self.actors.get_mut(&actor_id) {
+                                let _ = actor.mailbox.push_local(msg.clone());
+                                actor.state = ActorState::Suspended;
+                            }
+                            self.current_actor = None;
+                            return;
+                        }
+                    }
                 }
                 processed = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload);
-                if processed {
+                if processed && !self.actor_is_workflow(actor_id) {
                     self.checkpoint_actor(actor_id);
                 }
             }
             if !processed && self.has_bytecode_handler(actor_id, behavior_idx) {
-                // Journal before executing bytecode as well.
+                // Workflow command acceptance is atomic and fenced before
+                // execution. This leaves an accepted command replayable if the
+                // process dies before StepCompleted/StepFailed commits.
                 if self.actor_is_persistent(actor_id) {
-                    let seq = self.next_sequence(actor_id);
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                    let _ = self.persistence.append_journal(
-                        actor_id,
-                        JournalEntry {
-                            sequence: seq,
-                            behavior_id: msg.behavior_id,
-                            payload,
-                        },
-                    );
+                    let result = if self.actor_is_workflow(actor_id) {
+                        workflow::commit_workflow_command(self, actor_id, msg.behavior_id, payload)
+                    } else {
+                        let sequence = self.next_sequence(actor_id);
+                        self.persistence.append_journal(
+                            actor_id,
+                            JournalEntry {
+                                sequence,
+                                behavior_id: msg.behavior_id,
+                                payload,
+                            },
+                        )
+                    };
+                    if let Err(error) = result {
+                        if self.actor_is_workflow(actor_id) {
+                            tracing::warn!(
+                                actor_id,
+                                behavior_id = msg.behavior_id,
+                                %error,
+                                "nulang-persist: refusing to execute workflow command without durable acceptance"
+                            );
+                            if let Some(actor) = self.actors.get_mut(&actor_id) {
+                                let _ = actor.mailbox.push_local(msg.clone());
+                                actor.state = ActorState::Suspended;
+                            }
+                            self.current_actor = None;
+                            return;
+                        }
+                    }
                 }
                 let payload = msg.payload.clone();
-                // Enable non-blocking LLM suspension for this
-                // scheduler-driven behavior invocation. Nested synchronous
-                // entry points (ask_actor_sync) force it back off.
                 let saved_suspend = self.suspend_enabled;
                 self.suspend_enabled = true;
                 let result = self.run_bytecode_behavior(actor_id, behavior_idx, &payload);
                 self.suspend_enabled = saved_suspend;
                 match result {
                     Ok(_) => {
-                        self.checkpoint_actor(actor_id);
+                        if !self.actor_is_workflow(actor_id) {
+                            self.checkpoint_actor(actor_id);
+                        }
                         processed = true;
                     }
                     Err(crate::types::NuError::Suspended(_)) => {
-                        // The step yielded waiting for a signal or a
-                        // background LLM call. Do not mark it completed, do
-                        // not run compensations, and do not checkpoint the
-                        // partially-mutated durable state: persist only the
-                        // suspension marker so recovery can re-drive the
-                        // step from its last pre-suspend checkpoint.
                         self.persist_suspension_marker(actor_id);
                         processed = false;
                     }
                     Err(e) => {
-                        self.checkpoint_actor(actor_id);
-                        // A workflow step failed: record the failure (durable
-                        // StepFailed event — SPEC2 §10 known-issue #5: step
-                        // failures were silent, exit 0, no diagnostic), then
-                        // run saga compensations for previously completed
-                        // steps in reverse order.
                         if self.actor_is_workflow(actor_id) {
                             let seq = self.next_sequence(actor_id);
                             let step_name = self.step_name_for(actor_id, behavior_idx);
-                            let _ = self.persistence.append_workflow_event(
+                            match workflow::commit_workflow_event(
+                                self,
                                 actor_id,
                                 WorkflowEvent::StepFailed {
                                     sequence: seq,
                                     step_name,
                                     error: format!("{}", e),
                                 },
-                            );
-                            self.run_saga_compensation(actor_id, behavior_idx);
+                            ) {
+                                Ok(()) => self.run_saga_compensation(actor_id, behavior_idx),
+                                Err(error) => tracing::warn!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-persist: workflow failure was not durably committed"
+                                ),
+                            }
+                        } else {
+                            self.checkpoint_actor(actor_id);
                         }
                         processed = false;
                     }
@@ -3962,18 +4040,8 @@ impl Runtime {
                 && self.actor_is_workflow(actor_id)
                 && !self.is_internal_behavior(actor_id, behavior_idx)
             {
-                let seq = self.next_sequence(actor_id);
-                let step_name = self.step_name_for(actor_id, behavior_idx);
-                let _ = self.persistence.append_workflow_event(
-                    actor_id,
-                    WorkflowEvent::StepCompleted {
-                        sequence: seq,
-                        step_name,
-                    },
-                );
-                // Synthetic parallel steps do not increment step_index in their
-                // bytecode (so signal-waiting branches do not double-increment);
-                // advance it here when the step completes.
+                // Synthetic parallel steps advance step_index as part of the
+                // same snapshot that records StepCompleted.
                 if self.is_parallel_step(actor_id, behavior_idx) {
                     if let Some(actor) = self.actors.get_mut(&actor_id) {
                         if let Some(n) =
@@ -3983,7 +4051,22 @@ impl Runtime {
                         }
                     }
                 }
-                self.checkpoint_actor(actor_id);
+                let seq = self.next_sequence(actor_id);
+                let step_name = self.step_name_for(actor_id, behavior_idx);
+                if let Err(error) = workflow::commit_workflow_event(
+                    self,
+                    actor_id,
+                    WorkflowEvent::StepCompleted {
+                        sequence: seq,
+                        step_name,
+                    },
+                ) {
+                    tracing::warn!(
+                        actor_id,
+                        %error,
+                        "nulang-persist: workflow completion was not durably committed"
+                    );
+                }
             }
             let actor = match self.actors.get_mut(&actor_id) {
                 Some(a) => a,
@@ -4285,8 +4368,8 @@ impl Runtime {
     /// Schedule a durable timer for a workflow actor.
     ///
     /// Appends a `TimerSet` event, checkpoints state, and arms the runtime's
-    /// timer wheel. When the timer fires the runtime will append a
-    /// `TimerFired` event and deliver a `__timer_fired` message to the actor.
+    /// timer wheel. When the timer fires the runtime atomically commits the
+    /// `TimerFired` event together with the corresponding step advance.
     pub fn schedule_workflow_timer(&mut self, actor_id: u64, name: &str, duration_ms: u64) {
         workflow::schedule_workflow_timer(self, actor_id, name, duration_ms)
     }
@@ -4650,7 +4733,21 @@ impl Runtime {
                     context,
                 } => {
                     if self.actor_is_workflow(target_actor) {
-                        let _ = self.append_timer_fired(target_actor, &context);
+                        if let Err(error) = self.append_timer_fired(target_actor, &context) {
+                            tracing::warn!(
+                                actor_id = target_actor,
+                                timer = context,
+                                %error,
+                                "nulang-persist: refusing to advance fired workflow timer without atomic durable commit"
+                            );
+                            self.rearm_timer(target_actor, &context, DURABLE_TIMER_COMMIT_RETRY_MS);
+                        }
+                        // Durable workflow timers target the internal
+                        // __timer_fired behavior, whose only state effect is
+                        // now staged in append_timer_fired before commit.
+                        // Delivering the message as well would increment
+                        // step_index twice.
+                        continue;
                     }
                     self.send_message_by_id(target_actor, behavior_id, &payload);
                 }
@@ -4953,7 +5050,15 @@ impl Runtime {
                 // Compensation failed: do not record it as completed.
                 continue;
             }
-            let _ = self.append_saga_compensated(actor_id, &step_name);
+            if let Err(error) = self.append_saga_compensated(actor_id, &step_name) {
+                tracing::warn!(
+                    actor_id,
+                    step = step_name,
+                    %error,
+                    "nulang-persist: compensation executed but completion was not durably committed"
+                );
+                break;
+            }
             if let Some(actor) = self.actors.get_mut(&actor_id) {
                 if !actor.compensated_steps.contains(&step_name) {
                     actor.compensated_steps.push(step_name);
@@ -5037,9 +5142,9 @@ impl Runtime {
 
     /// Recover a persistent actor from the latest snapshot and replay the journal.
     ///
-    /// For workflow actors the durable workflow event journal is replayed
-    /// instead of the message journal, restoring the current step index and
-    /// any other state captured in workflow events.
+    /// For workflow actors, durable workflow metadata is rebuilt from the
+    /// workflow-event journal and atomically accepted commands newer than the
+    /// latest snapshot are replayed from the message journal.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
         let authority_manifest =
@@ -5217,10 +5322,23 @@ impl Runtime {
         }
 
         if is_workflow {
-            // Replay workflow events that arrived after the snapshot.
+            // Replay workflow state that is not represented by ActorSnapshot
+            // from the full durable journal. received_signals,
+            // compensated_steps, and the custom event log live outside
+            // snapshot.state, so a later snapshot must not make those events
+            // disappear during recovery. State-bearing events remain bounded
+            // by snapshot.sequence to avoid double-applying step/timer state
+            // already captured by the snapshot.
             let events_to_replay: Vec<_> = workflow_events
                 .iter()
-                .filter(|e| e.sequence() > snapshot.sequence)
+                .filter(|event| {
+                    matches!(
+                        event,
+                        WorkflowEvent::SignalReceived { .. }
+                            | WorkflowEvent::SagaCompensated { .. }
+                            | WorkflowEvent::Custom { .. }
+                    ) || event.sequence() > snapshot.sequence
+                })
                 .cloned()
                 .collect();
             let mut fired_timer_names: std::collections::HashSet<String> =
@@ -5236,6 +5354,106 @@ impl Runtime {
                     actor.sequence = event.sequence();
                 }
             }
+            // A workflow command is committed before its handler executes. If
+            // the process dies after that acceptance commit but before the
+            // handler completes, its sequence is newer than the latest
+            // snapshot. Replay exactly those accepted commands here without
+            // going through normal mailbox dispatch, which would journal them
+            // a second time and advance the durable tail again.
+            let accepted_commands: Vec<_> = self
+                .persistence
+                .read_journal(actor_id)
+                .into_iter()
+                .filter(|entry| entry.sequence > snapshot.sequence)
+                .collect();
+            for entry in accepted_commands {
+                let behavior_idx = entry.behavior_id as usize;
+                let payload: Vec<Value> =
+                    entry.payload.iter().map(|value| value.to_value()).collect();
+
+                let replay_result = if self.has_native_handler(actor_id, behavior_idx) {
+                    let handler = self
+                        .actors
+                        .get(&actor_id)
+                        .and_then(|actor| actor.behavior_table.get(behavior_idx))
+                        .map(|behavior| behavior.handler_fn)?;
+                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+                        handler(actor, &payload);
+                    }
+                    Ok(Value::nil())
+                } else if self.has_bytecode_handler(actor_id, behavior_idx) {
+                    self.current_actor = Some(actor_id);
+                    let result = self.run_bytecode_behavior(actor_id, behavior_idx, &payload);
+                    self.current_actor = None;
+                    result
+                } else {
+                    warn!(
+                        actor_id,
+                        behavior_id = entry.behavior_id,
+                        "nulang-recover: accepted workflow command has no recoverable handler"
+                    );
+                    self.actors.remove(&actor_id);
+                    return None;
+                };
+
+                if let Some(actor) = self.actors.get_mut(&actor_id) {
+                    actor.sequence = entry.sequence;
+                }
+
+                match replay_result {
+                    Ok(_) => {
+                        if !self.is_internal_behavior(actor_id, behavior_idx) {
+                            let sequence = self.next_sequence(actor_id);
+                            let step_name = self.step_name_for(actor_id, behavior_idx);
+                            if let Err(error) = workflow::commit_workflow_event(
+                                self,
+                                actor_id,
+                                WorkflowEvent::StepCompleted {
+                                    sequence,
+                                    step_name,
+                                },
+                            ) {
+                                warn!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-recover: replayed workflow command completion could not be committed"
+                                );
+                                self.actors.remove(&actor_id);
+                                return None;
+                            }
+                        }
+                    }
+                    Err(crate::types::NuError::Suspended(_)) => {
+                        // Persist only the suspension marker while retaining
+                        // the pre-command durable state. A later signal/effect
+                        // will resume and commit completion atomically.
+                        self.persist_suspension_marker(actor_id);
+                    }
+                    Err(error) => {
+                        let sequence = self.next_sequence(actor_id);
+                        let step_name = self.step_name_for(actor_id, behavior_idx);
+                        if let Err(commit_error) = workflow::commit_workflow_event(
+                            self,
+                            actor_id,
+                            WorkflowEvent::StepFailed {
+                                sequence,
+                                step_name,
+                                error: error.to_string(),
+                            },
+                        ) {
+                            warn!(
+                                actor_id,
+                                %commit_error,
+                                "nulang-recover: replayed workflow failure could not be committed"
+                            );
+                            self.actors.remove(&actor_id);
+                            return None;
+                        }
+                        self.run_saga_compensation(actor_id, behavior_idx);
+                    }
+                }
+            }
+
             // Re-arm timers that were set before the snapshot/replay but have
             // not yet fired. Timers are reconstructed from the full durable
             // journal, not just events after the snapshot, because snapshots do
