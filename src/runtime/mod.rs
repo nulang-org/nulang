@@ -2188,7 +2188,7 @@ impl Runtime {
         grain_id: Option<GrainId>,
     ) -> MessageAdmission {
         let target_shard = (target_id % self.shard_count as u64) as u16;
-        for arg in &args {
+        for arg in args {
             if arg.is_ptr() || arg.is_actor_ref() || arg.is_closure() {
                 tracing::warn!(
                     "nulang-shard: dropping cross-shard message to actor {}: \
@@ -2260,7 +2260,7 @@ impl Runtime {
         out_trace: Option<String>,
     ) -> MessageAdmission {
         let target_shard = (target_id % self.shard_count as u64) as u16;
-        for arg in &args {
+        for arg in args {
             if arg.is_ptr() || arg.is_actor_ref() || arg.is_closure() {
                 warn!(
                     "nulang-shard: dropping named cross-shard message to actor {}: \
