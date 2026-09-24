@@ -32,25 +32,45 @@ const DEFAULT_MAX_KEY_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_VALUE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
 const DEFAULT_MAX_ARENA_BYTES: usize = 512 * 1024 * 1024;
+const ARENA_SLAB_TARGET_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ArenaSlice {
-    offset: u32,
+    slab: u32,
+    block: u32,
     len: u32,
     class: u8,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArenaBlock {
+    slab: u32,
+    block: u32,
+}
+
+#[derive(Debug)]
+struct ArenaSlab {
+    bytes: Box<[u8]>,
+    block_size: u32,
+    live_blocks: u32,
+}
+
+#[derive(Debug)]
 struct ByteArena {
-    bytes: Vec<u8>,
-    free: Vec<Vec<u32>>,
+    slabs: Vec<ArenaSlab>,
+    free: Vec<Vec<ArenaBlock>>,
+    reserved_bytes: usize,
+    target_slab_bytes: usize,
 }
 
 impl ByteArena {
-    fn new() -> Self {
+    fn new(max_reserved_bytes: usize) -> Self {
+        assert!(max_reserved_bytes > 0);
         Self {
-            bytes: Vec::new(),
+            slabs: Vec::new(),
             free: (0..FREE_LIST_COUNT).map(|_| Vec::new()).collect(),
+            reserved_bytes: 0,
+            target_slab_bytes: ARENA_SLAB_TARGET_BYTES.min(max_reserved_bytes),
         }
     }
 
@@ -64,57 +84,141 @@ impl ByteArena {
         (exp - MIN_ARENA_EXP, capacity)
     }
 
+    fn blocks_per_slab(&self, capacity: usize) -> usize {
+        if capacity >= self.target_slab_bytes {
+            1
+        } else {
+            (self.target_slab_bytes / capacity).max(1)
+        }
+    }
+
     fn alloc(&mut self, src: &[u8]) -> ArenaSlice {
         let (class, capacity) = Self::class_for(src.len());
-        let offset = match self.free[class].pop() {
-            Some(offset) => offset,
+        let location = match self.free[class].pop() {
+            Some(location) => location,
             None => {
-                let offset = self.bytes.len();
-                let end = offset
-                    .checked_add(capacity)
-                    .expect("cache arena address overflow");
-                assert!(end <= u32::MAX as usize, "cache arena exceeds 4 GiB");
-                self.bytes.resize(end, 0);
-                offset as u32
+                let blocks = self.blocks_per_slab(capacity);
+                let slab_bytes = capacity
+                    .checked_mul(blocks)
+                    .expect("cache arena slab size overflow");
+                let slab_id = self.slabs.len();
+                assert!(slab_id <= u32::MAX as usize, "cache arena has too many slabs");
+
+                self.slabs.push(ArenaSlab {
+                    bytes: vec![0u8; slab_bytes].into_boxed_slice(),
+                    block_size: capacity as u32,
+                    live_blocks: 0,
+                });
+                self.reserved_bytes = self.reserved_bytes.saturating_add(slab_bytes);
+
+                for block in (1..blocks).rev() {
+                    self.free[class].push(ArenaBlock {
+                        slab: slab_id as u32,
+                        block: block as u32,
+                    });
+                }
+
+                ArenaBlock {
+                    slab: slab_id as u32,
+                    block: 0,
+                }
             }
         };
-        let start = offset as usize;
-        self.bytes[start..start + src.len()].copy_from_slice(src);
+
+        let slab = &mut self.slabs[location.slab as usize];
+        debug_assert_eq!(slab.block_size as usize, capacity);
+        let start = location.block as usize * capacity;
+        slab.bytes[start..start + src.len()].copy_from_slice(src);
+        slab.live_blocks = slab.live_blocks.saturating_add(1);
+
         ArenaSlice {
-            offset,
+            slab: location.slab,
+            block: location.block,
             len: src.len() as u32,
             class: class as u8,
         }
     }
 
     fn release(&mut self, slice: ArenaSlice) {
-        self.free[slice.class as usize].push(slice.offset);
+        let slab = &mut self.slabs[slice.slab as usize];
+        debug_assert!(slab.live_blocks > 0);
+        slab.live_blocks = slab.live_blocks.saturating_sub(1);
+        self.free[slice.class as usize].push(ArenaBlock {
+            slab: slice.slab,
+            block: slice.block,
+        });
     }
 
     fn get(&self, slice: ArenaSlice) -> &[u8] {
-        let start = slice.offset as usize;
-        &self.bytes[start..start + slice.len as usize]
+        let slab = &self.slabs[slice.slab as usize];
+        let block_size = slab.block_size as usize;
+        let start = slice.block as usize * block_size;
+        &slab.bytes[start..start + slice.len as usize]
     }
 
     fn reserved_bytes(&self) -> usize {
-        self.bytes.len()
+        self.reserved_bytes
+    }
+
+    fn free_bytes(&self) -> usize {
+        self.free
+            .iter()
+            .enumerate()
+            .map(|(class, blocks)| {
+                let block_size = 1usize << (MIN_ARENA_EXP + class);
+                blocks.len().saturating_mul(block_size)
+            })
+            .sum()
+    }
+
+    fn slab_count(&self) -> usize {
+        self.slabs.len()
+    }
+
+    fn metadata_reserved_bytes(&self) -> usize {
+        self.slabs
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ArenaSlab>())
+            .saturating_add(
+                self.free
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Vec<ArenaBlock>>()),
+            )
+            .saturating_add(
+                self.free
+                    .iter()
+                    .map(|blocks| {
+                        blocks
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<ArenaBlock>())
+                    })
+                    .sum::<usize>(),
+            )
     }
 
     fn additional_reserved_for(&self, lengths: &[usize]) -> usize {
-        let mut claimed_free = [0usize; FREE_LIST_COUNT];
-        let mut growth = 0usize;
+        let mut available = [0usize; FREE_LIST_COUNT];
+        for (class, blocks) in self.free.iter().enumerate() {
+            available[class] = blocks.len();
+        }
 
+        let mut growth = 0usize;
         for &len in lengths {
             if len <= INLINE_BYTES {
                 continue;
             }
+
             let (class, capacity) = Self::class_for(len);
-            if claimed_free[class] < self.free[class].len() {
-                claimed_free[class] += 1;
-            } else {
-                growth = growth.saturating_add(capacity);
+            if available[class] > 0 {
+                available[class] -= 1;
+                continue;
             }
+
+            let blocks = self.blocks_per_slab(capacity);
+            growth = growth.saturating_add(capacity.saturating_mul(blocks));
+            available[class] = blocks.saturating_sub(1);
         }
+
         growth
     }
 }
@@ -426,7 +530,13 @@ pub struct CacheMemoryStats {
     pub entries: usize,
     pub index_capacity: usize,
     pub arena_reserved_bytes: usize,
+    pub arena_free_bytes: usize,
+    pub arena_slab_count: usize,
+    pub arena_metadata_reserved_bytes: usize,
+    pub index_reserved_bytes: usize,
+    pub slot_reserved_bytes: usize,
     pub reusable_slots: usize,
+    pub estimated_reserved_bytes: usize,
 }
 
 /// Shard-local compact cache storage.
@@ -489,7 +599,7 @@ impl CacheStore {
         Self {
             config,
             hash_builder: RandomState::new(),
-            arena: ByteArena::new(),
+            arena: ByteArena::new(config.max_arena_bytes),
             slots: Vec::new(),
             free_slots: Vec::new(),
             index: vec![Bucket::EMPTY; DEFAULT_INDEX_CAPACITY],
@@ -1196,11 +1306,83 @@ impl CacheStore {
     }
 
     pub fn memory_stats(&self) -> CacheMemoryStats {
+        let arena_reserved_bytes = self.arena.reserved_bytes();
+        let arena_metadata_reserved_bytes = self.arena.metadata_reserved_bytes();
+        let index_reserved_bytes = self
+            .index
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Bucket>());
+        let slot_reserved_bytes = self
+            .slots
+            .capacity()
+            .saturating_mul(std::mem::size_of::<EntrySlot>());
+        let free_slot_reserved_bytes = self
+            .free_slots
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u32>());
+        let expiry_reserved_bytes = self
+            .expiry_scratch
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ExpirationRef>())
+            .saturating_add(
+                self.expiry
+                    .buckets
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Vec<ExpirationRef>>()),
+            )
+            .saturating_add(
+                self.expiry
+                    .buckets
+                    .iter()
+                    .map(|bucket| {
+                        bucket
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<ExpirationRef>())
+                    })
+                    .sum::<usize>(),
+            );
+        let eviction_reserved_bytes = self
+            .eviction
+            .small
+            .capacity()
+            .saturating_mul(std::mem::size_of::<EvictionRef>())
+            .saturating_add(
+                self.eviction
+                    .main
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<EvictionRef>()),
+            )
+            .saturating_add(
+                self.eviction
+                    .ghost
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
+            .saturating_add(
+                self.eviction
+                    .ghost_set
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            );
+        let estimated_reserved_bytes = arena_reserved_bytes
+            .saturating_add(arena_metadata_reserved_bytes)
+            .saturating_add(index_reserved_bytes)
+            .saturating_add(slot_reserved_bytes)
+            .saturating_add(free_slot_reserved_bytes)
+            .saturating_add(expiry_reserved_bytes)
+            .saturating_add(eviction_reserved_bytes);
+
         CacheMemoryStats {
             entries: self.index_len,
             index_capacity: self.index.len(),
-            arena_reserved_bytes: self.arena.reserved_bytes(),
+            arena_reserved_bytes,
+            arena_free_bytes: self.arena.free_bytes(),
+            arena_slab_count: self.arena.slab_count(),
+            arena_metadata_reserved_bytes,
+            index_reserved_bytes,
+            slot_reserved_bytes,
             reusable_slots: self.free_slots.len(),
+            estimated_reserved_bytes,
         }
     }
 }
@@ -1254,6 +1436,38 @@ mod tests {
         store.set_bytes(b"k", b"small", None, 0);
         assert_eq!(store.memory_stats().arena_reserved_bytes, 0);
         assert_eq!(store.get(b"k", 0), Some(CacheValueView::Bytes(b"small")));
+    }
+
+    #[test]
+    fn arena_growth_is_segmented_and_does_not_move_existing_values() {
+        let mut arena = ByteArena::new(4 * ARENA_SLAB_TARGET_BYTES);
+        let original = vec![7u8; 100];
+        let first = arena.alloc(&original);
+
+        let blocks_per_slab = ARENA_SLAB_TARGET_BYTES / 128;
+        let mut held = Vec::with_capacity(blocks_per_slab + 1);
+        for i in 0..=blocks_per_slab {
+            let payload = vec![(i % 251) as u8; 100];
+            held.push((arena.alloc(&payload), payload));
+        }
+
+        assert!(arena.slab_count() >= 2);
+        assert_eq!(arena.get(first), original.as_slice());
+        for (slice, payload) in held {
+            assert_eq!(arena.get(slice), payload.as_slice());
+        }
+    }
+
+    #[test]
+    fn arena_admission_accounts_for_whole_slab_growth() {
+        let arena = ByteArena::new(ARENA_SLAB_TARGET_BYTES);
+        assert_eq!(
+            arena.additional_reserved_for(&[100]),
+            ARENA_SLAB_TARGET_BYTES
+        );
+
+        let tiny = ByteArena::new(64);
+        assert_eq!(tiny.additional_reserved_for(&[40]), 64);
     }
 
     #[test]
