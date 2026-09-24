@@ -51,8 +51,8 @@ version + migration.*
 
 ## Stable tier
 
-### Python bool marshal type inference — 2026-09-24
-- **Default-feature builds now make PyO3 boolean extraction explicit with `extract::<bool>()`**, avoiding a compiler inference failure in the Python marshal path without changing conversion semantics.
+### Python marshal type inference — 2026-09-24
+- **Default-feature builds now make PyO3 bool/int/float/string extraction targets explicit with `extract::<T>()`**, avoiding compiler inference failures in the Python marshal path without changing conversion semantics.
 
 ### Consuming local-send ownership proof — 2026-09-24
 - **MIR now identifies fresh, single-definition heap-owning values whose sole use is a same-node actor send**, establishing a conservative proof surface for a later ORCA ownership handoff.
