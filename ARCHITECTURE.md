@@ -535,7 +535,7 @@ process
   |
   +-- shard N-1 / OS thread N-1
 
-cross-shard delivery: bounded mpsc::sync_channel(1024)
+cross-shard delivery: bounded crossbeam::channel(1024)
 optional Linux affinity: NULANG_PIN_CORES=1
 shard count: NULANG_SHARDS (default 1)
 ```
