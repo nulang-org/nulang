@@ -4635,6 +4635,102 @@ mod json_file_store_tests {
     }
 
     #[test]
+    fn test_json_file_store_durable_message_acceptance_and_ack_survive_restart() {
+        let dir = fresh_dir("durable_message");
+        let mut store = JsonFileStore::new(&dir).unwrap();
+
+        let sender = DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: 10,
+            activation_epoch: 3,
+            sequence: 1,
+            expected_previous_sequence: 0,
+            command: None,
+            snapshot: None,
+            workflow_events: Vec::new(),
+            domain_events: Vec::new(),
+            durable_effects: Vec::new(),
+            outbox: vec![DurableOutboxMessage {
+                destination_actor_id: 20,
+                ordinal: 0,
+                behavior_id: 7,
+                payload: vec![PersistedValue::Int(42)],
+            }],
+            inbox: Vec::new(),
+        };
+        store.commit_transition(sender).unwrap();
+
+        let pending = store.read_pending_outbox(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].destination_actor_id, 20);
+        let message_id = pending[0].id;
+        assert_eq!(message_id.sender_actor_id, 10);
+        assert_eq!(message_id.sender_epoch, 3);
+        assert_eq!(message_id.transition_sequence, 1);
+        assert_eq!(message_id.outbox_ordinal, 0);
+
+        let receiver = DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: 20,
+            activation_epoch: 1,
+            sequence: 1,
+            expected_previous_sequence: 0,
+            command: Some(JournalEntry {
+                sequence: 1,
+                behavior_id: 7,
+                payload: vec![PersistedValue::Int(42)],
+            }),
+            snapshot: None,
+            workflow_events: Vec::new(),
+            domain_events: Vec::new(),
+            durable_effects: Vec::new(),
+            outbox: Vec::new(),
+            inbox: vec![DurableInboxDelivery {
+                id: message_id,
+                destination_actor_id: 20,
+            }],
+        };
+        store.commit_transition(receiver).unwrap();
+        assert_eq!(
+            store.lookup_inbox_delivery(20, message_id).unwrap(),
+            Some(1)
+        );
+
+        let duplicate = DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: 20,
+            activation_epoch: 1,
+            sequence: 2,
+            expected_previous_sequence: 1,
+            command: None,
+            snapshot: None,
+            workflow_events: Vec::new(),
+            domain_events: Vec::new(),
+            durable_effects: Vec::new(),
+            outbox: Vec::new(),
+            inbox: vec![DurableInboxDelivery {
+                id: message_id,
+                destination_actor_id: 20,
+            }],
+        };
+        let duplicate_error = store.commit_transition(duplicate).unwrap_err();
+        assert_eq!(duplicate_error.kind(), io::ErrorKind::AlreadyExists);
+
+        store.acknowledge_outbox(message_id).unwrap();
+        assert!(store.read_pending_outbox(10).unwrap().is_empty());
+
+        drop(store);
+        let store = JsonFileStore::new(&dir).unwrap();
+        assert!(store.read_pending_outbox(10).unwrap().is_empty());
+        assert_eq!(
+            store.lookup_inbox_delivery(20, message_id).unwrap(),
+            Some(1)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_json_file_store_truncates_torn_final_transition_before_retry() {
         let dir = fresh_dir("torn_atomic_transition");
         let mut store = JsonFileStore::new(&dir).unwrap();
