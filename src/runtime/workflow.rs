@@ -123,6 +123,12 @@ fn mark_workflow_commit_failure(rt: &mut Runtime, actor_id: u64) {
     rt.workflow_commit_failures.insert(actor_id);
 }
 
+fn activation_epoch(rt: &Runtime, actor_id: u64) -> u64 {
+    // RFC 0014 already maintains the authoritative epoch for durable actors
+    // opted into node-loss respawn. Local/non-opted actors remain epoch 1.
+    rt.respawn_opted.get(&actor_id).copied().unwrap_or(1)
+}
+
 // ---------------------------------------------------------------------------
 // Checkpoint
 // ---------------------------------------------------------------------------
@@ -306,7 +312,7 @@ fn commit_workflow_transition(
     let transition = DurableTransition {
         version: DURABLE_TRANSITION_VERSION,
         actor_id,
-        activation_epoch: 1,
+        activation_epoch: activation_epoch(rt, actor_id),
         sequence,
         expected_previous_sequence,
         command,
@@ -393,7 +399,7 @@ pub(crate) fn commit_suspension_marker(rt: &mut Runtime, actor_id: u64) -> std::
     let transition = DurableTransition {
         version: DURABLE_TRANSITION_VERSION,
         actor_id,
-        activation_epoch: 1,
+        activation_epoch: activation_epoch(rt, actor_id),
         sequence,
         expected_previous_sequence,
         command,
