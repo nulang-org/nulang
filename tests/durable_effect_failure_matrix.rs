@@ -299,6 +299,37 @@ fn at_least_once_contract_exposes_duplicate_external_mutation() {
 }
 
 #[test]
+fn nonreplayable_contract_never_auto_redispatches_after_ambiguous_crash() {
+    let request = b"voice-call";
+    let spec = effect_spec(
+        "call/customer-42",
+        "Comms.call",
+        EffectBoundary::External,
+        DeliverySemantics::NoAutomaticRetry,
+    );
+    let operation_id = spec.id;
+    let mut store = MemoryStore::new();
+
+    {
+        let mut coordinator = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+        assert_eq!(
+            coordinator.begin(spec.clone(), request).unwrap(),
+            DurableEffectDispatchDecision::DispatchOnce { operation_id }
+        );
+    }
+
+    // The process may have crossed the provider boundary before dying. The
+    // persisted state is still only Prepared, so generic recovery cannot know
+    // whether another dispatch would duplicate an irreversible operation.
+    let mut restarted = DurableEffectCoordinator::new(&mut store, ACTOR_ID, 1);
+    assert_eq!(
+        restarted.begin(spec, request).unwrap(),
+        DurableEffectDispatchDecision::RefuseAutomaticRedispatch { operation_id }
+    );
+    assert_eq!(store.latest_sequence(ACTOR_ID), 1);
+}
+
+#[test]
 fn stale_activation_cannot_publish_late_provider_result_after_ownership_moves() {
     let request = b"order=42&amount=1000";
     let original = effect_spec(
