@@ -358,8 +358,7 @@ mod tests {
 
     #[test]
     fn caches_first_two_arguments_and_starts_tail_after_them() {
-        let input =
-            b"*5\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n$2\r\nPX\r\n$2\r\n10\r\n";
+        let input = b"*5\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n$2\r\nPX\r\n$2\r\n10\r\n";
         let (command, consumed) = parse_command(input).unwrap().unwrap();
 
         assert_eq!(consumed, input.len());
