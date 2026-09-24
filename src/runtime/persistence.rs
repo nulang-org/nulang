@@ -6074,6 +6074,47 @@ mod libsql_atomic_transition_tests {
     }
 
     #[test]
+    fn libsql_durable_message_acceptance_is_atomic_and_acknowledgeable() {
+        let mut store = LibsqlStore::in_memory().unwrap();
+
+        let sender = transition(42, 3, 1);
+        store.commit_transition(sender).unwrap();
+
+        let pending = store.read_pending_outbox(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        let message_id = pending[0].id;
+        assert_eq!(message_id.sender_actor_id, 42);
+        assert_eq!(message_id.sender_epoch, 3);
+        assert_eq!(message_id.transition_sequence, 1);
+        assert_eq!(message_id.outbox_ordinal, 0);
+
+        let mut receiver = transition(43, 1, 1);
+        receiver.outbox.clear();
+        receiver.inbox = vec![DurableInboxDelivery {
+            id: message_id,
+            destination_actor_id: 43,
+        }];
+        store.commit_transition(receiver).unwrap();
+        assert_eq!(
+            store.lookup_inbox_delivery(43, message_id).unwrap(),
+            Some(1)
+        );
+
+        let mut duplicate = transition(43, 1, 2);
+        duplicate.outbox.clear();
+        duplicate.inbox = vec![DurableInboxDelivery {
+            id: message_id,
+            destination_actor_id: 43,
+        }];
+        let error = store.commit_transition(duplicate).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(store.latest_sequence(43), 1);
+
+        store.acknowledge_outbox(message_id).unwrap();
+        assert!(store.read_pending_outbox(10).unwrap().is_empty());
+    }
+
+    #[test]
     fn libsql_atomic_transition_survives_reopen() {
         let path = std::env::temp_dir().join(format!(
             "nulang_atomic_transition_{}_reopen.db",
