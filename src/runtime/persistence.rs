@@ -2123,6 +2123,38 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_outbox_acks (
+                    actor_id INTEGER NOT NULL,
+                    sender_epoch INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    PRIMARY KEY (actor_id, sender_epoch, sequence, ordinal)
+                )",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_inbox (
+                    destination_actor_id INTEGER NOT NULL,
+                    sender_actor_id INTEGER NOT NULL,
+                    sender_epoch INTEGER NOT NULL,
+                    transition_sequence INTEGER NOT NULL,
+                    outbox_ordinal INTEGER NOT NULL,
+                    receiver_sequence INTEGER NOT NULL,
+                    PRIMARY KEY (
+                        destination_actor_id,
+                        sender_actor_id,
+                        sender_epoch,
+                        transition_sequence,
+                        outbox_ordinal
+                    )
+                )",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             Ok(())
         })
     }
@@ -2189,6 +2221,175 @@ impl LibsqlStore {
 
 #[cfg(feature = "sqlite")]
 impl PersistenceStore for LibsqlStore {
+    fn read_pending_outbox(&self, limit: usize) -> io::Result<Vec<DurableOutboxRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT o.actor_id, t.activation_epoch, o.sequence, o.ordinal,
+                            o.destination_actor_id, o.behavior_id, o.payload
+                     FROM durable_outbox o
+                     JOIN durable_transitions t
+                       ON t.actor_id = o.actor_id AND t.sequence = o.sequence
+                     LEFT JOIN durable_outbox_acks a
+                       ON a.actor_id = o.actor_id
+                      AND a.sender_epoch = t.activation_epoch
+                      AND a.sequence = o.sequence
+                      AND a.ordinal = o.ordinal
+                     WHERE a.actor_id IS NULL
+                     ORDER BY o.actor_id ASC, t.activation_epoch ASC,
+                              o.sequence ASC, o.ordinal ASC
+                     LIMIT ?1",
+                    libsql::params![limit as i64],
+                )
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+            let mut records = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+            {
+                let payload_json: String = row
+                    .get(6)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+                let payload = serde_json::from_str(&payload_json)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                records.push(DurableOutboxRecord {
+                    id: DurableMessageId {
+                        sender_actor_id: row.get::<i64>(0).map_err(|error| {
+                            io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                        })? as u64,
+                        sender_epoch: row.get::<i64>(1).map_err(|error| {
+                            io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                        })? as u64,
+                        transition_sequence: row.get::<i64>(2).map_err(|error| {
+                            io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                        })? as u64,
+                        outbox_ordinal: row.get::<i64>(3).map_err(|error| {
+                            io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                        })? as u32,
+                    },
+                    destination_actor_id: row.get::<i64>(4).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })? as u64,
+                    behavior_id: row.get::<i64>(5).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })? as u16,
+                    payload,
+                });
+            }
+            Ok(records)
+        })
+    }
+
+    fn acknowledge_outbox(&mut self, id: DurableMessageId) -> io::Result<()> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let changed = conn
+                .execute(
+                    "INSERT OR IGNORE INTO durable_outbox_acks
+                     (actor_id, sender_epoch, sequence, ordinal)
+                     SELECT o.actor_id, t.activation_epoch, o.sequence, o.ordinal
+                     FROM durable_outbox o
+                     JOIN durable_transitions t
+                       ON t.actor_id = o.actor_id AND t.sequence = o.sequence
+                     WHERE o.actor_id = ?1
+                       AND t.activation_epoch = ?2
+                       AND o.sequence = ?3
+                       AND o.ordinal = ?4",
+                    libsql::params![
+                        id.sender_actor_id as i64,
+                        id.sender_epoch as i64,
+                        id.transition_sequence as i64,
+                        id.outbox_ordinal as i64
+                    ],
+                )
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+            if changed == 0 {
+                let mut rows = conn
+                    .query(
+                        "SELECT 1
+                         FROM durable_outbox o
+                         JOIN durable_transitions t
+                           ON t.actor_id = o.actor_id AND t.sequence = o.sequence
+                         WHERE o.actor_id = ?1
+                           AND t.activation_epoch = ?2
+                           AND o.sequence = ?3
+                           AND o.ordinal = ?4
+                         LIMIT 1",
+                        libsql::params![
+                            id.sender_actor_id as i64,
+                            id.sender_epoch as i64,
+                            id.transition_sequence as i64,
+                            id.outbox_ordinal as i64
+                        ],
+                    )
+                    .await
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+                if rows
+                    .next()
+                    .await
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+                    .is_none()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "durable outbox message identity does not exist",
+                    ));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn lookup_inbox_delivery(
+        &self,
+        destination_actor_id: u64,
+        id: DurableMessageId,
+    ) -> io::Result<Option<u64>> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT receiver_sequence FROM durable_inbox
+                     WHERE destination_actor_id = ?1
+                       AND sender_actor_id = ?2
+                       AND sender_epoch = ?3
+                       AND transition_sequence = ?4
+                       AND outbox_ordinal = ?5",
+                    libsql::params![
+                        destination_actor_id as i64,
+                        id.sender_actor_id as i64,
+                        id.sender_epoch as i64,
+                        id.transition_sequence as i64,
+                        id.outbox_ordinal as i64
+                    ],
+                )
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+            match rows
+                .next()
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+            {
+                Some(row) => {
+                    let sequence: i64 = row.get(0).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?;
+                    Ok(Some(sequence as u64))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
     fn load_durable_tail(&self, actor_id: u64) -> io::Result<Option<DurableTail>> {
         let conn = self.conn();
         self.rt.block_on(async {
@@ -2566,6 +2767,57 @@ impl PersistenceStore for LibsqlStore {
                 )
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            }
+
+            for delivery in &transition.inbox {
+                let mut existing = tx
+                    .query(
+                        "SELECT receiver_sequence FROM durable_inbox
+                         WHERE destination_actor_id = ?1
+                           AND sender_actor_id = ?2
+                           AND sender_epoch = ?3
+                           AND transition_sequence = ?4
+                           AND outbox_ordinal = ?5",
+                        libsql::params![
+                            delivery.destination_actor_id as i64,
+                            delivery.id.sender_actor_id as i64,
+                            delivery.id.sender_epoch as i64,
+                            delivery.id.transition_sequence as i64,
+                            delivery.id.outbox_ordinal as i64
+                        ],
+                    )
+                    .await
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+                if existing
+                    .next()
+                    .await
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+                    .is_some()
+                {
+                    let _ = tx.rollback().await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "durable inbox identity was already accepted",
+                    ));
+                }
+                drop(existing);
+
+                tx.execute(
+                    "INSERT INTO durable_inbox
+                     (destination_actor_id, sender_actor_id, sender_epoch,
+                      transition_sequence, outbox_ordinal, receiver_sequence)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    libsql::params![
+                        delivery.destination_actor_id as i64,
+                        delivery.id.sender_actor_id as i64,
+                        delivery.id.sender_epoch as i64,
+                        delivery.id.transition_sequence as i64,
+                        delivery.id.outbox_ordinal as i64,
+                        transition.sequence as i64
+                    ],
+                )
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
             }
 
             tx.execute(
@@ -3020,6 +3272,14 @@ impl PersistenceStore for LibsqlStore {
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
         let conn = self.conn();
         self.rt.block_on(async {
+            conn.execute(
+                "DELETE FROM durable_inbox
+                 WHERE destination_actor_id = ?1 OR sender_actor_id = ?1",
+                libsql::params![actor_id as i64],
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
             for table in [
                 "snapshots",
                 "journal",
@@ -3029,6 +3289,7 @@ impl PersistenceStore for LibsqlStore {
                 "durable_domain_events",
                 "durable_effect_records",
                 "durable_outbox",
+                "durable_outbox_acks",
                 "durable_transitions",
                 "durable_tails",
             ] {
