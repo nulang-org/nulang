@@ -1096,6 +1096,15 @@ pub fn dispatch_aot_runtime_behavior(
         "dispatch_aot_runtime_behavior: null runtime ptr"
     );
 
+    // Native actor entry can be nested inside another AOT frame (for example,
+    // top-level native code synchronously asking an AOT-backed actor). Preserve
+    // the outer helper context rather than clearing it on return; otherwise the
+    // outer frame loses its callbacks/constants/module/runtime and subsequent
+    // spawn/effect/string/allocation helpers silently degrade.
+    let saved_helpers = crate::jit::runtime::save_aot_helper_thread_state();
+    let saved_module = AOT_MODULE_CTX.with(|cell| *cell.borrow());
+    let saved_runtime = AOT_RUNTIME_CTX.with(|cell| cell.get());
+
     // SAFETY: AotDispatchTarget.module points into Runtime::aot_module_storage,
     // whose boxed modules remain stable for the Runtime lifetime. The runtime
     // pointer is the caller's live exclusive scheduler borrow.
@@ -1108,10 +1117,10 @@ pub fn dispatch_aot_runtime_behavior(
     let mut callbacks = AotRuntimeCallbacks { runtime, actor_id };
     unsafe { crate::jit::runtime::set_jit_callbacks(&mut callbacks) };
     let status = call_aot_behavior(target.fn_ptr, actor_id, args);
-    crate::jit::runtime::clear_jit_callbacks();
-    crate::jit::runtime::aot_clear_constants();
-    clear_aot_runtime_ctx();
-    clear_aot_module_ctx();
+
+    crate::jit::runtime::restore_aot_helper_thread_state(saved_helpers);
+    AOT_RUNTIME_CTX.with(|cell| cell.set(saved_runtime));
+    AOT_MODULE_CTX.with(|cell| *cell.borrow_mut() = saved_module);
     status
 }
 
