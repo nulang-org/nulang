@@ -48,6 +48,10 @@ pub struct AllocationCommand {
     pub epoch: u64,
     pub kind: AllocationCommandKind,
     pub state: AllocationCommandState,
+    #[serde(default)]
+    pub claimed_by: Option<String>,
+    #[serde(default)]
+    pub claim_expires_at_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +75,7 @@ pub enum StoreError {
         actual_epoch: u64,
     },
     CommandNotFound(String),
+    CommandClaimLost(String),
 }
 
 impl fmt::Display for StoreError {
@@ -96,6 +101,9 @@ impl fmt::Display for StoreError {
                 "stale placement plan for {deployment_id} replica {replica}: expected epoch {expected_epoch}, current epoch {actual_epoch}"
             ),
             Self::CommandNotFound(id) => write!(f, "allocation command {id} was not found"),
+            Self::CommandClaimLost(id) => {
+                write!(f, "allocation command {id} is not claimed by this dispatcher")
+            }
         }
     }
 }
@@ -123,6 +131,16 @@ pub trait ControlStore: Send + Sync {
 
     fn pending_commands(&self) -> Result<Vec<AllocationCommand>, StoreError>;
 
+    /// Atomically lease all pending commands for selected logical replicas.
+    /// A replica's Stop and successor Start are always claimed as one group.
+    fn claim_pending_commands(
+        &self,
+        claimant: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+        max_commands: usize,
+    ) -> Result<Vec<AllocationCommand>, StoreError>;
+
     /// True only when a Start command still names the highest authoritative
     /// epoch for its logical deployment replica.
     fn start_command_is_authoritative(
@@ -130,7 +148,14 @@ pub trait ControlStore: Send + Sync {
         command: &AllocationCommand,
     ) -> Result<bool, StoreError>;
 
-    /// Idempotently mark a durable outbox command acknowledged.
+    /// Idempotently acknowledge a command owned by claimant.
+    fn acknowledge_claimed_command(
+        &self,
+        command_id: &str,
+        claimant: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Compatibility ACK for single-dispatcher callers.
     fn acknowledge_command(&self, command_id: &str) -> Result<(), StoreError>;
 }
 
@@ -319,6 +344,103 @@ impl PersistedState {
             .collect()
     }
 
+    fn claim_pending_commands(
+        &mut self,
+        claimant: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+        max_commands: usize,
+    ) -> Result<Vec<AllocationCommand>, StoreError> {
+        if claimant.trim().is_empty() {
+            return Err(StoreError::Backend(
+                "allocation command claimant must not be empty".into(),
+            ));
+        }
+        if lease_ms == 0 {
+            return Err(StoreError::Backend(
+                "allocation command lease must be greater than zero".into(),
+            ));
+        }
+        if max_commands == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut groups: BTreeMap<(String, u32), Vec<String>> = BTreeMap::new();
+        for command in self
+            .commands
+            .values()
+            .filter(|command| command.state == AllocationCommandState::Pending)
+        {
+            groups
+                .entry((command.deployment_id.clone(), command.replica))
+                .or_default()
+                .push(command.command_id.clone());
+        }
+
+        let claim_until = now_unix_ms.saturating_add(lease_ms);
+        let mut claimed = Vec::new();
+        for command_ids in groups.values_mut() {
+            command_ids.sort_by(|left_id, right_id| {
+                let left = self.commands.get(left_id).expect("grouped command exists");
+                let right = self.commands.get(right_id).expect("grouped command exists");
+                claim_command_priority(left.kind)
+                    .cmp(&claim_command_priority(right.kind))
+                    .then_with(|| left.epoch.cmp(&right.epoch))
+                    .then_with(|| left.command_id.cmp(&right.command_id))
+            });
+
+            let held_by_other = command_ids.iter().any(|command_id| {
+                let command = self.commands.get(command_id).expect("grouped command exists");
+                command
+                    .claimed_by
+                    .as_deref()
+                    .zip(command.claim_expires_at_unix_ms)
+                    .map(|(owner, expires)| owner != claimant && expires > now_unix_ms)
+                    .unwrap_or(false)
+            });
+            if held_by_other {
+                continue;
+            }
+
+            if !claimed.is_empty()
+                && claimed.len().saturating_add(command_ids.len()) > max_commands
+            {
+                break;
+            }
+
+            for command_id in command_ids.iter() {
+                let command = self.commands.get_mut(command_id).expect("grouped command exists");
+                command.claimed_by = Some(claimant.to_owned());
+                command.claim_expires_at_unix_ms = Some(claim_until);
+                claimed.push(command.clone());
+            }
+            if claimed.len() >= max_commands {
+                break;
+            }
+        }
+        Ok(claimed)
+    }
+
+    fn acknowledge_claimed_command(
+        &mut self,
+        command_id: &str,
+        claimant: &str,
+    ) -> Result<(), StoreError> {
+        let Some(command) = self.commands.get_mut(command_id) else {
+            return Err(StoreError::CommandNotFound(command_id.to_owned()));
+        };
+        if command.state == AllocationCommandState::Acknowledged {
+            return Ok(());
+        }
+        if command.claimed_by.as_deref() != Some(claimant) {
+            return Err(StoreError::CommandClaimLost(command_id.to_owned()));
+        }
+        command.state = AllocationCommandState::Acknowledged;
+        command.claimed_by = None;
+        command.claim_expires_at_unix_ms = None;
+        Ok(())
+    }
+
     fn start_command_is_authoritative(&self, command: &AllocationCommand) -> bool {
         if command.kind != AllocationCommandKind::Start {
             return false;
@@ -341,6 +463,13 @@ impl PersistedState {
         };
         command.state = AllocationCommandState::Acknowledged;
         Ok(())
+    }
+}
+
+fn claim_command_priority(kind: AllocationCommandKind) -> u8 {
+    match kind {
+        AllocationCommandKind::Stop => 0,
+        AllocationCommandKind::Start => 1,
     }
 }
 
@@ -378,6 +507,8 @@ fn start_command(evaluation: &Evaluation, allocation: &ObservedAllocation) -> Al
         epoch: allocation.epoch,
         kind: AllocationCommandKind::Start,
         state: AllocationCommandState::Pending,
+        claimed_by: None,
+        claim_expires_at_unix_ms: None,
     }
 }
 
@@ -395,6 +526,8 @@ fn stop_command(evaluation: &Evaluation, allocation: &ObservedAllocation) -> All
         epoch: allocation.epoch,
         kind: AllocationCommandKind::Stop,
         state: AllocationCommandState::Pending,
+        claimed_by: None,
+        claim_expires_at_unix_ms: None,
     }
 }
 
@@ -472,6 +605,19 @@ impl ControlStore for MemoryControlStore {
             .pending_commands())
     }
 
+    fn claim_pending_commands(
+        &self,
+        claimant: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+        max_commands: usize,
+    ) -> Result<Vec<AllocationCommand>, StoreError> {
+        self.state
+            .lock()
+            .expect("control-store mutex poisoned")
+            .claim_pending_commands(claimant, now_unix_ms, lease_ms, max_commands)
+    }
+
     fn start_command_is_authoritative(
         &self,
         command: &AllocationCommand,
@@ -481,6 +627,17 @@ impl ControlStore for MemoryControlStore {
             .lock()
             .expect("control-store mutex poisoned")
             .start_command_is_authoritative(command))
+    }
+
+    fn acknowledge_claimed_command(
+        &self,
+        command_id: &str,
+        claimant: &str,
+    ) -> Result<(), StoreError> {
+        self.state
+            .lock()
+            .expect("control-store mutex poisoned")
+            .acknowledge_claimed_command(command_id, claimant)
     }
 
     fn acknowledge_command(&self, command_id: &str) -> Result<(), StoreError> {
@@ -587,6 +744,19 @@ impl ControlStore for JsonFileControlStore {
             .pending_commands())
     }
 
+    fn claim_pending_commands(
+        &self,
+        claimant: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+        max_commands: usize,
+    ) -> Result<Vec<AllocationCommand>, StoreError> {
+        self.state
+            .lock()
+            .expect("control-store mutex poisoned")
+            .claim_pending_commands(claimant, now_unix_ms, lease_ms, max_commands)
+    }
+
     fn start_command_is_authoritative(
         &self,
         command: &AllocationCommand,
@@ -596,6 +766,17 @@ impl ControlStore for JsonFileControlStore {
             .lock()
             .expect("control-store mutex poisoned")
             .start_command_is_authoritative(command))
+    }
+
+    fn acknowledge_claimed_command(
+        &self,
+        command_id: &str,
+        claimant: &str,
+    ) -> Result<(), StoreError> {
+        self.state
+            .lock()
+            .expect("control-store mutex poisoned")
+            .acknowledge_claimed_command(command_id, claimant)
     }
 
     fn acknowledge_command(&self, command_id: &str) -> Result<(), StoreError> {
@@ -783,11 +964,31 @@ impl ControlStore for PostgresControlStore {
         Ok(self.load_state()?.pending_commands())
     }
 
+    fn claim_pending_commands(
+        &self,
+        claimant: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+        max_commands: usize,
+    ) -> Result<Vec<AllocationCommand>, StoreError> {
+        self.mutate(|state| {
+            state.claim_pending_commands(claimant, now_unix_ms, lease_ms, max_commands)
+        })
+    }
+
     fn start_command_is_authoritative(
         &self,
         command: &AllocationCommand,
     ) -> Result<bool, StoreError> {
         Ok(self.load_state()?.start_command_is_authoritative(command))
+    }
+
+    fn acknowledge_claimed_command(
+        &self,
+        command_id: &str,
+        claimant: &str,
+    ) -> Result<(), StoreError> {
+        self.mutate(|state| state.acknowledge_claimed_command(command_id, claimant))
     }
 
     fn acknowledge_command(&self, command_id: &str) -> Result<(), StoreError> {
@@ -969,6 +1170,72 @@ mod tests {
         assert!(commands
             .iter()
             .any(|command| command.kind == AllocationCommandKind::Start && command.epoch == 8));
+    }
+
+    #[test]
+    fn test_command_claims_keep_replica_transition_on_one_dispatcher() {
+        let store = MemoryControlStore::default();
+        let old = ObservedAllocation {
+            deployment_id: "api".into(),
+            revision: 1,
+            replica: 0,
+            node_id: 1,
+            epoch: 7,
+            state: AllocationState::Running,
+        };
+        store.seed_allocation(old.clone());
+        let eval = evaluation("eval-claim");
+        store.record_evaluation(&eval).unwrap();
+        let plan = plan_evaluation(&eval, &deployment(), &[node(1), node(2)], &[old]).unwrap();
+        store.commit_plan(&eval, &plan).unwrap();
+
+        let claimed = store
+            .claim_pending_commands("worker-a", 1_000, 5_000, 1)
+            .unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].kind, AllocationCommandKind::Stop);
+        assert_eq!(claimed[1].kind, AllocationCommandKind::Start);
+        assert!(claimed
+            .iter()
+            .all(|command| command.claimed_by.as_deref() == Some("worker-a")));
+        assert!(store
+            .claim_pending_commands("worker-b", 1_001, 5_000, 10)
+            .unwrap()
+            .is_empty());
+
+        let reclaimed = store
+            .claim_pending_commands("worker-b", 6_001, 5_000, 10)
+            .unwrap();
+        assert_eq!(reclaimed.len(), 2);
+        assert!(reclaimed
+            .iter()
+            .all(|command| command.claimed_by.as_deref() == Some("worker-b")));
+    }
+
+    #[test]
+    fn test_claimed_ack_rejects_wrong_dispatcher_and_is_idempotent() {
+        let store = MemoryControlStore::default();
+        let eval = evaluation("eval-claimed-ack");
+        store.record_evaluation(&eval).unwrap();
+        let plan = plan_evaluation(&eval, &deployment(), &[node(1)], &[]).unwrap();
+        store.commit_plan(&eval, &plan).unwrap();
+
+        let command = store
+            .claim_pending_commands("worker-a", 100, 1_000, 10)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            store.acknowledge_claimed_command(&command.command_id, "worker-b"),
+            Err(StoreError::CommandClaimLost(command.command_id.clone()))
+        );
+        store
+            .acknowledge_claimed_command(&command.command_id, "worker-a")
+            .unwrap();
+        store
+            .acknowledge_claimed_command(&command.command_id, "worker-a")
+            .unwrap();
+        assert!(store.pending_commands().unwrap().is_empty());
     }
 
     #[test]
