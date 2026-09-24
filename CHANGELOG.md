@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### JIT tier replacement and compile-time observability — 2026-09-24
+- **Tier-2 promotion now replaces the installed machine-code entry instead of returning the already-cached lower-tier function.** Compiled regions carry an explicit `Baseline` / `Typed` / `Simd` tier, and promotion uses fresh Cranelift symbols while preserving the same cache slot.
+- **Baseline regions can promote to type-directed code after the Tier-2 threshold when register types are provable and no folded direct call blocks the typed compiler; typed regions can subsequently promote to SIMD when the loop analyzer accepts them.** Failed promotion leaves the current code installed.
+- **Each installed compiled region records compiler wall time in nanoseconds.** Regression coverage pins pointer replacement, tier transition, per-session counters, and stable compiled-region cardinality across replacement.
+
+
 ### CI playground dependency and formatting repair — 2026-09-24
 - **Browser-playground compilation now includes the shared content-identity module and its pure-Rust `hex` dependency** (`crates/nulang-playground`), matching `semantic_identity.rs`'s current dependency graph. Runtime worker-pool files were also normalized to the repository's rustfmt output so the format gate reflects semantics rather than stale layout.
 
