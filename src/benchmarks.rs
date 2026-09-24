@@ -216,7 +216,7 @@ fn bench_ab_local_owned_payload_send() {
         actor Producer {
             state sink = nil
             behavior wire(s) { self.sink = s }
-            behavior emit() {
+            behavior produce() {
                 let xs = [1, 2, 3] in
                     send self.sink take(xs)
             }
@@ -246,16 +246,16 @@ fn bench_ab_local_owned_payload_send() {
             .expect("sink spawned")
     };
 
-    let emit_id = rt
+    let produce_id = rt
         .borrow()
-        .behavior_id_for(producer_id, "emit")
+        .behavior_id_for(producer_id, "produce")
         .expect("emit behavior");
 
     let start = Instant::now();
     {
         let mut runtime = rt.borrow_mut();
         for _ in 0..N {
-            runtime.send_message_by_id(producer_id, emit_id, &[]);
+            runtime.send_message_by_id(producer_id, produce_id, &[]);
         }
         runtime.run_scheduler();
     }
