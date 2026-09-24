@@ -266,7 +266,7 @@ pub struct DurableOutboxMessage {
 }
 
 /// One logical durable actor/workflow/entity transition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DurableTransition {
     pub version: u16,
     pub actor_id: u64,
@@ -933,9 +933,187 @@ impl JsonFileStore {
     fn events_path(&self, actor_id: u64) -> PathBuf {
         self.actor_dir(actor_id).join("events.jsonl")
     }
+
+    fn transitions_path(&self, actor_id: u64) -> PathBuf {
+        self.actor_dir(actor_id).join("durable_transitions.json")
+    }
+
+    fn read_atomic_transitions(&self, actor_id: u64) -> io::Result<Vec<DurableTransition>> {
+        let path = self.transitions_path(actor_id);
+        let data = match fs::read_to_string(&path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        serde_json::from_str(&data).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "failed to parse atomic transition journal for actor {} at {}: {}",
+                    actor_id,
+                    path.display(),
+                    error
+                ),
+            )
+        })
+    }
+
+    fn write_atomic_transitions(
+        &self,
+        actor_id: u64,
+        transitions: &[DurableTransition],
+    ) -> io::Result<()> {
+        let dir = self.actor_dir(actor_id);
+        fs::create_dir_all(&dir)?;
+        let path = self.transitions_path(actor_id);
+        let tmp_path = dir.join("durable_transitions.json.tmp");
+        let json = serde_json::to_vec(transitions)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        {
+            let mut file = fs::File::create(&tmp_path)?;
+            file.write_all(&json)?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp_path, &path)?;
+        // Persist the rename itself across a power loss on filesystems that
+        // require the containing directory to be fsync'd.
+        if let Ok(dir_file) = fs::File::open(&dir) {
+            let _ = dir_file.sync_all();
+        }
+        Ok(())
+    }
 }
 
 impl PersistenceStore for JsonFileStore {
+    fn load_durable_effect(
+        &self,
+        actor_id: u64,
+        effect_id: DurableEffectId,
+    ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        Ok(self
+            .read_atomic_transitions(actor_id)?
+            .into_iter()
+            .rev()
+            .flat_map(|transition| transition.durable_effects.into_iter().rev())
+            .find(|record| record.effect().spec().id == effect_id))
+    }
+
+    fn commit_transition(&mut self, transition: DurableTransition) -> io::Result<DurableCommit> {
+        transition.validate_structure()?;
+        let digest = transition.digest()?;
+        let mut transitions = self.read_atomic_transitions(transition.actor_id)?;
+
+        if let Some(last) = transitions.last() {
+            let tail_digest = last.digest()?;
+            if transition.activation_epoch == last.activation_epoch
+                && transition.sequence == last.sequence
+            {
+                if digest == tail_digest {
+                    return Ok(DurableCommit {
+                        actor_id: transition.actor_id,
+                        activation_epoch: last.activation_epoch,
+                        sequence: last.sequence,
+                        digest,
+                    });
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "conflicting durable transition already committed at this epoch/sequence",
+                ));
+            }
+            if transition.activation_epoch < last.activation_epoch {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "stale durable activation epoch {}; committed epoch is {}",
+                        transition.activation_epoch, last.activation_epoch
+                    ),
+                ));
+            }
+            if transition.expected_previous_sequence != last.sequence {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "durable transition predecessor {} does not match committed tail {}",
+                        transition.expected_previous_sequence, last.sequence
+                    ),
+                ));
+            }
+        } else {
+            // First atomic commit may continue legacy file-backed history.
+            let snapshot_seq = {
+                let path = self.snapshot_path(transition.actor_id);
+                fs::read_to_string(path)
+                    .ok()
+                    .and_then(|data| serde_json::from_str::<ActorSnapshot>(&data).ok())
+                    .map(|snapshot| snapshot.sequence)
+                    .unwrap_or(0)
+            };
+            let journal_seq = {
+                let path = self.journal_path(transition.actor_id);
+                fs::read_to_string(path)
+                    .ok()
+                    .and_then(|data| {
+                        data.lines()
+                            .filter_map(|line| serde_json::from_str::<JournalEntry>(line).ok())
+                            .last()
+                    })
+                    .map(|entry| entry.sequence)
+                    .unwrap_or(0)
+            };
+            let workflow_seq = {
+                let path = self.workflow_events_path(transition.actor_id);
+                fs::read_to_string(path)
+                    .ok()
+                    .and_then(|data| {
+                        data.lines()
+                            .filter_map(|line| serde_json::from_str::<WorkflowEvent>(line).ok())
+                            .last()
+                    })
+                    .map(|event| event.sequence())
+                    .unwrap_or(0)
+            };
+            let event_seq = {
+                let path = self.events_path(transition.actor_id);
+                fs::read_to_string(path)
+                    .ok()
+                    .and_then(|data| {
+                        data.lines()
+                            .filter_map(|line| serde_json::from_str::<EventEntry>(line).ok())
+                            .last()
+                    })
+                    .map(|entry| entry.sequence)
+                    .unwrap_or(0)
+            };
+            let legacy_tail = snapshot_seq
+                .max(journal_seq)
+                .max(workflow_seq)
+                .max(event_seq);
+            if transition.expected_previous_sequence != legacy_tail {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "first atomic transition predecessor {} does not match legacy tail {}",
+                        transition.expected_previous_sequence, legacy_tail
+                    ),
+                ));
+            }
+        }
+
+        let actor_id = transition.actor_id;
+        let activation_epoch = transition.activation_epoch;
+        let sequence = transition.sequence;
+        transitions.push(transition);
+        self.write_atomic_transitions(actor_id, &transitions)?;
+
+        Ok(DurableCommit {
+            actor_id,
+            activation_epoch,
+            sequence,
+            digest,
+        })
+    }
+
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
         let dir = self.actor_dir(snapshot.actor_id);
         fs::create_dir_all(&dir)?;
@@ -957,22 +1135,40 @@ impl PersistenceStore for JsonFileStore {
 
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
         let path = self.snapshot_path(actor_id);
-        // A missing file is the normal "no snapshot yet" case — stay silent.
-        let data = fs::read_to_string(&path).ok()?;
-        match serde_json::from_str(&data) {
-            Ok(snapshot) => Some(snapshot),
-            Err(e) => {
-                // A present-but-unparseable snapshot means corruption (e.g. an
-                // older non-atomic write); log it instead of silently resetting
-                // the actor's durable state on recovery.
-                warn!(
-                    "nulang-persist: failed to parse snapshot for actor {} at {}: {}",
-                    actor_id,
-                    path.display(),
-                    e
-                );
-                None
+        let legacy = match fs::read_to_string(&path) {
+            Ok(data) => match serde_json::from_str::<ActorSnapshot>(&data) {
+                Ok(snapshot) => Some(snapshot),
+                Err(e) => {
+                    warn!(
+                        "nulang-persist: failed to parse snapshot for actor {} at {}: {}",
+                        actor_id,
+                        path.display(),
+                        e
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        let atomic = self
+            .read_atomic_transitions(actor_id)
+            .ok()
+            .and_then(|transitions| {
+                transitions
+                    .into_iter()
+                    .rev()
+                    .find_map(|transition| transition.snapshot)
+            });
+        match (legacy, atomic) {
+            (Some(left), Some(right)) => {
+                if right.sequence >= left.sequence {
+                    Some(right)
+                } else {
+                    Some(left)
+                }
             }
+            (Some(snapshot), None) | (None, Some(snapshot)) => Some(snapshot),
+            (None, None) => None,
         }
     }
 
@@ -995,13 +1191,23 @@ impl PersistenceStore for JsonFileStore {
 
     fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
         let path = self.journal_path(actor_id);
-        let data = match fs::read_to_string(path) {
-            Ok(d) => d,
-            Err(_) => return Vec::new(),
-        };
-        data.lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect()
+        let mut entries: Vec<JournalEntry> = fs::read_to_string(path)
+            .ok()
+            .map(|data| {
+                data.lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Ok(transitions) = self.read_atomic_transitions(actor_id) {
+            entries.extend(
+                transitions
+                    .into_iter()
+                    .filter_map(|transition| transition.command),
+            );
+        }
+        entries.sort_by_key(|entry| entry.sequence);
+        entries
     }
 
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
@@ -1023,13 +1229,21 @@ impl PersistenceStore for JsonFileStore {
 
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
         let path = self.workflow_events_path(actor_id);
-        let data = match fs::read_to_string(path) {
-            Ok(d) => d,
-            Err(_) => return Vec::new(),
-        };
-        data.lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect()
+        let mut events: Vec<WorkflowEvent> = fs::read_to_string(path)
+            .ok()
+            .map(|data| {
+                data.lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Ok(transitions) = self.read_atomic_transitions(actor_id) {
+            for transition in transitions {
+                events.extend(transition.workflow_events);
+            }
+        }
+        events.sort_by_key(WorkflowEvent::sequence);
+        events
     }
 
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
@@ -1053,13 +1267,21 @@ impl PersistenceStore for JsonFileStore {
 
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
         let path = self.events_path(actor_id);
-        let data = match fs::read_to_string(path) {
-            Ok(d) => d,
-            Err(_) => return Vec::new(),
-        };
-        data.lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect()
+        let mut entries: Vec<EventEntry> = fs::read_to_string(path)
+            .ok()
+            .map(|data| {
+                data.lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Ok(transitions) = self.read_atomic_transitions(actor_id) {
+            for transition in transitions {
+                entries.extend(transition.domain_events);
+            }
+        }
+        entries.sort_by_key(|entry| entry.sequence);
+        entries
     }
 
     fn latest_sequence(&self, actor_id: u64) -> u64 {
@@ -2991,6 +3213,90 @@ mod json_file_store_tests {
             .snapshot_path(1)
             .with_file_name("snapshot.json.tmp")
             .exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_json_file_store_atomic_transition_round_trip() {
+        let dir = fresh_dir("atomic_transition");
+        let mut store = JsonFileStore::new(&dir).unwrap();
+        let mut state = HashMap::new();
+        state.insert("step_index".to_string(), PersistedValue::Int(1));
+        let transition = DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: 7,
+            activation_epoch: 1,
+            sequence: 1,
+            expected_previous_sequence: 0,
+            command: Some(JournalEntry {
+                sequence: 1,
+                behavior_id: 3,
+                payload: vec![PersistedValue::Int(9)],
+            }),
+            snapshot: Some(ActorSnapshot {
+                actor_id: 7,
+                sequence: 1,
+                state,
+                waiting_signal: None,
+                crdt_snapshot: None,
+                crdt_field_map: None,
+                authority_tokens: Default::default(),
+            }),
+            workflow_events: vec![WorkflowEvent::StepCompleted {
+                sequence: 1,
+                step_name: "charge".to_string(),
+            }],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        };
+
+        let first = store.commit_transition(transition.clone()).unwrap();
+        let retry = store.commit_transition(transition).unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(store.latest_sequence(7), 1);
+        assert_eq!(store.read_journal(7).len(), 1);
+        assert!(matches!(
+            store.read_workflow_events(7).as_slice(),
+            [WorkflowEvent::StepCompleted { sequence: 1, step_name }] if step_name == "charge"
+        ));
+        assert_eq!(
+            store
+                .load_snapshot(7)
+                .and_then(|snapshot| snapshot.state.get("step_index").cloned()),
+            Some(PersistedValue::Int(1))
+        );
+
+        let reopened = JsonFileStore::new(&dir).unwrap();
+        assert_eq!(reopened.latest_sequence(7), 1);
+        assert_eq!(reopened.read_journal(7)[0].behavior_id, 3);
+        assert!(!reopened
+            .actor_dir(7)
+            .join("durable_transitions.json.tmp")
+            .exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_json_file_store_atomic_transition_rejects_sequence_gap() {
+        let dir = fresh_dir("atomic_gap");
+        let mut store = JsonFileStore::new(&dir).unwrap();
+        let transition = DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: 8,
+            activation_epoch: 1,
+            sequence: 2,
+            expected_previous_sequence: 1,
+            command: None,
+            snapshot: None,
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+        };
+        let error = store.commit_transition(transition).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(store.latest_sequence(8), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 
