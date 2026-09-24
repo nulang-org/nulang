@@ -2527,6 +2527,13 @@ pub struct VM {
     pub handler_stack: Vec<HandlerFrame>,
     /// Step counter (for debugging / limits).
     step_count: usize,
+    /// Backend-neutral logical bytecode work counter.
+    ///
+    /// The interpreter charges one unit per executed bytecode instruction.
+    /// JIT execution charges the static bytecode length of each compiled region
+    /// that actually runs. This is telemetry only for now; scheduler policy
+    /// must not depend on it until benchmark-derived budgets are established.
+    logical_reduction_count: u64,
     /// Set by try_jit_execute when a JIT safepoint triggers a yield.
     /// Consumed by run_from / resume to return early; reset at start of run_from.
     pub yield_pending: bool,
@@ -2731,6 +2738,7 @@ impl VM {
             current_frame_idx: None,
             handler_stack: Vec::new(),
             step_count: 0,
+            logical_reduction_count: 0,
             yield_pending: false,
             jit_session: if enable_jit {
                 create_default_jit()
@@ -2888,6 +2896,15 @@ impl VM {
         {
             sb.io_output = buf;
         }
+    }
+
+    /// Backend-neutral logical bytecode work executed by this VM.
+    ///
+    /// Unlike `step_count`, this counter intentionally accounts for JIT
+    /// regions in terms of their source bytecode length so interpreter/JIT
+    /// benchmark runs can compare one common work unit.
+    pub fn logical_reduction_count(&self) -> u64 {
+        self.logical_reduction_count
     }
 
     /// Number of activation frames between the given frame and the stack
@@ -3648,11 +3665,19 @@ impl VM {
             // A re-entrant callee raised a runtime error. Surface it before
             // normal branch-exit or safepoint handling.
             if let Some(msg) = crate::jit::runtime::take_jit_pending_vm_error() {
+                // The compiled region entered and made progress before the
+                // re-entrant call failed. Charge a conservative single unit:
+                // exact partial-region accounting is intentionally deferred.
+                self.logical_reduction_count =
+                    self.logical_reduction_count.saturating_add(1);
                 self.jit_pending_error = Some(msg);
                 return true;
             }
 
             if let Some(exit_offset) = crate::jit::runtime::take_jit_branch_exit_pc() {
+                self.logical_reduction_count = self
+                    .logical_reduction_count
+                    .saturating_add(region_len.unwrap_or(1) as u64);
                 let base = pc as isize;
                 let off = exit_offset as i64 as isize;
                 self.frames[frame_idx].pc = (base + off).max(0) as usize;
@@ -3668,6 +3693,9 @@ impl VM {
             }
 
             if let Some(region_len) = region_len {
+                self.logical_reduction_count = self
+                    .logical_reduction_count
+                    .saturating_add(region_len as u64);
                 self.frames[frame_idx].pc += region_len;
                 return true;
             }
@@ -4993,6 +5021,11 @@ impl VM {
                 });
             }
         }
+
+        // One interpreter bytecode instruction is one logical reduction.
+        // Charge only after debugger pause handling so paused instructions are
+        // not reported as executed work.
+        self.logical_reduction_count = self.logical_reduction_count.saturating_add(1);
 
         self.frames[frame_idx].pc += 1;
 
@@ -7862,6 +7895,11 @@ mod vm_tests {
             .map(|j| j.compiled_count())
             .unwrap_or(0);
         assert!(compiled > 0, "loop body must have been JIT-compiled");
+        assert!(
+            vm.logical_reduction_count() >= 11_000,
+            "JIT regions must contribute backend-neutral logical bytecode work; got {}",
+            vm.logical_reduction_count()
+        );
     }
 
     /// Regression: a JIT-compiled `ArrLoad` must apply the interpreter's
@@ -8386,6 +8424,24 @@ mod vm_tests {
             result.err()
         );
         assert_eq!(result.unwrap().as_int(), Some(9));
+    }
+
+    #[test]
+    fn test_logical_reductions_count_interpreter_bytecode() {
+        let mut module = CodeModule::new("logical_reductions_interpreter");
+        module.emit(Instruction::new0(OpCode::Nop));
+        module.emit(Instruction::new0(OpCode::Nop));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+
+        let mut vm = VM::new_without_jit();
+        vm.load_module(module);
+        assert_eq!(vm.logical_reduction_count(), 0);
+
+        vm.run().expect("simple interpreter program must run");
+
+        // Halt is consumed by run() as a terminal marker rather than stepped.
+        assert_eq!(vm.logical_reduction_count(), 2);
     }
 
     /// Regression: `IMul` on 48-bit boundary values must not overflow i64
