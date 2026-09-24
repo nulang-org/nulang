@@ -6485,25 +6485,41 @@ impl Runtime {
         if let Some(child) = self.actors.get_mut(&child_id) {
             child.parent = Some(supervisor_id);
         }
-        // RFC 0014 §4: `RespawnOnNodeLoss` opts the child into shadow
-        // replication + the durable-actor directory (epoch starts at 1).
-        // Only durable (`persistent`) actors are opt-able: a non-durable
-        // actor has no snapshot to re-spawn from.
-        if spec.restart_policy == RestartPolicy::RespawnOnNodeLoss
-            && self
-                .actors
-                .get(&child_id)
-                .map(|a| a.persistent)
-                .unwrap_or(false)
-        {
-            self.respawn_opted.entry(child_id).or_insert(1);
-            if let Some(cluster) = self.distributed.cluster.as_mut() {
-                let node = self.distributed.node_id.unwrap_or(NodeId::LOCAL);
-                cluster.announce_directory(DurableDirectoryEntry {
-                    actor_id: child_id,
-                    node_id: node,
-                    epoch: 1,
-                });
+        // RFC 0014 §4: `RespawnOnNodeLoss` uses the frozen NBC v1 shadow
+        // transport. That transport does not carry compiler semantic sidecars,
+        // so only durable *legacy/unidentified* actors are eligible. Identified
+        // actors must remain local until a versioned transport can prove the
+        // executable definition that will consume their durable history.
+        if spec.restart_policy == RestartPolicy::RespawnOnNodeLoss {
+            let shadow_eligibility = self.actors.get(&child_id).map(|actor| {
+                (
+                    actor.persistent,
+                    actor.definition_semantic_id.is_none(),
+                )
+            });
+
+            match shadow_eligibility {
+                Some((true, true)) => {
+                    self.respawn_opted.entry(child_id).or_insert(1);
+                    if let Some(cluster) = self.distributed.cluster.as_mut() {
+                        let node = self.distributed.node_id.unwrap_or(NodeId::LOCAL);
+                        cluster.announce_directory(DurableDirectoryEntry {
+                            actor_id: child_id,
+                            node_id: node,
+                            epoch: 1,
+                        });
+                    }
+                }
+                Some((true, false)) => {
+                    // Defensive cleanup for callers that re-supervise an
+                    // existing actor after its provenance becomes known.
+                    self.respawn_opted.remove(&child_id);
+                    warn!(
+                        actor_id = child_id,
+                        "nulang-respawn: refusing legacy NBC v1 shadow opt-in for identified actor"
+                    );
+                }
+                _ => {}
             }
         }
         if let Some(supervisor) = self.supervisors.get_mut(&supervisor_id) {
