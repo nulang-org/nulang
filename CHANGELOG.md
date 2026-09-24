@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### Durable actor definition identity recovery gate — 2026-09-24
+- **Durable actor snapshots now persist the compiler-derived actor-definition `SemanticId` and every identified local activation path verifies an exact match before running state under code**. Ordinary recovery, deterministic persistent restart, virtual-actor hydration, and supervised restart share one definition-scoped gate; the containing program's whole-module identity is not used as the compatibility key.
+- **Legacy snapshots remain explicit legacy history.** `RecoveryIdentityPolicy::Strict` rejects snapshots without semantic provenance; the default compatibility path may read a pre-identity snapshot but keeps the live actor unverified, so a later checkpoint cannot silently upgrade historical provenance.
+- **Atomic libSQL durable transitions preserve the snapshot identity and include it in the transition digest**, so retry/idempotency checks cannot treat two transitions with different semantic provenance as equivalent.
+- **Frozen NBC v1 cross-node transport fails closed for identified durable actors.** Identified migration is refused, identified snapshots received over NBC v1 are rejected, and identified actors are not advertised through shadow failover until the transport carries a verifiable artifact/semantic manifest. This intentionally prefers temporary loss of experimental cross-node availability over executing identified durable state under unprovable code.
+
 ### Typed bytecode semantic identity sidecars — 2026-09-24
 - **Production typed compilation now attaches compiler-proven whole-program and actor-definition `SemanticId` sidecars to in-memory `CodeModule` values**. Definition identities remain parallel to `actor_metadata`, preserving namespace-distinct ownership even when short actor names collide.
 - **Frozen NBC v1 is unchanged.** Raw/legacy NBC loads and low-level `mir_codegen::compile_mir` remain explicitly unproven; the CLI, REPL, DAP, and FFI typed frontend paths use `compile_typed_bytecode` so later durable recovery code can distinguish proven current semantics from legacy code.
