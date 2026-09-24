@@ -158,15 +158,16 @@ Execution ordering is safety-biased:
   delivery, a compensating Stop is issued before ACK.
 
 This closes the crash-after-start/stale-outbox recovery case without requiring
-the executor to infer intent from gossip. The initial dispatcher assumes one
-logical dispatcher per control-store scope. Durable command claims/leases are
-the next hardening step before active-active dispatchers are supported.
+the executor to infer intent from gossip. Dispatchers now acquire durable leases
+with monotonically increasing claim generations before delivery. An unresolved
+Stop blocks a Start for the same logical replica at the store boundary, and a
+dispatcher whose lease has been reclaimed cannot ACK or release the newer
+generation. The same claim state is persisted by JSON and PostgreSQL stores.
 
 ## Next implementation slices
 
-1. Durable command claiming/leases for active-active dispatchers.
-2. Reconciliation event loop for deployment/node/allocation changes.
-3. PostgreSQL state normalization only if measured contention/state size justifies it.
+1. Reconciliation event loop for deployment/node/allocation changes.
+2. PostgreSQL state normalization only if measured contention/state size justifies it.
 4. Fabric-backed service directory with generation-tagged health advertisements.
 5. Workload identity and short-lived mTLS credentials bound to node/workload
    identity.
