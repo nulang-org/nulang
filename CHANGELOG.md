@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Preserve observable MIR panic through DCE — 2026-09-24
+- **MIR dead-store elimination now treats `RValue::Panic` as observable/divergent** (`src/mir_codegen.rs`), so an unused panic result cannot cause a reachable contract/precondition failure to be optimized away. A focused optimizer regression pins the behavior.
+
+
 ### Durable external-effect crash-window release gate — 2026-09-23
 - **The deterministic crash-window matrix now exercises the real `DurableEffectCoordinator` over `MemoryStore` using compiler-owned semantic effect-site IDs**, covering intent-only recovery, provider-commit/receipt-loss deduplication, completed-receipt replay, request/specification drift, stale-owner completion fencing, explicit at-least-once duplication, and backend-defined delegation.
 - **The public durability guarantee boundary is documented explicitly** (`docs/DURABILITY_GUARANTEES.md`): Nulang does not claim arbitrary exactly-once external execution; effectively-once behavior requires a real provider/backend deduplication contract and the same stable operation identity across recovery.
