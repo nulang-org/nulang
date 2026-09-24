@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### Compiler-owned semantic effect-site identity — 2026-09-23
+- **MIR can now derive backend-independent `EffectSiteId` values for every `Perform` / `PerformAsync` site.** Identity is domain-separated by module, owner kind, fully qualified function/behavior name, effect operation, and same-operation ordinal; source spans, compiler-generated local/block IDs, and bytecode PCs are deliberately excluded.
+- **Durable invocation identity can compose semantic site identity with durable execution identity.** `DurableEffectId::derive_from_site` combines actor identity, a replay-stable execution key, the compiler-owned site ID, and a dynamic occurrence index so repeated execution of one site inside a loop remains distinguishable while retries remain stable.
+- Regression tests pin formatting/source-line stability, unrelated-definition stability, actor-qualified behavior identity, same-operation site ordinals, dynamic occurrence separation, and hex round-tripping.
+- This changes no source syntax or bytecode format. Preserving the site ID through backend artifacts is the next integration step before receipt-backing `Provider.ask` / `Inference.ask`.
+
 ### Indexed selective receive — 2026-09-23
 - **Selective receive now lazily indexes staged mailbox lanes by behavior id**, avoiding repeated O(mailbox depth × arm count) scans while preserving system → local → normal precedence, FIFO candidate choice, first-arm semantics, and transactional guard retry/reset behavior.
 - Criterion coverage now measures mailbox depth, arm count, and repeated guard rejection; focused regressions pin index rebuilds after commit, new arrivals, duplicate arms, and cursor rewind on receive reset.
