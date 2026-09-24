@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Compiler-owned JIT parameter type seeds — 2026-09-24
+- **Source compilation now seeds primitive function/behavior argument types into the tiered JIT's bytecode must-analysis** (`src/bytecode.rs`, `src/mir_codegen.rs`, `src/jit/typed_compiler.rs`). Seeds are in-memory-only and omitted from frozen NBC artifacts. Only typed regions whose proof depends on a compiler seed receive a live tag guard before native entry; existing bytecode-proven typed regions retain the zero-guard fast path. Guard mismatch is a normal interpreter deopt, preserving dynamic VM/FFI/message entry safety.
+
+
 ### Dense terminal Tier-2 JIT state — 2026-09-24
 - **Post-compilation tiering state now lives beside each dense compiled-region cache entry** (`src/jit/mod.rs`) instead of a separate hash map. Untyped regions become terminal after the threshold; typed regions receive one real SIMD replacement attempt through a distinct Tier-2 symbol, and both success and static rejection stop further promotion bookkeeping.
 
