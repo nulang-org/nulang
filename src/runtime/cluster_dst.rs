@@ -87,6 +87,13 @@ pub(crate) enum ClusterTraceEvent {
     },
 }
 
+/// Minimal artifact required to reproduce a deterministic cluster fault run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ClusterReplayPlan {
+    pub seed: u64,
+    pub faults: Vec<ScheduledFault>,
+}
+
 /// Deterministic multi-node cluster harness.
 pub(crate) struct DeterministicCluster {
     /// The real runtimes, one per simulated node (index-aligned with
@@ -94,6 +101,8 @@ pub(crate) struct DeterministicCluster {
     pub nodes: Vec<Runtime>,
     /// Node addresses; each node's id is derived from its address.
     pub addrs: Vec<SocketAddr>,
+    /// Original seed retained so a run can emit a complete replay artifact.
+    seed: u64,
     /// Master seeded RNG: drives per-round node order and hands each
     /// node's scheduler its selections from one shared stream.
     rng: DeterministicRng,
@@ -169,6 +178,7 @@ impl DeterministicCluster {
         DeterministicCluster {
             nodes,
             addrs: addrs.to_vec(),
+            seed,
             rng,
             partitions: vec![std::collections::HashSet::new(); addrs.len()],
             crashed: vec![false; addrs.len()],
@@ -228,6 +238,37 @@ impl DeterministicCluster {
                 ClusterFault::Restart { node } => self.restart_node(node),
                 ClusterFault::ReorderAll { enabled } => self.set_reorder_all(enabled),
             }
+        }
+    }
+
+    /// Build a fresh cluster from a persisted seed + fault script.
+    pub fn from_replay_plan(addrs: &[SocketAddr], plan: &ClusterReplayPlan) -> Self {
+        let mut cluster = Self::new(addrs, plan.seed);
+        for scheduled in &plan.faults {
+            cluster.schedule_fault(scheduled.round, scheduled.fault.clone());
+        }
+        cluster
+    }
+
+    /// Export the minimal artifact needed to replay this run.
+    ///
+    /// Scheduled faults are recovered from the immutable trace, so faults that
+    /// have already fired are still present after `fault_script` is drained.
+    pub fn replay_plan(&self) -> ClusterReplayPlan {
+        let faults = self
+            .trace
+            .iter()
+            .filter_map(|event| match event {
+                ClusterTraceEvent::FaultScheduled { round, fault } => Some(ScheduledFault {
+                    round: *round,
+                    fault: fault.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        ClusterReplayPlan {
+            seed: self.seed,
+            faults,
         }
     }
 
@@ -1315,14 +1356,15 @@ mod foundationdb_trace_tests {
     fn scripted_faults_produce_identical_decision_traces_for_same_seed() {
         let addrs = [addr(32101), addr(32102), addr(32103)];
         let mut first = DeterministicCluster::new(&addrs, 0xF0_0D);
-        let mut second = DeterministicCluster::new(&addrs, 0xF0_0D);
+        first.schedule_fault(1, ClusterFault::Partition { from: 0, to: 1 });
+        first.schedule_fault(2, ClusterFault::Heal { node: 0 });
+        first.schedule_fault(3, ClusterFault::ReorderAll { enabled: true });
+        first.run_rounds(4);
 
-        for cluster in [&mut first, &mut second] {
-            cluster.schedule_fault(1, ClusterFault::Partition { from: 0, to: 1 });
-            cluster.schedule_fault(2, ClusterFault::Heal { node: 0 });
-            cluster.schedule_fault(3, ClusterFault::ReorderAll { enabled: true });
-            cluster.run_rounds(4);
-        }
+        let encoded_plan = serde_json::to_vec(&first.replay_plan()).unwrap();
+        let plan: ClusterReplayPlan = serde_json::from_slice(&encoded_plan).unwrap();
+        let mut second = DeterministicCluster::from_replay_plan(&addrs, &plan);
+        second.run_rounds(4);
 
         assert_eq!(first.trace(), second.trace());
         assert!(first.trace().iter().any(|event| matches!(
