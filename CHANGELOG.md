@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Typed JIT basic-block coalescing — 2026-09-24
+- **Typed Cranelift codegen now creates blocks only for real bytecode CFG leaders** (`src/jit/typed_compiler.rs`) instead of one block and unconditional jump per bytecode instruction. The newer native Int/Float caches, loop-carried SSA, and forward-CFG block parameters are preserved; ordinary CFG edges synchronize the VM register file conservatively.
+
+
 ### Consuming local-send ownership proof — 2026-09-24
 - **MIR now identifies fresh, single-definition heap-owning values whose sole use is a same-node actor send**, establishing a conservative proof surface for a later ORCA ownership handoff.
 - The analysis is intentionally metadata-only in this slice: it changes no bytecode, mailbox representation, reference count, or runtime behavior. Parameters, captures, handler bindings, multi-use values, and remote sends remain ineligible.
