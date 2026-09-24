@@ -55,6 +55,10 @@ fn report(name: &str, messages: u64, elapsed: std::time::Duration) {
     println!(
         "[bench] {name}: {messages} msgs in {secs:.3}s = {msg_per_s:.0} msg/s ({ns_per_msg:.1} ns/msg)"
     );
+    println!(
+        "[cross-bench] runtime=nulang benchmark={name} messages={messages} elapsed_ns={}",
+        elapsed.as_nanos()
+    );
 }
 
 /// Counting: one actor, main thread floods it with N messages.
