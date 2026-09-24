@@ -96,6 +96,18 @@ pub trait JitBackend {
     /// Number of bytecode instructions in the compiled region at `(module_idx, pc)`.
     fn compiled_region_len(&self, module_idx: usize, pc: usize) -> Option<usize>;
 
+    /// Whether native execution of this region may re-enter the VM and grow
+    /// or replace its frame stack. Backends default to the conservative answer
+    /// so alternative implementations keep using detached register storage.
+    ///
+    /// The VM uses this to decide whether it is sound to expose the active
+    /// frame's register array directly to native code. A backend may return
+    /// `false` only when every helper reachable from the compiled region is
+    /// proven not to access or mutate VM frame storage.
+    fn compiled_region_requires_vm_reentry(&self, _module_idx: usize, _pc: usize) -> bool {
+        true
+    }
+
     /// Number of regions compiled (scalar path).
     fn compiled_count(&self) -> usize;
 
