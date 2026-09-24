@@ -108,9 +108,13 @@ Temporal ScheduleActivity
     -> DurableEffectRecord::Prepared
     -> atomic transition commit
     -> activity dispatch
-    -> DurableEffectRecord::Completed
+    -> DurableEffectRecord::Completed | DurableEffectRecord::Failed
     -> atomic transition commit
 ```
+
+A known activity failure is persisted with an explicit retry class. Retryable
+failures reuse the same stable activity effect identity; terminal failures are
+replayed as failures without dispatching the activity again.
 
 The default delivery semantic is `AtLeastOnce`.
 

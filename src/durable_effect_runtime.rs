@@ -6,8 +6,8 @@
 //! `DurableEffectSpec` derived from semantic execution identity.
 
 use crate::durable_effect::{
-    DurableEffectId, DurableEffectRecord, DurableEffectRecoveryAction,
-    DurableEffectRequestMismatch, DurableEffectSpec,
+    DurableEffectId, DurableEffectRecord, DurableEffectRecoveryAction, DurableEffectRequestMismatch,
+    DurableEffectRetryClass, DurableEffectSpec,
 };
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
 use crate::runtime::{
@@ -19,9 +19,12 @@ use std::io;
 /// Runtime-owned decision after durable recovery state has been inspected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DurableEffectDispatchDecision {
-    /// A terminal receipt already exists. Return these bytes and do not call
-    /// the provider again.
+    /// A terminal success receipt already exists. Return these bytes and do not
+    /// call the provider again.
     ReplayRecordedResult(Vec<u8>),
+    /// A terminal failure receipt already exists. Return these bytes and do not
+    /// call the provider again.
+    ReplayRecordedFailure(Vec<u8>),
     /// Dispatch may be retried and duplicates are part of the declared
     /// at-least-once contract.
     DispatchAtLeastOnce { operation_id: DurableEffectId },
@@ -44,6 +47,10 @@ pub enum DurableEffectRuntimeError {
     MissingPreparedEffect {
         effect_id: DurableEffectId,
     },
+    TerminalFailureRecorded {
+        effect_id: DurableEffectId,
+        error: Vec<u8>,
+    },
 }
 
 impl fmt::Display for DurableEffectRuntimeError {
@@ -63,6 +70,11 @@ impl fmt::Display for DurableEffectRuntimeError {
             Self::MissingPreparedEffect { effect_id } => write!(
                 f,
                 "durable effect {effect_id} cannot complete because no prepared record exists"
+            ),
+            Self::TerminalFailureRecorded { effect_id, error } => write!(
+                f,
+                "durable effect {effect_id} already has terminal failure: {}",
+                String::from_utf8_lossy(error)
             ),
         }
     }
@@ -145,21 +157,62 @@ impl<'a> DurableEffectCoordinator<'a> {
 
         existing.effect().validate_request(request)?;
 
-        if let DurableEffectRecoveryAction::ReplayRecordedResult(recorded) =
-            existing.effect().recovery_action()
-        {
-            return Ok(recorded.to_vec());
+        match existing.effect().recovery_action() {
+            DurableEffectRecoveryAction::ReplayRecordedResult(recorded) => {
+                return Ok(recorded.to_vec());
+            }
+            DurableEffectRecoveryAction::ReplayRecordedFailure(error) => {
+                return Err(DurableEffectRuntimeError::TerminalFailureRecorded {
+                    effect_id,
+                    error: error.to_vec(),
+                });
+            }
+            DurableEffectRecoveryAction::RetryAtLeastOnce { .. }
+            | DurableEffectRecoveryAction::RetryWithDeduplication { .. }
+            | DurableEffectRecoveryAction::DelegateToBackend => {}
         }
 
         let completed = existing.effect().clone().complete(result);
         let durable_result = match &completed {
             DurableEffectRecord::Completed { result, .. } => result.clone(),
-            DurableEffectRecord::Prepared { .. } => unreachable!("completion must be terminal"),
+            DurableEffectRecord::Prepared { .. }
+            | DurableEffectRecord::Failed { .. } => {
+                unreachable!("retryable completion must become terminal success")
+            }
         };
         self.commit_record(DurableEffectPersistenceRecord::from_effect(completed))?;
         Ok(durable_result)
     }
 
+    /// Persist a provider/runtime failure receipt for a prepared invocation.
+    ///
+    /// Retryable failures remain eligible for redispatch using the same stable
+    /// operation identity. Terminal failures are monotonic and replay without
+    /// provider execution. Late failures never overwrite a completed result.
+    pub fn fail(
+        &mut self,
+        effect_id: DurableEffectId,
+        request: &[u8],
+        error: Vec<u8>,
+        retry_class: DurableEffectRetryClass,
+    ) -> Result<(), DurableEffectRuntimeError> {
+        let Some(existing) = self.store.load_durable_effect(self.actor_id, effect_id)? else {
+            return Err(DurableEffectRuntimeError::MissingPreparedEffect { effect_id });
+        };
+
+        existing.effect().validate_request(request)?;
+        match existing.effect().recovery_action() {
+            DurableEffectRecoveryAction::ReplayRecordedResult(_)
+            | DurableEffectRecoveryAction::ReplayRecordedFailure(_) => return Ok(()),
+            DurableEffectRecoveryAction::RetryAtLeastOnce { .. }
+            | DurableEffectRecoveryAction::RetryWithDeduplication { .. }
+            | DurableEffectRecoveryAction::DelegateToBackend => {}
+        }
+
+        let failed = existing.effect().clone().fail(error, retry_class);
+        self.commit_record(DurableEffectPersistenceRecord::from_effect(failed))?;
+        Ok(())
+    }
     fn validate_existing(
         &self,
         expected: &DurableEffectSpec,
@@ -209,6 +262,9 @@ fn decision(record: &DurableEffectRecord) -> DurableEffectDispatchDecision {
     match record.recovery_action() {
         DurableEffectRecoveryAction::ReplayRecordedResult(result) => {
             DurableEffectDispatchDecision::ReplayRecordedResult(result.to_vec())
+        }
+        DurableEffectRecoveryAction::ReplayRecordedFailure(error) => {
+            DurableEffectDispatchDecision::ReplayRecordedFailure(error.to_vec())
         }
         DurableEffectRecoveryAction::RetryAtLeastOnce { operation_id } => {
             DurableEffectDispatchDecision::DispatchAtLeastOnce { operation_id }
@@ -370,6 +426,77 @@ mod tests {
         assert_eq!(store.latest_sequence(42), 1);
     }
 
+    #[test]
+    fn terminal_failure_replays_without_redispatch() {
+        let mut store = MemoryStore::new();
+        let expected = spec(42, "turn:terminal", DeliverySemantics::AtLeastOnce);
+        let id = expected.id;
+
+        {
+            let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
+            coordinator.begin(expected.clone(), b"prompt").unwrap();
+            coordinator
+                .fail(
+                    id,
+                    b"prompt",
+                    b"permission denied".to_vec(),
+                    DurableEffectRetryClass::Terminal,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.latest_sequence(42), 2);
+        let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
+        assert_eq!(
+            coordinator.begin(expected, b"prompt").unwrap(),
+            DurableEffectDispatchDecision::ReplayRecordedFailure(
+                b"permission denied".to_vec()
+            )
+        );
+        assert_eq!(store.latest_sequence(42), 2);
+        assert!(matches!(
+            coordinator.complete(id, b"prompt", b"late-success".to_vec()),
+            Err(DurableEffectRuntimeError::TerminalFailureRecorded { effect_id, .. })
+                if effect_id == id
+        ));
+    }
+
+    #[test]
+    fn retryable_failure_reuses_operation_id_and_can_complete() {
+        let mut store = MemoryStore::new();
+        let expected = spec(
+            42,
+            "turn:retryable",
+            DeliverySemantics::EffectivelyOnceWithDeduplication,
+        );
+        let id = expected.id;
+
+        {
+            let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
+            coordinator.begin(expected.clone(), b"prompt").unwrap();
+            coordinator
+                .fail(
+                    id,
+                    b"prompt",
+                    b"timeout".to_vec(),
+                    DurableEffectRetryClass::Retryable,
+                )
+                .unwrap();
+        }
+
+        let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
+        assert_eq!(
+            coordinator.begin(expected, b"prompt").unwrap(),
+            DurableEffectDispatchDecision::DispatchWithDeduplication { operation_id: id }
+        );
+        assert_eq!(
+            coordinator
+                .complete(id, b"prompt", b"answer".to_vec())
+                .unwrap(),
+            b"answer"
+        );
+        assert_eq!(store.latest_sequence(42), 3);
+    }
     #[test]
     fn stale_activation_cannot_prepare_new_effect() {
         let mut store = MemoryStore::new();

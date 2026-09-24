@@ -210,6 +210,18 @@ impl DurableEffectSpec {
     }
 }
 
+/// Provider/runtime classification for a durably observed effect failure.
+///
+/// `Retryable` means the logical invocation may be dispatched again using the
+/// same stable `DurableEffectId` and the delivery contract on `DurableEffectSpec`.
+/// `Terminal` means the failure is a durable terminal receipt and MUST replay
+/// without re-executing the external effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableEffectRetryClass {
+    Retryable,
+    Terminal,
+}
+
 /// A journal lookup used the correct logical operation ID but supplied a
 /// different request body. Recovery must fail closed rather than replaying a
 /// recorded result or redispatching the old operation for the new request.
@@ -247,6 +259,12 @@ pub enum DurableEffectRecord {
         request_digest: [u8; 32],
         result: Vec<u8>,
     },
+    Failed {
+        spec: DurableEffectSpec,
+        request_digest: [u8; 32],
+        error: Vec<u8>,
+        retry_class: DurableEffectRetryClass,
+    },
 }
 
 impl DurableEffectRecord {
@@ -259,15 +277,17 @@ impl DurableEffectRecord {
 
     pub fn spec(&self) -> &DurableEffectSpec {
         match self {
-            Self::Prepared { spec, .. } | Self::Completed { spec, .. } => spec,
+            Self::Prepared { spec, .. }
+            | Self::Completed { spec, .. }
+            | Self::Failed { spec, .. } => spec,
         }
     }
 
     pub fn request_digest(&self) -> &[u8; 32] {
         match self {
-            Self::Prepared { request_digest, .. } | Self::Completed { request_digest, .. } => {
-                request_digest
-            }
+            Self::Prepared { request_digest, .. }
+            | Self::Completed { request_digest, .. }
+            | Self::Failed { request_digest, .. } => request_digest,
         }
     }
 
@@ -296,12 +316,53 @@ impl DurableEffectRecord {
             Self::Prepared {
                 spec,
                 request_digest,
+            }
+            | Self::Failed {
+                spec,
+                request_digest,
+                retry_class: DurableEffectRetryClass::Retryable,
+                ..
             } => Self::Completed {
                 spec,
                 request_digest,
                 result,
             },
             completed @ Self::Completed { .. } => completed,
+            terminal @ Self::Failed {
+                retry_class: DurableEffectRetryClass::Terminal,
+                ..
+            } => terminal,
+        }
+    }
+
+    /// Persist a provider/runtime failure receipt for this logical invocation.
+    ///
+    /// A completed result and a terminal failure are monotonic terminal
+    /// outcomes. Retryable failures may be replaced by later retryable/terminal
+    /// failures or by a successful completion, while preserving the same
+    /// logical operation identity and request digest.
+    pub fn fail(self, error: Vec<u8>, retry_class: DurableEffectRetryClass) -> Self {
+        match self {
+            Self::Prepared {
+                spec,
+                request_digest,
+            }
+            | Self::Failed {
+                spec,
+                request_digest,
+                retry_class: DurableEffectRetryClass::Retryable,
+                ..
+            } => Self::Failed {
+                spec,
+                request_digest,
+                error,
+                retry_class,
+            },
+            completed @ Self::Completed { .. } => completed,
+            terminal @ Self::Failed {
+                retry_class: DurableEffectRetryClass::Terminal,
+                ..
+            } => terminal,
         }
     }
 
@@ -311,17 +372,17 @@ impl DurableEffectRecord {
             Self::Completed { result, .. } => {
                 DurableEffectRecoveryAction::ReplayRecordedResult(result.as_slice())
             }
-            Self::Prepared { spec, .. } => match spec.delivery {
-                DeliverySemantics::BackendDefined => DurableEffectRecoveryAction::DelegateToBackend,
-                DeliverySemantics::AtLeastOnce => DurableEffectRecoveryAction::RetryAtLeastOnce {
-                    operation_id: spec.id,
-                },
-                DeliverySemantics::EffectivelyOnceWithDeduplication => {
-                    DurableEffectRecoveryAction::RetryWithDeduplication {
-                        operation_id: spec.id,
-                    }
-                }
-            },
+            Self::Failed {
+                error,
+                retry_class: DurableEffectRetryClass::Terminal,
+                ..
+            } => DurableEffectRecoveryAction::ReplayRecordedFailure(error.as_slice()),
+            Self::Prepared { spec, .. }
+            | Self::Failed {
+                spec,
+                retry_class: DurableEffectRetryClass::Retryable,
+                ..
+            } => retry_action(spec),
         }
     }
 
@@ -353,7 +414,9 @@ impl DurableEffectRecord {
     ) -> Result<DurableCompensationRecord, DurableCompensationError> {
         let original_effect_id = match self {
             Self::Completed { spec, .. } => spec.id,
-            Self::Prepared { .. } => return Err(DurableCompensationError::OriginalNotCompleted),
+            Self::Prepared { .. } | Self::Failed { .. } => {
+                return Err(DurableCompensationError::OriginalNotCompleted)
+            }
         };
         let effect_operation = effect_operation.into();
         let compensation_id =
@@ -373,6 +436,9 @@ pub enum DurableEffectRecoveryAction<'a> {
     /// Completion is already journaled: return the recorded bytes and do not
     /// execute the side effect again.
     ReplayRecordedResult(&'a [u8]),
+    /// A terminal failure receipt is already journaled: return the recorded
+    /// error and do not execute the side effect again.
+    ReplayRecordedFailure(&'a [u8]),
     /// Completion is unknown and duplicates are permitted by the declared
     /// contract. Retry the same logical operation ID.
     RetryAtLeastOnce { operation_id: DurableEffectId },
@@ -381,6 +447,19 @@ pub enum DurableEffectRecoveryAction<'a> {
     RetryWithDeduplication { operation_id: DurableEffectId },
     /// The configured backend owns the recovery guarantee and must decide.
     DelegateToBackend,
+}
+fn retry_action(spec: &DurableEffectSpec) -> DurableEffectRecoveryAction<'_> {
+    match spec.delivery {
+        DeliverySemantics::BackendDefined => DurableEffectRecoveryAction::DelegateToBackend,
+        DeliverySemantics::AtLeastOnce => DurableEffectRecoveryAction::RetryAtLeastOnce {
+            operation_id: spec.id,
+        },
+        DeliverySemantics::EffectivelyOnceWithDeduplication => {
+            DurableEffectRecoveryAction::RetryWithDeduplication {
+                operation_id: spec.id,
+            }
+        }
+    }
 }
 
 /// Invalid durable compensation transition.
@@ -632,6 +711,59 @@ mod tests {
         assert_eq!(*completed.request_digest(), digest);
     }
 
+    #[test]
+    fn retryable_failure_reuses_same_deduplication_identity() {
+        let record = DurableEffectRecord::prepare(
+            spec(DeliverySemantics::EffectivelyOnceWithDeduplication),
+            b"$10",
+        )
+        .fail(
+            b"provider unavailable".to_vec(),
+            DurableEffectRetryClass::Retryable,
+        );
+        let id = record.spec().id;
+        assert_eq!(
+            record.recovery_action_for_request(b"$10").unwrap(),
+            DurableEffectRecoveryAction::RetryWithDeduplication { operation_id: id }
+        );
+    }
+
+    #[test]
+    fn terminal_failure_replays_without_redispatch() {
+        let record = DurableEffectRecord::prepare(
+            spec(DeliverySemantics::AtLeastOnce),
+            b"$10",
+        )
+        .fail(
+            b"card declined".to_vec(),
+            DurableEffectRetryClass::Terminal,
+        );
+        assert_eq!(
+            record.recovery_action_for_request(b"$10").unwrap(),
+            DurableEffectRecoveryAction::ReplayRecordedFailure(b"card declined")
+        );
+        assert!(matches!(
+            record.complete(b"late-success".to_vec()),
+            DurableEffectRecord::Failed {
+                retry_class: DurableEffectRetryClass::Terminal,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn retryable_failure_can_later_complete() {
+        let record = DurableEffectRecord::prepare(
+            spec(DeliverySemantics::AtLeastOnce),
+            b"$10",
+        )
+        .fail(b"timeout".to_vec(), DurableEffectRetryClass::Retryable)
+        .complete(b"charged".to_vec());
+        assert_eq!(
+            record.recovery_action(),
+            DurableEffectRecoveryAction::ReplayRecordedResult(b"charged")
+        );
+    }
     #[test]
     fn compensation_requires_a_completed_original_effect() {
         let prepared = DurableEffectRecord::prepare(

@@ -196,7 +196,7 @@ result of one logical actor step:
 - signal acceptance records;
 - saga/compensation progress;
 - entity/domain `emit` records;
-- durable-effect Prepared/Completed records;
+- durable-effect Prepared/Completed/Failed records;
 - durable outbound message/outbox entries;
 - authority metadata changes when those become mutable.
 
@@ -225,10 +225,19 @@ COMMIT
 dispatch external request
   idempotency key = id when supported
 
-transition N+1:
+transition N+1 (success):
   DurableEffectRecord::Completed(id, result)
 COMMIT
+
+transition N+1 (known failure):
+  DurableEffectRecord::Failed(id, error, retry_class)
+COMMIT
 ```
+
+A `Retryable` failure may dispatch the same logical invocation again using the
+same `DurableEffectId` and declared delivery semantics. A `Terminal` failure is
+a durable terminal receipt: recovery returns the recorded error and MUST NOT
+re-execute the external effect.
 
 If Nulang crashes after Prepared but before external dispatch, recovery follows
 the declared delivery semantics.

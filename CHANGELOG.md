@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### Versioned durable external-effect failure receipts — 2026-09-23
+- **Durable effects now represent known provider/runtime failures explicitly as `Failed(error, retry_class)`.** `Retryable` failures retain the same stable operation/idempotency identity for another dispatch; `Terminal` failures replay the recorded error without re-executing the external effect.
+- **The durable-effect persistence envelope advances to version 2 rather than silently widening v1.** New writes use v2, while existing v1 `Prepared`/`Completed` records remain readable and unknown versions still fail closed.
+- **`DurableEffectCoordinator::fail` persists failure receipts through the same fenced atomic transition path as preparation/completion.** Retryable failures can later complete successfully; completed results and terminal failures are monotonic and cannot overwrite one another.
+- Focused tests cover v1 backward decoding, v2 failure round-trips, stable retry identity, terminal failure replay, and retryable-failure-to-success recovery.
 ### Durable external-effect recovery coordinator — 2026-09-23
 - **Atomic durable-effect records are now recoverable through the storage-neutral `PersistenceStore` contract.** Memory and libSQL backends can load the newest record for a stable `DurableEffectId`; backends without recovery support fail with `Unsupported` instead of pretending the effect never ran.
 - **`DurableEffectCoordinator` connects the existing semantic effect state machine to atomic `DurableTransition` commits.** A new effect persists `Prepared` before external dispatch, recovery validates both request digest and full effect specification, terminal results persist as `Completed`, and completed results replay without redispatch.
