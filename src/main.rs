@@ -11,6 +11,7 @@
 //!   nulang query <symbols|symbol> ...
 //!   nulang nula <new|build|build-wasm|test|run|add|remove|publish|deploy|watch|doc>
 //!   nulang fmt [--check] [<file>]
+//!   nulang fix --safe [--dry-run] [--json] <file>
 //!
 //! Options:
 //!   -r, --repl               Start interactive REPL
@@ -31,6 +32,7 @@
 //!   <FILE>.nbc               Run a pre-compiled .nbc artifact directly
 //!   --verify <src>           Verify .nbc source hash against <src>
 //!   nula <cmd>               Package manager (new, init, build, build-wasm, test, run, add, remove, publish, deploy, list, clean)
+//!   fix --safe <file>        Apply compiler-proven machine-applicable edits transactionally
 //!   --version, -V            Print version and exit
 //!   -v, --verbose            Show bytecode and AST
 //!   --bench [N]             Benchmark: run N times (default 10), print min/mean/median/max
@@ -235,6 +237,14 @@ fn main() {
         }
         return;
     }
+    if args[1] == "fix" {
+        if let Err(e) = nulang::safe_fix::run(&args[2..]) {
+            print_error(&e, true);
+            std::process::exit(exit_code(&e));
+        }
+        return;
+    }
+
     // `nulang node --listen <ADDR> [--seed <ADDR>] ...` — run a distributed
     // actor node (shard 0, network-enabled).
     if args[1] == "node" {
