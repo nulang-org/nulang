@@ -1,0 +1,10 @@
+[package]
+name = "nulang-cloud-control"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Deterministic reconciliation and placement primitives for Nulang Cloud"
+
+[dependencies]
+nulang-capacity = { path = "../nulang-capacity" }
+serde = { version = "1.0", features = ["derive"] }
