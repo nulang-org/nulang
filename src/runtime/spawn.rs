@@ -875,6 +875,49 @@ mod authority_tests {
     }
 
     #[test]
+    fn persistent_restart_rejects_semantic_mismatch_before_init_or_publish() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let mut rt = Runtime::new();
+        let actor_id = 910_010;
+        let persisted =
+            crate::content_identity::SemanticId::from_canonical_bytes(b"persisted-definition", []);
+        let current =
+            crate::content_identity::SemanticId::from_canonical_bytes(b"current-definition", []);
+        rt.persistence
+            .save_snapshot(ActorSnapshot {
+                actor_id,
+                semantic_id: Some(persisted.to_string()),
+                ..ActorSnapshot::default()
+            })
+            .unwrap();
+
+        let init_ran = Rc::new(Cell::new(false));
+        let init_flag = Rc::clone(&init_ran);
+        let result = try_spawn_actor_with_id(
+            &mut rt,
+            actor_id,
+            Box::new(move || {
+                init_flag.set(true);
+                vec![]
+            }),
+            std::collections::HashMap::new(),
+            true,
+            None,
+            None,
+            Some(current),
+        );
+
+        assert!(result.is_err(), "semantic mismatch must fail the restart");
+        assert!(!init_ran.get(), "semantic mismatch must abort before init");
+        assert!(
+            !rt.actors.contains_key(&actor_id),
+            "semantic mismatch must not publish a runnable actor"
+        );
+    }
+
+    #[test]
     fn legacy_restart_restores_snapshot_authority() {
         let mut rt = Runtime::new();
         let actor_id = 910_001;
