@@ -87,6 +87,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -95,11 +97,9 @@ jobs:
         run: cargo build --locked --all-targets
 
       - name: Test
-        run: |
-          # The five-node split-brain cluster test is known to be timing-
-          # sensitive on GitHub Actions shared runners. Retry the whole suite
-          # once on failure so a single flaky run does not block merges.
-          cargo test --locked || (echo "Retrying test suite after flaky failure..." && cargo test --locked)
+        # Cluster partition/healing coverage uses the virtual-clock harness;
+        # fail on the first suite failure so CI never masks a real regression.
+        run: cargo test --locked
 
       - name: Install cargo-llvm-cov
         if: env.CODECOV_TOKEN != ''
@@ -136,6 +136,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -169,6 +171,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -199,6 +203,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -235,6 +241,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -261,6 +269,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: '1.95.0'
           components: rustfmt, clippy
 
       - name: Cache cargo
@@ -371,6 +380,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
