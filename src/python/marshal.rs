@@ -150,14 +150,14 @@ pub fn python_to_nulang(obj: &pyo3::Bound<'_, pyo3::PyAny>) -> Result<Value, Str
     // Check for bool (must come before int, since bool subclasses int in Python)
     if let Ok(b) = obj.cast::<PyBool>() {
         let val: bool = b
-            .extract()
+            .extract::<bool>()
             .map_err(|e| format!("Failed to extract bool: {}", e))?;
         return Ok(Value::bool(val));
     }
 
     // Check for int
     if let Ok(i) = obj.cast::<PyInt>() {
-        let val: i64 = i.extract().unwrap_or_else(|_| {
+        let val: i64 = i.extract::<i64>().unwrap_or_else(|_| {
             // Big int — try to extract and clamp
             Python::attach(|_py| {
                 let big_int_str = i.str().map(|s| s.to_string()).unwrap_or_default();
@@ -170,7 +170,7 @@ pub fn python_to_nulang(obj: &pyo3::Bound<'_, pyo3::PyAny>) -> Result<Value, Str
     // Check for float
     if let Ok(f) = obj.cast::<PyFloat>() {
         let val: f64 = f
-            .extract()
+            .extract::<f64>()
             .map_err(|e| format!("Failed to extract float: {}", e))?;
         return Ok(Value::float(val));
     }
@@ -334,18 +334,18 @@ pub fn python_object_id_to_owned_foreign(
             return Ok(OwnedForeignValue::Bool(value));
         }
         if let Ok(value) = obj.cast::<PyInt>() {
-            let value: i64 = value.extract().unwrap_or_else(|_| {
+            let value: i64 = value.extract::<i64>().unwrap_or_else(|_| {
                 let text = value.str().map(|s| s.to_string()).unwrap_or_default();
                 if text.starts_with('-') { i64::MIN } else { i64::MAX }
             });
             return Ok(OwnedForeignValue::Int(value));
         }
         if let Ok(value) = obj.cast::<PyFloat>() {
-            let value: f64 = value.extract().map_err(|e| e.to_string())?;
+            let value = value.extract::<f64>().map_err(|e| e.to_string())?;
             return Ok(OwnedForeignValue::Float(value));
         }
         if let Ok(value) = obj.cast::<PyString>() {
-            let value: String = value.extract().map_err(|e| e.to_string())?;
+            let value = value.extract::<String>().map_err(|e| e.to_string())?;
             return Ok(OwnedForeignValue::String(value));
         }
 
@@ -555,7 +555,7 @@ mod tests {
         // Verify it's the same value
         Python::attach(|py| {
             let bound = py_obj.bind(py);
-            let extracted: i64 = bound.extract().expect("Expected int");
+            let extracted: i64 = bound.extract::<i64>().expect("Expected int");
             assert_eq!(extracted, 99, "TAG_PYTHON object should resolve to 99");
         });
     }
