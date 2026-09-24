@@ -15,7 +15,7 @@ use crate::runtime::network::NetworkTransport;
 use crate::runtime::service_directory::ServiceDirectory;
 use crate::runtime::{
     ActorAddress, AddressResolver, FileFabricStreamStore, MessageAdmission, Runtime,
-    ServiceAdvertisement, ServiceAdvertisementSnapshot,
+    ServiceAdvertisement, ServiceAdvertisementSnapshot, ServiceHealth,
 };
 use crate::vm::Value;
 
