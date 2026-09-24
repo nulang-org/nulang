@@ -571,9 +571,7 @@ impl Mailbox {
     /// Commit exactly the most recently returned candidate and return its
     /// payload so the runtime can establish receiver-side ORCA ownership only
     /// after the pattern+guard succeeds.
-    pub(crate) fn commit_receive_match_with_handoff(
-        &mut self,
-    ) -> Option<(Arc<Vec<Value>>, u16)> {
+    pub(crate) fn commit_receive_match_with_handoff(&mut self) -> Option<(Arc<Vec<Value>>, u16)> {
         let (lane, idx, payload) = self.active_match.take()?;
         let removed = match lane {
             MatchLane::System => self.system_skip_buffer.remove(idx),
