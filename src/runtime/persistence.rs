@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use crate::durable_effect::DurableEffectId;
 use crate::durable_effect_persistence::DurableEffectPersistenceRecord;
 use crate::vm::Value;
 
@@ -482,6 +483,22 @@ pub trait PersistenceStore: Send + Sync {
         ))
     }
 
+    /// Load the newest durable record for one logical external effect.
+    ///
+    /// Backends that cannot recover durable-effect records MUST fail closed
+    /// with `Unsupported`; returning `Ok(None)` would let a caller mistake
+    /// "cannot inspect history" for "this effect never ran" and redispatch it.
+    fn load_durable_effect(
+        &self,
+        _actor_id: u64,
+        _effect_id: DurableEffectId,
+    ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable effect recovery reads are not supported by this persistence backend",
+        ))
+    }
+
     /// Persist a snapshot of durable actor state.
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()>;
 
@@ -663,6 +680,20 @@ impl MemoryStore {
 }
 
 impl PersistenceStore for MemoryStore {
+    fn load_durable_effect(
+        &self,
+        actor_id: u64,
+        effect_id: DurableEffectId,
+    ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        Ok(self
+            .committed_transitions(actor_id)
+            .iter()
+            .rev()
+            .flat_map(|transition| transition.durable_effects.iter().rev())
+            .find(|record| record.effect().spec().id == effect_id)
+            .cloned())
+    }
+
     fn commit_transition(&mut self, transition: DurableTransition) -> io::Result<DurableCommit> {
         transition.validate_structure()?;
         let digest = transition.digest()?;
@@ -1437,6 +1468,41 @@ impl LibsqlStore {
 
 #[cfg(feature = "sqlite")]
 impl PersistenceStore for LibsqlStore {
+    fn load_durable_effect(
+        &self,
+        actor_id: u64,
+        effect_id: DurableEffectId,
+    ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT record FROM durable_effect_records
+                     WHERE actor_id = ?1
+                     ORDER BY sequence DESC, ordinal DESC",
+                    libsql::params![actor_id as i64],
+                )
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+            {
+                let json: String = row.get(0).map_err(|error| {
+                    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                })?;
+                let record = DurableEffectPersistenceRecord::from_json(json.as_bytes())
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                if record.effect().spec().id == effect_id {
+                    return Ok(Some(record));
+                }
+            }
+            Ok(None)
+        })
+    }
+
     fn commit_transition(&mut self, transition: DurableTransition) -> io::Result<DurableCommit> {
         transition.validate_structure()?;
         let digest = transition.digest()?;
