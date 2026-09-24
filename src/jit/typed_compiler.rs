@@ -1010,6 +1010,7 @@ fn simple_cfg_ssa_plan(
         })
     };
 
+    let predecessor_counts = region_predecessor_counts(instructions, start_offset, end_offset);
 
     // First try the canonical if/else layout: the instruction immediately
     // before the taken target is an unconditional jump over the else arm.
@@ -1838,7 +1839,6 @@ pub fn compile_bytecode_region_typed(
     let block_type_states =
         region_type_states(instructions, start_offset, end_offset, type_metadata);
     let mut meta = type_metadata.map(|m| m.clone()).unwrap_or_default();
-    let predecessor_counts = region_predecessor_counts(instructions, start_offset, end_offset);
     let mut int_cache = NativeIntCache::default();
     let mut float_cache = NativeFloatCache::default();
 
