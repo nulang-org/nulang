@@ -103,7 +103,10 @@ impl ByteArena {
                     .checked_mul(blocks)
                     .expect("cache arena slab size overflow");
                 let slab_id = self.slabs.len();
-                assert!(slab_id <= u32::MAX as usize, "cache arena has too many slabs");
+                assert!(
+                    slab_id <= u32::MAX as usize,
+                    "cache arena has too many slabs"
+                );
 
                 self.slabs.push(ArenaSlab {
                     bytes: vec![0u8; slab_bytes].into_boxed_slice(),
@@ -955,15 +958,13 @@ impl CacheStore {
     }
 
     fn eviction_ref_is_live(&self, item: EvictionRef, queue: EvictionQueue) -> bool {
-        self.slots
-            .get(item.slot as usize)
-            .is_some_and(|slot| {
-                slot.generation == item.generation
-                    && slot
-                        .entry
-                        .as_ref()
-                        .is_some_and(|entry| entry.eviction_queue == queue)
-            })
+        self.slots.get(item.slot as usize).is_some_and(|slot| {
+            slot.generation == item.generation
+                && slot
+                    .entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.eviction_queue == queue)
+        })
     }
 
     fn evict_from_small(&mut self) -> bool {
@@ -1055,7 +1056,11 @@ impl CacheStore {
     }
 
     fn maybe_compact_eviction_queues(&mut self) {
-        let queued = self.eviction.small.len().saturating_add(self.eviction.main.len());
+        let queued = self
+            .eviction
+            .small
+            .len()
+            .saturating_add(self.eviction.main.len());
         let threshold = self.index_len.max(64).saturating_mul(4).saturating_add(64);
         if queued <= threshold {
             return;
@@ -1419,14 +1424,11 @@ impl CacheStore {
             .free_slots
             .capacity()
             .saturating_mul(std::mem::size_of::<u32>());
-        let expiry_reserved_bytes = self
-            .expiry
-            .reserved_bytes()
-            .saturating_add(
-                self.expiry_scratch
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<ExpirationRef>()),
-            );
+        let expiry_reserved_bytes = self.expiry.reserved_bytes().saturating_add(
+            self.expiry_scratch
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ExpirationRef>()),
+        );
         let eviction_reserved_bytes = self
             .eviction
             .small
