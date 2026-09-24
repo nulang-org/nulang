@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Type-preserving async effect completions — 2026-09-23
+- **`PerformAsyncResult` now has an additive `ReadyValue(Value)` completion path** so asynchronous host effects can resume with integers, floats, booleans, actor-safe opaque handles, or other already-materialized VM values without coercing them through strings.
+- **The interpreter stores `ReadyValue` directly and the native JIT/AOT helper returns its raw value bits**, while the existing `Ready(Option<String>)` and `Pending` contracts remain unchanged. A VM regression pins non-string result preservation.
+
 ### Stateful blocking foreign executor — 2026-09-23
 - **Foreign backends can now be owned behind a dedicated bounded worker and invoked with fully-owned request envelopes** (`src/runtime/foreign_executor.rs`), keeping blocking backend execution off cooperative actor scheduler threads while preserving mutable interpreter/module state across calls.
 - **The scheduler-facing path remains non-blocking and never acquires the backend mutex**; one worker per backend instance serializes access deliberately. This slice still does not change VM suspension/resumption or route source-level Python/FFI effects through the executor.
