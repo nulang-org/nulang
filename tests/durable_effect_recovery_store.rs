@@ -42,7 +42,6 @@ fn transition(
         durable_effects: vec![record],
         outbox: vec![],
         inbox: vec![],
-        inbox: vec![],
     }
 }
 
