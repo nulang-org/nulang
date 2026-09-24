@@ -286,6 +286,13 @@ pub struct DurableOutboxRecord {
     pub payload: Vec<PersistedValue>,
 }
 
+/// One stable durable-message identity accepted by a receiver transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct DurableInboxDelivery {
+    pub id: DurableMessageId,
+    pub destination_actor_id: u64,
+}
+
 /// One logical durable actor/workflow/entity transition.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DurableTransition {
@@ -300,6 +307,8 @@ pub struct DurableTransition {
     pub domain_events: Vec<EventEntry>,
     pub durable_effects: Vec<DurableEffectPersistenceRecord>,
     pub outbox: Vec<DurableOutboxMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbox: Vec<DurableInboxDelivery>,
 }
 
 /// Durable tail used for epoch/sequence fencing and idempotent commit retry.
@@ -416,6 +425,22 @@ impl DurableTransition {
                 ));
             }
         }
+
+        let mut inbox_ids = HashSet::new();
+        for delivery in &self.inbox {
+            if delivery.destination_actor_id != self.actor_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "durable inbox delivery destination does not match transition actor",
+                ));
+            }
+            if !inbox_ids.insert(delivery.id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "duplicate durable inbox identity in transition",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -436,6 +461,8 @@ impl DurableTransition {
             domain_events: &'a [EventEntry],
             durable_effects: Vec<Vec<u8>>,
             outbox: &'a [DurableOutboxMessage],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            inbox: Option<&'a [DurableInboxDelivery]>,
         }
 
         let durable_effects = self
@@ -460,6 +487,7 @@ impl DurableTransition {
             domain_events: &self.domain_events,
             durable_effects,
             outbox: &self.outbox,
+            inbox: (!self.inbox.is_empty()).then_some(self.inbox.as_slice()),
         })
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
@@ -553,6 +581,19 @@ pub trait PersistenceStore: Send + Sync {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "durable inbox deduplication is not supported by this persistence backend",
+        ))
+    }
+
+    /// Return the receiver transition sequence that first accepted this stable
+    /// durable message identity, if any.
+    fn lookup_inbox_delivery(
+        &self,
+        _destination_actor_id: u64,
+        _id: DurableMessageId,
+    ) -> io::Result<Option<u64>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable inbox lookup is not supported by this persistence backend",
         ))
     }
 
@@ -718,7 +759,7 @@ pub struct MemoryStore {
     durable_tails: HashMap<u64, DurableTail>,
     committed_transitions: HashMap<u64, Vec<DurableTransition>>,
     delivered_outbox: HashSet<DurableMessageId>,
-    durable_inbox: HashSet<(u64, DurableMessageId)>,
+    durable_inbox: HashMap<(u64, DurableMessageId), u64>,
 }
 
 impl MemoryStore {
@@ -782,7 +823,19 @@ impl PersistenceStore for MemoryStore {
         destination_actor_id: u64,
         id: DurableMessageId,
     ) -> io::Result<bool> {
-        Ok(self.durable_inbox.insert((destination_actor_id, id)))
+        if self.durable_inbox.contains_key(&(destination_actor_id, id)) {
+            return Ok(false);
+        }
+        self.durable_inbox.insert((destination_actor_id, id), 0);
+        Ok(true)
+    }
+
+    fn lookup_inbox_delivery(
+        &self,
+        destination_actor_id: u64,
+        id: DurableMessageId,
+    ) -> io::Result<Option<u64>> {
+        Ok(self.durable_inbox.get(&(destination_actor_id, id)).copied())
     }
 
     fn load_durable_effect(
@@ -877,6 +930,18 @@ impl PersistenceStore for MemoryStore {
             }
         }
 
+        for delivery in &transition.inbox {
+            if self
+                .durable_inbox
+                .contains_key(&(delivery.destination_actor_id, delivery.id))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "durable inbox identity was already accepted",
+                ));
+            }
+        }
+
         if let Some(snapshot) = &transition.snapshot {
             self.snapshots.insert(transition.actor_id, snapshot.clone());
         }
@@ -905,6 +970,12 @@ impl PersistenceStore for MemoryStore {
             digest,
         };
         self.durable_tails.insert(transition.actor_id, tail);
+        for delivery in &transition.inbox {
+            self.durable_inbox.insert(
+                (delivery.destination_actor_id, delivery.id),
+                transition.sequence,
+            );
+        }
         self.committed_transitions
             .entry(transition.actor_id)
             .or_default()
@@ -1002,8 +1073,9 @@ impl PersistenceStore for MemoryStore {
         self.committed_transitions.remove(&actor_id);
         self.delivered_outbox
             .retain(|id| id.sender_actor_id != actor_id);
-        self.durable_inbox
-            .retain(|(destination, id)| *destination != actor_id && id.sender_actor_id != actor_id);
+        self.durable_inbox.retain(|(destination, id), _| {
+            *destination != actor_id && id.sender_actor_id != actor_id
+        });
         Ok(())
     }
 }
@@ -1094,6 +1166,23 @@ impl JsonFileStore {
 }
 
 impl PersistenceStore for JsonFileStore {
+    fn lookup_inbox_delivery(
+        &self,
+        destination_actor_id: u64,
+        id: DurableMessageId,
+    ) -> io::Result<Option<u64>> {
+        let transitions = self.read_atomic_transitions(destination_actor_id)?;
+        Ok(transitions.into_iter().find_map(|transition| {
+            transition
+                .inbox
+                .iter()
+                .any(|delivery| {
+                    delivery.destination_actor_id == destination_actor_id && delivery.id == id
+                })
+                .then_some(transition.sequence)
+        }))
+    }
+
     fn load_durable_effect(
         &self,
         actor_id: u64,
@@ -1205,6 +1294,20 @@ impl PersistenceStore for JsonFileStore {
                         "first atomic transition predecessor {} does not match legacy tail {}",
                         transition.expected_previous_sequence, legacy_tail
                     ),
+                ));
+            }
+        }
+
+        for delivery in &transition.inbox {
+            if transitions.iter().any(|existing| {
+                existing.inbox.iter().any(|accepted| {
+                    accepted.destination_actor_id == delivery.destination_actor_id
+                        && accepted.id == delivery.id
+                })
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "durable inbox identity was already accepted",
                 ));
             }
         }
@@ -1733,6 +1836,26 @@ impl LibsqlStore {
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_inbox (
+                    destination_actor_id INTEGER NOT NULL,
+                    sender_actor_id INTEGER NOT NULL,
+                    sender_epoch INTEGER NOT NULL,
+                    transition_sequence INTEGER NOT NULL,
+                    outbox_ordinal INTEGER NOT NULL,
+                    receiver_sequence INTEGER NOT NULL,
+                    PRIMARY KEY (
+                        destination_actor_id,
+                        sender_actor_id,
+                        sender_epoch,
+                        transition_sequence,
+                        outbox_ordinal
+                    )
+                )",
+                (),
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             Ok(())
         })
     }
@@ -1799,6 +1922,47 @@ impl LibsqlStore {
 
 #[cfg(feature = "sqlite")]
 impl PersistenceStore for LibsqlStore {
+    fn lookup_inbox_delivery(
+        &self,
+        destination_actor_id: u64,
+        id: DurableMessageId,
+    ) -> io::Result<Option<u64>> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT receiver_sequence FROM durable_inbox
+                     WHERE destination_actor_id = ?1
+                       AND sender_actor_id = ?2
+                       AND sender_epoch = ?3
+                       AND transition_sequence = ?4
+                       AND outbox_ordinal = ?5",
+                    libsql::params![
+                        destination_actor_id as i64,
+                        id.sender_actor_id as i64,
+                        id.sender_epoch as i64,
+                        id.transition_sequence as i64,
+                        id.outbox_ordinal as i64
+                    ],
+                )
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            match rows
+                .next()
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+            {
+                Some(row) => {
+                    let seq: i64 = row
+                        .get(0)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    Ok(Some(seq as u64))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
     fn load_durable_effect(
         &self,
         actor_id: u64,
@@ -2126,6 +2290,32 @@ impl PersistenceStore for LibsqlStore {
                 )
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            }
+
+            for delivery in &transition.inbox {
+                let result = tx
+                    .execute(
+                        "INSERT INTO durable_inbox
+                         (destination_actor_id, sender_actor_id, sender_epoch,
+                          transition_sequence, outbox_ordinal, receiver_sequence)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        libsql::params![
+                            delivery.destination_actor_id as i64,
+                            delivery.id.sender_actor_id as i64,
+                            delivery.id.sender_epoch as i64,
+                            delivery.id.transition_sequence as i64,
+                            delivery.id.outbox_ordinal as i64,
+                            transition.sequence as i64
+                        ],
+                    )
+                    .await;
+                if let Err(error) = result {
+                    let _ = tx.rollback().await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("durable inbox identity was already accepted: {error}"),
+                    ));
+                }
             }
 
             tx.execute(
@@ -2597,6 +2787,13 @@ impl PersistenceStore for LibsqlStore {
                     .await
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             }
+            conn.execute(
+                "DELETE FROM durable_inbox
+                 WHERE destination_actor_id = ?1 OR sender_actor_id = ?1",
+                libsql::params![actor_id as i64],
+            )
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             Ok(())
         })
     }
@@ -3032,6 +3229,7 @@ impl PostgresStore {
                 sender_epoch BIGINT NOT NULL,
                 transition_sequence BIGINT NOT NULL,
                 outbox_ordinal INTEGER NOT NULL,
+                receiver_sequence BIGINT NOT NULL DEFAULT 0,
                 received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (
                     destination_actor_id,
@@ -3041,6 +3239,12 @@ impl PostgresStore {
                     outbox_ordinal
                 )
             )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        tx.execute(
+            "ALTER TABLE durable_inbox
+             ADD COLUMN IF NOT EXISTS receiver_sequence BIGINT NOT NULL DEFAULT 0",
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -3128,8 +3332,8 @@ impl PersistenceStore for PostgresStore {
             .execute(
                 "INSERT INTO durable_inbox
                  (destination_actor_id, sender_actor_id, sender_epoch,
-                  transition_sequence, outbox_ordinal)
-                 VALUES ($1, $2, $3, $4, $5)
+                  transition_sequence, outbox_ordinal, receiver_sequence)
+                 VALUES ($1, $2, $3, $4, $5, 0)
                  ON CONFLICT DO NOTHING",
                 &[
                     &(destination_actor_id as i64),
@@ -3141,6 +3345,34 @@ impl PersistenceStore for PostgresStore {
             )
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         Ok(changed == 1)
+    }
+
+    fn lookup_inbox_delivery(
+        &self,
+        destination_actor_id: u64,
+        id: DurableMessageId,
+    ) -> io::Result<Option<u64>> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| io::Error::other("Postgres connection mutex poisoned"))?;
+        conn.query_opt(
+            "SELECT receiver_sequence FROM durable_inbox
+             WHERE destination_actor_id = $1
+               AND sender_actor_id = $2
+               AND sender_epoch = $3
+               AND transition_sequence = $4
+               AND outbox_ordinal = $5",
+            &[
+                &(destination_actor_id as i64),
+                &(id.sender_actor_id as i64),
+                &(id.sender_epoch as i64),
+                &(id.transition_sequence as i64),
+                &(id.outbox_ordinal as i32),
+            ],
+        )
+        .map(|row| row.map(|row| row.get::<_, i64>(0) as u64))
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
     }
 
     fn load_durable_effect(
@@ -3431,6 +3663,39 @@ impl PersistenceStore for PostgresStore {
                 ],
             )
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+
+        for delivery in &transition.inbox {
+            match tx.execute(
+                "INSERT INTO durable_inbox
+                 (destination_actor_id, sender_actor_id, sender_epoch,
+                  transition_sequence, outbox_ordinal, receiver_sequence)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    &(delivery.destination_actor_id as i64),
+                    &(delivery.id.sender_actor_id as i64),
+                    &(delivery.id.sender_epoch as i64),
+                    &(delivery.id.transition_sequence as i64),
+                    &(delivery.id.outbox_ordinal as i32),
+                    &(transition.sequence as i64),
+                ],
+            ) {
+                Ok(_) => {}
+                Err(error)
+                    if error
+                        .as_db_error()
+                        .map(|db| db.code() == &postgres::error::SqlState::UNIQUE_VIOLATION)
+                        .unwrap_or(false) =>
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "durable inbox identity was already accepted",
+                    ));
+                }
+                Err(error) => {
+                    return Err(io::Error::new(io::ErrorKind::Other, error.to_string()));
+                }
+            }
         }
 
         tx.execute(
@@ -3965,6 +4230,7 @@ mod json_file_store_tests {
             domain_events: vec![],
             durable_effects: vec![],
             outbox: vec![],
+            inbox: vec![],
         };
 
         let first = store.commit_transition(transition.clone()).unwrap();
@@ -4009,6 +4275,7 @@ mod json_file_store_tests {
             domain_events: vec![],
             durable_effects: vec![],
             outbox: vec![],
+            inbox: vec![],
         };
         let error = store.commit_transition(transition).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -4475,6 +4742,7 @@ mod durable_outbox_tests {
                 behavior_id: 4,
                 payload: vec![PersistedValue::Int(7)],
             }],
+            inbox: vec![],
         }
     }
 
@@ -4521,6 +4789,69 @@ mod durable_outbox_tests {
         // Deduplication is receiver-scoped: another destination may observe the
         // same sender identity independently.
         assert!(store.record_inbox_delivery(21, id).unwrap());
+    }
+
+    #[test]
+    fn memory_store_inbox_acceptance_is_atomic_with_command() {
+        let mut store = MemoryStore::new();
+        let id = DurableMessageId {
+            sender_actor_id: 10,
+            sender_epoch: 3,
+            transition_sequence: 1,
+            outbox_ordinal: 0,
+        };
+        let accepted = DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: 20,
+            activation_epoch: 1,
+            sequence: 1,
+            expected_previous_sequence: 0,
+            command: Some(JournalEntry {
+                sequence: 1,
+                behavior_id: 4,
+                payload: vec![PersistedValue::Int(7)],
+            }),
+            snapshot: None,
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+            inbox: vec![DurableInboxDelivery {
+                id,
+                destination_actor_id: 20,
+            }],
+        };
+
+        store.commit_transition(accepted).unwrap();
+        assert_eq!(store.lookup_inbox_delivery(20, id).unwrap(), Some(1));
+        assert_eq!(store.read_journal(20).len(), 1);
+
+        let duplicate = DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: 20,
+            activation_epoch: 1,
+            sequence: 2,
+            expected_previous_sequence: 1,
+            command: Some(JournalEntry {
+                sequence: 2,
+                behavior_id: 4,
+                payload: vec![PersistedValue::Int(7)],
+            }),
+            snapshot: None,
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![],
+            inbox: vec![DurableInboxDelivery {
+                id,
+                destination_actor_id: 20,
+            }],
+        };
+
+        let error = store.commit_transition(duplicate).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(store.latest_sequence(20), 1);
+        assert_eq!(store.read_journal(20).len(), 1);
     }
 }
 
@@ -4580,6 +4911,7 @@ mod postgres_store_tests {
                 behavior_id: 4,
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }],
+            inbox: vec![],
         }
     }
 
@@ -4628,6 +4960,61 @@ mod postgres_store_tests {
 
         store.clear(actor_id).unwrap();
         store.clear(actor_id + 1).unwrap();
+    }
+
+    #[test]
+    fn test_postgres_inbox_acceptance_is_atomic_with_receiver_command() {
+        let url = match pg_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let mut store = PostgresStore::new(&url).unwrap();
+        let receiver_id = fresh_actor_id();
+        let message_id = DurableMessageId {
+            sender_actor_id: receiver_id + 1000,
+            sender_epoch: 4,
+            transition_sequence: 9,
+            outbox_ordinal: 2,
+        };
+
+        let mut accepted = atomic_transition(receiver_id, 1, 1);
+        accepted.outbox.clear();
+        accepted.inbox.push(DurableInboxDelivery {
+            id: message_id,
+            destination_actor_id: receiver_id,
+        });
+        store.commit_transition(accepted).unwrap();
+
+        assert_eq!(
+            store
+                .lookup_inbox_delivery(receiver_id, message_id)
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(store.read_journal(receiver_id).len(), 1);
+
+        let mut duplicate = atomic_transition(receiver_id, 1, 2);
+        duplicate.outbox.clear();
+        duplicate.inbox.push(DurableInboxDelivery {
+            id: message_id,
+            destination_actor_id: receiver_id,
+        });
+        let error = store.commit_transition(duplicate).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+
+        // The duplicate inbox constraint fires inside the same SQL
+        // transaction as the receiver journal/snapshot/event writes, so the
+        // rejected delivery cannot advance any durable receiver state.
+        assert_eq!(store.latest_sequence(receiver_id), 1);
+        assert_eq!(store.read_journal(receiver_id).len(), 1);
+        assert_eq!(
+            store
+                .lookup_inbox_delivery(receiver_id, message_id)
+                .unwrap(),
+            Some(1)
+        );
+
+        store.clear(receiver_id).unwrap();
     }
 
     #[test]
@@ -4949,7 +5336,57 @@ mod durable_transition_tests {
                 behavior_id: 9,
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }],
+            inbox: vec![],
         }
+    }
+
+    #[test]
+    fn empty_inbox_preserves_legacy_v1_serialization_and_digest_shape() {
+        let value = transition(10, 1, 1);
+        let serialized = serde_json::to_value(&value).unwrap();
+        assert!(
+            serialized.get("inbox").is_none(),
+            "empty inbox must remain omitted from serialized v1 transitions"
+        );
+
+        #[derive(serde::Serialize)]
+        struct LegacyDigestEnvelope<'a> {
+            version: u16,
+            actor_id: u64,
+            activation_epoch: u64,
+            sequence: u64,
+            expected_previous_sequence: u64,
+            command: &'a Option<JournalEntry>,
+            snapshot: &'a Option<ActorSnapshot>,
+            workflow_events: &'a [WorkflowEvent],
+            domain_events: &'a [EventEntry],
+            durable_effects: Vec<Vec<u8>>,
+            outbox: &'a [DurableOutboxMessage],
+        }
+
+        let durable_effects = value
+            .durable_effects
+            .iter()
+            .map(|record| record.to_json().unwrap())
+            .collect::<Vec<_>>();
+        let mut legacy = serde_json::to_value(LegacyDigestEnvelope {
+            version: value.version,
+            actor_id: value.actor_id,
+            activation_epoch: value.activation_epoch,
+            sequence: value.sequence,
+            expected_previous_sequence: value.expected_previous_sequence,
+            command: &value.command,
+            snapshot: &value.snapshot,
+            workflow_events: &value.workflow_events,
+            domain_events: &value.domain_events,
+            durable_effects,
+            outbox: &value.outbox,
+        })
+        .unwrap();
+        canonicalize_json(&mut legacy);
+        let legacy_digest = *blake3::hash(&serde_json::to_vec(&legacy).unwrap()).as_bytes();
+
+        assert_eq!(value.digest().unwrap(), legacy_digest);
     }
 
     #[test]
@@ -5126,6 +5563,7 @@ mod libsql_atomic_transition_tests {
                 behavior_id: 4,
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }],
+            inbox: vec![],
         }
     }
 
