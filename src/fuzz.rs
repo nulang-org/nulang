@@ -904,6 +904,41 @@ mod tests {
         }
     }
 
+    /// Historical JIT regression: a `for` loop in a tiered region used to
+    /// lose updates to a mutable accumulator (cold=964593, warm=0).
+    #[test]
+    fn differential_regression_jit_for_loop_accumulator() {
+        let source = r#"
+let i2 = {
+    var fa0 = 0
+    for x1 in [964593] { fa0 = fa0 + x1 }
+    fa0
+}
+i2
+"#;
+        match differential_fuzz_one(source) {
+            Ok(DiffOutcome::Agreed { .. }) => {}
+            other => panic!(
+                "historical JIT for-loop accumulator regression diverged: {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Historical AOT regression: computed float negation was once lowered
+    /// with the wrong MIR result type, producing a large tagged integer.
+    #[test]
+    fn differential_regression_aot_computed_float_negation() {
+        let source = "-(0.1 + 0.22)";
+        match differential_fuzz_one(source) {
+            Ok(DiffOutcome::Agreed { aot: true, .. }) => {}
+            other => panic!(
+                "historical AOT computed-float negation regression did not agree under AOT: {:?}",
+                other
+            ),
+        }
+    }
+
     /// The WASM-enabled CI lane must prove that the restricted backend
     /// actually participates in the differential oracle. This catches a
     /// regression where every program is silently classified as unsupported
