@@ -1,6 +1,6 @@
 # RFC 0024: Orthogonal Execution Model
 
-- **Status:** Proposed — Phase 1 implemented
+- **Status:** Proposed — Phase 1 implemented; Phase 3 compatibility normalization underway
 - **Tier:** Experimental architecture guidance; no new Stable/Frozen syntax in Phase 1
 - **Created:** 2026-09-22
 - **Supersedes:** RFC 0017 only where RFC 0017 states that Nulang has one execution model (actors)
@@ -186,6 +186,25 @@ In particular:
 - actor execution semantics remain actor execution semantics independent of those origins.
 
 Migration must be additive until persisted/wire formats have explicit versioned replacements.
+
+### Phase 3 compatibility normalization
+
+The runtime exposes an additive `ActorSemantics` compatibility view with three
+independent dimensions recoverable from existing metadata:
+
+- persistence: ephemeral or durable;
+- activation: explicit or virtual;
+- surface origin: actor, agent, workflow, or organization.
+
+Unlike `ActorRole`, virtual activation does not compete with agent/workflow/
+organization provenance. Runtime dispatch, workflow, inference, supervision, and
+spawn decisions consume this normalized view. The legacy booleans and strict
+`ActorRole` decoder remain only for persisted/wire compatibility and mechanical
+copying until a versioned format migration is defined.
+
+This phase deliberately does **not** collapse reference capabilities into external
+authority, does not make local/scoped-task computation actor-backed, and does not
+infer identity semantics that the legacy actor flags cannot prove.
 
 ## Relationship to workflows
 
