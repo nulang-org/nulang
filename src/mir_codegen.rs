@@ -2821,6 +2821,77 @@ fn plan_drops(func: &mir::Function) -> DropPlan {
     plan
 }
 
+ // ---------------------------------------------------------------------------
+ // Consuming actor-send ownership analysis
+ // ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct ConsumingSendPlan {
+    args_by_stmt: FxHashMap<(usize, usize), Vec<mir::LocalId>>,
+}
+
+/// Identify local-send arguments whose sole ownership token can be handed off
+/// later without changing runtime behavior in this analysis-only phase.
+fn plan_consuming_send_args(func: &mir::Function) -> ConsumingSendPlan {
+    let nlocals = func.locals.len();
+    if nlocals == 0 {
+        return ConsumingSendPlan::default();
+    }
+
+    let ptr_ty: Vec<bool> = func.locals.iter().map(|l| may_hold_heap_ptr(&l.ty)).collect();
+    let mut excluded = vec![false; nlocals];
+    for id in func.params.iter().chain(&func.captures) {
+        excluded[id.0 as usize] = true;
+    }
+    for table in &func.handler_tables {
+        for binding in &table.bindings {
+            for id in &binding.params {
+                excluded[id.0 as usize] = true;
+            }
+        }
+    }
+
+    let mut def_count = vec![0usize; nlocals];
+    let mut use_count = vec![0usize; nlocals];
+    let mut owning_def = vec![false; nlocals];
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            for (u, _) in stmt_uses(stmt) {
+                use_count[u] += 1;
+            }
+            if let mir::Stmt::Assign { dst, op } = stmt {
+                let d = dst.0 as usize;
+                def_count[d] += 1;
+                let self_read = rvalue_uses(op).iter().any(|(u, _)| *u == d);
+                owning_def[d] = def_count[d] == 1 && rvalue_is_owning(op) && !self_read;
+            }
+        }
+        for (u, _) in terminator_uses(&block.terminator) {
+            use_count[u] += 1;
+        }
+    }
+
+    let mut plan = ConsumingSendPlan::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (si, stmt) in block.stmts.iter().enumerate() {
+            let mir::Stmt::Assign {
+                op: mir::RValue::Send { args, remote: false, .. },
+                ..
+            } = stmt else {
+                continue;
+            };
+            let owned: Vec<_> = args.iter().copied().filter(|arg| {
+                let a = arg.0 as usize;
+                ptr_ty[a] && !excluded[a] && def_count[a] == 1 && use_count[a] == 1 && owning_def[a]
+            }).collect();
+            if !owned.is_empty() {
+                plan.args_by_stmt.insert((bi, si), owned);
+            }
+        }
+    }
+    plan
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -3842,6 +3913,48 @@ mod optimize_tests {
             Some(0),
             "clearing the moved-from source must not invalidate the destination"
         );
+    }
+
+    #[test]
+    fn test_consuming_send_plan_marks_unique_fresh_local_payload() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("send_unique", None);
+        let target = b.add_param("target", Type::unit());
+        let payload = b.add_temp(arr_ty);
+        let sent = b.add_temp(Type::unit());
+        b.assign(payload, mir::RValue::ArrayLit(vec![]));
+        b.assign(sent, mir::RValue::Send { actor: target, behavior_idx: 0, args: vec![payload], remote: false });
+        b.terminate(mir::Terminator::Return(None));
+        let plan = plan_consuming_send_args(&b.build());
+        assert_eq!(plan.args_by_stmt.get(&(0, 1)), Some(&vec![payload]));
+    }
+
+    #[test]
+    fn test_consuming_send_plan_rejects_payload_with_competing_use() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("send_shared", None);
+        let target = b.add_param("target", Type::unit());
+        let payload = b.add_temp(arr_ty);
+        let len = b.add_temp(Type::int());
+        let sent = b.add_temp(Type::unit());
+        b.assign(payload, mir::RValue::ArrayLit(vec![]));
+        b.assign(len, mir::RValue::ArrayLen(payload));
+        b.assign(sent, mir::RValue::Send { actor: target, behavior_idx: 0, args: vec![payload], remote: false });
+        b.terminate(mir::Terminator::Return(None));
+        assert!(plan_consuming_send_args(&b.build()).args_by_stmt.is_empty());
+    }
+
+    #[test]
+    fn test_consuming_send_plan_rejects_remote_send() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("send_remote", None);
+        let target = b.add_param("target", Type::unit());
+        let payload = b.add_temp(arr_ty);
+        let sent = b.add_temp(Type::unit());
+        b.assign(payload, mir::RValue::ArrayLit(vec![]));
+        b.assign(sent, mir::RValue::Send { actor: target, behavior_idx: 0, args: vec![payload], remote: true });
+        b.terminate(mir::Terminator::Return(None));
+        assert!(plan_consuming_send_args(&b.build()).args_by_stmt.is_empty());
     }
 
     #[test]
