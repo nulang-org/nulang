@@ -9,7 +9,9 @@ use crate::bytecode::Constant;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{ActorSnapshot, EventEntry, PersistedValue, WorkflowEvent};
-use crate::runtime::turn::{commit_turn, StagedCommand, TurnOutcome};
+use crate::runtime::turn::{
+    commit_turn, ActiveDurableTurn, StagedCommand, StagedTimer, TurnOutcome,
+};
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
 use crate::vm::{Frame, Value, VM};
 
@@ -221,6 +223,228 @@ fn commit_outcome_from_last_snapshot(
     commit_prepared_outcome(rt, actor_id, previous, outcome, Some(snapshot), false)
 }
 
+fn has_active_turn(rt: &Runtime, actor_id: u64) -> bool {
+    rt.active_durable_turns.contains_key(&actor_id)
+}
+
+fn push_active_turn(
+    rt: &mut Runtime,
+    actor_id: u64,
+    command: Option<StagedCommand>,
+) -> std::io::Result<()> {
+    if has_active_turn(rt, actor_id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "durable workflow actor already has an active turn",
+        ));
+    }
+
+    let expected_previous_sequence = rt.persistence.latest_sequence(actor_id);
+    let sequence = expected_previous_sequence.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "workflow transition sequence overflow",
+        )
+    })?;
+    let mut outcome = TurnOutcome::default();
+    outcome.command = command;
+    rt.active_durable_turns.insert(
+        actor_id,
+        ActiveDurableTurn {
+            expected_previous_sequence,
+            sequence,
+            outcome,
+            timers: Vec::new(),
+        },
+    );
+    Ok(())
+}
+
+pub(crate) fn begin_active_turn(
+    rt: &mut Runtime,
+    actor_id: u64,
+    command: StagedCommand,
+) -> std::io::Result<()> {
+    push_active_turn(rt, actor_id, Some(command))
+}
+
+/// Start a durable continuation after a previously committed suspension.
+///
+/// Safepoint yields keep their original active turn in memory and therefore
+/// return without allocating another sequence. Signal/LLM/timer/receive wakes
+/// have already committed their prior suspension boundary, so they reserve a
+/// fresh transition sequence here.
+pub(crate) fn begin_active_continuation(
+    rt: &mut Runtime,
+    actor_id: u64,
+) -> std::io::Result<()> {
+    if !actor_is_workflow(rt, actor_id) || has_active_turn(rt, actor_id) {
+        return Ok(());
+    }
+    push_active_turn(rt, actor_id, None)
+}
+
+pub(crate) fn discard_active_turn(rt: &mut Runtime, actor_id: u64) {
+    rt.active_durable_turns.remove(&actor_id);
+}
+
+fn take_active_turn(
+    rt: &mut Runtime,
+    actor_id: u64,
+) -> std::io::Result<Option<ActiveDurableTurn>> {
+    Ok(rt.active_durable_turns.remove(&actor_id))
+}
+
+fn publish_staged_timers(rt: &mut Runtime, actor_id: u64, timers: Vec<StagedTimer>) {
+    for timer in timers {
+        match timer {
+            StagedTimer::Workflow { name, duration_ms } => {
+                rt.rearm_timer(actor_id, &name, duration_ms);
+            }
+            StagedTimer::Sleep { duration_ms } => {
+                rt.timer_wheel.timer_sleep_wake(
+                    std::time::Duration::from_millis(duration_ms),
+                    actor_id,
+                );
+            }
+        }
+    }
+}
+
+pub(crate) fn stage_workflow_event(
+    rt: &mut Runtime,
+    actor_id: u64,
+    make_event: impl FnOnce(u64) -> WorkflowEvent,
+) -> bool {
+    let Some(turn) = rt.active_durable_turns.get_mut(&actor_id) else {
+        return false;
+    };
+    turn.outcome.workflow_events.push(make_event(turn.sequence));
+    true
+}
+
+pub(crate) fn stage_timer_set(
+    rt: &mut Runtime,
+    actor_id: u64,
+    name: &str,
+    duration_ms: u64,
+) -> bool {
+    let Some(turn) = rt.active_durable_turns.get_mut(&actor_id) else {
+        return false;
+    };
+    turn.outcome.workflow_events.push(WorkflowEvent::TimerSet {
+        sequence: turn.sequence,
+        name: name.to_string(),
+        duration_ms,
+    });
+    turn.timers.push(StagedTimer::Workflow {
+        name: name.to_string(),
+        duration_ms,
+    });
+    true
+}
+
+pub(crate) fn stage_timer_sleep(
+    rt: &mut Runtime,
+    actor_id: u64,
+    duration_ms: u64,
+) -> bool {
+    let Some(turn) = rt.active_durable_turns.get_mut(&actor_id) else {
+        return false;
+    };
+    turn.timers.push(StagedTimer::Sleep { duration_ms });
+    true
+}
+
+pub(crate) fn commit_active_step_completed(
+    rt: &mut Runtime,
+    actor_id: u64,
+    step_name: String,
+) -> std::io::Result<bool> {
+    let Some(mut turn) = take_active_turn(rt, actor_id)? else {
+        return Ok(false);
+    };
+    turn.outcome
+        .workflow_events
+        .push(WorkflowEvent::StepCompleted {
+            sequence: turn.sequence,
+            step_name,
+        });
+    let snapshot = build_actor_snapshot(rt, actor_id, turn.sequence)?;
+    let timers = turn.timers;
+    commit_prepared_outcome(
+        rt,
+        actor_id,
+        turn.expected_previous_sequence,
+        turn.outcome,
+        snapshot,
+        true,
+    )?;
+    publish_staged_timers(rt, actor_id, timers);
+    Ok(true)
+}
+
+pub(crate) fn commit_active_step_failed(
+    rt: &mut Runtime,
+    actor_id: u64,
+    step_name: String,
+    error: String,
+) -> std::io::Result<bool> {
+    let Some(mut turn) = take_active_turn(rt, actor_id)? else {
+        return Ok(false);
+    };
+    turn.outcome.workflow_events.push(WorkflowEvent::StepFailed {
+        sequence: turn.sequence,
+        step_name,
+        error,
+    });
+    let snapshot = build_actor_snapshot(rt, actor_id, turn.sequence)?;
+    let timers = turn.timers;
+    commit_prepared_outcome(
+        rt,
+        actor_id,
+        turn.expected_previous_sequence,
+        turn.outcome,
+        snapshot,
+        true,
+    )?;
+    publish_staged_timers(rt, actor_id, timers);
+    Ok(true)
+}
+
+pub(crate) fn commit_active_suspension(
+    rt: &mut Runtime,
+    actor_id: u64,
+) -> std::io::Result<bool> {
+    let Some(turn) = take_active_turn(rt, actor_id)? else {
+        return Ok(false);
+    };
+
+    let mut snapshot = rt.persistence.load_snapshot(actor_id).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "durable workflow suspension requires an existing committed snapshot",
+        )
+    })?;
+    snapshot.sequence = turn.sequence;
+    snapshot.waiting_signal = rt
+        .actors
+        .get(&actor_id)
+        .and_then(|actor| actor.waiting_signal.clone());
+
+    let timers = turn.timers;
+    commit_prepared_outcome(
+        rt,
+        actor_id,
+        turn.expected_previous_sequence,
+        turn.outcome,
+        Some(snapshot),
+        false,
+    )?;
+    publish_staged_timers(rt, actor_id, timers);
+    Ok(true)
+}
+
 fn commit_workflow_event_with_command(
     rt: &mut Runtime,
     actor_id: u64,
@@ -244,6 +468,16 @@ fn commit_workflow_event(
     actor_id: u64,
     make_event: impl FnOnce(u64) -> WorkflowEvent,
 ) -> std::io::Result<()> {
+    // An activation that retained an ActiveDurableTurn (notably across a JIT
+    // safepoint) already owns the next durable sequence. Any ordinary workflow
+    // event produced before that activation reaches a durable boundary must
+    // join the same transition; committing it independently would advance the
+    // durable tail behind the active turn and invalidate its predecessor fence.
+    if let Some(turn) = rt.active_durable_turns.get_mut(&actor_id) {
+        turn.outcome.workflow_events.push(make_event(turn.sequence));
+        return Ok(());
+    }
+
     commit_workflow_event_with_command(rt, actor_id, None, make_event)
 }
 
@@ -295,6 +529,22 @@ pub(crate) fn commit_step_completed_with_command(
     step_name: String,
     command: Option<StagedCommand>,
 ) -> std::io::Result<()> {
+    if has_active_turn(rt, actor_id) {
+        if command.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "active workflow turn already owns its incoming command",
+            ));
+        }
+        if !commit_active_step_completed(rt, actor_id, step_name)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "active workflow turn disappeared before completion",
+            ));
+        }
+        return Ok(());
+    }
+
     commit_workflow_event_with_command(rt, actor_id, command, move |sequence| {
         WorkflowEvent::StepCompleted {
             sequence,
@@ -319,6 +569,22 @@ pub(crate) fn commit_step_failed_with_command(
     error: String,
     command: Option<StagedCommand>,
 ) -> std::io::Result<()> {
+    if has_active_turn(rt, actor_id) {
+        if command.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "active workflow turn already owns its incoming command",
+            ));
+        }
+        if !commit_active_step_failed(rt, actor_id, step_name, error)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "active workflow turn disappeared before failure commit",
+            ));
+        }
+        return Ok(());
+    }
+
     commit_workflow_event_with_command(rt, actor_id, command, move |sequence| {
         WorkflowEvent::StepFailed {
             sequence,
@@ -333,6 +599,22 @@ pub(crate) fn commit_suspension(
     actor_id: u64,
     command: Option<StagedCommand>,
 ) -> std::io::Result<()> {
+    if has_active_turn(rt, actor_id) {
+        if command.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "active workflow turn already owns its incoming command",
+            ));
+        }
+        if !commit_active_suspension(rt, actor_id)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "active workflow turn disappeared before suspension commit",
+            ));
+        }
+        return Ok(());
+    }
+
     let waiting_signal = rt
         .actors
         .get(&actor_id)
@@ -357,6 +639,7 @@ fn restore_last_committed_workflow_snapshot(rt: &mut Runtime, actor_id: u64) -> 
     let Some(snapshot) = rt.persistence.load_snapshot(actor_id) else {
         return false;
     };
+    let workflow_events = rt.persistence.read_workflow_events(actor_id);
     let Some(actor) = rt.actors.get_mut(&actor_id) else {
         return false;
     };
@@ -373,9 +656,40 @@ fn restore_last_committed_workflow_snapshot(rt: &mut Runtime, actor_id: u64) -> 
     for name in snapshot_owned_fields {
         actor.state_data.remove(&name);
     }
-    for (name, value) in snapshot.state {
+    for (name, value) in &snapshot.state {
         let value = value.to_value_on_heap(actor);
-        actor.set_state_field(name, value);
+        actor.set_state_field(name.clone(), value);
+    }
+
+    // Auxiliary workflow history is not stored in ActorSnapshot. A rejected
+    // turn may already have appended to these in-memory structures, so rebuild
+    // them from committed workflow events through the snapshot boundary just
+    // as recover_actor does after a process restart.
+    actor.received_signals.clear();
+    actor.compensated_steps.clear();
+    actor.event_log.clear();
+    for event in workflow_events
+        .iter()
+        .filter(|event| event.sequence() <= snapshot.sequence)
+    {
+        match event {
+            WorkflowEvent::SignalReceived { name, payload, .. } => {
+                actor.received_signals.push((name.clone(), payload.clone()));
+            }
+            WorkflowEvent::SagaCompensated { step_name, .. } => {
+                if !actor.compensated_steps.contains(step_name) {
+                    actor.compensated_steps.push(step_name.clone());
+                }
+            }
+            WorkflowEvent::Custom { name, args, .. } => {
+                let mut values = Vec::with_capacity(args.len());
+                for value in args {
+                    values.push(value.to_value_on_heap(actor));
+                }
+                actor.event_log.push((name.clone(), values));
+            }
+            _ => {}
+        }
     }
 
     actor.sequence = snapshot.sequence;
@@ -499,7 +813,7 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
         }
     }
     if is_workflow {
-        let commit = if event == "ParallelBranchCompleted" && args.len() == 2 {
+        if event == "ParallelBranchCompleted" && args.len() == 2 {
             let parallel_step_name =
                 resolve_string_constant(rt, actor_id, &args[0]).unwrap_or_default();
             let branch_name = resolve_string_constant(rt, actor_id, &args[1]).unwrap_or_default();
@@ -510,13 +824,26 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                     .unwrap_or(0);
                 actor.set_state_field("parallel_progress", Value::int(current + 1));
             }
-            commit_workflow_event(rt, actor_id, move |sequence| {
+
+            if stage_workflow_event(rt, actor_id, |sequence| {
+                WorkflowEvent::ParallelBranchCompleted {
+                    sequence,
+                    parallel_step_name: parallel_step_name.clone(),
+                    branch_name: branch_name.clone(),
+                }
+            }) {
+                return;
+            }
+
+            if let Err(error) = commit_workflow_event(rt, actor_id, move |sequence| {
                 WorkflowEvent::ParallelBranchCompleted {
                     sequence,
                     parallel_step_name,
                     branch_name,
                 }
-            })
+            }) {
+                quarantine_after_commit_failure(rt, actor_id, &error);
+            }
         } else {
             let module = rt
                 .actors
@@ -527,15 +854,24 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 .map(|v| PersistedValue::from_value_resolved(v, module))
                 .collect();
             let name = event.to_string();
-            commit_workflow_event(rt, actor_id, move |sequence| WorkflowEvent::Custom {
-                sequence,
-                name,
-                args: payload,
-            })
-        };
 
-        if let Err(error) = commit {
-            quarantine_after_commit_failure(rt, actor_id, &error);
+            if stage_workflow_event(rt, actor_id, |sequence| WorkflowEvent::Custom {
+                sequence,
+                name: name.clone(),
+                args: payload.clone(),
+            }) {
+                return;
+            }
+
+            if let Err(error) = commit_workflow_event(rt, actor_id, move |sequence| {
+                WorkflowEvent::Custom {
+                    sequence,
+                    name,
+                    args: payload,
+                }
+            }) {
+                quarantine_after_commit_failure(rt, actor_id, &error);
+            }
         }
     }
 }
@@ -576,6 +912,19 @@ pub(crate) fn append_signal_received(
     name: &str,
     payload: Option<String>,
 ) -> std::io::Result<()> {
+    let staged_name = name.to_string();
+
+    // A signal delivered while a safepoint-yielded activation retains its
+    // durable turn must join that transition. Persisting it independently
+    // would advance the durable tail and stale the turn's predecessor.
+    if stage_workflow_event(rt, actor_id, |sequence| WorkflowEvent::SignalReceived {
+        sequence,
+        name: staged_name.clone(),
+        payload: payload.clone(),
+    }) {
+        return Ok(());
+    }
+
     let preserve_committed_state = rt
         .actors
         .get(&actor_id)
@@ -704,6 +1053,9 @@ pub(crate) fn schedule_workflow_timer(
     duration_ms: u64,
 ) {
     if actor_is_workflow(rt, actor_id) {
+        if stage_timer_set(rt, actor_id, name, duration_ms) {
+            return;
+        }
         if let Err(error) = append_timer_set(rt, actor_id, name, duration_ms) {
             quarantine_after_commit_failure(rt, actor_id, &error);
             return;

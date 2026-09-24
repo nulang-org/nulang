@@ -3405,6 +3405,336 @@ fn test_receiver_hold_survives_sender_drop_until_release() {
 // ========================================================================
 
 #[test]
+fn active_workflow_turn_commits_command_events_state_and_timer_at_one_sequence() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "ActiveTurnWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+    assert_ne!(actor_id, 0);
+    assert!(rt.timer_wheel.is_empty());
+
+    let command = workflow::stage_command(&rt, actor_id, 7, &[Value::int(42)]);
+    workflow::begin_active_turn(&mut rt, actor_id, command).unwrap();
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .set_state_field("step_index", Value::int(1));
+    assert!(workflow::stage_timer_set(
+        &mut rt,
+        actor_id,
+        "deadline",
+        5_000
+    ));
+    assert!(workflow::stage_workflow_event(
+        &mut rt,
+        actor_id,
+        |sequence| WorkflowEvent::Custom {
+            sequence,
+            name: "OrderAccepted".to_string(),
+            args: vec![PersistedValue::Int(42)],
+        },
+    ));
+
+    // Consequences are staged only; the live timer wheel must not observe a
+    // durable timer before storage commits the containing transition.
+    assert!(rt.timer_wheel.is_empty());
+
+    assert!(workflow::commit_active_step_completed(
+        &mut rt,
+        actor_id,
+        "accept".to_string(),
+    )
+    .unwrap());
+
+    assert_eq!(rt.timer_wheel.len(), 1);
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let journal = rt.persistence.read_journal(actor_id);
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].sequence, snapshot.sequence);
+    assert_eq!(journal[0].behavior_id, 7);
+
+    let events = rt.persistence.read_workflow_events(actor_id);
+    let turn_events: Vec<_> = events
+        .iter()
+        .filter(|event| event.sequence() == snapshot.sequence)
+        .collect();
+    assert_eq!(turn_events.len(), 3);
+    assert!(turn_events
+        .iter()
+        .any(|event| matches!(event, WorkflowEvent::TimerSet { name, .. } if name == "deadline")));
+    assert!(turn_events
+        .iter()
+        .any(|event| matches!(event, WorkflowEvent::Custom { name, .. } if name == "OrderAccepted")));
+    assert!(turn_events
+        .iter()
+        .any(|event| matches!(event, WorkflowEvent::StepCompleted { step_name, .. } if step_name == "accept")));
+    assert_eq!(
+        snapshot.state.get("step_index"),
+        Some(&PersistedValue::Int(1))
+    );
+}
+
+#[test]
+fn failed_active_workflow_turn_publishes_no_timer_and_rolls_back_auxiliary_history() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "RejectedTurnWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+    assert_ne!(actor_id, 0);
+
+    let command = workflow::stage_command(&rt, actor_id, 4, &[]);
+    workflow::begin_active_turn(&mut rt, actor_id, command).unwrap();
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .set_state_field("step_index", Value::int(99));
+    rt.emit_event(actor_id, "RejectedEvent", &[]);
+    assert!(workflow::stage_timer_set(
+        &mut rt,
+        actor_id,
+        "must-not-publish",
+        10_000
+    ));
+    assert_eq!(rt.actors.get(&actor_id).unwrap().event_log.len(), 1);
+    assert!(rt.timer_wheel.is_empty());
+
+    // Simulate another committed writer advancing the persisted predecessor
+    // after this turn reserved its sequence. The active commit must fail its
+    // sequence fence and publish none of its deferred consequences.
+    let conflicting_sequence = rt.persistence.latest_sequence(actor_id) + 1;
+    rt.persistence
+        .append_journal(
+            actor_id,
+            JournalEntry {
+                sequence: conflicting_sequence,
+                behavior_id: 99,
+                payload: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    let error = workflow::commit_active_step_completed(
+        &mut rt,
+        actor_id,
+        "reject".to_string(),
+    )
+    .unwrap_err();
+    workflow::quarantine_after_commit_failure(&mut rt, actor_id, &error);
+
+    assert!(rt.timer_wheel.is_empty());
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(
+        actor.get_state_field("step_index"),
+        Some(Value::int(0)),
+        "failed turn must restore the committed durable field image"
+    );
+    assert!(
+        actor.event_log.is_empty(),
+        "custom event from a rejected turn must not remain observable in memory"
+    );
+    assert_eq!(actor.state, ActorState::Suspended);
+
+    let events = rt.persistence.read_workflow_events(actor_id);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        &events[0],
+        WorkflowEvent::WorkflowStarted { .. }
+    ));
+}
+
+#[test]
+fn active_workflow_turn_serializes_intervening_timer_and_signal_events() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "InterveningEventWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    let command = workflow::stage_command(&rt, actor_id, 11, &[Value::int(7)]);
+    workflow::begin_active_turn(&mut rt, actor_id, command).unwrap();
+    let predecessor = rt.persistence.latest_sequence(actor_id);
+
+    rt.append_timer_set(actor_id, "secondary-deadline", 250).unwrap();
+    rt.append_timer_fired(actor_id, "deadline").unwrap();
+    rt.append_signal_received(actor_id, "resume", Some("go".to_string()))
+        .unwrap();
+    rt.append_saga_compensated(actor_id, "cleanup").unwrap();
+
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        predecessor,
+        "intervening timer/signal events must not advance the durable tail while an active turn is retained"
+    );
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .set_state_field("step_index", Value::int(1));
+    assert!(workflow::commit_active_step_completed(
+        &mut rt,
+        actor_id,
+        "long-step".to_string(),
+    )
+    .unwrap());
+
+    let committed = predecessor + 1;
+    assert_eq!(rt.persistence.latest_sequence(actor_id), committed);
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(snapshot.sequence, committed);
+
+    let journal = rt.persistence.read_journal(actor_id);
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].sequence, committed);
+    assert_eq!(journal[0].behavior_id, 11);
+
+    let events = rt.persistence.read_workflow_events(actor_id);
+    let turn_events: Vec<_> = events
+        .iter()
+        .filter(|event| event.sequence() == committed)
+        .collect();
+    assert!(turn_events.iter().any(|event| {
+        matches!(
+            event,
+            WorkflowEvent::TimerSet { name, duration_ms, .. }
+                if name == "secondary-deadline" && *duration_ms == 250
+        )
+    }));
+    assert!(turn_events
+        .iter()
+        .any(|event| matches!(event, WorkflowEvent::TimerFired { name, .. } if name == "deadline")));
+    assert!(turn_events.iter().any(|event| {
+        matches!(
+            event,
+            WorkflowEvent::SignalReceived { name, payload, .. }
+                if name == "resume" && payload == &Some("go".to_string())
+        )
+    }));
+    assert!(turn_events.iter().any(|event| {
+        matches!(
+            event,
+            WorkflowEvent::SagaCompensated { step_name, .. } if step_name == "cleanup"
+        )
+    }));
+    assert!(turn_events.iter().any(|event| {
+        matches!(
+            event,
+            WorkflowEvent::StepCompleted { step_name, .. } if step_name == "long-step"
+        )
+    }));
+}
+
+#[test]
+fn active_workflow_suspension_publishes_timer_sleep_only_after_commit() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "TimerSleepTurnWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    let command = workflow::stage_command(&rt, actor_id, 3, &[]);
+    workflow::begin_active_turn(&mut rt, actor_id, command).unwrap();
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .set_state_field("step_index", Value::int(99));
+    rt.actors.get_mut(&actor_id).unwrap().waiting_signal =
+        Some("__timer_sleep_pending__".to_string());
+
+    assert!(workflow::stage_timer_sleep(&mut rt, actor_id, 60_000));
+    assert!(rt.timer_wheel.is_empty());
+
+    assert!(workflow::commit_active_suspension(&mut rt, actor_id).unwrap());
+    assert_eq!(rt.timer_wheel.len(), 1);
+
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let journal = rt.persistence.read_journal(actor_id);
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].sequence, snapshot.sequence);
+    assert_eq!(
+        snapshot.state.get("step_index"),
+        Some(&PersistedValue::Int(0)),
+        "suspension boundary must retain the pre-step committed state"
+    );
+    assert_eq!(
+        snapshot.waiting_signal.as_deref(),
+        Some("__timer_sleep_pending__")
+    );
+}
+
+#[test]
+fn resumed_workflow_continuation_stages_follow_on_events_in_one_transition() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "ContinuationTurnWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    rt.append_signal_received(actor_id, "resume", Some("go".to_string()))
+        .unwrap();
+    let signal_sequence = rt.persistence.latest_sequence(actor_id);
+
+    workflow::begin_active_continuation(&mut rt, actor_id).unwrap();
+    assert!(workflow::stage_workflow_event(
+        &mut rt,
+        actor_id,
+        |sequence| WorkflowEvent::Custom {
+            sequence,
+            name: "AfterResume".to_string(),
+            args: vec![PersistedValue::String("ok".to_string())],
+        },
+    ));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .set_state_field("step_index", Value::int(1));
+
+    assert!(workflow::commit_active_step_completed(
+        &mut rt,
+        actor_id,
+        "resume-step".to_string(),
+    )
+    .unwrap());
+
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(snapshot.sequence, signal_sequence + 1);
+    assert!(
+        rt.persistence.read_journal(actor_id).is_empty(),
+        "a resumed continuation has no new incoming command"
+    );
+
+    let events = rt.persistence.read_workflow_events(actor_id);
+    let continuation_events: Vec<_> = events
+        .iter()
+        .filter(|event| event.sequence() == snapshot.sequence)
+        .collect();
+    assert_eq!(continuation_events.len(), 2);
+    assert!(continuation_events
+        .iter()
+        .any(|event| matches!(event, WorkflowEvent::Custom { name, .. } if name == "AfterResume")));
+    assert!(continuation_events.iter().any(
+        |event| matches!(event, WorkflowEvent::StepCompleted { step_name, .. } if step_name == "resume-step")
+    ));
+}
+
+#[test]
 fn workflow_suspension_commit_preserves_pre_step_state_and_stages_command() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();

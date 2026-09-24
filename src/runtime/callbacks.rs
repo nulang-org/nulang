@@ -2075,9 +2075,17 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                     if ms == 0 {
                         return PerformAsyncResult::Ready(None);
                     }
-                    if ms > 0 {
-                        rt.timer_wheel
-                            .timer_sleep_wake(std::time::Duration::from_millis(ms), self.actor_id);
+                    if ms > 0
+                        && !crate::runtime::workflow::stage_timer_sleep(
+                            rt,
+                            self.actor_id,
+                            ms,
+                        )
+                    {
+                        rt.timer_wheel.timer_sleep_wake(
+                            std::time::Duration::from_millis(ms),
+                            self.actor_id,
+                        );
                     }
                 }
                 PerformAsyncResult::Pending

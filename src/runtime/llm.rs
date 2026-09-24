@@ -441,6 +441,10 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         }
         return;
     }
+    if let Err(error) = crate::runtime::workflow::begin_active_continuation(rt, actor_id) {
+        crate::runtime::workflow::quarantine_after_commit_failure(rt, actor_id, &error);
+        return;
+    }
 
     let self_ptr: *mut Runtime = rt;
     unsafe {
