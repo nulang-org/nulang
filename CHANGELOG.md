@@ -51,6 +51,12 @@ version + migration.*
 
 ## Stable tier
 
+### Durable external-effect recovery coordinator — 2026-09-23
+- **Atomic durable-effect records are now recoverable through the storage-neutral `PersistenceStore` contract.** Memory and libSQL backends can load the newest record for a stable `DurableEffectId`; backends without recovery support fail with `Unsupported` instead of pretending the effect never ran.
+- **`DurableEffectCoordinator` connects the existing semantic effect state machine to atomic `DurableTransition` commits.** A new effect persists `Prepared` before external dispatch, recovery validates both request digest and full effect specification, terminal results persist as `Completed`, and completed results replay without redispatch.
+- **Activation fencing and sequence CAS remain authoritative at the persistence boundary.** The coordinator supplies the current activation epoch but does not invent replay identity; callers must provide a semantic, replay-stable `DurableEffectSpec`.
+- Focused store/coordinator tests pin request drift, specification drift, monotonic completion, stale-activation rejection, newest-record lookup, and fail-closed unsupported-backend behavior.
+
 ### Semantic effect-site artifact metadata — 2026-09-23
 - **Bytecode artifacts now carry an additive `effect_sites` metadata sidecar** mapping the exact `Perform` / `PerformDirect` / `PerformAsync` instruction PC to the compiler-owned semantic effect-site digest and qualified operation. Opcode bytes and NBC format version remain unchanged.
 - **MIR codegen captures semantic sites before optimization and consumes them while emitting effects.** If optimization ever removes or reorders observable effect operations, codegen fails instead of silently attaching an incorrect durable identity.
