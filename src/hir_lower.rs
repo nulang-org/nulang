@@ -2800,6 +2800,104 @@ mod tests {
     }
 
     #[test]
+    fn explicit_actor_protocol_is_fingerprinted_before_hir_erases_omissions() {
+        let span = Span::default();
+        let behavior = ast::Behavior {
+            name: "get".to_string(),
+            params: vec![],
+            body: Expr::Literal(Literal::Int(1), span),
+            effect: Some(EffectRow::empty()),
+            cap: Capability::Ref,
+            ret_type: Some(Type::int()),
+            span,
+        };
+        let module = ast::AstModule {
+            name: "test".to_string(),
+            decls: vec![Decl::Actor {
+                name: "Counter".to_string(),
+                type_params: vec![],
+                persistent: false,
+                state_fields: vec![],
+                behaviors: vec![behavior],
+                init: vec![],
+                backend: None,
+                initializer: None,
+                events: vec![],
+                apply_handlers: vec![],
+                version: 1,
+                migrations: vec![],
+                is_organization: false,
+                virtual_: false,
+                key_params: vec![],
+                implements: None,
+                span,
+            }],
+        };
+
+        let hir = lower_module(&module, &FxHashMap::default());
+        let hir::Decl::Actor(actor) = &hir.decls[0] else {
+            panic!("actor should lower to actor HIR");
+        };
+        let expected = crate::protocol::ProtocolSchema::new(
+            "Counter",
+            [crate::protocol::ProtocolMember::behavior(
+                "get",
+                vec![],
+                Type::int(),
+                EffectRow::empty(),
+                Capability::Ref,
+            )
+            .unwrap()],
+        )
+        .unwrap()
+        .id()
+        .to_string();
+        assert_eq!(actor.protocol_id.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn incomplete_actor_protocol_does_not_mint_an_identity() {
+        let span = Span::default();
+        let behavior = ast::Behavior {
+            name: "get".to_string(),
+            params: vec![],
+            body: Expr::Literal(Literal::Int(1), span),
+            effect: None,
+            cap: Capability::Ref,
+            ret_type: None,
+            span,
+        };
+        let module = ast::AstModule {
+            name: "test".to_string(),
+            decls: vec![Decl::Actor {
+                name: "Counter".to_string(),
+                type_params: vec![],
+                persistent: false,
+                state_fields: vec![],
+                behaviors: vec![behavior],
+                init: vec![],
+                backend: None,
+                initializer: None,
+                events: vec![],
+                apply_handlers: vec![],
+                version: 1,
+                migrations: vec![],
+                is_organization: false,
+                virtual_: false,
+                key_params: vec![],
+                implements: None,
+                span,
+            }],
+        };
+
+        let hir = lower_module(&module, &FxHashMap::default());
+        let hir::Decl::Actor(actor) = &hir.decls[0] else {
+            panic!("actor should lower to actor HIR");
+        };
+        assert!(actor.protocol_id.is_none());
+    }
+
+    #[test]
     fn test_lower_if_is_expression_positioned() {
         // `let x = if c then 1 else 2 in x` must keep the if as an RValue so
         // statements after it stay in evaluation order.
