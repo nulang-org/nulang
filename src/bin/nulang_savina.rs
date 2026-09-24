@@ -556,6 +556,10 @@ fn bench_fork_join_sharded(shard_count: usize) -> Measurement {
     const WINDOW: i64 = 512;
 
     assert!(shard_count > 1, "sharded fork_join requires at least two shards");
+    assert!(
+        shard_count <= WORKERS,
+        "sharded fork_join supports at most one shard per worker ({WORKERS})"
+    );
 
     let source = format!(
         r#"
@@ -572,6 +576,8 @@ actor Producer {{
     state sent = 0
     state completed = 0
     state next = 0
+
+    behavior warm() {{ unit }}
 
     behavior kick(n) {{
         self.total = n
@@ -612,6 +618,7 @@ actor Producer {{
 actor Worker {{
     state producer = nil
     state count = 0
+    behavior warm() {{ unit }}
     behavior task(n) {{
         self.count = self.count + 1
         send self.producer ack()
@@ -622,7 +629,9 @@ unit
 "#
     );
     let module = compile_module(&source);
+    let producer_warm = bytecode_behavior_id(&module, "Producer.warm");
     let producer_kick = bytecode_behavior_id(&module, "Producer.kick");
+    let worker_warm = bytecode_behavior_id(&module, "Worker.warm");
 
     let mut shards = Runtime::new_sharded(shard_count);
     let producer = attach_plain_bytecode_actor(
@@ -673,8 +682,14 @@ unit
         }
     }
 
-    // Consume spawn-time ready tokens before timing. No workload messages have
-    // been admitted yet.
+    // Warm every actor through a no-op bytecode behavior. This materializes
+    // each actor's runtime-VM module index outside the measured region, matching
+    // the benchmark rule that compilation/module wiring is setup rather than
+    // message throughput.
+    shards[0].send_message_by_id(producer, producer_warm, &[]);
+    for &(owner, worker_id) in &workers {
+        shards[owner].send_message_by_id(worker_id, worker_warm, &[]);
+    }
     for shard in &mut shards {
         shard.run_scheduler();
     }
@@ -687,9 +702,7 @@ unit
     let barrier = Arc::new(Barrier::new(shard_count + 1));
     let done = Arc::new(AtomicBool::new(false));
 
-    let start;
-    let elapsed;
-    let finished_shards = std::thread::scope(|scope| {
+    let (finished_shards, elapsed) = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(shard_count);
         for (index, mut runtime) in shards.into_iter().enumerate() {
             let barrier = Arc::clone(&barrier);
@@ -720,14 +733,13 @@ unit
         }
 
         // Threads exist and are parked at the barrier before the clock starts.
-        start = Instant::now();
+        let start = Instant::now();
         barrier.wait();
         let runtimes: Vec<Runtime> = handles
             .into_iter()
             .map(|handle| handle.join().expect("Savina shard thread panicked"))
             .collect();
-        elapsed = start.elapsed();
-        runtimes
+        (runtimes, start.elapsed())
     });
 
     let completed = finished_shards[0]
