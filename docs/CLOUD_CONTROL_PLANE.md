@@ -140,10 +140,30 @@ separate tables without changing scheduler/reconciler semantics.
 already committed evaluation returns the durable plan rather than recomputing it
 against a newer node snapshot.
 
+## Node allocation executor
+
+`execute_pending_for_node` consumes the durable Start/Stop outbox for one node
+through the provider-neutral `AllocationRuntime` boundary. The runtime adapter is
+responsible for durably storing the local allocation epoch before reporting a
+start or stop as successful. The executor then verifies the observed epoch and
+ACKs the control-plane command only after the local mutation is proven.
+
+The executor treats a newer local epoch as authoritative: delayed Start/Stop
+commands from an older epoch are acknowledged without touching the newer
+workload. A Stop installs a fence even when no workload is currently live, and
+a delayed Start at an already-stopped epoch fails closed rather than
+resurrecting that allocation. If a control-plane ACK fails after the runtime
+action succeeds, the next pass observes the already-applied local epoch and
+ACKs idempotently without repeating the runtime mutation.
+
+This deliberately leaves process/WASM/microVM lifecycle details outside the
+control-plane crate. Concrete node agents implement `AllocationRuntime` and
+must make epoch fencing durable across their own restart.
+
 ## Next implementation slices
 
-1. Node-side allocation executor honoring epoch fencing and durable outbox ACKs.
-2. Reconciliation event loop for deployment/node/allocation changes.
+1. Reconciliation event loop for deployment/node/allocation changes.
+2. Concrete node-agent `AllocationRuntime` adapter for the first production execution target.
 3. PostgreSQL state normalization only if measured contention/state size justifies it.
 4. Fabric-backed service directory with generation-tagged health advertisements.
 5. Workload identity and short-lived mTLS credentials bound to node/workload
