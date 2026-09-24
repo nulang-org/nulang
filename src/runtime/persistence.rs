@@ -4432,6 +4432,7 @@ mod json_file_store_tests {
             domain_events: Vec::new(),
             durable_effects: Vec::new(),
             outbox: Vec::new(),
+            inbox: Vec::new(),
         };
         let expected_digest = transition.digest().unwrap();
 
@@ -4489,6 +4490,7 @@ mod json_file_store_tests {
             domain_events: Vec::new(),
             durable_effects: Vec::new(),
             outbox: Vec::new(),
+            inbox: Vec::new(),
         };
         store.commit_transition(first).unwrap();
 
@@ -4521,6 +4523,7 @@ mod json_file_store_tests {
             domain_events: Vec::new(),
             durable_effects: Vec::new(),
             outbox: Vec::new(),
+            inbox: Vec::new(),
         };
         store.commit_transition(second).unwrap();
 
@@ -5247,6 +5250,7 @@ mod durable_transition_tests {
                 behavior_id: 9,
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }],
+            inbox: Vec::new(),
         }
     }
 
@@ -5424,6 +5428,7 @@ mod libsql_atomic_transition_tests {
                 behavior_id: 4,
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }],
+            inbox: Vec::new(),
         }
     }
 
