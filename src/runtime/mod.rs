@@ -3370,7 +3370,6 @@ impl Runtime {
             .map(|id| id.to_string());
         Some(ActorSnapshot {
             actor_id,
-            semantic_id: None,
             sequence,
             semantic_id,
             state,
