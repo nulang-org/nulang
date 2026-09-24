@@ -48,8 +48,12 @@ The cache kernel in `src/runtime/cache.rs` establishes the representation
 boundary:
 
 - small byte strings are inline;
-- large keys and values live in reusable size-class slabs, so growth never relocates one monolithic backing buffer;
-- slab growth is accounted before admission and exposed through cache memory statistics;
+- large keys and values live in reusable size-class slabs, so growth never
+  relocates one monolithic backing buffer;
+- empty slabs remain hot during ordinary churn, but are reclaimed under arena
+  pressure or by an explicit trim before capacity failure/eviction;
+- slab growth, free space, metadata, index, and slot reservation are exposed
+  through cache memory statistics;
 - the key index is a contiguous open-addressed table;
 - entry slots are recycled with generations;
 - stale expiration records cannot delete a recycled slot.
@@ -69,7 +73,10 @@ levels, avoiding repeated visits on every base-wheel rotation.
 
 `src/runtime/resp.rs` parses RESP2 array-of-bulk-string commands into borrowed
 slices. It validates the complete frame while avoiding a per-command argument
-vector. Pipelined frames report their exact consumed length.
+vector. The first two validated arguments are retained directly on
+`RespCommand`, so common GET/SET/INCR/EXPIRE/TTL/PING routing and execution
+does not decode those bulk headers again. Pipelined frames report their exact
+consumed length.
 
 `src/runtime/resp_cache.rs` executes the initial compatibility surface directly
 against the shard-local kernel: PING, GET, SET (including EX/PX), DEL, EXISTS,
@@ -167,6 +174,13 @@ Before calling the service Redis-class, CI benchmarks should track at least:
 The local hot path target is zero actor messages and zero VM/GC allocations.
 Allocator activity in the RESP socket buffer and first-time arena/index growth
 must be measured separately from steady-state command execution.
+
+Compatibility CI launches the real Mio cache server through the optional
+`nulang-cache` binary and compares Nulang's declared RESP core over TCP against
+Valkey. The differential gate covers strings, binary values, counters,
+expiration/TTL, same-slot multi-key operations, deletion, and pipelining while
+deliberately avoiding commands outside Nulang's documented compatibility
+surface.
 
 ## Next implementation sequence
 
