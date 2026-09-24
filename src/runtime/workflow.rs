@@ -59,10 +59,22 @@ pub(crate) fn begin_workflow_command(
     if !actor_is_workflow(rt, actor_id) {
         return Ok(());
     }
+    let module = rt
+        .actors
+        .get(&actor_id)
+        .and_then(|actor| actor.bytecode_module.as_ref());
+    let persisted_payload: Vec<PersistedValue> = payload
+        .iter()
+        .map(|value| PersistedValue::from_value_resolved(value, module))
+        .collect();
+
     if let Some(pending) = rt.pending_workflow_commands.get(&actor_id) {
         // Recovery re-enqueues an already-durable command through the normal
-        // mailbox path. Allow that exact command to re-enter the activation.
-        if pending.persisted_sequence.is_some() && pending.behavior_id == behavior_id {
+        // mailbox path. Admit only the exact same behavior and payload.
+        if pending.persisted_sequence.is_some()
+            && pending.behavior_id == behavior_id
+            && pending.payload == persisted_payload
+        {
             return Ok(());
         }
         return Err(std::io::Error::new(
@@ -70,15 +82,6 @@ pub(crate) fn begin_workflow_command(
             "workflow activation already has an uncommitted driving command",
         ));
     }
-
-    let module = rt
-        .actors
-        .get(&actor_id)
-        .and_then(|actor| actor.bytecode_module.as_ref());
-    let persisted_payload = payload
-        .iter()
-        .map(|value| PersistedValue::from_value_resolved(value, module))
-        .collect();
 
     rt.pending_workflow_commands.insert(
         actor_id,
