@@ -3667,6 +3667,69 @@ fn test_workflow_checkpoint_and_event_share_atomic_sequence_tail() {
 }
 
 #[test]
+fn test_workflow_timer_set_stages_until_atomic_turn_boundary() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "StagedTimerWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    workflow::begin_workflow_command(&mut rt, actor_id, 5, &[Value::int(11)]).unwrap();
+    rt.vm_execution_depth = 1;
+    rt.schedule_workflow_timer(actor_id, "deadline", 500);
+    rt.vm_execution_depth = 0;
+
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 1);
+    assert!(rt.timer_wheel.is_empty());
+    assert_eq!(
+        rt.pending_workflow_events
+            .get(&actor_id)
+            .map(Vec::len),
+        Some(1)
+    );
+
+    workflow::commit_workflow_event(
+        &mut rt,
+        actor_id,
+        WorkflowEvent::StepCompleted {
+            sequence: 2,
+            step_name: "arm_timer".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 2);
+    assert!(!rt.timer_wheel.is_empty());
+    assert!(!rt.pending_workflow_events.contains_key(&actor_id));
+
+    let events = rt.persistence.read_workflow_events(actor_id);
+    assert_eq!(events.len(), 3);
+    assert!(matches!(
+        &events[1],
+        WorkflowEvent::TimerSet {
+            sequence: 2,
+            name,
+            duration_ms: 500,
+        } if name == "deadline"
+    ));
+    assert!(matches!(
+        &events[2],
+        WorkflowEvent::StepCompleted {
+            sequence: 2,
+            step_name,
+        } if step_name == "arm_timer"
+    ));
+
+    let journal = rt.persistence.read_journal(actor_id);
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].sequence, 2);
+    assert_eq!(journal[0].behavior_id, 5);
+}
+
+#[test]
 fn test_workflow_command_joins_first_atomic_transition() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
