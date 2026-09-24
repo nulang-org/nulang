@@ -8,5 +8,10 @@ license = "Apache-2.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "io-std", "io-util"] }
 async-trait = "0.1"
+nulang = { path = "../..", default-features = false }
+
+[[bin]]
+name = "nulang-mcp"
+path = "src/main.rs"
