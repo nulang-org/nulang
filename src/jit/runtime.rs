@@ -782,6 +782,77 @@ pub fn aot_clear_constants() {
     });
 }
 
+/// Snapshot of the helper thread-local state that nested AOT actor dispatch
+/// temporarily replaces. The constant pool is moved out rather than cloned so
+/// preserving an outer native frame does not add a copy proportional to the
+/// module's constant count.
+pub(crate) struct AotHelperThreadState {
+    callbacks: CbPair,
+    constants: Option<Vec<crate::bytecode::Constant>>,
+}
+
+/// Save the active AOT callback and constant-pool context before a nested
+/// native actor entry overwrites it.
+pub(crate) fn save_aot_helper_thread_state() -> AotHelperThreadState {
+    let callbacks = JIT_CALLBACKS.with(|cell| unsafe { *cell.get() });
+    let constants = AOT_CONSTANTS.with(|cell| cell.borrow_mut().take());
+    AotHelperThreadState {
+        callbacks,
+        constants,
+    }
+}
+
+/// Restore the helper context saved by `save_aot_helper_thread_state`.
+///
+/// This intentionally does not restore the pending AOT error slot: an error
+/// raised by the nested native call belongs to the enclosing run and must
+/// remain observable by the outer driver.
+pub(crate) fn restore_aot_helper_thread_state(state: AotHelperThreadState) {
+    unsafe {
+        JIT_CALLBACKS.with(|cell| *cell.get() = state.callbacks);
+    }
+    AOT_CONSTANTS.with(|cell| *cell.borrow_mut() = state.constants);
+}
+
+#[cfg(test)]
+mod aot_helper_state_tests {
+    use super::*;
+
+    #[test]
+    fn nested_aot_helper_state_round_trip_restores_outer_context() {
+        JIT_CALLBACKS.with(|cell| unsafe { *cell.get() = CbPair(11, 22) });
+        AOT_CONSTANTS.with(|cell| {
+            *cell.borrow_mut() = Some(vec![crate::bytecode::Constant::String(
+                "outer".to_string(),
+            )]);
+        });
+
+        let saved = save_aot_helper_thread_state();
+
+        JIT_CALLBACKS.with(|cell| unsafe { *cell.get() = CbPair(33, 44) });
+        AOT_CONSTANTS.with(|cell| {
+            *cell.borrow_mut() = Some(vec![crate::bytecode::Constant::String(
+                "inner".to_string(),
+            )]);
+        });
+
+        restore_aot_helper_thread_state(saved);
+
+        JIT_CALLBACKS.with(|cell| unsafe {
+            let restored = *cell.get();
+            assert_eq!((restored.0, restored.1), (11, 22));
+            *cell.get() = CbPair::NULL;
+        });
+        AOT_CONSTANTS.with(|cell| {
+            let restored = cell.borrow_mut().take();
+            assert!(matches!(
+                restored.as_deref(),
+                Some([crate::bytecode::Constant::String(value)]) if value == "outer"
+            ));
+        });
+    }
+}
+
 /// Allocate via callbacks or fall back to standalone AOT heap.
 /// Check if JIT callbacks are set, and if so, use them.
 pub(crate) unsafe fn try_with_callbacks<R>(
