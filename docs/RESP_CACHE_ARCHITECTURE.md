@@ -44,11 +44,12 @@ Multi-key behavior is intentionally tiered:
 
 ## Memory model
 
-The first cache kernel in `src/runtime/cache.rs` establishes the representation
+The cache kernel in `src/runtime/cache.rs` establishes the representation
 boundary:
 
 - small byte strings are inline;
-- large keys and values live in reusable size-class arena blocks;
+- large keys and values live in reusable size-class slabs, so growth never relocates one monolithic backing buffer;
+- slab growth is accounted before admission and exposed through cache memory statistics;
 - the key index is a contiguous open-addressed table;
 - entry slots are recycled with generations;
 - stale expiration records cannot delete a recycled slot.
@@ -59,10 +60,10 @@ encodings for hashes, sets, lists, and sorted sets.
 
 ## Expiration
 
-TTL work is separate from actor timers. The initial implementation uses a
-hashed timing wheel with generation checks and lazy expiry on reads. The next
-iteration should promote this to a hierarchical wheel so long TTLs do not
-revisit the same bucket each rotation.
+TTL work is separate from actor timers. The cache uses a multi-level hashed
+timing wheel with generation checks and lazy expiry on reads. Near-term TTLs
+stay in the base wheel while long-lived expirations are placed in coarser
+levels, avoiding repeated visits on every base-wheel rotation.
 
 ## RESP ingress and command execution
 
@@ -177,8 +178,7 @@ must be measured separately from steady-state command execution.
 3. Add a separate transparent proxy endpoint only for non-cluster clients;
    keep the per-shard production listeners redirect-only.
 4. Connect remote transparent handoffs to a cache-specific cluster transport.
-5. Promote expiration to a hierarchical timing wheel, then add packed
-   aggregate structures and durability acknowledgement modes.
+5. Add packed aggregate structures and durability acknowledgement modes.
 6. Expand RESP compatibility and add Nulang-native leases, locks, semaphores,
    fencing tokens, queues, and stored functions where they fit the product
    boundary.
