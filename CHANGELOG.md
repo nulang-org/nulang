@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Orthogonal actor semantic normalization — 2026-09-24
+- **Runtime semantic decisions now consume an additive `ActorSemantics` view instead of treating agent/workflow/organization/virtual flags as one mutually-exclusive role.** Surface origin, persistence, and activation are normalized independently; virtual activation can compose with workflow/agent/organization provenance.
+- **The strict legacy `ActorRole` decoder and raw metadata booleans remain for persisted/wire compatibility only.** No source syntax, bytecode format, persistence format, authority enforcement, or RFC 0024 execution-domain semantics change in this slice.
+
 ### Python bool marshal type inference — 2026-09-24
 - **Default-feature builds now make PyO3 boolean extraction explicit with `extract::<bool>()`**, avoiding a compiler inference failure in the Python marshal path without changing conversion semantics.
 
