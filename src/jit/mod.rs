@@ -211,6 +211,7 @@ impl JitSession {
             .flatten()
     }
 
+    #[cfg(test)]
     fn store_compiled(
         &mut self,
         module_idx: usize,
