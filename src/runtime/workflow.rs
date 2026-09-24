@@ -230,7 +230,10 @@ pub(crate) fn stage_or_commit_workflow_event(
     let sequence = next_sequence(rt, actor_id);
     stage_existing_workflow_event(rt, actor_id, make_event(sequence))?;
     if started {
-        commit_workflow_transition(rt, actor_id, false)?;
+        if let Err(error) = commit_workflow_transition(rt, actor_id, false) {
+            rollback_workflow_transition(rt, actor_id);
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -529,23 +532,27 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
         }
     }
     if is_workflow {
-        if event == "ParallelBranchCompleted" && args.len() == 2 {
+        let staged = if event == "ParallelBranchCompleted" && args.len() == 2 {
             let parallel_step_name =
                 resolve_string_constant(rt, actor_id, &args[0]).unwrap_or_default();
             let branch_name = resolve_string_constant(rt, actor_id, &args[1]).unwrap_or_default();
-            let _ = rt.persistence.append_parallel_branch_completed(
-                actor_id,
-                seq,
-                parallel_step_name,
-                branch_name,
-            );
-            if let Some(actor) = rt.actors.get_mut(&actor_id) {
-                let current = actor
-                    .get_state_field("parallel_progress")
-                    .and_then(|v| v.as_int())
-                    .unwrap_or(0);
-                actor.set_state_field("parallel_progress", Value::int(current + 1));
+            let result = stage_or_commit_workflow_event(rt, actor_id, |sequence| {
+                WorkflowEvent::ParallelBranchCompleted {
+                    sequence,
+                    parallel_step_name,
+                    branch_name,
+                }
+            });
+            if result.is_ok() {
+                if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                    let current = actor
+                        .get_state_field("parallel_progress")
+                        .and_then(|v| v.as_int())
+                        .unwrap_or(0);
+                    actor.set_state_field("parallel_progress", Value::int(current + 1));
+                }
             }
+            result
         } else {
             let module = rt
                 .actors
@@ -555,16 +562,20 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 .iter()
                 .map(|v| PersistedValue::from_value_resolved(v, module))
                 .collect();
-            let _ = rt.persistence.append_workflow_event(
+            stage_or_commit_workflow_event(rt, actor_id, |sequence| WorkflowEvent::Custom {
+                sequence,
+                name: event.to_string(),
+                args: payload,
+            })
+        };
+        if let Err(error) = staged {
+            tracing::warn!(
                 actor_id,
-                WorkflowEvent::Custom {
-                    sequence: seq,
-                    name: event.to_string(),
-                    args: payload,
-                },
+                %error,
+                "nulang-persist: workflow domain event transition rejected"
             );
+            rollback_workflow_transition(rt, actor_id);
         }
-        checkpoint_actor(rt, actor_id);
     }
 }
 
@@ -750,7 +761,7 @@ pub(crate) fn schedule_workflow_timer(
     // transition. Inside a turn it stays staged until that turn commits.
     if started {
         if let Err(error) = commit_workflow_transition(rt, actor_id, false) {
-            rt.workflow_transitions.remove(&actor_id);
+            rollback_workflow_transition(rt, actor_id);
             tracing::warn!(actor_id, %error, "nulang-persist: workflow timer commit failed");
         }
     }
