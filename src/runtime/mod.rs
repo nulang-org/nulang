@@ -1738,6 +1738,10 @@ impl Runtime {
         // bytecode whose own begin/end must stay inside this window. Runs
         // on every path so wakes of other actors are not lost.
         self.vm_exec_end();
+        if self.workflow_commit_failures.contains(&actor_id) {
+            self.discard_and_recover_failed_workflow(actor_id);
+            return;
+        }
         // The suspension resolved (completed or failed): drain any mail
         // that queued up while the step was suspended.
         self.requeue_if_mail_pending(actor_id);
@@ -4606,6 +4610,10 @@ impl Runtime {
             }
             (*self_ptr).vm_exec_end();
         }
+        if self.workflow_commit_failures.contains(&actor_id) {
+            self.discard_and_recover_failed_workflow(actor_id);
+            return;
+        }
         // Re-enqueue so the scheduler can continue processing the actor.
         self.enqueue_actor(actor_id);
     }
@@ -4731,6 +4739,10 @@ impl Runtime {
             // wakes of other actors are not lost when THIS one suspends.
             (*self_ptr).vm_exec_end();
         }
+        if self.workflow_commit_failures.contains(&actor_id) {
+            self.discard_and_recover_failed_workflow(actor_id);
+            return;
+        }
         // The suspension resolved (completed or failed): if messages queued
         // up while the behavior was suspended, schedule the actor to drain
         // them - step_actor leaves mail untouched while a suspension is live.
@@ -4747,7 +4759,16 @@ impl Runtime {
                     context,
                 } => {
                     if self.actor_is_workflow(target_actor) {
-                        let _ = self.append_timer_fired(target_actor, &context);
+                        if let Err(error) = self.append_timer_fired(target_actor, &context) {
+                            tracing::error!(
+                                actor_id = target_actor,
+                                timer = %context,
+                                %error,
+                                "nulang-workflow: refusing timer delivery after durable TimerFired commit failure"
+                            );
+                            self.discard_and_recover_failed_workflow(target_actor);
+                            continue;
+                        }
                     }
                     self.send_message_by_id(target_actor, behavior_id, &payload);
                 }
