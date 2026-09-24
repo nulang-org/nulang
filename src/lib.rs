@@ -88,6 +88,7 @@ pub mod registry;
 pub mod repl;
 pub mod resolver;
 pub mod runtime;
+pub mod safe_fix;
 pub mod semantic_identity;
 pub mod semantic_query;
 pub mod semantic_schema;
