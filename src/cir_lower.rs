@@ -266,7 +266,7 @@ fn translate_stmt(stmt: &Stmt, func: &mir::Function, pc: u32) -> CirStmt {
 fn translate_rvalue(op: &RValue, _func: &mir::Function, pc: u32) -> CirExpr {
     match op {
         RValue::Const(c) => translate_const(c),
-        RValue::Load(l) => CirExpr::Var(var(l, pc)),
+        RValue::Load(l) | RValue::MoveOut(l) => CirExpr::Var(var(l, pc)),
         RValue::Binary(bin, a, b) => CirExpr::BinaryOp {
             op: translate_binop(bin),
             lhs: Box::new(CirExpr::Var(var(a, pc))),

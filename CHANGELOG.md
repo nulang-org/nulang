@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### Explicit ownership transfer IR — 2026-09-24
+- **`consume x` now lowers to an explicit HIR/MIR `MoveOut` operation instead of relying on an ordinary copy or optimizer-inferred last use.** MoveOut transfers the source's counted ownership slot to the destination and invalidates the source without retain/release.
+- **The VM/JIT reference path, native AOT, and plain WASM preserve the same move-out contract without adding a bytecode opcode or changing NBC format v1.** Semantic identity gives MoveOut its own additive IR tag while leaving all existing RValue tags unchanged.
+- **Drop planning propagates ownership only through explicit MoveOut edges.** Ordinary `Load` remains an uncounted copy and can no longer be reinterpreted as a move based on use-count optimization.
+
 ### CI playground dependency and formatting repair — 2026-09-24
 - **Browser-playground compilation now includes the shared content-identity module and its pure-Rust `hex` dependency** (`crates/nulang-playground`), matching `semantic_identity.rs`'s current dependency graph. Runtime worker-pool files were also normalized to the repository's rustfmt output so the format gate reflects semantics rather than stale layout.
 

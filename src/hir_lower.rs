@@ -2225,7 +2225,31 @@ pub fn lower_expr(expr: &Expr, body: &mut hir::Body) -> hir::Operand {
             body.set_terminator(hir::Terminator::Break(op));
             hir::Operand::Unit
         }
-        Expr::Consume { expr, .. } => lower_expr(expr, body),
+        Expr::Consume { expr, span } => {
+            // `consume x` is an ownership transfer, represented explicitly in
+            // HIR rather than as an ordinary copy plus an incidental source
+            // clear. Backends lower MoveOut using their native transfer/clear
+            // mechanism without changing the serialized bytecode format.
+            //
+            // For non-binding expressions there is no reusable source slot to
+            // invalidate, so consuming is just evaluation of that expression.
+            let source = lower_expr(expr, body);
+            if let (Expr::Var(source_name, _), hir::Operand::Var(resolved_name, source_ty)) =
+                (expr.as_ref(), &source)
+            {
+                if source_name == resolved_name {
+                    let temp = fresh_temp_name();
+                    body.push(hir::Stmt::Let {
+                        name: temp.clone(),
+                        ty: source_ty.clone(),
+                        value: hir::RValue::MoveOut(source.clone()),
+                        span: *span,
+                    });
+                    return hir::Operand::Var(temp, source_ty.clone());
+                }
+            }
+            source
+        }
         Expr::Recover { body: b, .. } => lower_expr(b, body),
         Expr::Defer { expr, .. } => {
             // Defer is handled at block level; standalone defer is a no-op.
