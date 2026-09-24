@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### WASM component authority unification — 2026-09-24
+- **Wasmtime component host imports now use the same typed `AuthorityManifest` as the actor/runtime authority boundary** (Experimental backend surface, `src/wasm_component_runtime.rs`). The backend-specific `Capabilities { allow_log, allow_clock, allow_random }` policy is removed; `ComponentRuntime::new` is deny-by-default and `new_with_authority` accepts exact delegated authority.
+- **WIT host operations require exact grants at link and dispatch time.** `IO::Log`, `Time::Now`, and `Random::U64` use the existing `AuthorityGrant::Other` extension point. Sibling grants do not authorize one another, and unauthorized imports are omitted from the linker so component instantiation fails closed. This advances #334 without introducing a second WASM security policy.
+
 ### Python owned marshal type inference — 2026-09-24
 - **PyO3 owned-value extraction now uses explicit `bool`, `i64`, `f64`, and `String` type parameters**, avoiding generic-inference failures in all-feature/CodeQL builds without changing conversion semantics.
 
