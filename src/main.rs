@@ -47,7 +47,7 @@ use nulang::parser::Parser;
 use nulang::repl::Repl;
 use nulang::stdlib::StdLib;
 use nulang::typechecker::TypeChecker;
-use nulang::types::{NuError, NuResult, Span, Type};
+use nulang::types::{NuError, NuResult, NuWarning, Span, Type};
 use nulang::vm::VM;
 use std::io::IsTerminal;
 use std::io::Read;
@@ -808,7 +808,7 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        if let Err(e) = check_source(
+        let check_warnings = match check_source(
             &source,
             Some(&path),
             opts.verbose,
@@ -816,42 +816,52 @@ fn main() {
             &opts.with_capabilities,
             opts.deny_warnings,
         ) {
-            let code = exit_code(&e);
-            if opts.json {
-                // Machine-readable mode: the JSON report is the ONLY output on
-                // stdout; nothing human-rendered is printed.
-                let diags = if opts.all_errors {
+            Ok(warnings) => warnings,
+            Err(e) => {
+                let code = exit_code(&e);
+                if opts.json {
+                    // Machine-readable mode: the JSON report is the ONLY output on
+                    // stdout; nothing human-rendered is printed.
+                    let diags = if opts.all_errors {
+                        let all = collect_all_frontend_errors(&source, Some(&path));
+                        if all.is_empty() {
+                            nulang::json_diagnostics::diagnostics_from_error(&e)
+                        } else {
+                            all.iter()
+                                .flat_map(nulang::json_diagnostics::diagnostics_from_error)
+                                .collect()
+                        }
+                    } else {
+                        nulang::json_diagnostics::diagnostics_from_error(&e)
+                    };
+                    let report = nulang::json_diagnostics::JsonReport::new(
+                        "check",
+                        Some(path.clone()),
+                        diags,
+                    );
+                    print!("{}", report.to_json_string());
+                } else if opts.all_errors {
                     let all = collect_all_frontend_errors(&source, Some(&path));
                     if all.is_empty() {
-                        nulang::json_diagnostics::diagnostics_from_error(&e)
+                        print_error(&e, use_color);
                     } else {
-                        all.iter()
-                            .flat_map(nulang::json_diagnostics::diagnostics_from_error)
-                            .collect()
+                        for err in &all {
+                            print_error(err, use_color);
+                        }
                     }
                 } else {
-                    nulang::json_diagnostics::diagnostics_from_error(&e)
-                };
-                let report =
-                    nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), diags);
-                print!("{}", report.to_json_string());
-            } else if opts.all_errors {
-                let all = collect_all_frontend_errors(&source, Some(&path));
-                if all.is_empty() {
                     print_error(&e, use_color);
-                } else {
-                    for err in &all {
-                        print_error(err, use_color);
-                    }
                 }
-            } else {
-                print_error(&e, use_color);
+                std::process::exit(code);
             }
-            std::process::exit(code);
-        }
+        };
         if opts.json {
+            let diags = check_warnings
+                .iter()
+                .map(nulang::json_diagnostics::diagnostic_from_warning)
+                .collect();
             let report =
-                nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), Vec::new());
+                nulang::json_diagnostics::JsonReport::new("check", Some(path.clone()), diags);
             print!("{}", report.to_json_string());
         } else {
             println!("Type check passed.");
@@ -895,7 +905,7 @@ fn main() {
                 &opts.with_capabilities,
                 opts.deny_warnings,
             ) {
-                Ok((ast, _)) => {
+                Ok((ast, _, _)) => {
                     let mut checker = nulang::effect_checker::EffectChecker::new();
                     checker.set_resource_grants(&opts.with_capabilities);
                     let _ = checker.check_module(&ast.decls);
@@ -1614,7 +1624,7 @@ fn run_frontend(
     verbose: bool,
     with_capabilities: &[String],
     deny_warnings: bool,
-) -> NuResult<(nulang::ast::AstModule, nulang::typechecker::TypeChecker)> {
+) -> NuResult<(nulang::ast::AstModule, nulang::typechecker::TypeChecker, Vec<NuWarning>)> {
     let ps = nulang::prelude_source::PRELUDE_SOURCE;
     let mut pl = Lexer::new(ps);
     nulang::types::set_source_map_with_file(ps, Some("<prelude>"));
@@ -1628,20 +1638,20 @@ fn run_frontend(
     let mut ast = parser.parse_module()?;
     // Surface non-fatal frontend warnings (e.g. RFC 0015 deprecations).
     // Warnings never fail compilation unless --deny-warnings is passed.
-    let warnings = parser.take_warnings();
-    if !warnings.is_empty() {
+    let mut frontend_warnings = parser.take_warnings();
+    if !frontend_warnings.is_empty() {
         let use_color = std::io::stderr().is_terminal();
-        for w in &warnings {
+        for w in &frontend_warnings {
             eprintln!("{}", nulang::diagnostic::format_warning(w, use_color));
         }
         if deny_warnings {
             return Err(nulang::types::NuError::parse_error(
                 format!(
                     "aborting due to {} warning{} (--deny-warnings)",
-                    warnings.len(),
-                    if warnings.len() == 1 { "" } else { "s" }
+                    frontend_warnings.len(),
+                    if frontend_warnings.len() == 1 { "" } else { "s" }
                 ),
-                warnings[0].span,
+                frontend_warnings[0].span,
             ));
         }
     }
@@ -1700,6 +1710,7 @@ fn run_frontend(
             ));
         }
     }
+    frontend_warnings.extend(type_warnings);
 
     if verbose {
         println!("=== Inferred Type ===");
@@ -1805,7 +1816,7 @@ fn run_frontend(
         }
     }
 
-    Ok((ast, type_checker))
+    Ok((ast, type_checker, frontend_warnings))
 }
 
 #[cfg_attr(not(feature = "wasm-backend"), allow(unused_variables))]
@@ -1821,7 +1832,7 @@ fn run_source(
     store_path: Option<&str>,
     deny_warnings: bool,
 ) -> NuResult<()> {
-    let (ast, type_checker) =
+    let (ast, type_checker, _) =
         run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
     match backend {
         #[cfg(feature = "wasm-backend")]
@@ -2374,15 +2385,16 @@ fn check_source(
     _all_errors: bool,
     with_capabilities: &[String],
     deny_warnings: bool,
-) -> NuResult<()> {
-    let (_ast, _tc) = run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
+) -> NuResult<Vec<NuWarning>> {
+    let (_ast, _tc, warnings) =
+        run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
 
     if verbose {
         println!("Effect check passed.");
         println!("Capability analysis passed.");
     }
 
-    Ok(())
+    Ok(warnings)
 }
 
 /// Run the full frontend in multi-error mode and return every collected
@@ -2469,7 +2481,7 @@ fn compile_source_to_nbc(
     behavior_package_name: Option<&str>,
     behavior_package_version: Option<&str>,
 ) -> NuResult<()> {
-    let (mut ast, type_checker) =
+    let (mut ast, type_checker, _) =
         run_frontend(source, None, false, with_capabilities, deny_warnings)?;
 
     // Optional web-framework pass: rewrite HTML for signals/actions and emit the
@@ -2846,7 +2858,7 @@ mod tests {
             }
         "#;
 
-        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+        let (ast, type_checker, _) = run_frontend(source, None, false, &[], false)
             .expect("frontend should accept the actor program");
         let module = compile_with_new_pipeline(&ast, "test", &type_checker)
             .expect("actor program should compile");
@@ -2882,7 +2894,7 @@ mod tests {
             }
         "#;
 
-        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+        let (ast, type_checker, _) = run_frontend(source, None, false, &[], false)
             .expect("frontend should accept persistent actor program");
         let module = compile_with_new_pipeline(&ast, "test", &type_checker)
             .expect("persistent actor program should compile");
@@ -2936,7 +2948,7 @@ mod tests {
                 c
             }
         "#;
-        let (ast, type_checker) = run_frontend(source, None, false, &[], false)
+        let (ast, type_checker, _) = run_frontend(source, None, false, &[], false)
             .expect("frontend should accept the actor program");
         let module = compile_with_new_pipeline(&ast, "test", &type_checker)
             .expect("actor program should compile");
