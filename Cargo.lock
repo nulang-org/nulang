@@ -2594,6 +2594,7 @@ name = "nulang-cloud-control"
 version = "0.1.0"
 dependencies = [
  "nulang-capacity",
+ "postgres",
  "serde",
  "serde_json",
 ]
