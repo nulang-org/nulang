@@ -176,8 +176,11 @@ Core surface forms (`src/ast.rs`, `src/parser.rs`):
   §6.3).
 
 There is no `switch` and no `case` keyword — `match` arms are introduced by
-`|`. Pattern matching is typed but **not** exhaustiveness-checked today: a
-non-exhaustive `match` compiles and may fail at runtime.
+`|`. Pattern matching is typed. After ordinary inference succeeds, the compiler
+conservatively checks closed variant and `Bool` domains: `W0201` reports
+provably missing witnesses and `W0202` reports provably redundant arms. These
+remain warnings by default; `--deny-warnings` opts into rejection. Unsupported
+or unproven patterns retain the runtime non-exhaustive-match fallback.
 
 ### 2.2 HM Type Inference
 
@@ -212,9 +215,12 @@ consumption tracking. Capabilities are compile-time only — see §2.4.
 
 **What does not exist:** no type classes or constrained types
 (`fn f[T: Serializable]` is not valid Nulang), no `protocol` construct, and
-no exhaustiveness checking for `match`. Type inference deliberately does not
-cross actor boundaries — behavior signatures are explicit annotations — so
-actors remain separately checkable units.
+no complete pattern-matrix exhaustiveness proof for arbitrary nested
+structured/literal domains. Current match coverage is deliberately
+conservative for finite domains and leaves unsupported shapes to the runtime
+fallback. Type inference deliberately does not cross actor boundaries —
+behavior signatures are explicit annotations — so actors remain separately
+checkable units.
 
 ### 2.3 Effects: Static Rows, Runtime Handler Stack
 
