@@ -66,10 +66,7 @@ fn query_serve_handles_persistent_jsonrpc_session() {
     assert_eq!(responses.len(), 3);
     assert_eq!(responses[0]["result"]["schema_version"], 1);
     assert_eq!(responses[1]["result"]["symbols"][0]["name"], "main");
-    assert_eq!(
-        responses[1]["result"]["references"][0]["target"],
-        "add"
-    );
+    assert_eq!(responses[1]["result"]["references"][0]["target"], "add");
     assert!(responses[2]["result"].is_null());
 
     let _ = std::fs::remove_file(source);
