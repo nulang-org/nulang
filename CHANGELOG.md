@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### Non-replayable durable external effects — 2026-09-24
+- **Durable delivery semantics now include `NoAutomaticRetry` for effects whose ambiguous crash window cannot be retried safely.** A newly prepared effect still dispatches once, but recovery from an existing `Prepared` record returns an explicit refusal to redispatch rather than weakening the contract to at-least-once or backend-defined behavior.
+- **Durable-effect persistence advances to version 2 while retaining an explicit v1 reader.** V2 is the first format that can persist `NoAutomaticRetry`; new runtimes continue to restore historical v1 records, and unknown versions still fail closed.
+- **Compiler-owned host replay classes can derive durable delivery semantics where the mapping is unambiguous.** `external-requires-idempotency-key` maps to stable-key deduplication, `external-idempotent` remains honestly at-least-once, and `external-nonreplayable` maps to `NoAutomaticRetry`; generic `journal-result` still requires an explicit operation-specific delivery policy.
+
 ### Normalized HIR semantic boundary — 2026-09-24
 - **HIR now contains executable/typed semantic declarations rather than placeholder variants for source-only or compile-time-only forms.** Agent and workflow syntax still lower to actors; database, signal, given, class, and named-handler metadata are filtered before HIR, including inside nested modules; CRDT schemas continue to lower to their existing runtime-neutral constant representation.
 - MIR no longer carries unreachable agent/workflow/database/CRDT declaration branches, reducing downstream semantic states without changing source syntax or runtime formats.
