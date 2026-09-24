@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Default-feature warning cleanup — 2026-09-23
+- **Runtime tests now import `Arc` only when the `tcp` feature is enabled**, matching the deterministic network tests that use it and keeping default-feature validation warning-clean.
+
 ### Same-host actor optimization A/B gate — 2026-09-23
 - **Performance pull requests can now compare the candidate to their exact base SHA on the same runner and logical CPU** (`scripts/nulang_ab_bench.py`, `.github/workflows/nulang-ab-bench.yml`). Build work is excluded from timing, execution order alternates by round, and the JSON artifact records raw samples, medians, throughput/latency deltas, toolchains, and CPU affinity.
 - **Stacked performance work is measured incrementally by construction**, and Nulang-only probes cover the small-message payload boundary plus AOT actor dispatch without contaminating the cross-language baseline.
