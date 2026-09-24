@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Run matched Savina-style messaging baselines on one host.
 
-The script intentionally compares standard runtime primitives, not third-party
-actor frameworks. See benchmarks/cross_runtime/README.md before interpreting
-or publishing results.
+The default set compares standard runtime primitives. Optional Pony and CAF
+fixtures add actor-runtime baselines without changing the default dependency
+set. See benchmarks/cross_runtime/README.md before interpreting or publishing
+results.
 """
 
 from __future__ import annotations
@@ -176,6 +177,50 @@ def build_commands(selected: list[str]) -> dict[str, list[str]]:
             "stop",
         ]
 
+    if "pony" in selected:
+        ponyc = shutil.which("ponyc")
+        if ponyc is None:
+            raise RuntimeError("ponyc is required for the Pony actor baseline")
+        pony_build = BUILD / "pony"
+        pony_build.mkdir(parents=True, exist_ok=True)
+        command_output(
+            [
+                ponyc,
+                "--output",
+                str(pony_build),
+                "--bin-name",
+                "pony_baseline",
+                str(FIXTURES / "pony_baseline"),
+            ]
+        )
+        pony_binary = pony_build / (
+            "pony_baseline.exe" if os.name == "nt" else "pony_baseline"
+        )
+        commands["pony"] = [str(pony_binary)]
+
+    if "caf" in selected:
+        cmake = shutil.which("cmake")
+        if cmake is None:
+            raise RuntimeError("cmake is required for the CAF actor baseline")
+        caf_build = BUILD / "caf"
+        command_output(
+            [
+                cmake,
+                "-S",
+                str(FIXTURES / "caf_baseline"),
+                "-B",
+                str(caf_build),
+                "-DCMAKE_BUILD_TYPE=Release",
+            ]
+        )
+        command_output(
+            [cmake, "--build", str(caf_build), "--config", "Release", "--parallel"]
+        )
+        caf_binary = caf_build / (
+            "Release/caf_baseline.exe" if os.name == "nt" else "caf_baseline"
+        )
+        commands["caf"] = [str(caf_binary)]
+
     return commands
 
 
@@ -243,6 +288,15 @@ def environment_metadata(
         "cargo": maybe_version(["cargo", "--version"]) if shutil.which("cargo") else None,
         "go": maybe_version(["go", "version"]) if shutil.which("go") else None,
         "erlang_otp": otp,
+        "ponyc": (
+            maybe_version(["ponyc", "--version"]) if shutil.which("ponyc") else None
+        ),
+        "cmake": (
+            maybe_version(["cmake", "--version"]) if shutil.which("cmake") else None
+        ),
+        "cxx": (
+            maybe_version(["c++", "--version"]) if shutil.which("c++") else None
+        ),
     }
 
 
@@ -292,7 +346,7 @@ def main() -> int:
     parser.add_argument(
         "--runtimes",
         default="nulang,rust,go,erlang",
-        help="comma-separated subset of nulang,rust,go,erlang",
+        help="comma-separated subset of nulang,rust,go,erlang,pony,caf",
     )
     parser.add_argument(
         "--cpu-mode",
@@ -311,7 +365,9 @@ def main() -> int:
         parser.error("--runs must be >= 1 and --warmup must be >= 0")
 
     selected = [item.strip() for item in args.runtimes.split(",") if item.strip()]
-    unknown = sorted(set(selected) - {"nulang", "rust", "go", "erlang"})
+    unknown = sorted(
+        set(selected) - {"nulang", "rust", "go", "erlang", "pony", "caf"}
+    )
     if unknown:
         parser.error(f"unknown runtimes: {', '.join(unknown)}")
 
@@ -357,7 +413,7 @@ def main() -> int:
 
     report = {
         "schema": 2,
-        "methodology": "standard-runtime Savina-style messaging baselines",
+        "methodology": "matched Savina-style messaging baselines",
         "warmup_runs": args.warmup,
         "measured_runs": args.runs,
         "environment": environment_metadata(args.cpu_mode, cpu_affinity),
