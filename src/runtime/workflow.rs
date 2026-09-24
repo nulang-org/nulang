@@ -9,8 +9,8 @@ use crate::bytecode::Constant;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{
-    ActorSnapshot, DurableTransition, EventEntry, JournalEntry, PersistedValue, WorkflowEvent,
-    DURABLE_TRANSITION_VERSION,
+    ActorSnapshot, DurableInboxDelivery, DurableMessageId, DurableTransition, EventEntry,
+    JournalEntry, PersistedValue, WorkflowEvent, DURABLE_TRANSITION_VERSION,
 };
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
 use crate::vm::{Frame, Value, VM};
@@ -151,6 +151,53 @@ pub(crate) fn durable_activation_epoch(rt: &Runtime, actor_id: u64) -> std::io::
     Ok(opted_epoch.unwrap_or(1).max(1))
 }
 
+/// Atomically accept one durable outbox message into a workflow receiver.
+///
+/// The stable inbox identity and accepted command share the same fenced
+/// transition. A crash after this commit but before handler execution is safe:
+/// workflow recovery replays the accepted journal entry above the last
+/// snapshot.
+pub(crate) fn commit_durable_inbox_command(
+    rt: &mut Runtime,
+    actor_id: u64,
+    message_id: DurableMessageId,
+    behavior_id: u16,
+    payload: Vec<PersistedValue>,
+) -> std::io::Result<u64> {
+    let previous = rt.persistence.latest_sequence(actor_id);
+    let sequence = previous
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("durable inbox sequence overflow"))?;
+    let activation_epoch = durable_activation_epoch(rt, actor_id)?;
+
+    rt.persistence.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id,
+        activation_epoch,
+        sequence,
+        expected_previous_sequence: previous,
+        command: Some(JournalEntry {
+            sequence,
+            behavior_id,
+            payload,
+        }),
+        snapshot: None,
+        workflow_events: vec![],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+        inbox: vec![DurableInboxDelivery {
+            id: message_id,
+            destination_actor_id: actor_id,
+        }],
+    })?;
+
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.sequence = sequence;
+    }
+    Ok(sequence)
+}
+
 /// Atomically accept an incoming workflow command without advancing the
 /// workflow snapshot.
 ///
@@ -187,6 +234,7 @@ pub(crate) fn commit_workflow_command(
         domain_events: vec![],
         durable_effects: vec![],
         outbox: vec![],
+        inbox: vec![],
     })?;
 
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
@@ -236,6 +284,7 @@ pub(crate) fn commit_workflow_event(
         domain_events: vec![],
         durable_effects: vec![],
         outbox: vec![],
+        inbox: vec![],
     })?;
 
     // Replicate only committed local state.
@@ -299,6 +348,7 @@ pub(crate) fn commit_workflow_snapshot(
         domain_events: vec![],
         durable_effects: vec![],
         outbox: vec![],
+        inbox: vec![],
     })?;
 
     rt.maybe_shadow_replicate(actor_id, &snapshot);
