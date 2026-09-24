@@ -157,6 +157,31 @@ fn collect_tool_schemas_into(decls: &[Decl], tools: &mut Vec<ToolSchema>) {
     }
 }
 
+fn declared_actor_protocol_id(name: &str, behaviors: &[ast::Behavior]) -> Option<String> {
+    let mut members = Vec::with_capacity(behaviors.len());
+
+    for behavior in behaviors {
+        let mut params = Vec::with_capacity(behavior.params.len());
+        for param in &behavior.params {
+            params.push(lower_runtime_type(param.ty.as_ref()?));
+        }
+        let response = lower_runtime_type(behavior.ret_type.as_ref()?);
+        let member = crate::protocol::ProtocolMember::behavior(
+            behavior.name.clone(),
+            params,
+            response,
+            behavior.effect.clone().unwrap_or_else(EffectRow::empty),
+            behavior.cap,
+        )
+        .ok()?;
+        members.push(member);
+    }
+
+    crate::protocol::ProtocolSchema::new(name, members)
+        .ok()
+        .map(|schema| schema.id().to_string())
+}
+
 fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
     match decl {
         Decl::CrdtDecl {
@@ -317,6 +342,7 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
             apply_handlers: apply_handlers.clone(),
             version: *version,
             migrations: migrations.clone(),
+            protocol_id: declared_actor_protocol_id(name, behaviors),
             is_workflow: false,
             is_organization: *is_organization,
             is_agent: false,
@@ -940,6 +966,7 @@ fn desugar_agent(
         apply_handlers: Vec::new(),
         version: 1,
         migrations: Vec::new(),
+        protocol_id: None,
         is_workflow: false,
         is_organization: false,
         is_agent: true,
@@ -1109,6 +1136,7 @@ fn desugar_workflow(name: &str, items: &[ast::WorkflowItem], span: Span) -> hir:
         apply_handlers: Vec::new(),
         version: 1,
         migrations: Vec::new(),
+        protocol_id: None,
         is_workflow: true,
         is_organization: false,
         is_agent: false,
