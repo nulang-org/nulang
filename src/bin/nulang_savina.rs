@@ -10,6 +10,10 @@ use std::cell::RefCell;
 use std::env;
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Barrier,
+};
 use std::time::{Duration, Instant};
 
 use nulang::lexer::Lexer;
@@ -37,6 +41,9 @@ struct Config {
     format: OutputFormat,
     benchmark: Option<String>,
     repeat: u32,
+    /// Number of real Runtime shards used by workloads that provide an
+    /// explicit sharded fixture. Today that is fork_join only.
+    shards: usize,
 }
 
 #[derive(Debug)]
@@ -44,6 +51,7 @@ struct Measurement {
     benchmark: &'static str,
     messages: u64,
     elapsed: Duration,
+    shards: usize,
 }
 
 impl Measurement {
@@ -89,6 +97,7 @@ fn main() -> ExitCode {
                 "counting" => bench_counting(),
                 "ping_pong" => bench_ping_pong(),
                 "thread_ring" => bench_thread_ring(),
+                "fork_join" if config.shards > 1 => bench_fork_join_sharded(config.shards),
                 "fork_join" => bench_fork_join(),
                 "skynet" => bench_skynet(),
                 _ => unreachable!("benchmark list and dispatcher must stay in sync"),
@@ -104,6 +113,7 @@ fn parse_args() -> Result<Option<Config>, String> {
     let mut format = OutputFormat::Human;
     let mut benchmark = None;
     let mut repeat = 1u32;
+    let mut shards = 1usize;
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -135,6 +145,17 @@ fn parse_args() -> Result<Option<Config>, String> {
                     return Err("--repeat must be at least 1".to_string());
                 }
             }
+            "--shards" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--shards requires a positive integer".to_string())?;
+                shards = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid shard count: {value}"))?;
+                if shards == 0 {
+                    return Err("--shards must be at least 1".to_string());
+                }
+            }
             "--list" => {
                 for name in BENCHMARKS {
                     println!("{name}");
@@ -153,12 +174,13 @@ fn parse_args() -> Result<Option<Config>, String> {
         format,
         benchmark,
         repeat,
+        shards,
     }))
 }
 
 fn print_usage() {
     eprintln!(
-        "Usage: nulang-savina [--format human|jsonl] [--benchmark NAME] [--repeat N] [--list]"
+        "Usage: nulang-savina [--format human|jsonl] [--benchmark NAME] [--repeat N] [--shards N] [--list]"
     );
 }
 
@@ -166,18 +188,20 @@ fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
     match format {
         OutputFormat::Human => {
             println!(
-                "[bench] {}: {} msgs in {:.3}s = {:.0} msg/s ({:.1} ns/msg)",
+                "[bench] {}: {} msgs in {:.3}s = {:.0} msg/s ({:.1} ns/msg), shards={}",
                 measurement.benchmark,
                 measurement.messages,
                 measurement.elapsed.as_secs_f64(),
                 measurement.messages_per_second(),
-                measurement.ns_per_message()
+                measurement.ns_per_message(),
+                measurement.shards
             );
             println!(
-                "[cross-bench] runtime=nulang benchmark={} messages={} elapsed_ns={}",
+                "[cross-bench] runtime=nulang benchmark={} messages={} elapsed_ns={} shards={}",
                 measurement.benchmark,
                 measurement.messages,
-                measurement.elapsed.as_nanos()
+                measurement.elapsed.as_nanos(),
+                measurement.shards
             );
         }
         OutputFormat::Jsonl => {
@@ -186,7 +210,7 @@ fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
             println!(
                 "{}",
                 json!({
-                    "schema": 1,
+                    "schema": 2,
                     "runtime": "nulang",
                     "suite": "savina-style",
                     "benchmark": measurement.benchmark,
@@ -195,13 +219,14 @@ fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
                     "elapsed_ns": elapsed_ns,
                     "messages_per_second": measurement.messages_per_second(),
                     "ns_per_message": measurement.ns_per_message(),
+                    "shards": measurement.shards,
                 })
             );
         }
     }
 }
 
-fn compile_run_with_runtime(source: &str, runtime: Rc<RefCell<Runtime>>) -> Value {
+fn compile_module(source: &str) -> nulang::bytecode::CodeModule {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.lex().expect("bench: lex failed");
     let mut parser = Parser::new(tokens);
@@ -212,8 +237,11 @@ fn compile_run_with_runtime(source: &str, runtime: Rc<RefCell<Runtime>>) -> Valu
         .expect("bench: typecheck failed");
     let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
     let mut mir = nulang::mir_lower::lower_module(&hir).expect("bench: MIR lower failed");
-    let module =
-        nulang::mir_codegen::compile_mir(&mut mir, "savina").expect("bench: codegen failed");
+    nulang::mir_codegen::compile_mir(&mut mir, "savina").expect("bench: codegen failed")
+}
+
+fn compile_run_with_runtime(source: &str, runtime: Rc<RefCell<Runtime>>) -> Value {
+    let module = compile_module(source);
     let mut vm = VM::new();
     vm.load_module(module);
     vm.set_actor_callbacks(Box::new(RuntimeVmCallbacks::new(runtime)));
@@ -253,6 +281,7 @@ fn bench_counting() -> Measurement {
         benchmark: "counting",
         messages: N as u64,
         elapsed,
+        shards: 1,
     }
 }
 
@@ -321,6 +350,7 @@ fn bench_ping_pong() -> Measurement {
         benchmark: "ping_pong",
         messages: 2 * N as u64 + 1,
         elapsed,
+        shards: 1,
     }
 }
 
@@ -386,6 +416,7 @@ let s = spawn Sink {} in
         benchmark: "thread_ring",
         messages: HOPS as u64,
         elapsed,
+        shards: 1,
     }
 }
 
@@ -455,6 +486,282 @@ let s = spawn Sink {} in
         benchmark: "fork_join",
         messages: 2 * TASKS as u64,
         elapsed,
+        shards: 1,
+    }
+}
+
+fn bytecode_behavior_id(module: &nulang::bytecode::CodeModule, qualified: &str) -> u16 {
+    module
+        .behaviors
+        .iter()
+        .position(|behavior| behavior.name == qualified)
+        .unwrap_or_else(|| panic!("benchmark behavior {qualified} must exist")) as u16
+}
+
+/// Create one plain bytecode actor directly on its owning shard.
+///
+/// Runtime::spawn_from_module draws a fresh id without regard to the Runtime
+/// instance on which it is called. For a benchmark that owns several Runtime
+/// shards explicitly, use spawn_actor_near as an id-placement primitive and
+/// then attach the same plain-actor bytecode metadata that spawn_from_module
+/// would install. Setup is outside the timed region.
+fn attach_plain_bytecode_actor(
+    runtime: &mut Runtime,
+    shard_hint: usize,
+    module: &nulang::bytecode::CodeModule,
+    init: Vec<(String, Value)>,
+) -> u64 {
+    let actor_id = runtime.spawn_actor_near(shard_hint as u64, Box::new(move || init));
+    assert_eq!(
+        actor_id % runtime.shard_count as u64,
+        runtime.shard_idx as u64,
+        "benchmark actor must be physically created on its owning shard"
+    );
+
+    let offsets: Vec<usize> = module
+        .behaviors
+        .iter()
+        .map(|behavior| behavior.code_offset)
+        .collect();
+    let compensation_offsets: Vec<Option<usize>> = module
+        .behaviors
+        .iter()
+        .map(|behavior| behavior.compensate_offset)
+        .collect();
+
+    let actor = runtime
+        .actors
+        .get_mut(&actor_id)
+        .expect("fresh benchmark actor");
+    actor.bytecode_module = Some(module.clone());
+    actor.bytecode_offsets = offsets;
+    actor.compensation_offsets = compensation_offsets;
+    actor_id
+}
+
+/// True multi-shard fork/join fixture.
+///
+/// Eight worker actors are distributed round-robin across real Runtime shards.
+/// A producer actor on shard 0 maintains a 512-task in-flight window: this is
+/// below the 1024-entry cross-shard bus capacity, so the fixture measures
+/// scheduler/transport/handler throughput rather than silently dropping a
+/// preloaded 50k-message burst on bounded channels.
+///
+/// All actors, bytecode attachment, scheduler warmup and OS-thread creation are
+/// outside the timed region. A barrier releases all shard scheduler threads at
+/// once; completion is the producer observing every worker acknowledgement.
+fn bench_fork_join_sharded(shard_count: usize) -> Measurement {
+    const WORKERS: usize = 8;
+    const TASKS: i64 = 50_000;
+    const WINDOW: i64 = 512;
+
+    assert!(shard_count > 1, "sharded fork_join requires at least two shards");
+
+    let source = format!(
+        r#"
+actor Producer {{
+    state w0 = nil
+    state w1 = nil
+    state w2 = nil
+    state w3 = nil
+    state w4 = nil
+    state w5 = nil
+    state w6 = nil
+    state w7 = nil
+    state total = 0
+    state sent = 0
+    state completed = 0
+    state next = 0
+
+    behavior kick(n) {{
+        self.total = n
+        self.sent = 0
+        self.completed = 0
+        self.next = 0
+        while self.sent < {WINDOW} {{
+            if self.next == 0 then send self.w0 task(self.sent) else unit
+            if self.next == 1 then send self.w1 task(self.sent) else unit
+            if self.next == 2 then send self.w2 task(self.sent) else unit
+            if self.next == 3 then send self.w3 task(self.sent) else unit
+            if self.next == 4 then send self.w4 task(self.sent) else unit
+            if self.next == 5 then send self.w5 task(self.sent) else unit
+            if self.next == 6 then send self.w6 task(self.sent) else unit
+            if self.next == 7 then send self.w7 task(self.sent) else unit
+            if self.next == 7 then self.next = 0 else self.next = self.next + 1
+            self.sent = self.sent + 1
+        }}
+    }}
+
+    behavior ack() {{
+        self.completed = self.completed + 1
+        if self.sent < self.total then {{
+            if self.next == 0 then send self.w0 task(self.sent) else unit
+            if self.next == 1 then send self.w1 task(self.sent) else unit
+            if self.next == 2 then send self.w2 task(self.sent) else unit
+            if self.next == 3 then send self.w3 task(self.sent) else unit
+            if self.next == 4 then send self.w4 task(self.sent) else unit
+            if self.next == 5 then send self.w5 task(self.sent) else unit
+            if self.next == 6 then send self.w6 task(self.sent) else unit
+            if self.next == 7 then send self.w7 task(self.sent) else unit
+            if self.next == 7 then self.next = 0 else self.next = self.next + 1
+            self.sent = self.sent + 1
+        }} else unit
+    }}
+}}
+
+actor Worker {{
+    state producer = nil
+    state count = 0
+    behavior task(n) {{
+        self.count = self.count + 1
+        send self.producer ack()
+    }}
+}}
+
+unit
+"#
+    );
+    let module = compile_module(&source);
+    let producer_kick = bytecode_behavior_id(&module, "Producer.kick");
+
+    let mut shards = Runtime::new_sharded(shard_count);
+    let producer = attach_plain_bytecode_actor(
+        &mut shards[0],
+        0,
+        &module,
+        vec![
+            ("w0".to_string(), Value::nil()),
+            ("w1".to_string(), Value::nil()),
+            ("w2".to_string(), Value::nil()),
+            ("w3".to_string(), Value::nil()),
+            ("w4".to_string(), Value::nil()),
+            ("w5".to_string(), Value::nil()),
+            ("w6".to_string(), Value::nil()),
+            ("w7".to_string(), Value::nil()),
+            ("total".to_string(), Value::int(0)),
+            ("sent".to_string(), Value::int(0)),
+            ("completed".to_string(), Value::int(0)),
+            ("next".to_string(), Value::int(0)),
+        ],
+    );
+
+    let mut workers = Vec::with_capacity(WORKERS);
+    for index in 0..WORKERS {
+        let owner = index % shard_count;
+        let worker = attach_plain_bytecode_actor(
+            &mut shards[owner],
+            owner,
+            &module,
+            vec![
+                ("producer".to_string(), Value::actor_ref(producer)),
+                ("count".to_string(), Value::int(0)),
+            ],
+        );
+        workers.push((owner, worker));
+    }
+
+    {
+        let producer_actor = shards[0]
+            .actors
+            .get_mut(&producer)
+            .expect("producer actor");
+        for (index, &(_, worker_id)) in workers.iter().enumerate() {
+            producer_actor.set_state_field(
+                format!("w{index}"),
+                Value::actor_ref(worker_id),
+            );
+        }
+    }
+
+    // Consume spawn-time ready tokens before timing. No workload messages have
+    // been admitted yet.
+    for shard in &mut shards {
+        shard.run_scheduler();
+    }
+
+    // Admit the one control message before the barrier. It remains queued on
+    // shard 0 and is part of neither the reported 100k logical message count
+    // nor OS-thread startup.
+    shards[0].send_message_by_id(producer, producer_kick, &[Value::int(TASKS)]);
+
+    let barrier = Arc::new(Barrier::new(shard_count + 1));
+    let done = Arc::new(AtomicBool::new(false));
+
+    let start;
+    let elapsed;
+    let finished_shards = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(shard_count);
+        for (index, mut runtime) in shards.into_iter().enumerate() {
+            let barrier = Arc::clone(&barrier);
+            let done = Arc::clone(&done);
+            handles.push(scope.spawn(move || {
+                barrier.wait();
+                loop {
+                    runtime.run_scheduler();
+
+                    if index == 0 {
+                        let completed = runtime
+                            .actors
+                            .get(&producer)
+                            .and_then(|actor| actor.get_state_field("completed"))
+                            .and_then(|value| value.as_int())
+                            .unwrap_or(0);
+                        if completed >= TASKS {
+                            done.store(true, Ordering::Release);
+                        }
+                    }
+                    if done.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                runtime
+            }));
+        }
+
+        // Threads exist and are parked at the barrier before the clock starts.
+        start = Instant::now();
+        barrier.wait();
+        let runtimes: Vec<Runtime> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("Savina shard thread panicked"))
+            .collect();
+        elapsed = start.elapsed();
+        runtimes
+    });
+
+    let completed = finished_shards[0]
+        .actors
+        .get(&producer)
+        .and_then(|actor| actor.get_state_field("completed"))
+        .and_then(|value| value.as_int());
+    assert_eq!(
+        completed,
+        Some(TASKS),
+        "producer must observe every worker acknowledgement"
+    );
+
+    let worker_total: i64 = workers
+        .iter()
+        .map(|&(owner, actor_id)| {
+            finished_shards[owner]
+                .actors
+                .get(&actor_id)
+                .and_then(|actor| actor.get_state_field("count"))
+                .and_then(|value| value.as_int())
+                .unwrap_or(-1)
+        })
+        .sum();
+    assert_eq!(
+        worker_total, TASKS,
+        "workers must process exactly the requested task count"
+    );
+
+    Measurement {
+        benchmark: "fork_join",
+        messages: 2 * TASKS as u64,
+        elapsed,
+        shards: shard_count,
     }
 }
 
@@ -518,5 +825,6 @@ spawn Skynet {}
         benchmark: "skynet",
         messages: EXPECTED as u64 - 1,
         elapsed,
+        shards: 1,
     }
 }
