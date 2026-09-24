@@ -5,7 +5,10 @@
 //! The caller is responsible for routing the command to the physical owner of
 //! its Redis logical slot before invoking this module.
 
-use super::cache::{redis_slot, CacheIncrementError, CacheStore, CacheTtl, CacheValueView};
+use super::cache::{
+    redis_slot, CacheConfig, CacheIncrementError, CacheStore, CacheTtl, CacheValueView,
+    CacheWriteError,
+};
 use super::resp::{
     parse_command, write_array_len, write_bulk, write_bulk_integer, write_error, write_integer,
     write_null_bulk, write_simple, RespArgs, RespCommand, RespParseError,
@@ -16,6 +19,9 @@ const ERR_SYNTAX: &[u8] = b"ERR syntax error";
 const ERR_SET_EXPIRE: &[u8] = b"ERR invalid expire time in 'set' command";
 const ERR_CROSS_SLOT: &[u8] = b"CROSSSLOT Keys in request don't hash to the same slot";
 const ERR_UNKNOWN: &[u8] = b"ERR unknown command";
+const ERR_KEY_TOO_LARGE: &[u8] = b"ERR cache key exceeds configured maximum";
+const ERR_VALUE_TOO_LARGE: &[u8] = b"ERR cache value exceeds configured maximum";
+const ERR_CACHE_CAPACITY: &[u8] = b"OOM cache capacity exceeded";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RespCommandSlot {
@@ -221,8 +227,10 @@ fn execute_set(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, ou
         None
     };
 
-    store.set_bytes(key, value, ttl_ms, now_ms);
-    write_simple(out, b"OK");
+    match store.try_set_bytes(key, value, ttl_ms, now_ms) {
+        Ok(()) => write_simple(out, b"OK"),
+        Err(error) => write_cache_error(out, error),
+    }
 }
 
 fn execute_del(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
@@ -280,6 +288,7 @@ fn execute_incr(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, o
         Err(CacheIncrementError::NotInteger | CacheIncrementError::Overflow) => {
             write_error(out, ERR_INTEGER)
         }
+        Err(CacheIncrementError::WriteRejected(error)) => write_cache_error(out, error),
     }
 }
 
@@ -354,15 +363,29 @@ fn execute_mset(store: &mut CacheStore, command: RespCommand<'_>, now_ms: u64, o
         return;
     }
 
-    // The shard owner executes a command to completion without yielding. Once
-    // all keys have passed the slot check, these writes are atomic with respect
-    // to other commands on this shard.
+    // The shard owner executes a command to completion without yielding. Preflight
+    // the entire batch against admission limits so a rejected MSET cannot leave
+    // a prefix of the command visible.
+    let mut pairs = Vec::with_capacity(command.argc() / 2);
     let mut args = command.args();
     while let Some(key) = args.next() {
         let value = args.next().expect("validated value pair");
-        store.set_bytes(key, value, None, now_ms);
+        pairs.push((key, value));
     }
-    write_simple(out, b"OK");
+    match store.try_set_many_bytes(&pairs, None, now_ms) {
+        Ok(()) => write_simple(out, b"OK"),
+        Err(error) => write_cache_error(out, error),
+    }
+}
+
+fn write_cache_error(out: &mut Vec<u8>, error: CacheWriteError) {
+    match error {
+        CacheWriteError::KeyTooLarge => write_error(out, ERR_KEY_TOO_LARGE),
+        CacheWriteError::ValueTooLarge => write_error(out, ERR_VALUE_TOO_LARGE),
+        CacheWriteError::EntryLimitReached | CacheWriteError::ArenaLimitReached => {
+            write_error(out, ERR_CACHE_CAPACITY)
+        }
+    }
 }
 
 fn write_value(value: Option<CacheValueView<'_>>, out: &mut Vec<u8>) {
@@ -545,6 +568,32 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(command_slot(cross), RespCommandSlot::CrossSlot);
+    }
+
+    #[test]
+    fn set_and_mset_reject_capacity_without_partial_mutation() {
+        let mut store = CacheStore::with_config(CacheConfig {
+            max_key_bytes: 8,
+            max_value_bytes: 8,
+            max_entries: 1,
+            max_arena_bytes: 1024,
+        });
+
+        assert_eq!(
+            run(&mut store, b"*3\r\n$3\r\nSET\r\n$9\r\ntoolong!!\r\n$1\r\nv\r\n", 0),
+            b"-ERR cache key exceeds configured maximum\r\n"
+        );
+        assert!(store.is_empty());
+
+        assert_eq!(
+            run(
+                &mut store,
+                b"*5\r\n$4\r\nMSET\r\n$5\r\na{1}\r\n$1\r\n1\r\n$5\r\nb{1}\r\n$1\r\n2\r\n",
+                0
+            ),
+            b"-OOM cache capacity exceeded\r\n"
+        );
+        assert!(store.is_empty());
     }
 
     #[test]
