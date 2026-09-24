@@ -54,7 +54,7 @@ version + migration.*
 ### Finite-domain match coverage diagnostics — 2026-09-24
 - **Matches over closed variant types and `Bool` now produce conservative semantic warnings after successful type inference**: `W0201` reports proven missing constructor/value witnesses and `W0202` reports arms proven unreachable.
 - Guarded arms never establish exhaustiveness, and structured payload patterns are not treated as total unless the current proof engine can establish that safely. Unknown/infinite domains continue to use the existing runtime non-exhaustive-match path.
-- Default Nulang 1.x source validity is unchanged; `--deny-warnings` opts into strict rejection, and the LSP reports the same stable warning codes and source ranges.
+- Default Nulang 1.x source validity is unchanged; `--deny-warnings` opts into strict rejection, and the LSP plus `--check --json` report the same stable warning codes and source ranges. Successful JSON checks now preserve non-fatal frontend warnings instead of returning an empty diagnostics array.
 
 ### Python bool marshal type inference — 2026-09-24
 - **Default-feature builds now make PyO3 boolean extraction explicit with `extract::<bool>()`**, avoiding a compiler inference failure in the Python marshal path without changing conversion semantics.
