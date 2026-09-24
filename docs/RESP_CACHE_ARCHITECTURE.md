@@ -174,6 +174,13 @@ Before calling the service Redis-class, CI benchmarks should track at least:
 - local versus cross-shard command latency;
 - p50/p95/p99/p99.9 end-to-end RESP latency under pipelining.
 
+The cache compatibility workflow now measures sequential GET-hit and depth-32
+pipelined GET-hit latency against Valkey on the same runner. It records
+p50/p95/p99/p99.9 plus maxima as a JSON artifact and gates only severe tail
+regressions using generous absolute floors combined with same-runner relative
+limits. This keeps the gate useful on noisy shared CI hosts without turning
+minor scheduling variance into failures.
+
 The local hot path target is zero actor messages and zero VM/GC allocations.
 Allocator activity in the RESP socket buffer and first-time arena/index growth
 must be measured separately from steady-state command execution.
