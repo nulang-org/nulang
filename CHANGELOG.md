@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Lazy trace-context creation on the actor hot path — 2026-09-23
+- **Untraced local actor messages no longer synthesize and serialize W3C trace context when TRACE-level collection is disabled** (`src/runtime/trace.rs`, `src/runtime/mod.rs`). Existing incoming traceparents are still continued unconditionally, so distributed causal chains remain intact; fresh roots are created only when TRACE collection is active. A same-host, single-CPU, alternating 7-round Savina A/B measured median improvements of 33.9% for ping-pong, 37.6% for thread-ring, and 35.5% for fork-join, with counting and Skynet effectively unchanged.
+
 ### Same-host actor optimization A/B gate — 2026-09-23
 - **Performance pull requests can now compare the candidate to their exact base SHA on the same runner and logical CPU** (`scripts/nulang_ab_bench.py`, `.github/workflows/nulang-ab-bench.yml`). Build work is excluded from timing, execution order alternates by round, and the JSON artifact records raw samples, medians, throughput/latency deltas, toolchains, and CPU affinity.
 - **Stacked performance work is measured incrementally by construction**, and Nulang-only probes cover the small-message payload boundary plus AOT actor dispatch without contaminating the cross-language baseline.
