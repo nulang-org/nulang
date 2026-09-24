@@ -635,9 +635,7 @@ fn collect_decl_references(
                     );
                 }
             }
-            Decl::Module {
-                name, decls, ..
-            } => {
+            Decl::Module { name, decls, .. } => {
                 let nested = qualify(prefix, name);
                 collect_decl_references(decls, &nested, declared, file, source, out);
             }
@@ -1017,7 +1015,9 @@ fn walk_expr(
         Expr::Pipe { left, right, .. } => {
             walk_expr(left, bound, declared, owner, file, source, out);
             if let Expr::Var(name, span) = right.as_ref() {
-                record_reference(name, *span, "call", bound, declared, owner, file, source, out);
+                record_reference(
+                    name, *span, "call", bound, declared, owner, file, source, out,
+                );
             } else {
                 walk_expr(right, bound, declared, owner, file, source, out);
             }
