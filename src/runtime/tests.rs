@@ -3503,6 +3503,227 @@ fn stage_test_durable_outbox(
 }
 
 #[test]
+fn test_workflow_send_is_staged_until_sender_transition_commits() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+
+    let sender = rt.spawn_workflow_actor(
+        "DurableSender",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models.clone(),
+    );
+    let receiver = rt.spawn_workflow_actor(
+        "DurableReceiver",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+    rt.actors
+        .get_mut(&receiver)
+        .unwrap()
+        .register_behavior("next", noop_test_behavior);
+
+    rt.current_actor = Some(sender);
+    rt.begin_durable_workflow_turn(sender);
+    rt.send_message_by_id(receiver, 1, &[Value::int(7)]);
+
+    assert_eq!(rt.actors.get(&receiver).unwrap().mailbox.len(), 0);
+    assert_eq!(rt.staged_workflow_outbox(sender).len(), 1);
+    assert!(rt.persistence.read_pending_outbox(8).unwrap().is_empty());
+
+    let sequence = rt.next_sequence(sender);
+    workflow::commit_workflow_event(
+        &mut rt,
+        sender,
+        WorkflowEvent::Custom {
+            sequence,
+            name: "SenderBoundary".to_string(),
+            args: vec![],
+        },
+    )
+    .unwrap();
+
+    assert!(!rt.has_staged_workflow_outbox(sender));
+    let pending = rt.persistence.read_pending_outbox(8).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id.sender_actor_id, sender);
+    assert_eq!(pending[0].destination_actor_id, receiver);
+    assert_eq!(pending[0].payload, vec![PersistedValue::Int(7)]);
+    assert_eq!(rt.actors.get(&receiver).unwrap().mailbox.len(), 0);
+
+    rt.end_durable_workflow_turn(sender);
+    rt.current_actor = None;
+
+    let report = rt.pump_durable_outbox(8).unwrap();
+    assert_eq!(report.accepted, 1);
+    assert_eq!(report.acknowledged, 1);
+    assert_eq!(rt.actors.get(&receiver).unwrap().mailbox.len(), 1);
+}
+
+#[test]
+fn test_nested_durable_workflow_turns_keep_outboxes_isolated() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+
+    let sender_a = rt.spawn_workflow_actor(
+        "NestedSenderA",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models.clone(),
+    );
+    let sender_b = rt.spawn_workflow_actor(
+        "NestedSenderB",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models.clone(),
+    );
+    let receiver = rt.spawn_workflow_actor(
+        "NestedReceiver",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+    rt.actors
+        .get_mut(&receiver)
+        .unwrap()
+        .register_behavior("next", noop_test_behavior);
+
+    rt.current_actor = Some(sender_a);
+    rt.begin_durable_workflow_turn(sender_a);
+    rt.send_message_by_id(receiver, 1, &[Value::int(1)]);
+
+    rt.current_actor = Some(sender_b);
+    rt.begin_durable_workflow_turn(sender_b);
+    rt.send_message_by_id(receiver, 1, &[Value::int(2)]);
+
+    assert_eq!(rt.staged_workflow_outbox(sender_a).len(), 1);
+    assert_eq!(rt.staged_workflow_outbox(sender_b).len(), 1);
+
+    let seq_b = rt.next_sequence(sender_b);
+    workflow::commit_workflow_event(
+        &mut rt,
+        sender_b,
+        WorkflowEvent::Custom {
+            sequence: seq_b,
+            name: "NestedB".to_string(),
+            args: vec![],
+        },
+    )
+    .unwrap();
+    rt.end_durable_workflow_turn(sender_b);
+
+    rt.current_actor = Some(sender_a);
+    assert_eq!(rt.staged_workflow_outbox(sender_a).len(), 1);
+    let seq_a = rt.next_sequence(sender_a);
+    workflow::commit_workflow_event(
+        &mut rt,
+        sender_a,
+        WorkflowEvent::Custom {
+            sequence: seq_a,
+            name: "NestedA".to_string(),
+            args: vec![],
+        },
+    )
+    .unwrap();
+    rt.end_durable_workflow_turn(sender_a);
+    rt.current_actor = None;
+
+    let pending = rt.persistence.read_pending_outbox(8).unwrap();
+    assert_eq!(pending.len(), 2);
+    assert_eq!(
+        pending
+            .iter()
+            .map(|record| record.id.sender_actor_id)
+            .collect::<std::collections::HashSet<_>>(),
+        [sender_a, sender_b].into_iter().collect()
+    );
+}
+
+#[test]
+fn test_failed_workflow_segment_discards_uncommitted_staged_send() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+
+    let sender = rt.spawn_workflow_actor(
+        "FailingSender",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models.clone(),
+    );
+    let receiver = rt.spawn_workflow_actor(
+        "FailingReceiver",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+    rt.actors
+        .get_mut(&receiver)
+        .unwrap()
+        .register_behavior("next", noop_test_behavior);
+
+    rt.current_actor = Some(sender);
+    rt.begin_durable_workflow_turn(sender);
+    rt.send_message_by_id(receiver, 1, &[]);
+    assert_eq!(rt.staged_workflow_outbox(sender).len(), 1);
+
+    rt.discard_staged_workflow_outbox(sender);
+    let sequence = rt.next_sequence(sender);
+    workflow::commit_workflow_event(
+        &mut rt,
+        sender,
+        WorkflowEvent::StepFailed {
+            sequence,
+            step_name: "failing".to_string(),
+            error: "boom".to_string(),
+        },
+    )
+    .unwrap();
+
+    rt.end_durable_workflow_turn(sender);
+    rt.current_actor = None;
+
+    assert!(rt.persistence.read_pending_outbox(8).unwrap().is_empty());
+    assert_eq!(rt.actors.get(&receiver).unwrap().mailbox.len(), 0);
+}
+
+#[test]
+fn test_workflow_suspension_commits_staged_send_with_marker_snapshot() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+
+    let sender = rt.spawn_workflow_actor(
+        "SuspendingSender",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models.clone(),
+    );
+    let receiver = rt.spawn_workflow_actor(
+        "SuspendingReceiver",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+    rt.actors
+        .get_mut(&receiver)
+        .unwrap()
+        .register_behavior("next", noop_test_behavior);
+
+    rt.current_actor = Some(sender);
+    rt.begin_durable_workflow_turn(sender);
+    rt.send_message_by_id(receiver, 1, &[]);
+
+    rt.actors.get_mut(&sender).unwrap().waiting_signal = Some("resume".to_string());
+    rt.persist_suspension_marker(sender);
+
+    assert!(!rt.has_staged_workflow_outbox(sender));
+    let snapshot = rt.persistence.load_snapshot(sender).unwrap();
+    assert_eq!(snapshot.waiting_signal.as_deref(), Some("resume"));
+    let pending = rt.persistence.read_pending_outbox(8).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id.sender_actor_id, sender);
+    assert_eq!(pending[0].destination_actor_id, receiver);
+
+    rt.end_durable_workflow_turn(sender);
+    rt.current_actor = None;
+}
+
+#[test]
 fn test_durable_outbox_pump_accepts_once_and_executes_without_rejournal() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
