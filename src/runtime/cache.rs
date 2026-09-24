@@ -26,6 +26,7 @@ const MIN_ARENA_EXP: usize = 5; // 32 bytes
 const MAX_ARENA_EXP: usize = 30; // 1 GiB blocks are the largest representable class
 const FREE_LIST_COUNT: usize = MAX_ARENA_EXP - MIN_ARENA_EXP + 1;
 const DEFAULT_INDEX_CAPACITY: usize = 64;
+const INDEX_MIGRATION_BUCKETS_PER_MUTATION: usize = 8;
 const DEFAULT_WHEEL_BUCKETS: usize = 256;
 const DEFAULT_WHEEL_LEVELS: usize = 5;
 const DEFAULT_WHEEL_TICK_MS: u64 = 10;
@@ -432,6 +433,12 @@ impl Bucket {
     }
 }
 
+#[derive(Debug)]
+struct IndexMigration {
+    old: Vec<Bucket>,
+    cursor: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ExpirationRef {
     slot: u32,
@@ -712,6 +719,7 @@ pub struct CacheStore {
     slots: Vec<EntrySlot>,
     free_slots: Vec<u32>,
     index: Vec<Bucket>,
+    index_migration: Option<IndexMigration>,
     index_len: usize,
     tombstones: usize,
     expiry: ExpirationWheel,
@@ -763,6 +771,7 @@ impl CacheStore {
             slots: Vec::new(),
             free_slots: Vec::new(),
             index: vec![Bucket::EMPTY; DEFAULT_INDEX_CAPACITY],
+            index_migration: None,
             index_len: 0,
             tombstones: 0,
             expiry: ExpirationWheel::new(DEFAULT_WHEEL_BUCKETS, DEFAULT_WHEEL_TICK_MS),
@@ -928,11 +937,11 @@ impl CacheStore {
     }
 
     #[inline]
-    fn find_slot(&self, key: &[u8], hash: u64) -> Option<u32> {
-        let mask = self.index.len() - 1;
+    fn find_slot_in(&self, index: &[Bucket], key: &[u8], hash: u64) -> Option<u32> {
+        let mask = index.len() - 1;
         let mut idx = hash as usize & mask;
-        for _ in 0..self.index.len() {
-            let bucket = self.index[idx];
+        for _ in 0..index.len() {
+            let bucket = index[idx];
             if bucket.slot == EMPTY_SLOT {
                 return None;
             }
@@ -947,6 +956,15 @@ impl CacheStore {
             idx = (idx + 1) & mask;
         }
         None
+    }
+
+    #[inline]
+    fn find_slot(&self, key: &[u8], hash: u64) -> Option<u32> {
+        self.find_slot_in(&self.index, key, hash).or_else(|| {
+            self.index_migration
+                .as_ref()
+                .and_then(|migration| self.find_slot_in(&migration.old, key, hash))
+        })
     }
 
     fn live_slot_id(&mut self, key: &[u8], now_ms: u64) -> Option<u32> {
@@ -968,22 +986,62 @@ impl CacheStore {
     }
 
     fn ensure_index_capacity(&mut self) {
+        if self.index_migration.is_some() {
+            return;
+        }
+
         if self.tombstones > self.index_len && self.tombstones > 32 {
-            self.rehash(self.index.len());
+            self.start_index_migration(self.index.len());
+            return;
         }
 
         let used = self.index_len + self.tombstones + 1;
         if used * 10 >= self.index.len() * 7 {
-            self.rehash(self.index.len() * 2);
+            self.start_index_migration(self.index.len() * 2);
         }
     }
 
-    fn rehash(&mut self, new_capacity: usize) {
+    fn start_index_migration(&mut self, new_capacity: usize) {
+        debug_assert!(self.index_migration.is_none());
         let capacity = new_capacity.max(DEFAULT_INDEX_CAPACITY).next_power_of_two();
         let old = std::mem::replace(&mut self.index, vec![Bucket::EMPTY; capacity]);
+        self.index_migration = Some(IndexMigration { old, cursor: 0 });
         self.tombstones = 0;
-        for bucket in old.into_iter().filter(|bucket| bucket.is_live()) {
-            self.insert_bucket_raw(bucket.hash, bucket.slot);
+    }
+
+    fn migrate_index_step(&mut self, max_buckets: usize) {
+        for _ in 0..max_buckets {
+            let bucket = {
+                let Some(migration) = self.index_migration.as_mut() else {
+                    return;
+                };
+                if migration.cursor >= migration.old.len() {
+                    break;
+                }
+
+                let cursor = migration.cursor;
+                migration.cursor += 1;
+                let bucket = migration.old[cursor];
+                if bucket.is_live() {
+                    migration.old[cursor] = Bucket {
+                        hash: 0,
+                        slot: TOMBSTONE_SLOT,
+                    };
+                }
+                bucket
+            };
+
+            if bucket.is_live() {
+                self.insert_bucket_raw(bucket.hash, bucket.slot);
+            }
+        }
+
+        let complete = self
+            .index_migration
+            .as_ref()
+            .is_some_and(|migration| migration.cursor >= migration.old.len());
+        if complete {
+            self.index_migration = None;
         }
     }
 
@@ -1007,24 +1065,37 @@ impl CacheStore {
         }
     }
 
-    fn remove_bucket(&mut self, hash: u64, slot: u32) {
-        let mask = self.index.len() - 1;
+    fn remove_bucket_from(index: &mut [Bucket], hash: u64, slot: u32) -> bool {
+        let mask = index.len() - 1;
         let mut idx = hash as usize & mask;
-        for _ in 0..self.index.len() {
-            let bucket = self.index[idx];
+        for _ in 0..index.len() {
+            let bucket = index[idx];
             if bucket.slot == EMPTY_SLOT {
-                return;
+                return false;
             }
             if bucket.slot == slot && bucket.hash == hash {
-                self.index[idx] = Bucket {
+                index[idx] = Bucket {
                     hash: 0,
                     slot: TOMBSTONE_SLOT,
                 };
-                self.index_len -= 1;
-                self.tombstones += 1;
-                return;
+                return true;
             }
             idx = (idx + 1) & mask;
+        }
+        false
+    }
+
+    fn remove_bucket(&mut self, hash: u64, slot: u32) {
+        if Self::remove_bucket_from(&mut self.index, hash, slot) {
+            self.index_len -= 1;
+            self.tombstones += 1;
+            return;
+        }
+
+        if let Some(migration) = self.index_migration.as_mut() {
+            if Self::remove_bucket_from(&mut migration.old, hash, slot) {
+                self.index_len -= 1;
+            }
         }
     }
 
@@ -1191,10 +1262,12 @@ impl CacheStore {
         entry.key.release(&mut self.arena);
         entry.value.release(&mut self.arena);
         self.free_slots.push(slot_id);
+        self.migrate_index_step(INDEX_MIGRATION_BUCKETS_PER_MUTATION);
         true
     }
 
     fn set_value(&mut self, key: &[u8], value: CacheValue, ttl_ms: Option<u64>, now_ms: u64) {
+        self.migrate_index_step(INDEX_MIGRATION_BUCKETS_PER_MUTATION);
         let hash = self.hash(key);
         let expires_at_ms = ttl_ms.map(|ttl| now_ms.saturating_add(ttl));
 
@@ -1505,6 +1578,12 @@ impl CacheStore {
         let index_reserved_bytes = self
             .index
             .capacity()
+            .saturating_add(
+                self.index_migration
+                    .as_ref()
+                    .map(|migration| migration.old.capacity())
+                    .unwrap_or(0),
+            )
             .saturating_mul(std::mem::size_of::<Bucket>());
         let slot_reserved_bytes = self
             .slots
@@ -1752,6 +1831,70 @@ mod tests {
         let mut store = CacheStore::new();
         store.set_integer(b"short", 1, Some(5), 100);
         assert_eq!(store.purge_expired(110, 100), 1);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn index_growth_migrates_incrementally_without_losing_reads() {
+        let mut store = CacheStore::new();
+        let mut inserted = Vec::new();
+
+        for i in 0..DEFAULT_INDEX_CAPACITY as u64 {
+            let key = i.to_le_bytes();
+            store.set_integer(&key, i as i64, None, 0);
+            inserted.push((key, i as i64));
+            if store.index_migration.is_some() {
+                break;
+            }
+        }
+
+        let migration = store
+            .index_migration
+            .as_ref()
+            .expect("load threshold should start incremental migration");
+        assert!(migration.cursor < migration.old.len());
+        assert_eq!(store.index.len(), DEFAULT_INDEX_CAPACITY * 2);
+
+        for (key, expected) in &inserted {
+            assert_eq!(
+                store.get(key, 0),
+                Some(CacheValueView::Integer(*expected))
+            );
+        }
+
+        let drive_key = inserted[0].0;
+        while store.index_migration.is_some() {
+            store.set_integer(&drive_key, 999, None, 0);
+        }
+
+        assert_eq!(store.get(&drive_key, 0), Some(CacheValueView::Integer(999)));
+        for (key, expected) in inserted.iter().skip(1) {
+            assert_eq!(
+                store.get(key, 0),
+                Some(CacheValueView::Integer(*expected))
+            );
+        }
+    }
+
+    #[test]
+    fn deletion_finds_entries_remaining_in_old_index() {
+        let mut store = CacheStore::new();
+        let mut keys = Vec::new();
+
+        for i in 0..DEFAULT_INDEX_CAPACITY as u64 {
+            let key = i.to_le_bytes();
+            store.set_integer(&key, i as i64, None, 0);
+            keys.push(key);
+            if store.index_migration.is_some() {
+                break;
+            }
+        }
+
+        assert!(store.index_migration.is_some());
+        for key in keys {
+            assert!(store.delete(&key));
+            assert_eq!(store.get(&key, 0), None);
+        }
         assert!(store.is_empty());
     }
 
