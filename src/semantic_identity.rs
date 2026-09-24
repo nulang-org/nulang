@@ -25,6 +25,167 @@ use crate::types::{
 
 const MIR_SEMANTIC_CANONICAL_VERSION: &[u8] = b"nulang.mir-semantic.v1\0";
 const ACTOR_DEFINITION_MIR_CANONICAL_VERSION: &[u8] = b"nulang.actor-definition-mir.v1\0";
+const EFFECT_SITE_CANONICAL_VERSION: &[u8] = b"nulang.effect-site.v1\0";
+
+/// Backend-independent identity of one semantic `perform` site.
+///
+/// This identity deliberately excludes source spans, MIR local/block numbers,
+/// and bytecode program counters. Those are presentation/backend details that
+/// may change under formatting, fresh compiler allocations, or codegen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EffectSiteId(SemanticId);
+
+impl EffectSiteId {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        self.0.as_bytes()
+    }
+
+    pub fn to_hex(self) -> String {
+        self.0.to_hex()
+    }
+}
+
+impl fmt::Display for EffectSiteId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::str::FromStr for EffectSiteId {
+    type Err = crate::content_identity::ContentIdentityParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.parse()?))
+    }
+}
+
+/// Semantic owner category used in effect-site identity.
+///
+/// Functions and actor behaviors use separate domains even if their names
+/// happen to match. MIR behavior names are already actor-qualified
+/// (`Actor.behavior`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EffectSiteOwnerKind {
+    Function,
+    Behavior,
+}
+
+/// One effect site discovered in canonical MIR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirEffectSite {
+    pub id: EffectSiteId,
+    pub owner_kind: EffectSiteOwnerKind,
+    pub owner_name: String,
+    pub effect_operation: String,
+    /// Zero-based occurrence among the same qualified operation in this owner.
+    ///
+    /// Non-effect statements and different effect operations do not perturb
+    /// this ordinal. Inserting another invocation of the same operation before
+    /// this site intentionally changes subsequent identities because there is
+    /// otherwise no backend-independent way to distinguish those identical
+    /// semantic call sites.
+    pub operation_ordinal: u32,
+}
+
+/// Derive one stable effect-site identity from semantic owner information.
+///
+/// The caller supplies the occurrence ordinal among the same qualified
+/// operation in the owner. The resulting identity is suitable as an input to
+/// durable logical-invocation identity, but is not itself an invocation ID:
+/// retries/turns still need durable execution identity.
+pub fn effect_site_id(
+    module_name: &str,
+    owner_kind: EffectSiteOwnerKind,
+    owner_name: &str,
+    effect_operation: &str,
+    operation_ordinal: u32,
+) -> EffectSiteId {
+    let mut bytes = Vec::new();
+    put_site_bytes(&mut bytes, EFFECT_SITE_CANONICAL_VERSION);
+    put_site_bytes(&mut bytes, module_name.as_bytes());
+    bytes.push(match owner_kind {
+        EffectSiteOwnerKind::Function => 0,
+        EffectSiteOwnerKind::Behavior => 1,
+    });
+    put_site_bytes(&mut bytes, owner_name.as_bytes());
+    put_site_bytes(&mut bytes, effect_operation.as_bytes());
+    bytes.extend_from_slice(&operation_ordinal.to_le_bytes());
+    EffectSiteId(SemanticId::from_canonical_bytes(&bytes, []))
+}
+
+/// Enumerate semantic effect sites in MIR using a backend-independent contract.
+///
+/// Site ordering in the returned vector follows MIR owner order and statement
+/// order for diagnostics only; the ID itself depends on the stable owner name,
+/// operation, and same-operation ordinal rather than vector indexes.
+pub fn effect_sites_for_mir(module: &mir::Module) -> Vec<MirEffectSite> {
+    let mut sites = Vec::new();
+
+    for function in &module.functions {
+        collect_effect_sites_from_function(
+            &mut sites,
+            &module.name,
+            EffectSiteOwnerKind::Function,
+            function,
+        );
+    }
+    for behavior in &module.behaviors {
+        collect_effect_sites_from_function(
+            &mut sites,
+            &module.name,
+            EffectSiteOwnerKind::Behavior,
+            behavior,
+        );
+    }
+
+    sites
+}
+
+fn collect_effect_sites_from_function(
+    out: &mut Vec<MirEffectSite>,
+    module_name: &str,
+    owner_kind: EffectSiteOwnerKind,
+    function: &mir::Function,
+) {
+    let mut operation_counts: BTreeMap<String, u32> = BTreeMap::new();
+
+    for block in &function.blocks {
+        for stmt in &block.stmts {
+            let Stmt::Assign { op, .. } = stmt else {
+                continue;
+            };
+            let effect_operation = match op {
+                RValue::Perform { effect, op, .. } => format!("{effect}.{op}"),
+                RValue::PerformAsync { effect_op, .. } => effect_op.clone(),
+                _ => continue,
+            };
+            let ordinal = operation_counts
+                .entry(effect_operation.clone())
+                .or_insert(0);
+            let operation_ordinal = *ordinal;
+            *ordinal = ordinal.saturating_add(1);
+
+            out.push(MirEffectSite {
+                id: effect_site_id(
+                    module_name,
+                    owner_kind,
+                    &function.name,
+                    &effect_operation,
+                    operation_ordinal,
+                ),
+                owner_kind,
+                owner_name: function.name.clone(),
+                effect_operation,
+                operation_ordinal,
+            });
+        }
+    }
+}
+
+fn put_site_bytes(out: &mut Vec<u8>, value: &[u8]) {
+    out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    out.extend_from_slice(value);
+}
 
 /// Derive a compiler semantic identity from backend-independent MIR.
 ///
@@ -1453,5 +1614,107 @@ mod tests {
             semantic_id_for_mir(&native, []).unwrap(),
             semantic_id_for_mir(&wasm, []).unwrap()
         );
+    }
+
+    #[test]
+    fn effect_site_identity_ignores_formatting_and_source_lines() {
+        let compact = lower(
+            "actor Assistant { behavior ask(prompt: String) { perform Inference.ask(prompt) } }",
+        );
+        let formatted = lower(
+            "// source presentation only\nactor Assistant {\n  behavior ask(prompt: String) {\n    perform Inference.ask(prompt)\n  }\n}\n",
+        );
+
+        let first = effect_sites_for_mir(&compact);
+        let second = effect_sites_for_mir(&formatted);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].owner_name, "Assistant.ask");
+        assert_eq!(first[0].effect_operation, "Inference.ask");
+        assert_eq!(first[0].operation_ordinal, 0);
+    }
+
+    #[test]
+    fn unrelated_definition_change_does_not_renumber_effect_site() {
+        let first = lower(
+            "fn unrelated() -> Int { 1 }\nactor Assistant { behavior ask(prompt: String) { perform Inference.ask(prompt) } }",
+        );
+        let changed = lower(
+            "fn unrelated() -> Int { 999 }\nactor Assistant { behavior ask(prompt: String) { perform Inference.ask(prompt) } }",
+        );
+
+        let first_site = effect_sites_for_mir(&first)
+            .into_iter()
+            .find(|site| site.owner_name == "Assistant.ask")
+            .unwrap();
+        let changed_site = effect_sites_for_mir(&changed)
+            .into_iter()
+            .find(|site| site.owner_name == "Assistant.ask")
+            .unwrap();
+        assert_eq!(first_site.id, changed_site.id);
+    }
+
+    #[test]
+    fn same_operation_sites_receive_distinct_stable_ordinals() {
+        let module = lower(
+            "actor Assistant { behavior ask(prompt: String) { perform Inference.ask(prompt); perform Inference.ask(prompt) } }",
+        );
+        let sites: Vec<_> = effect_sites_for_mir(&module)
+            .into_iter()
+            .filter(|site| site.owner_name == "Assistant.ask")
+            .collect();
+
+        assert_eq!(sites.len(), 2);
+        assert_eq!(sites[0].operation_ordinal, 0);
+        assert_eq!(sites[1].operation_ordinal, 1);
+        assert_ne!(sites[0].id, sites[1].id);
+    }
+
+    #[test]
+    fn owner_kind_and_owner_name_domain_separate_effect_sites() {
+        let function = effect_site_id(
+            "app",
+            EffectSiteOwnerKind::Function,
+            "ask",
+            "Inference.ask",
+            0,
+        );
+        let behavior = effect_site_id(
+            "app",
+            EffectSiteOwnerKind::Behavior,
+            "ask",
+            "Inference.ask",
+            0,
+        );
+        let other_behavior = effect_site_id(
+            "app",
+            EffectSiteOwnerKind::Behavior,
+            "Other.ask",
+            "Inference.ask",
+            0,
+        );
+
+        assert_ne!(function, behavior);
+        assert_ne!(behavior, other_behavior);
+        assert_eq!(function.to_string().parse::<EffectSiteId>().unwrap(), function);
+    }
+
+    #[test]
+    fn different_effect_operation_does_not_share_site_identity() {
+        let inference = effect_site_id(
+            "app",
+            EffectSiteOwnerKind::Behavior,
+            "Assistant.ask",
+            "Inference.ask",
+            0,
+        );
+        let http = effect_site_id(
+            "app",
+            EffectSiteOwnerKind::Behavior,
+            "Assistant.ask",
+            "Http.post",
+            0,
+        );
+        assert_ne!(inference, http);
     }
 }
