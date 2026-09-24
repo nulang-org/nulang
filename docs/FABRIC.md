@@ -132,10 +132,17 @@ node to be healthy in cluster membership. Service health can therefore remove a
 destination from routing, but it cannot create ownership, change an allocation
 epoch, or authorize failover.
 
-The current service-directory slice exposes manual complete snapshot
-export/replacement APIs. Carrying those snapshots automatically in the existing
-NUL0 gossip envelope is the next integration slice; until then it does not claim
-automatic cross-node service convergence.
+Service-directory snapshots now converge automatically over the existing NUL0
+gossip round. The wire format adds a self-identifying `SVC0` tail after the
+existing membership/durable-directory/FAB0 sections. A service snapshot can also
+appear without FAB0 when the subscription snapshot was omitted, so the two
+metadata planes fail independently rather than forcing partial replacement.
+
+Current peers parse and apply the complete service snapshot only when its
+generation is newer than the last accepted generation for that node. Older peers
+remain compatible because they stop after the fields they understand and ignore
+the additive tail. Snapshot sender identity is verified against the transport
+sender before application.
 
 This layer has deliberately **no durability guarantee yet** for ephemeral topic
 or service metadata. It defines routing semantics that durable Cloud ownership
@@ -210,7 +217,7 @@ and Fabric streams can reuse.
 - [x] Deterministic partition/reorder coverage for automatic gossip.
 - [x] Typed generation-fenced service-directory registry with health-aware
   resolution and manual complete snapshot exchange.
-- [ ] Carry complete service-directory snapshots automatically in NUL0 gossip.
+- [x] Carry complete service-directory snapshots automatically in NUL0 gossip.
 
 ### Phase 3 — durable streams
 
