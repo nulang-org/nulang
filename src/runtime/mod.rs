@@ -5399,30 +5399,51 @@ impl Runtime {
                     }
                 }
             }
-            // If the workflow was in the middle of a step waiting on a signal,
-            // re-trigger that step so it can resume from replayed events. We
-            // use step_index as the behavior id because each step is compiled
-            // to a behavior at the same index.
+            // If the workflow was in the middle of a suspended step, re-drive
+            // the actual durable command that entered the activation. Older
+            // histories may not contain a command record, so retain the
+            // step_index/empty-payload fallback for compatibility.
             let should_resume = self
                 .actors
                 .get(&actor_id)
-                .map(|a| a.waiting_signal.is_some() || a.suspended_execution.is_some())
+                .map(|actor| actor.waiting_signal.is_some() || actor.suspended_execution.is_some())
                 .unwrap_or(false);
             if should_resume {
-                let current_step = self
-                    .actors
-                    .get(&actor_id)
-                    .and_then(|a| a.get_state_field("step_index"))
-                    .and_then(|v| v.as_int())
-                    .unwrap_or(0) as u16;
-                let has_behavior = self
-                    .actors
-                    .get(&actor_id)
-                    .and_then(|a| a.bytecode_module.as_ref())
-                    .map(|m| (current_step as usize) < m.behaviors.len())
-                    .unwrap_or(false);
-                if has_behavior {
-                    self.send_message_by_id(actor_id, current_step, &[]);
+                let durable_command = self
+                    .persistence
+                    .read_journal(actor_id)
+                    .into_iter()
+                    .rev()
+                    .find(|entry| entry.sequence <= snapshot.sequence);
+
+                if let Some(command) = durable_command {
+                    let behavior_id = command.behavior_id;
+                    let payload = match self.actors.get_mut(&actor_id) {
+                        Some(actor) => command
+                            .payload
+                            .iter()
+                            .map(|value| value.to_value_on_heap(actor))
+                            .collect::<Vec<_>>(),
+                        None => Vec::new(),
+                    };
+                    let has_behavior = self.has_bytecode_handler(actor_id, behavior_id as usize)
+                        || self.has_native_handler(actor_id, behavior_id as usize);
+                    if has_behavior {
+                        workflow::restore_workflow_command(self, actor_id, &command);
+                        self.send_message_by_id(actor_id, behavior_id, &payload);
+                    }
+                } else {
+                    let current_step = self
+                        .actors
+                        .get(&actor_id)
+                        .and_then(|actor| actor.get_state_field("step_index"))
+                        .and_then(|value| value.as_int())
+                        .unwrap_or(0) as u16;
+                    let has_behavior = self.has_bytecode_handler(actor_id, current_step as usize)
+                        || self.has_native_handler(actor_id, current_step as usize);
+                    if has_behavior {
+                        self.send_message_by_id(actor_id, current_step, &[]);
+                    }
                 }
             }
         } else {
