@@ -3,12 +3,19 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use nulang::durable_effect::{DurableEffectId, DurableEffectSpec};
+use nulang::durable_effect_runtime::{
+    DurableEffectCoordinator, DurableEffectDispatchDecision,
+};
+use nulang::primitives::{DeliverySemantics, EffectBoundary};
 use nulang::runtime::{
     ActorSnapshot, DurableTransition, JsonFileStore, PersistedValue, PersistenceStore,
     WorkflowEvent, DURABLE_TRANSITION_VERSION,
 };
+use nulang::semantic_identity::{effect_site_id, EffectSiteOwnerKind};
 
 const ACTOR_ID: u64 = 29;
+const EFFECT_ACTOR_ID: u64 = 31;
 const CHILD_ENV: &str = "NU_DURABILITY_HARD_KILL_CHILD";
 const STORE_ENV: &str = "NU_DURABILITY_HARD_KILL_STORE";
 
@@ -68,6 +75,108 @@ fn child_writer() {
     }
 }
 
+fn effect_spec() -> DurableEffectSpec {
+    let site = effect_site_id(
+        "durability-hard-kill",
+        EffectSiteOwnerKind::Behavior,
+        "HardKillActor.run",
+        "Provider.ask",
+        0,
+    );
+    DurableEffectSpec::new(
+        DurableEffectId::derive_from_site(EFFECT_ACTOR_ID, "turn:1", site, 0),
+        "Provider.ask",
+        EffectBoundary::External,
+        DeliverySemantics::EffectivelyOnceWithDeduplication,
+    )
+}
+
+fn effect_child_writer() {
+    let store_dir = std::env::var_os(STORE_ENV).expect("child store path must be provided");
+    let mut store = JsonFileStore::new(store_dir).expect("child must open JSON durable store");
+    let spec = effect_spec();
+    let effect_id = spec.id;
+
+    let mut coordinator = DurableEffectCoordinator::new(&mut store, EFFECT_ACTOR_ID, 1);
+    assert_eq!(
+        coordinator.begin(spec, b"request").unwrap(),
+        DurableEffectDispatchDecision::DispatchWithDeduplication {
+            operation_id: effect_id
+        }
+    );
+    assert_eq!(
+        coordinator
+            .complete(effect_id, b"request", b"provider-result".to_vec())
+            .unwrap(),
+        b"provider-result"
+    );
+
+    println!("NU_EFFECT_ACK 2");
+    std::io::stdout()
+        .flush()
+        .expect("child must flush effect acknowledgement");
+
+    loop {
+        std::thread::park();
+    }
+}
+
+fn hard_kill_after_ack(
+    test_name: &str,
+    child_mode: &str,
+    ack_prefix: &str,
+    store_dir: &std::path::Path,
+) -> String {
+    let current_test_binary = std::env::current_exe().expect("test binary path must be available");
+    let mut child = Command::new(current_test_binary)
+        .arg("--exact")
+        .arg(test_name)
+        .arg("--nocapture")
+        .env(CHILD_ENV, child_mode)
+        .env(STORE_ENV, store_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("durability child process must start");
+
+    let stdout = child
+        .stdout
+        .take()
+        .expect("durability child stdout must be piped");
+    let mut reader = BufReader::new(stdout);
+    let mut acknowledgement = None;
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let bytes = reader
+            .read_line(&mut line)
+            .expect("parent must read child acknowledgement");
+        if bytes == 0 {
+            break;
+        }
+        if let Some(value) = line.trim().strip_prefix(ack_prefix) {
+            acknowledgement = Some(value.trim().to_owned());
+            break;
+        }
+    }
+
+    let acknowledgement =
+        acknowledgement.expect("child exited before acknowledging its durable commit");
+
+    child
+        .kill()
+        .expect("parent must be able to hard-kill durability child");
+    let status = child.wait().expect("parent must reap durability child");
+    assert!(
+        !status.success(),
+        "durability child must terminate abruptly rather than exit normally"
+    );
+
+    acknowledgement
+}
+
 fn fresh_dir() -> std::path::PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -81,69 +190,21 @@ fn fresh_dir() -> std::path::PathBuf {
 
 #[test]
 fn acknowledged_json_atomic_transition_survives_immediate_hard_kill() {
-    if std::env::var_os(CHILD_ENV).is_some() {
+    if std::env::var(CHILD_ENV).ok().as_deref() == Some("transition") {
         child_writer();
         return;
     }
 
     let store_dir = fresh_dir();
-    let current_test_binary = std::env::current_exe().expect("test binary path must be available");
-
-    let mut child = Command::new(current_test_binary)
-        .arg("--exact")
-        .arg("acknowledged_json_atomic_transition_survives_immediate_hard_kill")
-        .arg("--nocapture")
-        .env(CHILD_ENV, "1")
-        .env(STORE_ENV, &store_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("durability child process must start");
-
-    let stdout = child
-        .stdout
-        .take()
-        .expect("durability child stdout must be piped");
-    let mut reader = BufReader::new(stdout);
-    let mut acknowledged_sequence = None;
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        let bytes = reader
-            .read_line(&mut line)
-            .expect("parent must read child acknowledgement");
-        if bytes == 0 {
-            break;
-        }
-        if let Some(value) = line.trim().strip_prefix("NU_DURABILITY_ACK ") {
-            acknowledged_sequence = Some(
-                value
-                    .parse::<u64>()
-                    .expect("child acknowledgement must contain a sequence"),
-            );
-            break;
-        }
-    }
-
-    assert_eq!(
-        acknowledged_sequence,
-        Some(1),
-        "child exited or stopped producing output before acknowledging the durable commit"
-    );
-
-    // Child::kill is an abrupt termination primitive (SIGKILL on Unix and
-    // TerminateProcess on Windows). The child is intentionally parked above,
-    // so this cannot be confused with graceful shutdown.
-    child
-        .kill()
-        .expect("parent must be able to hard-kill durability child");
-    let status = child.wait().expect("parent must reap durability child");
-    assert!(
-        !status.success(),
-        "durability child must terminate abruptly rather than exit normally"
-    );
+    let acknowledged_sequence = hard_kill_after_ack(
+        "acknowledged_json_atomic_transition_survives_immediate_hard_kill",
+        "transition",
+        "NU_DURABILITY_ACK ",
+        &store_dir,
+    )
+    .parse::<u64>()
+    .expect("transition acknowledgement must contain a sequence");
+    assert_eq!(acknowledged_sequence, 1);
 
     let reopened = JsonFileStore::new(&store_dir).expect("parent must reopen JSON durable store");
 
@@ -176,4 +237,42 @@ fn acknowledged_json_atomic_transition_survives_immediate_hard_kill() {
     ));
 
     std::fs::remove_dir_all(&store_dir).expect("test store cleanup must succeed");
+}
+
+#[test]
+fn completed_durable_effect_receipt_survives_hard_kill_and_replays_without_dispatch() {
+    if std::env::var(CHILD_ENV).ok().as_deref() == Some("effect") {
+        effect_child_writer();
+        return;
+    }
+
+    let store_dir = fresh_dir();
+    let acknowledged_sequence = hard_kill_after_ack(
+        "completed_durable_effect_receipt_survives_hard_kill_and_replays_without_dispatch",
+        "effect",
+        "NU_EFFECT_ACK ",
+        &store_dir,
+    )
+    .parse::<u64>()
+    .expect("effect acknowledgement must contain the durable sequence");
+    assert_eq!(acknowledged_sequence, 2);
+
+    let mut reopened =
+        JsonFileStore::new(&store_dir).expect("parent must reopen JSON durable-effect store");
+    assert_eq!(reopened.latest_sequence(EFFECT_ACTOR_ID), 2);
+
+    let spec = effect_spec();
+    let mut coordinator = DurableEffectCoordinator::new(&mut reopened, EFFECT_ACTOR_ID, 1);
+    assert_eq!(
+        coordinator.begin(spec, b"request").unwrap(),
+        DurableEffectDispatchDecision::ReplayRecordedResult(b"provider-result".to_vec()),
+        "a completed durable effect must replay its committed receipt rather than request provider dispatch"
+    );
+    assert_eq!(
+        reopened.latest_sequence(EFFECT_ACTOR_ID),
+        2,
+        "replay must not append another effect transition"
+    );
+
+    std::fs::remove_dir_all(&store_dir).expect("effect test store cleanup must succeed");
 }
