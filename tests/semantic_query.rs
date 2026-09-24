@@ -61,12 +61,10 @@ fn type_query_returns_inferred_function_facts() {
     let symbols = v["symbols"].as_array().expect("symbols");
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0]["name"], "twice");
-    assert!(
-        symbols[0]["inferred_type"]
-            .as_str()
-            .expect("inferred type")
-            .contains("Int")
-    );
+    assert!(symbols[0]["inferred_type"]
+        .as_str()
+        .expect("inferred type")
+        .contains("Int"));
     assert!(symbols[0]["inferred_effects"].is_string());
     assert!(symbols[0]["inferred_capability"].is_string());
 
