@@ -8,3 +8,4 @@ description = "Deterministic reconciliation and placement primitives for Nulang 
 [dependencies]
 nulang-capacity = { path = "../nulang-capacity" }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

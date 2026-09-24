@@ -2595,6 +2595,7 @@ version = "0.1.0"
 dependencies = [
  "nulang-capacity",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

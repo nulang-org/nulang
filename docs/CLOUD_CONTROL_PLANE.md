@@ -41,8 +41,9 @@ DeploymentSpec + Evaluation + NodeSnapshot + ObservedAllocations
        retained / placements / superseded / blocked
 ```
 
-The planner is deliberately pure. It does not provision machines, acquire
-capacity, start actors, stop actors, or write durable state.
+The planner is deliberately pure. It does not provision machines or mutate
+runtimes. Durable ownership is handled by the separate `ControlStore` commit
+boundary described below.
 
 ## Fencing
 
@@ -94,11 +95,39 @@ Provider capacity selection and workload placement are intentionally distinct:
 the cheapest VM offer is not necessarily the correct node for an existing
 stateful or locality-sensitive workload.
 
+## Durable commit and reconciliation
+
+The control-plane crate now exposes a storage-neutral `ControlStore` contract.
+An evaluation is persisted before planning, then `commit_plan` atomically:
+
+1. verifies that the evaluation identity/revision still match;
+2. compare-and-sets the current allocation epochs used by the plan;
+3. marks superseded allocations stopped;
+4. installs replacement allocations in `Starting` state;
+5. persists the exact `PlacementPlan`;
+6. writes deterministic Start/Stop commands to a durable outbox.
+
+Exact retries of one evaluation return `AlreadyCommitted`; reusing an
+evaluation id with different content fails closed. A stale plan that lost an
+epoch race cannot mutate allocations or enqueue commands.
+
+`MemoryControlStore` is provided for deterministic tests. The
+`JsonFileControlStore` is a single-process durable backend: every mutation is
+serialized to a sibling temporary file, fsynced, renamed over the previous
+state, and the parent directory is fsynced on Unix. It is suitable for local
+controllers and recovery tests, not multi-controller production deployment.
+Production backends should implement the same contract with database
+transactions and compare-and-set semantics.
+
+`reconcile_once` provides the first idempotent reconciler turn. Recovery of an
+already committed evaluation returns the durable plan rather than recomputing it
+against a newer node snapshot.
+
 ## Next implementation slices
 
-1. Durable evaluation/plan/allocation store with compare-and-set epoch commit.
-2. Reconciler state machine that consumes deployment/node/allocation changes.
-3. Runtime allocation executor honoring epoch fencing and drain/stop commands.
+1. Production transactional `ControlStore` backend (PostgreSQL first).
+2. Node-side allocation executor honoring epoch fencing and durable outbox ACKs.
+3. Reconciliation event loop for deployment/node/allocation changes.
 4. Fabric-backed service directory with generation-tagged health advertisements.
 5. Workload identity and short-lived mTLS credentials bound to node/workload
    identity.

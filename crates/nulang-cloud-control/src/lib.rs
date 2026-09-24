@@ -8,7 +8,11 @@
 //! and then committed by a higher-level reconciler.
 
 pub mod model;
+pub mod reconciler;
 pub mod scheduler;
+pub mod store;
 
 pub use model::*;
+pub use reconciler::{reconcile_once, ReconcileError, ReconcileResult};
 pub use scheduler::plan_evaluation;
+pub use store::*;
