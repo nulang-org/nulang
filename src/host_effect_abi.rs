@@ -360,6 +360,18 @@ pub fn lookup_host_operation_by_identity(
     })
 }
 
+/// Resolve the full canonical v0alpha1 host-operation identity.
+///
+/// This is useful for validating compiler-emitted manifests without requiring
+/// deployment code to reverse-engineer source effect spellings.
+pub fn lookup_host_operation_by_canonical_id(
+    canonical_id: &str,
+) -> Option<&'static HostOperationDescriptor> {
+    HOST_OPERATIONS
+        .iter()
+        .find(|operation| operation.canonical_id() == canonical_id)
+}
+
 /// Build the compiler-owned external ABI descriptor consumed by conformance
 /// tooling and, eventually, Cloud admission/runtime adapters.
 ///

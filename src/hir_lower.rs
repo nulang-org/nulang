@@ -157,6 +157,35 @@ fn collect_tool_schemas_into(decls: &[Decl], tools: &mut Vec<ToolSchema>) {
     }
 }
 
+fn declared_actor_protocol_id(name: &str, behaviors: &[ast::Behavior]) -> Option<String> {
+    let mut members = Vec::with_capacity(behaviors.len());
+
+    for behavior in behaviors {
+        let mut params = Vec::with_capacity(behavior.params.len());
+        for param in &behavior.params {
+            params.push(lower_runtime_type(param.ty.as_ref()?));
+        }
+        let response = lower_runtime_type(behavior.ret_type.as_ref()?);
+        let effect = behavior.effect.as_ref()?;
+        if !matches!(effect, EffectRow::Closed(_)) {
+            return None;
+        }
+        let member = crate::protocol::ProtocolMember::behavior(
+            behavior.name.clone(),
+            params,
+            response,
+            effect.clone(),
+            behavior.cap,
+        )
+        .ok()?;
+        members.push(member);
+    }
+
+    crate::protocol::ProtocolSchema::new(name, members)
+        .ok()
+        .map(|schema| schema.id().to_string())
+}
+
 fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
     match decl {
         Decl::CrdtDecl {
@@ -317,6 +346,7 @@ fn lower_decl(decl: &Decl, tools: &[ToolSchema]) -> hir::Decl {
             apply_handlers: apply_handlers.clone(),
             version: *version,
             migrations: migrations.clone(),
+            protocol_id: declared_actor_protocol_id(name, behaviors),
             is_workflow: false,
             is_organization: *is_organization,
             is_agent: false,
@@ -940,6 +970,7 @@ fn desugar_agent(
         apply_handlers: Vec::new(),
         version: 1,
         migrations: Vec::new(),
+        protocol_id: None,
         is_workflow: false,
         is_organization: false,
         is_agent: true,
@@ -1109,6 +1140,7 @@ fn desugar_workflow(name: &str, items: &[ast::WorkflowItem], span: Span) -> hir:
         apply_handlers: Vec::new(),
         version: 1,
         migrations: Vec::new(),
+        protocol_id: None,
         is_workflow: true,
         is_organization: false,
         is_agent: false,
@@ -2769,6 +2801,107 @@ mod tests {
             hir::Decl::Module { decls, .. } => assert!(decls.is_empty()),
             other => panic!("expected normalized module, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn explicit_actor_protocol_is_fingerprinted_before_hir_erases_omissions() {
+        let span = Span::default();
+        let behavior = ast::Behavior {
+            name: "get".to_string(),
+            params: vec![],
+            body: Expr::Literal(Literal::Int(1), span),
+            effect: Some(EffectRow::empty()),
+            cap: Capability::Ref,
+            ret_type: Some(Type::int()),
+            span,
+        };
+        let module = ast::AstModule {
+            name: "test".to_string(),
+            decls: vec![Decl::Actor {
+                name: "Counter".to_string(),
+                type_params: vec![],
+                persistent: false,
+                state_fields: vec![],
+                behaviors: vec![behavior],
+                init: vec![],
+                backend: None,
+                initializer: None,
+                events: vec![],
+                apply_handlers: vec![],
+                version: 1,
+                migrations: vec![],
+                is_organization: false,
+                virtual_: false,
+                key_params: vec![],
+                implements: None,
+                span,
+            }],
+        };
+
+        let hir = lower_module(&module, &FxHashMap::default());
+        let hir::Decl::Actor(actor) = &hir.decls[0] else {
+            panic!("actor should lower to actor HIR");
+        };
+        let expected = crate::protocol::ProtocolSchema::new(
+            "Counter",
+            [crate::protocol::ProtocolMember::behavior(
+                "get",
+                vec![],
+                Type::int(),
+                EffectRow::empty(),
+                Capability::Ref,
+            )
+            .unwrap()],
+        )
+        .unwrap()
+        .id()
+        .to_string();
+        assert_eq!(actor.protocol_id.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn incomplete_actor_protocol_does_not_mint_an_identity() {
+        let span = Span::default();
+        let behavior = ast::Behavior {
+            name: "get".to_string(),
+            params: vec![],
+            body: Expr::Literal(Literal::Int(1), span),
+            // Return type is explicit, but the effect contract is not. The
+            // compiler must not silently promote an inferred/default-empty row
+            // into a stable distributed protocol contract.
+            effect: None,
+            cap: Capability::Ref,
+            ret_type: Some(Type::int()),
+            span,
+        };
+        let module = ast::AstModule {
+            name: "test".to_string(),
+            decls: vec![Decl::Actor {
+                name: "Counter".to_string(),
+                type_params: vec![],
+                persistent: false,
+                state_fields: vec![],
+                behaviors: vec![behavior],
+                init: vec![],
+                backend: None,
+                initializer: None,
+                events: vec![],
+                apply_handlers: vec![],
+                version: 1,
+                migrations: vec![],
+                is_organization: false,
+                virtual_: false,
+                key_params: vec![],
+                implements: None,
+                span,
+            }],
+        };
+
+        let hir = lower_module(&module, &FxHashMap::default());
+        let hir::Decl::Actor(actor) = &hir.decls[0] else {
+            panic!("actor should lower to actor HIR");
+        };
+        assert!(actor.protocol_id.is_none());
     }
 
     #[test]

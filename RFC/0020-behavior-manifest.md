@@ -9,17 +9,32 @@
 
 ## Implementation status
 
-An experimental v0alpha1 durability/admission subset is implemented in
+An experimental v0alpha1 compiler/admission subset is implemented in
 `src/behavior_manifest.rs`. Package bytecode builds emit
 `<package>.behavior.json` and deployment bundles include it. The current
-implementation covers compiler artifact identity, an exact BLAKE3 digest binding
-to the emitted bytecode bytes, durable actor persistence classification,
-state-schema semantic identity, schema versions, migration topology,
-deterministic manifest hashing, and structural upgrade preflight.
+implementation covers:
+
+- compiler/artifact identity and an exact BLAKE3 binding to emitted bytecode;
+- durable actor persistence class, state-schema semantic identity, schema
+  versions, migration topology, deterministic hashing, and structural upgrade
+  preflight;
+- canonical actor `ProtocolId` when source behavior signatures are complete
+  enough for the compiler to prove a stable structural protocol;
+- an exhaustive inventory of explicit typed-HIR `perform Effect.op` sites;
+- canonical host-operation identity, replay classification, and checked
+  effect-row authority requirement for operations present in the compiler-owned
+  host-effect ABI;
+- explicit unclassified entries for custom/unknown effect operations rather
+  than guessed replay or authority semantics.
+
+Manifest authority fields are **requirements/evidence, never grants**. Runtime
+policy remains authoritative and may only restrict them.
 
 This does **not** resolve the RFC or complete its full proposed surface:
-effects, authority inventories, interfaces, resources, provenance attestations,
-and canonical migration-body identity remain follow-up work. Migration identity
+resource-specific authority requirements derived from runtime arguments,
+interfaces, resources, provenance attestations, and canonical migration-body
+identity remain follow-up work. Custom effect replay semantics remain
+unclassified unless they opt into a compiler-owned contract. Migration identity
 is explicitly marked `topology-only` until migration expressions have a
 canonical semantic representation.
 
@@ -357,17 +372,24 @@ After a future v1 stabilization, additive advisory fields may evolve independent
 
 ### Phase 0 — RFC and schema prototype
 
-- define `v0alpha1` JSON schema;
-- add internal compiler data structures;
-- emit artifact identity, package metadata, inferred effect inventory, and external authority inventory;
-- add deterministic canonicalization tests;
+- [x] define `v0alpha1` JSON schema;
+- [x] add compiler-owned manifest data structures;
+- [x] emit artifact identity and package metadata;
+- [x] inventory explicit typed-HIR effect operations;
+- [x] emit canonical replay/checked-authority requirements for compiler-known
+  host operations and fail honest on unknown/custom effects;
+- [x] add deterministic canonicalization/validation tests;
+- [ ] derive resource-specific external authority shapes where static argument
+  information is sufficient;
 - no Cloud enforcement.
 
 ### Phase 1 — durability/replay metadata
 
-- emit durable actor/entity/workflow schema identities;
-- emit effect replay classifications;
-- add golden fixtures and backend-equivalence tests.
+- [x] emit durable actor/entity/workflow schema identities;
+- [x] emit proven actor protocol identities when signatures are complete;
+- [x] emit replay classifications for compiler-known host operations;
+- [ ] add backend-equivalence/golden package fixtures for the semantic inventory;
+- [ ] canonically identify migration bodies rather than topology only.
 
 ### Phase 2 — deployment integration
 

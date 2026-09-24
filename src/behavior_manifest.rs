@@ -1,16 +1,26 @@
 //! Experimental RFC 0020 Behavior Manifest support.
 //!
-//! This module intentionally implements a narrow, enforceable subset first:
-//! artifact/compiler identity plus durable actor state-schema identity and
-//! migration topology. It is designed for deployment admission and upgrade
-//! preflight checks, not as a claim that runtime migration execution is
-//! complete. Migration bodies do not yet have a canonical semantic encoding,
-//! so `migration_identity` is explicitly `topology-only`.
+//! The v0alpha1 implementation emits compiler-owned evidence for artifact
+//! identity, durable actor state schemas/migration topology, proven actor
+//! protocol identities, and explicit typed-HIR `perform` sites. Host operations
+//! known to the compiler carry canonical ABI identity, replay classification,
+//! and the checked authority requirement. Unknown/custom effects remain
+//! explicitly unclassified rather than being guessed.
+//!
+//! This is deployment evidence, not authorization. A manifest never grants
+//! runtime authority, and it does not claim runtime migration execution or
+//! arbitrary exactly-once external side effects. Migration bodies do not yet
+//! have a canonical semantic encoding, so `migration_identity` remains
+//! explicitly `topology-only`.
 
 use crate::artifact_identity::ArtifactIdentityManifest;
 use crate::content_identity::{ArtifactId, SemanticId, SourceId};
 use crate::format::constants::LANGUAGE_VERSION_STR;
 use crate::hir;
+use crate::host_effect_abi::{
+    lookup_host_operation, lookup_host_operation_by_canonical_id, HostAuthorityRequirement,
+};
+use crate::protocol::ProtocolId;
 use crate::semantic_schema::{
     actor_state_schemas_from_hir, canonical_actor_state_schema_bytes, ActorStateSchema,
 };
@@ -28,6 +38,12 @@ pub struct BehaviorManifest {
     pub schema: String,
     pub package: BehaviorPackage,
     pub artifact: BehaviorArtifact,
+    /// Compiler-derived inventory of explicit typed-HIR `perform` sites.
+    ///
+    /// This is evidence, not authorization: authority requirements describe
+    /// the checked compiler boundary and never grant runtime access.
+    #[serde(default)]
+    pub effects: BehaviorEffectInventory,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actors: Vec<BehaviorActor>,
 }
@@ -62,9 +78,66 @@ pub struct BehaviorActor {
     pub persistence: BehaviorPersistence,
     pub schema_version: u32,
     pub state_schema_semantic_id: String,
+    /// Exact compiler-owned protocol identity when source behavior signatures
+    /// were complete enough to prove a stable structural contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_id: Option<String>,
     pub migration_identity: MigrationIdentityCoverage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub migrations: Vec<BehaviorMigrationStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorEffectInventory {
+    pub coverage: BehaviorEffectCoverage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_operations: Vec<BehaviorHostOperation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unclassified_operations: Vec<BehaviorEffectOperation>,
+}
+
+impl Default for BehaviorEffectInventory {
+    fn default() -> Self {
+        Self {
+            coverage: BehaviorEffectCoverage::NotEmitted,
+            host_operations: Vec::new(),
+            unclassified_operations: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BehaviorEffectCoverage {
+    /// Older/foreign v0alpha1 manifest: no compiler effect inventory is claimed.
+    NotEmitted,
+    /// Every explicit typed-HIR `perform Effect.op` site was inspected.
+    /// Registry-known host operations are classified below; custom/handled
+    /// operations remain visible in `unclassified_operations`.
+    TypedHirPerformSites,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorHostOperation {
+    /// Versioned compiler-owned host ABI identity.
+    pub canonical_id: String,
+    /// RFC 0020 replay contract spelling owned by `host_effect_abi`.
+    pub replay: String,
+    /// Authorization provenance required by the compiler-owned host contract.
+    /// This is a requirement/evidence record, not a runtime authority grant.
+    pub authority_requirement: BehaviorAuthorityRequirement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorAuthorityRequirement {
+    pub kind: String,
+    pub effect: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BehaviorEffectOperation {
+    pub effect: String,
+    pub operation: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +207,7 @@ impl BehaviorManifest {
                 persistence: classify_persistence(actor),
                 schema_version: schema.version,
                 state_schema_semantic_id: state_schema_semantic_id(&schema).to_string(),
+                protocol_id: actor.protocol_id.clone(),
                 migration_identity: MigrationIdentityCoverage::TopologyOnly,
                 migrations: migration_steps(&schema),
             });
@@ -158,6 +232,7 @@ impl BehaviorManifest {
                 backend: artifact.backend().to_string(),
                 flags: artifact.flags().map(str::to_string).collect(),
             },
+            effects: effect_inventory_from_hir(hir),
             actors,
         };
         manifest.normalize();
@@ -318,6 +393,10 @@ impl BehaviorManifest {
     fn normalize(&mut self) {
         self.artifact.flags.sort();
         self.artifact.flags.dedup();
+        self.effects
+            .host_operations
+            .sort_by(|left, right| left.canonical_id.cmp(&right.canonical_id));
+        self.effects.unclassified_operations.sort();
         self.actors
             .sort_by(|left, right| left.name.cmp(&right.name));
         for actor in &mut self.actors {
@@ -374,6 +453,72 @@ impl BehaviorManifest {
             });
         }
 
+        match self.effects.coverage {
+            BehaviorEffectCoverage::NotEmitted
+                if !self.effects.host_operations.is_empty()
+                    || !self.effects.unclassified_operations.is_empty() =>
+            {
+                return Err(BehaviorManifestError::InvalidEffectInventory(
+                    "coverage is not-emitted but effect entries are present".to_string(),
+                ));
+            }
+            BehaviorEffectCoverage::NotEmitted | BehaviorEffectCoverage::TypedHirPerformSites => {}
+        }
+
+        let mut host_ids = BTreeSet::new();
+        for operation in &self.effects.host_operations {
+            if !host_ids.insert(operation.canonical_id.clone()) {
+                return Err(BehaviorManifestError::InvalidEffectInventory(format!(
+                    "duplicate canonical host operation '{}'",
+                    operation.canonical_id
+                )));
+            }
+            let descriptor = lookup_host_operation_by_canonical_id(&operation.canonical_id)
+                .ok_or_else(|| {
+                    BehaviorManifestError::InvalidEffectInventory(format!(
+                        "unknown canonical host operation '{}'",
+                        operation.canonical_id
+                    ))
+                })?;
+            if operation.replay != descriptor.replay.manifest_class() {
+                return Err(BehaviorManifestError::InvalidEffectInventory(format!(
+                    "host operation '{}' replay class '{}' does not match compiler contract '{}'",
+                    operation.canonical_id,
+                    operation.replay,
+                    descriptor.replay.manifest_class()
+                )));
+            }
+            let (expected_kind, expected_effect) = match descriptor.authority {
+                HostAuthorityRequirement::CheckedEffectRow(effect) => {
+                    ("checked-effect-row", effect)
+                }
+            };
+            if operation.authority_requirement.kind != expected_kind
+                || operation.authority_requirement.effect != expected_effect
+            {
+                return Err(BehaviorManifestError::InvalidEffectInventory(format!(
+                    "host operation '{}' authority requirement does not match compiler contract",
+                    operation.canonical_id
+                )));
+            }
+        }
+
+        let mut unclassified = BTreeSet::new();
+        for operation in &self.effects.unclassified_operations {
+            if !unclassified.insert((operation.effect.clone(), operation.operation.clone())) {
+                return Err(BehaviorManifestError::InvalidEffectInventory(format!(
+                    "duplicate unclassified effect operation '{}.{}'",
+                    operation.effect, operation.operation
+                )));
+            }
+            if lookup_host_operation(&operation.effect, &operation.operation).is_some() {
+                return Err(BehaviorManifestError::InvalidEffectInventory(format!(
+                    "compiler-known host operation '{}.{}' must be emitted as a canonical host operation",
+                    operation.effect, operation.operation
+                )));
+            }
+        }
+
         let mut actor_names = BTreeSet::new();
         for actor in &self.actors {
             if !actor_names.insert(actor.name.clone()) {
@@ -389,6 +534,9 @@ impl BehaviorManifest {
                 "actors[].state_schema_semantic_id",
                 &actor.state_schema_semantic_id,
             )?;
+            if let Some(protocol_id) = &actor.protocol_id {
+                parse_identity::<ProtocolId>("actors[].protocol_id", protocol_id)?;
+            }
 
             let mut origins = BTreeSet::new();
             for step in &actor.migrations {
@@ -507,6 +655,175 @@ fn migration_steps(schema: &ActorStateSchema) -> Vec<BehaviorMigrationStep> {
     steps
 }
 
+fn effect_inventory_from_hir(module: &hir::Module) -> BehaviorEffectInventory {
+    let mut host_operations: BTreeMap<String, BehaviorHostOperation> = BTreeMap::new();
+    let mut unclassified_operations: BTreeSet<BehaviorEffectOperation> = BTreeSet::new();
+
+    fn record_operation(
+        effect: &str,
+        operation: &str,
+        host_operations: &mut BTreeMap<String, BehaviorHostOperation>,
+        unclassified_operations: &mut BTreeSet<BehaviorEffectOperation>,
+    ) {
+        if let Some(descriptor) = lookup_host_operation(effect, operation) {
+            let authority_requirement = match descriptor.authority {
+                HostAuthorityRequirement::CheckedEffectRow(required_effect) => {
+                    BehaviorAuthorityRequirement {
+                        kind: "checked-effect-row".to_string(),
+                        effect: required_effect.to_string(),
+                    }
+                }
+            };
+            let canonical_id = descriptor.canonical_id();
+            host_operations
+                .entry(canonical_id.clone())
+                .or_insert_with(|| BehaviorHostOperation {
+                    canonical_id,
+                    replay: descriptor.replay.manifest_class().to_string(),
+                    authority_requirement,
+                });
+        } else {
+            unclassified_operations.insert(BehaviorEffectOperation {
+                effect: effect.to_string(),
+                operation: operation.to_string(),
+            });
+        }
+    }
+
+    fn collect_rvalue(
+        value: &hir::RValue,
+        host_operations: &mut BTreeMap<String, BehaviorHostOperation>,
+        unclassified_operations: &mut BTreeSet<BehaviorEffectOperation>,
+    ) {
+        match value {
+            hir::RValue::Perform { effect, op, .. } => {
+                record_operation(effect, op, host_operations, unclassified_operations);
+            }
+            hir::RValue::Closure { body, .. } | hir::RValue::RecClosure { body, .. } => {
+                collect_body(body, host_operations, unclassified_operations);
+            }
+            hir::RValue::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_body(then_body, host_operations, unclassified_operations);
+                if let Some(else_body) = else_body {
+                    collect_body(else_body, host_operations, unclassified_operations);
+                }
+            }
+            hir::RValue::Match { arms, .. } => {
+                for (_, guard, body) in arms {
+                    if let Some(guard) = guard {
+                        collect_body(guard, host_operations, unclassified_operations);
+                    }
+                    collect_body(body, host_operations, unclassified_operations);
+                }
+            }
+            hir::RValue::For { body, .. } | hir::RValue::Block(body) => {
+                collect_body(body, host_operations, unclassified_operations);
+            }
+            hir::RValue::While { cond, body, .. } => {
+                collect_body(cond, host_operations, unclassified_operations);
+                collect_body(body, host_operations, unclassified_operations);
+            }
+            hir::RValue::Handle { body, handlers, .. } => {
+                collect_body(body, host_operations, unclassified_operations);
+                for handler in handlers {
+                    collect_body(
+                        &handler.body,
+                        host_operations,
+                        unclassified_operations,
+                    );
+                }
+            }
+            hir::RValue::Receive { arms, after, .. } => {
+                for (_, _, guard, body) in arms {
+                    if let Some(guard) = guard {
+                        collect_body(guard, host_operations, unclassified_operations);
+                    }
+                    collect_body(body, host_operations, unclassified_operations);
+                }
+                if let Some((timeout, body)) = after {
+                    collect_body(timeout, host_operations, unclassified_operations);
+                    collect_body(body, host_operations, unclassified_operations);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_body(
+        body: &hir::Body,
+        host_operations: &mut BTreeMap<String, BehaviorHostOperation>,
+        unclassified_operations: &mut BTreeSet<BehaviorEffectOperation>,
+    ) {
+        for statement in &body.stmts {
+            match statement {
+                hir::Stmt::Let { value, .. } | hir::Stmt::Assign { value, .. } => {
+                    collect_rvalue(value, host_operations, unclassified_operations);
+                }
+                hir::Stmt::StateSet { .. }
+                | hir::Stmt::Emit { .. }
+                | hir::Stmt::ParallelMarker { .. } => {}
+            }
+        }
+    }
+
+    fn collect_decls(
+        decls: &[hir::Decl],
+        host_operations: &mut BTreeMap<String, BehaviorHostOperation>,
+        unclassified_operations: &mut BTreeSet<BehaviorEffectOperation>,
+    ) {
+        for decl in decls {
+            match decl {
+                hir::Decl::Function(function) => {
+                    collect_body(
+                        &function.body,
+                        host_operations,
+                        unclassified_operations,
+                    );
+                }
+                hir::Decl::Actor(actor) => {
+                    for behavior in &actor.behaviors {
+                        collect_body(
+                            &behavior.body,
+                            host_operations,
+                            unclassified_operations,
+                        );
+                        if let Some(compensate) = &behavior.compensate {
+                            collect_body(
+                                compensate,
+                                host_operations,
+                                unclassified_operations,
+                            );
+                        }
+                    }
+                }
+                hir::Decl::Module { decls, .. } => {
+                    collect_decls(decls, host_operations, unclassified_operations);
+                }
+                hir::Decl::Constant { body, .. } => {
+                    collect_body(body, host_operations, unclassified_operations);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    collect_decls(
+        &module.decls,
+        &mut host_operations,
+        &mut unclassified_operations,
+    );
+
+    BehaviorEffectInventory {
+        coverage: BehaviorEffectCoverage::TypedHirPerformSites,
+        host_operations: host_operations.into_values().collect(),
+        unclassified_operations: unclassified_operations.into_iter().collect(),
+    }
+}
+
 fn classify_persistence(actor: &hir::ActorDef) -> BehaviorPersistence {
     let mut durable = false;
     let mut event_sourced = false;
@@ -581,6 +898,7 @@ pub enum BehaviorManifestError {
         field: &'static str,
         message: String,
     },
+    InvalidEffectInventory(String),
     DuplicateActor(String),
     ArtifactIdentityMismatch {
         expected: ArtifactId,
@@ -617,6 +935,9 @@ impl fmt::Display for BehaviorManifestError {
             }
             Self::InvalidIdentity { field, message } => {
                 write!(f, "invalid {field} in behavior manifest: {message}")
+            }
+            Self::InvalidEffectInventory(message) => {
+                write!(f, "invalid behavior manifest effect inventory: {message}")
             }
             Self::DuplicateActor(actor) => {
                 write!(f, "behavior manifest contains duplicate actor '{actor}'")
@@ -752,7 +1073,7 @@ mod tests {
     use crate::ast::{Expr, Literal, MigrationDecl, StateModel};
     use crate::content_identity::SemanticId;
     use crate::hir::{ActorDef, Module, Operand};
-    use crate::types::{PrimitiveType, Span, Type};
+    use crate::types::{Capability, EffectRow, PrimitiveType, Span, Type};
 
     fn artifact() -> ArtifactIdentityManifest {
         ArtifactIdentityManifest::new(
@@ -800,6 +1121,7 @@ mod tests {
                 apply_handlers: Vec::new(),
                 version,
                 migrations,
+                protocol_id: None,
                 is_organization: false,
                 is_workflow: false,
                 is_agent: false,
@@ -846,6 +1168,7 @@ mod tests {
                 backend: "bytecode".to_string(),
                 flags: Vec::new(),
             },
+            effects: BehaviorEffectInventory::default(),
             actors: vec![actor],
         }
     }
@@ -856,6 +1179,7 @@ mod tests {
             persistence: BehaviorPersistence::Durable,
             schema_version: version,
             state_schema_semantic_id: schema_id(schema_seed),
+            protocol_id: None,
             migration_identity: MigrationIdentityCoverage::TopologyOnly,
             migrations: if version == 1 {
                 Vec::new()
@@ -891,6 +1215,153 @@ mod tests {
         assert_eq!(actor.migrations[0].from, 1);
         assert_eq!(actor.migrations[0].to, 2);
         assert!(actor.migrations[0].state);
+    }
+
+    #[test]
+    fn typed_hir_emits_host_replay_authority_and_unclassified_effect_evidence() {
+        let mut hir = typed_hir(1);
+        hir.decls.push(hir::Decl::Function(hir::FunctionDef {
+            name: "effects".to_string(),
+            type_params: Vec::new(),
+            params: Vec::new(),
+            dict_params: Vec::new(),
+            ret: Type::unit(),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+            body: hir::Body {
+                stmts: vec![
+                    hir::Stmt::Let {
+                        name: "known".to_string(),
+                        ty: Type::string(),
+                        value: hir::RValue::Perform {
+                            effect: "Http".to_string(),
+                            op: "get".to_string(),
+                            args: vec![Operand::Literal(
+                                Literal::String("https://example.com".to_string()),
+                                Type::string(),
+                            )],
+                            ty: Type::string(),
+                        },
+                        span: Span::default(),
+                    },
+                    hir::Stmt::Let {
+                        name: "custom".to_string(),
+                        ty: Type::unit(),
+                        value: hir::RValue::Perform {
+                            effect: "Custom".to_string(),
+                            op: "ping".to_string(),
+                            args: Vec::new(),
+                            ty: Type::unit(),
+                        },
+                        span: Span::default(),
+                    },
+                ],
+                terminator: hir::Terminator::FnReturn(Some(Operand::Unit)),
+            },
+            public: false,
+            placement: None,
+            span: Span::default(),
+        }));
+
+        let manifest = BehaviorManifest::from_typed_hir(
+            "demo",
+            "0.1.0",
+            &artifact(),
+            b"compiled-nbc",
+            &hir,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manifest.effects.coverage,
+            BehaviorEffectCoverage::TypedHirPerformSites
+        );
+        assert_eq!(manifest.effects.host_operations.len(), 1);
+        let known = &manifest.effects.host_operations[0];
+        let expected = lookup_host_operation("Http", "get").unwrap();
+        assert_eq!(known.canonical_id, expected.canonical_id());
+        assert_eq!(known.replay, "journal-result");
+        assert_eq!(known.authority_requirement.kind, "checked-effect-row");
+        assert_eq!(known.authority_requirement.effect, "Http");
+        assert_eq!(
+            manifest.effects.unclassified_operations,
+            vec![BehaviorEffectOperation {
+                effect: "Custom".to_string(),
+                operation: "ping".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn typed_hir_propagates_only_proven_protocol_identity() {
+        let mut hir = typed_hir(1);
+        let protocol_id = crate::protocol::ProtocolSchema::new(
+            "Counter",
+            std::iter::empty::<crate::protocol::ProtocolMember>(),
+        )
+        .unwrap()
+        .id()
+        .to_string();
+        let hir::Decl::Actor(actor) = &mut hir.decls[0] else {
+            panic!("fixture actor missing");
+        };
+        actor.protocol_id = Some(protocol_id.clone());
+
+        let manifest = BehaviorManifest::from_typed_hir(
+            "demo",
+            "0.1.0",
+            &artifact(),
+            b"compiled-nbc",
+            &hir,
+        )
+        .unwrap();
+        assert_eq!(manifest.actors[0].protocol_id.as_deref(), Some(protocol_id.as_str()));
+    }
+
+    #[test]
+    fn tampered_host_contract_evidence_is_rejected() {
+        let mut hir = typed_hir(1);
+        hir.decls.push(hir::Decl::Function(hir::FunctionDef {
+            name: "effects".to_string(),
+            type_params: Vec::new(),
+            params: Vec::new(),
+            dict_params: Vec::new(),
+            ret: Type::unit(),
+            effect: EffectRow::empty(),
+            cap: Capability::Ref,
+            body: hir::Body {
+                stmts: vec![hir::Stmt::Let {
+                    name: "known".to_string(),
+                    ty: Type::string(),
+                    value: hir::RValue::Perform {
+                        effect: "Http".to_string(),
+                        op: "get".to_string(),
+                        args: Vec::new(),
+                        ty: Type::string(),
+                    },
+                    span: Span::default(),
+                }],
+                terminator: hir::Terminator::FnReturn(Some(Operand::Unit)),
+            },
+            public: false,
+            placement: None,
+            span: Span::default(),
+        }));
+
+        let mut manifest = BehaviorManifest::from_typed_hir(
+            "demo",
+            "0.1.0",
+            &artifact(),
+            b"compiled-nbc",
+            &hir,
+        )
+        .unwrap();
+        manifest.effects.host_operations[0].replay = "pure".to_string();
+
+        assert!(matches!(
+            manifest.to_json(),
+            Err(BehaviorManifestError::InvalidEffectInventory(_))
+        ));
     }
 
     #[test]

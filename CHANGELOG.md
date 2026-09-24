@@ -1719,6 +1719,11 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Compiler semantic evidence in Behavior Manifests — 2026-09-24
+- **RFC 0020 manifests now inventory every explicit typed-HIR `perform Effect.op` site.** Operations in the compiler-owned host-effect ABI emit canonical host identity, replay class, and checked-effect-row authority requirement; unknown/custom effects remain explicitly unclassified instead of receiving guessed security or replay semantics.
+- **Actors can carry compiler-proven structural `ProtocolId` evidence into the manifest.** The ID is minted before HIR erases omitted annotations and only when behavior parameters/returns are explicit and the canonical protocol schema validates; incomplete contracts emit no protocol identity.
+- **Manifest semantic evidence is validated fail-closed but grants no authority.** Canonical host contracts are revalidated when manifests are parsed/serialized, replay/authority tampering is rejected, and runtime/deployment policy remains the only source of actual external authority. No bytecode, wire, persistence, or source-language format changes in this slice.
+
 ### RFC 0020 Behavior Manifest durability admission subset — 2026-09-23
 - **Package builds now emit `<package>.behavior.json` beside `.nbc` artifacts** (`src/behavior_manifest.rs`, `src/main.rs`, `src/package/commands.rs`). The experimental `nulang.behavior/v0alpha1` sidecar binds package/language metadata to compiler artifact identity and exposes durable actor persistence class, schema version, canonical state-schema semantic identity, and migration topology.
 - **Manifest parsing fails closed** on unknown schema versions/artifact kinds, malformed content identities or digests, duplicate actors, invalid/incomplete migration chains, and artifact identity tampering. The sidecar includes a BLAKE3 digest of the exact emitted `.nbc` bytes and can verify the executable/manifest pairing; canonical ordering gives deterministic JSON and a separate domain-separated manifest digest.
