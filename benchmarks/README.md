@@ -36,6 +36,23 @@ reported as skipped, not failed, until enough history accumulates.
 This intentionally does not need a dedicated non-shared runner: the
 noise-adaptive threshold is the fix, not the infrastructure change.
 
+## Cross-runtime Savina baselines
+
+`benchmarks/cross_runtime/` contains an opt-in comparison harness for the
+same counting, ping-pong, thread-ring, and fork-join workloads in Nulang,
+Rust standard-library channels, Go channels/goroutines, and Erlang processes.
+Use `scripts/cross_runtime_bench.py` to run every available runtime on the
+same machine and emit one JSON report with exact toolchain metadata and median
+timings.
+
+Comparative runs default to `--cpu-mode single`: every measured runtime
+process is pinned to the same one logical CPU, matching the current
+single-shard Nulang Savina harness's compute budget. `--cpu-mode host` is
+diagnostic only until a separate sharded Nulang fixture exists; in particular,
+host-mode fork-join results must not be presented as a fair multicore
+comparison. These are language/runtime baselines, not a universal framework
+ranking; see the cross-runtime README for the full interpretation constraints.
+
 ## Interpretation rules
 
 Benchmark names describe the operation actually timed. Do not convert a result
