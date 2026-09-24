@@ -2081,7 +2081,8 @@ fn dead_store_elim(func: &mut mir::Function) -> bool {
 fn rvalue_side_effecting(rv: &mir::RValue) -> bool {
     matches!(
         rv,
-        mir::RValue::Call { .. }
+        mir::RValue::Panic(_)
+            | mir::RValue::Call { .. }
             | mir::RValue::Perform { .. }
             | mir::RValue::PerformAsync { .. }
             | mir::RValue::SignalWait { .. }
@@ -3623,6 +3624,29 @@ mod optimize_tests {
         assert!(
             !has_opcode(&module, OpCode::IAdd),
             "dead folded store must not emit IAdd"
+        );
+    }
+
+    #[test]
+    fn test_dce_preserves_reachable_panic() {
+        let mut b = mir::FunctionBuilder::new("panic_dce", None);
+        let dst = b.add_temp(crate::types::Type::unit());
+        b.assign(dst, mir::RValue::Panic("boom".to_string()));
+        b.terminate(mir::Terminator::Return(None));
+
+        let mut func = b.build();
+        let mut consts = Vec::new();
+        optimize_function(&mut func, &mut consts);
+
+        assert!(
+            func.blocks[0].stmts.iter().any(|stmt| matches!(
+                stmt,
+                mir::Stmt::Assign {
+                    op: mir::RValue::Panic(msg),
+                    ..
+                } if msg == "boom"
+            )),
+            "reachable Panic is divergent/observable and must survive DCE"
         );
     }
 
