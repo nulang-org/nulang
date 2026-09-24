@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### Transactional safe source fixes — 2026-09-24
+- **`nulang fix --safe <file>` applies only compiler-produced `machine_applicable` edits**, never human help text or heuristic rewrites. `--dry-run` and `--json` expose the same plan without mutating source.
+- Safe edits are deduplicated, bounds/UTF-8 checked, and overlap/conflict checked before application. The edited source is re-parsed and re-typechecked in memory, and a fix is refused if it increases the compiler error count.
+- The command uses optimistic concurrency (BLAKE3 of the originally analyzed bytes), preserves file permissions, stages the validated result beside the source, and commits with a same-directory rename; a concurrent source change or failed staging/rename leaves the original untouched.
+
 ### Agent-native source queries and repairable diagnostics — 2026-09-24
 - **Core tooling now exposes `nulang query symbols` and `nulang query symbol` without the optional AI runtime**, returning stable JSON declaration metadata including qualified names, source spans, signatures, effect/capability annotations, and visibility where available.
 - **JSON diagnostics now carry stable machine-oriented `kind` values, structured `data`, exact UTF-8 byte offsets, and `fixes`**, while preserving the existing error code/message/notes/suggestion surface. An unbound identifier with exactly one close in-scope candidate emits a `machine_applicable` replacement edit.
