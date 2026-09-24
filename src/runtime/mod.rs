@@ -4834,25 +4834,19 @@ impl Runtime {
         }
     }
 
-    /// Persist only the suspension marker of a persistent actor whose
-    /// bytecode behavior has just suspended (signal wait or background LLM
-    /// call), without snapshotting the step's partially-mutated durable
-    /// state.  Recovery reads the marker (`waiting_signal`, or the
-    /// `LLM_SUSPEND_MARKER` sentinel for LLM suspends) to decide that the
-    /// in-flight step must be re-driven; the state it re-runs from is the
-    /// last pre-step checkpoint.  A no-op when the actor has no snapshot
-    /// yet - without one there is nothing to recover anyway.
+    /// Persist a workflow suspension boundary without committing partially
+    /// mutated live state.
+    ///
+    /// The workflow subsystem advances the atomic durable tail using the last
+    /// committed snapshot as the state baseline, updates only the wait marker,
+    /// and includes any still-pending driving command.
     fn persist_suspension_marker(&mut self, actor_id: u64) {
-        let waiting_signal = match self.actors.get(&actor_id) {
-            Some(actor) if actor.persistent => actor.waiting_signal.clone(),
-            _ => return,
-        };
-        if let Some(mut snapshot) = self.persistence.load_snapshot(actor_id) {
-            if snapshot.waiting_signal == waiting_signal {
-                return;
-            }
-            snapshot.waiting_signal = waiting_signal;
-            let _ = self.persistence.save_snapshot(snapshot);
+        if let Err(error) = workflow::commit_suspension_marker(self, actor_id) {
+            tracing::error!(
+                actor_id,
+                %error,
+                "nulang-workflow: failed to commit suspension boundary"
+            );
         }
     }
 
