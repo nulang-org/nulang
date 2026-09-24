@@ -800,6 +800,7 @@ mod tests {
                 apply_handlers: Vec::new(),
                 version,
                 migrations,
+                protocol_id: None,
                 is_organization: false,
                 is_workflow: false,
                 is_agent: false,
