@@ -41,16 +41,18 @@ impl ActorVmCallbacks for CaptureCallbacks {
 
     fn perform_builtin_effect_at_site(
         &mut self,
-        context: EffectInvocationContext<'_>,
+        context: EffectInvocationContext,
         effect_name: &str,
         op_name: Option<&str>,
         _module: &CodeModule,
         _regs: &[Value],
     ) -> Option<Value> {
-        let site = context.site.expect("compiler-owned site metadata");
+        let site_id = context
+            .semantic_site_id
+            .expect("compiler-owned semantic site id");
         self.seen.lock().unwrap().builtin = Some((
-            context.pc,
-            site.id,
+            context.artifact_pc.expect("bytecode pc"),
+            site_id,
             format!("{}.{}", effect_name, op_name.unwrap_or_default()),
         ));
         Some(Value::unit())
@@ -58,13 +60,19 @@ impl ActorVmCallbacks for CaptureCallbacks {
 
     fn perform_async_at_site(
         &mut self,
-        context: EffectInvocationContext<'_>,
+        context: EffectInvocationContext,
         effect_op: &str,
         _constants: &[Constant],
         _args: &[Value],
     ) -> PerformAsyncResult {
-        let site = context.site.expect("compiler-owned site metadata");
-        self.seen.lock().unwrap().asynchronous = Some((context.pc, site.id, effect_op.to_string()));
+        let site_id = context
+            .semantic_site_id
+            .expect("compiler-owned semantic site id");
+        self.seen.lock().unwrap().asynchronous = Some((
+            context.artifact_pc.expect("bytecode pc"),
+            site_id,
+            effect_op.to_string(),
+        ));
         PerformAsyncResult::Ready(None)
     }
 }
