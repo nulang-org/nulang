@@ -3605,7 +3605,10 @@ impl VM {
         // frame-register path exposes this immutable, disjoint module context
         // to string-aware helpers instead of exposing the parent VM itself.
         // Non-reentrant execution cannot grow/reallocate `self.modules`.
-        let module_ptr = self.modules.get(module_idx).map(|module| module as *const CodeModule);
+        let module_ptr = self
+            .modules
+            .get(module_idx)
+            .map(|module| module as *const CodeModule);
 
         // Detach the raw-bit constant cache as well. No slice into VM-owned
         // storage may survive a re-entrant &mut VM call.
@@ -3664,8 +3667,7 @@ impl VM {
             //   this non-reentrant path;
             // - execution is synchronous and the borrow ends on return.
             let regs = unsafe {
-                &mut *(&mut self.frames[frame_idx].regs as *mut [Value; 256]
-                    as *mut [u64; 256])
+                &mut *(&mut self.frames[frame_idx].regs as *mut [Value; 256] as *mut [u64; 256])
             };
             jit.execute_compiled(module_idx, pc, regs, &constants)
         };
