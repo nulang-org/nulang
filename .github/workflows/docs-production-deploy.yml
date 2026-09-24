@@ -10,8 +10,8 @@ name: Docs Production Deploy
 #   CLOUDFLARE_PAGES_API_TOKEN
 #   CLOUDFLARE_ACCOUNT_ID
 #
-# The API token should be scoped to the nulang-docs Pages project with the
-# minimum permissions required to create deployments.
+# The API token should use the account-level Cloudflare Pages Write/Edit
+# permission, scoped to the Nulang Cloudflare account.
 
 on:
   workflow_dispatch:
@@ -78,6 +78,7 @@ jobs:
           test -s docs/dist/index.html
           test -s docs/dist/playground/index.html
           test -s docs/dist/playground/nulang_playground.wasm
+          echo "EXPECTED_HOMEPAGE_SHA=$(sha256sum docs/dist/index.html | awk '{print $1}')" >> "$GITHUB_ENV"
 
       - name: Validate Cloudflare deployment credentials
         env:
@@ -105,20 +106,23 @@ jobs:
             --commit-hash="$DEPLOY_SHA" \
             --commit-message="Production deploy $DEPLOY_SHA"
 
-      - name: Verify production
+      - name: Verify production matches the selected commit
         shell: bash
         run: |
           for attempt in {1..12}; do
-            homepage="$(curl -fsS --max-time 15 https://nulang.org/ || true)"
-            if echo "$homepage" | grep -q "<title" &&
+            if curl -fsS --max-time 15 https://nulang.org/ -o /tmp/nulang-homepage.html &&
                curl -fsS --max-time 15 https://nulang.org/playground/nulang_playground.wasm -o /tmp/nulang_playground.wasm &&
                test -s /tmp/nulang_playground.wasm; then
-              echo "nulang.org and the browser compiler are reachable."
-              exit 0
+              production_sha="$(sha256sum /tmp/nulang-homepage.html | awk '{print $1}')"
+              if [ "$production_sha" = "$EXPECTED_HOMEPAGE_SHA" ]; then
+                echo "nulang.org matches the selected commit and the browser compiler is reachable."
+                exit 0
+              fi
+              echo "Homepage digest is still stale: $production_sha (expected $EXPECTED_HOMEPAGE_SHA)."
             fi
             echo "Production not ready yet (attempt $attempt/12)."
             sleep 5
           done
 
-          echo "::error::Production smoke test did not observe a healthy site and browser compiler."
+          echo "::error::Production did not converge to the selected commit or the browser compiler is unavailable."
           exit 1
