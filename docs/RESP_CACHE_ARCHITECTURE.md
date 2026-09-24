@@ -165,18 +165,29 @@ now provides the first durable substrate:
 The persistence format records canonical cache mutations rather than RESP
 frames. `CacheStore` itself remains thread-confined and filesystem-free.
 
-The acknowledgement model is still intentionally layered above this substrate:
+The local acknowledgement model is now explicit through
+`DurableCacheStore`:
 
-- memory: acknowledge after local mutation;
-- async journal: enqueue WAL append before acknowledgement;
-- journal: acknowledge after a configured local WAL durability point;
-- replica: acknowledge after a configured replica;
-- quorum: acknowledge after consensus/quorum.
+- `Memory`: mutate the shard-local store with no WAL work;
+- `BufferedJournal`: append the canonical mutation to the WAL before the
+  operation succeeds, without forcing a data sync;
+- `SyncedJournal`: append and `sync_data` before the operation succeeds.
 
-The WAL API already distinguishes buffered append from `sync_data`, but the
-RESP mutation path does not yet select or advertise a durability class. Online
-snapshot/WAL rotation, replication, and failover remain follow-up work. The
-default cache path must continue to run without WAL or consensus work.
+Multi-key mutations are encoded as one WAL batch record. If journaling fails
+after the in-memory mutation, the durability wrapper poisons itself and refuses
+all subsequent mutations. Because a shard executes one command at a time, this
+provides fail-stop behavior before a response or later command can observe a
+state transition that was not journaled.
+
+`snapshot_and_rotate` publishes a durable snapshot at the current WAL
+sequence and then atomically installs a new WAL whose base sequence equals that
+snapshot. A crash before rotation can replay the older log and skip records
+already covered by the snapshot; a crash after rotation recovers from the new
+base sequence.
+
+Replica and quorum acknowledgement modes remain future work, as does wiring
+the durability wrapper into the production RESP server configuration. The
+default cache path continues to run without WAL or consensus work.
 
 ## Performance gates
 
@@ -219,9 +230,10 @@ surface.
 3. Add a separate transparent proxy endpoint only for non-cluster clients;
    keep the per-shard production listeners redirect-only.
 4. Connect remote transparent handoffs to a cache-specific cluster transport.
-5. Wire explicit memory / async-journal / journal acknowledgement modes into
-   cache mutations, then add online snapshot/WAL rotation.
-6. Add cache replication, recovery bootstrap, and failover fencing.
+5. Wire the durability wrapper into the production RESP server configuration
+   and expose explicit recovery/bootstrap policy.
+6. Add cache replication, replica acknowledgement, recovery bootstrap, and
+   failover fencing.
 7. Add packed aggregate structures, then expand RESP compatibility and add
    Nulang-native leases, locks, semaphores,
    fencing tokens, queues, and stored functions where they fit the product
