@@ -1630,6 +1630,10 @@ html:not([data-has-hero]) .nu-footer {
   }
 
   html:not([data-has-hero]) .sl-markdown-content table {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
     font-size: 0.82rem;
+    -webkit-overflow-scrolling: touch;
   }
 }
