@@ -3462,6 +3462,84 @@ fn test_workflow_actor_step_event_and_checkpoint() {
         snapshot.state.get("step_index"),
         Some(&PersistedValue::Int(1))
     );
+
+    // RFC 0022 Phase B: the delivered command, StepCompleted event, and
+    // resulting state snapshot are one transition and therefore share one
+    // sequence number instead of advancing through split append/checkpoint
+    // writes.
+    let journal = rt.persistence.read_journal(actor_id);
+    assert_eq!(journal.len(), 1);
+    let completed_sequence = events[1].sequence();
+    assert_eq!(journal[0].sequence, completed_sequence);
+    assert_eq!(snapshot.sequence, completed_sequence);
+    assert_eq!(rt.persistence.latest_sequence(actor_id), completed_sequence);
+}
+
+#[test]
+fn test_workflow_atomic_transition_rolls_back_everything_on_rejected_commit() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "AtomicWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    let before_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let before_events = rt.persistence.read_workflow_events(actor_id);
+    let before_timers = rt.timer_wheel.len();
+
+    assert!(
+        super::workflow::begin_workflow_transition(&mut rt, actor_id, None).unwrap(),
+        "test must own a fresh workflow transition"
+    );
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .set_state_field("step_index", Value::int(99));
+    rt.schedule_workflow_timer(actor_id, "must_not_publish", 60_000);
+    super::workflow::stage_step_completed(
+        &mut rt,
+        actor_id,
+        "mutate_and_sleep".to_string(),
+    )
+    .unwrap();
+
+    // Force the optimistic sequence fence to reject this transition before
+    // any store mutation. The runtime must then take RFC 0022's COMMIT-NOTHING
+    // branch.
+    rt.workflow_transitions
+        .get_mut(&actor_id)
+        .unwrap()
+        .expected_previous_sequence = before_snapshot.sequence.saturating_add(100);
+
+    assert!(
+        super::workflow::commit_workflow_transition(&mut rt, actor_id, false).is_err()
+    );
+    super::workflow::rollback_workflow_transition(&mut rt, actor_id);
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(
+        actor.get_state_field("step_index").and_then(|value| value.as_int()),
+        Some(0)
+    );
+    assert!(!rt.workflow_transitions.contains_key(&actor_id));
+    assert_eq!(rt.timer_wheel.len(), before_timers);
+    assert_eq!(
+        rt.persistence.load_snapshot(actor_id).unwrap().sequence,
+        before_snapshot.sequence
+    );
+    assert_eq!(
+        rt.persistence.read_workflow_events(actor_id).len(),
+        before_events.len()
+    );
+    assert!(
+        !rt.persistence
+            .read_workflow_events(actor_id)
+            .iter()
+            .any(|event| matches!(event, WorkflowEvent::TimerSet { name, .. } if name == "must_not_publish"))
+    );
 }
 
 #[test]
