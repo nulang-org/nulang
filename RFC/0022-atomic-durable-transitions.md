@@ -552,6 +552,14 @@ No runtime call site changes yet.
 - Redeliver unacknowledged committed outbox messages.
 - Add receiver-side deduplication.
 
+Implementation status (2026-09-24): transition-level outbox persistence is
+live in the atomic storage contract, and PostgreSQL now exposes stable
+RFC-identity pending/acknowledgement plus receiver-dedup persistence primitives.
+The runtime dispatcher is deliberately still pending: inbox dedup acceptance
+must be committed atomically with the receiver's command/state transition so a
+crash cannot persist "seen" before the message has actually become durable
+receiver progress.
+
 #### Phase F — distributed ownership
 
 - Connect virtual-actor activation ownership to epochs/leases.

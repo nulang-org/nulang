@@ -51,6 +51,13 @@ version + migration.*
 
 ## Stable tier
 
+### PostgreSQL atomic transitions and durable messaging persistence — 2026-09-24
+- **PostgresStore now implements the RFC 0022 atomic transition contract** with one SQL transaction covering the durable tail, snapshot, accepted command, workflow/domain events, durable-effect records, and staged outbox messages.
+- **Per-actor tail rows are locked and fenced by activation epoch, predecessor sequence, and transition digest.** Exact retries are idempotent; stale owners, sequence gaps, and conflicting same-position commits fail closed.
+- **PostgreSQL recovery reads now include atomic workflow/domain history and the atomic durable tail**, so a committed transition is immediately visible through the normal recovery APIs.
+- **Durable outbox rows carry the RFC 0022 stable message identity** `(sender_actor_id, sender_epoch, transition_sequence, outbox_ordinal)`, expose pending/acknowledge APIs, and persist receiver-side dedup identities.
+- **The in-memory backend implements the same pending/ack/dedup contract for deterministic tests.** Runtime delivery is intentionally not wired yet: receiver dedup must be committed with the receiver's own state transition before Nulang can claim end-to-end effectively-once actor messaging.
+
 ### JIT tier replacement and compile-time observability — 2026-09-24
 - **Tier-2 promotion now replaces the installed machine-code entry instead of returning the already-cached lower-tier function.** Compiled regions carry an explicit `Baseline` / `Typed` / `Simd` tier plus a `Fast` / `Optimized` codegen policy, and promotion uses fresh Cranelift symbols while preserving the same cache slot.
 - **First-tier native code now uses a low-latency Cranelift module with `opt_level=none` and `regalloc_algorithm=single_pass`; hot replacement uses a separate `opt_level=speed` + backtracking-register-allocation module.** Baseline code can retain folded direct calls while being recompiled at the optimized level; typed code preserves type-directed guard stripping across promotion and can subsequently promote to SIMD when the loop analyzer accepts it.

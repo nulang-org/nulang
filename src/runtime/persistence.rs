@@ -4,7 +4,7 @@
 //! snapshot of durable actor state and an append-only journal of messages.
 //! On recovery the runtime loads the latest snapshot and replays the journal.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -265,6 +265,27 @@ pub struct DurableOutboxMessage {
     pub payload: Vec<PersistedValue>,
 }
 
+/// Stable identity for one durable outbound message.
+///
+/// RFC 0022 deliberately includes the sender activation epoch so a stale
+/// failover owner cannot collide with messages emitted by the replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct DurableMessageId {
+    pub sender_actor_id: u64,
+    pub sender_epoch: u64,
+    pub transition_sequence: u64,
+    pub outbox_ordinal: u32,
+}
+
+/// One committed, not-yet-acknowledged durable outbound message.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DurableOutboxRecord {
+    pub id: DurableMessageId,
+    pub destination_actor_id: u64,
+    pub behavior_id: u16,
+    pub payload: Vec<PersistedValue>,
+}
+
 /// One logical durable actor/workflow/entity transition.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DurableTransition {
@@ -499,6 +520,42 @@ pub trait PersistenceStore: Send + Sync {
         ))
     }
 
+    /// Read committed durable outbox messages that have not yet been
+    /// acknowledged as delivered. Implementations must return stable message
+    /// identities so a dispatcher can safely retry after a crash.
+    fn read_pending_outbox(&self, _limit: usize) -> io::Result<Vec<DurableOutboxRecord>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable outbox reads are not supported by this persistence backend",
+        ))
+    }
+
+    /// Acknowledge one durable outbox message after the receiver has accepted
+    /// it under its deduplication contract. This operation must be idempotent.
+    fn acknowledge_outbox(&mut self, _id: DurableMessageId) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable outbox acknowledgement is not supported by this persistence backend",
+        ))
+    }
+
+    /// Persist receiver-side deduplication identity.
+    ///
+    /// Returns true only for the first observation. This is persistence
+    /// plumbing; the runtime must still combine dedup acceptance with receiver
+    /// command/state commit before claiming end-to-end effectively-once
+    /// delivery.
+    fn record_inbox_delivery(
+        &mut self,
+        _destination_actor_id: u64,
+        _id: DurableMessageId,
+    ) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable inbox deduplication is not supported by this persistence backend",
+        ))
+    }
+
     /// Persist a snapshot of durable actor state.
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()>;
 
@@ -660,6 +717,8 @@ pub struct MemoryStore {
     events: HashMap<u64, Vec<EventEntry>>,
     durable_tails: HashMap<u64, DurableTail>,
     committed_transitions: HashMap<u64, Vec<DurableTransition>>,
+    delivered_outbox: HashSet<DurableMessageId>,
+    durable_inbox: HashSet<(u64, DurableMessageId)>,
 }
 
 impl MemoryStore {
@@ -680,6 +739,52 @@ impl MemoryStore {
 }
 
 impl PersistenceStore for MemoryStore {
+    fn read_pending_outbox(&self, limit: usize) -> io::Result<Vec<DurableOutboxRecord>> {
+        let mut records = Vec::new();
+        for transitions in self.committed_transitions.values() {
+            for transition in transitions {
+                for message in &transition.outbox {
+                    let id = DurableMessageId {
+                        sender_actor_id: transition.actor_id,
+                        sender_epoch: transition.activation_epoch,
+                        transition_sequence: transition.sequence,
+                        outbox_ordinal: message.ordinal,
+                    };
+                    if !self.delivered_outbox.contains(&id) {
+                        records.push(DurableOutboxRecord {
+                            id,
+                            destination_actor_id: message.destination_actor_id,
+                            behavior_id: message.behavior_id,
+                            payload: message.payload.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        records.sort_by_key(|record| {
+            (
+                record.id.sender_actor_id,
+                record.id.transition_sequence,
+                record.id.outbox_ordinal,
+            )
+        });
+        records.truncate(limit);
+        Ok(records)
+    }
+
+    fn acknowledge_outbox(&mut self, id: DurableMessageId) -> io::Result<()> {
+        self.delivered_outbox.insert(id);
+        Ok(())
+    }
+
+    fn record_inbox_delivery(
+        &mut self,
+        destination_actor_id: u64,
+        id: DurableMessageId,
+    ) -> io::Result<bool> {
+        Ok(self.durable_inbox.insert((destination_actor_id, id)))
+    }
+
     fn load_durable_effect(
         &self,
         actor_id: u64,
@@ -895,6 +1000,10 @@ impl PersistenceStore for MemoryStore {
         self.events.remove(&actor_id);
         self.durable_tails.remove(&actor_id);
         self.committed_transitions.remove(&actor_id);
+        self.delivered_outbox
+            .retain(|id| id.sender_actor_id != actor_id);
+        self.durable_inbox
+            .retain(|(destination, id)| *destination != actor_id && id.sender_actor_id != actor_id);
         Ok(())
     }
 }
@@ -2773,8 +2882,22 @@ impl PostgresStore {
     }
 
     fn ensure_tables(&self) -> io::Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| io::Error::other("Postgres connection mutex poisoned"))?;
+        let mut tx = conn
+            .transaction()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        // PostgreSQL can still race on system-catalog inserts when several
+        // processes execute CREATE TABLE IF NOT EXISTS concurrently against a
+        // fresh database. Serialize schema bootstrap transactionally.
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&0x4e55_4c41_4e47_5f53_i64],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        tx.execute(
             "CREATE TABLE IF NOT EXISTS snapshots (
                 actor_id BIGINT PRIMARY KEY,
                 sequence BIGINT NOT NULL,
@@ -2787,12 +2910,12 @@ impl PostgresStore {
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        conn.execute(
+        tx.execute(
             "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS authority_tokens TEXT",
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        conn.execute(
+        tx.execute(
             "CREATE TABLE IF NOT EXISTS journal (
                 actor_id BIGINT NOT NULL,
                 sequence BIGINT NOT NULL,
@@ -2803,7 +2926,7 @@ impl PostgresStore {
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        conn.execute(
+        tx.execute(
             "CREATE TABLE IF NOT EXISTS workflow_events (
                 actor_id BIGINT NOT NULL,
                 sequence BIGINT NOT NULL,
@@ -2813,7 +2936,7 @@ impl PostgresStore {
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        conn.execute(
+        tx.execute(
             "CREATE TABLE IF NOT EXISTS events (
                 actor_id BIGINT NOT NULL,
                 sequence BIGINT NOT NULL,
@@ -2826,12 +2949,555 @@ impl PostgresStore {
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS durable_tails (
+                actor_id BIGINT PRIMARY KEY,
+                activation_epoch BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                digest TEXT NOT NULL
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS durable_transitions (
+                actor_id BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                activation_epoch BIGINT NOT NULL,
+                expected_previous_sequence BIGINT NOT NULL,
+                digest TEXT NOT NULL,
+                PRIMARY KEY (actor_id, sequence)
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS durable_workflow_events (
+                actor_id BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                event TEXT NOT NULL,
+                PRIMARY KEY (actor_id, sequence, ordinal)
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS durable_domain_events (
+                actor_id BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                event TEXT NOT NULL,
+                PRIMARY KEY (actor_id, sequence, ordinal)
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS durable_effect_records (
+                actor_id BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                record TEXT NOT NULL,
+                PRIMARY KEY (actor_id, sequence, ordinal)
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS durable_outbox (
+                actor_id BIGINT NOT NULL,
+                sender_epoch BIGINT NOT NULL,
+                sequence BIGINT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                destination_actor_id BIGINT NOT NULL,
+                behavior_id INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                delivered_at TIMESTAMPTZ,
+                PRIMARY KEY (actor_id, sender_epoch, sequence, ordinal)
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS durable_outbox_pending_idx
+             ON durable_outbox (delivered_at, actor_id, sequence, ordinal)",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS durable_inbox (
+                destination_actor_id BIGINT NOT NULL,
+                sender_actor_id BIGINT NOT NULL,
+                sender_epoch BIGINT NOT NULL,
+                transition_sequence BIGINT NOT NULL,
+                outbox_ordinal INTEGER NOT NULL,
+                received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (
+                    destination_actor_id,
+                    sender_actor_id,
+                    sender_epoch,
+                    transition_sequence,
+                    outbox_ordinal
+                )
+            )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        tx.commit()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         Ok(())
     }
 }
 
 #[cfg(feature = "postgres")]
 impl PersistenceStore for PostgresStore {
+    fn read_pending_outbox(&self, limit: usize) -> io::Result<Vec<DurableOutboxRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| io::Error::other("Postgres connection mutex poisoned"))?;
+        let rows = conn
+            .query(
+                "SELECT actor_id, sender_epoch, sequence, ordinal,
+                        destination_actor_id, behavior_id, payload
+                 FROM durable_outbox
+                 WHERE delivered_at IS NULL
+                 ORDER BY actor_id ASC, sequence ASC, ordinal ASC
+                 LIMIT $1",
+                &[&(limit as i64)],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| {
+                let payload_json: String = row.get(6);
+                let payload = serde_json::from_str(&payload_json)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Ok(DurableOutboxRecord {
+                    id: DurableMessageId {
+                        sender_actor_id: row.get::<_, i64>(0) as u64,
+                        sender_epoch: row.get::<_, i64>(1) as u64,
+                        transition_sequence: row.get::<_, i64>(2) as u64,
+                        outbox_ordinal: row.get::<_, i32>(3) as u32,
+                    },
+                    destination_actor_id: row.get::<_, i64>(4) as u64,
+                    behavior_id: row.get::<_, i32>(5) as u16,
+                    payload,
+                })
+            })
+            .collect()
+    }
+
+    fn acknowledge_outbox(&mut self, id: DurableMessageId) -> io::Result<()> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| io::Error::other("Postgres connection mutex poisoned"))?;
+        conn.execute(
+            "UPDATE durable_outbox
+             SET delivered_at = COALESCE(delivered_at, NOW())
+             WHERE actor_id = $1
+               AND sender_epoch = $2
+               AND sequence = $3
+               AND ordinal = $4",
+            &[
+                &(id.sender_actor_id as i64),
+                &(id.sender_epoch as i64),
+                &(id.transition_sequence as i64),
+                &(id.outbox_ordinal as i32),
+            ],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
+    }
+
+    fn record_inbox_delivery(
+        &mut self,
+        destination_actor_id: u64,
+        id: DurableMessageId,
+    ) -> io::Result<bool> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| io::Error::other("Postgres connection mutex poisoned"))?;
+        let changed = conn
+            .execute(
+                "INSERT INTO durable_inbox
+                 (destination_actor_id, sender_actor_id, sender_epoch,
+                  transition_sequence, outbox_ordinal)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT DO NOTHING",
+                &[
+                    &(destination_actor_id as i64),
+                    &(id.sender_actor_id as i64),
+                    &(id.sender_epoch as i64),
+                    &(id.transition_sequence as i64),
+                    &(id.outbox_ordinal as i32),
+                ],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(changed == 1)
+    }
+
+    fn load_durable_effect(
+        &self,
+        actor_id: u64,
+        effect_id: DurableEffectId,
+    ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| io::Error::other("Postgres connection mutex poisoned"))?;
+        let rows = conn
+            .query(
+                "SELECT record FROM durable_effect_records
+                 WHERE actor_id = $1
+                 ORDER BY sequence DESC, ordinal DESC",
+                &[&(actor_id as i64)],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        for row in rows {
+            let json: String = row.get(0);
+            let record = DurableEffectPersistenceRecord::from_json(json.as_bytes())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if record.effect().spec().id == effect_id {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
+    fn commit_transition(&mut self, transition: DurableTransition) -> io::Result<DurableCommit> {
+        transition.validate_structure()?;
+        let digest = transition.digest()?;
+        let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+
+        // Serialize all runtime data before the SQL transaction starts. After
+        // BEGIN, every fallible operation is a database operation and Postgres
+        // can roll the whole logical transition back on any failure.
+        let snapshot_data = transition
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                Ok::<_, io::Error>((
+                    serde_json::to_string(&snapshot.state)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                    serde_json::to_string(&snapshot.crdt_snapshot)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                    serde_json::to_string(&snapshot.crdt_field_map)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                    serde_json::to_string(&snapshot.authority_tokens)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                ))
+            })
+            .transpose()?;
+        let command_payload = transition
+            .command
+            .as_ref()
+            .map(|entry| {
+                serde_json::to_string(&entry.payload)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            })
+            .transpose()?;
+        let workflow_json = transition
+            .workflow_events
+            .iter()
+            .map(|event| {
+                serde_json::to_string(event)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let domain_json = transition
+            .domain_events
+            .iter()
+            .map(|event| {
+                serde_json::to_string(event)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let effect_json = transition
+            .durable_effects
+            .iter()
+            .map(|record| {
+                let bytes = record
+                    .to_json()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let outbox_payload_json = transition
+            .outbox
+            .iter()
+            .map(|message| {
+                serde_json::to_string(&message.payload)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| io::Error::other("Postgres connection mutex poisoned"))?;
+        let mut tx = conn
+            .transaction()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        // FOR UPDATE serializes commits once an actor has an atomic tail. The
+        // first transition has no row to lock; competing first writers are
+        // still fenced by the durable_transitions/durable_tails primary keys.
+        let current_tail = tx
+            .query_opt(
+                "SELECT activation_epoch, sequence, digest
+                 FROM durable_tails
+                 WHERE actor_id = $1
+                 FOR UPDATE",
+                &[&(transition.actor_id as i64)],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+            .map(|row| {
+                (
+                    row.get::<_, i64>(0) as u64,
+                    row.get::<_, i64>(1) as u64,
+                    row.get::<_, String>(2),
+                )
+            });
+
+        if let Some((epoch, sequence, stored_digest)) = &current_tail {
+            if transition.activation_epoch == *epoch && transition.sequence == *sequence {
+                if stored_digest == &digest_hex {
+                    tx.commit()
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    return Ok(DurableCommit {
+                        actor_id: transition.actor_id,
+                        activation_epoch: transition.activation_epoch,
+                        sequence: transition.sequence,
+                        digest,
+                    });
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "conflicting durable transition already committed at this epoch/sequence",
+                ));
+            }
+            if transition.activation_epoch < *epoch {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "stale durable activation epoch {}; committed epoch is {}",
+                        transition.activation_epoch, epoch
+                    ),
+                ));
+            }
+            if transition.expected_previous_sequence != *sequence {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "durable transition predecessor {} does not match committed tail {}",
+                        transition.expected_previous_sequence, sequence
+                    ),
+                ));
+            }
+        } else {
+            // Continue legacy history on the first atomic commit. This lookup
+            // happens in the same SQL transaction as the new tail write.
+            let row = tx
+                .query_one(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM (
+                        SELECT sequence FROM snapshots WHERE actor_id = $1
+                        UNION ALL
+                        SELECT sequence FROM journal WHERE actor_id = $1
+                        UNION ALL
+                        SELECT sequence FROM workflow_events WHERE actor_id = $1
+                        UNION ALL
+                        SELECT sequence FROM events WHERE actor_id = $1
+                     ) AS legacy",
+                    &[&(transition.actor_id as i64)],
+                )
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let legacy_tail = row.get::<_, i64>(0) as u64;
+            if transition.expected_previous_sequence != legacy_tail {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "first atomic durable transition predecessor {} does not match legacy tail {}",
+                        transition.expected_previous_sequence, legacy_tail
+                    ),
+                ));
+            }
+        }
+
+        if let (
+            Some(snapshot),
+            Some((state_json, crdt_json, crdt_field_map_json, authority_json)),
+        ) = (&transition.snapshot, &snapshot_data)
+        {
+            tx.execute(
+                "INSERT INTO snapshots
+                 (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (actor_id) DO UPDATE SET
+                   sequence = EXCLUDED.sequence,
+                   state = EXCLUDED.state,
+                   waiting_signal = EXCLUDED.waiting_signal,
+                   crdt_snapshot = EXCLUDED.crdt_snapshot,
+                   crdt_field_map = EXCLUDED.crdt_field_map,
+                   authority_tokens = EXCLUDED.authority_tokens",
+                &[
+                    &(snapshot.actor_id as i64),
+                    &(snapshot.sequence as i64),
+                    state_json,
+                    &snapshot.waiting_signal.as_deref(),
+                    crdt_json,
+                    crdt_field_map_json,
+                    authority_json,
+                ],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+
+        if let (Some(command), Some(payload_json)) = (&transition.command, &command_payload) {
+            tx.execute(
+                "INSERT INTO journal (actor_id, sequence, behavior_id, payload)
+                 VALUES ($1, $2, $3, $4)",
+                &[
+                    &(transition.actor_id as i64),
+                    &(command.sequence as i64),
+                    &(command.behavior_id as i32),
+                    payload_json,
+                ],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+
+        for (ordinal, event_json) in workflow_json.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO durable_workflow_events (actor_id, sequence, ordinal, event)
+                 VALUES ($1, $2, $3, $4)",
+                &[
+                    &(transition.actor_id as i64),
+                    &(transition.sequence as i64),
+                    &(ordinal as i32),
+                    event_json,
+                ],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+
+        for (ordinal, event_json) in domain_json.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO durable_domain_events (actor_id, sequence, ordinal, event)
+                 VALUES ($1, $2, $3, $4)",
+                &[
+                    &(transition.actor_id as i64),
+                    &(transition.sequence as i64),
+                    &(ordinal as i32),
+                    event_json,
+                ],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+
+        for (ordinal, record_json) in effect_json.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO durable_effect_records (actor_id, sequence, ordinal, record)
+                 VALUES ($1, $2, $3, $4)",
+                &[
+                    &(transition.actor_id as i64),
+                    &(transition.sequence as i64),
+                    &(ordinal as i32),
+                    record_json,
+                ],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+
+        for (message, payload_json) in transition.outbox.iter().zip(&outbox_payload_json) {
+            tx.execute(
+                "INSERT INTO durable_outbox
+                 (actor_id, sender_epoch, sequence, ordinal, destination_actor_id, behavior_id, payload)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &(transition.actor_id as i64),
+                    &(transition.activation_epoch as i64),
+                    &(transition.sequence as i64),
+                    &(message.ordinal as i32),
+                    &(message.destination_actor_id as i64),
+                    &(message.behavior_id as i32),
+                    payload_json,
+                ],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+
+        tx.execute(
+            "INSERT INTO durable_transitions
+             (actor_id, sequence, activation_epoch, expected_previous_sequence, digest)
+             VALUES ($1, $2, $3, $4, $5)",
+            &[
+                &(transition.actor_id as i64),
+                &(transition.sequence as i64),
+                &(transition.activation_epoch as i64),
+                &(transition.expected_previous_sequence as i64),
+                &digest_hex,
+            ],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        if let Some((old_epoch, old_sequence, old_digest)) = current_tail {
+            let changed = tx
+                .execute(
+                    "UPDATE durable_tails
+                     SET activation_epoch = $1, sequence = $2, digest = $3
+                     WHERE actor_id = $4
+                       AND activation_epoch = $5
+                       AND sequence = $6
+                       AND digest = $7",
+                    &[
+                        &(transition.activation_epoch as i64),
+                        &(transition.sequence as i64),
+                        &digest_hex,
+                        &(transition.actor_id as i64),
+                        &(old_epoch as i64),
+                        &(old_sequence as i64),
+                        &old_digest,
+                    ],
+                )
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            if changed != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "durable tail changed while committing transition",
+                ));
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO durable_tails (actor_id, activation_epoch, sequence, digest)
+                 VALUES ($1, $2, $3, $4)",
+                &[
+                    &(transition.actor_id as i64),
+                    &(transition.activation_epoch as i64),
+                    &(transition.sequence as i64),
+                    &digest_hex,
+                ],
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+
+        tx.commit()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        Ok(DurableCommit {
+            actor_id: transition.actor_id,
+            activation_epoch: transition.activation_epoch,
+            sequence: transition.sequence,
+            digest,
+        })
+    }
+
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
         let state_json = serde_json::to_string(&snapshot.state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -2979,20 +3645,32 @@ impl PersistenceStore for PostgresStore {
             Ok(c) => c,
             Err(_) => return Vec::new(),
         };
-        let rows = match conn.query(
+        let mut events = Vec::new();
+
+        if let Ok(rows) = conn.query(
             "SELECT event FROM workflow_events
              WHERE actor_id = $1 ORDER BY sequence ASC",
             &[&(actor_id as i64)],
         ) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-        rows.iter()
-            .filter_map(|row| {
+            events.extend(rows.iter().filter_map(|row| {
                 let event_json: String = row.get(0);
                 serde_json::from_str(&event_json).ok()
-            })
-            .collect()
+            }));
+        }
+
+        if let Ok(rows) = conn.query(
+            "SELECT event FROM durable_workflow_events
+             WHERE actor_id = $1 ORDER BY sequence ASC, ordinal ASC",
+            &[&(actor_id as i64)],
+        ) {
+            events.extend(rows.iter().filter_map(|row| {
+                let event_json: String = row.get(0);
+                serde_json::from_str(&event_json).ok()
+            }));
+        }
+
+        events.sort_by_key(WorkflowEvent::sequence);
+        events
     }
 
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
@@ -3027,16 +3705,14 @@ impl PersistenceStore for PostgresStore {
             Ok(c) => c,
             Err(_) => return Vec::new(),
         };
-        let rows = match conn.query(
+        let mut entries = Vec::new();
+
+        if let Ok(rows) = conn.query(
             "SELECT sequence, field_name, event_name, args, value FROM events
              WHERE actor_id = $1 ORDER BY sequence ASC",
             &[&(actor_id as i64)],
         ) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-        rows.iter()
-            .filter_map(|row| {
+            entries.extend(rows.iter().filter_map(|row| {
                 let seq: i64 = row.get(0);
                 let field_name: String = row.get(1);
                 let event_name: String = row.get(2);
@@ -3051,8 +3727,22 @@ impl PersistenceStore for PostgresStore {
                     args,
                     value,
                 })
-            })
-            .collect()
+            }));
+        }
+
+        if let Ok(rows) = conn.query(
+            "SELECT event FROM durable_domain_events
+             WHERE actor_id = $1 ORDER BY sequence ASC, ordinal ASC",
+            &[&(actor_id as i64)],
+        ) {
+            entries.extend(rows.iter().filter_map(|row| {
+                let event_json: String = row.get(0);
+                serde_json::from_str(&event_json).ok()
+            }));
+        }
+
+        entries.sort_by_key(|entry| entry.sequence);
+        entries
     }
 
     fn latest_sequence(&self, actor_id: u64) -> u64 {
@@ -3092,22 +3782,48 @@ impl PersistenceStore for PostgresStore {
             .ok()
             .flatten()
             .map(|row| row.get(0));
+        let atomic_seq: Option<i64> = conn
+            .query_opt(
+                "SELECT sequence FROM durable_tails WHERE actor_id = $1",
+                &[&(actor_id as i64)],
+            )
+            .ok()
+            .flatten()
+            .map(|row| row.get(0));
         snapshot_seq
             .unwrap_or(0)
             .max(journal_seq.unwrap_or(0))
             .max(wf_event_seq.unwrap_or(0))
-            .max(event_seq.unwrap_or(0)) as u64
+            .max(event_seq.unwrap_or(0))
+            .max(atomic_seq.unwrap_or(0)) as u64
     }
 
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        for table in ["snapshots", "journal", "workflow_events", "events"] {
+        for table in [
+            "snapshots",
+            "journal",
+            "workflow_events",
+            "events",
+            "durable_workflow_events",
+            "durable_domain_events",
+            "durable_effect_records",
+            "durable_outbox",
+            "durable_transitions",
+            "durable_tails",
+        ] {
             conn.execute(
                 &format!("DELETE FROM {} WHERE actor_id = $1", table),
                 &[&(actor_id as i64)],
             )
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         }
+        conn.execute(
+            "DELETE FROM durable_inbox
+             WHERE destination_actor_id = $1 OR sender_actor_id = $1",
+            &[&(actor_id as i64)],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         Ok(())
     }
 
@@ -3730,6 +4446,85 @@ mod rocksdb_store_tests {
 }
 
 #[cfg(test)]
+mod durable_outbox_tests {
+    use super::*;
+
+    fn transition_with_outbox() -> DurableTransition {
+        DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id: 10,
+            activation_epoch: 3,
+            sequence: 1,
+            expected_previous_sequence: 0,
+            command: None,
+            snapshot: Some(ActorSnapshot {
+                actor_id: 10,
+                sequence: 1,
+                state: HashMap::new(),
+                waiting_signal: None,
+                crdt_snapshot: None,
+                crdt_field_map: None,
+                authority_tokens: Default::default(),
+            }),
+            workflow_events: vec![],
+            domain_events: vec![],
+            durable_effects: vec![],
+            outbox: vec![DurableOutboxMessage {
+                destination_actor_id: 20,
+                ordinal: 0,
+                behavior_id: 4,
+                payload: vec![PersistedValue::Int(7)],
+            }],
+        }
+    }
+
+    #[test]
+    fn memory_store_outbox_redelivers_until_acknowledged() {
+        let mut store = MemoryStore::new();
+        store.commit_transition(transition_with_outbox()).unwrap();
+
+        let pending = store.read_pending_outbox(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].id,
+            DurableMessageId {
+                sender_actor_id: 10,
+                sender_epoch: 3,
+                transition_sequence: 1,
+                outbox_ordinal: 0,
+            }
+        );
+        assert_eq!(pending[0].destination_actor_id, 20);
+        assert_eq!(pending[0].payload, vec![PersistedValue::Int(7)]);
+
+        // A crash before acknowledgement means the same stable message is
+        // returned again rather than silently disappearing.
+        assert_eq!(store.read_pending_outbox(10).unwrap(), pending);
+
+        store.acknowledge_outbox(pending[0].id).unwrap();
+        store.acknowledge_outbox(pending[0].id).unwrap();
+        assert!(store.read_pending_outbox(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn memory_store_inbox_deduplicates_stable_message_identity() {
+        let mut store = MemoryStore::new();
+        let id = DurableMessageId {
+            sender_actor_id: 10,
+            sender_epoch: 3,
+            transition_sequence: 1,
+            outbox_ordinal: 0,
+        };
+
+        assert!(store.record_inbox_delivery(20, id).unwrap());
+        assert!(!store.record_inbox_delivery(20, id).unwrap());
+        // Deduplication is receiver-scoped: another destination may observe the
+        // same sender identity independently.
+        assert!(store.record_inbox_delivery(21, id).unwrap());
+    }
+}
+
+#[cfg(test)]
 #[cfg(feature = "postgres")]
 mod postgres_store_tests {
     use super::*;
@@ -3742,6 +4537,177 @@ mod postgres_store_tests {
     fn fresh_actor_id() -> u64 {
         static COUNTER: AtomicU64 = AtomicU64::new(1000);
         COUNTER.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn atomic_transition(actor_id: u64, activation_epoch: u64, sequence: u64) -> DurableTransition {
+        let mut state = HashMap::new();
+        state.insert("count".to_string(), PersistedValue::Int(sequence as i64));
+        DurableTransition {
+            version: DURABLE_TRANSITION_VERSION,
+            actor_id,
+            activation_epoch,
+            sequence,
+            expected_previous_sequence: sequence - 1,
+            command: Some(JournalEntry {
+                sequence,
+                behavior_id: 3,
+                payload: vec![PersistedValue::Int(sequence as i64)],
+            }),
+            snapshot: Some(ActorSnapshot {
+                actor_id,
+                sequence,
+                state,
+                waiting_signal: None,
+                crdt_snapshot: None,
+                crdt_field_map: None,
+                authority_tokens: Default::default(),
+            }),
+            workflow_events: vec![WorkflowEvent::StepCompleted {
+                sequence,
+                step_name: format!("step-{sequence}"),
+            }],
+            domain_events: vec![EventEntry {
+                sequence,
+                field_name: "count".to_string(),
+                event_name: "Changed".to_string(),
+                args: vec![],
+                value: PersistedValue::Int(sequence as i64),
+            }],
+            durable_effects: vec![],
+            outbox: vec![DurableOutboxMessage {
+                destination_actor_id: actor_id + 1,
+                ordinal: 0,
+                behavior_id: 4,
+                payload: vec![PersistedValue::Int(sequence as i64)],
+            }],
+        }
+    }
+
+    #[test]
+    fn test_postgres_atomic_transition_and_outbox_contract() {
+        let url = match pg_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let mut store = PostgresStore::new(&url).unwrap();
+        let actor_id = fresh_actor_id();
+        let value = atomic_transition(actor_id, 7, 1);
+
+        let first = store.commit_transition(value.clone()).unwrap();
+        let retry = store.commit_transition(value).unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(store.latest_sequence(actor_id), 1);
+        assert_eq!(store.load_snapshot(actor_id).unwrap().sequence, 1);
+        assert_eq!(store.read_journal(actor_id).len(), 1);
+        assert_eq!(store.read_workflow_events(actor_id).len(), 1);
+        assert_eq!(store.read_events(actor_id).len(), 1);
+
+        let pending = store.read_pending_outbox(10).unwrap();
+        let record = pending
+            .iter()
+            .find(|record| record.id.sender_actor_id == actor_id)
+            .expect("committed outbox message is pending");
+        assert_eq!(record.id.sender_epoch, 7);
+        assert_eq!(record.id.transition_sequence, 1);
+        assert_eq!(record.destination_actor_id, actor_id + 1);
+
+        assert!(store
+            .record_inbox_delivery(record.destination_actor_id, record.id)
+            .unwrap());
+        assert!(!store
+            .record_inbox_delivery(record.destination_actor_id, record.id)
+            .unwrap());
+
+        store.acknowledge_outbox(record.id).unwrap();
+        store.acknowledge_outbox(record.id).unwrap();
+        assert!(store
+            .read_pending_outbox(100)
+            .unwrap()
+            .iter()
+            .all(|item| item.id.sender_actor_id != actor_id));
+
+        store.clear(actor_id).unwrap();
+        store.clear(actor_id + 1).unwrap();
+    }
+
+    #[test]
+    fn test_postgres_atomic_transition_rejects_gap_and_stale_epoch() {
+        let url = match pg_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let mut store = PostgresStore::new(&url).unwrap();
+        let actor_id = fresh_actor_id();
+        store
+            .commit_transition(atomic_transition(actor_id, 2, 1))
+            .unwrap();
+
+        let mut gap = atomic_transition(actor_id, 2, 3);
+        gap.expected_previous_sequence = 2;
+        let error = store.commit_transition(gap).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(store.latest_sequence(actor_id), 1);
+
+        let stale = atomic_transition(actor_id, 1, 2);
+        let error = store.commit_transition(stale).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(store.latest_sequence(actor_id), 1);
+
+        store.clear(actor_id).unwrap();
+    }
+
+    #[test]
+    fn test_postgres_atomic_transition_rolls_back_mid_commit_failure() {
+        let url = match pg_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let mut store = PostgresStore::new(&url).unwrap();
+        let actor_id = fresh_actor_id();
+
+        // Seed only the row reached late in commit_transition. Snapshot,
+        // journal, and event inserts happen first, so this forces a genuine
+        // transactional rollback rather than an up-front validation error.
+        {
+            let mut conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO durable_outbox
+                 (actor_id, sender_epoch, sequence, ordinal,
+                  destination_actor_id, behavior_id, payload)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &(actor_id as i64),
+                    &1_i64,
+                    &1_i64,
+                    &0_i32,
+                    &((actor_id + 99) as i64),
+                    &1_i32,
+                    &"[]",
+                ],
+            )
+            .unwrap();
+        }
+
+        let error = store
+            .commit_transition(atomic_transition(actor_id, 1, 1))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+
+        assert!(store.load_snapshot(actor_id).is_none());
+        assert!(store.read_journal(actor_id).is_empty());
+        assert!(store.read_workflow_events(actor_id).is_empty());
+        assert!(store.read_events(actor_id).is_empty());
+        assert_eq!(store.latest_sequence(actor_id), 0);
+
+        let transition_rows = store
+            .query(
+                "SELECT COUNT(*)::int8 FROM durable_transitions WHERE actor_id = $1",
+                &[Value::int(actor_id as i64)],
+            )
+            .unwrap();
+        assert_eq!(transition_rows, vec!["[0]".to_string()]);
+
+        store.clear(actor_id).unwrap();
     }
 
     #[test]
