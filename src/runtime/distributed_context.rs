@@ -12,8 +12,10 @@ use std::time::{Duration, Instant};
 use crate::runtime::cluster::{ClusterState, NodeId};
 use crate::runtime::fabric_stream_cluster::FabricStreamReplicationState;
 use crate::runtime::network::NetworkTransport;
+use crate::runtime::service_directory::ServiceDirectory;
 use crate::runtime::{
     ActorAddress, AddressResolver, FileFabricStreamStore, MessageAdmission, Runtime,
+    ServiceAdvertisement, ServiceAdvertisementSnapshot,
 };
 use crate::vm::Value;
 
@@ -181,6 +183,14 @@ enum FabricControl {
         generation: u64,
         subscriptions: Vec<FabricSubscription>,
     },
+    UpsertService(ServiceAdvertisement),
+    RemoveLocalServiceAllocation {
+        node_id: NodeId,
+        deployment_id: String,
+        replica: u32,
+        allocation_epoch: u64,
+    },
+    ReplaceRemoteServices(ServiceAdvertisementSnapshot),
     RemoveRemoteNode(NodeId),
 }
 
@@ -500,6 +510,7 @@ pub struct DistributedContext {
     pub node_id: Option<NodeId>,
     pub enabled: bool,
     fabric: FabricRegistry,
+    services: ServiceDirectory,
     fabric_control_tx: Option<Vec<mpsc::Sender<FabricControl>>>,
     fabric_control_rx: Option<mpsc::Receiver<FabricControl>>,
     // Shared by every shard in one runtime process. A single monotonic source
@@ -619,8 +630,38 @@ impl Runtime {
                         .replace_remote_node(node_id, generation, subscriptions);
                     applied += 1;
                 }
+                Ok(FabricControl::UpsertService(advertisement)) => {
+                    if let Err(error) = self.distributed.services.upsert_local(advertisement) {
+                        tracing::warn!("nulang-fabric: rejected shard service update: {}", error);
+                    }
+                    applied += 1;
+                }
+                Ok(FabricControl::RemoveLocalServiceAllocation {
+                    node_id,
+                    deployment_id,
+                    replica,
+                    allocation_epoch,
+                }) => {
+                    self.distributed.services.remove_local_allocation(
+                        node_id,
+                        &deployment_id,
+                        replica,
+                        allocation_epoch,
+                    );
+                    applied += 1;
+                }
+                Ok(FabricControl::ReplaceRemoteServices(snapshot)) => {
+                    if let Err(error) = self.distributed.services.replace_remote_node(snapshot) {
+                        tracing::warn!(
+                            "nulang-fabric: rejected remote service snapshot on shard sync: {}",
+                            error
+                        );
+                    }
+                    applied += 1;
+                }
                 Ok(FabricControl::RemoveRemoteNode(node_id)) => {
                     let _ = self.distributed.fabric.remove_remote_node(node_id);
+                    let _ = self.distributed.services.remove_remote_node(node_id);
                     applied += 1;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -786,10 +827,168 @@ impl Runtime {
     pub fn fabric_remove_remote_node(&mut self, node_id: NodeId) -> usize {
         self.fabric_sync();
         let (removed, generation_removed) = self.distributed.fabric.remove_remote_node(node_id);
-        if removed > 0 || generation_removed {
+        let (services_removed, service_generation_removed) =
+            self.distributed.services.remove_remote_node(node_id);
+        if removed > 0
+            || generation_removed
+            || services_removed > 0
+            || service_generation_removed
+        {
             self.fabric_broadcast_control(FabricControl::RemoveRemoteNode(node_id));
         }
         removed
+    }
+
+    /// Advertise or update one service endpoint owned by this runtime node.
+    ///
+    /// Allocation epochs are part of service identity. A lower epoch cannot
+    /// replace a newer endpoint for the same deployment replica, and a health
+    /// change advances the shared Fabric metadata generation.
+    pub fn fabric_advertise_service(
+        &mut self,
+        advertisement: ServiceAdvertisement,
+    ) -> Result<bool, String> {
+        self.fabric_sync();
+        let node_id = self.distributed.node_id.ok_or_else(|| {
+            "Fabric service advertisement requires distribution to be enabled".to_string()
+        })?;
+        if advertisement.node_id != node_id {
+            return Err(format!(
+                "Fabric service node mismatch: local node {:?}, advertisement claims {:?}",
+                node_id, advertisement.node_id
+            ));
+        }
+
+        let changed = self
+            .distributed
+            .services
+            .upsert_local(advertisement.clone())?;
+        if changed {
+            self.fabric_bump_generation();
+            self.fabric_broadcast_control(FabricControl::UpsertService(advertisement));
+        }
+        Ok(changed)
+    }
+
+    /// Withdraw every endpoint exported by one exact local allocation epoch.
+    pub fn fabric_withdraw_service_allocation(
+        &mut self,
+        deployment_id: &str,
+        replica: u32,
+        allocation_epoch: u64,
+    ) -> Result<usize, String> {
+        self.fabric_sync();
+        let node_id = self.distributed.node_id.ok_or_else(|| {
+            "Fabric service withdrawal requires distribution to be enabled".to_string()
+        })?;
+        let removed = self.distributed.services.remove_local_allocation(
+            node_id,
+            deployment_id,
+            replica,
+            allocation_epoch,
+        );
+        if removed > 0 {
+            self.fabric_bump_generation();
+            self.fabric_broadcast_control(FabricControl::RemoveLocalServiceAllocation {
+                node_id,
+                deployment_id: deployment_id.to_string(),
+                replica,
+                allocation_epoch,
+            });
+        }
+        Ok(removed)
+    }
+
+    /// Export a complete generation-tagged local service snapshot.
+    ///
+    /// Partial replacement is unsafe, so exceeding the caller's bound returns
+    /// an error rather than truncating the snapshot.
+    pub fn fabric_service_advertisements(
+        &mut self,
+        limit: usize,
+    ) -> Result<ServiceAdvertisementSnapshot, String> {
+        self.fabric_sync();
+        let node_id = self.distributed.node_id.ok_or_else(|| {
+            "Fabric service advertisements require distribution to be enabled".to_string()
+        })?;
+        let generation = self.fabric_current_generation();
+        self.distributed
+            .services
+            .local_snapshot(node_id, generation, limit)
+    }
+
+    /// Atomically replace the service snapshot learned from one remote node.
+    ///
+    /// Older or duplicate generations are ignored. Node-loss cleanup clears
+    /// the remembered generation so a restarted node may begin at generation 1.
+    pub fn fabric_replace_remote_service_advertisements(
+        &mut self,
+        snapshot: ServiceAdvertisementSnapshot,
+    ) -> Result<usize, String> {
+        self.fabric_sync();
+        if !self.distributed.enabled || self.distributed.node_id.is_none() {
+            return Err(
+                "Fabric remote service advertisements require distribution to be enabled".into(),
+            );
+        }
+        if self.distributed.node_id == Some(snapshot.node_id) {
+            return Ok(0);
+        }
+
+        let changed = self
+            .distributed
+            .services
+            .replace_remote_node(snapshot.clone())?;
+        self.fabric_broadcast_control(FabricControl::ReplaceRemoteServices(snapshot));
+        Ok(changed)
+    }
+
+    /// Resolve currently serving service endpoints.
+    ///
+    /// Service health is advisory routing state. Remote endpoints are returned
+    /// only while cluster membership still considers their node healthy;
+    /// membership/fencing remains authoritative for node ownership.
+    pub fn fabric_resolve_service(
+        &mut self,
+        service: &str,
+    ) -> Result<Vec<ServiceAdvertisement>, String> {
+        self.fabric_sync();
+        let local_node = self.distributed.node_id;
+        let healthy_remote: HashSet<NodeId> = self
+            .distributed
+            .cluster
+            .as_ref()
+            .map(|cluster| {
+                cluster
+                    .healthy_members()
+                    .into_iter()
+                    .map(|node| node.node_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(self
+            .distributed
+            .services
+            .resolve(service)?
+            .into_iter()
+            .filter(|advertisement| {
+                Some(advertisement.node_id) == local_node
+                    || healthy_remote.contains(&advertisement.node_id)
+            })
+            .collect())
+    }
+
+    /// Number of service endpoints in the local routing view.
+    pub fn fabric_service_endpoint_count(&self) -> usize {
+        self.distributed.services.len()
+    }
+
+    /// Number of service endpoints learned from remote nodes.
+    pub fn fabric_remote_service_endpoint_count(&self) -> usize {
+        self.distributed
+            .services
+            .remote_len(self.distributed.node_id)
     }
 
     /// Number of ephemeral subscriptions currently known by this runtime shard.
