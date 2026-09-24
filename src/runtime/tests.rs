@@ -3697,6 +3697,53 @@ fn test_workflow_command_joins_first_atomic_transition() {
 }
 
 #[test]
+fn test_workflow_suspension_commits_command_but_not_partial_state() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "SuspendingWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    workflow::begin_workflow_command(&mut rt, actor_id, 4, &[Value::int(9)]).unwrap();
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.set_state_field("step_index", Value::int(7));
+        actor.waiting_signal = Some("resume".to_string());
+    }
+
+    workflow::commit_suspension_marker(&mut rt, actor_id).unwrap();
+
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(snapshot.sequence, 2);
+    assert_eq!(snapshot.waiting_signal.as_deref(), Some("resume"));
+    assert!(matches!(
+        snapshot.state.get("step_index"),
+        Some(PersistedValue::Int(0))
+    ));
+
+    // The live continuation still owns its partial mutations. A crash would
+    // discard them and recover from the baseline above.
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
+        Some(7)
+    );
+
+    let journal = rt.persistence.read_journal(actor_id);
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].sequence, 2);
+    assert_eq!(journal[0].behavior_id, 4);
+    assert!(!rt.pending_workflow_commands.contains_key(&actor_id));
+    assert_eq!(rt.persistence.latest_sequence(actor_id), 2);
+}
+
+#[test]
 fn test_workflow_commit_failure_discards_unrecoverable_activation() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
