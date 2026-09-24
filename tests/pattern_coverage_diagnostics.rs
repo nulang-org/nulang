@@ -99,3 +99,49 @@ fn exhaustive_bool_match_has_no_coverage_warning() {
 
     assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
 }
+
+
+#[test]
+fn warnings_are_not_sticky_across_checker_reuse() {
+    fn parse(source: &str) -> nulang::ast::AstModule {
+        let tokens = Lexer::new(source).lex().expect("lex");
+        Parser::new(tokens).parse_module().expect("parse")
+    }
+
+    let non_exhaustive = parse(
+        r#"
+        fn choose(flag: Bool) -> Int {
+            match flag {
+                | true => 1
+            }
+        }
+        "#,
+    );
+    let exhaustive = parse(
+        r#"
+        fn choose(flag: Bool) -> Int {
+            match flag {
+                | true => 1
+                | false => 0
+            }
+        }
+        "#,
+    );
+
+    let mut type_checker = TypeChecker::new();
+    type_checker
+        .check_module(&non_exhaustive)
+        .expect("first typecheck");
+    assert!(type_checker
+        .take_warnings()
+        .iter()
+        .any(|warning| warning.code == "W0201"));
+
+    type_checker
+        .check_module(&exhaustive)
+        .expect("second typecheck");
+    assert!(
+        type_checker.take_warnings().is_empty(),
+        "semantic warnings must belong to the current check only"
+    );
+}
