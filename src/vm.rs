@@ -7137,28 +7137,55 @@ mod vm_tests {
     #[cfg(feature = "native-codegen")]
     #[test]
     fn test_jit_direct_frame_string_equality_keeps_module_context() {
-        use crate::lexer::Lexer;
-        use crate::parser::Parser;
-        use crate::typechecker::TypeChecker;
+        let mut module = CodeModule::new("jit_string_context");
+        let c_limit = module.add_constant(Constant::Int(2_000));
+        let c_left = module.add_constant(Constant::String("same".to_string()));
+        let c_right = module.add_constant(Constant::String("same".to_string()));
 
-        let source = r#"
-            var i = 0;
-            var equal = false;
-            while i < 2000 {
-                equal = "same" == "same";
-                i = i + 1;
-            };
-            equal
-        "#;
+        // r0 = i/result, r1 = limit, r2 = loop condition, r4/r5 = strings,
+        // r6 = equality result, r7 = padding accumulator. Keep the loop body
+        // large enough to be a real JIT candidate so the test exercises the
+        // direct-frame path rather than merely validating interpreter behavior.
+        module.emit(Instruction::new3(
+            OpCode::ConstU,
+            ((c_limit >> 8) & 0xFF) as u8,
+            (c_limit & 0xFF) as u8,
+            1,
+        ));
+        module.emit(Instruction::new1(OpCode::Const0, 0));
+        module.emit(Instruction::new1(OpCode::Const0, 7));
 
-        let mut type_checker = TypeChecker::new();
-        let tokens = Lexer::new(source).lex().expect("lex");
-        let ast = Parser::new(tokens).parse_module().expect("parse");
-        type_checker.check_module(&ast).expect("typecheck");
-        let hir = crate::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
-        let mut mir = crate::mir_lower::lower_module(&hir).expect("mir lower");
-        let module = crate::mir_codegen::compile_mir(&mut mir, "jit_string_context")
-            .expect("compile");
+        let loop_start = module.current_offset();
+        module.emit(Instruction::new3(
+            OpCode::ConstU,
+            ((c_left >> 8) & 0xFF) as u8,
+            (c_left & 0xFF) as u8,
+            4,
+        ));
+        module.emit(Instruction::new3(
+            OpCode::ConstU,
+            ((c_right >> 8) & 0xFF) as u8,
+            (c_right & 0xFF) as u8,
+            5,
+        ));
+        module.emit(Instruction::new3(OpCode::ICmpEq, 4, 5, 6));
+        module.emit(Instruction::new1(OpCode::IInc, 7));
+        module.emit(Instruction::new1(OpCode::IInc, 7));
+        module.emit(Instruction::new1(OpCode::IInc, 7));
+        module.emit(Instruction::new1(OpCode::IInc, 0));
+        module.emit(Instruction::new3(OpCode::ICmpLt, 0, 1, 2));
+
+        let jmp_back = module.current_offset();
+        let back = loop_start as i64 - jmp_back as i64;
+        module.emit(Instruction::new3(
+            OpCode::JmpT,
+            2,
+            ((back as i16 >> 8) & 0xFF) as u8,
+            (back as i16 & 0xFF) as u8,
+        ));
+        module.emit(Instruction::new2(OpCode::Move, 6, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
 
         let mut vm = VM::new();
         vm.load_module(module);
@@ -7168,12 +7195,14 @@ mod vm_tests {
             Some(true),
             "hot string equality must preserve interned-string resolution"
         );
+
+        let compiled = vm
+            .jit_session
+            .as_ref()
+            .map(|jit| jit.compiled_count())
+            .unwrap_or(0);
         assert!(
-            vm.jit_session
-                .as_ref()
-                .map(|jit| jit.compiled_count())
-                .unwrap_or(0)
-                > 0,
+            compiled > 0,
             "string equality loop must tier up for this regression to be meaningful"
         );
     }
