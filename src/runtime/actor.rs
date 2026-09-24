@@ -763,6 +763,7 @@ mod tests {
             sender: 99,
             priority: MessagePriority::Normal,
             trace_id: None,
+            durable_id: None,
         };
         assert!(actor.send(msg.clone()).is_ok());
         let received = actor.receive().expect("should receive a message");
