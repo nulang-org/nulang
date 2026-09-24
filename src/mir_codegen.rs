@@ -3942,12 +3942,15 @@ mod optimize_tests {
         let payload = b.add_temp(arr_ty);
         let sent = b.add_temp(Type::unit());
         b.assign(payload, mir::RValue::ArrayLit(vec![]));
-        b.assign(sent, mir::RValue::Send {
+        b.assign(
+            sent,
+            mir::RValue::Send {
                 actor: target,
                 behavior_idx: 0,
                 args: vec![payload],
                 remote: false,
-            });
+            },
+        );
         b.terminate(mir::Terminator::Return(None));
         let plan = plan_consuming_send_args(&b.build());
         assert_eq!(plan.args_by_stmt.get(&(0, 1)), Some(&vec![payload]));
@@ -3963,12 +3966,15 @@ mod optimize_tests {
         let sent = b.add_temp(Type::unit());
         b.assign(payload, mir::RValue::ArrayLit(vec![]));
         b.assign(len, mir::RValue::ArrayLen(payload));
-        b.assign(sent, mir::RValue::Send {
+        b.assign(
+            sent,
+            mir::RValue::Send {
                 actor: target,
                 behavior_idx: 0,
                 args: vec![payload],
                 remote: false,
-            });
+            },
+        );
         b.terminate(mir::Terminator::Return(None));
         assert!(plan_consuming_send_args(&b.build()).args_by_stmt.is_empty());
     }
@@ -3981,12 +3987,15 @@ mod optimize_tests {
         let payload = b.add_temp(arr_ty);
         let sent = b.add_temp(Type::unit());
         b.assign(payload, mir::RValue::ArrayLit(vec![]));
-        b.assign(sent, mir::RValue::Send {
+        b.assign(
+            sent,
+            mir::RValue::Send {
                 actor: target,
                 behavior_idx: 0,
                 args: vec![payload],
                 remote: true,
-            });
+            },
+        );
         b.terminate(mir::Terminator::Return(None));
         assert!(plan_consuming_send_args(&b.build()).args_by_stmt.is_empty());
     }
