@@ -3685,9 +3685,7 @@ fn test_workflow_timer_set_stages_until_atomic_turn_boundary() {
     assert_eq!(rt.persistence.latest_sequence(actor_id), 1);
     assert!(rt.timer_wheel.is_empty());
     assert_eq!(
-        rt.pending_workflow_events
-            .get(&actor_id)
-            .map(Vec::len),
+        rt.pending_workflow_events.get(&actor_id).map(Vec::len),
         Some(1)
     );
 
