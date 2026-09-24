@@ -839,11 +839,12 @@ pub(crate) fn schedule_workflow_timer(
 ) {
     if actor_is_workflow(rt, actor_id) {
         if rt.vm_execution_depth > 0 {
+            let sequence = next_sequence(rt, actor_id);
             stage_workflow_event(
                 rt,
                 actor_id,
                 WorkflowEvent::TimerSet {
-                    sequence: next_sequence(rt, actor_id),
+                    sequence,
                     name: name.to_string(),
                     duration_ms,
                 },
