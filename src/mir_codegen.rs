@@ -688,7 +688,7 @@ impl MirCodegen {
                             }
                             if candidate_mask != 0 {
                                 self.module.send_ownership_sites.push(SendOwnershipSite {
-                                    pc: function_start + stmt_code_start + offset,
+                                    pc: stmt_code_start + offset,
                                     candidate_mask,
                                     sources,
                                 });
@@ -3975,6 +3975,45 @@ mod optimize_tests {
             value.as_int(),
             Some(0),
             "clearing the moved-from source must not invalidate the destination"
+        );
+    }
+
+    #[test]
+    fn test_codegen_send_ownership_site_pc_is_absolute_across_functions() {
+        let mut module = mir::Module::new("send_site_absolute");
+
+        let mut prefix = mir::FunctionBuilder::new("prefix", None);
+        let prefix_value = prefix.add_temp(Type::int());
+        prefix.assign(prefix_value, mir::RValue::Use(mir::Operand::Constant(mir::Constant::Int(1))));
+        prefix.terminate(mir::Terminator::Return(Some(prefix_value)));
+        module.functions.push(prefix.build());
+
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut sender = mir::FunctionBuilder::new("sender", None);
+        let target = sender.add_param("target", Type::unit());
+        let payload = sender.add_temp(arr_ty);
+        let sent = sender.add_temp(Type::unit());
+        sender.assign(payload, mir::RValue::ArrayLit(vec![]));
+        sender.assign(
+            sent,
+            mir::RValue::Send {
+                actor: target,
+                behavior_idx: 0,
+                args: vec![payload],
+                remote: false,
+            },
+        );
+        sender.terminate(mir::Terminator::Return(None));
+        module.functions.push(sender.build());
+
+        let code = compile_mir(&mut module, "send_site_absolute").unwrap();
+        assert_eq!(code.send_ownership_sites.len(), 1);
+        let site = &code.send_ownership_sites[0];
+        assert!(site.pc < code.instructions.len());
+        assert_eq!(code.instructions[site.pc].opcode, OpCode::Send);
+        assert!(
+            site.pc > code.function_table[0],
+            "send site in the second function must point past the first function"
         );
     }
 
