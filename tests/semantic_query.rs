@@ -112,3 +112,26 @@ fn callers_and_callees_form_a_direct_call_graph() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+
+#[test]
+fn context_query_returns_local_semantic_slice() {
+    let dir = temp_dir("context");
+    let src = write_source(&dir);
+    let v = run_json(&["context", "twice"], &src);
+
+    let symbols = v["symbols"].as_array().expect("symbols");
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0]["name"], "twice");
+
+    let refs = v["references"].as_array().expect("references");
+    assert_eq!(refs.len(), 2);
+    assert!(refs
+        .iter()
+        .any(|r| r["owner"] == "twice" && r["target"] == "add"));
+    assert!(refs
+        .iter()
+        .any(|r| r["owner"] == "main" && r["target"] == "twice"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
