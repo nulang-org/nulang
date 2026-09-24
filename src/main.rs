@@ -1682,7 +1682,7 @@ fn run_frontend(
 
     // Semantic warnings require inferred types, so they are surfaced after
     // successful type checking. They follow the same warning-by-default,
-    // strict-under---deny-warnings policy as parser warnings.
+    // strict-under-`--deny-warnings` policy as parser warnings.
     let type_warnings = type_checker.take_warnings();
     if !type_warnings.is_empty() {
         let use_color = std::io::stderr().is_terminal();
