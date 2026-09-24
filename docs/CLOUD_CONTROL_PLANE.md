@@ -140,9 +140,31 @@ separate tables without changing scheduler/reconciler semantics.
 already committed evaluation returns the durable plan rather than recomputing it
 against a newer node snapshot.
 
+## Durable command execution
+
+`dispatch_pending` drains the allocation outbox through an
+`AllocationCommandSink`. The sink contract is explicitly idempotent because a
+controller can crash after a node applied a command but before the ACK reached
+durable storage.
+
+Execution ordering is safety-biased:
+
+- Stop commands are attempted before Start commands;
+- a failed Stop blocks Starts for the same logical deployment replica;
+- a pending Start is rechecked against the authoritative allocation epoch;
+- a stale Start is never delivered as Start; it is converted to an idempotent
+  compensating Stop before the stale command is acknowledged;
+- after a successful Start, authority is checked again; if it changed during
+  delivery, a compensating Stop is issued before ACK.
+
+This closes the crash-after-start/stale-outbox recovery case without requiring
+the executor to infer intent from gossip. The initial dispatcher assumes one
+logical dispatcher per control-store scope. Durable command claims/leases are
+the next hardening step before active-active dispatchers are supported.
+
 ## Next implementation slices
 
-1. Node-side allocation executor honoring epoch fencing and durable outbox ACKs.
+1. Durable command claiming/leases for active-active dispatchers.
 2. Reconciliation event loop for deployment/node/allocation changes.
 3. PostgreSQL state normalization only if measured contention/state size justifies it.
 4. Fabric-backed service directory with generation-tagged health advertisements.
