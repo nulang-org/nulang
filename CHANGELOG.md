@@ -1725,6 +1725,12 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Cloud control-plane placement foundation — 2026-09-24
+- **Nulang Cloud now has an isolated deterministic control-plane planner** (`crates/nulang-cloud-control`) that turns deployment intent plus node/allocation snapshots into a pure `PlacementPlan` without mutating runtimes or provisioning infrastructure.
+- **Placement separates hard feasibility from soft ranking.** Node state, architecture, region/zone, trust tier, required labels/capabilities, resource availability, and per-node replica limits reject candidates before region-locality, failure-domain spread, node spread, and headroom scoring.
+- **Per-replica allocation epochs provide a fencing contract for later durable commit/execution.** Matching allocations are retained, lower-epoch duplicates are superseded, stale revisions and invalid placements are replaced with `max(epoch)+1`, and scale-down work is explicit.
+- **Blocked placement is explainable rather than opaque.** Partial plans identify unscheduled replicas, per-node rejection details, and aggregate rejection counts suitable for a future `nula cloud explain` surface. The existing `nulang-capacity` crate remains the separate provider-capacity/lease layer.
+
 ### RFC 0020 Behavior Manifest durability admission subset — 2026-09-23
 - **Package builds now emit `<package>.behavior.json` beside `.nbc` artifacts** (`src/behavior_manifest.rs`, `src/main.rs`, `src/package/commands.rs`). The experimental `nulang.behavior/v0alpha1` sidecar binds package/language metadata to compiler artifact identity and exposes durable actor persistence class, schema version, canonical state-schema semantic identity, and migration topology.
 - **Manifest parsing fails closed** on unknown schema versions/artifact kinds, malformed content identities or digests, duplicate actors, invalid/incomplete migration chains, and artifact identity tampering. The sidecar includes a BLAKE3 digest of the exact emitted `.nbc` bytes and can verify the executable/manifest pairing; canonical ordering gives deterministic JSON and a separate domain-separated manifest digest.
