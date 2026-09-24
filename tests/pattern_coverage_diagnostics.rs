@@ -100,7 +100,6 @@ fn exhaustive_bool_match_has_no_coverage_warning() {
     assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
 }
 
-
 #[test]
 fn warnings_are_not_sticky_across_checker_reuse() {
     fn parse(source: &str) -> nulang::ast::AstModule {
