@@ -1085,6 +1085,7 @@ pub fn compile_mir_function_body(
     _func_index: usize,
     func_id: cranelift_module::FuncId,
     mode: CompileMode,
+    effect_site_indices: &[usize],
 ) -> AotResult<()> {
     aot.mode = mode;
     // Reconstruct the signature for the codegen context. Lifted closure
@@ -1109,6 +1110,39 @@ pub fn compile_mir_function_body(
     let local_base = mir::FunctionBuilder::LOCAL_BASE;
     let type_meta = mir_func.type_metadata.clone();
     aot.cap_metadata = CapabilityMetadata::from_mir_function(mir_func);
+
+    // Map natural MIR statement order to canonical module-level semantic-site
+    // indexes before reverse-postorder codegen changes block visitation order.
+    let mut effect_site_by_stmt: HashMap<(mir::BlockId, usize), usize> = HashMap::new();
+    let mut effect_cursor = 0usize;
+    for block in &mir_func.blocks {
+        for (stmt_idx, stmt) in block.stmts.iter().enumerate() {
+            let is_effect = matches!(
+                stmt,
+                mir::Stmt::Assign {
+                    op: mir::RValue::Perform { .. } | mir::RValue::PerformAsync { .. },
+                    ..
+                }
+            );
+            if is_effect {
+                let site_index = *effect_site_indices.get(effect_cursor).ok_or_else(|| {
+                    AotCompileError::Internal(format!(
+                        "semantic effect-site metadata exhausted in native function '{}'",
+                        mir_func.name
+                    ))
+                })?;
+                effect_site_by_stmt.insert((block.id, stmt_idx), site_index);
+                effect_cursor += 1;
+            }
+        }
+    }
+    if effect_cursor != effect_site_indices.len() {
+        return Err(AotCompileError::Internal(format!(
+            "{} semantic effect-site records were not mapped in native function '{}'",
+            effect_site_indices.len() - effect_cursor,
+            mir_func.name
+        )));
+    }
 
     // Analyze block predecessors.
     let preds = compute_predecessors(mir_func);
@@ -1309,7 +1343,7 @@ pub fn compile_mir_function_body(
             let func_ref = module.declare_func_in_func(h_id, builder.func);
             h.insert(h_name, func_ref);
         }
-        // perform helpers: nulang_aot_perform_N(eff, op, arg0..argN-1) -> i64
+        // perform helpers: nulang_aot_perform_N(site, eff, op, arg0..argN-1) -> i64
         const AOT_PERFORM_HELPERS: [&str; 9] = [
             "nulang_aot_perform_0",
             "nulang_aot_perform_1",
@@ -1323,6 +1357,7 @@ pub fn compile_mir_function_body(
         ];
         for (n, h_name) in AOT_PERFORM_HELPERS.iter().enumerate() {
             let mut h_sig = module.make_signature();
+            h_sig.params.push(AbiParam::new(types::I64)); // semantic site index
             h_sig.params.push(AbiParam::new(types::I64)); // effect name const
             h_sig.params.push(AbiParam::new(types::I64)); // op name const
             for _ in 0..n {
@@ -1458,7 +1493,7 @@ pub fn compile_mir_function_body(
             let func_ref = module.declare_func_in_func(h_id, builder.func);
             h.insert(h_name, func_ref);
         }
-        // async-effect helpers: nulang_aot_perform_async_N(effect, arg0..)
+        // async-effect helpers: nulang_aot_perform_async_N(site, effect, arg0..)
         // -> i64
         const AOT_PERFORM_ASYNC_HELPERS: [&str; 9] = [
             "nulang_aot_perform_async_0",
@@ -1473,6 +1508,7 @@ pub fn compile_mir_function_body(
         ];
         for (n, h_name) in AOT_PERFORM_ASYNC_HELPERS.iter().enumerate() {
             let mut h_sig = module.make_signature();
+            h_sig.params.push(AbiParam::new(types::I64)); // semantic site index
             h_sig.params.push(AbiParam::new(types::I64)); // effect name (TAG_STRING)
             for _ in 0..n {
                 h_sig.params.push(AbiParam::new(types::I64));
@@ -1795,6 +1831,7 @@ pub fn compile_mir_function_body(
                     &handler_threaded_width,
                     &site_extras,
                     &mut cont_thread,
+                    effect_site_by_stmt.get(&(bid, stmt_idx)).copied(),
                     stmt_idx,
                     bid,
                 )?;
@@ -2034,6 +2071,7 @@ fn compile_stmt(
     handler_threaded_width: &HashMap<mir::BlockId, usize>,
     site_extras: &HashMap<(mir::BlockId, usize), Vec<u32>>,
     cont_thread: &mut Vec<u32>,
+    effect_site_index: Option<usize>,
     stmt_idx: usize,
     current_block: mir::BlockId,
 ) -> AotResult<()> {
@@ -2253,6 +2291,7 @@ fn compile_stmt(
                 constants,
                 field_map,
                 foreign_functions,
+                effect_site_index,
             )?;
             let reg = mir::FunctionBuilder::LOCAL_BASE + dst.0;
             local_vals.insert(reg, val);
@@ -2380,6 +2419,7 @@ fn compile_rvalue(
     constants: &[crate::bytecode::Constant],
     field_map: &HashMap<String, u8>,
     foreign_functions: &[mir::ForeignFunction],
+    effect_site_index: Option<usize>,
 ) -> AotResult<Value> {
     match rv {
         mir::RValue::Const(c) => compile_const(builder, c, mode, constants),
@@ -2589,7 +2629,15 @@ fn compile_rvalue(
                     )))
                 }
             };
-            let mut call_args = Vec::with_capacity(arg_vals.len() + 2);
+            let site_index = effect_site_index.ok_or_else(|| {
+                AotCompileError::Internal(format!(
+                    "missing semantic effect-site index for native {}.{}",
+                    effect, op
+                ))
+            })?;
+            let site_val = builder.ins().iconst(types::I64, site_index as i64);
+            let mut call_args = Vec::with_capacity(arg_vals.len() + 3);
+            call_args.push(site_val);
             call_args.push(eff_val);
             call_args.push(op_val);
             call_args.extend(arg_vals);
@@ -2798,7 +2846,15 @@ fn compile_rvalue(
                     )))
                 }
             };
-            let mut call_args = Vec::with_capacity(arg_vals.len() + 1);
+            let site_index = effect_site_index.ok_or_else(|| {
+                AotCompileError::Internal(format!(
+                    "missing semantic effect-site index for native {}",
+                    effect_op
+                ))
+            })?;
+            let site_val = builder.ins().iconst(types::I64, site_index as i64);
+            let mut call_args = Vec::with_capacity(arg_vals.len() + 2);
+            call_args.push(site_val);
             call_args.push(eff_val);
             call_args.extend(arg_vals);
             call_helper(builder, helpers, helper_name, &call_args)
@@ -3022,6 +3078,7 @@ fn compile_rvalue(
                     constants,
                     field_map,
                     foreign_functions,
+                    None,
                 )?;
                 let name_val = builder.ins().iconst(types::I64, name_idx);
                 call_void_helper(builder, helpers, "nulang_aot_spawn_push", &[name_val, val])?;
