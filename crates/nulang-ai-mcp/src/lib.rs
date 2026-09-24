@@ -121,8 +121,8 @@ impl McpServer {
         let result = match req.method.as_str() {
             "server/discover" => Ok(self.server_discover()),
             "initialize" => Ok(self.initialize(req.params.as_ref())),
-            "ping" => Ok(json!({})),
-            "notifications/initialized" => Ok(Value::Null),
+            "ping" if !modern => Ok(json!({})),
+            "notifications/initialized" if !modern => Ok(Value::Null),
             "tools/list" => self.tools_list().await,
             "tools/call" => self.tools_call(req.params.unwrap_or_default()).await,
             _ => Err(JsonRpcError {
@@ -155,7 +155,7 @@ impl McpServer {
 
     fn server_discover(&self) -> Value {
         json!({
-            "supportedVersions": [MODERN_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION],
+            "supportedVersions": [MODERN_PROTOCOL_VERSION],
             "capabilities": {
                 "tools": {
                     "listChanged": false
@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discover_advertises_modern_and_legacy_eras() {
+    async fn discover_advertises_modern_era() {
         let server = semantic_mcp_server().await;
         let response = server
             .handle_request(request(1, "server/discover", Some(json!({}))))
@@ -428,10 +428,10 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!(MODERN_PROTOCOL_VERSION)));
-        assert!(result["supportedVersions"]
-            .as_array()
-            .unwrap()
-            .contains(&json!(LEGACY_PROTOCOL_VERSION)));
+        assert_eq!(
+            result["supportedVersions"].as_array().unwrap(),
+            &[json!(MODERN_PROTOCOL_VERSION)]
+        );
         assert_eq!(
             result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
             SERVER_NAME
