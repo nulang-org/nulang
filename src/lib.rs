@@ -77,6 +77,7 @@ pub mod package;
 pub mod parallel_analysis;
 pub mod parallel_marker;
 pub mod parser;
+pub mod pattern_coverage;
 pub mod prelude_source;
 pub mod primitives;
 pub mod protocol;

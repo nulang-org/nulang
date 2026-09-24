@@ -176,8 +176,12 @@ Core surface forms (`src/ast.rs`, `src/parser.rs`):
   §6.3).
 
 There is no `switch` and no `case` keyword — `match` arms are introduced by
-`|`. Pattern matching is typed but **not** exhaustiveness-checked today: a
-non-exhaustive `match` compiles and may fail at runtime.
+`|`. Pattern matching is typed and receives a conservative finite-domain
+coverage pass after type inference. Closed variants and `Bool` can produce
+`W0201` (provably non-exhaustive) and `W0202` (provably redundant arm) without
+changing default Nulang 1.x program validity; `--deny-warnings` opts into
+strict rejection. Unsupported/infinite domains and unproven structured cases
+retain the runtime non-exhaustive-match fallback.
 
 ### 2.2 HM Type Inference
 
@@ -210,11 +214,12 @@ Pony-style lattice (`iso`, `lineariso`, `trn`, `ref`, `val`, `box`, `tag`;
 subtyping computed via `join`). `LinearIso` adds exactly-once linear
 consumption tracking. Capabilities are compile-time only — see §2.4.
 
-**What does not exist:** no type classes or constrained types
-(`fn f[T: Serializable]` is not valid Nulang), no `protocol` construct, and
-no exhaustiveness checking for `match`. Type inference deliberately does not
-cross actor boundaries — behavior signatures are explicit annotations — so
-actors remain separately checkable units.
+**Current static-analysis boundary:** finite-domain `match` coverage is
+conservative rather than a complete pattern-matrix proof, and dynamic/opaque
+actor references remain permissive where no nominal protocol is statically
+known. Type inference deliberately does not infer behavior signatures across
+actor boundaries; declared/derived protocol metadata supplies those
+constraints when the target identity is known.
 
 ### 2.3 Effects: Static Rows, Runtime Handler Stack
 
