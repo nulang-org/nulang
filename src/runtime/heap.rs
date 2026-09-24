@@ -757,13 +757,24 @@ impl ActorHeap {
             .total_size
             .max(self.growth_floor)
             .max(min_capacity);
-        let layout = std::alloc::Layout::from_size_align(new_size, ALIGN).ok()?;
-        // SAFETY: layout has non-zero size (`total_size` > 0) and is valid.
-        let base = unsafe { std::alloc::alloc(layout) };
-        if base.is_null() {
-            // Report OS OOM as exhaustion, matching alloc's `None` contract.
-            return None;
-        }
+        // Reuse only an exact-size pooled block. The configured growth floor
+        // is a real memory tier, not merely a minimum: accepting a larger
+        // best-fit block here would make actor footprint depend on unrelated
+        // prior heap sizes on this shard.
+        let pooled = HEAP_POOL.with(|pool| pool.borrow_mut().acquire_exact(new_size));
+        let base = match pooled {
+            Some((base, _)) => base,
+            None => {
+                let layout = std::alloc::Layout::from_size_align(new_size, ALIGN).ok()?;
+                // SAFETY: layout has non-zero size and is valid.
+                let base = unsafe { std::alloc::alloc(layout) };
+                if base.is_null() {
+                    // Report OS OOM as exhaustion, matching alloc's `None` contract.
+                    return None;
+                }
+                base
+            }
+        };
 
         // Retire the exhausted block; its contents stay exactly where they are.
         self.retired_blocks.push((self.base, self.total_size));
@@ -1333,6 +1344,28 @@ fn test_heap_pool_exact_acquire_does_not_substitute_larger_block() {
     // The acquired small block is no longer owned by the pool.
     unsafe { std::alloc::dealloc(base, small_layout) };
     // The 16 KiB block remains in the pool and is released by HeapPool::drop.
+}
+
+#[test]
+fn test_tiered_heap_reuses_exact_growth_blocks() {
+    // Seed the thread-local pool with a 16 KiB block by materializing and
+    // dropping a generic heap of that exact size.
+    {
+        let mut donor = ActorHeap::new(16 * 1024);
+        donor.alloc(8, TypeTag::Raw).expect("donor allocation");
+    }
+
+    let mut heap = ActorHeap::new_with_growth_floor(4 * 1024, 16 * 1024);
+    // Materialize the 4 KiB first tier.
+    heap.alloc(8, TypeTag::Raw).expect("initial allocation");
+
+    // Force growth with an allocation that fits the 16 KiB tier but not the
+    // remaining first block. The active block must become exactly 16 KiB.
+    while heap.free_bytes() >= 256 {
+        heap.alloc(128, TypeTag::Raw).expect("fill first block");
+    }
+    heap.alloc(128, TypeTag::Raw).expect("growth allocation");
+    assert_eq!(heap.total_size, 16 * 1024);
 }
 
 #[test]
