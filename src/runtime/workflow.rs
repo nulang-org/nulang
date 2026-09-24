@@ -203,7 +203,7 @@ pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::
     // persistence operation must advance that same tail. A legacy snapshot
     // write here would create history that commit_transition cannot fence.
     if actor_is_workflow(rt, actor_id) {
-        return commit_workflow_transition(rt, actor_id, Vec::new());
+        return commit_workflow_transition(rt, actor_id, Vec::new(), true, true);
     }
 
     let sequence = next_sequence(rt, actor_id);
@@ -225,6 +225,8 @@ fn commit_workflow_transition(
     rt: &mut Runtime,
     actor_id: u64,
     workflow_events: Vec<WorkflowEvent>,
+    include_pending_command: bool,
+    include_snapshot: bool,
 ) -> std::io::Result<()> {
     let expected_previous_sequence = rt.persistence.latest_sequence(actor_id);
     let sequence = match workflow_events.first() {
@@ -258,14 +260,21 @@ fn commit_workflow_transition(
         return Err(error);
     }
 
-    let snapshot = match build_actor_snapshot(rt, actor_id, sequence) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            mark_workflow_commit_failure(rt, actor_id);
-            return Err(error);
+    let snapshot = if include_snapshot {
+        match build_actor_snapshot(rt, actor_id, sequence) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                mark_workflow_commit_failure(rt, actor_id);
+                return Err(error);
+            }
         }
+    } else {
+        None
     };
-    let command = pending_command_at_sequence(rt, actor_id, sequence);
+    let command = include_pending_command
+        .then(|| pending_command_at_sequence(rt, actor_id, sequence))
+        .flatten();
+    let committed_pending_command = command.is_some();
     let transition = DurableTransition {
         version: DURABLE_TRANSITION_VERSION,
         actor_id,
@@ -286,9 +295,11 @@ fn commit_workflow_transition(
     }
 
     // The command is no longer merely in-flight once the durable transition
-    // that it caused has committed.
-    rt.pending_workflow_commands.remove(&actor_id);
-    rt.workflow_commit_failures.remove(&actor_id);
+    // that it caused has committed. External event-only transitions deliberately
+    // leave the original suspended command pending.
+    if committed_pending_command {
+        rt.pending_workflow_commands.remove(&actor_id);
+    }
 
     if let Some(snapshot) = snapshot.as_ref() {
         publish_committed_snapshot(rt, actor_id, snapshot);
@@ -305,7 +316,19 @@ pub(crate) fn commit_workflow_event(
     actor_id: u64,
     event: WorkflowEvent,
 ) -> std::io::Result<()> {
-    commit_workflow_transition(rt, actor_id, vec![event])
+    commit_workflow_transition(rt, actor_id, vec![event], true, true)
+}
+
+/// Commit an externally-driven workflow event without attributing a suspended
+/// command to it and without snapshotting partially-mutated in-memory state.
+///
+/// Recovery replays these events after the last committed snapshot.
+fn commit_external_workflow_event(
+    rt: &mut Runtime,
+    actor_id: u64,
+    event: WorkflowEvent,
+) -> std::io::Result<()> {
+    commit_workflow_transition(rt, actor_id, vec![event], false, false)
 }
 
 /// Snapshot the durable and CRDT state of a persistent actor.
@@ -465,7 +488,7 @@ pub(crate) fn append_timer_fired(
     name: &str,
 ) -> std::io::Result<()> {
     let sequence = next_sequence(rt, actor_id);
-    commit_workflow_event(
+    commit_external_workflow_event(
         rt,
         actor_id,
         WorkflowEvent::TimerFired {
@@ -482,7 +505,7 @@ pub(crate) fn append_signal_received(
     payload: Option<String>,
 ) -> std::io::Result<()> {
     let sequence = next_sequence(rt, actor_id);
-    commit_workflow_event(
+    commit_external_workflow_event(
         rt,
         actor_id,
         WorkflowEvent::SignalReceived {
