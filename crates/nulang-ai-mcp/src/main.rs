@@ -70,6 +70,9 @@ async fn write_response(
     stdout
         .write_all(&bytes)
         .await
-        .and_then(|_| async { stdout.flush().await }.await)
-        .map_err(|error| format!("write response: {error}"))
+        .map_err(|error| format!("write response: {error}"))?;
+    stdout
+        .flush()
+        .await
+        .map_err(|error| format!("flush response: {error}"))
 }
