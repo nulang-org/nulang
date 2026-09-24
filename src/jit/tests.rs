@@ -1631,13 +1631,6 @@ fn test_tier2_replaces_baseline_with_typed_code() {
     );
 }
 
-/// ArrLen opcode must write its result (array length) to the *destination*
-/// register (`instr.op2`), not an unused operand (`instr.op3`).  The scalar
-/// compiler previously passed `instr.op3` to `nulang_arr_len`, which silently
-/// wrote the length to the wrong register — causing any cold-vs-warm
-/// divergence when ArrLen appeared inside a JIT-compiled region.
-///
-/// Regression test for commit fcdca62 (op3→op2 in the ArrLen handler).
 #[test]
 fn test_tier2_replaces_typed_region_with_simd_code() {
     if !crate::jit::simd_compiler::is_simd_supported() {
@@ -1696,7 +1689,13 @@ fn test_tier2_replaces_typed_region_with_simd_code() {
     );
 }
 
-
+/// ArrLen opcode must write its result (array length) to the *destination*
+/// register (`instr.op2`), not an unused operand (`instr.op3`).  The scalar
+/// compiler previously passed `instr.op3` to `nulang_arr_len`, which silently
+/// wrote the length to the wrong register — causing any cold-vs-warm
+/// divergence when ArrLen appeared inside a JIT-compiled region.
+///
+/// Regression test for commit fcdca62 (op3→op2 in the ArrLen handler).
 #[test]
 fn test_arrlen_scalar_register_destination() {
     use crate::vm::VM;
