@@ -5559,16 +5559,35 @@ impl Runtime {
         let stable_actor_id = grain_actor_id(&grain_id);
 
         // Register the recovery module so checkpoint/replay know the bytecode.
-        self.register_recovery_module(
+        self.register_recovery_module_for_definition(
             stable_actor_id,
+            &grain_id.grain_type,
             grain_type.module.clone(),
             grain_type.bytecode_offsets.clone(),
             grain_type.compensation_offsets.clone(),
         );
 
         let snapshot = self.persistence.load_snapshot(stable_actor_id);
+        let verified_definition_semantic_id = if let Some(ref snap) = snapshot {
+            Self::verify_snapshot_definition_semantic_identity(
+                stable_actor_id,
+                snap,
+                grain_type.module.actor_semantic_id(&grain_id.grain_type),
+                RecoveryIdentityPolicy::LegacyCompatible,
+            )
+            .map_err(|error| NuError::RuntimeError {
+                msg: format!(
+                    "cannot hydrate virtual actor {}: {}",
+                    grain_id.actor_name(),
+                    error
+                ),
+                span: Span::new(0, 0),
+            })?
+        } else {
+            grain_type.module.actor_semantic_id(&grain_id.grain_type)
+        };
 
-        let actor = if let Some(ref snap) = snapshot {
+        let mut actor = if let Some(ref snap) = snapshot {
             Self::restore_actor_from_snapshot(
                 stable_actor_id,
                 &grain_type.module,
@@ -5610,6 +5629,8 @@ impl Runtime {
             }
             actor
         };
+
+        actor.definition_semantic_id = verified_definition_semantic_id;
 
         // Track the grain identity.
         self.actors.insert(stable_actor_id, actor);
@@ -5688,6 +5709,18 @@ impl Runtime {
                 return false;
             }
         };
+
+        // Frozen NBC v1 does not embed the compiler semantic sidecar, so an
+        // identified snapshot arriving through this transport cannot be
+        // verified against the received bytecode. Reject rather than trusting
+        // the snapshot to self-certify the code that should execute its state.
+        if snapshot.semantic_id.is_some() {
+            tracing::warn!(
+                "nulang-migrate: refusing identified snapshot for actor {} over legacy NBC v1 transport",
+                actor_id
+            );
+            return false;
+        }
 
         let is_workflow = module.actor_metadata.iter().any(|m| m.is_workflow);
         let is_agent = module.actor_metadata.iter().any(|m| m.is_agent);
@@ -6440,6 +6473,7 @@ impl Runtime {
                 .iter()
                 .map(|entry| (entry.name.clone(), entry.handler_fn))
                 .collect(),
+            definition_semantic_id: actor.definition_semantic_id,
             bytecode_module: actor.bytecode_module.clone(),
             bytecode_offsets: actor.bytecode_offsets.clone(),
             compensation_offsets: actor.compensation_offsets.clone(),
