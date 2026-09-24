@@ -25,7 +25,7 @@
 
 use crate::bytecode::{
     CodeModule, Constant, DebugFunctionInfo, EffectSiteMetadata, ForeignFunctionDef,
-    HandlerBinding, HandlerTable, Instruction, OpCode,
+    HandlerBinding, HandlerTable, Instruction, OpCode, SendOwnershipSite, SendOwnershipSource,
 };
 use crate::mir;
 use crate::semantic_identity::{effect_sites_for_mir, EffectSiteOwnerKind, MirEffectSite};
@@ -587,6 +587,7 @@ impl MirCodegen {
         // Conservative liveness-based placement of `Drop` instructions (see
         // the module docs and `plan_drops`).
         let drop_plan = plan_drops(func);
+        let consuming_send_plan = plan_consuming_send_args(func);
 
         // Source-line map: `(block id, statement index) -> line`, translated
         // to bytecode PCs below so the debugger can place breakpoints and
@@ -652,7 +653,50 @@ impl MirCodegen {
                     }
                     _ => None,
                 };
+                let stmt_code_start = self.module.instructions.len();
                 self.compile_stmt(stmt, func, &mut handle_patches, effect_site)?;
+
+                if let Some(consuming) = consuming_send_plan.args_by_stmt.get(&(bi, si)) {
+                    if let mir::Stmt::Assign {
+                        op:
+                            mir::RValue::Send {
+                                args,
+                                remote: false,
+                                ..
+                            },
+                        ..
+                    } = stmt
+                    {
+                        if let Some((offset, _)) = self.module.instructions[stmt_code_start..]
+                            .iter()
+                            .enumerate()
+                            .find(|(_, instr)| instr.opcode == OpCode::Send)
+                        {
+                            let mut candidate_mask = 0u16;
+                            let mut sources = Vec::new();
+                            for (arg_idx, arg) in args.iter().enumerate() {
+                                if arg_idx >= u16::BITS as usize || !consuming.contains(arg) {
+                                    continue;
+                                }
+                                candidate_mask |= 1u16 << arg_idx;
+                                let source = if let Some(&slot) = self.spill_map.get(&arg.0) {
+                                    SendOwnershipSource::Spill(slot)
+                                } else {
+                                    SendOwnershipSource::Register((LOCAL_BASE + arg.0) as u8)
+                                };
+                                sources.push((arg_idx as u8, source));
+                            }
+                            if candidate_mask != 0 {
+                                self.module.send_ownership_sites.push(SendOwnershipSite {
+                                    pc: stmt_code_start + offset,
+                                    candidate_mask,
+                                    sources,
+                                });
+                            }
+                        }
+                    }
+                }
+
                 if let Some(src) = drop_plan.ownership_transfer.get(&(bi, si)) {
                     self.clear_local_after_transfer(*src);
                 }
@@ -3932,6 +3976,82 @@ mod optimize_tests {
             Some(0),
             "clearing the moved-from source must not invalidate the destination"
         );
+    }
+
+    #[test]
+    fn test_codegen_send_ownership_site_pc_is_absolute_across_functions() {
+        let mut module = mir::Module::new("send_site_absolute");
+
+        let mut prefix = mir::FunctionBuilder::new("prefix", None);
+        let prefix_value = prefix.add_temp(Type::int());
+        prefix.assign(prefix_value, mir::RValue::Const(Constant::Int(1)));
+        prefix.terminate(mir::Terminator::Return(Some(prefix_value)));
+        module.functions.push(prefix.build());
+
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut sender = mir::FunctionBuilder::new("sender", None);
+        let target = sender.add_param("target", Type::unit());
+        let payload = sender.add_temp(arr_ty);
+        let sent = sender.add_temp(Type::unit());
+        sender.assign(payload, mir::RValue::ArrayLit(vec![]));
+        sender.assign(
+            sent,
+            mir::RValue::Send {
+                actor: target,
+                behavior_idx: 0,
+                args: vec![payload],
+                remote: false,
+            },
+        );
+        sender.terminate(mir::Terminator::Return(None));
+        module.functions.push(sender.build());
+
+        let code = compile_mir(&mut module, "send_site_absolute").unwrap();
+        assert_eq!(code.send_ownership_sites.len(), 1);
+        let site = &code.send_ownership_sites[0];
+        assert!(site.pc < code.instructions.len());
+        assert_eq!(code.instructions[site.pc].opcode, OpCode::Send);
+        assert!(
+            site.pc > code.function_table[0],
+            "send site in the second function must point past the first function"
+        );
+    }
+
+    #[test]
+    fn test_codegen_records_runtime_only_consuming_send_site() {
+        let arr_ty = Type::Array(Box::new(Type::int()));
+        let mut b = mir::FunctionBuilder::new("send_site", None);
+        let target = b.add_param("target", Type::unit());
+        let payload = b.add_temp(arr_ty);
+        let sent = b.add_temp(Type::unit());
+
+        b.assign(payload, mir::RValue::ArrayLit(vec![]));
+        b.assign(
+            sent,
+            mir::RValue::Send {
+                actor: target,
+                behavior_idx: 0,
+                args: vec![payload],
+                remote: false,
+            },
+        );
+        b.terminate(mir::Terminator::Return(None));
+
+        let mut module = mir::Module::new("send_site");
+        module.functions.push(b.build());
+        let code = compile_mir(&mut module, "send_site").unwrap();
+
+        assert_eq!(code.send_ownership_sites.len(), 1);
+        let site = &code.send_ownership_sites[0];
+        assert_eq!(site.candidate_mask, 1);
+        assert_eq!(
+            site.sources,
+            vec![(
+                0,
+                SendOwnershipSource::Register((LOCAL_BASE + payload.0) as u8),
+            )]
+        );
+        assert_eq!(code.instructions[site.pc].opcode, OpCode::Send);
     }
 
     #[test]
