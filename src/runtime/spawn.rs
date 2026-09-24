@@ -8,7 +8,7 @@ use crate::authority::AuthorityManifest;
 use crate::authority_runtime::RuntimeAuthorityError;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::{Actor, ActorBackend, BehaviorEntry};
-use crate::runtime::persistence::{ActorSnapshot, PersistedValue, StateModel, WorkflowEvent};
+use crate::runtime::persistence::{ActorSnapshot, PersistedValue, StateModel};
 use crate::runtime::timer_fired_handler;
 use crate::runtime::Runtime;
 use crate::runtime::{bytecode_step_placeholder, fresh_actor_id, map_ast_state_model};
@@ -17,7 +17,7 @@ use crate::vm::Value;
 /// Core spawn logic shared by infallible compatibility entry points.
 ///
 /// Durable workflow creation should prefer `try_spawn_actor_with_models` so a
-/// failed initial journal/snapshot commit is observable to the caller.
+/// failed initial atomic durable transition is observable to the caller.
 pub(crate) fn spawn_actor_with_models(
     rt: &mut Runtime,
     init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
@@ -534,7 +534,7 @@ mod authority_tests {
     use super::*;
     use crate::authority::AuthorityGrant;
     use crate::bytecode::CodeModule;
-    use crate::runtime::persistence::PersistenceStore;
+    use crate::runtime::persistence::{PersistenceStore, WorkflowEvent};
 
     fn secret_manifest(name: &str) -> AuthorityManifest {
         AuthorityManifest::from_tokens([format!("Secret::Read({name})")].iter().map(String::as_str))
