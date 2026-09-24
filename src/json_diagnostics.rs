@@ -385,11 +385,18 @@ mod tests {
         let d = &diags[0];
         assert_eq!(d.code.as_deref(), Some("E0202"));
         assert_eq!(d.severity, "error");
+        assert_eq!(d.kind, "unbound_variable");
         let span = d.span.as_ref().expect("span");
         assert_eq!(span.line, 1);
         assert_eq!(span.col, 13);
         assert_eq!(span.end_col, 19);
         assert_eq!(span.file, "test.nula");
+        assert_eq!(span.start_byte, start);
+        assert_eq!(span.end_byte, start + 6);
+        assert_eq!(d.data.as_ref().unwrap()["name"], "countr");
+        assert_eq!(d.fixes.len(), 1);
+        assert_eq!(d.fixes[0].applicability, "machine_applicable");
+        assert_eq!(d.fixes[0].edits[0].replacement, "counter");
         assert!(d
             .notes
             .iter()
