@@ -156,6 +156,7 @@ perform IO.print("Hello, " + name + "!")
 | [`CHANGELOG.md`](CHANGELOG.md) | Changelog organized by stability tier (Frozen / Stable / Experimental) |
 | [`GOVERNANCE.md`](GOVERNANCE.md) | Stability tiers, RFC process, and language versioning |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Implementation architecture and module map |
+| [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) | Concise current-`main` matrix: shipped backends, actor runtime, durability, distribution, and status boundaries |
 | [`docs/SEMANTIC_STABILIZATION_CONTRACT.md`](docs/SEMANTIC_STABILIZATION_CONTRACT.md) | Current semantic-source-of-truth, backend, durability, and production-validation contract |
 | [`docs/FABRIC.md`](docs/FABRIC.md) | Experimental distributed messaging and durable stream substrate |
 | [`docs/RESP_CACHE_ARCHITECTURE.md`](docs/RESP_CACHE_ARCHITECTURE.md) | Experimental RESP-compatible cache architecture and cluster-routing invariants |
