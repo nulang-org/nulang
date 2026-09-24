@@ -41,6 +41,9 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
 pub(crate) struct PendingWorkflowCommand {
     pub behavior_id: u16,
     pub payload: Vec<PersistedValue>,
+    /// Sequence at which this command is already present in durable history.
+    /// None means the next command-caused transition must persist it.
+    pub persisted_sequence: Option<u64>,
 }
 
 /// Stage the mailbox command that is about to execute a workflow behavior.
@@ -56,7 +59,12 @@ pub(crate) fn begin_workflow_command(
     if !actor_is_workflow(rt, actor_id) {
         return Ok(());
     }
-    if rt.pending_workflow_commands.contains_key(&actor_id) {
+    if let Some(pending) = rt.pending_workflow_commands.get(&actor_id) {
+        // Recovery re-enqueues an already-durable command through the normal
+        // mailbox path. Allow that exact command to re-enter the activation.
+        if pending.persisted_sequence.is_some() && pending.behavior_id == behavior_id {
+            return Ok(());
+        }
         return Err(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             "workflow activation already has an uncommitted driving command",
@@ -77,6 +85,7 @@ pub(crate) fn begin_workflow_command(
         PendingWorkflowCommand {
             behavior_id,
             payload: persisted_payload,
+            persisted_sequence: None,
         },
     );
     Ok(())
@@ -85,11 +94,29 @@ pub(crate) fn begin_workflow_command(
 fn pending_command_at_sequence(rt: &Runtime, actor_id: u64, sequence: u64) -> Option<JournalEntry> {
     rt.pending_workflow_commands
         .get(&actor_id)
+        .filter(|pending| pending.persisted_sequence.is_none())
         .map(|pending| JournalEntry {
             sequence,
             behavior_id: pending.behavior_id,
             payload: pending.payload.clone(),
         })
+}
+
+/// Restore a command that is already present in durable history so recovery
+/// can re-drive it without appending a duplicate journal record.
+pub(crate) fn restore_workflow_command(
+    rt: &mut Runtime,
+    actor_id: u64,
+    entry: &JournalEntry,
+) {
+    rt.pending_workflow_commands.insert(
+        actor_id,
+        PendingWorkflowCommand {
+            behavior_id: entry.behavior_id,
+            payload: entry.payload.clone(),
+            persisted_sequence: Some(entry.sequence),
+        },
+    );
 }
 
 fn mark_workflow_commit_failure(rt: &mut Runtime, actor_id: u64) {
@@ -274,7 +301,8 @@ fn commit_workflow_transition(
     let command = include_pending_command
         .then(|| pending_command_at_sequence(rt, actor_id, sequence))
         .flatten();
-    let committed_pending_command = command.is_some();
+    let clear_pending_command =
+        include_pending_command && rt.pending_workflow_commands.contains_key(&actor_id);
     let transition = DurableTransition {
         version: DURABLE_TRANSITION_VERSION,
         actor_id,
@@ -294,10 +322,10 @@ fn commit_workflow_transition(
         return Err(error);
     }
 
-    // The command is no longer merely in-flight once the durable transition
-    // that it caused has committed. External event-only transitions deliberately
-    // leave the original suspended command pending.
-    if committed_pending_command {
+    // A command-caused transition completes ownership of the staged command.
+    // External event-only transitions deliberately leave a recovered command
+    // pending so the original activation can still finish.
+    if clear_pending_command {
         rt.pending_workflow_commands.remove(&actor_id);
     }
 
