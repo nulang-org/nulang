@@ -1,0 +1,74 @@
+name: Cache Valkey Compatibility
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/runtime/cache*.rs"
+      - "src/runtime/resp*.rs"
+      - "src/bin/nulang_cache.rs"
+      - "scripts/cache_valkey_diff.py"
+      - "Cargo.toml"
+      - ".github/workflows/cache-valkey-compat.yml"
+  pull_request:
+    paths:
+      - "src/runtime/cache*.rs"
+      - "src/runtime/resp*.rs"
+      - "src/bin/nulang_cache.rs"
+      - "scripts/cache_valkey_diff.py"
+      - "Cargo.toml"
+      - ".github/workflows/cache-valkey-compat.yml"
+
+concurrency:
+  group: cache-valkey-compat-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  differential:
+    name: RESP differential oracle
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TARGET_DIR: target
+
+    services:
+      valkey:
+        image: valkey/valkey:9.1-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Nulang cache server
+        run: cargo build --locked --no-default-features --features cache-server --bin nulang-cache
+
+      - name: Start Nulang cache server
+        run: |
+          ./target/debug/nulang-cache --bind 127.0.0.1:6380 >/tmp/nulang-cache.log 2>&1 &
+          echo $! >/tmp/nulang-cache.pid
+
+      - name: Compare RESP core with Valkey
+        run: python3 scripts/cache_valkey_diff.py --nulang 127.0.0.1:6380 --valkey 127.0.0.1:6379
+
+      - name: Show Nulang cache log on failure
+        if: failure()
+        run: cat /tmp/nulang-cache.log || true
+
+      - name: Stop Nulang cache server
+        if: always()
+        run: |
+          if test -f /tmp/nulang-cache.pid; then
+            kill "$(cat /tmp/nulang-cache.pid)" 2>/dev/null || true
+          fi
