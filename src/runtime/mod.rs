@@ -4646,17 +4646,39 @@ impl Runtime {
     /// sentinel). Mirrors `resume_suspended_llm_step`: the actor's
     /// callbacks are re-installed on the shared VM before `vm.resume()`.
     fn resume_suspended_receive_wait(&mut self, actor_id: u64) {
+        if self.actor_is_workflow(actor_id) {
+            if let Err(error) = workflow::begin_workflow_transition(self, actor_id, None) {
+                tracing::warn!(
+                    actor_id,
+                    %error,
+                    "nulang-persist: failed to begin receive-resume transition"
+                );
+                return;
+            }
+        }
+
         let suspended = match self.actors.get_mut(&actor_id) {
             Some(actor) => actor.suspended_execution.take(),
             None => return,
         };
-        let Some(suspended) = suspended else { return };
+        let Some(suspended) = suspended else {
+            workflow::rollback_workflow_transition(self, actor_id);
+            return;
+        };
 
         if self.vm.is_none() {
-            // No VM available; put the suspension back so a later wake can
-            // re-trigger it.
             if let Some(actor) = self.actors.get_mut(&actor_id) {
                 actor.suspended_execution = Some(suspended);
+            }
+            if self.actor_is_workflow(actor_id) {
+                if let Err(error) = workflow::commit_workflow_transition(self, actor_id, true) {
+                    tracing::warn!(
+                        actor_id,
+                        %error,
+                        "nulang-persist: receive wake transition rejected"
+                    );
+                    workflow::rollback_workflow_transition(self, actor_id);
+                }
             }
             return;
         }
@@ -4664,15 +4686,11 @@ impl Runtime {
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
-            // Re-install callbacks bound to THIS actor: other actors may have
-            // run on the shared VM while this one was suspended.
             vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks {
                 runtime: self_ptr,
             }));
             vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::new(self_ptr, actor_id)));
             vm.restore_suspended_state(suspended.vm_state);
-            // A resumed behavior is still scheduler-context execution: a
-            // `perform LLM.ask` after the wait must suspend (non-blocking).
             let saved_suspend = (*self_ptr).suspend_enabled;
             (*self_ptr).suspend_enabled = true;
             (*self_ptr).vm_exec_begin();
@@ -4680,9 +4698,6 @@ impl Runtime {
             (*self_ptr).suspend_enabled = saved_suspend;
             match result {
                 Ok(_) => {
-                    // The wait resolved (match or timeout) and the behavior
-                    // ran to completion: drop any leftover wait state and
-                    // record workflow completion like the LLM resume path.
                     (*self_ptr).clear_receive_wait(actor_id);
                     if (*self_ptr).actor_is_workflow(actor_id) {
                         if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
@@ -4693,23 +4708,25 @@ impl Runtime {
                                 actor.set_state_field("step_index", Value::int(n + 1));
                             }
                         }
-                        let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        let committed = workflow::stage_step_completed(
+                            &mut *self_ptr,
                             actor_id,
-                            WorkflowEvent::StepCompleted {
-                                sequence: seq,
-                                step_name: suspended.step_name,
-                            },
-                        );
-                        (*self_ptr).checkpoint_actor(actor_id);
+                            suspended.step_name.clone(),
+                        )
+                        .and_then(|_| {
+                            workflow::commit_workflow_transition(&mut *self_ptr, actor_id, false)
+                        });
+                        if let Err(error) = committed {
+                            tracing::warn!(
+                                actor_id,
+                                %error,
+                                "nulang-persist: receive-resumed workflow completion rejected"
+                            );
+                            workflow::rollback_workflow_transition(&mut *self_ptr, actor_id);
+                        }
                     }
                 }
                 Err(crate::types::NuError::Suspended(VmSuspension::ReceiveWait)) => {
-                    // Re-suspended on the same wait (the waking message did
-                    // not match): keep the original timer and re-capture the
-                    // VM state so the next message or the timeout can resume
-                    // it. maybe_schedule_receive_wait is a no-op while the
-                    // wait state is live, so the deadline is not restarted.
                     if let Some(vm_state) = vm.take_suspended_state() {
                         let timeout = vm.suspended_receive_timeout.take();
                         if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
@@ -4717,17 +4734,25 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
-                                    step_name: suspended.step_name,
+                                    step_name: suspended.step_name.clone(),
                                 });
                         }
                         (*self_ptr).maybe_schedule_receive_wait(actor_id, timeout);
                     }
+                    if (*self_ptr).actor_is_workflow(actor_id) {
+                        if let Err(error) =
+                            workflow::commit_workflow_transition(&mut *self_ptr, actor_id, true)
+                        {
+                            tracing::warn!(
+                                actor_id,
+                                %error,
+                                "nulang-persist: receive re-suspend transition rejected"
+                            );
+                            workflow::rollback_workflow_transition(&mut *self_ptr, actor_id);
+                        }
+                    }
                 }
                 Err(crate::types::NuError::Suspended(_)) => {
-                    // Suspended on something else (a signal wait or a
-                    // background LLM call) past the receive: the wait is
-                    // over. Re-capture so the matching signal or pumped
-                    // completion can resume the behavior.
                     (*self_ptr).clear_receive_wait(actor_id);
                     if let Some(vm_state) = vm.take_suspended_state() {
                         let signal_name = vm.suspended_signal_name.take();
@@ -4738,25 +4763,57 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
-                                    step_name: suspended.step_name,
+                                    step_name: suspended.step_name.clone(),
                                 });
                         }
                     }
+                    if (*self_ptr).actor_is_workflow(actor_id) {
+                        if let Err(error) =
+                            workflow::commit_workflow_transition(&mut *self_ptr, actor_id, true)
+                        {
+                            tracing::warn!(
+                                actor_id,
+                                %error,
+                                "nulang-persist: chained suspension transition rejected"
+                            );
+                            workflow::rollback_workflow_transition(&mut *self_ptr, actor_id);
+                        }
+                    }
                 }
-                // Other errors: the wait is over; the send-path result is
-                // discarded anyway, matching step_actor semantics.
-                Err(_) => (*self_ptr).clear_receive_wait(actor_id),
+                Err(error) => {
+                    (*self_ptr).clear_receive_wait(actor_id);
+                    if (*self_ptr).actor_is_workflow(actor_id) {
+                        let staged = workflow::stage_step_failed(
+                            &mut *self_ptr,
+                            actor_id,
+                            suspended.step_name.clone(),
+                            format!("{}", error),
+                        );
+                        if let Err(stage_error) = staged {
+                            tracing::warn!(
+                                actor_id,
+                                error = %stage_error,
+                                "nulang-persist: failed to stage receive-resume workflow failure"
+                            );
+                            workflow::rollback_workflow_transition(&mut *self_ptr, actor_id);
+                        } else {
+                            (*self_ptr).run_saga_compensation(actor_id, suspended.behavior_idx);
+                            if let Err(commit_error) =
+                                workflow::commit_workflow_transition(&mut *self_ptr, actor_id, false)
+                            {
+                                tracing::warn!(
+                                    actor_id,
+                                    error = %commit_error,
+                                    "nulang-persist: receive-resume failure transition rejected"
+                                );
+                                workflow::rollback_workflow_transition(&mut *self_ptr, actor_id);
+                            }
+                        }
+                    }
+                }
             }
-            // End the VM-execution window only after any suspend-state
-            // re-capture above: draining deferred wakes runs other actors
-            // on the shared VM, which would clobber the frames an
-            // un-captured suspend still needs. Runs on every path, so
-            // wakes of other actors are not lost when THIS one suspends.
             (*self_ptr).vm_exec_end();
         }
-        // The suspension resolved (completed or failed): if messages queued
-        // up while the behavior was suspended, schedule the actor to drain
-        // them - step_actor leaves mail untouched while a suspension is live.
         self.requeue_if_mail_pending(actor_id);
     }
 
