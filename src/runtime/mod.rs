@@ -1750,12 +1750,7 @@ impl Runtime {
             let target_shard = (target_id % self.shard_count as u64) as u16;
             if target_shard != self.shard_idx {
                 let out_trace = self.current_trace.as_ref().map(|t| t.to_traceparent());
-                let _ = self.send_cross_shard_named_message(
-                    target_id,
-                    behavior,
-                    args,
-                    out_trace,
-                );
+                let _ = self.send_cross_shard_named_message(target_id, behavior, args, out_trace);
                 return;
             }
         }
