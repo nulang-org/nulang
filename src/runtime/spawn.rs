@@ -155,7 +155,6 @@ fn try_spawn_actor_with_id(
     }
     rt.actors.insert(id, actor);
     if workflow.is_some() {
-        let seq = crate::runtime::workflow::next_sequence(rt, id);
         let state = {
             let actor = rt.actors.get(&id).unwrap();
             let mut state = Vec::new();
@@ -174,33 +173,23 @@ fn try_spawn_actor_with_id(
             }
             state
         };
-        let commit = rt
-            .persistence
-            .append_workflow_event(
+
+        let commit = (|| -> std::io::Result<()> {
+            crate::runtime::workflow::begin_workflow_transition(rt, id, None)?;
+            crate::runtime::workflow::stage_workflow_started(
+                rt,
                 id,
-                WorkflowEvent::WorkflowStarted {
-                    sequence: seq,
-                    name: workflow_name.as_ref().unwrap().clone(),
-                    state,
-                },
-            )
-            .and_then(|_| crate::runtime::workflow::try_checkpoint_actor(rt, id));
+                workflow_name.as_ref().unwrap().clone(),
+                state,
+            )?;
+            crate::runtime::workflow::commit_workflow_transition(rt, id, false)
+        })();
+
         if let Err(error) = commit {
+            crate::runtime::workflow::rollback_workflow_transition(rt, id);
             rt.actors.remove(&id);
             if let Some(ref mut mgr) = rt.crdt_manager {
                 mgr.unregister_actor_fields(id);
-            }
-
-            // WorkflowStarted may already have committed when the initial
-            // snapshot fails. A failed spawn must not leave that half-created
-            // durable identity behind for later recovery/reconciliation.
-            if let Err(cleanup_error) = rt.persistence.clear(id) {
-                return Err(std::io::Error::new(
-                    error.kind(),
-                    format!(
-                        "{error}; failed to clear partial durable workflow state: {cleanup_error}"
-                    ),
-                ));
             }
             return Err(error);
         }
