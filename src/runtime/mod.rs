@@ -306,6 +306,16 @@ pub(crate) enum MessageAdmission {
     Rejected,
 }
 
+/// Policy for histories created before strong semantic identity was persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryIdentityPolicy {
+    /// Reject any snapshot that cannot prove which semantics produced it.
+    Strict,
+    /// Permit legacy snapshots that lack semantic identity, while still
+    /// rejecting malformed identities and all identified-code mismatches.
+    LegacyCompatible,
+}
+
 pub struct Runtime {
     pub actors: HashMap<u64, Actor>,
     pub supervisors: HashMap<u64, Supervisor>,
@@ -442,6 +452,11 @@ pub struct Runtime {
     // compensation_offsets).
     pub(crate) recovery_modules:
         HashMap<u64, (crate::bytecode::CodeModule, Vec<usize>, Vec<Option<usize>>)>,
+    /// Definition-scoped semantic identity paired with each recovery module.
+    /// Kept separate from the module tuple so whole-program artifact identity
+    /// cannot accidentally become the durable actor compatibility key.
+    pub(crate) recovery_definition_semantic_ids:
+        HashMap<u64, crate::content_identity::SemanticId>,
     /// Content-addressed bytecode cache for fetch-on-demand.
     /// When a node receives a message for an unknown content hash, it can
     /// request the bytecode from the sender and cache it here keyed by hash.
@@ -633,6 +648,7 @@ impl Runtime {
             draining_receive_wakes: false,
             idle_callback: None,
             recovery_modules: HashMap::new(),
+            recovery_definition_semantic_ids: HashMap::new(),
             #[cfg(feature = "ai-runtime")]
             ai: AiRuntimeRegistry::new(),
             #[cfg(feature = "ai-runtime")]
@@ -876,7 +892,41 @@ impl Runtime {
         offsets: Vec<usize>,
         compensation_offsets: Vec<Option<usize>>,
     ) {
-        spawn::register_recovery_module(self, actor_id, module, offsets, compensation_offsets)
+        // Compatibility path for callers that do not carry an actor name.
+        // A single definition sidecar is unambiguous; multi-actor modules
+        // require register_recovery_module_for_definition instead.
+        let definition_semantic_id = match module.actor_semantic_ids.as_slice() {
+            [id] => Some(*id),
+            _ => None,
+        };
+        spawn::register_recovery_module(
+            self,
+            actor_id,
+            module,
+            offsets,
+            compensation_offsets,
+            definition_semantic_id,
+        )
+    }
+
+    /// Register recovery metadata for one known actor definition.
+    pub fn register_recovery_module_for_definition(
+        &mut self,
+        actor_id: u64,
+        actor_name: &str,
+        module: crate::bytecode::CodeModule,
+        offsets: Vec<usize>,
+        compensation_offsets: Vec<Option<usize>>,
+    ) {
+        let definition_semantic_id = module.actor_semantic_id(actor_name);
+        spawn::register_recovery_module(
+            self,
+            actor_id,
+            module,
+            offsets,
+            compensation_offsets,
+            definition_semantic_id,
+        )
     }
 
     /// Register all `virtual entity` types declared in `module` with the
@@ -3313,9 +3363,15 @@ impl Runtime {
                 .map(|((_, name), id)| (name.clone(), id.0))
                 .collect()
         });
+        let semantic_id = self
+            .actors
+            .get(&actor_id)
+            .and_then(|actor| actor.definition_semantic_id)
+            .map(|id| id.to_string());
         Some(ActorSnapshot {
             actor_id,
             sequence,
+            semantic_id,
             state,
             waiting_signal,
             crdt_snapshot,
