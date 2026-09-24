@@ -375,6 +375,30 @@ pub(crate) fn rollback_workflow_transition(rt: &mut Runtime, actor_id: u64) {
     }
 }
 
+pub(crate) fn stage_workflow_started(
+    rt: &mut Runtime,
+    actor_id: u64,
+    name: String,
+    state: Vec<PersistedValue>,
+) -> std::io::Result<()> {
+    if !has_workflow_transition(rt, actor_id) {
+        begin_workflow_transition(rt, actor_id, None)?;
+    }
+    if !has_workflow_transition(rt, actor_id) {
+        return Ok(());
+    }
+    let sequence = next_sequence(rt, actor_id);
+    stage_existing_workflow_event(
+        rt,
+        actor_id,
+        WorkflowEvent::WorkflowStarted {
+            sequence,
+            name,
+            state,
+        },
+    )
+}
+
 pub(crate) fn stage_step_completed(
     rt: &mut Runtime,
     actor_id: u64,
