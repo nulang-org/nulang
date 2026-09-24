@@ -60,8 +60,8 @@ pub struct SemanticSpan {
     pub end_col: usize,
 }
 
-#[derive(Debug)]
-struct SemanticIndex {
+#[derive(Debug, Clone)]
+pub(crate) struct SemanticIndex {
     file: String,
     symbols: Vec<SemanticSymbol>,
     references: Vec<SemanticReference>,
@@ -109,14 +109,39 @@ pub fn run(args: &[String]) -> NuResult<()> {
         )));
     }
 
-    let requested = positional[0];
-    let index = analyze_file(Path::new(positional[1]))?;
+    let report = query_file(command, positional[0], Path::new(positional[1]))?;
+    emit_report(&report, json)
+}
+
+/// Run one semantic query against a source file.
+pub fn query_file(
+    command: &str,
+    requested: &str,
+    path: &Path,
+) -> NuResult<SemanticQueryReport> {
+    let index = analyze_file(path)?;
+    query_index(command, requested, &index)
+}
+
+pub(crate) fn query_index(
+    command: &str,
+    requested: &str,
+    index: &SemanticIndex,
+) -> NuResult<SemanticQueryReport> {
+    if !matches!(
+        command,
+        "type" | "references" | "callers" | "callees" | "context"
+    ) {
+        return Err(query_err(format!("unknown semantic query '{command}'")));
+    }
+
     let (symbols, references) = match command {
         "type" => (
             index
                 .symbols
-                .into_iter()
+                .iter()
                 .filter(|s| name_matches(requested, &s.name, &s.qualified_name))
+                .cloned()
                 .collect(),
             Vec::new(),
         ),
@@ -124,54 +149,58 @@ pub fn run(args: &[String]) -> NuResult<()> {
             Vec::new(),
             index
                 .references
-                .into_iter()
+                .iter()
                 .filter(|r| target_matches(requested, &r.target))
+                .cloned()
                 .collect(),
         ),
         "callers" => (
             Vec::new(),
             index
                 .references
-                .into_iter()
+                .iter()
                 .filter(|r| r.kind == "call" && target_matches(requested, &r.target))
+                .cloned()
                 .collect(),
         ),
         "callees" => (
             Vec::new(),
             index
                 .references
-                .into_iter()
+                .iter()
                 .filter(|r| r.kind == "call" && owner_matches(requested, &r.owner))
+                .cloned()
                 .collect(),
         ),
         "context" => {
             let symbols = index
                 .symbols
-                .into_iter()
+                .iter()
                 .filter(|s| name_matches(requested, &s.name, &s.qualified_name))
+                .cloned()
                 .collect();
             let references = index
                 .references
-                .into_iter()
+                .iter()
                 .filter(|r| {
                     (r.kind == "call" && owner_matches(requested, &r.owner))
                         || target_matches(requested, &r.target)
                 })
+                .cloned()
                 .collect();
             (symbols, references)
         }
         _ => unreachable!(),
     };
 
-    let report = SemanticQueryReport {
+    Ok(SemanticQueryReport {
         schema_version: SEMANTIC_QUERY_SCHEMA_VERSION,
         command: command.to_string(),
-        file: index.file,
+        file: index.file.clone(),
         ok: true,
         symbols,
         references,
-    };
-    emit_report(&report, json)
+    })
 }
 
 fn print_help() {
@@ -246,13 +275,17 @@ fn emit_report(report: &SemanticQueryReport, json: bool) -> NuResult<()> {
     Ok(())
 }
 
-fn analyze_file(path: &Path) -> NuResult<SemanticIndex> {
+pub(crate) fn analyze_file(path: &Path) -> NuResult<SemanticIndex> {
     let source = std::fs::read_to_string(path)
         .map_err(|e| query_err(format!("cannot read '{}': {e}", path.display())))?;
+    analyze_source(path, &source)
+}
+
+pub(crate) fn analyze_source(path: &Path, source: &str) -> NuResult<SemanticIndex> {
     let file = path.display().to_string();
 
-    set_source_map_with_file(&source, Some(&file));
-    let tokens = Lexer::new(&source).lex()?;
+    set_source_map_with_file(source, Some(&file));
+    let tokens = Lexer::new(source).lex()?;
     let ast = Parser::new(tokens).parse_module()?;
 
     // Resolve imports on a clone solely for type inference. Reference spans
@@ -270,13 +303,13 @@ fn analyze_file(path: &Path) -> NuResult<SemanticIndex> {
     let _ = checker.check_module(&typed_ast);
 
     let mut symbols = Vec::new();
-    collect_semantic_symbols(&ast.decls, "", &checker, &file, &source, &mut symbols);
+    collect_semantic_symbols(&ast.decls, "", &checker, &file, source, &mut symbols);
 
     let mut declared = HashSet::new();
     collect_value_names(&ast.decls, &mut declared);
 
     let mut references = Vec::new();
-    collect_decl_references(&ast.decls, "", &declared, &file, &source, &mut references);
+    collect_decl_references(&ast.decls, "", &declared, &file, source, &mut references);
 
     Ok(SemanticIndex {
         file,
