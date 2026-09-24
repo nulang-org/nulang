@@ -87,9 +87,9 @@ pub mod python;
 pub mod registry;
 pub mod repl;
 pub mod resolver;
-pub mod semantic_query;
 pub mod runtime;
 pub mod semantic_identity;
+pub mod semantic_query;
 pub mod semantic_schema;
 pub mod stdlib;
 #[cfg(test)]
