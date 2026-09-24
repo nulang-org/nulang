@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Guarded compiler-owned JIT parameter type seeds — 2026-09-24
+- **Source compilation now seeds primitive function/behavior argument types into the tiered JIT must-analysis** (`src/bytecode.rs`, `src/mir_codegen.rs`, `src/jit/typed_compiler.rs`). Seeds are in-memory-only and omitted from NBC artifacts. Only regions whose proof starts from a compiler seed receive a live tag guard before native entry; bytecode-only typed regions retain the existing guard-free fast path. Guard mismatch deopts to the interpreter, preserving dynamic VM/FFI/message entry safety.
+
+
 ### Python bool marshal type inference — 2026-09-24
 - **Default-feature builds now make PyO3 boolean extraction explicit with `extract::<bool>()`**, avoiding a compiler inference failure in the Python marshal path without changing conversion semantics.
 
