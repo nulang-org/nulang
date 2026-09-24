@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### Reproducible cross-runtime actor baselines — 2026-09-23
+- **Matched Savina-style counting, ping-pong, thread-ring, and fork-join fixtures now cover Nulang, Rust standard-library channels, Go channels/goroutines, and Erlang/BEAM processes** (`benchmarks/cross_runtime/`, `scripts/cross_runtime_bench.py`). The runner records exact timing samples, medians, toolchain/git/CPU metadata, and emits one JSON artifact.
+- **Comparative runs default to one enforced logical CPU across every runtime process and child scheduler/thread**, matching the current single-shard Nulang harness's compute budget. Unconstrained host mode is explicitly diagnostic until a separate sharded Nulang fixture exists, so multicore fork-join results are not misrepresented as equivalent comparisons.
+- **Benchmark-related pull requests run the cross-runtime harness automatically**, while manual workflow dispatch remains available for longer controlled runs.
+
 ### Inline small actor message payloads — 2026-09-23
 - **Actor messages with 0–4 values now store their NaN-boxed payload directly in the message envelope** (`src/runtime/mailbox.rs`) instead of allocating a `Vec` plus `Arc`; larger payloads retain shared `Arc<Vec<Value>>` storage.
 - **Local runtime sends, AOT sends, supervision/system messages, cross-shard delivery, and decoded network delivery all use the small-message representation.**
