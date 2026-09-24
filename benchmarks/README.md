@@ -53,6 +53,29 @@ host-mode fork-join results must not be presented as a fair multicore
 comparison. These are language/runtime baselines, not a universal framework
 ranking; see the cross-runtime README for the full interpretation constraints.
 
+## Same-runner Nulang A/B
+
+`scripts/nulang_ab_bench.py` compares the current checkout against an exact
+base ref on one host. Both variants are built before measurement, runs alternate
+base/candidate order to reduce thermal/load drift bias, and measured processes
+default to the same logical CPU. The report includes each workload's median
+throughput plus candidate-vs-base throughput, latency, and speedup deltas.
+
+The `Nulang actor A/B benchmarks` workflow uses the pull request's exact base
+SHA rather than a moving branch name. This makes stacked performance PRs
+incremental by construction: a child PR is measured against its parent stack
+layer, while a root performance PR is measured against `main`.
+
+PR runs use `--no-default-features --features native-codegen` to isolate the
+core VM/JIT/AOT/actor runtime from unrelated optional integrations. Longer
+manual runs can use the default feature set when production-profile validation
+is needed.
+
+Nulang-only A/B probes include a 0/1/4/5/16-value enqueue sweep around the
+small-message inline boundary and an AOT actor-drain workload for native
+dispatch changes. They are emitted as `[ab-bench]` records and are never
+folded into the cross-language Rust/Go/Erlang comparison.
+
 ## Interpretation rules
 
 Benchmark names describe the operation actually timed. Do not convert a result
