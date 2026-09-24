@@ -77,6 +77,12 @@ version + migration.*
 - **Migration compatibility metadata now survives HIR→MIR lowering** (`src/mir_lower.rs`, `src/bytecode.rs`) instead of being replaced with an empty `ActorMeta.migrations` payload.
 - **Typed actor semantic identity now includes entity schema version and canonical migration topology/event surface** (`src/semantic_schema.rs`), so schema-evolution declarations participate in compatibility identity. Runtime execution of migration bodies and persisted snapshot/history schema-version fencing remain follow-up work; this entry does not claim RFC 0008 replay migration is complete.
 
+### Direct runtime AOT actor dispatch — 2026-09-23
+- **Runtime-owned AOT behaviors now call the stable native actor-entry ABI directly** (`src/runtime/mod.rs`, `src/aot/mod.rs`) instead of arming `AOT_DISPATCH`, invoking the generic behavior-table adapter, then reading the target back from thread-local state.
+- **Common native actor payloads no longer allocate a temporary raw-word Vec**: 0–4 boxed values are packed into fixed stack storage before entering the ABI; larger arities retain the allocation-backed fallback.
+- **Synchronous ask, mailbox-flush, scheduler, and recovery native-handler entry points share one dispatch boundary**, preventing runtime-owned AOT calls from depending on a separately armed TLS target.
+- **Criterion now tracks one-argument and five-argument direct actor-entry dispatch separately** so the stack-packed common path and allocation-backed fallback remain measurable.
+
 ### Stable native actor entry ABI — 2026-09-23
 - **AOT actor dispatch now crosses one versioned C-ABI boundary** (`src/native_abi.rs`, `src/aot/codegen.rs`, `src/aot/mod.rs`). Generated Cranelift wrappers validate ABI version and payload arity, load boxed arguments, and call the behavior's optimized internal native function. The runtime no longer selects an arity-specific Rust function type from message length.
 - **Native actor entry status reserves explicit scheduler outcomes** (`Completed`, `Waiting`, `Yielded`, `Suspended`, `Faulted`) so continuation-aware preemption can be added without changing the runtime-facing calling convention. Mid-function AOT yielding is intentionally not enabled until continuation state can be preserved.

@@ -1998,8 +1998,6 @@ impl Runtime {
             .map(|e| !e.name.is_empty())
             .unwrap_or(false);
         if is_native {
-            let handler =
-                self.actors.get(&actor_id).unwrap().behavior_table[behavior_idx].handler_fn;
             self.current_actor = Some(actor_id);
             if self.actor_is_persistent(actor_id) {
                 let seq = self.next_sequence(actor_id);
@@ -2013,9 +2011,7 @@ impl Runtime {
                     },
                 );
             }
-            if let Some(actor) = self.actors.get_mut(&actor_id) {
-                handler(actor, args);
-            }
+            let _ = self.dispatch_native_handler(actor_id, behavior_idx, args);
             self.checkpoint_actor(actor_id);
             self.current_actor = None;
             return Ok(Value::nil());
@@ -2061,17 +2057,10 @@ impl Runtime {
                 let _ = self.run_bytecode_behavior(actor_id, behavior_idx, &msg.payload);
                 self.checkpoint_actor(actor_id);
                 self.current_actor = prev;
-            } else if let Some(handler) = self
-                .actors
-                .get(&actor_id)
-                .and_then(|a| a.behavior_table.get(behavior_idx))
-                .map(|e| e.handler_fn)
-            {
+            } else if self.has_native_handler(actor_id, behavior_idx) {
                 let prev = self.current_actor;
                 self.current_actor = Some(actor_id);
-                if let Some(actor) = self.actors.get_mut(&actor_id) {
-                    handler(actor, &msg.payload);
-                }
+                let _ = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload);
                 self.checkpoint_actor(actor_id);
                 self.current_actor = prev;
             }
@@ -3882,71 +3871,24 @@ impl Runtime {
                 }
             }
 
-            let handler_fn: Option<fn(&mut Actor, &[Value])> = {
-                let actor = match self.actors.get(&actor_id) {
-                    Some(a) => a,
-                    None => {
-                        self.current_actor = None;
-                        return;
-                    }
-                };
-                if behavior_idx < actor.behavior_table.len() {
-                    Some(actor.behavior_table[behavior_idx].handler_fn)
-                } else {
-                    None
-                }
-            };
-            // AOT target to arm around the handler (None for bytecode/native
-            // handlers or behaviors without an AOT-compiled version).
-            #[cfg(feature = "native-codegen")]
-            let aot_target = self
-                .actors
-                .get(&actor_id)
-                .and_then(|a| a.aot_targets.get(behavior_idx))
-                .and_then(|t| *t);
             let mut processed = false;
-            let is_placeholder = self
-                .actors
-                .get(&actor_id)
-                .and_then(|a| a.behavior_table.get(behavior_idx))
-                .map(|e| e.name.is_empty())
-                .unwrap_or(false);
-            if let Some(handler) = handler_fn {
-                if !is_placeholder {
-                    // Journal the message before handling so recovery can replay it.
-                    if self.actor_is_persistent(actor_id) {
-                        let seq = self.next_sequence(actor_id);
-                        let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                        let _ = self.persistence.append_journal(
-                            actor_id,
-                            JournalEntry {
-                                sequence: seq,
-                                behavior_id: msg.behavior_id,
-                                payload,
-                            },
-                        );
-                    }
-                    let actor = match self.actors.get_mut(&actor_id) {
-                        Some(a) => a,
-                        None => {
-                            self.current_actor = None;
-                            return;
-                        }
-                    };
-                    // Arm the AOT native target so `aot_behavior_adapter` (the
-                    // behavior's handler) dispatches through AOT code.
-                    #[cfg(feature = "native-codegen")]
-                    if let Some(target) = aot_target {
-                        crate::aot::set_aot_dispatch(Some(target));
-                    }
-                    handler(actor, &msg.payload);
-                    #[cfg(feature = "native-codegen")]
-                    if aot_target.is_some() {
-                        crate::aot::clear_aot_dispatch();
-                    }
-                    // Snapshot durable state after the message is processed.
+            if self.has_native_handler(actor_id, behavior_idx) {
+                // Journal the message before handling so recovery can replay it.
+                if self.actor_is_persistent(actor_id) {
+                    let seq = self.next_sequence(actor_id);
+                    let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
+                    let _ = self.persistence.append_journal(
+                        actor_id,
+                        JournalEntry {
+                            sequence: seq,
+                            behavior_id: msg.behavior_id,
+                            payload,
+                        },
+                    );
+                }
+                processed = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload);
+                if processed {
                     self.checkpoint_actor(actor_id);
-                    processed = true;
                 }
             }
             if !processed && self.has_bytecode_handler(actor_id, behavior_idx) {
@@ -5348,13 +5290,8 @@ impl Runtime {
                 let behavior_idx = entry.behavior_id as usize;
                 let payload: Vec<Value> = entry.payload.iter().map(|p| p.to_value()).collect();
                 if self.has_native_handler(actor_id, behavior_idx) {
-                    let handler = self
-                        .actors
-                        .get(&actor_id)
-                        .and_then(|a| a.behavior_table.get(behavior_idx))
-                        .map(|b| b.handler_fn)?;
+                    let _ = self.dispatch_native_handler(actor_id, behavior_idx, &payload);
                     if let Some(actor) = self.actors.get_mut(&actor_id) {
-                        handler(actor, &payload);
                         actor.sequence = entry.sequence;
                     }
                 } else if self.has_bytecode_handler(actor_id, behavior_idx) {
@@ -5753,6 +5690,59 @@ impl Runtime {
             .and_then(|a| a.behavior_table.get(behavior_idx))
             .map(|e| !e.name.is_empty())
             .unwrap_or(false)
+    }
+
+    /// Dispatch a registered native handler without keeping a Rust borrow into
+    /// the Runtime across AOT native execution.
+    ///
+    /// AOT-backed behaviors go directly through the stable actor-entry ABI;
+    /// ordinary Rust handlers retain the existing function-pointer path.
+    fn dispatch_native_handler(
+        &mut self,
+        actor_id: u64,
+        behavior_idx: usize,
+        args: &[Value],
+    ) -> bool {
+        let handler = self
+            .actors
+            .get(&actor_id)
+            .and_then(|actor| actor.behavior_table.get(behavior_idx))
+            .filter(|entry| !entry.name.is_empty())
+            .map(|entry| entry.handler_fn);
+        let Some(handler) = handler else {
+            return false;
+        };
+
+        #[cfg(feature = "native-codegen")]
+        {
+            let aot_target = self
+                .actors
+                .get(&actor_id)
+                .and_then(|actor| actor.aot_targets.get(behavior_idx))
+                .and_then(|target| *target);
+            if let Some(target) = aot_target {
+                // No borrow into self survives this boundary. Native helper
+                // callbacks may re-enter the Runtime through this raw pointer.
+                let runtime = self as *mut Runtime;
+                let status =
+                    crate::aot::dispatch_aot_runtime_behavior(target, runtime, actor_id, args);
+                if status != crate::native_abi::NativeActorStatus::Completed {
+                    tracing::warn!(
+                        actor_id,
+                        ?status,
+                        "native actor entry returned a non-completed status"
+                    );
+                }
+                return true;
+            }
+        }
+
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            handler(actor, args);
+            true
+        } else {
+            false
+        }
     }
 
     // -- Fault Tolerance: Links --
