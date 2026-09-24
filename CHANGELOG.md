@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### MCP semantic compiler adapter — 2026-09-24
+- **`nulang-mcp` exposes the core semantic query API as read-only MCP tools** for inferred types/effects/capabilities, references, callers, callees, and compact semantic context. The adapter depends on the root compiler with default features disabled, so it does not pull the optional AI runtime into semantic analysis.
+- The MCP host now serves both lifecycle eras: legacy clients can use the 2025 `initialize` handshake, while 2026-07-28 clients can use `server/discover` and per-request protocol metadata. Modern results are stamped with `resultType` and server identity; unsupported modern versions fail with MCP error `-32022`.
+- Tool schemas use JSON Schema 2020-12, tool listing is deterministic, and `tools/call` returns both textual and structured compiler results. Source mutation is deliberately excluded from MCP and remains behind the explicit `nulang fix --safe` command.
+
 ### Agent-native source queries and repairable diagnostics — 2026-09-24
 - **Core tooling now exposes `nulang query symbols` and `nulang query symbol` without the optional AI runtime**, returning stable JSON declaration metadata including qualified names, source spans, signatures, effect/capability annotations, and visibility where available.
 - **JSON diagnostics now carry stable machine-oriented `kind` values, structured `data`, exact UTF-8 byte offsets, and `fixes`**, while preserving the existing error code/message/notes/suggestion surface. An unbound identifier with exactly one close in-scope candidate emits a `machine_applicable` replacement edit.
