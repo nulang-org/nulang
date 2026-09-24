@@ -3083,6 +3083,11 @@ fn test_consuming_send_handoffs_local_ref_without_inflight_churn() {
 
     let consumed = rt.send_message_by_id_consuming(receiver_id, 0, &[value], 1);
     assert_eq!(consumed, 1);
+    assert_eq!(
+        rt.cycle_detector.graph_size(),
+        1,
+        "handoff must register the receiver foreign-reference edge"
+    );
 
     unsafe {
         let header = &*ActorHeap::header_of(ptr);
@@ -3114,6 +3119,11 @@ fn test_consuming_send_handoffs_local_ref_without_inflight_churn() {
     assert_eq!(stats.refcount_ops_elided, 2);
 
     rt.release_held_foreign_refs(receiver_id);
+    assert_eq!(
+        rt.cycle_detector.graph_size(),
+        0,
+        "receiver hold release must remove the handoff cycle edge"
+    );
     assert_eq!(
         rt.actors.get(&owner_id).unwrap().heap.live_count(),
         0,
