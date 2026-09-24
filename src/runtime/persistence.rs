@@ -935,10 +935,7 @@ struct JsonDurableTransitionRecord {
 }
 
 impl JsonDurableTransitionRecord {
-    fn from_transition(
-        transition: &DurableTransition,
-        digest: [u8; 32],
-    ) -> io::Result<Self> {
+    fn from_transition(transition: &DurableTransition, digest: [u8; 32]) -> io::Result<Self> {
         Ok(Self {
             version: transition.version,
             actor_id: transition.actor_id,
@@ -1352,10 +1349,7 @@ impl PersistenceStore for JsonFileStore {
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
         let legacy = self.load_legacy_snapshot(actor_id);
         let atomic = match self.read_transition_records(actor_id) {
-            Ok((records, _)) => records
-                .into_iter()
-                .rev()
-                .find_map(|record| record.snapshot),
+            Ok((records, _)) => records.into_iter().rev().find_map(|record| record.snapshot),
             Err(error) => {
                 warn!(
                     "nulang-persist: refusing snapshot recovery for actor {} because transitions.log is corrupt: {}",
@@ -2962,16 +2956,14 @@ impl PersistenceStore for RocksDbStore {
             .workflow_events
             .iter()
             .map(|event| {
-                serde_json::to_vec(event)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                serde_json::to_vec(event).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
             })
             .collect::<io::Result<Vec<_>>>()?;
         let domain_json = transition
             .domain_events
             .iter()
             .map(|event| {
-                serde_json::to_vec(event)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                serde_json::to_vec(event).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
             })
             .collect::<io::Result<Vec<_>>>()?;
         let effect_json = transition
@@ -3576,8 +3568,7 @@ impl PersistenceStore for PostgresStore {
                 let bytes = record
                     .to_json()
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                String::from_utf8(bytes)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
             })
             .collect::<io::Result<Vec<_>>>()?;
         let outbox_payload_json = transition
@@ -3677,8 +3668,10 @@ impl PersistenceStore for PostgresStore {
             ));
         }
 
-        if let (Some(snapshot), Some((state_json, crdt_json, crdt_field_map_json, authority_json))) =
-            (&transition.snapshot, &snapshot_data)
+        if let (
+            Some(snapshot),
+            Some((state_json, crdt_json, crdt_field_map_json, authority_json)),
+        ) = (&transition.snapshot, &snapshot_data)
         {
             tx.execute(
                 "INSERT INTO snapshots
@@ -4303,11 +4296,7 @@ mod json_file_store_tests {
         let store = JsonFileStore::new(&dir).unwrap();
         assert_eq!(store.load_durable_tail(42).unwrap().unwrap().sequence, 1);
         assert_eq!(
-            store
-                .load_snapshot(42)
-                .unwrap()
-                .state
-                .get("count"),
+            store.load_snapshot(42).unwrap().state.get("count"),
             Some(&PersistedValue::Int(7))
         );
         assert_eq!(store.read_journal(42).len(), 1);
