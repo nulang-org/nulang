@@ -394,6 +394,13 @@ pub struct Runtime {
 
     // Persistence engine (v0.7)
     pub persistence: Box<dyn PersistenceStore>,
+    /// Mailbox commands currently driving workflow activations but not yet
+    /// attached to a committed durable transition.
+    pub(crate) pending_workflow_commands: HashMap<u64, workflow::PendingWorkflowCommand>,
+    /// Workflow activations whose durable commit failed while user code was
+    /// executing. The scheduler must discard/recover these before allowing
+    /// another turn to observe their in-memory mutations.
+    pub(crate) workflow_commit_failures: HashSet<u64>,
     // Immutable shared object store for large `val` buffers.
     pub object_store: ObjectStore,
     // Virtual actor (grain) type registry and resident mapping.
@@ -620,6 +627,8 @@ impl Runtime {
             process_groups: ProcessGroups::new(),
             pending_fetched_messages: HashMap::new(),
             persistence: Box::new(MemoryStore::new()),
+            pending_workflow_commands: HashMap::new(),
+            workflow_commit_failures: HashSet::new(),
             object_store: ObjectStore::new(),
             grain_registry: GrainRegistry::new(),
             grain_residents: HashMap::new(),
@@ -3683,6 +3692,25 @@ impl Runtime {
             }
             let behavior_idx = msg.behavior_id as usize;
 
+            if self.actor_is_workflow(actor_id) {
+                if let Err(error) = workflow::begin_workflow_command(
+                    self,
+                    actor_id,
+                    msg.behavior_id,
+                    &msg.payload,
+                ) {
+                    tracing::error!(
+                        actor_id,
+                        %error,
+                        "nulang-workflow: refusing to execute a second uncommitted workflow command"
+                    );
+                    self.workflow_commit_failures.insert(actor_id);
+                    self.discard_and_recover_failed_workflow(actor_id);
+                    self.current_actor = None;
+                    return;
+                }
+            }
+
             // ORCA receiver protocol: hold every heap pointer in the
             // received payload so the owning objects (and any retired
             // owner heap) stay alive until this actor exits.
@@ -3965,6 +3993,9 @@ impl Runtime {
                                     %error,
                                     "nulang-workflow: failed to commit StepFailed transition"
                                 );
+                                self.discard_and_recover_failed_workflow(actor_id);
+                                self.current_actor = None;
+                                return;
                             }
                             self.run_saga_compensation(actor_id, behavior_idx);
                         } else {
@@ -3974,6 +4005,17 @@ impl Runtime {
                     }
                 }
             }
+
+            // A persistence failure raised from a callback during bytecode
+            // execution (for example emit/timer persistence) invalidates the
+            // entire activation. Do not let later completion bookkeeping make
+            // that rejected in-memory state observable.
+            if self.workflow_commit_failures.contains(&actor_id) {
+                self.discard_and_recover_failed_workflow(actor_id);
+                self.current_actor = None;
+                return;
+            }
+
             if processed
                 && self.actor_is_workflow(actor_id)
                 && !self.is_internal_behavior(actor_id, behavior_idx)
@@ -4006,6 +4048,26 @@ impl Runtime {
                         %error,
                         "nulang-workflow: failed to commit StepCompleted transition"
                     );
+                    self.discard_and_recover_failed_workflow(actor_id);
+                    self.current_actor = None;
+                    return;
+                }
+            } else if processed
+                && self.actor_is_workflow(actor_id)
+                && self.is_internal_behavior(actor_id, behavior_idx)
+            {
+                // Internal workflow messages still need one atomic boundary
+                // for their driving command and resulting durable state even
+                // though they intentionally do not emit StepCompleted.
+                if let Err(error) = crate::runtime::workflow::try_checkpoint_actor(self, actor_id) {
+                    tracing::error!(
+                        actor_id,
+                        %error,
+                        "nulang-workflow: failed to commit internal workflow transition"
+                    );
+                    self.discard_and_recover_failed_workflow(actor_id);
+                    self.current_actor = None;
+                    return;
                 }
             }
             let actor = match self.actors.get_mut(&actor_id) {
@@ -4720,6 +4782,38 @@ impl Runtime {
     /// the last checkpoint (dirty-bit optimization).
     pub fn checkpoint_actor(&mut self, actor_id: u64) {
         workflow::checkpoint_actor(self, actor_id)
+    }
+
+    /// Discard an activation whose durable transition failed and recover only
+    /// from committed state.
+    ///
+    /// Continuing the existing actor would expose mutations that persistence
+    /// explicitly rejected. Bytecode-backed workflows are reconstructed from
+    /// the last snapshot plus committed workflow history. Runtime-only/native
+    /// workflows without recovery metadata are removed and stay unavailable,
+    /// which is deliberately fail-closed.
+    pub(crate) fn discard_and_recover_failed_workflow(&mut self, actor_id: u64) {
+        self.workflow_commit_failures.remove(&actor_id);
+        self.pending_workflow_commands.remove(&actor_id);
+
+        if let Some(manager) = self.crdt_manager.as_mut() {
+            manager.unregister_actor_fields(actor_id);
+        }
+        self.remove_actor_reaping(actor_id);
+
+        if self.recovery_modules.contains_key(&actor_id) {
+            if self.recover_actor(actor_id).is_none() {
+                tracing::error!(
+                    actor_id,
+                    "nulang-workflow: failed to recover activation after durable commit failure"
+                );
+            }
+        } else {
+            tracing::error!(
+                actor_id,
+                "nulang-workflow: discarded failed activation; no recovery module is registered"
+            );
+        }
     }
 
     /// Persist only the suspension marker of a persistent actor whose
