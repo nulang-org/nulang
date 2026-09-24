@@ -57,6 +57,13 @@ version + migration.*
 - **Each installed compiled region records compiler wall time in nanoseconds.** Regression coverage pins pointer replacement, optimization-level transition, SIMD promotion, per-session counters, and stable compiled-region cardinality across replacement.
 
 
+### Atomic workflow execution on current scheduler — 2026-09-24
+- **Workflow command acceptance, step completion/failure, timer firing, signal resume, saga progress, and LLM-resumed completion now stay on the RFC 0022 atomic durable-transition tail.** Workflow execution fails closed when durable command acceptance cannot commit instead of executing against an uncommitted history.
+- **The current native/bytecode scheduler dispatch path no longer splits workflow journal visibility from state checkpoint visibility.** Accepted commands remain replayable after a crash, recovered workflow metadata is rebuilt across snapshots, and durable timer commit failures are retried rather than silently advancing.
+- **JsonFileStore now supports atomic durable transitions for development and crash-recovery testing** through a versioned whole-transition journal committed by fsync + atomic rename. Reads merge legacy history with atomic transitions, exact commit retries are idempotent, and sequence gaps/stale histories fail closed.
+- **Durable-effect records embedded in atomic transition journals reuse the existing versioned canonical effect codec** rather than introducing a second persistence representation.
+- Workflow-focused no-default-feature coverage includes restart recovery, signals, timers, queries, parallel branches, compensation, atomic creation failure, and persistence fencing.
+
 ### CI playground dependency and formatting repair — 2026-09-24
 - **Browser-playground compilation now includes the shared content-identity module and its pure-Rust `hex` dependency** (`crates/nulang-playground`), matching `semantic_identity.rs`'s current dependency graph. Runtime worker-pool files were also normalized to the repository's rustfmt output so the format gate reflects semantics rather than stale layout.
 
