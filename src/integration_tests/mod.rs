@@ -33,6 +33,26 @@ mod tests {
     }
 
     impl PersistenceStore for SharedMemoryStore {
+        fn commit_transition(
+            &mut self,
+            transition: crate::runtime::DurableTransition,
+        ) -> std::io::Result<crate::runtime::DurableCommit> {
+            self.0.lock().unwrap().commit_transition(transition)
+        }
+
+        fn load_durable_effect(
+            &self,
+            actor_id: u64,
+            effect_id: crate::durable_effect::DurableEffectId,
+        ) -> std::io::Result<
+            Option<crate::durable_effect_persistence::DurableEffectPersistenceRecord>,
+        > {
+            self.0
+                .lock()
+                .unwrap()
+                .load_durable_effect(actor_id, effect_id)
+        }
+
         fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
             self.0.lock().unwrap().save_snapshot(snapshot)
         }
