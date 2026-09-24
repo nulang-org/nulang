@@ -361,10 +361,19 @@ impl CacheStore {
     }
 
     pub fn with_config(config: CacheConfig) -> Self {
-        assert!(config.max_key_bytes > 0, "cache max_key_bytes must be non-zero");
-        assert!(config.max_value_bytes > 0, "cache max_value_bytes must be non-zero");
+        assert!(
+            config.max_key_bytes > 0,
+            "cache max_key_bytes must be non-zero"
+        );
+        assert!(
+            config.max_value_bytes > 0,
+            "cache max_value_bytes must be non-zero"
+        );
         assert!(config.max_entries > 0, "cache max_entries must be non-zero");
-        assert!(config.max_arena_bytes > 0, "cache max_arena_bytes must be non-zero");
+        assert!(
+            config.max_arena_bytes > 0,
+            "cache max_arena_bytes must be non-zero"
+        );
         Self {
             config,
             hash_builder: RandomState::new(),
@@ -1128,7 +1137,10 @@ mod tests {
             max_entries: 1,
             max_arena_bytes: 1024,
         });
-        let pairs = [(b"a".as_slice(), b"1".as_slice()), (b"b".as_slice(), b"2".as_slice())];
+        let pairs = [
+            (b"a".as_slice(), b"1".as_slice()),
+            (b"b".as_slice(), b"2".as_slice()),
+        ];
         assert_eq!(
             store.try_set_many_bytes(&pairs, None, 0),
             Err(CacheWriteError::EntryLimitReached)
