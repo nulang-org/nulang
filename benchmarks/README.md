@@ -57,12 +57,13 @@ same machine and emit one JSON report with exact toolchain metadata and median
 timings.
 
 Comparative runs default to `--cpu-mode single`: every measured runtime
-process is pinned to the same one logical CPU, matching the current
-single-shard Nulang Savina harness's compute budget. `--cpu-mode host` is
-diagnostic only until a separate sharded Nulang fixture exists; in particular,
-host-mode fork-join results must not be presented as a fair multicore
-comparison. These are language/runtime baselines, not a universal framework
-ranking; see the cross-runtime README for the full interpretation constraints.
+process is pinned to the same one logical CPU and Nulang fork-join is forced to
+one shard. Host-mode multicore measurement is explicit rather than inferred:
+`--cpu-mode host --nulang-shards N` selects the real sharded Nulang fork-join
+fixture for 2–8 shards, while counting, ping-pong, and thread-ring remain
+single-shard. The JSON report records both topologies. These are
+language/runtime baselines, not a universal framework ranking; see the
+cross-runtime README for the full interpretation constraints.
 
 ## Same-runner Nulang A/B
 
