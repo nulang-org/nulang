@@ -180,6 +180,7 @@ fn selective_receive_mailbox(depth: usize, hit_behavior: u16) -> Mailbox {
                 sender: 0,
                 priority: MessagePriority::Normal,
                 trace_id: None,
+                durable_id: None,
             })
             .unwrap();
     }
@@ -190,6 +191,7 @@ fn selective_receive_mailbox(depth: usize, hit_behavior: u16) -> Mailbox {
             sender: 0,
             priority: MessagePriority::Normal,
             trace_id: None,
+            durable_id: None,
         })
         .unwrap();
     mailbox
@@ -243,6 +245,7 @@ fn bench_selective_receive(c: &mut Criterion) {
                             sender,
                             priority: MessagePriority::Normal,
                             trace_id: None,
+                            durable_id: None,
                         })
                         .unwrap();
                 }
