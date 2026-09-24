@@ -1708,9 +1708,9 @@ define_aot_call_closure!(nulang_aot_call_closure_8, a0, a1, a2, a3, a4, a5, a6, 
 // ---------------------------------------------------------------------------
 // `perform Effect.op(args)` for the async-effect family (LLM/Inference.ask,
 // Timer.sleep, Pipeline.*, Supervisor.*) lowers to an arity-matched
-// `nulang_aot_perform_async_N` call. The helper resolves the fully-qualified
-// effect name from the module pool, routes through the current callbacks'
-// `perform_async` (the same path the bytecode PerformAsync opcode takes), and
+// `nulang_aot_perform_async_N` call. Generated code also passes the canonical
+// semantic effect-site index. The helper resolves both the effect name and the
+// compiler-owned site digest, routes through the site-aware callback path, and
 // materializes the result: Ready(Some(content)) becomes a heap string,
 // Ready(None) and unarmed callbacks become nil. Effects that return Pending
 // (LLM.ask, Timer.sleep with a positive delay) degrade to nil — the native
@@ -1720,12 +1720,19 @@ macro_rules! define_aot_perform_async {
     ($name:ident, $($arg:ident),*) => {
         /// Dispatch an async effect from AOT-compiled code.
         #[no_mangle]
-        pub unsafe extern "C" fn $name(effect_raw: u64 $(, $arg: u64)*) -> u64 {
+        pub unsafe extern "C" fn $name(site_index: u64, effect_raw: u64 $(, $arg: u64)*) -> u64 {
             let args = [$($arg),*];
             let effect_op = resolve_string_coerce(effect_raw).unwrap_or_default();
             let constants = crate::aot::aot_module_constants();
             let vals: Vec<Value> = args.iter().map(|a| unsafe { Value::from_bits(*a) }).collect();
-            match try_with_callbacks(|cb| cb.perform_async(&effect_op, constants, &vals)) {
+            let context = crate::vm::EffectInvocationContext {
+                module_idx: None,
+                artifact_pc: None,
+                semantic_site_id: crate::aot::aot_effect_site_id(site_index),
+            };
+            match try_with_callbacks(|cb| {
+                cb.perform_async_at_site(context, &effect_op, constants, &vals)
+            }) {
                 Some(crate::vm::PerformAsyncResult::Ready(Some(content))) => {
                     let bytes = content.into_bytes();
                     if let Some(ptr) = alloc_obj(bytes.len() + 1, HeapTypeTag::String) {
