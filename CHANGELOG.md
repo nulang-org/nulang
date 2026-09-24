@@ -1704,6 +1704,9 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### RFC 0020 Behavior Manifest effect inventory — 2026-09-23
+- **Behavior manifests now carry a compiler-derived effect inventory across typed function/actor-behavior rows and executable constant bodies.** Closed typed rows and directly provable HIR effects contribute their known families; open rows or executable calls/runtime helpers whose effect requirements cannot be proven mark `effect_inventory_complete: false` so deployment policy fails closed. Older v0alpha1 manifests deserialize conservatively as incomplete rather than being misread as pure/no-effect programs.
+
 ### RFC 0020 Behavior Manifest durability admission subset — 2026-09-23
 - **Package builds now emit `<package>.behavior.json` beside `.nbc` artifacts** (`src/behavior_manifest.rs`, `src/main.rs`, `src/package/commands.rs`). The experimental `nulang.behavior/v0alpha1` sidecar binds package/language metadata to compiler artifact identity and exposes durable actor persistence class, schema version, canonical state-schema semantic identity, and migration topology.
 - **Manifest parsing fails closed** on unknown schema versions/artifact kinds, malformed content identities or digests, duplicate actors, invalid/incomplete migration chains, and artifact identity tampering. The sidecar includes a BLAKE3 digest of the exact emitted `.nbc` bytes and can verify the executable/manifest pairing; canonical ordering gives deterministic JSON and a separate domain-separated manifest digest.
