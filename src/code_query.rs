@@ -106,7 +106,9 @@ fn cmd_symbols(args: &[String]) -> NuResult<()> {
         i += 1;
     }
 
-    let file = file.ok_or_else(|| query_err("usage: nulang query symbols <file> [--name <substring>] [--json]"))?;
+    let file = file.ok_or_else(|| {
+        query_err("usage: nulang query symbols <file> [--name <substring>] [--json]")
+    })?;
     let mut report = analyze_file(Path::new(file), "symbols")?;
     if let Some(filter) = name_filter {
         let needle = filter.to_lowercase();
@@ -132,7 +134,9 @@ fn cmd_symbol(args: &[String]) -> NuResult<()> {
     }
 
     if positional.len() != 2 {
-        return Err(query_err("usage: nulang query symbol <name> <file> [--json]"));
+        return Err(query_err(
+            "usage: nulang query symbol <name> <file> [--json]",
+        ));
     }
     let requested = positional[0];
     let mut report = analyze_file(Path::new(positional[1]), "symbol")?;
@@ -176,9 +180,8 @@ fn emit_report(report: &QueryReport, json: bool) -> NuResult<()> {
 }
 
 pub fn analyze_file(path: &Path, command: &str) -> NuResult<QueryReport> {
-    let source = std::fs::read_to_string(path).map_err(|e| {
-        query_err(format!("cannot read '{}': {e}", path.display()))
-    })?;
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| query_err(format!("cannot read '{}': {e}", path.display())))?;
 
     let tokens = Lexer::new(&source).lex()?;
     let ast = Parser::new(tokens).parse_module()?;
@@ -262,7 +265,11 @@ fn collect_decls(
                 } else {
                     format!("[{}]", type_params.join(", "))
                 };
-                let head = if *persistent { "persistent actor" } else { "actor" };
+                let head = if *persistent {
+                    "persistent actor"
+                } else {
+                    "actor"
+                };
                 out.push(symbol(
                     name,
                     prefix,
@@ -421,7 +428,9 @@ fn collect_decls(
                 file,
                 source,
             )),
-            Decl::Agent { name, model, span, .. } => out.push(symbol(
+            Decl::Agent {
+                name, model, span, ..
+            } => out.push(symbol(
                 name,
                 prefix,
                 "agent",
