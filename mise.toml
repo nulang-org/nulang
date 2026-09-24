@@ -1,0 +1,46 @@
+min_version = { hard = "2026.9.0", soft = "2026.9.11" }
+
+[settings]
+# Nulang already pins Rust in rust-toolchain.toml. Let mise consume that file
+# instead of creating a second Rust-version source of truth.
+idiomatic_version_file_enable_tools = ["rust"]
+
+[tools]
+# Shared Cargo action cache + scheduler across linked worktrees and parallel
+# coding agents. Cargo remains the command developers invoke.
+mr-boxington = "latest"
+
+[wrappers.cargo]
+command = "mbx"
+env = { MBX_CARGO_SHIM_MODE = "1" }
+
+[tasks.setup]
+description = "Prepare a checkout/worktree for development"
+run = """
+rustup component add rustfmt clippy
+cargo fetch --locked
+"""
+
+[tasks.dev]
+description = "Run the Nulang REPL from source"
+run = "cargo run --locked -- --repl"
+
+[tasks.test]
+description = "Run the default Rust test suite"
+run = "cargo test --locked"
+
+[tasks.check]
+description = "Run the blocking local CI contract"
+run = "bash scripts/ci-local.sh"
+
+[tasks."check-full"]
+description = "Run the complete local CI contract"
+run = "bash scripts/ci-local.sh --full"
+
+[tasks.bench]
+description = "Run the Rust benchmark suite"
+run = "cargo bench --locked"
+
+[tasks.clean]
+description = "Remove Cargo build artifacts for this worktree"
+run = "cargo clean"
