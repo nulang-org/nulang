@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### Tiered actor heap activation — 2026-09-24
+- **Runtime-created actors now materialize a 4 KiB first ORCA bump block on their first small-object allocation instead of 16 KiB.** Completely idle and LOS-only actors remain bump-block-free.
+- **Actors that outgrow the compact first block switch to a 16 KiB steady-state growth floor rather than chaining 4 KiB blocks indefinitely.** Generic `ActorHeap::new(size)` retains its existing equal-size growth behavior; only the runtime actor constructor opts into tiered growth.
+- Criterion now tracks `actor/first_heap_alloc/1000` separately from idle spawn throughput so the density optimization has a direct regression signal.
+
 ### Backend-neutral JIT region planning — 2026-09-24
 - **Native compilation eligibility is now separated from Cranelift code generation.** `src/jit/region_planner.rs` owns region boundaries, non-suspending direct-call folding, recursion safety, cached per-module analyses, and type metadata production.
 - **`JitSession` now consumes a `RegionPlan` for initial compilation and Tier-2 replacement instead of recomputing language/runtime safety rules itself.** This creates a reusable planning boundary for MIR, a custom baseline emitter, or another future native backend without duplicating call/effect/recursion semantics.
