@@ -328,6 +328,18 @@ pub struct DurableOutboxPumpReport {
     pub deferred: usize,
 }
 
+/// One active durable workflow execution segment.
+///
+/// The stack shape is intentional: `vm_exec_end` may resume another actor
+/// before the outer workflow has reached its own durable boundary. Each nested
+/// actor therefore needs an independent staged outbox.
+#[derive(Debug, Default)]
+struct DurableWorkflowTurnContext {
+    actor_id: u64,
+    outbox: Vec<DurableOutboxMessage>,
+    next_outbox_ordinal: u32,
+}
+
 pub struct Runtime {
     pub actors: HashMap<u64, Actor>,
     pub supervisors: HashMap<u64, Supervisor>,
@@ -416,6 +428,9 @@ pub struct Runtime {
 
     // Persistence engine (v0.7)
     pub persistence: Box<dyn PersistenceStore>,
+    /// Nested durable workflow execution segments. Outgoing workflow messages
+    /// stay here until the next atomic workflow transition commits.
+    durable_workflow_turns: Vec<DurableWorkflowTurnContext>,
     // Immutable shared object store for large `val` buffers.
     pub object_store: ObjectStore,
     // Virtual actor (grain) type registry and resident mapping.
@@ -642,6 +657,7 @@ impl Runtime {
             process_groups: ProcessGroups::new(),
             pending_fetched_messages: HashMap::new(),
             persistence: Box::new(MemoryStore::new()),
+            durable_workflow_turns: Vec::new(),
             object_store: ObjectStore::new(),
             grain_registry: GrainRegistry::new(),
             grain_residents: HashMap::new(),
@@ -1258,6 +1274,13 @@ impl Runtime {
             return;
         }
 
+        if self.actor_is_workflow(actor_id) && !self.has_durable_workflow_turn(actor_id) {
+            self.begin_durable_workflow_turn(actor_id);
+        }
+        let mut keep_durable_turn = false;
+        let behavior_idx = suspended.behavior_idx;
+        let durable_step_name = suspended.step_name.clone();
+
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -1279,6 +1302,7 @@ impl Runtime {
 
             match result {
                 Ok(_) if vm.yield_pending => {
+                    keep_durable_turn = true;
                     // JIT safepoint yield: re-capture VM state.
                     if let Some(vm_state) = vm.take_suspended_state() {
                         if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
@@ -1293,9 +1317,35 @@ impl Runtime {
                     }
                 }
                 Ok(_) => {
-                    // Behavior completed: clear suspension.
+                    // Behavior completed: clear suspension and close the
+                    // workflow turn through the same atomic boundary as the
+                    // interpreter path.
                     if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                         actor.jit_yield_pending = false;
+                        if (*self_ptr).actor_is_workflow(actor_id) {
+                            if let Some(n) =
+                                actor.get_state_field("step_index").and_then(|v| v.as_int())
+                            {
+                                actor.set_state_field("step_index", Value::int(n + 1));
+                            }
+                        }
+                    }
+                    if (*self_ptr).actor_is_workflow(actor_id) {
+                        let sequence = (*self_ptr).next_sequence(actor_id);
+                        if let Err(error) = workflow::commit_workflow_event(
+                            &mut *self_ptr,
+                            actor_id,
+                            WorkflowEvent::StepCompleted {
+                                sequence,
+                                step_name: durable_step_name.clone(),
+                            },
+                        ) {
+                            tracing::warn!(
+                                actor_id,
+                                %error,
+                                "nulang-persist: JIT-resumed workflow completion was not durably committed"
+                            );
+                        }
                     }
                 }
                 Err(crate::types::NuError::Suspended(_)) => {
@@ -1315,16 +1365,38 @@ impl Runtime {
                                 });
                         }
                         (*self_ptr).maybe_schedule_receive_wait(actor_id, receive_timeout);
+                        (*self_ptr).persist_suspension_marker(actor_id);
                     }
                 }
-                Err(_) => {
-                    // Other error: clear suspension.
+                Err(error) => {
+                    (*self_ptr).discard_staged_workflow_outbox(actor_id);
                     if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                         actor.jit_yield_pending = false;
+                    }
+                    if (*self_ptr).actor_is_workflow(actor_id) {
+                        let sequence = (*self_ptr).next_sequence(actor_id);
+                        if let Err(commit_error) = workflow::commit_workflow_event(
+                            &mut *self_ptr,
+                            actor_id,
+                            WorkflowEvent::StepFailed {
+                                sequence,
+                                step_name: (*self_ptr).step_name_for(actor_id, behavior_idx),
+                                error: error.to_string(),
+                            },
+                        ) {
+                            tracing::warn!(
+                                actor_id,
+                                %commit_error,
+                                "nulang-persist: JIT-resumed workflow failure was not durably committed"
+                            );
+                        }
                     }
                 }
             }
             (*self_ptr).vm_exec_end();
+        }
+        if !keep_durable_turn {
+            self.end_durable_workflow_turn(actor_id);
         }
         self.requeue_if_mail_pending(actor_id);
     }
@@ -1651,6 +1723,9 @@ impl Runtime {
 
         let behavior_idx = suspended.behavior_idx;
         let step_name = suspended.step_name;
+        let previous_actor = self.current_actor;
+        self.current_actor = Some(actor_id);
+        self.begin_durable_workflow_turn(actor_id);
         let self_ptr: *mut Runtime = self;
         let result = unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -1743,6 +1818,7 @@ impl Runtime {
                     // A chained receive-after suspend arms its timeout
                     // here; a no-op for the other sentinels.
                     self.maybe_schedule_receive_wait(actor_id, receive_timeout);
+                    self.persist_suspension_marker(actor_id);
                 }
             }
             Err(error) => {
@@ -1750,6 +1826,7 @@ impl Runtime {
                 // not run compensation unless the failure marker and current
                 // state commit on the same fenced atomic tail.
                 if self.actor_is_workflow(actor_id) {
+                    self.discard_staged_workflow_outbox(actor_id);
                     let seq = self.next_sequence(actor_id);
                     let failed_step = self.step_name_for(actor_id, behavior_idx);
                     match workflow::commit_workflow_event(
@@ -1782,6 +1859,8 @@ impl Runtime {
         // bytecode whose own begin/end must stay inside this window. Runs
         // on every path so wakes of other actors are not lost.
         self.vm_exec_end();
+        self.end_durable_workflow_turn(actor_id);
+        self.current_actor = previous_actor;
         // The suspension resolved (completed or failed): drain any mail
         // that queued up while the step was suspended.
         self.requeue_if_mail_pending(actor_id);
@@ -2529,6 +2608,15 @@ impl Runtime {
         // receiving side derives its own child. When no message is being
         // handled, the outgoing message starts a fresh trace on its own.
         let out_trace = self.current_trace.as_ref().map(|t| t.to_traceparent());
+
+        // A send performed inside an active durable workflow segment to a
+        // local workflow receiver is part of the sender's next atomic
+        // transition. Do not publish it to the receiver mailbox before that
+        // transition commits.
+        if self.try_stage_durable_workflow_send(target_id, behavior_id, args) {
+            return;
+        }
+
         // Cross-node routing by bare actor-ref value (RFC-0007 gap): a
         // spawn@node placeholder or reply-by-ref id whose hosting node we
         // know routes over the wire instead of the local mailbox. The
@@ -2655,6 +2743,134 @@ impl Runtime {
         }
 
         self.deliver_local_message(target_id, behavior_id, args, out_trace);
+    }
+
+    /// Begin one durable workflow execution segment.
+    pub(crate) fn begin_durable_workflow_turn(&mut self, actor_id: u64) {
+        if !self.actor_is_workflow(actor_id) {
+            return;
+        }
+        self.durable_workflow_turns
+            .push(DurableWorkflowTurnContext {
+                actor_id,
+                outbox: Vec::new(),
+                next_outbox_ordinal: 0,
+            });
+    }
+
+    fn durable_workflow_turn_index(&self, actor_id: u64) -> Option<usize> {
+        self.durable_workflow_turns
+            .iter()
+            .rposition(|turn| turn.actor_id == actor_id)
+    }
+
+    #[cfg(feature = "native-codegen")]
+    pub(crate) fn has_durable_workflow_turn(&self, actor_id: u64) -> bool {
+        self.durable_workflow_turn_index(actor_id).is_some()
+    }
+
+    pub(crate) fn has_staged_workflow_outbox(&self, actor_id: u64) -> bool {
+        self.durable_workflow_turn_index(actor_id)
+            .and_then(|index| self.durable_workflow_turns.get(index))
+            .map(|turn| !turn.outbox.is_empty())
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn staged_workflow_outbox(&self, actor_id: u64) -> Vec<DurableOutboxMessage> {
+        self.durable_workflow_turn_index(actor_id)
+            .and_then(|index| self.durable_workflow_turns.get(index))
+            .map(|turn| turn.outbox.clone())
+            .unwrap_or_default()
+    }
+
+    /// Mark the current staged batch as part of a successfully committed
+    /// durable transition while keeping the execution segment open for later
+    /// sends before the handler itself returns.
+    pub(crate) fn durable_workflow_boundary_committed(&mut self, actor_id: u64) {
+        if let Some(index) = self.durable_workflow_turn_index(actor_id) {
+            if let Some(turn) = self.durable_workflow_turns.get_mut(index) {
+                turn.outbox.clear();
+                turn.next_outbox_ordinal = 0;
+            }
+        }
+    }
+
+    /// Discard effects staged since the most recent durable boundary. Used
+    /// when the current execution segment fails before those sends commit.
+    pub(crate) fn discard_staged_workflow_outbox(&mut self, actor_id: u64) {
+        self.durable_workflow_boundary_committed(actor_id);
+    }
+
+    /// End one durable workflow execution segment.
+    pub(crate) fn end_durable_workflow_turn(&mut self, actor_id: u64) {
+        if let Some(index) = self.durable_workflow_turn_index(actor_id) {
+            let turn = self.durable_workflow_turns.remove(index);
+            if !turn.outbox.is_empty() {
+                tracing::warn!(
+                    actor_id,
+                    staged_messages = turn.outbox.len(),
+                    "nulang-persist: discarding workflow sends that never reached a durable boundary"
+                );
+            }
+        }
+    }
+
+    /// Stage one local workflow-to-workflow send in the active sender turn.
+    ///
+    /// This deliberately returns false for remote/cross-shard/non-workflow
+    /// receivers so those paths retain their existing semantics until the
+    /// corresponding durable transport contracts exist.
+    fn try_stage_durable_workflow_send(
+        &mut self,
+        target_id: u64,
+        behavior_id: u16,
+        args: &[Value],
+    ) -> bool {
+        let Some(sender_id) = self.current_actor else {
+            return false;
+        };
+        let Some(turn_index) = self.durable_workflow_turn_index(sender_id) else {
+            return false;
+        };
+
+        let target_is_supported = self
+            .actors
+            .get(&target_id)
+            .map(|actor| actor.persistent && actor.is_workflow)
+            .unwrap_or(false)
+            && !self.is_internal_behavior(target_id, behavior_id as usize)
+            && (self.has_native_handler(target_id, behavior_id as usize)
+                || self.has_bytecode_handler(target_id, behavior_id as usize));
+        if !target_is_supported {
+            return false;
+        }
+
+        let module = self
+            .actors
+            .get(&sender_id)
+            .and_then(|actor| actor.bytecode_module.as_ref());
+        let payload = args
+            .iter()
+            .map(|value| PersistedValue::from_value_resolved(value, module))
+            .collect::<Vec<_>>();
+
+        let turn = &mut self.durable_workflow_turns[turn_index];
+        let ordinal = turn.next_outbox_ordinal;
+        let Some(next_ordinal) = ordinal.checked_add(1) else {
+            tracing::warn!(
+                actor_id = sender_id,
+                "nulang-persist: durable workflow outbox ordinal overflow; send not staged"
+            );
+            return true;
+        };
+        turn.next_outbox_ordinal = next_ordinal;
+        turn.outbox.push(DurableOutboxMessage {
+            destination_actor_id: target_id,
+            ordinal,
+            behavior_id,
+            payload,
+        });
+        true
     }
 
     /// Scheduler-facing wrapper around the durable outbox pump.
@@ -4126,6 +4342,7 @@ impl Runtime {
             }
 
             let mut processed = false;
+            let mut durable_turn_started = false;
             if self.has_native_handler(actor_id, behavior_idx) {
                 // Accept workflow commands on the same RFC 0022 atomic tail
                 // used by their completion/failure transitions. Plain
@@ -4161,6 +4378,12 @@ impl Runtime {
                             return;
                         }
                     }
+                }
+                if self.actor_is_workflow(actor_id)
+                    && !self.is_internal_behavior(actor_id, behavior_idx)
+                {
+                    self.begin_durable_workflow_turn(actor_id);
+                    durable_turn_started = true;
                 }
                 processed = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload);
                 if processed && !self.actor_is_workflow(actor_id) {
@@ -4203,6 +4426,13 @@ impl Runtime {
                         }
                     }
                 }
+                if !durable_turn_started
+                    && self.actor_is_workflow(actor_id)
+                    && !self.is_internal_behavior(actor_id, behavior_idx)
+                {
+                    self.begin_durable_workflow_turn(actor_id);
+                    durable_turn_started = true;
+                }
                 let payload = msg.payload.clone();
                 let saved_suspend = self.suspend_enabled;
                 self.suspend_enabled = true;
@@ -4221,6 +4451,7 @@ impl Runtime {
                     }
                     Err(e) => {
                         if self.actor_is_workflow(actor_id) {
+                            self.discard_staged_workflow_outbox(actor_id);
                             let seq = self.next_sequence(actor_id);
                             let step_name = self.step_name_for(actor_id, behavior_idx);
                             match workflow::commit_workflow_event(
@@ -4278,6 +4509,21 @@ impl Runtime {
                     );
                 }
             }
+            if durable_turn_started {
+                #[cfg(feature = "native-codegen")]
+                let keep_turn_for_jit_yield = self
+                    .actors
+                    .get(&actor_id)
+                    .map(|actor| actor.jit_yield_pending)
+                    .unwrap_or(false);
+                #[cfg(not(feature = "native-codegen"))]
+                let keep_turn_for_jit_yield = false;
+
+                if !keep_turn_for_jit_yield {
+                    self.end_durable_workflow_turn(actor_id);
+                }
+            }
+
             let actor = match self.actors.get_mut(&actor_id) {
                 Some(a) => a,
                 None => {
@@ -4741,6 +4987,9 @@ impl Runtime {
             self.enqueue_actor(actor_id);
             return;
         }
+        let previous_actor = self.current_actor;
+        self.current_actor = Some(actor_id);
+        self.begin_durable_workflow_turn(actor_id);
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -4774,14 +5023,20 @@ impl Runtime {
                             }
                         }
                         let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        if let Err(error) = crate::runtime::workflow::commit_workflow_event(
+                            &mut *self_ptr,
                             actor_id,
                             crate::runtime::WorkflowEvent::StepCompleted {
                                 sequence: seq,
                                 step_name: suspended.step_name.clone(),
                             },
-                        );
-                        (*self_ptr).checkpoint_actor(actor_id);
+                        ) {
+                            tracing::warn!(
+                                actor_id,
+                                %error,
+                                "nulang-persist: Timer.sleep-resumed workflow completion was not durably committed"
+                            );
+                        }
                     }
                 }
                 Err(crate::types::NuError::Suspended(_)) => {
@@ -4797,8 +5052,10 @@ impl Runtime {
                                 });
                         }
                     }
+                    (*self_ptr).persist_suspension_marker(actor_id);
                 }
                 Err(e) => {
+                    (*self_ptr).discard_staged_workflow_outbox(actor_id);
                     // VM error during resume - log and clean up.
                     tracing::warn!("Timer.sleep resume error for actor {}: {:?}", actor_id, e);
                     if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
@@ -4808,6 +5065,8 @@ impl Runtime {
             }
             (*self_ptr).vm_exec_end();
         }
+        self.end_durable_workflow_turn(actor_id);
+        self.current_actor = previous_actor;
         // Re-enqueue so the scheduler can continue processing the actor.
         self.enqueue_actor(actor_id);
     }
@@ -4834,6 +5093,9 @@ impl Runtime {
             return;
         }
 
+        let previous_actor = self.current_actor;
+        self.current_actor = Some(actor_id);
+        self.begin_durable_workflow_turn(actor_id);
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -4867,14 +5129,20 @@ impl Runtime {
                             }
                         }
                         let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        if let Err(error) = crate::runtime::workflow::commit_workflow_event(
+                            &mut *self_ptr,
                             actor_id,
                             WorkflowEvent::StepCompleted {
                                 sequence: seq,
                                 step_name: suspended.step_name,
                             },
-                        );
-                        (*self_ptr).checkpoint_actor(actor_id);
+                        ) {
+                            tracing::warn!(
+                                actor_id,
+                                %error,
+                                "nulang-persist: receive-resumed workflow completion was not durably committed"
+                            );
+                        }
                     }
                 }
                 Err(crate::types::NuError::Suspended(VmSuspension::ReceiveWait)) => {
@@ -4894,6 +5162,7 @@ impl Runtime {
                                 });
                         }
                         (*self_ptr).maybe_schedule_receive_wait(actor_id, timeout);
+                        (*self_ptr).persist_suspension_marker(actor_id);
                     }
                 }
                 Err(crate::types::NuError::Suspended(_)) => {
@@ -4915,10 +5184,14 @@ impl Runtime {
                                 });
                         }
                     }
+                    (*self_ptr).persist_suspension_marker(actor_id);
                 }
                 // Other errors: the wait is over; the send-path result is
                 // discarded anyway, matching step_actor semantics.
-                Err(_) => (*self_ptr).clear_receive_wait(actor_id),
+                Err(_) => {
+                    (*self_ptr).discard_staged_workflow_outbox(actor_id);
+                    (*self_ptr).clear_receive_wait(actor_id);
+                }
             }
             // End the VM-execution window only after any suspend-state
             // re-capture above: draining deferred wakes runs other actors
@@ -4927,6 +5200,8 @@ impl Runtime {
             // wakes of other actors are not lost when THIS one suspends.
             (*self_ptr).vm_exec_end();
         }
+        self.end_durable_workflow_turn(actor_id);
+        self.current_actor = previous_actor;
         // The suspension resolved (completed or failed): if messages queued
         // up while the behavior was suspended, schedule the actor to drain
         // them - step_actor leaves mail untouched while a suspension is live.
@@ -5008,11 +5283,23 @@ impl Runtime {
             _ => return,
         };
         if let Some(mut snapshot) = self.persistence.load_snapshot(actor_id) {
-            if snapshot.waiting_signal == waiting_signal {
+            let marker_changed = snapshot.waiting_signal != waiting_signal;
+            if !marker_changed && !self.has_staged_workflow_outbox(actor_id) {
                 return;
             }
             snapshot.waiting_signal = waiting_signal;
-            let _ = self.persistence.save_snapshot(snapshot);
+            let result = if self.actor_is_workflow(actor_id) {
+                workflow::commit_workflow_snapshot(self, actor_id, snapshot)
+            } else {
+                self.persistence.save_snapshot(snapshot)
+            };
+            if let Err(error) = result {
+                tracing::warn!(
+                    actor_id,
+                    %error,
+                    "nulang-persist: suspension boundary was not durably committed"
+                );
+            }
         }
     }
 
@@ -5581,6 +5868,10 @@ impl Runtime {
                 let payload: Vec<Value> =
                     entry.payload.iter().map(|value| value.to_value()).collect();
 
+                let previous_actor = self.current_actor;
+                self.current_actor = Some(actor_id);
+                self.begin_durable_workflow_turn(actor_id);
+
                 let replay_result = if self.has_native_handler(actor_id, behavior_idx) {
                     let handler = self
                         .actors
@@ -5602,6 +5893,8 @@ impl Runtime {
                         behavior_id = entry.behavior_id,
                         "nulang-recover: accepted workflow command has no recoverable handler"
                     );
+                    self.end_durable_workflow_turn(actor_id);
+                    self.current_actor = previous_actor;
                     self.actors.remove(&actor_id);
                     return None;
                 };
@@ -5628,6 +5921,8 @@ impl Runtime {
                                     %error,
                                     "nulang-recover: replayed workflow command completion could not be committed"
                                 );
+                                self.end_durable_workflow_turn(actor_id);
+                                self.current_actor = previous_actor;
                                 self.actors.remove(&actor_id);
                                 return None;
                             }
@@ -5640,6 +5935,7 @@ impl Runtime {
                         self.persist_suspension_marker(actor_id);
                     }
                     Err(error) => {
+                        self.discard_staged_workflow_outbox(actor_id);
                         let sequence = self.next_sequence(actor_id);
                         let step_name = self.step_name_for(actor_id, behavior_idx);
                         if let Err(commit_error) = workflow::commit_workflow_event(
@@ -5656,12 +5952,17 @@ impl Runtime {
                                 %commit_error,
                                 "nulang-recover: replayed workflow failure could not be committed"
                             );
+                            self.end_durable_workflow_turn(actor_id);
+                            self.current_actor = previous_actor;
                             self.actors.remove(&actor_id);
                             return None;
                         }
                         self.run_saga_compensation(actor_id, behavior_idx);
                     }
                 }
+
+                self.end_durable_workflow_turn(actor_id);
+                self.current_actor = previous_actor;
             }
 
             // Re-arm timers that were set before the snapshot/replay but have
