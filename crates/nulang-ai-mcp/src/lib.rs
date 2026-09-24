@@ -117,6 +117,21 @@ impl McpServer {
             );
         }
 
+        let requested_protocol = request_protocol(&req);
+        if let Some(version) = requested_protocol {
+            if version != MODERN_PROTOCOL_VERSION && req.method != "initialize" {
+                return error_response(
+                    id,
+                    -32022,
+                    "Unsupported protocol version",
+                    Some(json!({
+                        "supported": [MODERN_PROTOCOL_VERSION],
+                        "requested": version
+                    })),
+                );
+            }
+        }
+
         let modern = is_modern_request(&req);
         let result = match req.method.as_str() {
             "server/discover" => Ok(self.server_discover()),
@@ -167,11 +182,7 @@ impl McpServer {
         })
     }
 
-    fn initialize(&self, params: Option<&Value>) -> Value {
-        let _requested = params
-            .and_then(|value| value.get("protocolVersion"))
-            .and_then(Value::as_str);
-
+    fn initialize(&self, _params: Option<&Value>) -> Value {
         json!({
             "protocolVersion": LEGACY_PROTOCOL_VERSION,
             "capabilities": {
@@ -259,16 +270,16 @@ fn error_response(
     }
 }
 
-fn is_modern_request(req: &JsonRpcRequest) -> bool {
-    if req.method == "server/discover" {
-        return true;
-    }
+fn request_protocol(req: &JsonRpcRequest) -> Option<&str> {
     req.params
         .as_ref()
         .and_then(|params| params.get("_meta"))
         .and_then(|meta| meta.get("io.modelcontextprotocol/protocolVersion"))
         .and_then(Value::as_str)
-        == Some(MODERN_PROTOCOL_VERSION)
+}
+
+fn is_modern_request(req: &JsonRpcRequest) -> bool {
+    req.method == "server/discover" || request_protocol(req) == Some(MODERN_PROTOCOL_VERSION)
 }
 
 fn stamp_modern_result(result: &mut Value) {
@@ -488,6 +499,29 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn unsupported_modern_protocol_returns_mcp_error() {
+        let server = semantic_mcp_server().await;
+        let response = server
+            .handle_request(request(
+                9,
+                "tools/list",
+                Some(json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2099-01-01"
+                    }
+                })),
+            ))
+            .await;
+        let error = response.error.expect("protocol error");
+        assert_eq!(error.code, -32022);
+        assert_eq!(error.data.as_ref().unwrap()["requested"], "2099-01-01");
+        assert_eq!(
+            error.data.as_ref().unwrap()["supported"],
+            json!([MODERN_PROTOCOL_VERSION])
+        );
     }
 
     #[tokio::test]
