@@ -19,6 +19,9 @@ pub enum RespParseError {
 pub struct RespCommand<'a> {
     name: &'a [u8],
     args_bytes: &'a [u8],
+    args_after_two_bytes: &'a [u8],
+    arg0: Option<&'a [u8]>,
+    arg1: Option<&'a [u8]>,
     argc: usize,
 }
 
@@ -31,11 +34,33 @@ impl<'a> RespCommand<'a> {
         self.argc
     }
 
+    /// First validated command argument, cached during frame parsing.
+    ///
+    /// Common keyed commands use this directly so routing and execution do not
+    /// decode the same RESP bulk header repeatedly.
+    pub fn arg0(&self) -> Option<&'a [u8]> {
+        self.arg0
+    }
+
+    /// Second validated command argument, cached during frame parsing.
+    pub fn arg1(&self) -> Option<&'a [u8]> {
+        self.arg1
+    }
+
     pub fn args(&self) -> RespArgs<'a> {
         RespArgs {
             bytes: self.args_bytes,
             cursor: 0,
             remaining: self.argc,
+        }
+    }
+
+    /// Iterate only arguments after the two cached hot-path arguments.
+    pub fn args_after_two(&self) -> RespArgs<'a> {
+        RespArgs {
+            bytes: self.args_after_two_bytes,
+            cursor: 0,
+            remaining: self.argc.saturating_sub(2),
         }
     }
 }
@@ -96,19 +121,39 @@ pub fn parse_command(input: &[u8]) -> Result<Option<(RespCommand<'_>, usize)>, R
     };
     cursor += consumed;
     let args_start = cursor;
+    let argc = count - 1;
+    let mut arg0 = None;
+    let mut arg1 = None;
+    let mut args_after_two_start = args_start;
 
-    for _ in 1..count {
-        let Some((_, consumed)) = parse_bulk(&input[cursor..])? else {
+    for arg_index in 0..argc {
+        let Some((argument, consumed)) = parse_bulk(&input[cursor..])? else {
             return Ok(None);
         };
         cursor += consumed;
+
+        match arg_index {
+            0 => arg0 = Some(argument),
+            1 => {
+                arg1 = Some(argument);
+                args_after_two_start = cursor;
+            }
+            _ => {}
+        }
+    }
+
+    if argc < 2 {
+        args_after_two_start = cursor;
     }
 
     Ok(Some((
         RespCommand {
             name,
             args_bytes: &input[args_start..cursor],
-            argc: count - 1,
+            args_after_two_bytes: &input[args_after_two_start..cursor],
+            arg0,
+            arg1,
+            argc,
         },
         cursor,
     )))
@@ -305,7 +350,24 @@ mod tests {
         assert_eq!(consumed, input.len());
         assert_eq!(command.name(), b"GET");
         assert_eq!(command.argc(), 1);
+        assert_eq!(command.arg0(), Some(b"foo".as_slice()));
+        assert_eq!(command.arg1(), None);
         assert_eq!(command.args().collect::<Vec<_>>(), vec![b"foo".as_slice()]);
+        assert!(command.args_after_two().next().is_none());
+    }
+
+    #[test]
+    fn caches_first_two_arguments_and_starts_tail_after_them() {
+        let input = b"*5\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n$2\r\nPX\r\n$2\r\n10\r\n";
+        let (command, consumed) = parse_command(input).unwrap().unwrap();
+
+        assert_eq!(consumed, input.len());
+        assert_eq!(command.arg0(), Some(b"key".as_slice()));
+        assert_eq!(command.arg1(), Some(b"value".as_slice()));
+        assert_eq!(
+            command.args_after_two().collect::<Vec<_>>(),
+            vec![b"PX".as_slice(), b"10".as_slice()]
+        );
     }
 
     #[test]

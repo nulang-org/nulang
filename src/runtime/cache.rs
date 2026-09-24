@@ -26,31 +26,54 @@ const MIN_ARENA_EXP: usize = 5; // 32 bytes
 const MAX_ARENA_EXP: usize = 30; // 1 GiB blocks are the largest representable class
 const FREE_LIST_COUNT: usize = MAX_ARENA_EXP - MIN_ARENA_EXP + 1;
 const DEFAULT_INDEX_CAPACITY: usize = 64;
-const DEFAULT_WHEEL_BUCKETS: usize = 4_096;
+const DEFAULT_WHEEL_BUCKETS: usize = 256;
+const DEFAULT_WHEEL_LEVELS: usize = 5;
 const DEFAULT_WHEEL_TICK_MS: u64 = 10;
 const DEFAULT_MAX_KEY_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_VALUE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
 const DEFAULT_MAX_ARENA_BYTES: usize = 512 * 1024 * 1024;
+const ARENA_SLAB_TARGET_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ArenaSlice {
-    offset: u32,
+    slab: u32,
+    block: u32,
     len: u32,
     class: u8,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArenaBlock {
+    slab: u32,
+    block: u32,
+}
+
+#[derive(Debug)]
+struct ArenaSlab {
+    bytes: Box<[u8]>,
+    block_size: u32,
+    live_blocks: u32,
+}
+
+#[derive(Debug)]
 struct ByteArena {
-    bytes: Vec<u8>,
-    free: Vec<Vec<u32>>,
+    slabs: Vec<ArenaSlab>,
+    reusable_slabs: Vec<u32>,
+    free: Vec<Vec<ArenaBlock>>,
+    reserved_bytes: usize,
+    target_slab_bytes: usize,
 }
 
 impl ByteArena {
-    fn new() -> Self {
+    fn new(max_reserved_bytes: usize) -> Self {
+        assert!(max_reserved_bytes > 0);
         Self {
-            bytes: Vec::new(),
+            slabs: Vec::new(),
+            reusable_slabs: Vec::new(),
             free: (0..FREE_LIST_COUNT).map(|_| Vec::new()).collect(),
+            reserved_bytes: 0,
+            target_slab_bytes: ARENA_SLAB_TARGET_BYTES.min(max_reserved_bytes),
         }
     }
 
@@ -64,57 +87,200 @@ impl ByteArena {
         (exp - MIN_ARENA_EXP, capacity)
     }
 
+    fn blocks_per_slab(&self, capacity: usize) -> usize {
+        if capacity >= self.target_slab_bytes {
+            1
+        } else {
+            (self.target_slab_bytes / capacity).max(1)
+        }
+    }
+
     fn alloc(&mut self, src: &[u8]) -> ArenaSlice {
         let (class, capacity) = Self::class_for(src.len());
-        let offset = match self.free[class].pop() {
-            Some(offset) => offset,
+        let location = match self.free[class].pop() {
+            Some(location) => location,
             None => {
-                let offset = self.bytes.len();
-                let end = offset
-                    .checked_add(capacity)
-                    .expect("cache arena address overflow");
-                assert!(end <= u32::MAX as usize, "cache arena exceeds 4 GiB");
-                self.bytes.resize(end, 0);
-                offset as u32
+                let blocks = self.blocks_per_slab(capacity);
+                let slab_bytes = capacity
+                    .checked_mul(blocks)
+                    .expect("cache arena slab size overflow");
+                let slab_id = if let Some(slab_id) = self.reusable_slabs.pop() {
+                    let slab = &mut self.slabs[slab_id as usize];
+                    debug_assert!(slab.bytes.is_empty());
+                    debug_assert_eq!(slab.live_blocks, 0);
+                    *slab = ArenaSlab {
+                        bytes: vec![0u8; slab_bytes].into_boxed_slice(),
+                        block_size: capacity as u32,
+                        live_blocks: 0,
+                    };
+                    slab_id
+                } else {
+                    let slab_id = self.slabs.len();
+                    assert!(
+                        slab_id <= u32::MAX as usize,
+                        "cache arena has too many slabs"
+                    );
+                    self.slabs.push(ArenaSlab {
+                        bytes: vec![0u8; slab_bytes].into_boxed_slice(),
+                        block_size: capacity as u32,
+                        live_blocks: 0,
+                    });
+                    slab_id as u32
+                };
+                self.reserved_bytes = self.reserved_bytes.saturating_add(slab_bytes);
+
+                for block in (1..blocks).rev() {
+                    self.free[class].push(ArenaBlock {
+                        slab: slab_id,
+                        block: block as u32,
+                    });
+                }
+
+                ArenaBlock {
+                    slab: slab_id,
+                    block: 0,
+                }
             }
         };
-        let start = offset as usize;
-        self.bytes[start..start + src.len()].copy_from_slice(src);
+
+        let slab = &mut self.slabs[location.slab as usize];
+        debug_assert_eq!(slab.block_size as usize, capacity);
+        let start = location.block as usize * capacity;
+        slab.bytes[start..start + src.len()].copy_from_slice(src);
+        slab.live_blocks = slab.live_blocks.saturating_add(1);
+
         ArenaSlice {
-            offset,
+            slab: location.slab,
+            block: location.block,
             len: src.len() as u32,
             class: class as u8,
         }
     }
 
     fn release(&mut self, slice: ArenaSlice) {
-        self.free[slice.class as usize].push(slice.offset);
+        let slab = &mut self.slabs[slice.slab as usize];
+        debug_assert!(slab.live_blocks > 0);
+        slab.live_blocks = slab.live_blocks.saturating_sub(1);
+        self.free[slice.class as usize].push(ArenaBlock {
+            slab: slice.slab,
+            block: slice.block,
+        });
     }
 
     fn get(&self, slice: ArenaSlice) -> &[u8] {
-        let start = slice.offset as usize;
-        &self.bytes[start..start + slice.len as usize]
+        let slab = &self.slabs[slice.slab as usize];
+        let block_size = slab.block_size as usize;
+        let start = slice.block as usize * block_size;
+        &slab.bytes[start..start + slice.len as usize]
     }
 
     fn reserved_bytes(&self) -> usize {
-        self.bytes.len()
+        self.reserved_bytes
+    }
+
+    fn free_bytes(&self) -> usize {
+        self.free
+            .iter()
+            .enumerate()
+            .map(|(class, blocks)| {
+                let block_size = 1usize << (MIN_ARENA_EXP + class);
+                blocks.len().saturating_mul(block_size)
+            })
+            .sum()
+    }
+
+    fn slab_count(&self) -> usize {
+        self.slabs
+            .iter()
+            .filter(|slab| !slab.bytes.is_empty())
+            .count()
+    }
+
+    /// Reclaim backing memory for slabs that no longer contain live blocks.
+    ///
+    /// Normal delete churn keeps empty slabs hot for reuse. This cold-path
+    /// operation is invoked only when admission would otherwise exceed the
+    /// configured arena limit (or explicitly through CacheStore::trim_arena).
+    fn reclaim_empty_slabs(&mut self) -> usize {
+        if self.slabs.is_empty() {
+            return 0;
+        }
+
+        let mut reclaim = vec![false; self.slabs.len()];
+        let mut reclaimed = 0usize;
+
+        for (slab_id, slab) in self.slabs.iter_mut().enumerate() {
+            if slab.live_blocks != 0 || slab.bytes.is_empty() {
+                continue;
+            }
+
+            reclaim[slab_id] = true;
+            reclaimed = reclaimed.saturating_add(slab.bytes.len());
+            slab.bytes = Vec::new().into_boxed_slice();
+            slab.block_size = 0;
+            self.reusable_slabs.push(slab_id as u32);
+        }
+
+        if reclaimed == 0 {
+            return 0;
+        }
+
+        for blocks in &mut self.free {
+            blocks.retain(|block| !reclaim[block.slab as usize]);
+        }
+        self.reserved_bytes = self.reserved_bytes.saturating_sub(reclaimed);
+        reclaimed
+    }
+
+    fn metadata_reserved_bytes(&self) -> usize {
+        self.slabs
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ArenaSlab>())
+            .saturating_add(
+                self.reusable_slabs
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(
+                self.free
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Vec<ArenaBlock>>()),
+            )
+            .saturating_add(
+                self.free
+                    .iter()
+                    .map(|blocks| {
+                        blocks
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<ArenaBlock>())
+                    })
+                    .sum::<usize>(),
+            )
     }
 
     fn additional_reserved_for(&self, lengths: &[usize]) -> usize {
-        let mut claimed_free = [0usize; FREE_LIST_COUNT];
-        let mut growth = 0usize;
+        let mut available = [0usize; FREE_LIST_COUNT];
+        for (class, blocks) in self.free.iter().enumerate() {
+            available[class] = blocks.len();
+        }
 
+        let mut growth = 0usize;
         for &len in lengths {
             if len <= INLINE_BYTES {
                 continue;
             }
+
             let (class, capacity) = Self::class_for(len);
-            if claimed_free[class] < self.free[class].len() {
-                claimed_free[class] += 1;
-            } else {
-                growth = growth.saturating_add(capacity);
+            if available[class] > 0 {
+                available[class] -= 1;
+                continue;
             }
+
+            let blocks = self.blocks_per_slab(capacity);
+            growth = growth.saturating_add(capacity.saturating_mul(blocks));
+            available[class] = blocks.saturating_sub(1);
         }
+
         growth
     }
 }
@@ -361,25 +527,86 @@ impl S3Fifo {
 #[derive(Debug)]
 struct ExpirationWheel {
     tick_ms: u64,
-    buckets: Vec<Vec<ExpirationRef>>,
+    buckets_per_level: usize,
+    levels: Vec<Vec<Vec<ExpirationRef>>>,
     last_tick: Option<u64>,
 }
 
 impl ExpirationWheel {
     fn new(bucket_count: usize, tick_ms: u64) -> Self {
-        assert!(bucket_count > 0);
+        assert!(bucket_count > 1);
+        assert!(bucket_count.is_power_of_two());
         assert!(tick_ms > 0);
         Self {
             tick_ms,
-            buckets: (0..bucket_count).map(|_| Vec::new()).collect(),
+            buckets_per_level: bucket_count,
+            levels: (0..DEFAULT_WHEEL_LEVELS)
+                .map(|_| (0..bucket_count).map(|_| Vec::new()).collect())
+                .collect(),
             last_tick: None,
         }
     }
 
+    fn bits_per_level(&self) -> u32 {
+        self.buckets_per_level.trailing_zeros()
+    }
+
     fn schedule(&mut self, item: ExpirationRef, now_ms: u64) {
-        self.last_tick.get_or_insert(now_ms / self.tick_ms);
-        let bucket = ((item.expires_at_ms / self.tick_ms) % self.buckets.len() as u64) as usize;
-        self.buckets[bucket].push(item);
+        let now_tick = now_ms / self.tick_ms;
+        let expires_tick = item.expires_at_ms / self.tick_ms;
+        self.last_tick.get_or_insert(now_tick);
+
+        let delta = expires_tick.saturating_sub(now_tick);
+        let bits = self.bits_per_level();
+        let mut level = 0usize;
+        while level + 1 < self.levels.len() {
+            let shift = bits.saturating_mul((level + 1) as u32);
+            let span = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+            if delta < span {
+                break;
+            }
+            level += 1;
+        }
+
+        let shift = bits.saturating_mul(level as u32);
+        let coarse_tick = expires_tick >> shift;
+        let bucket = (coarse_tick & (self.buckets_per_level as u64 - 1)) as usize;
+        self.levels[level][bucket].push(item);
+    }
+
+    fn drain_level_range(
+        level: &mut [Vec<ExpirationRef>],
+        bucket_count: usize,
+        start_tick: u64,
+        end_tick: u64,
+        include_start: bool,
+        out: &mut Vec<ExpirationRef>,
+    ) {
+        if end_tick < start_tick {
+            return;
+        }
+
+        let first = if include_start {
+            start_tick
+        } else {
+            start_tick.saturating_add(1)
+        };
+        if first > end_tick {
+            return;
+        }
+
+        let elapsed = end_tick.saturating_sub(first).saturating_add(1);
+        if elapsed >= bucket_count as u64 {
+            for bucket in level {
+                out.append(bucket);
+            }
+            return;
+        }
+
+        let mask = bucket_count as u64 - 1;
+        for tick in first..=end_tick {
+            out.append(&mut level[(tick & mask) as usize]);
+        }
     }
 
     fn drain_candidates(&mut self, now_ms: u64, out: &mut Vec<ExpirationRef>) {
@@ -389,25 +616,62 @@ impl ExpirationWheel {
             return;
         };
 
-        let bucket_count = self.buckets.len() as u64;
-        let elapsed = current.saturating_sub(last);
+        let bits = self.bits_per_level();
+        for level_index in (0..self.levels.len()).rev() {
+            let shift = bits.saturating_mul(level_index as u32);
+            let last_coarse = last >> shift;
+            let current_coarse = current >> shift;
 
-        if elapsed >= bucket_count {
-            for bucket in &mut self.buckets {
-                out.append(bucket);
-            }
-        } else {
-            // Include the current bucket even when no full tick elapsed so
-            // sub-tick TTLs can be reaped by an explicit purge call.
-            // Revisit the previous tick as well. A sub-tick TTL may have
-            // been scheduled into that bucket after the prior purge and can
-            // become due before the clock advances into the next bucket.
-            for tick in last..=current {
-                let idx = (tick % bucket_count) as usize;
-                out.append(&mut self.buckets[idx]);
+            if level_index == 0 {
+                // Revisit the current base bucket so sub-tick expirations
+                // scheduled after the previous sweep can still be observed.
+                Self::drain_level_range(
+                    &mut self.levels[level_index],
+                    self.buckets_per_level,
+                    last_coarse,
+                    current_coarse,
+                    true,
+                    out,
+                );
+            } else if current_coarse > last_coarse {
+                Self::drain_level_range(
+                    &mut self.levels[level_index],
+                    self.buckets_per_level,
+                    last_coarse,
+                    current_coarse,
+                    false,
+                    out,
+                );
             }
         }
+
         self.last_tick = Some(current);
+    }
+
+    fn reserved_bytes(&self) -> usize {
+        self.levels
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Vec<Vec<ExpirationRef>>>())
+            .saturating_add(
+                self.levels
+                    .iter()
+                    .map(|level| {
+                        level
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<Vec<ExpirationRef>>())
+                            .saturating_add(
+                                level
+                                    .iter()
+                                    .map(|bucket| {
+                                        bucket
+                                            .capacity()
+                                            .saturating_mul(std::mem::size_of::<ExpirationRef>())
+                                    })
+                                    .sum::<usize>(),
+                            )
+                    })
+                    .sum::<usize>(),
+            )
     }
 }
 
@@ -426,7 +690,13 @@ pub struct CacheMemoryStats {
     pub entries: usize,
     pub index_capacity: usize,
     pub arena_reserved_bytes: usize,
+    pub arena_free_bytes: usize,
+    pub arena_slab_count: usize,
+    pub arena_metadata_reserved_bytes: usize,
+    pub index_reserved_bytes: usize,
+    pub slot_reserved_bytes: usize,
     pub reusable_slots: usize,
+    pub estimated_reserved_bytes: usize,
 }
 
 /// Shard-local compact cache storage.
@@ -489,7 +759,7 @@ impl CacheStore {
         Self {
             config,
             hash_builder: RandomState::new(),
-            arena: ByteArena::new(),
+            arena: ByteArena::new(config.max_arena_bytes),
             slots: Vec::new(),
             free_slots: Vec::new(),
             index: vec![Bucket::EMPTY; DEFAULT_INDEX_CAPACITY],
@@ -576,6 +846,15 @@ impl CacheStore {
         Ok(())
     }
 
+    fn prepare_bytes_batch(&mut self, pairs: &[(&[u8], &[u8])]) -> Result<(), CacheWriteError> {
+        match self.validate_bytes_batch(pairs) {
+            Err(CacheWriteError::ArenaLimitReached) if self.arena.reclaim_empty_slabs() != 0 => {
+                self.validate_bytes_batch(pairs)
+            }
+            result => result,
+        }
+    }
+
     fn prepare_bytes_write(&mut self, key: &[u8], value: &[u8]) -> Result<(), CacheWriteError> {
         if key.len() > self.config.max_key_bytes {
             return Err(CacheWriteError::KeyTooLarge);
@@ -587,10 +866,17 @@ impl CacheStore {
         loop {
             match self.validate_bytes_write(key, value) {
                 Ok(()) => return Ok(()),
-                Err(error @ CacheWriteError::EntryLimitReached)
-                | Err(error @ CacheWriteError::ArenaLimitReached) => {
+                Err(CacheWriteError::ArenaLimitReached) => {
+                    if self.arena.reclaim_empty_slabs() != 0 {
+                        continue;
+                    }
                     if !self.eviction.enabled() || !self.evict_one() {
-                        return Err(error);
+                        return Err(CacheWriteError::ArenaLimitReached);
+                    }
+                }
+                Err(CacheWriteError::EntryLimitReached) => {
+                    if !self.eviction.enabled() || !self.evict_one() {
+                        return Err(CacheWriteError::EntryLimitReached);
                     }
                 }
                 Err(error) => return Err(error),
@@ -623,10 +909,17 @@ impl CacheStore {
         loop {
             match self.validate_integer_write(key) {
                 Ok(()) => return Ok(()),
-                Err(error @ CacheWriteError::EntryLimitReached)
-                | Err(error @ CacheWriteError::ArenaLimitReached) => {
+                Err(CacheWriteError::ArenaLimitReached) => {
+                    if self.arena.reclaim_empty_slabs() != 0 {
+                        continue;
+                    }
                     if !self.eviction.enabled() || !self.evict_one() {
-                        return Err(error);
+                        return Err(CacheWriteError::ArenaLimitReached);
+                    }
+                }
+                Err(CacheWriteError::EntryLimitReached) => {
+                    if !self.eviction.enabled() || !self.evict_one() {
+                        return Err(CacheWriteError::EntryLimitReached);
                     }
                 }
                 Err(error) => return Err(error),
@@ -746,15 +1039,13 @@ impl CacheStore {
     }
 
     fn eviction_ref_is_live(&self, item: EvictionRef, queue: EvictionQueue) -> bool {
-        self.slots
-            .get(item.slot as usize)
-            .is_some_and(|slot| {
-                slot.generation == item.generation
-                    && slot
-                        .entry
-                        .as_ref()
-                        .is_some_and(|entry| entry.eviction_queue == queue)
-            })
+        self.slots.get(item.slot as usize).is_some_and(|slot| {
+            slot.generation == item.generation
+                && slot
+                    .entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.eviction_queue == queue)
+        })
     }
 
     fn evict_from_small(&mut self) -> bool {
@@ -846,7 +1137,11 @@ impl CacheStore {
     }
 
     fn maybe_compact_eviction_queues(&mut self) {
-        let queued = self.eviction.small.len().saturating_add(self.eviction.main.len());
+        let queued = self
+            .eviction
+            .small
+            .len()
+            .saturating_add(self.eviction.main.len());
         let threshold = self.index_len.max(64).saturating_mul(4).saturating_add(64);
         if queued <= threshold {
             return;
@@ -985,7 +1280,7 @@ impl CacheStore {
         ttl_ms: Option<u64>,
         now_ms: u64,
     ) -> Result<(), CacheWriteError> {
-        self.validate_bytes_batch(pairs)?;
+        self.prepare_bytes_batch(pairs)?;
         for &(key, value) in pairs {
             self.set_bytes_unchecked(key, value, ttl_ms, now_ms);
         }
@@ -1195,12 +1490,77 @@ impl CacheStore {
         self.stats
     }
 
+    /// Release backing storage for arena slabs with no live blocks.
+    ///
+    /// Deletes normally retain empty slabs for fast same-class reuse. Call this
+    /// at an explicit memory-pressure boundary; write admission also invokes it
+    /// automatically before eviction or an arena-capacity error.
+    pub fn trim_arena(&mut self) -> usize {
+        self.arena.reclaim_empty_slabs()
+    }
+
     pub fn memory_stats(&self) -> CacheMemoryStats {
+        let arena_reserved_bytes = self.arena.reserved_bytes();
+        let arena_metadata_reserved_bytes = self.arena.metadata_reserved_bytes();
+        let index_reserved_bytes = self
+            .index
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Bucket>());
+        let slot_reserved_bytes = self
+            .slots
+            .capacity()
+            .saturating_mul(std::mem::size_of::<EntrySlot>());
+        let free_slot_reserved_bytes = self
+            .free_slots
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u32>());
+        let expiry_reserved_bytes = self.expiry.reserved_bytes().saturating_add(
+            self.expiry_scratch
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ExpirationRef>()),
+        );
+        let eviction_reserved_bytes = self
+            .eviction
+            .small
+            .capacity()
+            .saturating_mul(std::mem::size_of::<EvictionRef>())
+            .saturating_add(
+                self.eviction
+                    .main
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<EvictionRef>()),
+            )
+            .saturating_add(
+                self.eviction
+                    .ghost
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
+            .saturating_add(
+                self.eviction
+                    .ghost_set
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            );
+        let estimated_reserved_bytes = arena_reserved_bytes
+            .saturating_add(arena_metadata_reserved_bytes)
+            .saturating_add(index_reserved_bytes)
+            .saturating_add(slot_reserved_bytes)
+            .saturating_add(free_slot_reserved_bytes)
+            .saturating_add(expiry_reserved_bytes)
+            .saturating_add(eviction_reserved_bytes);
+
         CacheMemoryStats {
             entries: self.index_len,
             index_capacity: self.index.len(),
-            arena_reserved_bytes: self.arena.reserved_bytes(),
+            arena_reserved_bytes,
+            arena_free_bytes: self.arena.free_bytes(),
+            arena_slab_count: self.arena.slab_count(),
+            arena_metadata_reserved_bytes,
+            index_reserved_bytes,
+            slot_reserved_bytes,
             reusable_slots: self.free_slots.len(),
+            estimated_reserved_bytes,
         }
     }
 }
@@ -1257,13 +1617,92 @@ mod tests {
     }
 
     #[test]
+    fn arena_growth_is_segmented_and_does_not_move_existing_values() {
+        let mut arena = ByteArena::new(4 * ARENA_SLAB_TARGET_BYTES);
+        let original = vec![7u8; 100];
+        let first = arena.alloc(&original);
+
+        let blocks_per_slab = ARENA_SLAB_TARGET_BYTES / 128;
+        let mut held = Vec::with_capacity(blocks_per_slab + 1);
+        for i in 0..=blocks_per_slab {
+            let payload = vec![(i % 251) as u8; 100];
+            held.push((arena.alloc(&payload), payload));
+        }
+
+        assert!(arena.slab_count() >= 2);
+        assert_eq!(arena.get(first), original.as_slice());
+        for (slice, payload) in held {
+            assert_eq!(arena.get(slice), payload.as_slice());
+        }
+    }
+
+    #[test]
+    fn empty_slabs_are_reclaimed_only_on_pressure() {
+        let mut store = CacheStore::with_config(CacheConfig {
+            max_key_bytes: 64,
+            max_value_bytes: 1024,
+            max_entries: 8,
+            max_arena_bytes: ARENA_SLAB_TARGET_BYTES,
+        });
+
+        store.try_set_bytes(b"a", &[1; 100], None, 0).unwrap();
+        assert_eq!(
+            store.memory_stats().arena_reserved_bytes,
+            ARENA_SLAB_TARGET_BYTES
+        );
+        assert!(store.delete(b"a"));
+
+        // Delete churn retains the empty slab until pressure requires another
+        // incompatible size class.
+        assert_eq!(
+            store.memory_stats().arena_reserved_bytes,
+            ARENA_SLAB_TARGET_BYTES
+        );
+
+        store.try_set_bytes(b"b", &[2; 200], None, 0).unwrap();
+        let stats = store.memory_stats();
+        assert_eq!(stats.arena_reserved_bytes, ARENA_SLAB_TARGET_BYTES);
+        assert_eq!(stats.arena_slab_count, 1);
+        assert_eq!(store.get(b"b", 0), Some(CacheValueView::Bytes(&[2; 200])));
+    }
+
+    #[test]
+    fn explicit_trim_releases_empty_slab_backing_memory_and_reuses_id() {
+        let mut arena = ByteArena::new(ARENA_SLAB_TARGET_BYTES);
+        let slice = arena.alloc(&[7; 100]);
+        assert_eq!(arena.slabs.len(), 1);
+        arena.release(slice);
+
+        assert_eq!(arena.reclaim_empty_slabs(), ARENA_SLAB_TARGET_BYTES);
+        assert_eq!(arena.reserved_bytes(), 0);
+        assert_eq!(arena.slab_count(), 0);
+
+        let replacement = arena.alloc(&[8; 200]);
+        assert_eq!(replacement.slab, 0);
+        assert_eq!(arena.slabs.len(), 1);
+        assert_eq!(arena.slab_count(), 1);
+    }
+
+    #[test]
+    fn arena_admission_accounts_for_whole_slab_growth() {
+        let arena = ByteArena::new(ARENA_SLAB_TARGET_BYTES);
+        assert_eq!(
+            arena.additional_reserved_for(&[100]),
+            ARENA_SLAB_TARGET_BYTES
+        );
+
+        let tiny = ByteArena::new(64);
+        assert_eq!(tiny.additional_reserved_for(&[40]), 64);
+    }
+
+    #[test]
     fn large_value_blocks_are_reused_after_delete() {
         let mut store = CacheStore::new();
         let a = vec![1u8; 100];
         let b = vec![2u8; 100];
         store.set_bytes(b"a", &a, None, 0);
         let reserved = store.memory_stats().arena_reserved_bytes;
-        assert_eq!(reserved, 128);
+        assert_eq!(reserved, ARENA_SLAB_TARGET_BYTES);
         assert!(store.delete(b"a"));
         store.set_bytes(b"b", &b, None, 0);
         assert_eq!(store.memory_stats().arena_reserved_bytes, reserved);
@@ -1271,6 +1710,29 @@ mod tests {
             store.get(b"b", 0),
             Some(CacheValueView::Bytes(b.as_slice()))
         );
+    }
+
+    #[test]
+    fn hierarchical_ttl_wheel_does_not_revisit_long_ttls_each_base_rotation() {
+        let mut wheel = ExpirationWheel::new(DEFAULT_WHEEL_BUCKETS, DEFAULT_WHEEL_TICK_MS);
+        let item = ExpirationRef {
+            slot: 1,
+            generation: 1,
+            expires_at_ms: 24 * 60 * 60 * 1_000,
+        };
+        wheel.schedule(item, 0);
+
+        let mut candidates = Vec::new();
+        wheel.drain_candidates(
+            DEFAULT_WHEEL_BUCKETS as u64 * DEFAULT_WHEEL_TICK_MS,
+            &mut candidates,
+        );
+        assert!(candidates.is_empty());
+
+        wheel.drain_candidates(item.expires_at_ms, &mut candidates);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].slot, item.slot);
+        assert_eq!(candidates[0].generation, item.generation);
     }
 
     #[test]

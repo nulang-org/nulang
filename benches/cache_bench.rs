@@ -108,6 +108,28 @@ fn bench_resp_get_dispatch_same_shard(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_long_lived_ttl_sweep(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cache/ttl_long_lived_sweep");
+    group.throughput(Throughput::Elements(10_000));
+
+    let mut store = CacheStore::new();
+    let ttl_ms = 24 * 60 * 60 * 1_000;
+    for i in 0..10_000u64 {
+        store.set_integer(&i.to_le_bytes(), i as i64, Some(ttl_ms), 0);
+    }
+
+    let mut now_ms = 0u64;
+    group.bench_function("base_rotation", |b| {
+        b.iter(|| {
+            // One complete base-wheel rotation. Long-lived TTLs should remain
+            // parked in coarser levels instead of being revisited here.
+            now_ms = now_ms.saturating_add(256 * 10);
+            black_box(store.purge_expired(black_box(now_ms), usize::MAX));
+        });
+    });
+    group.finish();
+}
+
 fn bench_redis_slot(c: &mut Criterion) {
     let mut group = c.benchmark_group("cache/redis_slot");
     group.throughput(Throughput::Elements(1));
@@ -125,5 +147,6 @@ criterion_group!(
     bench_set_large_reuse,
     bench_resp_get_execute,
     bench_resp_get_dispatch_same_shard,
+    bench_long_lived_ttl_sweep,
     bench_redis_slot
 );
