@@ -544,19 +544,17 @@ mod authority_tests {
     #[derive(Clone)]
     struct RecordingStore {
         inner: std::sync::Arc<std::sync::Mutex<crate::runtime::persistence::MemoryStore>>,
-        fail_snapshot: bool,
-        fail_workflow_event: bool,
+        fail_commit: bool,
         last_actor_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl RecordingStore {
-        fn new(fail_snapshot: bool, fail_workflow_event: bool) -> Self {
+        fn new(fail_commit: bool) -> Self {
             Self {
                 inner: std::sync::Arc::new(std::sync::Mutex::new(
                     crate::runtime::persistence::MemoryStore::new(),
                 )),
-                fail_snapshot,
-                fail_workflow_event,
+                fail_commit,
                 last_actor_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             }
         }
@@ -571,10 +569,19 @@ mod authority_tests {
         fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
             self.last_actor_id
                 .store(snapshot.actor_id, std::sync::atomic::Ordering::Relaxed);
-            if self.fail_snapshot {
-                return Err(std::io::Error::other("injected snapshot failure"));
-            }
             self.inner.lock().unwrap().save_snapshot(snapshot)
+        }
+
+        fn commit_transition(
+            &mut self,
+            transition: crate::runtime::persistence::DurableTransition,
+        ) -> std::io::Result<crate::runtime::persistence::DurableCommit> {
+            self.last_actor_id
+                .store(transition.actor_id, std::sync::atomic::Ordering::Relaxed);
+            if self.fail_commit {
+                return Err(std::io::Error::other("injected atomic transition failure"));
+            }
+            self.inner.lock().unwrap().commit_transition(transition)
         }
 
         fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
@@ -600,9 +607,6 @@ mod authority_tests {
         ) -> std::io::Result<()> {
             self.last_actor_id
                 .store(actor_id, std::sync::atomic::Ordering::Relaxed);
-            if self.fail_workflow_event {
-                return Err(std::io::Error::other("injected workflow event failure"));
-            }
             self.inner
                 .lock()
                 .unwrap()
@@ -635,9 +639,9 @@ mod authority_tests {
     }
 
     #[test]
-    fn initial_workflow_snapshot_failure_is_not_published() {
+    fn initial_workflow_atomic_commit_failure_is_not_published() {
         let mut rt = Runtime::new();
-        let store = RecordingStore::new(true, false);
+        let store = RecordingStore::new(true);
         let probe = store.clone();
         rt.persistence = Box::new(store);
         rt.crdt_manager = Some(crate::runtime::crdt_manager::CrdtManager::new(1));
@@ -672,36 +676,37 @@ mod authority_tests {
     }
 
     #[test]
-    fn initial_workflow_event_failure_is_not_published() {
+    fn initial_workflow_start_event_and_snapshot_share_atomic_sequence() {
         let mut rt = Runtime::new();
-        let store = RecordingStore::new(false, true);
+        let store = RecordingStore::new(false);
         let probe = store.clone();
         rt.persistence = Box::new(store);
 
-        let result = try_spawn_actor_with_models(
+        let actor_id = try_spawn_actor_with_models(
             &mut rt,
             Box::new(Vec::new),
             HashMap::new(),
             true,
-            Some("FailingWorkflow"),
+            Some("AtomicWorkflow"),
             None,
-        );
+        )
+        .unwrap();
 
-        assert!(result.is_err());
-        let actor_id = probe.last_actor_id();
-        assert_ne!(actor_id, 0);
-        assert!(!rt.actors.contains_key(&actor_id));
-        assert!(probe.load_snapshot(actor_id).is_none());
-        assert!(
-            probe.read_workflow_events(actor_id).is_empty(),
-            "failed initial workflow creation must remove the committed start event"
-        );
+        let snapshot = probe.load_snapshot(actor_id).unwrap();
+        let events = probe.read_workflow_events(actor_id);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            WorkflowEvent::WorkflowStarted { name, .. } if name == "AtomicWorkflow"
+        ));
+        assert_eq!(events[0].sequence(), snapshot.sequence);
+        assert_eq!(probe.latest_sequence(actor_id), snapshot.sequence);
     }
 
     #[test]
     fn workflow_initial_snapshot_contains_delegated_authority() {
         let mut rt = Runtime::new();
-        let store = RecordingStore::new(false, false);
+        let store = RecordingStore::new(false);
         let probe = store.clone();
         rt.persistence = Box::new(store);
         let requested = secret_manifest("WORKFLOW_KEY");
