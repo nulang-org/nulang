@@ -397,6 +397,9 @@ pub struct Runtime {
     /// Mailbox commands currently driving workflow activations but not yet
     /// attached to a committed durable transition.
     pub(crate) pending_workflow_commands: HashMap<u64, workflow::PendingWorkflowCommand>,
+    /// Workflow events produced by the currently executing VM turn. These stay
+    /// invisible until the step/suspension boundary commits atomically.
+    pub(crate) pending_workflow_events: HashMap<u64, Vec<WorkflowEvent>>,
     /// Workflow activations whose durable commit failed while user code was
     /// executing. The scheduler must discard/recover these before allowing
     /// another turn to observe their in-memory mutations.
@@ -628,6 +631,7 @@ impl Runtime {
             pending_fetched_messages: HashMap::new(),
             persistence: Box::new(MemoryStore::new()),
             pending_workflow_commands: HashMap::new(),
+            pending_workflow_events: HashMap::new(),
             workflow_commit_failures: HashSet::new(),
             object_store: ObjectStore::new(),
             grain_registry: GrainRegistry::new(),
@@ -4813,6 +4817,7 @@ impl Runtime {
     pub(crate) fn discard_and_recover_failed_workflow(&mut self, actor_id: u64) {
         self.workflow_commit_failures.remove(&actor_id);
         self.pending_workflow_commands.remove(&actor_id);
+        self.pending_workflow_events.remove(&actor_id);
 
         if let Some(manager) = self.crdt_manager.as_mut() {
             manager.unregister_actor_fields(actor_id);
