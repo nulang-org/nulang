@@ -287,7 +287,7 @@ fn diagnostic_fixes(err: &NuError, primary_span: Option<Span>) -> Vec<JsonFix> {
 }
 
 fn unbound_name(msg: &str) -> Option<&str> {
-    msg.strip_prefix("Unbound variable: '")?.strip_suffix(''')
+    msg.strip_prefix("Unbound variable: '")?.strip_suffix("'")
 }
 
 /// The core message without position prefixes or structured-field suffixes.
