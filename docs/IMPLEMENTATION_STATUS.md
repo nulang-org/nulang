@@ -114,10 +114,12 @@ crash window.
 
 Important boundaries:
 
-- durable outbox delivery is currently proven only for local workflow
-  receivers; ordinary actor sends are not yet automatically staged into the
-  sender transition, generic persistent actors are deferred, and cross-node
-  durable delivery remains incomplete;
+- active local workflow turns automatically stage sends to local workflow
+  receivers into the sender's next atomic transition; publication occurs only
+  after commit, and suspension/recovery/resume paths preserve the same rule.
+  Sends to non-workflow receivers and cross-node/cross-shard destinations still
+  use their existing paths; generic persistent-actor and distributed durable
+  delivery remain incomplete;
 
 - persistent actors/entities/workflows are implemented and recoverable, but
   the higher-level durable semantic model is still being stabilized;
