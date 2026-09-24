@@ -101,20 +101,29 @@ def build_commands(selected: list[str]) -> dict[str, list[str]]:
     if "nulang" in selected:
         if shutil.which("cargo") is None:
             raise RuntimeError("cargo is required for the Nulang benchmark")
-        # Build outside the affinity-constrained measured rounds so the first
-        # runtime sample is not also paying compilation/startup work.
+        # Build the standalone minimal runner outside the affinity-constrained
+        # measured rounds. This avoids compiling unrelated default features or
+        # the full release-test matrix before each cross-runtime comparison.
         command_output(
-            ["cargo", "test", "--release", "--no-run", "benchmarks::bench_"]
+            [
+                "cargo",
+                "build",
+                "--locked",
+                "--profile",
+                "savina",
+                "--no-default-features",
+                "--features",
+                "savina-bench",
+                "--bin",
+                "nulang-savina",
+            ]
         )
-        commands["nulang"] = [
-            "cargo",
-            "test",
-            "--release",
-            "benchmarks::bench_",
-            "--",
-            "--nocapture",
-            "--test-threads=1",
-        ]
+        metadata = json.loads(
+            command_output(["cargo", "metadata", "--format-version", "1", "--no-deps"])
+        )
+        executable = "nulang-savina.exe" if os.name == "nt" else "nulang-savina"
+        binary = Path(metadata["target_directory"]) / "savina" / executable
+        commands["nulang"] = [str(binary), "--format", "human"]
 
     if "rust" in selected:
         rustc = shutil.which("rustc")

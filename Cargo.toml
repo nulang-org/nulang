@@ -50,6 +50,8 @@ native-codegen = [
 # Marker profile for embedded mobile runtimes. Intentionally empty: the
 # bytecode interpreter and pre-registered host callbacks need no JIT.
 mobile-runtime = []
+# Enables the standalone Savina-style actor benchmark runner without pulling optional subsystems.
+savina-bench = []
 python = ["dep:pyo3"]
 sqlite = ["dep:libsql"]
 lsp = ["dep:tower-lsp", "dep:tokio", "dep:futures", "dep:tower-service"]
@@ -191,10 +193,23 @@ name = "nula_difffuzz"
 path = "src/bin/nula_difffuzz.rs"
 required-features = ["difffuzz"]
 
+[[bin]]
+name = "nulang-savina"
+path = "src/bin/nulang_savina.rs"
+required-features = ["savina-bench"]
+
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
+
+# Fast optimized profile for standalone Savina actor benchmarks. Keep this separate
+# from [profile.bench] so Criterion history remains comparable.
+[profile.savina]
+inherits = "release"
+lto = false
+codegen-units = 8
+debug = false
 
 [profile.dev]
 opt-level = 0

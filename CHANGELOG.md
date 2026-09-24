@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Standalone Savina actor benchmark runner — 2026-09-23
+- **Savina-style actor workloads now have a dedicated minimal benchmark path** (`src/bin/nulang_savina.rs`, `benchmarks/SAVINA.md`). Counting, ping-pong, thread-ring, fork-join, and Skynet can run with `--no-default-features` under the non-LTO `savina` profile and emit stable JSONL records for repeated measurements. CI smoke-tests the runner and archives five-repetition output on main benchmark runs. The existing Criterion profile and historical regression baselines are unchanged.
+
 ### Compiler-owned semantic effect-site identity — 2026-09-23
 - **MIR can now derive backend-independent `EffectSiteId` values for every `Perform` / `PerformAsync` site.** Identity is domain-separated by module, owner kind, fully qualified function/behavior name, effect operation, and same-operation ordinal; source spans, compiler-generated local/block IDs, and bytecode PCs are deliberately excluded.
 - **Durable invocation identity can compose semantic site identity with durable execution identity.** `DurableEffectId::derive_from_site` combines actor identity, a replay-stable execution key, the compiler-owned site ID, and a dynamic occurrence index so repeated execution of one site inside a loop remains distinguishable while retries remain stable.
