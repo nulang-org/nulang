@@ -15,7 +15,7 @@
 //!   recycled slot;
 //! - Redis Cluster compatible 16,384-slot hashing and hash tags.
 
-use std::collections::hash_map::RandomState;
+use std::collections::{hash_map::RandomState, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 
 pub const REDIS_CLUSTER_SLOTS: u16 = 16_384;
@@ -182,6 +182,12 @@ pub enum CacheIncrementError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheEvictionPolicy {
+    None,
+    S3Fifo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheConfig {
     pub max_key_bytes: usize,
     pub max_value_bytes: usize,
@@ -221,12 +227,20 @@ impl CacheValue {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvictionQueue {
+    Small,
+    Main,
+}
+
 #[derive(Debug)]
 struct Entry {
     hash: u64,
     key: PackedBytes,
     value: CacheValue,
     expires_at_ms: Option<u64>,
+    frequency: u8,
+    eviction_queue: EvictionQueue,
 }
 
 #[derive(Debug, Default)]
@@ -257,6 +271,91 @@ struct ExpirationRef {
     slot: u32,
     generation: u32,
     expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EvictionRef {
+    slot: u32,
+    generation: u32,
+}
+
+#[derive(Debug)]
+struct S3Fifo {
+    policy: CacheEvictionPolicy,
+    small: VecDeque<EvictionRef>,
+    main: VecDeque<EvictionRef>,
+    ghost: VecDeque<u64>,
+    ghost_set: HashSet<u64>,
+    small_entries: usize,
+    main_entries: usize,
+    small_target: usize,
+    ghost_capacity: usize,
+}
+
+impl S3Fifo {
+    fn new(policy: CacheEvictionPolicy, max_entries: usize) -> Self {
+        Self {
+            policy,
+            small: VecDeque::new(),
+            main: VecDeque::new(),
+            ghost: VecDeque::new(),
+            ghost_set: HashSet::new(),
+            small_entries: 0,
+            main_entries: 0,
+            small_target: (max_entries / 10).max(1),
+            ghost_capacity: max_entries.max(1),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.policy == CacheEvictionPolicy::S3Fifo
+    }
+
+    fn choose_admission_queue(&mut self, hash: u64) -> EvictionQueue {
+        if self.ghost_set.remove(&hash) {
+            EvictionQueue::Main
+        } else {
+            EvictionQueue::Small
+        }
+    }
+
+    fn record_insert(&mut self, queue: EvictionQueue, item: EvictionRef) {
+        match queue {
+            EvictionQueue::Small => {
+                self.small_entries += 1;
+                self.small.push_back(item);
+            }
+            EvictionQueue::Main => {
+                self.main_entries += 1;
+                self.main.push_back(item);
+            }
+        }
+    }
+
+    fn record_remove(&mut self, queue: EvictionQueue) {
+        match queue {
+            EvictionQueue::Small => self.small_entries = self.small_entries.saturating_sub(1),
+            EvictionQueue::Main => self.main_entries = self.main_entries.saturating_sub(1),
+        }
+    }
+
+    fn record_promotion(&mut self, item: EvictionRef) {
+        self.small_entries = self.small_entries.saturating_sub(1);
+        self.main_entries += 1;
+        self.main.push_back(item);
+    }
+
+    fn remember_ghost(&mut self, hash: u64) {
+        if self.ghost_set.insert(hash) {
+            self.ghost.push_back(hash);
+        }
+        while self.ghost_set.len() > self.ghost_capacity {
+            let Some(oldest) = self.ghost.pop_front() else {
+                break;
+            };
+            self.ghost_set.remove(&oldest);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -319,6 +418,7 @@ pub struct CacheStats {
     pub sets: u64,
     pub deletes: u64,
     pub expirations: u64,
+    pub evictions: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,6 +446,7 @@ pub struct CacheStore {
     tombstones: usize,
     expiry: ExpirationWheel,
     expiry_scratch: Vec<ExpirationRef>,
+    eviction: S3Fifo,
     stats: CacheStats,
 }
 
@@ -357,10 +458,21 @@ impl Default for CacheStore {
 
 impl CacheStore {
     pub fn new() -> Self {
-        Self::with_config(CacheConfig::default())
+        Self::with_config_and_eviction(CacheConfig::default(), CacheEvictionPolicy::S3Fifo)
     }
 
+    /// Construct a cache with hard admission limits and no automatic eviction.
+    ///
+    /// This preserves a useful fail-closed mode for callers that need an
+    /// explicit capacity error instead of cache replacement semantics.
     pub fn with_config(config: CacheConfig) -> Self {
+        Self::with_config_and_eviction(config, CacheEvictionPolicy::None)
+    }
+
+    pub fn with_config_and_eviction(
+        config: CacheConfig,
+        eviction_policy: CacheEvictionPolicy,
+    ) -> Self {
         assert!(
             config.max_key_bytes > 0,
             "cache max_key_bytes must be non-zero"
@@ -385,6 +497,7 @@ impl CacheStore {
             tombstones: 0,
             expiry: ExpirationWheel::new(DEFAULT_WHEEL_BUCKETS, DEFAULT_WHEEL_TICK_MS),
             expiry_scratch: Vec::new(),
+            eviction: S3Fifo::new(eviction_policy, config.max_entries),
             stats: CacheStats::default(),
         }
     }
@@ -463,6 +576,28 @@ impl CacheStore {
         Ok(())
     }
 
+    fn prepare_bytes_write(&mut self, key: &[u8], value: &[u8]) -> Result<(), CacheWriteError> {
+        if key.len() > self.config.max_key_bytes {
+            return Err(CacheWriteError::KeyTooLarge);
+        }
+        if value.len() > self.config.max_value_bytes {
+            return Err(CacheWriteError::ValueTooLarge);
+        }
+
+        loop {
+            match self.validate_bytes_write(key, value) {
+                Ok(()) => return Ok(()),
+                Err(error @ CacheWriteError::EntryLimitReached)
+                | Err(error @ CacheWriteError::ArenaLimitReached) => {
+                    if !self.eviction.enabled() || !self.evict_one() {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     fn validate_integer_write(&self, key: &[u8]) -> Result<(), CacheWriteError> {
         if key.len() > self.config.max_key_bytes {
             return Err(CacheWriteError::KeyTooLarge);
@@ -479,6 +614,24 @@ impl CacheStore {
             return Err(CacheWriteError::ArenaLimitReached);
         }
         Ok(())
+    }
+
+    fn prepare_integer_write(&mut self, key: &[u8]) -> Result<(), CacheWriteError> {
+        if key.len() > self.config.max_key_bytes {
+            return Err(CacheWriteError::KeyTooLarge);
+        }
+        loop {
+            match self.validate_integer_write(key) {
+                Ok(()) => return Ok(()),
+                Err(error @ CacheWriteError::EntryLimitReached)
+                | Err(error @ CacheWriteError::ArenaLimitReached) => {
+                    if !self.eviction.enabled() || !self.evict_one() {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     #[inline]
@@ -582,6 +735,143 @@ impl CacheStore {
         }
     }
 
+    fn record_hit(&mut self, slot_id: u32) {
+        if let Some(entry) = self
+            .slots
+            .get_mut(slot_id as usize)
+            .and_then(|slot| slot.entry.as_mut())
+        {
+            entry.frequency = entry.frequency.saturating_add(1).min(3);
+        }
+    }
+
+    fn eviction_ref_is_live(&self, item: EvictionRef, queue: EvictionQueue) -> bool {
+        self.slots
+            .get(item.slot as usize)
+            .is_some_and(|slot| {
+                slot.generation == item.generation
+                    && slot
+                        .entry
+                        .as_ref()
+                        .is_some_and(|entry| entry.eviction_queue == queue)
+            })
+    }
+
+    fn evict_from_small(&mut self) -> bool {
+        let attempts = self.eviction.small.len().saturating_add(1);
+        for _ in 0..attempts {
+            let Some(item) = self.eviction.small.pop_front() else {
+                return false;
+            };
+            if !self.eviction_ref_is_live(item, EvictionQueue::Small) {
+                continue;
+            }
+
+            let promote = self.slots[item.slot as usize]
+                .entry
+                .as_ref()
+                .is_some_and(|entry| entry.frequency > 1);
+            if promote {
+                let entry = self.slots[item.slot as usize]
+                    .entry
+                    .as_mut()
+                    .expect("validated live eviction entry");
+                entry.frequency = 0;
+                entry.eviction_queue = EvictionQueue::Main;
+                self.eviction.record_promotion(item);
+                continue;
+            }
+
+            let hash = self.slots[item.slot as usize]
+                .entry
+                .as_ref()
+                .expect("validated live eviction entry")
+                .hash;
+            if self.remove_slot(item.slot) {
+                self.eviction.remember_ghost(hash);
+                self.stats.evictions += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn evict_from_main(&mut self) -> bool {
+        // Frequency is capped at three, so four full passes are sufficient to
+        // age every live main-queue entry to an evictable state.
+        let attempts = self.eviction.main.len().saturating_mul(4).saturating_add(1);
+        for _ in 0..attempts {
+            let Some(item) = self.eviction.main.pop_front() else {
+                return false;
+            };
+            if !self.eviction_ref_is_live(item, EvictionQueue::Main) {
+                continue;
+            }
+
+            let frequency = self.slots[item.slot as usize]
+                .entry
+                .as_ref()
+                .expect("validated live eviction entry")
+                .frequency;
+            if frequency > 0 {
+                self.slots[item.slot as usize]
+                    .entry
+                    .as_mut()
+                    .expect("validated live eviction entry")
+                    .frequency = frequency - 1;
+                self.eviction.main.push_back(item);
+                continue;
+            }
+
+            if self.remove_slot(item.slot) {
+                self.stats.evictions += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn evict_one(&mut self) -> bool {
+        if !self.eviction.enabled() || self.index_len == 0 {
+            return false;
+        }
+
+        let evicted = if self.eviction.small_entries > self.eviction.small_target {
+            self.evict_from_small() || self.evict_from_main()
+        } else {
+            self.evict_from_main() || self.evict_from_small()
+        };
+        self.maybe_compact_eviction_queues();
+        evicted
+    }
+
+    fn maybe_compact_eviction_queues(&mut self) {
+        let queued = self.eviction.small.len().saturating_add(self.eviction.main.len());
+        let threshold = self
+            .config
+            .max_entries
+            .saturating_mul(4)
+            .saturating_add(64);
+        if queued <= threshold {
+            return;
+        }
+
+        self.eviction.small.clear();
+        self.eviction.main.clear();
+        self.eviction.small_entries = 0;
+        self.eviction.main_entries = 0;
+        for (slot_id, slot) in self.slots.iter().enumerate() {
+            let Some(entry) = slot.entry.as_ref() else {
+                continue;
+            };
+            let item = EvictionRef {
+                slot: slot_id as u32,
+                generation: slot.generation,
+            };
+            self.eviction.record_insert(entry.eviction_queue, item);
+        }
+    }
+
     fn allocate_slot(&mut self, entry: Entry) -> (u32, u32) {
         if let Some(slot_id) = self.free_slots.pop() {
             let slot = &mut self.slots[slot_id as usize];
@@ -606,6 +896,7 @@ impl CacheStore {
             return false;
         };
         self.remove_bucket(entry.hash, slot_id);
+        self.eviction.record_remove(entry.eviction_queue);
         entry.key.release(&mut self.arena);
         entry.value.release(&mut self.arena);
         self.free_slots.push(slot_id);
@@ -625,7 +916,7 @@ impl CacheStore {
             let old_value = std::mem::replace(&mut entry.value, value);
             old_value.release(&mut self.arena);
             entry.expires_at_ms = expires_at_ms;
-            slot.generation = slot.generation.wrapping_add(1).max(1);
+            entry.frequency = entry.frequency.saturating_add(1).min(3);
             let generation = slot.generation;
             if let Some(expires_at_ms) = expires_at_ms {
                 self.expiry.schedule(
@@ -643,15 +934,25 @@ impl CacheStore {
 
         self.ensure_index_capacity();
         let packed_key = PackedBytes::pack(key, &mut self.arena);
+        let eviction_queue = self.eviction.choose_admission_queue(hash);
         let entry = Entry {
             hash,
             key: packed_key,
             value,
             expires_at_ms,
+            frequency: u8::from(eviction_queue == EvictionQueue::Main),
+            eviction_queue,
         };
         let (slot_id, generation) = self.allocate_slot(entry);
         self.insert_bucket_raw(hash, slot_id);
         self.index_len += 1;
+        self.eviction.record_insert(
+            eviction_queue,
+            EvictionRef {
+                slot: slot_id,
+                generation,
+            },
+        );
         if let Some(expires_at_ms) = expires_at_ms {
             self.expiry.schedule(
                 ExpirationRef {
@@ -677,7 +978,7 @@ impl CacheStore {
         ttl_ms: Option<u64>,
         now_ms: u64,
     ) -> Result<(), CacheWriteError> {
-        self.validate_bytes_write(key, value)?;
+        self.prepare_bytes_write(key, value)?;
         self.set_bytes_unchecked(key, value, ttl_ms, now_ms);
         Ok(())
     }
@@ -707,7 +1008,7 @@ impl CacheStore {
         ttl_ms: Option<u64>,
         now_ms: u64,
     ) -> Result<(), CacheWriteError> {
-        self.validate_integer_write(key)?;
+        self.prepare_integer_write(key)?;
         self.set_value(key, CacheValue::Integer(value), ttl_ms, now_ms);
         Ok(())
     }
@@ -724,6 +1025,7 @@ impl CacheStore {
         };
 
         self.stats.hits += 1;
+        self.record_hit(slot_id);
         let entry = self.slots[slot_id as usize]
             .entry
             .as_ref()
@@ -763,7 +1065,6 @@ impl CacheStore {
         let slot = &mut self.slots[slot_id as usize];
         let entry = slot.entry.as_mut().expect("live slot vanished");
         entry.expires_at_ms = Some(expires_at_ms);
-        slot.generation = slot.generation.wrapping_add(1).max(1);
         let generation = slot.generation;
         self.expiry.schedule(
             ExpirationRef {
@@ -822,6 +1123,7 @@ impl CacheStore {
         let next = base
             .checked_add(delta)
             .ok_or(CacheIncrementError::Overflow)?;
+        self.record_hit(slot_id);
         if let CacheValue::Bytes(bytes) = current {
             bytes.release(&mut self.arena);
         }
@@ -1146,6 +1448,61 @@ mod tests {
             Err(CacheWriteError::EntryLimitReached)
         );
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn s3_fifo_evicts_cold_entry_and_retains_reused_entry() {
+        let mut store = CacheStore::with_config_and_eviction(
+            CacheConfig {
+                max_key_bytes: 64,
+                max_value_bytes: 64,
+                max_entries: 2,
+                max_arena_bytes: 1024,
+            },
+            CacheEvictionPolicy::S3Fifo,
+        );
+
+        store.try_set_bytes(b"a", b"1", None, 0).unwrap();
+        store.try_set_bytes(b"b", b"2", None, 0).unwrap();
+        assert_eq!(store.get(b"a", 0), Some(CacheValueView::Bytes(b"1")));
+        assert_eq!(store.get(b"a", 0), Some(CacheValueView::Bytes(b"1")));
+
+        store.try_set_bytes(b"c", b"3", None, 0).unwrap();
+
+        assert_eq!(store.get(b"a", 0), Some(CacheValueView::Bytes(b"1")));
+        assert_eq!(store.get(b"b", 0), None);
+        assert_eq!(store.get(b"c", 0), Some(CacheValueView::Bytes(b"3")));
+        assert_eq!(store.stats().evictions, 1);
+    }
+
+    #[test]
+    fn s3_fifo_ghost_hit_admits_directly_to_main() {
+        let mut store = CacheStore::with_config_and_eviction(
+            CacheConfig {
+                max_key_bytes: 64,
+                max_value_bytes: 64,
+                max_entries: 2,
+                max_arena_bytes: 1024,
+            },
+            CacheEvictionPolicy::S3Fifo,
+        );
+
+        store.set_bytes(b"a", b"1", None, 0);
+        store.set_bytes(b"b", b"2", None, 0);
+        store.set_bytes(b"c", b"3", None, 0);
+        assert_eq!(store.get(b"a", 0), None);
+
+        store.set_bytes(b"a", b"4", None, 0);
+        let hash = store.hash(b"a");
+        let slot_id = store.find_slot(b"a", hash).expect("re-admitted key");
+        assert_eq!(
+            store.slots[slot_id as usize]
+                .entry
+                .as_ref()
+                .expect("live entry")
+                .eviction_queue,
+            EvictionQueue::Main
+        );
     }
 
     #[test]
