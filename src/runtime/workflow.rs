@@ -107,11 +107,7 @@ fn pending_command_at_sequence(rt: &Runtime, actor_id: u64, sequence: u64) -> Op
 
 /// Restore a command that is already present in durable history so recovery
 /// can re-drive it without appending a duplicate journal record.
-pub(crate) fn restore_workflow_command(
-    rt: &mut Runtime,
-    actor_id: u64,
-    entry: &JournalEntry,
-) {
+pub(crate) fn restore_workflow_command(rt: &mut Runtime, actor_id: u64, entry: &JournalEntry) {
     rt.pending_workflow_commands.insert(
         actor_id,
         PendingWorkflowCommand {
