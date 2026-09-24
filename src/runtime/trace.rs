@@ -1,7 +1,10 @@
 //! W3C trace context propagation for the actor runtime.
 //!
-//! The runtime threads a W3C `traceparent` string through every message so
-//! causal chains span actor, shard, and node boundaries:
+//! The runtime propagates an existing W3C `traceparent` through actor, shard,
+//! and node boundaries. For messages that arrive without trace context, a fresh
+//! root is created only when TRACE-level span collection is enabled. This keeps
+//! causal tracing intact while making the default no-subscriber message path
+//! avoid trace-id generation and traceparent formatting:
 //!
 //! * the local mailbox — [`Message::trace_id`](crate::runtime::mailbox::Message),
 //! * the cross-shard channel — [`CrossShardMsg::DeliverMessage`],
@@ -76,6 +79,21 @@ pub struct TraceContext {
 }
 
 impl TraceContext {
+    /// Derive the dispatch context for an incoming actor message.
+    ///
+    /// Existing valid trace context is always continued, even when local span
+    /// collection is disabled, so a downstream send preserves the distributed
+    /// causal chain. Untraced or malformed messages create a fresh root only
+    /// when the caller is actively collecting TRACE-level spans.
+    #[inline]
+    pub(crate) fn for_dispatch(traceparent: Option<&str>, create_root: bool) -> Option<Self> {
+        match traceparent.and_then(Self::from_traceparent) {
+            Some(incoming) => Some(incoming.child()),
+            None if create_root => Some(Self::root()),
+            None => None,
+        }
+    }
+
     /// Start a fresh trace at a root span.
     pub fn root() -> Self {
         TraceContext {
@@ -202,6 +220,31 @@ impl TraceContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_dispatch_without_context_or_trace_collection_is_none() {
+        assert_eq!(TraceContext::for_dispatch(None, false), None);
+        assert_eq!(TraceContext::for_dispatch(Some("malformed"), false), None);
+    }
+
+    #[test]
+    fn test_dispatch_continues_incoming_context_without_local_collection() {
+        let incoming = TraceContext::root();
+        let traceparent = incoming.to_traceparent();
+        let child =
+            TraceContext::for_dispatch(Some(&traceparent), false).expect("incoming trace continues");
+        assert_eq!(child.trace_id(), incoming.trace_id());
+        assert_eq!(child.parent_span_id(), incoming.span_id());
+        assert_ne!(child.span_id(), incoming.span_id());
+    }
+
+    #[test]
+    fn test_dispatch_creates_root_when_trace_collection_is_enabled() {
+        let root = TraceContext::for_dispatch(None, true).expect("TRACE collection creates root");
+        assert_ne!(root.trace_id(), 0);
+        assert_ne!(root.span_id(), 0);
+        assert_eq!(root.parent_span_id(), 0);
+    }
 
     #[test]
     fn test_traceparent_roundtrip() {
