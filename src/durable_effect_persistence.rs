@@ -28,6 +28,29 @@ pub enum DurableEffectPersistenceRecord {
     },
 }
 
+impl serde::Serialize for DurableEffectPersistenceRecord {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let bytes = self.to_json().map_err(serde::ser::Error::custom)?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(serde::ser::Error::custom)?;
+        serde::Serialize::serialize(&value, serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DurableEffectPersistenceRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        let bytes = serde_json::to_vec(&value).map_err(serde::de::Error::custom)?;
+        Self::from_json(&bytes).map_err(serde::de::Error::custom)
+    }
+}
+
 impl DurableEffectPersistenceRecord {
     pub fn from_effect(record: DurableEffectRecord) -> Self {
         Self::Effect(record)
