@@ -164,15 +164,58 @@ Stop blocks a Start for the same logical replica at the store boundary, and a
 dispatcher whose lease has been reclaimed cannot ACK or release the newer
 generation. The same claim state is persisted by JSON and PostgreSQL stores.
 
+## Durable node-side execution fence
+
+`FencedNodeExecutor` is the concrete node-side implementation of the
+allocation-command sink boundary. It persists a small local lifecycle record per
+logical deployment replica and applies the allocation epoch again at the point
+where external side effects occur.
+
+The state machine is intentionally conservative:
+
+```text
+Start(N)
+  -> persist Starting(N)
+  -> idempotent WorkloadLifecycle.start(N)
+  -> persist Running(N)
+
+Stop(N)
+  -> persist Stopping(N)
+  -> idempotent WorkloadLifecycle.stop(N)
+  -> persist Stopped(N)
+```
+
+A retryable launcher failure leaves `Starting` or `Stopping` durable so the
+exact operation is retried after controller/node-agent recovery. A newer Start
+cannot pass a locally live prior epoch. A delayed Start for an already-fenced
+older epoch is a safe no-op, while the same stopped epoch cannot be resurrected.
+A delayed Stop for an old epoch may clean up that exact orphaned workload but
+cannot overwrite the durable record for a newer running epoch. Commands for a
+different node fail before any launcher side effect.
+
+The node execution file is a **secondary fence**, not cluster ownership. The
+transactional control store remains authoritative. The executor serializes
+commands through one node-local state machine and requires
+`WorkloadLifecycle` implementations to make exact Start/Stop identities
+idempotent.
+
+This does **not** yet make `AllocationCommand` a complete workload launch
+description. Placement commands currently identify deployment/revision/
+replica/node/epoch, but do not carry an immutable artifact digest, behavior
+manifest binding, entrypoint, arguments, environment, or sandbox profile. The
+next execution slice is therefore an immutable workload-revision contract
+derived from RFC 0020 package artifacts; concrete process/container launchers
+should consume that contract rather than mutable paths or tags.
+
 ## Next implementation slices
 
-1. Reconciliation event loop for deployment/node/allocation changes.
-2. PostgreSQL state normalization only if measured contention/state size justifies it.
-4. Fabric-backed service directory with generation-tagged health advertisements.
-5. Workload identity and short-lived mTLS credentials bound to node/workload
+1. Immutable workload revision/artifact launch contract bound to RFC 0020
+   executable + behavior-manifest digests.
+2. Workload identity and short-lived mTLS credentials bound to node/workload
    identity.
-6. Capability-to-network-policy compilation, enforced in the NUL0 transport.
-7. Optional L7 waypoint for HTTP/gRPC policy; no per-actor sidecars.
+3. Capability-to-network-policy compilation, enforced in the NUL0 transport.
+4. Optional L7 waypoint for HTTP/gRPC policy; no per-actor sidecars.
+5. PostgreSQL state normalization only if measured contention/state size justifies it.
 
 ## Non-goals
 
