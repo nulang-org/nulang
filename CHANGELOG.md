@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### WASM component authority unification — 2026-09-24
+- **Wasmtime component host imports now use the same typed `AuthorityManifest` as the actor/runtime authority boundary** (Experimental backend surface, `src/wasm_component_runtime.rs`). The backend-specific `Capabilities { allow_log, allow_clock, allow_random }` policy is removed; `ComponentRuntime::new` is deny-by-default and `new_with_authority` accepts exact delegated authority.
+- **WIT host operations require exact grants at link and dispatch time.** `IO::Log`, `Time::Now`, and `Random::U64` use the existing `AuthorityGrant::Other` extension point. Sibling grants do not authorize one another, and unauthorized imports are omitted from the linker so component instantiation fails closed. This advances #334 without introducing a second WASM security policy.
+
 ### CI playground dependency and formatting repair — 2026-09-24
 - **Browser-playground compilation now includes the shared content-identity module and its pure-Rust `hex` dependency** (`crates/nulang-playground`), matching `semantic_identity.rs`'s current dependency graph. Runtime worker-pool files were also normalized to the repository's rustfmt output so the format gate reflects semantics rather than stale layout.
 
