@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Same-host actor optimization A/B gate — 2026-09-23
+- **Performance pull requests can now compare the candidate to their exact base SHA on the same runner and logical CPU** (`scripts/nulang_ab_bench.py`, `.github/workflows/nulang-ab-bench.yml`). Build work is excluded from timing, execution order alternates by round, and the JSON artifact records raw samples, medians, throughput/latency deltas, toolchains, and CPU affinity.
+- **Stacked performance work is measured incrementally by construction**, and Nulang-only probes cover the small-message payload boundary plus AOT actor dispatch without contaminating the cross-language baseline.
+
 ### Reproducible cross-runtime actor baselines — 2026-09-23
 - **Matched Savina-style counting, ping-pong, thread-ring, and fork-join fixtures now cover Nulang, Rust standard-library channels, Go channels/goroutines, and Erlang/BEAM processes** (`benchmarks/cross_runtime/`, `scripts/cross_runtime_bench.py`). The runner records exact timing samples, medians, toolchain/git/CPU metadata, and emits one JSON artifact.
 - **Comparative runs default to one enforced logical CPU across every runtime process and child scheduler/thread**, matching the current single-shard Nulang harness's compute budget. Unconstrained host mode is explicitly diagnostic until a separate sharded Nulang fixture exists, so multicore fork-join results are not misrepresented as equivalent comparisons.
