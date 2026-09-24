@@ -11,6 +11,7 @@ use std::time::Instant;
 use tracing::warn;
 
 mod actor;
+mod blocking_executor;
 pub mod cache;
 pub mod cache_cluster;
 pub mod cache_dispatch;
@@ -88,6 +89,7 @@ mod cluster_sim;
 mod tests;
 
 pub use actor::*;
+pub use blocking_executor::*;
 pub use cache::*;
 pub use cache_cluster::*;
 pub use cache_dispatch::*;
