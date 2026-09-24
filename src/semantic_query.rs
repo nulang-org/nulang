@@ -83,9 +83,12 @@ pub fn run(args: &[String]) -> NuResult<()> {
         print_help();
         return Ok(());
     }
-    if !matches!(command, "type" | "references" | "callers" | "callees") {
+    if !matches!(
+        command,
+        "type" | "references" | "callers" | "callees" | "context"
+    ) {
         return Err(query_err(format!(
-            "unknown semantic query '{command}'; try: type, references, callers, callees"
+            "unknown semantic query '{command}'; try: type, references, callers, callees, context"
         )));
     }
 
@@ -141,6 +144,22 @@ pub fn run(args: &[String]) -> NuResult<()> {
                 .filter(|r| r.kind == "call" && owner_matches(requested, &r.owner))
                 .collect(),
         ),
+        "context" => {
+            let symbols = index
+                .symbols
+                .into_iter()
+                .filter(|s| name_matches(requested, &s.name, &s.qualified_name))
+                .collect();
+            let references = index
+                .references
+                .into_iter()
+                .filter(|r| {
+                    (r.kind == "call" && owner_matches(requested, &r.owner))
+                        || target_matches(requested, &r.target)
+                })
+                .collect();
+            (symbols, references)
+        }
         _ => unreachable!(),
     };
 
@@ -162,7 +181,8 @@ fn print_help() {
            nulang query type <name> <file> [--json]\n\
            nulang query references <name> <file> [--json]\n\
            nulang query callers <name> <file> [--json]\n\
-           nulang query callees <owner> <file> [--json]\n"
+           nulang query callees <owner> <file> [--json]\n\
+           nulang query context <name> <file> [--json]\n"
     );
 }
 
@@ -176,7 +196,7 @@ fn emit_report(report: &SemanticQueryReport, json: bool) -> NuResult<()> {
     }
 
     match report.command.as_str() {
-        "type" => {
+        "type" | "context" => {
             if report.symbols.is_empty() {
                 println!("No matching symbols.");
             }
@@ -191,6 +211,19 @@ fn emit_report(report: &SemanticQueryReport, json: bool) -> NuResult<()> {
                     symbol.span.line,
                     symbol.span.col
                 );
+            }
+            if report.command == "context" {
+                for reference in &report.references {
+                    println!(
+                        "{}  {} -> {}  {}:{}:{}",
+                        reference.kind,
+                        reference.owner,
+                        reference.target,
+                        reference.span.file,
+                        reference.span.line,
+                        reference.span.col
+                    );
+                }
             }
         }
         _ => {
