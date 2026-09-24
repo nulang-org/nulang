@@ -164,15 +164,46 @@ Stop blocks a Start for the same logical replica at the store boundary, and a
 dispatcher whose lease has been reclaimed cannot ACK or release the newer
 generation. The same claim state is persisted by JSON and PostgreSQL stores.
 
+## Reconciliation event loop
+
+The core control plane now provides a bounded, source-neutral event-loop turn
+through `process_reconcile_batch`. Queue/Kafka/PostgreSQL/HTTP adapters remain
+outside the scheduling core and translate their changes into complete
+`ReconcileEvent` snapshots.
+
+The event protocol follows the same crash rule as the execution outbox:
+
+1. the source provides a stable source event id and stable evaluation id;
+2. an optional allocation observation is applied only to an allocation epoch
+   the control plane already owns;
+3. `reconcile_once` atomically commits the plan and Start/Stop outbox;
+4. only then is the source event acknowledged.
+
+A crash between steps 3 and 4 causes source redelivery. The stable evaluation id
+returns the already committed plan instead of creating duplicate ownership or
+outbox work.
+
+Allocation status ingestion is fenced independently. A node report may advance
+`Starting -> Running/Failed/Stopped`, `Running -> Failed/Stopped`, or
+`Failed -> Stopped`. It cannot create an unknown allocation, move an epoch to
+another node, or resurrect a terminal allocation. Reports for epochs older than
+the current owner are ignored as stale.
+
+Within one poll, only exact redeliveries of the same evaluation and typed
+snapshot are coalesced. Distinct deployment/node/allocation evaluations are
+processed in source order. More aggressive coalescing is intentionally deferred
+until a source offers a durable high-water mark or atomic batch acknowledgement;
+otherwise a controller crash could lose an intermediate event without a durable
+record that it was superseded.
+
 ## Next implementation slices
 
-1. Reconciliation event loop for deployment/node/allocation changes.
-2. PostgreSQL state normalization only if measured contention/state size justifies it.
-4. Fabric-backed service directory with generation-tagged health advertisements.
-5. Workload identity and short-lived mTLS credentials bound to node/workload
+1. Fabric-backed service directory with generation-tagged health advertisements.
+2. Workload identity and short-lived mTLS credentials bound to node/workload
    identity.
-6. Capability-to-network-policy compilation, enforced in the NUL0 transport.
-7. Optional L7 waypoint for HTTP/gRPC policy; no per-actor sidecars.
+3. Capability-to-network-policy compilation, enforced in the NUL0 transport.
+4. Optional L7 waypoint for HTTP/gRPC policy; no per-actor sidecars.
+5. PostgreSQL state normalization only if measured contention/state size justifies it.
 
 ## Non-goals
 
