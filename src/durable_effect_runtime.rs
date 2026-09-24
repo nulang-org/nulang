@@ -30,6 +30,12 @@ pub enum DurableEffectDispatchDecision {
     DispatchWithDeduplication { operation_id: DurableEffectId },
     /// The configured backend owns recovery semantics.
     DelegateToBackend { operation_id: DurableEffectId },
+    /// First dispatch for an operation whose contract forbids automatic
+    /// redispatch after ambiguous recovery.
+    DispatchOnce { operation_id: DurableEffectId },
+    /// Recovery found a Prepared record whose contract forbids automatic
+    /// redispatch. The caller must reconcile explicitly.
+    RefuseAutomaticRedispatch { operation_id: DurableEffectId },
 }
 
 #[derive(Debug)]
@@ -121,7 +127,7 @@ impl<'a> DurableEffectCoordinator<'a> {
         self.commit_record(DurableEffectPersistenceRecord::from_effect(
             prepared.clone(),
         ))?;
-        Ok(decision(&prepared))
+        Ok(initial_dispatch_decision(&prepared))
     }
 
     /// Persist the terminal result for a previously prepared effect.
@@ -217,6 +223,22 @@ fn decision(record: &DurableEffectRecord) -> DurableEffectDispatchDecision {
                 operation_id: record.spec().id,
             }
         }
+        DurableEffectRecoveryAction::RefuseAutomaticRedispatch { operation_id } => {
+            DurableEffectDispatchDecision::RefuseAutomaticRedispatch { operation_id }
+        }
+    }
+}
+
+fn initial_dispatch_decision(record: &DurableEffectRecord) -> DurableEffectDispatchDecision {
+    if matches!(
+        record.spec().delivery,
+        crate::primitives::DeliverySemantics::NoAutomaticRetry
+    ) {
+        DurableEffectDispatchDecision::DispatchOnce {
+            operation_id: record.spec().id,
+        }
+    } else {
+        decision(record)
     }
 }
 
@@ -367,6 +389,30 @@ mod tests {
             coordinator.begin(drifted, b"prompt"),
             Err(DurableEffectRuntimeError::SpecMismatch { effect_id, .. }) if effect_id == id
         ));
+        assert_eq!(store.latest_sequence(42), 1);
+    }
+
+    #[test]
+    fn nonreplayable_effect_dispatches_once_then_refuses_recovery_redispatch() {
+        let mut store = MemoryStore::new();
+        let expected = spec(42, "turn:7:voice-call", DeliverySemantics::NoAutomaticRetry);
+        let id = expected.id;
+
+        {
+            let mut coordinator = DurableEffectCoordinator::new(&mut store, 42, 1);
+            assert_eq!(
+                coordinator.begin(expected.clone(), b"call").unwrap(),
+                DurableEffectDispatchDecision::DispatchOnce { operation_id: id }
+            );
+        }
+
+        let mut recovered = DurableEffectCoordinator::new(&mut store, 42, 1);
+        assert_eq!(
+            recovered.begin(expected, b"call").unwrap(),
+            DurableEffectDispatchDecision::RefuseAutomaticRedispatch {
+                operation_id: id,
+            }
+        );
         assert_eq!(store.latest_sequence(42), 1);
     }
 

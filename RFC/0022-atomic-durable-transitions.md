@@ -236,8 +236,13 @@ the declared delivery semantics.
 If it crashes after the external system commits but before Completed is
 durable, the outcome is unknown. Recovery retries using the same
 `DurableEffectId` when the dependency supports deduplication, retries
-at-least-once when that is the declared contract, or delegates to the backend
-for `BackendDefined`.
+at-least-once when that is the declared contract, delegates to the backend for
+`BackendDefined`, or refuses automatic redispatch for `NoAutomaticRetry`.
+
+`NoAutomaticRetry` still permits the initial dispatch after the Prepared
+record commits. It changes only recovery from an already-existing ambiguous
+Prepared record. Reconciliation then belongs to an operation-specific query,
+compensation flow, or operator decision.
 
 There is deliberately no generic ExactlyOnce variant.
 

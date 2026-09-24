@@ -21,6 +21,7 @@
 //! the contract and prevent future implementations from quietly upgrading an
 //! at-least-once external call into an unsound "exactly once" promise.
 
+use crate::host_effect_abi::{HostOperationDescriptor, HostReplayClass};
 use crate::primitives::{DeliverySemantics, EffectBoundary};
 use crate::semantic_identity::EffectSiteId;
 use blake3::Hasher;
@@ -208,7 +209,51 @@ impl DurableEffectSpec {
             delivery,
         }
     }
+
+    /// Build a durable external-effect specification directly from the
+    /// compiler-owned host contract when that contract fully determines safe
+    /// redispatch semantics.
+    ///
+    /// Generic `JournalResult` operations require an operation-specific
+    /// delivery decision and therefore fail closed here rather than inheriting
+    /// a guessed retry policy.
+    pub fn from_host_operation(
+        id: DurableEffectId,
+        operation: &HostOperationDescriptor,
+    ) -> Result<Self, DurableHostEffectSpecError> {
+        let delivery = operation
+            .replay
+            .durable_delivery_semantics()
+            .ok_or(DurableHostEffectSpecError::ExplicitDeliveryPolicyRequired {
+                replay: operation.replay,
+            })?;
+        Ok(Self::new(
+            id,
+            operation.canonical_id(),
+            EffectBoundary::External,
+            delivery,
+        ))
+    }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableHostEffectSpecError {
+    ExplicitDeliveryPolicyRequired { replay: HostReplayClass },
+}
+
+impl fmt::Display for DurableHostEffectSpecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ExplicitDeliveryPolicyRequired { replay } => write!(
+                f,
+                "host replay class {:?} does not determine ambiguous durable redispatch policy",
+                replay
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DurableHostEffectSpecError {}
 
 /// A journal lookup used the correct logical operation ID but supplied a
 /// different request body. Recovery must fail closed rather than replaying a
@@ -321,6 +366,11 @@ impl DurableEffectRecord {
                         operation_id: spec.id,
                     }
                 }
+                DeliverySemantics::NoAutomaticRetry => {
+                    DurableEffectRecoveryAction::RefuseAutomaticRedispatch {
+                        operation_id: spec.id,
+                    }
+                }
             },
         }
     }
@@ -381,6 +431,9 @@ pub enum DurableEffectRecoveryAction<'a> {
     RetryWithDeduplication { operation_id: DurableEffectId },
     /// The configured backend owns the recovery guarantee and must decide.
     DelegateToBackend,
+    /// The original dispatch may have committed externally but completion is
+    /// not durably known. Automatic redispatch is forbidden by contract.
+    RefuseAutomaticRedispatch { operation_id: DurableEffectId },
 }
 
 /// Invalid durable compensation transition.
@@ -466,6 +519,30 @@ mod tests {
             EffectBoundary::External,
             delivery,
         )
+    }
+
+    #[test]
+    fn host_nonreplayable_contract_builds_no_retry_spec() {
+        let operation = crate::host_effect_abi::lookup_host_operation("Comms", "call").unwrap();
+        let id = DurableEffectId::derive(42, "turn:call", 0, "Comms.call");
+        let spec = DurableEffectSpec::from_host_operation(id, operation).unwrap();
+
+        assert_eq!(spec.id, id);
+        assert_eq!(spec.effect_operation, operation.canonical_id());
+        assert_eq!(spec.boundary, EffectBoundary::External);
+        assert_eq!(spec.delivery, DeliverySemantics::NoAutomaticRetry);
+    }
+
+    #[test]
+    fn journal_result_host_contract_requires_explicit_delivery_policy() {
+        let operation = crate::host_effect_abi::lookup_host_operation("Http", "get").unwrap();
+        let id = DurableEffectId::derive(42, "turn:http", 0, "Http.get");
+        assert_eq!(
+            DurableEffectSpec::from_host_operation(id, operation).unwrap_err(),
+            DurableHostEffectSpecError::ExplicitDeliveryPolicyRequired {
+                replay: HostReplayClass::JournalResult,
+            }
+        );
     }
 
     #[test]
@@ -701,6 +778,21 @@ mod tests {
         assert_eq!(
             compensation.recovery_action_for_request(b"refund").unwrap(),
             DurableEffectRecoveryAction::ReplayRecordedResult(b"refunded")
+        );
+    }
+
+    #[test]
+    fn nonreplayable_prepared_effect_refuses_automatic_redispatch() {
+        let record = DurableEffectRecord::prepare(
+            spec(DeliverySemantics::NoAutomaticRetry),
+            b"call",
+        );
+        let id = record.spec().id;
+        assert_eq!(
+            record.recovery_action_for_request(b"call").unwrap(),
+            DurableEffectRecoveryAction::RefuseAutomaticRedispatch {
+                operation_id: id,
+            }
         );
     }
 

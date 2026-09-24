@@ -22,12 +22,15 @@ For one logical durable external effect, the runtime contract is:
 2. combine it with replay-stable execution identity to derive one `DurableEffectId`;
 3. persist a `Prepared` record atomically before provider execution;
 4. bind the record to the exact request digest and full effect specification;
-5. reuse the same operation ID on every recovery attempt;
-6. persist the first terminal result as `Completed`;
-7. replay a completed result without redispatching the provider;
-8. reject request or specification drift before dispatch;
-9. reject stale activation epochs at the persistence boundary;
-10. model compensation as another explicit durable effect rather than pretending
+5. follow the declared recovery contract after an ambiguous `Prepared`
+   record: retry, retry with stable deduplication, delegate, or refuse automatic
+   redispatch;
+6. reuse the same operation ID on every permitted recovery attempt;
+7. persist the first terminal result as `Completed`;
+8. replay a completed result without redispatching the provider;
+9. reject request or specification drift before dispatch;
+10. reject stale activation epochs at the persistence boundary;
+11. model compensation as another explicit durable effect rather than pretending
     the original external mutation can be rolled back.
 
 A Nulang-local journal or transaction cannot prove that an arbitrary remote
@@ -39,8 +42,8 @@ remote side commits and before Nulang records the receipt.
 | Crash point | Durable state after restart | Required recovery | External observation |
 |---|---|---|---|
 | Before intent commit | No effect record | Start a logical attempt only if the owning durable turn was not committed | No provider call should have occurred |
-| After intent, before provider | `Prepared` | Retry the same semantic operation ID | One call if the first process never reached the provider |
-| After provider commit, before receipt | `Prepared` | Retry with the same operation ID | May duplicate under at-least-once; effectively-once requires provider/backend deduplication |
+| After intent, before provider | `Prepared` | Follow delivery policy; non-replayable effects require explicit reconciliation rather than automatic dispatch | One call only when the runtime can prove the original process never crossed the provider boundary; otherwise policy governs |
+| After provider commit, before receipt | `Prepared` | Retry with the same operation ID only when permitted; `NoAutomaticRetry` refuses redispatch | May duplicate under at-least-once; effectively-once requires provider/backend deduplication; non-replayable stays ambiguous |
 | After receipt, before actor/workflow resume | `Completed` | Return the recorded result | Provider must not be called again |
 | Replay request/spec differs | `Prepared` or `Completed` | Fail closed | Provider must not be called |
 | Backend owns semantics | Backend-defined | Delegate to the backend contract | Nulang must not strengthen the guarantee |
@@ -64,6 +67,16 @@ blanket exactly-once guarantee for an uncooperative provider.
 
 The configured backend owns retry, deduplication, and commit semantics. Nulang
 delegates rather than inferring a stronger guarantee.
+
+### `NoAutomaticRetry`
+
+The first dispatch is allowed only after `Prepared` commits. If recovery later
+finds that same `Prepared` record, Nulang refuses to redispatch automatically:
+the remote operation may already have committed and there is no sound generic
+way to distinguish that from a pre-dispatch crash. An operation-specific
+reconciliation path, compensation protocol, or operator decision must resolve
+the ambiguity. This is the durable meaning of compiler host operations
+classified as `external-nonreplayable`.
 
 ## What is not yet a production-wide guarantee
 

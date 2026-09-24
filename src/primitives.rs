@@ -474,6 +474,10 @@ pub enum DeliverySemantics {
     /// The guarantee is delegated to a configured backend and must not be
     /// strengthened by the language/runtime documentation.
     BackendDefined,
+    /// Recovery must not automatically redispatch an ambiguously completed
+    /// operation. An operator, compensating protocol, or operation-specific
+    /// reconciliation path must decide what happens next.
+    NoAutomaticRetry,
 }
 
 #[cfg(test)]
