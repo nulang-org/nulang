@@ -71,7 +71,7 @@ fn bench_first_heap_alloc_batch(c: &mut Criterion) {
                 (rt, ids)
             },
             |(mut rt, ids)| {
-                for actor_id in ids {
+                for &actor_id in &ids {
                     let ptr = rt
                         .actors
                         .get_mut(&actor_id)
@@ -81,7 +81,12 @@ fn bench_first_heap_alloc_batch(c: &mut Criterion) {
                         .expect("first actor heap allocation");
                     black_box(ptr);
                 }
-                black_box(rt);
+                black_box(rt.actor_count());
+                // Returning the runtime defers destruction of the 1,000
+                // materialized heaps until Criterion has stopped this sample's
+                // timer. The benchmark therefore isolates first allocation
+                // instead of timing mass pool return/deallocation.
+                (rt, ids)
             },
             BatchSize::SmallInput,
         )
