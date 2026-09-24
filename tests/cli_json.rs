@@ -55,7 +55,11 @@ fn run_check_json(file: &Path) -> (i32, String, String) {
 #[test]
 fn check_json_unbound_variable_reports_e0202() {
     let dir = temp_dir("unbound");
-    let src = write_temp(&dir, "bad.nula", "fn main() = countr + 1\n");
+    let src = write_temp(
+        &dir,
+        "bad.nula",
+        "fn main(counter: Int) = countr + 1\n",
+    );
 
     let (code, stdout, _stderr) = run_check_json(&src);
     assert_ne!(code, 0, "failing check must exit nonzero");
@@ -80,6 +84,24 @@ fn check_json_unbound_variable_reports_e0202() {
     assert!(span.is_object(), "expected a resolved span: {d:?}");
     assert_eq!(span["line"], 1);
     assert!(span["col"].as_u64().unwrap() >= 1);
+
+    assert_eq!(d["kind"], "unbound_variable");
+    assert_eq!(d["data"]["name"], "countr");
+    assert!(
+        d["data"]["candidates"]
+            .as_array()
+            .expect("candidate array")
+            .iter()
+            .any(|name| name == "counter")
+    );
+    assert!(span["start_byte"].is_number());
+    assert!(span["end_byte"].is_number());
+    let fixes = d["fixes"].as_array().expect("fixes array");
+    assert_eq!(fixes.len(), 1, "single close name should be safely repairable");
+    assert_eq!(fixes[0]["applicability"], "machine_applicable");
+    assert_eq!(fixes[0]["edits"][0]["replacement"], "counter");
+    assert_eq!(fixes[0]["edits"][0]["start_byte"], span["start_byte"]);
+    assert_eq!(fixes[0]["edits"][0]["end_byte"], span["end_byte"]);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
