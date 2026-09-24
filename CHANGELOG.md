@@ -54,7 +54,7 @@ version + migration.*
 ### Inline cross-shard actor payloads — 2026-09-24
 - **Ordinary cross-shard actor messages now preserve the existing 0–4-value inline `MessagePayload` representation directly from the caller slice, without first materializing a `Vec<Value>`.** Object-transfer variants allocate a mutable vector only when destination object ids must be rewritten, then enter the mailbox through the same payload abstraction.
 - **Cross-shard receive draining now dispatches each message directly from the bounded shard channel instead of collecting an intermediate `Vec<CrossShardMsg>`.** This removes one allocation from each non-empty drain pass without changing admission, ordering, backpressure, grain hydration, or ORCA ownership semantics.
-- A two-shard regression test verifies that a one-value message remains inline at the destination mailbox.
+- A two-shard regression test verifies that a one-value message remains inline at the destination mailbox, and Criterion now compares `actor/message_roundtrip/{same_shard_512,cross_shard_512}` with setup excluded and a batch below the bounded shard-bus capacity.
 
 ### Backend-neutral JIT region planning — 2026-09-24
 - **Native compilation eligibility is now separated from Cranelift code generation.** `src/jit/region_planner.rs` owns region boundaries, non-suspending direct-call folding, recursion safety, cached per-module analyses, and type metadata production.
