@@ -77,12 +77,11 @@ impl QuerySession {
                 .insert(path_buf.clone(), CachedIndex { digest, index });
         }
 
-        let index = &self
+        let index = self
             .cache
             .get(&path_buf)
-            .expect("semantic query cache populated above")
-            .index;
-        query_index(command, name, index)
+            .ok_or_else(|| daemon_error("semantic query cache population failed".to_string()))?;
+        query_index(command, name, &index.index)
     }
 
     pub fn invalidate(&mut self, path: &Path) -> bool {
