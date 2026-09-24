@@ -22,13 +22,13 @@ pub mod behavior_manifest;
 #[cfg(test)]
 pub mod benchmarks;
 pub mod bytecode;
-pub mod code_query;
 #[cfg(feature = "wasmfx-backend")]
 pub mod cir;
 #[cfg(feature = "wasmfx-backend")]
 pub mod cir_analysis;
 #[cfg(feature = "wasmfx-backend")]
 pub mod cir_lower;
+pub mod code_query;
 pub mod compat;
 pub mod compiler_identity;
 pub mod content_identity;
