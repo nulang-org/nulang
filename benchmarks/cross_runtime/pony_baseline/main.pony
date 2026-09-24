@@ -18,6 +18,9 @@ actor Counter
 actor Pong
   var _count: U64 = 0
 
+  new create() =>
+    None
+
   be recv(ping: Ping tag) =>
     _count = _count + 1
     ping.ack(_count, this)
