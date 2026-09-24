@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Typed bytecode semantic identity sidecars — 2026-09-24
+- **Production typed compilation now attaches compiler-proven whole-program and actor-definition `SemanticId` sidecars to in-memory `CodeModule` values**. Definition identities remain parallel to `actor_metadata`, preserving namespace-distinct ownership even when short actor names collide.
+- **Frozen NBC v1 is unchanged.** Raw/legacy NBC loads and low-level `mir_codegen::compile_mir` remain explicitly unproven; the CLI, REPL, DAP, and FFI typed frontend paths use `compile_typed_bytecode` so later durable recovery code can distinguish proven current semantics from legacy code.
+
 ### CI playground dependency and formatting repair — 2026-09-24
 - **Browser-playground compilation now includes the shared content-identity module and its pure-Rust `hex` dependency** (`crates/nulang-playground`), matching `semantic_identity.rs`'s current dependency graph. Runtime worker-pool files were also normalized to the repository's rustfmt output so the format gate reflects semantics rather than stale layout.
 
