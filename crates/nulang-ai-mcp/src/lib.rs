@@ -168,17 +168,12 @@ impl McpServer {
     }
 
     fn initialize(&self, params: Option<&Value>) -> Value {
-        let requested = params
+        let _requested = params
             .and_then(|value| value.get("protocolVersion"))
             .and_then(Value::as_str);
-        let protocol_version = if requested == Some(LEGACY_PROTOCOL_VERSION) {
-            LEGACY_PROTOCOL_VERSION
-        } else {
-            LEGACY_PROTOCOL_VERSION
-        };
 
         json!({
-            "protocolVersion": protocol_version,
+            "protocolVersion": LEGACY_PROTOCOL_VERSION,
             "capabilities": {
                 "tools": {
                     "listChanged": false
