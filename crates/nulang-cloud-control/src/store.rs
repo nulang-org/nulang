@@ -123,6 +123,13 @@ pub trait ControlStore: Send + Sync {
 
     fn pending_commands(&self) -> Result<Vec<AllocationCommand>, StoreError>;
 
+    /// True only when a Start command still names the highest authoritative
+    /// epoch for its logical deployment replica.
+    fn start_command_is_authoritative(
+        &self,
+        command: &AllocationCommand,
+    ) -> Result<bool, StoreError>;
+
     /// Idempotently mark a durable outbox command acknowledged.
     fn acknowledge_command(&self, command_id: &str) -> Result<(), StoreError>;
 }
@@ -312,6 +319,22 @@ impl PersistedState {
             .collect()
     }
 
+    fn start_command_is_authoritative(&self, command: &AllocationCommand) -> bool {
+        if command.kind != AllocationCommandKind::Start {
+            return false;
+        }
+
+        self.max_epoch(&command.deployment_id, command.replica) == command.epoch
+            && self.allocations.iter().any(|allocation| {
+                allocation.deployment_id == command.deployment_id
+                    && allocation.revision == command.revision
+                    && allocation.replica == command.replica
+                    && allocation.node_id == command.node_id
+                    && allocation.epoch == command.epoch
+                    && allocation.state.is_active()
+            })
+    }
+
     fn acknowledge_command(&mut self, command_id: &str) -> Result<(), StoreError> {
         let Some(command) = self.commands.get_mut(command_id) else {
             return Err(StoreError::CommandNotFound(command_id.to_owned()));
@@ -449,6 +472,17 @@ impl ControlStore for MemoryControlStore {
             .pending_commands())
     }
 
+    fn start_command_is_authoritative(
+        &self,
+        command: &AllocationCommand,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("control-store mutex poisoned")
+            .start_command_is_authoritative(command))
+    }
+
     fn acknowledge_command(&self, command_id: &str) -> Result<(), StoreError> {
         self.state
             .lock()
@@ -551,6 +585,17 @@ impl ControlStore for JsonFileControlStore {
             .lock()
             .expect("control-store mutex poisoned")
             .pending_commands())
+    }
+
+    fn start_command_is_authoritative(
+        &self,
+        command: &AllocationCommand,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("control-store mutex poisoned")
+            .start_command_is_authoritative(command))
     }
 
     fn acknowledge_command(&self, command_id: &str) -> Result<(), StoreError> {
@@ -736,6 +781,13 @@ impl ControlStore for PostgresControlStore {
 
     fn pending_commands(&self) -> Result<Vec<AllocationCommand>, StoreError> {
         Ok(self.load_state()?.pending_commands())
+    }
+
+    fn start_command_is_authoritative(
+        &self,
+        command: &AllocationCommand,
+    ) -> Result<bool, StoreError> {
+        Ok(self.load_state()?.start_command_is_authoritative(command))
     }
 
     fn acknowledge_command(&self, command_id: &str) -> Result<(), StoreError> {
