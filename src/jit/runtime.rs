@@ -496,10 +496,11 @@ pub fn clear_jit_string_module() {
 
 /// Resolve a raw u64 value to its string content (for comparison).
 ///
-/// Interned strings are resolved through the active VM plus its module index.
-/// No borrowed constant-pool slice is stored in thread-local state, so native
-/// execution retains no Rust reference into VM-owned module storage across a
-/// re-entrant interpreter call.
+/// Interned strings are resolved through either the direct-frame path's
+/// immutable active-module pointer or the detached path's VM + module index.
+/// No borrowed constant-pool slice is stored in thread-local state; the module
+/// pointer is installed only while non-reentrant native execution keeps
+/// `VM::modules` fixed in place.
 fn resolve_jit_string(raw: u64) -> Option<String> {
     if (raw & TAG_MASK) == TAG_STRING {
         let id = (raw & PAYLOAD_MASK) as u32;
