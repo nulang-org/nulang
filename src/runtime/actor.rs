@@ -264,6 +264,9 @@ pub struct Actor {
     pub compensation_offsets: Vec<Option<usize>>,
     /// Names of steps already compensated (used during recovery replay).
     pub compensated_steps: Vec<String>,
+    /// Compiler-proven semantic identity of this actor definition. This is
+    /// intentionally narrower than the containing module's whole-program ID.
+    pub definition_semantic_id: Option<crate::content_identity::SemanticId>,
     /// Bytecode module used by this actor's bytecode behaviors.
     pub bytecode_module: Option<crate::bytecode::CodeModule>,
     /// Index of the loaded bytecode module in the runtime VM.
@@ -409,6 +412,7 @@ impl Actor {
             bytecode_offsets: Vec::new(),
             compensation_offsets: Vec::new(),
             compensated_steps: Vec::new(),
+            definition_semantic_id: None,
             bytecode_module: None,
             bytecode_module_idx: None,
             parent: None,
