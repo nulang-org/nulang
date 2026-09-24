@@ -10,7 +10,7 @@ already implemented by Nulang's `src/benchmarks.rs` harness:
 | thread_ring | 10 actors, H=20,000 token hops | 20,000 |
 | fork_join | 8 workers, 50,000 tasks | 100,000 |
 
-The companion implementations use only each platform's standard message
+The default companion implementations use each platform's standard message
 primitive:
 
 - **Nulang** — real `Runtime` + bytecode actors from `src/benchmarks.rs`
@@ -18,12 +18,27 @@ primitive:
 - **Go** — channels + goroutines
 - **Erlang/BEAM** — native processes + mailboxes
 
+Two actor-runtime fixtures are available as explicit opt-ins:
+
+- **Pony** — native Pony actors and behaviors, built with `ponyc`
+- **CAF** — C++ Actor Framework event-based actors, built with CMake against
+  an installed `CAF::core`
+
+They are intentionally not part of the default runtime set so contributors and
+CI do not need Pony or CAF installed unless they are running those comparisons.
+
 Run all installed runtimes on the same host:
 
 ```bash
 python3 scripts/cross_runtime_bench.py --runs 5 --warmup 1 \
   --cpu-mode single \
   --output /tmp/nulang-cross-runtime.json
+
+# Add actor-runtime baselines when their toolchains are installed.
+python3 scripts/cross_runtime_bench.py --runs 5 --warmup 1 \
+  --runtimes nulang,erlang,pony,caf \
+  --cpu-mode single \
+  --output /tmp/nulang-actor-runtimes.json
 ```
 
 The runner compiles each external fixture once, performs warm-up runs, then
@@ -53,8 +68,10 @@ another environment where the selected affinity is recorded and enforced.
 ## Interpretation constraints
 
 These numbers are **baselines, not a universal language or framework
-ranking**. The implementations intentionally use standard runtime primitives,
-not third-party actor frameworks, and their schedulers differ materially.
+ranking**. The default Rust/Go/Erlang implementations use standard runtime
+primitives; the optional Pony and CAF fixtures intentionally exercise their
+native actor runtimes. Their schedulers and mailbox implementations differ
+materially.
 
 In particular:
 
@@ -63,9 +80,10 @@ In particular:
 - Nulang's existing benchmark sends the counting/fork-join input burst and
   then drains the runtime scheduler; Rust/Go/Erlang actors may consume while
   the producer is still sending.
-- Rust's baseline uses native threads, Go uses goroutines, and Erlang uses
-  BEAM processes. CPU affinity makes the available compute budget comparable;
-  it does not make their scheduling semantics identical.
+- Rust's baseline uses native threads, Go uses goroutines, Erlang uses BEAM
+  processes, Pony uses actors/behaviors, and CAF uses event-based actors. CPU
+  affinity makes the available compute budget comparable; it does not make
+  their scheduling semantics identical.
 - `thread_ring` reports the same logical hop count as Nulang's existing
   harness rather than attempting to count setup/completion control messages.
 - Compilation, process startup, actor wiring, and fixture construction are
@@ -74,6 +92,6 @@ In particular:
   and repeat important results on controlled hardware before publishing them.
 - Do not turn one workload into a blanket "X is faster than Y" claim.
 
-For actor-framework comparisons (for example Pony, Ractor/Actix/Kameo,
-Proto.Actor, or Pekko/Akka), add separate pinned fixtures instead of silently
-changing these standard-runtime baselines.
+For additional actor-framework comparisons (for example Ractor, Actix/Kameo,
+Proto.Actor, or Pekko/Akka), add separate opt-in pinned fixtures instead of
+silently changing the default baseline set.
