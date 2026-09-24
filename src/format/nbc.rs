@@ -250,6 +250,24 @@ mod tests {
     }
 
     #[test]
+    fn test_nbc_drops_compiler_only_jit_type_seeds() {
+        use crate::type_metadata::{KnownType, TypeMetadata};
+
+        let mut m = sample_module();
+        let mut seed = TypeMetadata::new();
+        seed.set_type(0, KnownType::Int);
+        m.jit_type_seeds.push((0, seed));
+        assert!(!m.jit_type_seeds.is_empty());
+
+        let bytes = m.to_nbc(None).expect("encode");
+        let art = CodeModule::from_nbc(&bytes).expect("decode");
+        assert!(
+            art.module.jit_type_seeds.is_empty(),
+            ".nbc artifacts must not carry compiler-only JIT type facts"
+        );
+    }
+
+    #[test]
     fn effect_site_metadata_validation_rejects_unsorted_duplicate_and_invalid_pcs() {
         let mut module = sample_module();
         module
