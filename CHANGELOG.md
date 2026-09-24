@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### MIR scalar-copy and constant-branch simplification — 2026-09-24
+- **Canonical MIR optimization now propagates definitely-scalar block-local copies and folds locally-proven Bool branches** (`src/mir_codegen.rs`). Heap-capable locals remain excluded to preserve ORCA/drop semantics. Unlike the older #784 experiment, this current-main replay deliberately does not prune unreachable blocks because semantic effect-site identities are captured before optimization and must remain stable until pruning-aware metadata is implemented.
+
+
 ### Preserve observable MIR panic through DCE — 2026-09-24
 - **MIR dead-store elimination now treats `RValue::Panic` as observable/divergent** (`src/mir_codegen.rs`), so an unused panic result cannot cause a reachable contract/precondition failure to be optimized away. A focused optimizer regression pins the behavior.
 
