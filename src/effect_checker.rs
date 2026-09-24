@@ -570,18 +570,11 @@ impl EffectChecker {
         let mut report: Vec<FunctionEffectReport> = flat
             .into_iter()
             .filter_map(|decl| match decl {
-                Decl::Function {
-                    name,
-                    effect,
-                    ..
-                } => self.fn_rows.get(name).cloned().map(|row| {
-                    let unique_effects: BTreeSet<Effect> =
-                        row.effects().iter().cloned().collect();
+                Decl::Function { name, effect, .. } => self.fn_rows.get(name).cloned().map(|row| {
+                    let unique_effects: BTreeSet<Effect> = row.effects().iter().cloned().collect();
                     let origins = unique_effects
                         .into_iter()
-                        .filter_map(|eff| {
-                            self.effect_origin(name, &eff, &declared_rows)
-                        })
+                        .filter_map(|eff| self.effect_origin(name, &eff, &declared_rows))
                         .collect();
                     FunctionEffectReport {
                         name: name.clone(),
@@ -3167,10 +3160,7 @@ fn contract_only() ! { Net } {
         );
         assert_eq!(declared_io.kind, EffectOriginKind::Body);
 
-        let contract = report
-            .iter()
-            .find(|r| r.name == "contract_only")
-            .unwrap();
+        let contract = report.iter().find(|r| r.name == "contract_only").unwrap();
         let net = contract
             .origins
             .iter()
