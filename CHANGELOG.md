@@ -1711,6 +1711,11 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Immutable ArtifactId retention and historical lookup — 2026-09-24
+- **Compiled artifacts can now be retained durably under `ArtifactId` with independent BLAKE3 byte verification** (Experimental, `src/artifact_store.rs`). The filesystem store writes one versioned manifest+artifact record, fsyncs it, and publishes it with no-clobber hard-link semantics so concurrent writers cannot overwrite historical code.
+- **Historical lookup fails closed on corruption or codegen nondeterminism.** Every load re-validates the versioned `ArtifactIdentityManifest`, requires its embedded `ArtifactId` to match the requested key, and re-hashes the retained artifact bytes. Reusing one `ArtifactId` with different emitted bytes is rejected as an artifact collision rather than silently replacing the original executable.
+- This establishes the retention primitive required by durable semantic pinning. Snapshot-level `ArtifactId` pinning and automatic recovery-module hydration remain separate follow-up work under #333.
+
 ### RFC 0020 Behavior Manifest durability admission subset — 2026-09-23
 - **Package builds now emit `<package>.behavior.json` beside `.nbc` artifacts** (`src/behavior_manifest.rs`, `src/main.rs`, `src/package/commands.rs`). The experimental `nulang.behavior/v0alpha1` sidecar binds package/language metadata to compiler artifact identity and exposes durable actor persistence class, schema version, canonical state-schema semantic identity, and migration topology.
 - **Manifest parsing fails closed** on unknown schema versions/artifact kinds, malformed content identities or digests, duplicate actors, invalid/incomplete migration chains, and artifact identity tampering. The sidecar includes a BLAKE3 digest of the exact emitted `.nbc` bytes and can verify the executable/manifest pairing; canonical ordering gives deterministic JSON and a separate domain-separated manifest digest.
