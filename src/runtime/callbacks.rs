@@ -2341,6 +2341,19 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                     }
                 };
 
+                // Frozen NBC v1 strips compiler semantic sidecars. Moving an
+                // identified durable actor over that transport would either
+                // lose provenance or force the receiver to trust a
+                // self-asserted snapshot ID. Refuse the move until migration
+                // carries a verifiable artifact manifest.
+                if actor.definition_semantic_id.is_some() {
+                    tracing::warn!(
+                        actor_id,
+                        "nulang-migrate: identified actor cannot use legacy NBC v1 migration transport"
+                    );
+                    return;
+                }
+
                 // Build the durable-state snapshot.
                 let mut state = std::collections::HashMap::new();
                 for (name, value) in &actor.state_data {
@@ -2402,6 +2415,7 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                 let snapshot = crate::runtime::persistence::ActorSnapshot {
                     actor_id,
                     sequence: actor.sequence,
+                    semantic_id: None,
                     state,
                     waiting_signal: actor.waiting_signal.clone(),
                     crdt_snapshot,
