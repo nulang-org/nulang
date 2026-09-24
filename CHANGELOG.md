@@ -51,6 +51,9 @@ version + migration.*
 
 ## Stable tier
 
+### Lazy trace-context creation on the actor hot path — 2026-09-24
+- **Untraced actor messages no longer synthesize and serialize fresh W3C trace roots when TRACE-level collection is disabled** (`src/runtime/trace.rs`, `src/runtime/mod.rs`). Existing valid incoming traceparents are still continued unconditionally, while fresh roots are created only when local TRACE collection is active. This removes trace-id generation and formatting from the default untraced message path without changing distributed causal propagation.
+
 ### Stateful blocking foreign executor — 2026-09-23
 - **Foreign backends can now be owned behind a dedicated bounded worker and invoked with fully-owned request envelopes** (`src/runtime/foreign_executor.rs`), keeping blocking backend execution off cooperative actor scheduler threads while preserving mutable interpreter/module state across calls.
 - **The scheduler-facing path remains non-blocking and never acquires the backend mutex**; one worker per backend instance serializes access deliberately. This slice still does not change VM suspension/resumption or route source-level Python/FFI effects through the executor.
