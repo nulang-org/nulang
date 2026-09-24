@@ -584,10 +584,8 @@ mod authority_tests {
             &mut self,
             transition: crate::runtime::persistence::DurableTransition,
         ) -> std::io::Result<crate::runtime::persistence::DurableCommit> {
-            self.last_actor_id.store(
-                transition.actor_id,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            self.last_actor_id
+                .store(transition.actor_id, std::sync::atomic::Ordering::Relaxed);
             if self.fail_snapshot && transition.snapshot.is_some() {
                 return Err(std::io::Error::other("injected snapshot failure"));
             }
