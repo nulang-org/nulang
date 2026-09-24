@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Owned Python foreign execution — 2026-09-23
+- **The Python foreign backend now opts into the worker-safe `ForeignInterop::call_owned` contract**, consuming only owned semantic values and opaque registry handles while preserving the existing synchronous VM-`Value` compatibility path.
+- **Owned Python arguments/results convert through the registry without VM, actor-heap, or module string-pool access**; unsupported custom backends continue to fail closed unless they explicitly implement the owned-call contract.
+
 ### Owned foreign-call worker boundary — 2026-09-23
 - **Foreign calls can now be marshalled into worker-safe owned envelopes before leaving the actor scheduler thread** (`src/runtime/foreign_call.rs`). Primitive values cross by semantic value, strings cross by resolved UTF-8 content, and supported backend objects cross only as opaque backend-tagged ids.
 - **Actor references, heap pointers, closures, unresolved string ids, and other runtime-local VM representations fail closed** instead of crossing worker threads. The request/result types are statically asserted `Send + 'static`; this slice does not yet execute a backend or suspend/resume actors.
