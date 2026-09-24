@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const INLINE_PAYLOAD_VALUES: usize = 4;
+const INDEXED_RECEIVE_MIN_ARMS: usize = 8;
 
 /// Actor-message payload optimized for the common small-message case.
 ///
@@ -289,6 +290,11 @@ pub struct Mailbox {
     /// means the previous candidate's guard rejected it; only this active
     /// candidate may be consumed by `commit_receive_match`.
     active_match: Option<(MatchLane, usize, Arc<Vec<Value>>)>,
+    /// Small-arm selective receives scan each lane once across guard retries.
+    /// Large-arm receives keep the behavior index path below.
+    receive_scan_system: usize,
+    receive_scan_local: usize,
+    receive_scan_normal: usize,
 }
 
 impl Mailbox {
@@ -308,6 +314,9 @@ impl Mailbox {
             skip_buffer: VecDeque::new(),
             receive_indexes: None,
             active_match: None,
+            receive_scan_system: 0,
+            receive_scan_local: 0,
+            receive_scan_normal: 0,
         }
     }
 
@@ -390,6 +399,7 @@ impl Mailbox {
         if result.is_some() {
             self.active_match = None;
             self.invalidate_receive_indexes();
+            self.reset_scan_cursors();
             self.release_slot();
         }
         result
@@ -435,6 +445,50 @@ impl Mailbox {
         }
     }
 
+    fn stage_arrivals_linear(&mut self) {
+        // Linear-mode appends are not reflected in a previously-built index.
+        // Mark it invalid now so a later indexed receive rebuilds from staged
+        // buffers before consulting positional metadata.
+        self.invalidate_receive_indexes();
+
+        while let Some(msg) = self.local_queue.pop_front() {
+            if msg.priority == MessagePriority::System {
+                self.system_skip_buffer.push_back((msg, false));
+            } else {
+                self.local_skip_buffer.push_back((msg, false));
+            }
+        }
+        while let Some(msg) = self.system_queue.pop() {
+            self.system_skip_buffer.push_back((msg, false));
+        }
+        while let Some(msg) = self.normal_queue.pop() {
+            self.skip_buffer.push_back((msg, false));
+        }
+    }
+
+    fn scan_linear(
+        buffer: &mut VecDeque<(Message, bool)>,
+        behavior_ids: &[u16],
+        cursor: &mut usize,
+    ) -> Option<(usize, usize, Arc<Vec<Value>>)> {
+        while *cursor < buffer.len() {
+            let idx = *cursor;
+            *cursor += 1;
+            let (message, tried) = buffer.get_mut(idx)?;
+            if *tried {
+                continue;
+            }
+            if let Some(arm_pos) = behavior_ids
+                .iter()
+                .position(|&behavior_id| behavior_id == message.behavior_id)
+            {
+                *tried = true;
+                return Some((arm_pos, idx, message.payload.to_shared()));
+            }
+        }
+        None
+    }
+
     fn scan_indexed(
         buffer: &mut VecDeque<(Message, bool)>,
         index: &mut ReceiveLaneIndex,
@@ -452,9 +506,40 @@ impl Mailbox {
     /// guard actually succeeded.
     pub fn receive_match(&mut self, behavior_ids: &[u16]) -> Option<(usize, Arc<Vec<Value>>)> {
         // If the VM asks for another candidate before commit, the previous
-        // candidate was rejected by its pattern/guard. It remains `tried` for
+        // candidate was rejected by its pattern/guard. It remains tried for
         // this receive expression but is no longer the commit target.
         self.active_match = None;
+
+        if behavior_ids.len() < INDEXED_RECEIVE_MIN_ARMS {
+            self.stage_arrivals_linear();
+
+            if let Some((pos, idx, payload)) = Self::scan_linear(
+                &mut self.system_skip_buffer,
+                behavior_ids,
+                &mut self.receive_scan_system,
+            ) {
+                self.active_match = Some((MatchLane::System, idx, Arc::clone(&payload)));
+                return Some((pos, payload));
+            }
+            if let Some((pos, idx, payload)) = Self::scan_linear(
+                &mut self.local_skip_buffer,
+                behavior_ids,
+                &mut self.receive_scan_local,
+            ) {
+                self.active_match = Some((MatchLane::Local, idx, Arc::clone(&payload)));
+                return Some((pos, payload));
+            }
+            if let Some((pos, idx, payload)) = Self::scan_linear(
+                &mut self.skip_buffer,
+                behavior_ids,
+                &mut self.receive_scan_normal,
+            ) {
+                self.active_match = Some((MatchLane::Normal, idx, Arc::clone(&payload)));
+                return Some((pos, payload));
+            }
+            return None;
+        }
+
         self.ensure_receive_indexes();
         self.stage_arrivals();
 
@@ -539,6 +624,13 @@ impl Mailbox {
         self.capacity
     }
 
+    #[inline]
+    fn reset_scan_cursors(&mut self) {
+        self.receive_scan_system = 0;
+        self.receive_scan_local = 0;
+        self.receive_scan_normal = 0;
+    }
+
     fn clear_tried_flags(&mut self) {
         for (_, tried) in self.system_skip_buffer.iter_mut() {
             *tried = false;
@@ -554,6 +646,7 @@ impl Mailbox {
             indexes.local.reset_cursors();
             indexes.normal.reset_cursors();
         }
+        self.reset_scan_cursors();
     }
 
     fn invalidate_receive_indexes(&mut self) {
