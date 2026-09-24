@@ -33,18 +33,25 @@ versions, and the CPU topology used for measurement.
 
 ## CPU-topology rule
 
-`--cpu-mode single` is the default and is the mode intended for cross-runtime
-comparison. On Linux it constrains every measured runtime process, including
-all of its child threads/schedulers, to the same one logical CPU chosen from
-the benchmark process's allowed CPU set. Nulang's current Savina harness uses
-one runtime shard, so this prevents `fork_join` from silently comparing
-single-shard Nulang with multi-core Rust, Go, or BEAM execution.
+`--cpu-mode single` is the default and remains the one-core comparison mode.
+On Linux it constrains every measured runtime process, including all child
+threads/schedulers, to the same logical CPU chosen from the benchmark process's
+allowed CPU set. In this mode Nulang fork-join is forced to one shard.
 
-`--cpu-mode host` leaves CPU affinity unconstrained. It is useful for
-diagnostics, but **host-mode fork-join results are not a fair multicore Nulang
-comparison** because this harness still measures Nulang with one shard. A
-separate sharded Nulang fixture is required before host-wide scaling numbers
-should be compared or published.
+`--cpu-mode host` leaves CPU affinity unconstrained. Host mode still defaults
+to one Nulang shard, so it remains diagnostic unless the sharded fork-join
+fixture is selected explicitly. For example:
+
+```bash
+python3 scripts/cross_runtime_bench.py --runs 5 --warmup 1 \
+  --cpu-mode host --nulang-shards 4 \
+  --output /tmp/nulang-cross-runtime-host.json
+```
+
+`--nulang-shards` accepts 1–8 and affects **only Nulang fork-join**. The other
+Nulang workloads remain single-shard. The report records both
+`nulang_fork_join_shards` and `nulang_non_fork_join_shards`, and the harness
+rejects multi-shard Nulang when `--cpu-mode single` is selected.
 
 On platforms without `sched_getaffinity`/`sched_setaffinity`, use
 `--cpu-mode host`; single-core comparative runs should be produced on Linux or
@@ -59,10 +66,16 @@ not third-party actor frameworks, and their schedulers differ materially.
 In particular:
 
 - In `single` mode every measured runtime is constrained to the same one
-  logical CPU, but their scheduler designs still differ.
-- Nulang's existing benchmark sends the counting/fork-join input burst and
-  then drains the runtime scheduler; Rust/Go/Erlang actors may consume while
-  the producer is still sending.
+  logical CPU, but their scheduler designs still differ. In host mode, choose
+  `--nulang-shards` intentionally for the machine being measured; the harness
+  does not infer a supposedly "fair" shard count from host CPU count.
+- Nulang counting and single-shard fork-join send their input burst before
+  draining the runtime scheduler; Rust/Go/Erlang actors may consume while the
+  producer is still sending. The opt-in sharded Nulang fork-join instead keeps
+  a bounded 512-task in-flight window so real shard threads can drain the
+  bounded cross-shard transport concurrently. The logical workload remains
+  50,000 tasks plus 50,000 acknowledgements, but producer scheduling semantics
+  are therefore not identical.
 - Rust's baseline uses native threads, Go uses goroutines, and Erlang uses
   BEAM processes. CPU affinity makes the available compute budget comparable;
   it does not make their scheduling semantics identical.
