@@ -1662,15 +1662,21 @@ impl Runtime {
                             actor.set_state_field("step_index", Value::int(n + 1));
                         }
                     }
-                    let seq = self.next_sequence(actor_id);
-                    let _ = self.persistence.append_workflow_event(
+                    let sequence = self.next_sequence(actor_id);
+                    if let Err(error) = crate::runtime::workflow::commit_workflow_event(
+                        self,
                         actor_id,
                         WorkflowEvent::StepCompleted {
-                            sequence: seq,
+                            sequence,
                             step_name,
                         },
-                    );
-                    self.checkpoint_actor(actor_id);
+                    ) {
+                        tracing::error!(
+                            actor_id,
+                            %error,
+                            "nulang-workflow: failed to commit signal-resumed StepCompleted transition"
+                        );
+                    }
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
@@ -2005,7 +2011,7 @@ impl Runtime {
             .unwrap_or(false);
         if is_native {
             self.current_actor = Some(actor_id);
-            if self.actor_is_persistent(actor_id) {
+            if self.actor_is_persistent(actor_id) && !self.actor_is_workflow(actor_id) {
                 let seq = self.next_sequence(actor_id);
                 let payload = args.iter().map(PersistedValue::from_value).collect();
                 let _ = self.persistence.append_journal(
@@ -3879,8 +3885,9 @@ impl Runtime {
 
             let mut processed = false;
             if self.has_native_handler(actor_id, behavior_idx) {
-                // Journal the message before handling so recovery can replay it.
-                if self.actor_is_persistent(actor_id) {
+                // Workflow commands join the atomic transition path below;
+                // legacy message journaling remains for non-workflow actors.
+                if self.actor_is_persistent(actor_id) && !self.actor_is_workflow(actor_id) {
                     let seq = self.next_sequence(actor_id);
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
                     let _ = self.persistence.append_journal(
@@ -3893,13 +3900,14 @@ impl Runtime {
                     );
                 }
                 processed = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload);
-                if processed {
+                if processed && !self.actor_is_workflow(actor_id) {
                     self.checkpoint_actor(actor_id);
                 }
             }
             if !processed && self.has_bytecode_handler(actor_id, behavior_idx) {
-                // Journal before executing bytecode as well.
-                if self.actor_is_persistent(actor_id) {
+                // Workflow commands are committed with their resulting state
+                // and workflow marker; do not create a legacy journal gap.
+                if self.actor_is_persistent(actor_id) && !self.actor_is_workflow(actor_id) {
                     let seq = self.next_sequence(actor_id);
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
                     let _ = self.persistence.append_journal(
@@ -3921,7 +3929,9 @@ impl Runtime {
                 self.suspend_enabled = saved_suspend;
                 match result {
                     Ok(_) => {
-                        self.checkpoint_actor(actor_id);
+                        if !self.actor_is_workflow(actor_id) {
+                            self.checkpoint_actor(actor_id);
+                        }
                         processed = true;
                     }
                     Err(crate::types::NuError::Suspended(_)) => {
@@ -3935,24 +3945,30 @@ impl Runtime {
                         processed = false;
                     }
                     Err(e) => {
-                        self.checkpoint_actor(actor_id);
-                        // A workflow step failed: record the failure (durable
-                        // StepFailed event — SPEC2 §10 known-issue #5: step
-                        // failures were silent, exit 0, no diagnostic), then
-                        // run saga compensations for previously completed
-                        // steps in reverse order.
+                        // A workflow failure marker and the state visible at
+                        // that failure boundary commit together. Other actors
+                        // retain their legacy standalone checkpoint path.
                         if self.actor_is_workflow(actor_id) {
-                            let seq = self.next_sequence(actor_id);
+                            let sequence = self.next_sequence(actor_id);
                             let step_name = self.step_name_for(actor_id, behavior_idx);
-                            let _ = self.persistence.append_workflow_event(
+                            if let Err(error) = crate::runtime::workflow::commit_workflow_event(
+                                self,
                                 actor_id,
                                 WorkflowEvent::StepFailed {
-                                    sequence: seq,
+                                    sequence,
                                     step_name,
                                     error: format!("{}", e),
                                 },
-                            );
+                            ) {
+                                tracing::error!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-workflow: failed to commit StepFailed transition"
+                                );
+                            }
                             self.run_saga_compensation(actor_id, behavior_idx);
+                        } else {
+                            self.checkpoint_actor(actor_id);
                         }
                         processed = false;
                     }
@@ -3962,18 +3978,10 @@ impl Runtime {
                 && self.actor_is_workflow(actor_id)
                 && !self.is_internal_behavior(actor_id, behavior_idx)
             {
-                let seq = self.next_sequence(actor_id);
-                let step_name = self.step_name_for(actor_id, behavior_idx);
-                let _ = self.persistence.append_workflow_event(
-                    actor_id,
-                    WorkflowEvent::StepCompleted {
-                        sequence: seq,
-                        step_name,
-                    },
-                );
                 // Synthetic parallel steps do not increment step_index in their
-                // bytecode (so signal-waiting branches do not double-increment);
-                // advance it here when the step completes.
+                // bytecode (so signal-waiting branches do not double-increment).
+                // Mutate it before committing so the snapshot and completion
+                // marker describe the same logical turn.
                 if self.is_parallel_step(actor_id, behavior_idx) {
                     if let Some(actor) = self.actors.get_mut(&actor_id) {
                         if let Some(n) =
@@ -3983,7 +3991,22 @@ impl Runtime {
                         }
                     }
                 }
-                self.checkpoint_actor(actor_id);
+                let sequence = self.next_sequence(actor_id);
+                let step_name = self.step_name_for(actor_id, behavior_idx);
+                if let Err(error) = crate::runtime::workflow::commit_workflow_event(
+                    self,
+                    actor_id,
+                    WorkflowEvent::StepCompleted {
+                        sequence,
+                        step_name,
+                    },
+                ) {
+                    tracing::error!(
+                        actor_id,
+                        %error,
+                        "nulang-workflow: failed to commit StepCompleted transition"
+                    );
+                }
             }
             let actor = match self.actors.get_mut(&actor_id) {
                 Some(a) => a,
@@ -4573,15 +4596,21 @@ impl Runtime {
                                 actor.set_state_field("step_index", Value::int(n + 1));
                             }
                         }
-                        let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        let sequence = (*self_ptr).next_sequence(actor_id);
+                        if let Err(error) = crate::runtime::workflow::commit_workflow_event(
+                            &mut *self_ptr,
                             actor_id,
                             WorkflowEvent::StepCompleted {
-                                sequence: seq,
+                                sequence,
                                 step_name: suspended.step_name,
                             },
-                        );
-                        (*self_ptr).checkpoint_actor(actor_id);
+                        ) {
+                            tracing::error!(
+                                actor_id,
+                                %error,
+                                "nulang-workflow: failed to commit receive-resumed StepCompleted transition"
+                            );
+                        }
                     }
                 }
                 Err(crate::types::NuError::Suspended(VmSuspension::ReceiveWait)) => {
