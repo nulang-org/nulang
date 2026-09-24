@@ -57,6 +57,12 @@ version + migration.*
 ### Transitive effect provenance reporting — 2026-09-24
 - **`nulang effects [--json] <file>` now reports each module-level function's transitive effect row with deterministic shortest provenance paths** (`src/effect_checker.rs`, `src/main.rs`). The checker reuses ordinary effect inference and shadowing semantics, distinguishes body-derived effects from declaration-only contracts, and keeps output name-sorted for stable tooling.
 
+### Finite-domain match coverage diagnostics — 2026-09-24
+- **Closed variant and `Bool` matches now receive conservative semantic coverage diagnostics** (`src/pattern_coverage.rs`, `src/typechecker.rs`). `W0201` reports provably missing constructor/value witnesses and `W0202` reports provably redundant arms; guarded arms never establish total coverage.
+- **Default source validity remains unchanged.** Unsupported or infinite domains keep the existing runtime non-exhaustive fallback, while `--deny-warnings` provides opt-in strict rejection.
+- **CLI, JSON check mode, and LSP consume the same typechecker-owned warning stream**, preserving stable codes and source spans rather than reimplementing coverage per frontend.
+- **Safety/specification documentation now matches the implementation** for match coverage, dynamic effect-handler resolution, mailbox backpressure, ORCA shard isolation, workflow compensation, and sendable reference capabilities.
+
 ### Consuming local-send ownership proof — 2026-09-24
 - **MIR now identifies fresh, single-definition heap-owning values whose sole use is a same-node actor send**, establishing a conservative proof surface for a later ORCA ownership handoff.
 - The analysis is intentionally metadata-only in this slice: it changes no bytecode, mailbox representation, reference count, or runtime behavior. Parameters, captures, handler bindings, multi-use values, and remote sends remain ineligible.
