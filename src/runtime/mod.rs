@@ -6491,12 +6491,10 @@ impl Runtime {
         // actors must remain local until a versioned transport can prove the
         // executable definition that will consume their durable history.
         if spec.restart_policy == RestartPolicy::RespawnOnNodeLoss {
-            let shadow_eligibility = self.actors.get(&child_id).map(|actor| {
-                (
-                    actor.persistent,
-                    actor.definition_semantic_id.is_none(),
-                )
-            });
+            let shadow_eligibility = self
+                .actors
+                .get(&child_id)
+                .map(|actor| (actor.persistent, actor.definition_semantic_id.is_none()));
 
             match shadow_eligibility {
                 Some((true, true)) => {
