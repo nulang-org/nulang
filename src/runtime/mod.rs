@@ -394,6 +394,10 @@ pub struct Runtime {
 
     // Persistence engine (v0.7)
     pub persistence: Box<dyn PersistenceStore>,
+    /// RFC 0022 Phase-B staging: one in-flight atomic durable transition per
+    /// workflow actor. Entries exist only while a workflow turn/resume is
+    /// executing and are removed on commit or rollback.
+    pub(crate) workflow_transitions: HashMap<u64, workflow::WorkflowTransitionStage>,
     // Immutable shared object store for large `val` buffers.
     pub object_store: ObjectStore,
     // Virtual actor (grain) type registry and resident mapping.
@@ -620,6 +624,7 @@ impl Runtime {
             process_groups: ProcessGroups::new(),
             pending_fetched_messages: HashMap::new(),
             persistence: Box::new(MemoryStore::new()),
+            workflow_transitions: HashMap::new(),
             object_store: ObjectStore::new(),
             grain_registry: GrainRegistry::new(),
             grain_residents: HashMap::new(),
@@ -3877,10 +3882,41 @@ impl Runtime {
                 }
             }
 
+            let workflow_turn =
+                self.actor_is_workflow(actor_id) && self.actor_is_persistent(actor_id);
+            if workflow_turn {
+                let command_payload = self
+                    .actors
+                    .get(&actor_id)
+                    .map(|actor| {
+                        let module = actor.bytecode_module.as_ref();
+                        msg.payload
+                            .iter()
+                            .map(|value| PersistedValue::from_value_resolved(value, module))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if let Err(error) = workflow::begin_workflow_transition(
+                    self,
+                    actor_id,
+                    Some((msg.behavior_id, command_payload)),
+                ) {
+                    tracing::warn!(
+                        actor_id,
+                        %error,
+                        "nulang-persist: failed to begin atomic workflow turn"
+                    );
+                    self.current_actor = None;
+                    return;
+                }
+            }
+
             let mut processed = false;
             if self.has_native_handler(actor_id, behavior_idx) {
-                // Journal the message before handling so recovery can replay it.
-                if self.actor_is_persistent(actor_id) {
+                // Non-workflow persistent actors retain the legacy journal +
+                // checkpoint path. Workflow commands are staged above and are
+                // committed with their state/events in one DurableTransition.
+                if self.actor_is_persistent(actor_id) && !workflow_turn {
                     let seq = self.next_sequence(actor_id);
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
                     let _ = self.persistence.append_journal(
@@ -3893,13 +3929,12 @@ impl Runtime {
                     );
                 }
                 processed = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload);
-                if processed {
+                if processed && !workflow_turn {
                     self.checkpoint_actor(actor_id);
                 }
             }
             if !processed && self.has_bytecode_handler(actor_id, behavior_idx) {
-                // Journal before executing bytecode as well.
-                if self.actor_is_persistent(actor_id) {
+                if self.actor_is_persistent(actor_id) && !workflow_turn {
                     let seq = self.next_sequence(actor_id);
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
                     let _ = self.persistence.append_journal(
@@ -3921,69 +3956,108 @@ impl Runtime {
                 self.suspend_enabled = saved_suspend;
                 match result {
                     Ok(_) => {
-                        self.checkpoint_actor(actor_id);
+                        if !workflow_turn {
+                            self.checkpoint_actor(actor_id);
+                        }
                         processed = true;
                     }
                     Err(crate::types::NuError::Suspended(_)) => {
-                        // The step yielded waiting for a signal or a
-                        // background LLM call. Do not mark it completed, do
-                        // not run compensations, and do not checkpoint the
-                        // partially-mutated durable state: persist only the
-                        // suspension marker so recovery can re-drive the
-                        // step from its last pre-suspend checkpoint.
-                        self.persist_suspension_marker(actor_id);
+                        if workflow_turn {
+                            // Commit command + staged timers/signals/events,
+                            // but retain the pre-step durable state so restart
+                            // deterministically re-drives this suspended step.
+                            if let Err(error) =
+                                workflow::commit_workflow_transition(self, actor_id, true)
+                            {
+                                tracing::warn!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-persist: suspended workflow transition rejected"
+                                );
+                                workflow::rollback_workflow_transition(self, actor_id);
+                            }
+                        } else {
+                            self.persist_suspension_marker(actor_id);
+                        }
                         processed = false;
                     }
                     Err(e) => {
-                        self.checkpoint_actor(actor_id);
-                        // A workflow step failed: record the failure (durable
-                        // StepFailed event — SPEC2 §10 known-issue #5: step
-                        // failures were silent, exit 0, no diagnostic), then
-                        // run saga compensations for previously completed
-                        // steps in reverse order.
-                        if self.actor_is_workflow(actor_id) {
-                            let seq = self.next_sequence(actor_id);
+                        if workflow_turn {
                             let step_name = self.step_name_for(actor_id, behavior_idx);
-                            let _ = self.persistence.append_workflow_event(
+                            if let Err(error) = workflow::stage_step_failed(
+                                self,
                                 actor_id,
-                                WorkflowEvent::StepFailed {
-                                    sequence: seq,
-                                    step_name,
-                                    error: format!("{}", e),
-                                },
-                            );
-                            self.run_saga_compensation(actor_id, behavior_idx);
+                                step_name,
+                                format!("{}", e),
+                            ) {
+                                tracing::warn!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-persist: failed to stage workflow failure"
+                                );
+                                workflow::rollback_workflow_transition(self, actor_id);
+                            } else {
+                                // Compensation events produced here join the
+                                // same failed-step transition.
+                                self.run_saga_compensation(actor_id, behavior_idx);
+                                if let Err(error) =
+                                    workflow::commit_workflow_transition(self, actor_id, false)
+                                {
+                                    tracing::warn!(
+                                        actor_id,
+                                        %error,
+                                        "nulang-persist: failed workflow transition rejected"
+                                    );
+                                    workflow::rollback_workflow_transition(self, actor_id);
+                                }
+                            }
+                        } else {
+                            self.checkpoint_actor(actor_id);
                         }
                         processed = false;
                     }
                 }
             }
-            if processed
-                && self.actor_is_workflow(actor_id)
-                && !self.is_internal_behavior(actor_id, behavior_idx)
-            {
-                let seq = self.next_sequence(actor_id);
-                let step_name = self.step_name_for(actor_id, behavior_idx);
-                let _ = self.persistence.append_workflow_event(
-                    actor_id,
-                    WorkflowEvent::StepCompleted {
-                        sequence: seq,
-                        step_name,
-                    },
-                );
-                // Synthetic parallel steps do not increment step_index in their
-                // bytecode (so signal-waiting branches do not double-increment);
-                // advance it here when the step completes.
-                if self.is_parallel_step(actor_id, behavior_idx) {
-                    if let Some(actor) = self.actors.get_mut(&actor_id) {
-                        if let Some(n) =
-                            actor.get_state_field("step_index").and_then(|v| v.as_int())
-                        {
-                            actor.set_state_field("step_index", Value::int(n + 1));
+            if processed && workflow_turn {
+                if !self.is_internal_behavior(actor_id, behavior_idx) {
+                    // Synthetic parallel steps do not increment step_index in
+                    // bytecode; include that mutation in the same commit as
+                    // StepCompleted.
+                    if self.is_parallel_step(actor_id, behavior_idx) {
+                        if let Some(actor) = self.actors.get_mut(&actor_id) {
+                            if let Some(n) =
+                                actor.get_state_field("step_index").and_then(|v| v.as_int())
+                            {
+                                actor.set_state_field("step_index", Value::int(n + 1));
+                            }
                         }
                     }
+                    let step_name = self.step_name_for(actor_id, behavior_idx);
+                    if let Err(error) =
+                        workflow::stage_step_completed(self, actor_id, step_name)
+                    {
+                        tracing::warn!(
+                            actor_id,
+                            %error,
+                            "nulang-persist: failed to stage workflow completion"
+                        );
+                        workflow::rollback_workflow_transition(self, actor_id);
+                        processed = false;
+                    }
                 }
-                self.checkpoint_actor(actor_id);
+                if processed {
+                    if let Err(error) =
+                        workflow::commit_workflow_transition(self, actor_id, false)
+                    {
+                        tracing::warn!(
+                            actor_id,
+                            %error,
+                            "nulang-persist: workflow turn commit rejected"
+                        );
+                        workflow::rollback_workflow_transition(self, actor_id);
+                        processed = false;
+                    }
+                }
             }
             let actor = match self.actors.get_mut(&actor_id) {
                 Some(a) => a,
