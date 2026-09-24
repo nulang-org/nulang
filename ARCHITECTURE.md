@@ -214,11 +214,12 @@ Pony-style lattice (`iso`, `lineariso`, `trn`, `ref`, `val`, `box`, `tag`;
 subtyping computed via `join`). `LinearIso` adds exactly-once linear
 consumption tracking. Capabilities are compile-time only — see §2.4.
 
-**What does not exist:** no type classes or constrained types
-(`fn f[T: Serializable]` is not valid Nulang), no `protocol` construct, and
-no exhaustiveness checking for `match`. Type inference deliberately does not
-cross actor boundaries — behavior signatures are explicit annotations — so
-actors remain separately checkable units.
+**Current static-analysis boundary:** finite-domain `match` coverage is
+conservative rather than a complete pattern-matrix proof, and dynamic/opaque
+actor references remain permissive where no nominal protocol is statically
+known. Type inference deliberately does not infer behavior signatures across
+actor boundaries; declared/derived protocol metadata supplies those
+constraints when the target identity is known.
 
 ### 2.3 Effects: Static Rows, Runtime Handler Stack
 
