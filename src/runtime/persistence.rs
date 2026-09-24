@@ -1944,7 +1944,6 @@ impl PersistenceStore for LibsqlStore {
             Some(ActorSnapshot {
                 actor_id,
                 sequence: sequence as u64,
-                semantic_id: None,
                 semantic_id,
                 state,
                 waiting_signal,
@@ -2705,7 +2704,6 @@ impl PersistenceStore for PostgresStore {
         Some(ActorSnapshot {
             actor_id,
             sequence: sequence as u64,
-                semantic_id: None,
             semantic_id,
             state,
             waiting_signal,
@@ -3130,7 +3128,7 @@ mod json_file_store_tests {
                 .save_snapshot(ActorSnapshot {
                     actor_id: 1,
                     sequence: 1,
-                semantic_id: None,
+                    semantic_id: None,
                     state,
                     waiting_signal: None,
                     crdt_snapshot: None,
@@ -3416,7 +3414,7 @@ mod rocksdb_store_tests {
                 .save_snapshot(ActorSnapshot {
                     actor_id: 1,
                     sequence: 1,
-                semantic_id: None,
+                    semantic_id: None,
                     state,
                     waiting_signal: None,
                     crdt_snapshot: None,
