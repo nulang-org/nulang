@@ -532,6 +532,7 @@ pub(crate) fn signal_workflow(
             %error,
             "nulang-workflow: refusing to deliver signal after durable commit failure"
         );
+        rt.discard_and_recover_failed_workflow(actor_id);
         return;
     }
 
