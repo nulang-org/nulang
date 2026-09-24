@@ -51,6 +51,10 @@ version + migration.*
 
 ## Stable tier
 
+### Site-aware effect callback provenance — 2026-09-24
+- **Bytecode `Perform` and `PerformAsync` dispatch now carry an optional backend-local artifact PC plus the validated compiler-owned semantic-site digest into the VM→runtime callback boundary.** The semantic digest is backend-independent and copyable; new callback methods default to the existing behavior so embedders remain source-compatible without reconstructing identity from names or PCs.
+- Focused regression tests prove synchronous built-in and generic async callbacks receive the exact semantic-site digest attached to the executing opcode. Native/JIT adapters can use the same context with no fake bytecode PC while they adopt equivalent provenance.
+
 ### Durable external-effect crash-window release gate — 2026-09-23
 - **The deterministic crash-window matrix now exercises the real `DurableEffectCoordinator` over `MemoryStore` using compiler-owned semantic effect-site IDs**, covering intent-only recovery, provider-commit/receipt-loss deduplication, completed-receipt replay, request/specification drift, stale-owner completion fencing, explicit at-least-once duplication, and backend-defined delegation.
 - **The public durability guarantee boundary is documented explicitly** (`docs/DURABILITY_GUARANTEES.md`): Nulang does not claim arbitrary exactly-once external execution; effectively-once behavior requires a real provider/backend deduplication contract and the same stable operation identity across recovery.

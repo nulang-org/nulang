@@ -127,6 +127,20 @@ pub enum PerformAsyncResult {
     Pending,
 }
 
+/// Exact compiler/runtime provenance for one effect dispatch.
+///
+/// `semantic_site_id` is compiler-owned and backend-independent; it is the
+/// only field suitable as input to durable logical identity. `artifact_pc`
+/// is optional backend-local diagnostic provenance (present for bytecode,
+/// absent for native backends). Legacy or hand-built artifacts may have no
+/// semantic site identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectInvocationContext {
+    pub module_idx: Option<usize>,
+    pub artifact_pc: Option<usize>,
+    pub semantic_site_id: Option<[u8; 32]>,
+}
+
 /// Callback interface that supplies real actor-runtime behavior for the VM's
 /// `Spawn`, `ArrAlloc`, `SConcat`, `SRead`, and `Drop` opcodes.
 pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
@@ -294,6 +308,24 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
         self.perform_builtin_effect(effect_name, op_name, &module.constants, regs)
     }
 
+    /// Handle an unbound built-in effect with exact executing-site provenance.
+    ///
+    /// The default preserves the existing callback contract. Runtime-backed
+    /// implementations that need durable/replay identity can override this
+    /// method and consume `context.site` without forcing legacy embedders to
+    /// understand compiler metadata.
+    fn perform_builtin_effect_at_site(
+        &mut self,
+        context: EffectInvocationContext,
+        effect_name: &str,
+        op_name: Option<&str>,
+        module: &CodeModule,
+        regs: &[Value],
+    ) -> Option<Value> {
+        let _ = context;
+        self.perform_builtin_effect_in_module(effect_name, op_name, module, regs)
+    }
+
     /// Check whether a workflow signal has been received.
     /// Default returns `Ready(unit)` so un-wired signal waits do not block.
     fn wait_signal(&mut self, _name: &str) -> SignalWaitResult {
@@ -347,6 +379,22 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
         _args: &[Value],
     ) -> PerformAsyncResult {
         PerformAsyncResult::Ready(None)
+    }
+
+    /// Execute a generic async effect with exact executing-site provenance.
+    ///
+    /// The default delegates to `perform_async`; bytecode runtimes can opt
+    /// into semantic identity now, while native/JIT adapters remain source-
+    /// compatible until they propagate equivalent site context.
+    fn perform_async_at_site(
+        &mut self,
+        context: EffectInvocationContext,
+        effect_op: &str,
+        constants: &[Constant],
+        args: &[Value],
+    ) -> PerformAsyncResult {
+        let _ = context;
+        self.perform_async(effect_op, constants, args)
     }
 
     /// Try to receive a message from the current actor's mailbox.
@@ -3997,8 +4045,14 @@ impl VM {
         // effect callback.  This is the common case for Actor.* builtins in
         // actor bytecode (no user handler, empty handler_stack).
         if self.handler_stack.is_empty() {
+            let performing_pc = self.frames[frame_idx].pc.saturating_sub(1);
             let result = match self.modules.get(module_idx) {
-                Some(module) => self.actor_callbacks.perform_builtin_effect_in_module(
+                Some(module) => self.actor_callbacks.perform_builtin_effect_at_site(
+                    EffectInvocationContext {
+                        module_idx: Some(module_idx),
+                        artifact_pc: Some(performing_pc),
+                        semantic_site_id: module.effect_site_at(performing_pc).map(|site| site.id),
+                    },
                     &effect_name,
                     op_name.as_deref(),
                     module,
@@ -4078,8 +4132,14 @@ impl VM {
             // workflow steps, IO.print in standalone scripts). Args
             // are in r0..rn; string-id args resolve against the
             // performing module's constant pool.
+            let performing_pc = self.frames[frame_idx].pc.saturating_sub(1);
             let result = match self.modules.get(module_idx) {
-                Some(module) => self.actor_callbacks.perform_builtin_effect_in_module(
+                Some(module) => self.actor_callbacks.perform_builtin_effect_at_site(
+                    EffectInvocationContext {
+                        module_idx: Some(module_idx),
+                        artifact_pc: Some(performing_pc),
+                        semantic_site_id: module.effect_site_at(performing_pc).map(|site| site.id),
+                    },
                     &effect_name,
                     op_name.as_deref(),
                     module,
@@ -4335,14 +4395,19 @@ impl VM {
         // Pass the full frame register slice and the module's constant pool
         // so the callback can resolve string-id arguments from registers.
         let args = &self.frames[frame_idx].regs;
-        let constants = self
-            .modules
-            .get(module_idx)
-            .map(|m| &m.constants[..])
-            .unwrap_or(&[]);
+        let performing_pc = self.frames[frame_idx].pc.saturating_sub(1);
+        let module = self.modules.get(module_idx);
+        let constants = module.map(|m| &m.constants[..]).unwrap_or(&[]);
+        let context = EffectInvocationContext {
+            module_idx: Some(module_idx),
+            artifact_pc: Some(performing_pc),
+            semantic_site_id: module
+                .and_then(|m| m.effect_site_at(performing_pc))
+                .map(|site| site.id),
+        };
         match self
             .actor_callbacks
-            .perform_async(&effect_op, constants, args)
+            .perform_async_at_site(context, &effect_op, constants, args)
         {
             PerformAsyncResult::Ready(result) => {
                 let value = match result {
