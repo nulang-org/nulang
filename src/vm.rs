@@ -8502,6 +8502,11 @@ mod vm_tests {
             .map(|j| j.compiled_count())
             .unwrap_or(0);
         assert!(compiled > 0, "loop body must have been JIT-compiled");
+        assert!(
+            vm.logical_reduction_count() >= 11_000,
+            "JIT regions must contribute backend-neutral logical bytecode work; got {}",
+            vm.logical_reduction_count()
+        );
     }
 
     // -- SCmpEq (string equality; emitted by variant-match lowering) --
