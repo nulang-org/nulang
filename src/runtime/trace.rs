@@ -231,8 +231,8 @@ mod tests {
     fn test_dispatch_continues_incoming_context_without_local_collection() {
         let incoming = TraceContext::root();
         let traceparent = incoming.to_traceparent();
-        let child =
-            TraceContext::for_dispatch(Some(&traceparent), false).expect("incoming trace continues");
+        let child = TraceContext::for_dispatch(Some(&traceparent), false)
+            .expect("incoming trace continues");
         assert_eq!(child.trace_id(), incoming.trace_id());
         assert_eq!(child.parent_span_id(), incoming.span_id());
         assert_ne!(child.span_id(), incoming.span_id());
