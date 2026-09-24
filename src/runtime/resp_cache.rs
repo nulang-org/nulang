@@ -6,8 +6,7 @@
 //! its Redis logical slot before invoking this module.
 
 use super::cache::{
-    redis_slot, CacheConfig, CacheIncrementError, CacheStore, CacheTtl, CacheValueView,
-    CacheWriteError,
+    redis_slot, CacheIncrementError, CacheStore, CacheTtl, CacheValueView, CacheWriteError,
 };
 use super::resp::{
     parse_command, write_array_len, write_bulk, write_bulk_integer, write_error, write_integer,
@@ -572,7 +571,7 @@ mod tests {
 
     #[test]
     fn set_and_mset_reject_capacity_without_partial_mutation() {
-        let mut store = CacheStore::with_config(CacheConfig {
+        let mut store = CacheStore::with_config(super::super::cache::CacheConfig {
             max_key_bytes: 8,
             max_value_bytes: 8,
             max_entries: 1,
