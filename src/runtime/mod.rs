@@ -2055,7 +2055,7 @@ impl Runtime {
             let behavior_idx = msg.behavior_id as usize;
 
             // Hold heap pointers from the payload.
-            self.hold_payload_refs(actor_id, &msg.payload);
+            self.hold_payload_refs(actor_id, &msg.payload, msg.ownership_handoff_mask);
 
             if self.has_bytecode_handler(actor_id, behavior_idx) {
                 let prev = self.current_actor;
@@ -2944,6 +2944,8 @@ impl Runtime {
             total.local_refs_dropped += stats.local_refs_dropped;
             total.foreign_refs_sent += stats.foreign_refs_sent;
             total.foreign_refs_received += stats.foreign_refs_received;
+            total.ownership_handoffs += stats.ownership_handoffs;
+            total.refcount_ops_elided += stats.refcount_ops_elided;
             total.cycles_detected += stats.cycles_detected;
             total.bytes_allocated += stats.bytes_allocated;
             total.bytes_freed += stats.bytes_freed;
@@ -2979,6 +2981,7 @@ impl Runtime {
                 payload: MessagePayload::from_slice(&[Value::int(1)]),
                 sender: 0, // DLQ system message has no sender
                 priority: MessagePriority::System,
+                ownership_handoff_mask: 0,
                 trace_id: None,
             });
         }
@@ -3618,8 +3621,13 @@ impl Runtime {
     /// object survives until the receiver exits - even if the sender drops
     /// its local references or exits first.  Holds are recorded on the
     /// receiver's `OrcaGc` and released by [`release_held_foreign_refs`].
-    fn hold_payload_refs(&mut self, receiver_id: u64, payload: &[Value]) {
-        for value in payload {
+    fn hold_payload_refs(
+        &mut self,
+        receiver_id: u64,
+        payload: &[Value],
+        handoff_mask: u16,
+    ) {
+        for (idx, value) in payload.iter().enumerate() {
             if let Some(id) = value.as_object_id() {
                 // Object-store ref: increment the node-local refcount and
                 // record the hold on the receiving actor.
@@ -3629,6 +3637,13 @@ impl Runtime {
                 }
                 continue;
             }
+
+            if idx < u16::BITS as usize && handoff_mask & (1u16 << idx) != 0 {
+                // Admission already converted the sender's sole local token
+                // into this receiver hold and recorded it on receiver GC.
+                continue;
+            }
+
             let Some(ptr) = value.as_ptr() else { continue };
             if ptr.is_null() {
                 continue;
@@ -3797,7 +3812,7 @@ impl Runtime {
             // ORCA receiver protocol: hold every heap pointer in the
             // received payload so the owning objects (and any retired
             // owner heap) stay alive until this actor exits.
-            self.hold_payload_refs(actor_id, &msg.payload);
+            self.hold_payload_refs(actor_id, &msg.payload, msg.ownership_handoff_mask);
 
             // Establish the W3C trace context for this message: a child of
             // the sender's span when the message carries a traceparent (so
