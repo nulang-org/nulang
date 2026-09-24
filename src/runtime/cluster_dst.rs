@@ -977,6 +977,18 @@ mod tests {
         crate::mir_codegen::compile_mir(&mut mir, "test").unwrap()
     }
 
+    /// Compile through the production typed path so the module carries
+    /// compiler-proven whole-program and actor-definition semantic sidecars.
+    fn compile_identified_module(source: &str) -> crate::bytecode::CodeModule {
+        let tokens = crate::lexer::Lexer::new(source).lex().unwrap();
+        let ast = crate::parser::Parser::new(tokens).parse_module().unwrap();
+        let mut tc = crate::typechecker::TypeChecker::new();
+        tc.check_module(&ast).unwrap();
+        let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+        let mut mir = crate::mir_lower::lower_module(&hir).unwrap();
+        crate::compiler_identity::compile_typed_bytecode(&hir, &mut mir, [], "test").unwrap()
+    }
+
     /// A bytecode `persistent actor` with a `Durable` `count` field and an
     /// `inc(by)` behavior. Re-spawn requires a bytecode module (the shadow
     /// replica serializes it as NBC), so native-closure actors can't be used.
@@ -1003,6 +1015,39 @@ mod tests {
         rt.supervise_child(
             sup,
             ChildSpec::new("counter", RestartPolicy::RespawnOnNodeLoss),
+            id,
+        );
+        id
+    }
+
+    /// Spawn the same durable counter through the identified typed compiler
+    /// path, then request legacy RFC 0014 node-loss re-spawn. The runtime must
+    /// refuse that cross-node opt-in until the transport can carry semantic
+    /// provenance.
+    fn spawn_identified_respawnable_counter(rt: &mut Runtime) -> u64 {
+        use crate::runtime::supervisor::{ChildSpec, RestartPolicy, RestartStrategy};
+
+        let module = compile_identified_module(COUNTER_SOURCE);
+        assert!(
+            module.actor_semantic_id("Counter").is_some(),
+            "typed fixture must carry definition semantic identity"
+        );
+        let idx = module.actor_metadata[0].behavior_indices[0];
+        let id = rt
+            .spawn_from_module(&module, idx, vec![])
+            .as_actor_id()
+            .expect("spawn returns an actor id");
+        assert!(
+            rt.actors
+                .get(&id)
+                .and_then(|actor| actor.definition_semantic_id)
+                .is_some(),
+            "spawned actor must retain compiler-proven definition identity"
+        );
+        let sup = rt.create_supervisor("identified-sup", RestartStrategy::OneForOne);
+        rt.supervise_child(
+            sup,
+            ChildSpec::new("identified-counter", RestartPolicy::RespawnOnNodeLoss),
             id,
         );
         id
@@ -1113,6 +1158,44 @@ mod tests {
         assert_eq!(
             replica_holders, 1,
             "exactly one survivor must hold the shadow replica"
+        );
+    }
+
+    /// Identified durable actors cannot enter RFC 0014's frozen NBC-v1
+    /// shadow path: that transport strips the compiler semantic sidecar. The
+    /// actor must therefore stay out of the respawn directory and a graceful
+    /// goodbye must not reap it under the false assumption that a verified
+    /// shadow exists.
+    #[test]
+    fn test_d7c_identified_actor_refuses_legacy_shadow_failover() {
+        let mut cluster = DeterministicCluster::new(&[addr(9351), addr(9352)], 12);
+        cluster.run_rounds(20);
+
+        let counter = spawn_identified_respawnable_counter(&mut cluster.node_mut(0));
+
+        assert!(
+            !cluster.node(0).respawn_opted.contains_key(&counter),
+            "identified actor must not enter legacy shadow failover"
+        );
+        if let Some(state) = cluster.node(0).distributed.cluster.as_ref() {
+            assert!(
+                state.directory_entry(counter).is_none(),
+                "identified actor must not be advertised without a verifiable shadow"
+            );
+        }
+
+        cluster.node_mut(0).checkpoint_actor(counter);
+        cluster.run_rounds(20);
+
+        assert!(
+            !cluster.node(1).shadow_replicas.contains_key(&counter),
+            "identified snapshot must never cross the legacy NBC-v1 shadow transport"
+        );
+
+        cluster.node_mut(0).goodbye_self();
+        assert!(
+            cluster.node(0).actors.contains_key(&counter),
+            "goodbye_self must not reap an actor that has no verifiable shadow"
         );
     }
 
