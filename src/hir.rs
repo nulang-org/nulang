@@ -1,17 +1,16 @@
 //! High-level Intermediate Representation (HIR).
 //!
 //! HIR is the output of type checking and effect/capability analysis.
-//! It mirrors the AST but:
+//! It is a normalized semantic IR rather than a one-for-one AST mirror:
 //!   - every binding and operand carries a resolved `Type`;
 //!   - nested expressions are flattened into statements/terminators;
-//!   - actor/module structure is preserved;
-//!   - patterns are preserved with type annotations.
+//!   - source-only sugar such as agents and workflows has already lowered to
+//!     canonical actor semantics;
+//!   - compile-time-only declarations are absent;
+//!   - actor/module structure and typed patterns are preserved.
 
-use crate::ast::{BinOp, CrdtType, Expr, Literal, Pattern, StateModel, UnOp};
+use crate::ast::{BinOp, Literal, Pattern, StateModel, UnOp};
 use crate::types::{Capability, EffectRow, Span, Type};
-
-// Re-exported AST types used in HIR declarations
-pub use crate::ast::{DatabaseColumn, DatabaseTable};
 
 // ---------------------------------------------------------------------------
 // Module and declarations
@@ -65,32 +64,14 @@ pub enum Decl {
         items: Vec<String>,
         span: Span,
     },
-    Database {
-        name: String,
-        tables: Vec<DatabaseTable>,
-        span: Span,
-    },
     ExternBlock {
         library: String,
         funcs: Vec<ExternFunc>,
         span: Span,
     },
-    Workflow {
-        name: String,
-        span: Span,
-    },
-    Agent {
-        name: String,
-        span: Span,
-    },
     Constant {
         name: String,
         body: Body,
-        span: Span,
-    },
-    CrdtDecl {
-        name: String,
-        fields: Vec<(String, CrdtType, Type, Expr)>,
         span: Span,
     },
 }
