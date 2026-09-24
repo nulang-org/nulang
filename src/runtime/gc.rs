@@ -391,7 +391,7 @@ impl OrcaGc {
         payload_ptr: *mut u8,
     ) -> bool {
         let header = &mut *heap.header_ptr(payload_ptr);
-        if header.actor_id != self.actor_id || header.ref_count == 0 {
+        if header.actor_id != self.actor_id || header.ref_count != 1 {
             return false;
         }
 
