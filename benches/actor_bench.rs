@@ -140,6 +140,102 @@ fn bench_message_enqueue(c: &mut Criterion) {
     group.finish();
 }
 
+fn register_roundtrip_counter(rt: &mut Runtime, actor_id: u64) {
+    rt.actors
+        .get_mut(&actor_id)
+        .expect("roundtrip actor")
+        .register_behavior("inc", |actor, args| {
+            let count = actor
+                .get_state_field("count")
+                .and_then(|value| value.as_int())
+                .unwrap_or(0);
+            let by = args.first().and_then(|value| value.as_int()).unwrap_or(1);
+            actor.set_state_field("count", Value::int(count + by));
+        });
+}
+
+fn roundtrip_count(rt: &Runtime, actor_id: u64) -> i64 {
+    rt.actors
+        .get(&actor_id)
+        .and_then(|actor| actor.get_state_field("count"))
+        .and_then(|value| value.as_int())
+        .unwrap_or(-1)
+}
+
+fn local_roundtrip_fixture() -> (Runtime, u64) {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| {
+        vec![("count".to_string(), Value::int(0))]
+    }));
+    register_roundtrip_counter(&mut rt, actor_id);
+    // Consume the spawn-time ready token so the timed section measures only
+    // the message burst plus handler execution.
+    rt.run_scheduler();
+    (rt, actor_id)
+}
+
+fn cross_shard_roundtrip_fixture() -> (Runtime, Runtime, u64) {
+    let mut shards = Runtime::new_sharded(2);
+    let mut actor_id = shards[1].spawn_actor(Box::new(|| {
+        vec![("count".to_string(), Value::int(0))]
+    }));
+    while actor_id % 2 != 1 {
+        actor_id = shards[1].spawn_actor(Box::new(|| {
+            vec![("count".to_string(), Value::int(0))]
+        }));
+    }
+    register_roundtrip_counter(&mut shards[1], actor_id);
+    shards[1].run_scheduler();
+
+    let receiver = shards.pop().expect("receiver shard");
+    let sender = shards.pop().expect("sender shard");
+    (sender, receiver, actor_id)
+}
+
+/// End-to-end message burst comparison with runtime construction excluded.
+/// The cross-shard batch stays below the 1024-entry bounded shard-bus capacity,
+/// so this measures transport admission + destination drain + the same native
+/// handler work without making backpressure/drop behavior part of the result.
+fn bench_message_roundtrip(c: &mut Criterion) {
+    const ROUNDTRIP_BATCH: usize = 512;
+    let mut group = c.benchmark_group("actor/message_roundtrip");
+    group.throughput(Throughput::Elements(ROUNDTRIP_BATCH as u64));
+
+    group.bench_function("same_shard_512", |b| {
+        b.iter_batched(
+            local_roundtrip_fixture,
+            |(mut rt, actor_id)| {
+                for _ in 0..ROUNDTRIP_BATCH {
+                    rt.send_message_by_id(actor_id, 0, &[Value::int(1)]);
+                }
+                rt.run_scheduler();
+                let count = roundtrip_count(&rt, actor_id);
+                debug_assert_eq!(count, ROUNDTRIP_BATCH as i64);
+                black_box(count);
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.bench_function("cross_shard_512", |b| {
+        b.iter_batched(
+            cross_shard_roundtrip_fixture,
+            |(mut sender, mut receiver, actor_id)| {
+                for _ in 0..ROUNDTRIP_BATCH {
+                    sender.send_message_by_id(actor_id, 0, &[Value::int(1)]);
+                }
+                receiver.run_scheduler();
+                let count = roundtrip_count(&receiver, actor_id);
+                debug_assert_eq!(count, ROUNDTRIP_BATCH as i64);
+                black_box(count);
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.finish();
+}
+
 /// Scheduler + native-handler execution cost for an already-enqueued batch.
 ///
 /// Enqueueing is performed in setup, outside the timed section. Primitive
@@ -264,6 +360,7 @@ criterion_group!(
     bench_spawn_idle_batch,
     bench_spawn_send_receive,
     bench_message_enqueue,
+    bench_message_roundtrip,
     bench_message_drain,
     bench_selective_receive
 );
