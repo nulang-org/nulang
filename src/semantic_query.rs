@@ -1055,10 +1055,10 @@ fn walk_expr(
             walk_expr(body, &nested, declared, owner, file, source, out);
         }
         Expr::Seal { names, body, .. } => {
-            let allowed = names.iter().collect::<HashSet<_>>();
+            let allowed = names.iter().map(String::as_str).collect::<HashSet<_>>();
             let mut nested = bound.clone();
             for name in declared {
-                if !allowed.contains(name) {
+                if !allowed.contains(name.as_str()) {
                     nested.insert(name.clone());
                 }
             }
