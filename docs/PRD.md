@@ -3,8 +3,19 @@
 
 **Version:** 0.1 — Draft  
 **Date:** 2026-07-21  
-**Status:** Internal strategic review  
-**Author:** AI assistant review based on current `nulang` repository and proposed strategic updates  
+**Status:** Historical strategic draft — superseded for current semantics  
+**Author:** AI assistant review based on the July 2026 `nulang` repository and proposed strategic updates  
+
+> **Historical document.** This PRD records the July 2026 repositioning proposal
+> and is not the source of truth for current language semantics. RFC 0021
+> superseded the original permanent Frozen-Core policy for pre-adoption source
+> semantics, and RFC 0024 superseded the "entity as the universal unit of
+> computation" framing with an orthogonal execution model: ordinary local
+> computation, scoped tasks, and independently addressable actors are distinct
+> execution forms, while durability, identity, placement, effects, reference
+> capabilities, and external authority compose with those forms. Use
+> `SPEC2.md`, `GOVERNANCE.md`, accepted RFCs, and
+> `docs/IMPLEMENTATION_STATUS.md` for current behavior and status.
 
 ---
 

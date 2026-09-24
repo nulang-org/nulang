@@ -1,17 +1,18 @@
 # Nulang Architecture Reference
 
-**Document Version:** 1.1
-**Date:** July 2026
+**Document Version:** 1.2
+**Date:** September 2026
 **Audience:** Core implementers, runtime engineers, language designers
 **Companion Documents:** design notes in `docs/archive/` (AI SDK, workflow SDK, cloud, package manager)
 
-> **Implementation status (v1.1):** Sections 2 and 6 (Language and AI Runtime)
-> have been re-verified against the current source tree and describe the
-> system as implemented. Sections 3–5 and the derived material in Sections
-> 7–10 still describe the *target* architecture; where the implementation
-> already diverges in a verified way, §1 carries the corrections. Treat
-> uncaveated numbers and diagrams in Sections 3–5 as design goals, not
-> as-built fact.
+> **Implementation status (v1.2):** This document mixes an as-built reference
+> with longer-term architecture. The compiler/backend description and the
+> correction list in §1 are maintained against current `main`; substantial
+> parts of Sections 3–5 and derived diagrams in Sections 7–10 still describe
+> target architecture. Treat uncaveated topology, protocol, capacity, and
+> performance numbers outside explicitly marked "current" sections as design
+> goals rather than shipped behavior. For a concise current-main matrix, see
+> `docs/IMPLEMENTATION_STATUS.md`.
 >
 > **Semantic-model correction (September 2026):** RFC 0024 supersedes the
 > earlier language-wide "everything is an actor" framing. The five layers below
@@ -85,7 +86,7 @@ boundary, supporting independent testability, replaceability, and evolution.
 - Data passes across boundaries as plain structs; no shared mutable state
 - Each layer can be tested with mocked adjacent layers
 
-**Implementation note (updated July 2026):** the compiler targets a
+**Implementation note (updated September 2026):** the compiler targets a
 register-VM bytecode by default. A WASM backend (`--backend wasm | wasm-run | wasm-aot`)
 exists behind the `wasm-backend` feature flag (src/mir_wasm.rs, src/wasm_runtime.rs).
 A native/AOT backend (`--backend native`) compiles via Cranelift ahead-of-time.
@@ -109,13 +110,19 @@ mind while reading §3–§5:
   on scoped OS threads. The live per-shard dequeue path uses scheduler worker
   slot 0; Chase-Lev peer stealing is implemented for generic multi-worker callers
   but is not active inside the current live shard loop.
-- **Persistence** ships three `PersistenceStore` backends — `MemoryStore`,
-  `JsonFileStore`, `LibsqlStore` (`src/runtime/persistence.rs`) — not
-  PostgreSQL or S3.
-- **The NUL0 transport** is a hand-rolled, length-prefixed TCP protocol whose
-  fixed header is 13 bytes (4-byte `NUL0` magic, 1-byte packet type, 8-byte
-  sequence); the version/flags/MAC fields, TLS, QUIC, and Poly1305 drawn in
-  §5.5 do not exist in `src/runtime/network.rs`.
+- **Persistence** is abstracted by `PersistenceStore`. Current `main` ships
+  `MemoryStore`, `JsonFileStore`, and `LibsqlStore`; optional
+  `rocksdb` and `postgres` features add `RocksDbStore` and
+  `PostgresStore`. Atomic durable-transition support is capability-specific:
+  unsupported stores fail closed rather than emulating an atomic commit with
+  sequential writes.
+- **The NUL0 transport** is a hand-rolled, length-prefixed TCP protocol. Each
+  connection begins with a frozen 16-byte versioned handshake
+  (`NUL0` magic + `u32` wire version + `u64` node id); each framed packet
+  then carries the 13-byte NUL0/type/sequence envelope after its 4-byte length
+  prefix. The TCP path supports mutual TLS through rustls, with an explicit
+  insecure plaintext mode for development/testing. QUIC and the older
+  Poly1305-style target design in §5.5 are not implemented.
 
 ---
 
