@@ -9,6 +9,7 @@
 
 pub mod executor;
 pub mod model;
+pub mod node_executor;
 pub mod reconciler;
 pub mod scheduler;
 pub mod store;
@@ -18,6 +19,9 @@ pub use executor::{
     DispatchOutcome, DispatchRecord, DispatchReport,
 };
 pub use model::*;
+pub use node_executor::{
+    FencedNodeExecutor, NodeAllocationPhase, NodeAllocationRecord, WorkloadLifecycle,
+};
 pub use reconciler::{reconcile_once, ReconcileError, ReconcileResult};
 pub use scheduler::plan_evaluation;
 pub use store::*;
