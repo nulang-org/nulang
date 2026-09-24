@@ -2501,15 +2501,12 @@ impl Runtime {
             return 0;
         }
 
-        let out_trace = self.current_trace.as_ref().map(|trace| trace.to_traceparent());
-        self.deliver_local_message_inner(
-            target_id,
-            behavior_id,
-            args,
-            out_trace,
-            candidate_mask,
-        )
-        .1
+        let out_trace = self
+            .current_trace
+            .as_ref()
+            .map(|trace| trace.to_traceparent());
+        self.deliver_local_message_inner(target_id, behavior_id, args, out_trace, candidate_mask)
+            .1
     }
 
     #[tracing::instrument(level = "trace", skip(self, args))]
@@ -2771,7 +2768,9 @@ impl Runtime {
 
         if admission != MessageAdmission::Accepted {
             for (idx, owner_id, _) in &handed_off {
-                let Some(ptr) = args[*idx].as_ptr() else { continue };
+                let Some(ptr) = args[*idx].as_ptr() else {
+                    continue;
+                };
                 if let Some(owner) = self.actors.get_mut(owner_id) {
                     unsafe {
                         owner
@@ -3637,12 +3636,7 @@ impl Runtime {
     /// object survives until the receiver exits - even if the sender drops
     /// its local references or exits first.  Holds are recorded on the
     /// receiver's `OrcaGc` and released by [`release_held_foreign_refs`].
-    fn hold_payload_refs(
-        &mut self,
-        receiver_id: u64,
-        payload: &[Value],
-        handoff_mask: u16,
-    ) {
+    fn hold_payload_refs(&mut self, receiver_id: u64, payload: &[Value], handoff_mask: u16) {
         for (idx, value) in payload.iter().enumerate() {
             if let Some(id) = value.as_object_id() {
                 // Object-store ref: increment the node-local refcount and
@@ -3713,12 +3707,8 @@ impl Runtime {
                 // their in-flight decrement was processed. Removal is
                 // idempotent; consuming handoffs keep the edge until the
                 // receiver releases its direct hold.
-                self.cycle_detector.remove_foreign_ref(
-                    actor_id,
-                    sentinel,
-                    owner_id,
-                    header,
-                );
+                self.cycle_detector
+                    .remove_foreign_ref(actor_id, sentinel, owner_id, header);
             }
 
             if let Some(owner) = self.actors.get_mut(&owner_id) {
