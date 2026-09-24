@@ -1623,10 +1623,7 @@ fn test_tier2_replaces_baseline_with_typed_code() {
     }
     .expect("baseline region should compile");
 
-    assert_eq!(
-        jit.compiled_tier(0, start),
-        Some(CompilationTier::Baseline)
-    );
+    assert_eq!(jit.compiled_tier(0, start), Some(CompilationTier::Baseline));
     assert_eq!(
         jit.compiled_optimization(0, start),
         Some(CodegenOptimization::Fast),
