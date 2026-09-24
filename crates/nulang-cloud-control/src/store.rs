@@ -123,6 +123,42 @@ pub trait ControlStore: Send + Sync {
 
     fn pending_commands(&self) -> Result<Vec<AllocationCommand>, StoreError>;
 
+    /// True only when a Start command still names the highest authoritative
+    /// epoch for its logical deployment replica.
+    ///
+    /// Keep this derivation storage-neutral: every backend already exposes the
+    /// authoritative allocation snapshot through `allocations_for`, so the
+    /// dispatcher does not need backend-specific fencing logic.
+    fn start_command_is_authoritative(
+        &self,
+        command: &AllocationCommand,
+    ) -> Result<bool, StoreError> {
+        if command.kind != AllocationCommandKind::Start {
+            return Ok(false);
+        }
+
+        let allocations = self.allocations_for(&command.deployment_id)?;
+        let max_epoch = allocations
+            .iter()
+            .filter(|allocation| {
+                allocation.deployment_id == command.deployment_id
+                    && allocation.replica == command.replica
+            })
+            .map(|allocation| allocation.epoch)
+            .max()
+            .unwrap_or(0);
+
+        Ok(max_epoch == command.epoch
+            && allocations.iter().any(|allocation| {
+                allocation.deployment_id == command.deployment_id
+                    && allocation.revision == command.revision
+                    && allocation.replica == command.replica
+                    && allocation.node_id == command.node_id
+                    && allocation.epoch == command.epoch
+                    && allocation.state.is_active()
+            }))
+    }
+
     /// Idempotently mark a durable outbox command acknowledged.
     fn acknowledge_command(&self, command_id: &str) -> Result<(), StoreError>;
 }
