@@ -51,6 +51,11 @@ version + migration.*
 
 ## Stable tier
 
+### Zero-copy non-reentrant JIT register entry — 2026-09-24
+- **Cranelift regions that cannot re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
+- **Compiled-region metadata now records whether native execution may grow or replace the VM frame stack.** Regions containing helper-backed direct calls retain the detached register snapshot because re-entrant interpreter calls may reallocate `VM::frames`; typed, SIMD, and scalar non-call regions use the direct-frame path.
+- **The direct-frame path does not install the raw `JIT_VM` pointer.** Alternate JIT backends default to the conservative re-entry classification, and unit coverage pins the direct-call fallback invariant.
+
 ### Backend-neutral JIT region planning — 2026-09-24
 - **Native compilation eligibility is now separated from Cranelift code generation.** `src/jit/region_planner.rs` owns region boundaries, non-suspending direct-call folding, recursion safety, cached per-module analyses, and type metadata production.
 - **`JitSession` now consumes a `RegionPlan` for initial compilation and Tier-2 replacement instead of recomputing language/runtime safety rules itself.** This creates a reusable planning boundary for MIR, a custom baseline emitter, or another future native backend without duplicating call/effect/recursion semantics.
