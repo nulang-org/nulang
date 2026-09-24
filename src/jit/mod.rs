@@ -69,17 +69,51 @@ pub const TIER2_THRESHOLD: u64 = 10_000;
 /// threshold are rejected.
 pub const STRAIGHT_LINE_MIN: usize = 8;
 
+/// Runtime representation assumptions introduced specifically by
+/// compiler-owned source-signature seeds. Bytecode-only type proofs do not
+/// need a guard and therefore keep the existing zero-guard hot path.
+type TypeGuard = Box<[(u8, typed_compiler::KnownType)]>;
+
+fn type_guard_from_metadata(meta: &typed_compiler::TypeMetadata) -> TypeGuard {
+    meta.regs
+        .iter()
+        .enumerate()
+        .filter_map(|(reg, &ty)| {
+            (ty != typed_compiler::KnownType::Unknown).then_some((reg as u8, ty))
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+#[inline(always)]
+fn type_guard_matches(guard: &TypeGuard, regs: &[u64; 256]) -> bool {
+    use crate::value_layout::{is_float_raw, TAG_BOOL, TAG_INT, TAG_MASK};
+    use typed_compiler::KnownType;
+
+    guard.iter().all(|&(reg, ty)| {
+        let bits = regs[reg as usize];
+        match ty {
+            KnownType::Unknown => true,
+            KnownType::Int => (bits & TAG_MASK) == TAG_INT,
+            KnownType::Float => is_float_raw(bits),
+            KnownType::Bool => (bits & TAG_MASK) == TAG_BOOL,
+        }
+    })
+}
+
 /// Metadata for one compiled bytecode region.
 ///
 /// Tier-2 state lives beside the compiled pointer instead of in a hash table.
 /// Once a region reaches its one useful static promotion decision it becomes
 /// terminal and steady-state native entry stops paying tiering bookkeeping.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct CompiledRegion {
     ptr: *const u8,
     len: usize,
     tier2_executions: u32,
     tier2_terminal: bool,
+    /// Present only when source-signature seeds contributed to the typed proof.
+    guard: Option<TypeGuard>,
 }
 
 // ---------------------------------------------------------------------------
@@ -185,12 +219,11 @@ impl JitSession {
     }
 
     #[inline(always)]
-    fn compiled_entry(&self, module_idx: usize, offset: usize) -> Option<CompiledRegion> {
+    fn compiled_entry(&self, module_idx: usize, offset: usize) -> Option<&CompiledRegion> {
         self.compiled
             .get(module_idx)
             .and_then(|row| row.get(offset))
-            .copied()
-            .flatten()
+            .and_then(Option::as_ref)
     }
 
     #[inline(always)]
@@ -234,8 +267,24 @@ impl JitSession {
                     len: region_len,
                     tier2_executions: 0,
                     tier2_terminal: false,
+                    guard: None,
                 });
             }
+        }
+    }
+
+    fn install_type_guard(
+        &mut self,
+        module_idx: usize,
+        offset: usize,
+        meta: &typed_compiler::TypeMetadata,
+    ) {
+        let guard = type_guard_from_metadata(meta);
+        if guard.is_empty() {
+            return;
+        }
+        if let Some(region) = self.compiled_entry_mut(module_idx, offset) {
+            region.guard = Some(guard);
         }
     }
 
@@ -1166,8 +1215,11 @@ impl crate::backends::JitBackend for JitSession {
         // The caller already probed this PC. Existing compiled code performs
         // Tier-2 bookkeeping while the module borrow is still available, before
         // native execution can re-enter the VM.
-        if let Some(region) = self.compiled_entry(module_idx, pc) {
-            if !region.tier2_terminal {
+        if let Some(tier2_terminal) = self
+            .compiled_entry(module_idx, pc)
+            .map(|region| region.tier2_terminal)
+        {
+            if !tier2_terminal {
                 self.record_tier2_and_maybe_promote(module_idx, pc, module);
             }
             return true;
@@ -1179,6 +1231,8 @@ impl crate::backends::JitBackend for JitSession {
             find_compilable_region_with_calls(pc, instructions, module, Some(&ms), Some(&rc));
         if region_len >= 3 {
             let meta = typed_compiler::infer_reg_types(module, pc);
+            let seed_guard_required =
+                typed_compiler::compiler_type_seed_applies(module, pc) && !meta.is_empty();
             let meta_ref = if meta.is_empty() { None } else { Some(&meta) };
             if unsafe {
                 self.compile_region_typed(
@@ -1192,6 +1246,12 @@ impl crate::backends::JitBackend for JitSession {
             }
             .is_some()
             {
+                // Only typed regions whose proof gained precision from a
+                // compiler-owned entry seed require a dynamic representation
+                // check. Bytecode-only typed regions remain guard-free.
+                if seed_guard_required && self.is_typed_compiled(module_idx, pc) {
+                    self.install_type_guard(module_idx, pc, &meta);
+                }
                 return true;
             }
         }
@@ -1211,9 +1271,18 @@ impl crate::backends::JitBackend for JitSession {
         regs: &mut [u64; 256],
         constants: &[u64],
     ) -> crate::backends::TieredAction {
-        let Some(func) = (unsafe { self.get_compiled(module_idx, pc) }) else {
+        let Some(region) = self.compiled_entry(module_idx, pc) else {
             return crate::backends::TieredAction::Interpret;
         };
+        if region
+            .guard
+            .as_ref()
+            .is_some_and(|guard| !type_guard_matches(guard, regs))
+        {
+            return crate::backends::TieredAction::Interpret;
+        }
+        let ptr = region.ptr;
+        let func: JitFunctionPtr = unsafe { std::mem::transmute(ptr) };
         func(regs.as_mut_ptr(), constants.as_ptr());
         crate::backends::TieredAction::RanJit
     }
