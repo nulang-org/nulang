@@ -7650,3 +7650,62 @@ fn workflow_durable_effect_ids_share_activation_operation_sequence() {
         )
     );
 }
+
+
+#[test]
+fn workflow_operation_lookup_returns_committed_custom_event() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "OperationLookupWorkflow",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    let activation = WorkflowActivationId::new(actor_id, 61);
+    super::workflow::begin_workflow_activation(&mut rt, activation, false);
+
+    rt.emit_event(actor_id, "audit", &[Value::int(9)]);
+
+    let event = rt
+        .workflow_event_for_operation(actor_id, activation.operation(0))
+        .expect("operation history should be valid")
+        .expect("custom event should be addressable by operation id");
+
+    assert!(matches!(
+        event,
+        WorkflowEvent::Custom {
+            operation_id: Some(id),
+            name,
+            ..
+        } if id == activation.operation(0) && name == "audit"
+    ));
+}
+
+#[test]
+fn workflow_operation_lookup_rejects_duplicate_operation_identity() {
+    let actor_id = 99;
+    let operation = WorkflowActivationId::new(actor_id, 7).operation(0);
+    let mut store = MemoryStore::new();
+    for sequence in [8, 9] {
+        store
+            .append_workflow_event(
+                actor_id,
+                WorkflowEvent::Custom {
+                    sequence,
+                    operation_id: Some(operation),
+                    name: "duplicate".to_string(),
+                    args: vec![],
+                },
+            )
+            .unwrap();
+    }
+
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store);
+
+    assert!(matches!(
+        rt.workflow_event_for_operation(actor_id, operation),
+        Err(WorkflowOperationAnalysisError::DuplicateOperationIdentity {
+            operation_id
+        }) if operation_id == operation
+    ));
+}
