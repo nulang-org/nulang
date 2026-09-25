@@ -541,6 +541,25 @@ mod tests {
     }
 
     #[test]
+    fn migration_can_be_cancelled_under_newer_epoch_without_changing_owner() {
+        let mut map = CacheSlotMap::new_local(1, 1).unwrap();
+        let slot = redis_slot(b"cancel-migration");
+        let source = map.owner_for_slot(slot).unwrap();
+        let target = CacheShardOwner {
+            node_id: 2,
+            shard: 0,
+        };
+
+        map.begin_migration(5, slot, target).unwrap();
+        map.cancel_migration(6, slot).unwrap();
+
+        assert_eq!(map.epoch(), 6);
+        assert_eq!(map.owner_for_slot(slot), Some(source));
+        assert_eq!(map.migration_for_slot(slot), None);
+        assert!(!map.has_migrations());
+    }
+
+    #[test]
     fn generic_epoch_update_cannot_overwrite_slot_mid_migration() {
         let mut map = CacheSlotMap::new_local(1, 1).unwrap();
         let slot = redis_slot(b"migrate-me");
