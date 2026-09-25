@@ -2,7 +2,7 @@
 
 ### Cloud reconciliation event loop — 2026-09-25
 - **Nulang Cloud now has a deterministic in-process reconciliation queue above `reconcile_once`.** `ReconcileLoop` coalesces deployment/node/allocation/capacity wakeups while durable ownership, plans, fencing, evaluations, and outbox state remain in `ControlStore`.
-- **Pending work is state-based and bounded.** At most one request is queued per deployment; newer revisions supersede older pending revisions, stale revisions are ignored, and same-revision triggers coalesce.
+- **Pending work is state-based and bounded.** At most one request is queued per deployment; newer revisions supersede older pending revisions, stale revisions are ignored, and same-revision triggers coalesce while preserving the first evaluation id for retry stability.
 - **Failed turns preserve the same durable evaluation identity.** A failed reconcile remains queued and retry reaches `reconcile_once` with the identical evaluation id, preserving its idempotency contract.
 - **Controller backpressure stays explicit.** `reconcile_ready` requires a caller-supplied turn budget and processes deployments in deterministic lexical order.
 - Combined with the fenced node executor, the control-plane foundation now closes the pure-plan → durable commit/outbox → node execution loop without embedding provider SDKs into the scheduler.
