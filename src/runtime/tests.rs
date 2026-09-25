@@ -3546,6 +3546,86 @@ fn test_workflow_terminal_failure_keeps_last_safe_snapshot() {
 }
 
 #[test]
+fn test_terminal_failure_helper_records_step_failed_before_checkpoint() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "ResumeFailureWorkflow",
+        Box::new(|| vec![("count".to_string(), Value::int(0))]),
+        models,
+    );
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .set_state_field("count", Value::int(7));
+    let activation = WorkflowActivationId::new(actor_id, 7);
+
+    assert!(workflow::fail_workflow_step(
+        &mut rt,
+        actor_id,
+        Some(activation),
+        "charge",
+        "provider failed",
+        0,
+    ));
+
+    assert!(matches!(
+        rt.persistence.read_workflow_events(actor_id).last(),
+        Some(WorkflowEvent::StepFailed {
+            activation: Some(recorded),
+            step_name,
+            error,
+            ..
+        }) if *recorded == activation
+            && step_name == "charge"
+            && error == "provider failed"
+    ));
+    assert_eq!(
+        rt.persistence.load_snapshot(actor_id).unwrap().state.get("count"),
+        Some(&PersistedValue::Int(7)),
+        "failed-state snapshot may advance only after StepFailed is durable"
+    );
+}
+
+#[test]
+fn test_terminal_failure_helper_keeps_safe_snapshot_when_marker_fails() {
+    let mut rt = Runtime::new();
+    let store = FailTerminalWorkflowStore::new();
+    let probe = store.clone();
+    rt.persistence = Box::new(store);
+
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "ResumeFailureSafeSnapshotWorkflow",
+        Box::new(|| vec![("count".to_string(), Value::int(0))]),
+        models,
+    );
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .set_state_field("count", Value::int(7));
+    probe.fail_terminal_events();
+
+    assert!(!workflow::fail_workflow_step(
+        &mut rt,
+        actor_id,
+        Some(WorkflowActivationId::new(actor_id, 7)),
+        "charge",
+        "provider failed",
+        0,
+    ));
+    assert_eq!(
+        probe.load_snapshot(actor_id).unwrap().state.get("count"),
+        Some(&PersistedValue::Int(0)),
+        "terminal persistence failure must preserve the last completed snapshot"
+    );
+}
+
+#[test]
 fn test_terminal_completion_helper_does_not_advance_state_when_marker_fails() {
     let mut rt = Runtime::new();
     let store = FailTerminalWorkflowStore::new();

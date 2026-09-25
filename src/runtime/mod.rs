@@ -1298,8 +1298,22 @@ impl Runtime {
                         (*self_ptr).maybe_schedule_receive_wait(actor_id, receive_timeout);
                     }
                 }
-                Err(_) => {
-                    // Other error: clear suspension.
+                Err(error) => {
+                    if (*self_ptr).actor_is_workflow(actor_id) {
+                        let step_name = if suspended.step_name.is_empty() {
+                            (*self_ptr).step_name_for(actor_id, suspended.behavior_idx)
+                        } else {
+                            suspended.step_name.clone()
+                        };
+                        workflow::fail_workflow_step(
+                            &mut *self_ptr,
+                            actor_id,
+                            suspended.activation,
+                            step_name,
+                            error.to_string(),
+                            suspended.behavior_idx,
+                        );
+                    }
                     if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                         actor.jit_yield_pending = false;
                     }
@@ -1707,10 +1721,16 @@ impl Runtime {
                     self.maybe_schedule_receive_wait(actor_id, receive_timeout);
                 }
             }
-            Err(_) => {
-                // Step failed after resumption: run saga compensations.
+            Err(error) => {
                 if self.actor_is_workflow(actor_id) {
-                    self.run_saga_compensation(actor_id, behavior_idx);
+                    workflow::fail_workflow_step(
+                        self,
+                        actor_id,
+                        suspended.activation,
+                        step_name,
+                        error.to_string(),
+                        behavior_idx,
+                    );
                 }
             }
         }
@@ -3952,36 +3972,19 @@ impl Runtime {
                         processed = false;
                     }
                     Err(e) => {
-                        // A workflow step failed: its mutated durable state is
-                        // not a safe recovery point until the terminal marker
-                        // is durable. Non-workflow actors retain the legacy
-                        // checkpoint behavior.
+                        // A workflow step failure is terminal only after its
+                        // StepFailed marker is durable. Compensation and the
+                        // failed-state snapshot are gated behind that marker.
                         if self.actor_is_workflow(actor_id) {
-                            let seq = self.next_sequence(actor_id);
                             let step_name = self.step_name_for(actor_id, behavior_idx);
-                            let terminal_committed = match self.persistence.append_workflow_event(
+                            workflow::fail_workflow_step(
+                                self,
                                 actor_id,
-                                WorkflowEvent::StepFailed {
-                                    sequence: seq,
-                                    activation: workflow_activation,
-                                    step_name,
-                                    error: format!("{}", e),
-                                },
-                            ) {
-                                Ok(()) => true,
-                                Err(error) => {
-                                    warn!(
-                                        actor_id,
-                                        %error,
-                                        "failed to persist terminal StepFailed event"
-                                    );
-                                    false
-                                }
-                            };
-                            if terminal_committed {
-                                self.run_saga_compensation(actor_id, behavior_idx);
-                                self.checkpoint_actor(actor_id);
-                            }
+                                workflow_activation,
+                                step_name,
+                                e.to_string(),
+                                behavior_idx,
+                            );
                         } else {
                             self.checkpoint_actor(actor_id);
                         }
@@ -4517,9 +4520,18 @@ impl Runtime {
                         }
                     }
                 }
-                Err(e) => {
-                    // VM error during resume - log and clean up.
-                    tracing::warn!("Timer.sleep resume error for actor {}: {:?}", actor_id, e);
+                Err(error) => {
+                    tracing::warn!("Timer.sleep resume error for actor {}: {:?}", actor_id, error);
+                    if (*self_ptr).actor_is_workflow(actor_id) {
+                        workflow::fail_workflow_step(
+                            &mut *self_ptr,
+                            actor_id,
+                            suspended.activation,
+                            suspended.step_name.clone(),
+                            error.to_string(),
+                            suspended.behavior_idx,
+                        );
+                    }
                     if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                         actor.suspended_execution = None;
                     }
@@ -4632,9 +4644,19 @@ impl Runtime {
                         }
                     }
                 }
-                // Other errors: the wait is over; the send-path result is
-                // discarded anyway, matching step_actor semantics.
-                Err(_) => (*self_ptr).clear_receive_wait(actor_id),
+                Err(error) => {
+                    (*self_ptr).clear_receive_wait(actor_id);
+                    if (*self_ptr).actor_is_workflow(actor_id) {
+                        workflow::fail_workflow_step(
+                            &mut *self_ptr,
+                            actor_id,
+                            suspended.activation,
+                            suspended.step_name.clone(),
+                            error.to_string(),
+                            suspended.behavior_idx,
+                        );
+                    }
+                }
             }
             // End the VM-execution window only after any suspend-state
             // re-capture above: draining deferred wakes runs other actors

@@ -404,6 +404,41 @@ pub(crate) fn complete_workflow_step(
     true
 }
 
+/// Durably close a failed workflow activation before compensation and snapshot advance.
+///
+/// Returns false when StepFailed cannot be persisted. In that case compensation
+/// is not executed and the previous completed snapshot remains the recovery anchor.
+pub(crate) fn fail_workflow_step(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<WorkflowActivationId>,
+    step_name: impl Into<String>,
+    error: impl Into<String>,
+    failed_behavior_idx: usize,
+) -> bool {
+    let sequence = next_sequence(rt, actor_id);
+    if let Err(storage_error) = rt.persistence.append_workflow_event(
+        actor_id,
+        WorkflowEvent::StepFailed {
+            sequence,
+            activation,
+            step_name: step_name.into(),
+            error: error.into(),
+        },
+    ) {
+        tracing::warn!(
+            actor_id,
+            %storage_error,
+            "failed to persist terminal StepFailed event"
+        );
+        return false;
+    }
+
+    rt.run_saga_compensation(actor_id, failed_behavior_idx);
+    checkpoint_actor(rt, actor_id);
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Signal delivery
 // ---------------------------------------------------------------------------
