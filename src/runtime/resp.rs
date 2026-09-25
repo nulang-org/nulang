@@ -275,6 +275,14 @@ pub fn write_moved(out: &mut Vec<u8>, slot: u16, target: &[u8]) {
     out.extend_from_slice(b"\r\n");
 }
 
+pub fn write_ask(out: &mut Vec<u8>, slot: u16, target: &[u8]) {
+    out.extend_from_slice(b"-ASK ");
+    write_u64_decimal(out, slot as u64);
+    out.push(b' ');
+    out.extend_from_slice(target);
+    out.extend_from_slice(b"\r\n");
+}
+
 pub fn write_array_len(out: &mut Vec<u8>, len: usize) {
     out.push(b'*');
     write_u64_decimal(out, len as u64);
