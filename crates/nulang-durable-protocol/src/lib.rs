@@ -333,8 +333,7 @@ impl DurableTimerMutation {
         if set_activation_epoch == 0 || set_sequence == 0 {
             return Err(DurableProtocolError::InvalidTimerGeneration);
         }
-        if set_activation_epoch > transition_activation_epoch
-            || set_sequence > transition_sequence
+        if set_activation_epoch > transition_activation_epoch || set_sequence > transition_sequence
         {
             return Err(DurableProtocolError::InvalidTimerGeneration);
         }
@@ -491,11 +490,7 @@ impl DurableEffectMutation {
                 request_digest,
                 idempotency_key,
                 ..
-            } => validate_prepared_effect(
-                operation,
-                request_digest,
-                idempotency_key.as_deref(),
-            ),
+            } => validate_prepared_effect(operation, request_digest, idempotency_key.as_deref()),
             Self::Completed {
                 operation,
                 request_digest,
@@ -516,11 +511,7 @@ impl DurableEffectMutation {
                 {
                     return Err(DurableProtocolError::InvalidCompensation);
                 }
-                validate_prepared_effect(
-                    operation,
-                    request_digest,
-                    idempotency_key.as_deref(),
-                )
+                validate_prepared_effect(operation, request_digest, idempotency_key.as_deref())
             }
             Self::CompensationCompleted {
                 original_effect_id,
