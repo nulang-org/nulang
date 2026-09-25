@@ -1,5 +1,6 @@
 # Nulang Changelog
 ### Unary-negation backend parity — 2026-09-25
+- **Unary `-` now rejects concrete nonnumeric operands during type checking.** Known booleans, tuples, functions, and other nonnumeric values fail before code generation; unresolved inference variables remain dynamic until Nulang has a principled numeric constraint/typeclass.
 - **Native AOT no longer bypasses checked `INeg` semantics.** Statically numeric negation routes through the runtime helper so 48-bit overflow and nil/error propagation match the bytecode reference; ambiguous or non-numeric native operands fail closed instead of being miscompiled.
 - **Tiered JIT stops before `INeg` for now.** The interpreter remains authoritative for dynamic unary-negation type errors and overflow until the JIT has an explicit runtime-error propagation channel.
 - **Differential regressions cover the nightly failures.** Tuple/function/bool operands and negative-exponent/nil paths are pinned by focused cross-backend tests.
