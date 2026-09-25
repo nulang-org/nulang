@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Multicore shard-scaling benchmark — 2026-09-25
+- **A standalone `nulang-shard-bench` runner now measures fixed-work same-shard scaling across 1/2/4/8 runtime shards.** Actor/message setup and OS thread creation are outside timing; a barrier releases one scheduler thread per shard together, and semantic assertions require every preloaded message to be processed exactly once.
+- **Scaling output reports throughput, ns/message, 1-shard speedup, parallel efficiency, and host parallelism in human or JSONL form.** The workload is explicitly a best-case independent-actor ceiling rather than a cross-shard transport benchmark.
+- **A path-scoped workflow runs the harness tests on pull requests and offers an opt-in diagnostic scaling sweep artifact.** Absolute multicore speedups are not regression-gated on shared CI hardware.
+
 ### Runtime hot-path benchmark decomposition — 2026-09-25
 - **The same-host A/B harness now reports a mailbox-only one-value admission lower bound alongside the full runtime enqueue sweep.** This exposes the cost above message construction/mailbox admission before actor-routing or scheduler changes are justified.
 - **The actor A/B harness now measures AOT against warmed bytecode/JIT on the exact same 50k-message actor drain.** Bytecode is warmed past tier-up, enqueue time is excluded for both paths, and the harness prints the direct AOT speedup while retaining the existing AOT history record.
