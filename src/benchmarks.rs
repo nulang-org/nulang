@@ -75,6 +75,19 @@ fn report_ab(name: &str, operations: u64, elapsed: std::time::Duration) {
 
 fn ab_noop_handler(_actor: &mut crate::runtime::Actor, _args: &[Value]) {}
 
+#[cfg(feature = "native-codegen")]
+fn compile_ab_module(source: &str, name: &str) -> crate::bytecode::CodeModule {
+    let tokens = Lexer::new(source).lex().expect("bench: lex failed");
+    let ast = Parser::new(tokens)
+        .parse_module()
+        .expect("bench: parse failed");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("bench: typecheck failed");
+    let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = crate::mir_lower::lower_module(&hir).expect("bench: MIR lower failed");
+    crate::mir_codegen::compile_mir(&mut mir, name).expect("bench: codegen failed")
+}
+
 /// Lower-bound local mailbox admission probe for one inline primitive value.
 ///
 /// This intentionally bypasses actor lookup, routing/grain checks, ORCA
@@ -167,16 +180,7 @@ fn bench_ab_jit_tiering_crossover() {
         let source = format!(
             "var sum = 0; var i = 0; while i < {trips} {{ sum = sum + i * 3 - i / 7; i = i + 1; }}; sum"
         );
-        let tokens = Lexer::new(&source).lex().expect("bench: lex failed");
-        let ast = Parser::new(tokens)
-            .parse_module()
-            .expect("bench: parse failed");
-        let mut tc = TypeChecker::new();
-        tc.check_module(&ast).expect("bench: typecheck failed");
-        let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
-        let mut mir = crate::mir_lower::lower_module(&hir).expect("bench: MIR lower failed");
-        let module = crate::mir_codegen::compile_mir(&mut mir, "bench-ab-tiering")
-            .expect("bench: codegen failed");
+        let module = compile_ab_module(&source, "bench-ab-tiering");
 
         let mut interp_vms: Vec<VM> = (0..REPEATS)
             .map(|_| {
@@ -221,6 +225,75 @@ fn bench_ab_jit_tiering_crossover() {
             REPEATS as u64,
             jit_elapsed,
         );
+    }
+}
+
+#[cfg(feature = "native-codegen")]
+#[test]
+fn bench_ab_jit_warm_execution() {
+    const REPEATS: usize = 10;
+    const TRIPS: usize = 100_000;
+
+    let workloads = [
+        (
+            "jit_warm_hot_loop_100k",
+            format!(
+                "var sum = 0; var i = 0; while i < {TRIPS} {{ sum = sum + i * 3 - i / 7; i = i + 1; }}; sum"
+            ),
+        ),
+        (
+            "jit_warm_call_loop_100k",
+            format!(
+                "fn add(x: Int, y: Int) -> Int {{ x + y }}; var sum = 0; var i = 0; while i < {TRIPS} {{ sum = add(sum, i); i = i + 1; }}; sum"
+            ),
+        ),
+    ];
+
+    for (name, source) in workloads {
+        let module = compile_ab_module(&source, "bench-ab-jit-warm");
+
+        let mut interp = VM::new_without_jit();
+        interp.load_module(module.clone());
+        let expected = interp
+            .run()
+            .expect("bench: interpreter oracle failed")
+            .as_int()
+            .expect("bench: warm JIT workload must return Int");
+
+        let mut vm = VM::new();
+        vm.load_module(module);
+        let warm = vm
+            .run()
+            .expect("bench: JIT warm-up failed")
+            .as_int()
+            .expect("bench: warm JIT workload must return Int");
+        assert_eq!(
+            warm, expected,
+            "warm-up JIT result must match interpreter oracle"
+        );
+        assert!(
+            vm.jit_compiled_count() > 0,
+            "warm execution benchmark must actually compile a JIT region"
+        );
+
+        let start = Instant::now();
+        let mut last = None;
+        for _ in 0..REPEATS {
+            last = Some(
+                vm.run()
+                    .expect("bench: warmed JIT run failed")
+                    .as_int()
+                    .expect("bench: warm JIT workload must return Int"),
+            );
+        }
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            last,
+            Some(expected),
+            "warmed JIT result must stay identical to interpreter oracle"
+        );
+        report_ab(name, REPEATS as u64, elapsed);
     }
 }
 
