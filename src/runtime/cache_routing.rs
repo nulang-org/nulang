@@ -161,6 +161,37 @@ impl CacheSlotMap {
         Ok(())
     }
 
+    /// Cancel an in-progress migration under a newer placement epoch.
+    ///
+    /// Source ownership is preserved; only the importing target metadata is
+    /// cleared. This gives the control plane a fail-closed escape hatch when a
+    /// key transfer cannot complete safely.
+    pub fn cancel_migration(
+        &mut self,
+        proposed_epoch: u64,
+        slot: u16,
+    ) -> Result<(), CachePlacementError> {
+        if proposed_epoch <= self.epoch {
+            return Err(CachePlacementError::StaleEpoch {
+                current: self.epoch,
+                proposed: proposed_epoch,
+            });
+        }
+        let migration_target = self
+            .migration_targets
+            .get_mut(slot as usize)
+            .ok_or(CachePlacementError::InvalidMigrationSlot(slot))?;
+        if migration_target.is_none() {
+            return Err(CachePlacementError::NoMigration { slot });
+        }
+
+        *migration_target = None;
+        debug_assert!(self.migration_count > 0);
+        self.migration_count -= 1;
+        self.epoch = proposed_epoch;
+        Ok(())
+    }
+
     /// Complete an in-progress migration by atomically changing ownership and
     /// clearing migration state under a newer placement epoch.
     pub fn finish_migration(
