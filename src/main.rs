@@ -2808,6 +2808,42 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 mod tests {
     use super::*;
 
+    #[test]
+    #[cfg(feature = "wasm-backend")]
+    fn wasm_behavior_sidecar_binds_canonical_wasm_bytes() {
+        let source = r#"
+            actor Counter {
+                state count: Int = 0
+                behavior inc() { self.count = self.count + 1 }
+            }
+        "#;
+        let (ast, type_checker) =
+            run_frontend(source, None, false, &[], false).expect("frontend");
+        let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
+        let mir = nulang::mir_lower::lower_module(&hir).expect("mir");
+        use nulang::backends::WasmBackend;
+        let mut backend = nulang::backends::DefaultWasmBackend;
+        let wasm = backend.compile(&mir, "test").expect("wasm");
+
+        let manifest = build_wasm_behavior_manifest(
+            source,
+            "demo",
+            "0.1.0",
+            &hir,
+            &mir,
+            &wasm,
+        )
+        .expect("behavior manifest");
+
+        assert_eq!(
+            manifest.artifact.kind,
+            nulang::behavior_manifest::BEHAVIOR_ARTIFACT_KIND_WASM_MODULE
+        );
+        assert_eq!(manifest.artifact.backend, "wasm");
+        manifest.verify_artifact_bytes(&wasm).unwrap();
+        assert!(manifest.verify_artifact_bytes(b"different").is_err());
+    }
+
     /// An actor program run through the CLI path must create real actors
     /// and deliver sent messages: with the bare standalone VM the stub
     /// spawn/send callbacks would leave the counter at 0.
