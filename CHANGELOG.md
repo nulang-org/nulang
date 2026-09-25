@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Compiler-owned host-effect source identity — 2026-09-25
+- **The experimental `nulang.host-effects/v0alpha1` descriptor now exports structured source effect/operation identity alongside canonical host IDs.** Compatibility adapters such as Nulang Cloud can generate source-name bridges from compiler-owned data instead of maintaining an independent semantic mapping.
+- **Canonical host identity remains the execution contract.** Source identity is exported for adapter generation and conformance tooling; it does not replace the versioned `effect_id` / `operation_id` pair.
+
 ### Native JIT codegen backend boundary — 2026-09-24
 - **`JitSession` no longer owns Cranelift modules or reusable Cranelift contexts.** `src/jit/native_codegen.rs` introduces `NativeCodegenBackend`, `NativeCompileRequest`, and specialization requests for scalar, typed, and SIMD lowering.
 - **`CraneliftCodegen` now exclusively owns both compiler tiers.** Fast code still uses `opt_level=none` + single-pass register allocation, optimized code still uses `opt_level=speed` + backtracking, but tier/cache orchestration only sees native entry pointers and compile success/failure.
