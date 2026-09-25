@@ -101,6 +101,8 @@ httparse = "1"
 # HTTP client (synchronous, for standalone VM)
 ureq = { version = "2", optional = true }
 
+nulang-workflow-protocol = { path = "crates/nulang-workflow-protocol" }
+
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
