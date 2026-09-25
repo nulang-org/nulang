@@ -281,6 +281,12 @@ pub struct Actor {
     turn_reductions: u32,     // Messages handled in the current scheduling turn
     pub max_reductions: u32,  // Max reductions per turn before yield (preemption)
     pub sequence: u64,        // Last persisted sequence number
+    /// Accepted workflow command currently executing or suspended.
+    ///
+    /// This is intentionally runtime state rather than completed actor state:
+    /// snapshots remain at safe boundaries until #836's replay engine can
+    /// reconstruct intermediate continuations.
+    pub workflow_activation: Option<WorkflowActivationContext>,
     /// Sentinel heap object used by the cycle detector to represent this
     /// actor as a holder of foreign references.
     cycle_sentinel: Option<*mut OrcaHeader>,
@@ -368,6 +374,34 @@ pub struct ReceiveWaitState {
     pub timed_out: bool,
 }
 
+/// Runtime replay context for one accepted workflow command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkflowActivationContext {
+    pub id: WorkflowActivationId,
+    pub next_operation_ordinal: u32,
+    pub replaying: bool,
+}
+
+impl WorkflowActivationContext {
+    pub const fn new(id: WorkflowActivationId, replaying: bool) -> Self {
+        Self {
+            id,
+            next_operation_ordinal: 0,
+            replaying,
+        }
+    }
+
+    /// Allocate the next deterministic operation identity for this activation.
+    pub fn next_operation_id(&mut self) -> WorkflowOperationId {
+        let ordinal = self.next_operation_ordinal;
+        self.next_operation_ordinal = self
+            .next_operation_ordinal
+            .checked_add(1)
+            .expect("workflow activation operation ordinal overflow");
+        self.id.operation(ordinal)
+    }
+}
+
 /// Captured VM state plus metadata for resuming a workflow step.
 #[derive(Debug)]
 pub struct SuspendedExecution {
@@ -424,6 +458,7 @@ impl Actor {
             turn_reductions: 0,
             max_reductions: 1000,
             sequence: 0,
+            workflow_activation: None,
             cycle_sentinel: None,
             suspended_execution: None,
             waiting_signal: None,

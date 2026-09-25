@@ -2054,6 +2054,7 @@ fn test_memory_store_latest_sequence() {
             1,
             JournalEntry {
                 sequence: 7,
+                activation_id: None,
                 behavior_id: 0,
                 payload: vec![],
             },
@@ -2094,6 +2095,7 @@ fn test_libsql_store_append_read_journal() {
             1,
             JournalEntry {
                 sequence: 1,
+                activation_id: None,
                 behavior_id: 0,
                 payload: vec![PersistedValue::Int(10)],
             },
@@ -2104,6 +2106,7 @@ fn test_libsql_store_append_read_journal() {
             1,
             JournalEntry {
                 sequence: 2,
+                activation_id: None,
                 behavior_id: 1,
                 payload: vec![PersistedValue::Int(20)],
             },
@@ -2137,6 +2140,7 @@ fn test_libsql_store_latest_sequence() {
             1,
             JournalEntry {
                 sequence: 7,
+                activation_id: None,
                 behavior_id: 0,
                 payload: vec![],
             },
@@ -2165,6 +2169,7 @@ fn test_libsql_store_clear() {
             1,
             JournalEntry {
                 sequence: 2,
+                activation_id: None,
                 behavior_id: 0,
                 payload: vec![],
             },
@@ -2201,6 +2206,7 @@ fn test_libsql_store_persists_to_disk() {
                 1,
                 JournalEntry {
                     sequence: 2,
+                    activation_id: None,
                     behavior_id: 0,
                     payload: vec![PersistedValue::Bool(true)],
                 },
@@ -3453,7 +3459,29 @@ fn test_workflow_actor_step_event_and_checkpoint() {
 
     let events = rt.persistence.read_workflow_events(actor_id);
     assert_eq!(events.len(), 2);
-    assert!(matches!(&events[1], WorkflowEvent::StepCompleted { .. }));
+    let activation_id = match &events[1] {
+        WorkflowEvent::StepCompleted {
+            activation_id: Some(id),
+            ..
+        } => *id,
+        other => panic!("expected activation-aware StepCompleted, got {other:?}"),
+    };
+    assert_eq!(activation_id.actor_id, actor_id);
+
+    let journal = rt.persistence.read_journal(actor_id);
+    let activation_command = journal
+        .iter()
+        .find(|entry| entry.activation_id == Some(activation_id))
+        .expect("accepted workflow command must carry activation id");
+    assert_eq!(activation_command.sequence, activation_id.command_sequence);
+    assert!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .workflow_activation
+            .is_none(),
+        "terminal event must close the live activation context"
+    );
 
     let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
     assert_eq!(
@@ -7477,4 +7505,85 @@ fn workflow_timer_fire_is_not_delivered_when_durable_fire_append_fails() {
     );
 
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn workflow_activation_operation_ids_are_stable_and_monotonic() {
+    let id = WorkflowActivationId::new(42, 7);
+    let mut context = WorkflowActivationContext::new(id, false);
+
+    assert_eq!(context.next_operation_id(), id.operation(0));
+    assert_eq!(context.next_operation_id(), id.operation(1));
+    assert_eq!(context.next_operation_ordinal, 2);
+}
+
+#[test]
+fn workflow_activation_analysis_finds_unfinished_accepted_command() {
+    let actor_id = 77;
+    let first = WorkflowActivationId::new(actor_id, 2);
+    let second = WorkflowActivationId::new(actor_id, 4);
+    let journal = vec![
+        JournalEntry {
+            sequence: 2,
+            activation_id: Some(first),
+            behavior_id: 0,
+            payload: vec![],
+        },
+        JournalEntry {
+            sequence: 3,
+            activation_id: None,
+            behavior_id: 99,
+            payload: vec![],
+        },
+        JournalEntry {
+            sequence: 4,
+            activation_id: Some(second),
+            behavior_id: 1,
+            payload: vec![PersistedValue::Int(9)],
+        },
+    ];
+    let events = vec![WorkflowEvent::StepCompleted {
+        sequence: 5,
+        activation_id: Some(first),
+        step_name: "first".to_string(),
+    }];
+
+    let records = super::workflow::analyze_workflow_activations(actor_id, &journal, &events)
+        .expect("activation-aware history should be unambiguous");
+
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].id, first);
+    assert_eq!(
+        records[0].terminal,
+        Some(WorkflowActivationTerminal::Completed { event_sequence: 5 })
+    );
+    assert_eq!(records[1].id, second);
+    assert_eq!(records[1].command.behavior_id, 1);
+    assert_eq!(records[1].terminal, None);
+}
+
+#[test]
+fn workflow_activation_analysis_rejects_untagged_terminal_after_upgrade() {
+    let actor_id = 88;
+    let id = WorkflowActivationId::new(actor_id, 10);
+    let journal = vec![JournalEntry {
+        sequence: 10,
+        activation_id: Some(id),
+        behavior_id: 0,
+        payload: vec![],
+    }];
+    let events = vec![WorkflowEvent::StepCompleted {
+        sequence: 11,
+        activation_id: None,
+        step_name: "ambiguous".to_string(),
+    }];
+
+    assert!(matches!(
+        super::workflow::analyze_workflow_activations(actor_id, &journal, &events),
+        Err(
+            WorkflowActivationAnalysisError::UntaggedTerminalAfterActivationUpgrade {
+                event_sequence: 11
+            }
+        )
+    ));
 }

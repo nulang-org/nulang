@@ -154,10 +154,49 @@ pub struct ActorSnapshot {
     pub authority_tokens: BTreeSet<String>,
 }
 
+/// Stable identity of one accepted workflow command activation.
+///
+/// The command's journal sequence is the stable activation identity within one
+/// actor. Pairing it with the actor id makes the identity globally meaningful
+/// for replay-sensitive operations and durable-effect ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowActivationId {
+    pub actor_id: u64,
+    pub command_sequence: u64,
+}
+
+impl WorkflowActivationId {
+    pub const fn new(actor_id: u64, command_sequence: u64) -> Self {
+        Self {
+            actor_id,
+            command_sequence,
+        }
+    }
+
+    pub const fn operation(self, ordinal: u32) -> WorkflowOperationId {
+        WorkflowOperationId {
+            activation: self,
+            ordinal,
+        }
+    }
+}
+
+/// Stable identity of one replay-sensitive operation inside an activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowOperationId {
+    pub activation: WorkflowActivationId,
+    pub ordinal: u32,
+}
+
 /// A journal entry records a message delivered to an actor.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct JournalEntry {
     pub sequence: u64,
+    /// Present only when this message is the accepted user command that opens a
+    /// workflow activation. Missing on legacy records and non-workflow/internal
+    /// runtime messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_id: Option<WorkflowActivationId>,
     pub behavior_id: u16,
     pub payload: Vec<PersistedValue>,
 }
@@ -196,7 +235,12 @@ pub enum WorkflowEvent {
         state: Vec<PersistedValue>,
     },
     /// A workflow step completed successfully.
-    StepCompleted { sequence: u64, step_name: String },
+    StepCompleted {
+        sequence: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activation_id: Option<WorkflowActivationId>,
+        step_name: String,
+    },
     /// A timer was set for a workflow.
     TimerSet {
         sequence: u64,
@@ -225,6 +269,8 @@ pub enum WorkflowEvent {
     /// silent — exit 0, no diagnostic).
     StepFailed {
         sequence: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activation_id: Option<WorkflowActivationId>,
         step_name: String,
         error: String,
     },
@@ -250,6 +296,23 @@ impl WorkflowEvent {
             | WorkflowEvent::StepFailed { sequence, .. }
             | WorkflowEvent::Custom { sequence, .. } => *sequence,
         }
+    }
+
+    /// Activation closed by this terminal event, when emitted by an
+    /// activation-aware runtime. Legacy terminal events return `None`.
+    pub fn terminal_activation_id(&self) -> Option<WorkflowActivationId> {
+        match self {
+            WorkflowEvent::StepCompleted { activation_id, .. }
+            | WorkflowEvent::StepFailed { activation_id, .. } => *activation_id,
+            _ => None,
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            WorkflowEvent::StepCompleted { .. } | WorkflowEvent::StepFailed { .. }
+        )
     }
 }
 
@@ -1988,6 +2051,7 @@ impl PersistenceStore for LibsqlStore {
                         };
                         entries.push(JournalEntry {
                             sequence: seq as u64,
+                            activation_id: None,
                             behavior_id: bid as u16,
                             payload,
                         });
@@ -2730,6 +2794,7 @@ impl PersistenceStore for PostgresStore {
                 let payload: Vec<PersistedValue> = serde_json::from_str(&payload_json).ok()?;
                 Some(JournalEntry {
                     sequence: seq as u64,
+                    activation_id: None,
                     behavior_id: bid as u16,
                     payload,
                 })
@@ -3003,6 +3068,7 @@ mod json_file_store_tests {
                 1,
                 JournalEntry {
                     sequence: 1,
+                    activation_id: None,
                     behavior_id: 0,
                     payload: vec![PersistedValue::Int(10)],
                 },
@@ -3013,6 +3079,7 @@ mod json_file_store_tests {
                 1,
                 JournalEntry {
                     sequence: 2,
+                    activation_id: None,
                     behavior_id: 1,
                     payload: vec![PersistedValue::Int(20)],
                 },
@@ -3047,6 +3114,7 @@ mod json_file_store_tests {
                 1,
                 JournalEntry {
                     sequence: 7,
+                    activation_id: None,
                     behavior_id: 0,
                     payload: vec![],
                 },
@@ -3076,6 +3144,7 @@ mod json_file_store_tests {
                 1,
                 JournalEntry {
                     sequence: 2,
+                    activation_id: None,
                     behavior_id: 0,
                     payload: vec![],
                 },
@@ -3112,6 +3181,7 @@ mod json_file_store_tests {
                     1,
                     JournalEntry {
                         sequence: 2,
+                        activation_id: None,
                         behavior_id: 0,
                         payload: vec![PersistedValue::Bool(true)],
                     },
@@ -3284,6 +3354,7 @@ mod rocksdb_store_tests {
                 1,
                 JournalEntry {
                     sequence: 1,
+                    activation_id: None,
                     behavior_id: 0,
                     payload: vec![PersistedValue::Int(10)],
                 },
@@ -3294,6 +3365,7 @@ mod rocksdb_store_tests {
                 1,
                 JournalEntry {
                     sequence: 2,
+                    activation_id: None,
                     behavior_id: 1,
                     payload: vec![PersistedValue::Int(20)],
                 },
@@ -3328,6 +3400,7 @@ mod rocksdb_store_tests {
                 1,
                 JournalEntry {
                     sequence: 7,
+                    activation_id: None,
                     behavior_id: 0,
                     payload: vec![],
                 },
@@ -3357,6 +3430,7 @@ mod rocksdb_store_tests {
                 1,
                 JournalEntry {
                     sequence: 2,
+                    activation_id: None,
                     behavior_id: 0,
                     payload: vec![],
                 },
@@ -3393,6 +3467,7 @@ mod rocksdb_store_tests {
                     1,
                     JournalEntry {
                         sequence: 2,
+                        activation_id: None,
                         behavior_id: 0,
                         payload: vec![PersistedValue::Bool(true)],
                     },
@@ -3481,6 +3556,7 @@ mod postgres_store_tests {
                 actor_id,
                 JournalEntry {
                     sequence: 1,
+                    activation_id: None,
                     behavior_id: 0,
                     payload: vec![PersistedValue::Int(10)],
                 },
@@ -3491,6 +3567,7 @@ mod postgres_store_tests {
                 actor_id,
                 JournalEntry {
                     sequence: 2,
+                    activation_id: None,
                     behavior_id: 1,
                     payload: vec![PersistedValue::Int(20)],
                 },
@@ -3529,6 +3606,7 @@ mod postgres_store_tests {
                 actor_id,
                 JournalEntry {
                     sequence: 7,
+                    activation_id: None,
                     behavior_id: 0,
                     payload: vec![],
                 },
@@ -3562,6 +3640,7 @@ mod postgres_store_tests {
                 actor_id,
                 JournalEntry {
                     sequence: 2,
+                    activation_id: None,
                     behavior_id: 0,
                     payload: vec![],
                 },
@@ -3655,12 +3734,14 @@ mod durable_transition_tests {
             expected_previous_sequence: sequence - 1,
             command: Some(JournalEntry {
                 sequence,
+                activation_id: None,
                 behavior_id: 7,
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }),
             snapshot: Some(snapshot(actor_id, sequence, &[("count", sequence as i64)])),
             workflow_events: vec![WorkflowEvent::StepCompleted {
                 sequence,
+                activation_id: None,
                 step_name: format!("step-{sequence}"),
             }],
             domain_events: vec![EventEntry {
@@ -3816,6 +3897,7 @@ mod libsql_atomic_transition_tests {
             expected_previous_sequence: sequence - 1,
             command: Some(JournalEntry {
                 sequence,
+                activation_id: None,
                 behavior_id: 3,
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }),
@@ -3823,6 +3905,7 @@ mod libsql_atomic_transition_tests {
             workflow_events: vec![
                 WorkflowEvent::StepCompleted {
                     sequence,
+                    activation_id: None,
                     step_name: "persist".to_string(),
                 },
                 WorkflowEvent::Custom {

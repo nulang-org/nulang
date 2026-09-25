@@ -124,6 +124,9 @@ pub use resp_cache::*;
 pub use scheduler::*;
 pub use supervisor::*;
 pub use timer::*;
+pub use workflow::{
+    WorkflowActivationAnalysisError, WorkflowActivationRecord, WorkflowActivationTerminal,
+};
 
 use crate::types::{ExitReason, NuError, Span, VmSuspension};
 use crate::vm::Value;
@@ -1139,6 +1142,22 @@ impl Runtime {
         workflow::signal_workflow(self, actor_id, name, payload)
     }
 
+    /// Inspect activation-aware workflow history without executing replay.
+    pub fn workflow_activation_records(
+        &self,
+        actor_id: u64,
+    ) -> Result<Vec<WorkflowActivationRecord>, WorkflowActivationAnalysisError> {
+        let journal = self.persistence.read_journal(actor_id);
+        let events = self.persistence.read_workflow_events(actor_id);
+        workflow::analyze_workflow_activations(actor_id, &journal, &events)
+    }
+
+    /// Allocate the next deterministic replay identity inside the live workflow
+    /// activation, if one exists.
+    pub fn next_workflow_operation_id(&mut self, actor_id: u64) -> Option<WorkflowOperationId> {
+        workflow::next_workflow_operation_id(self, actor_id)
+    }
+
     /// Register a read-only query handler on a workflow actor.
     ///
     /// The handler is a function/closure value invoked by `query_workflow`
@@ -1667,14 +1686,7 @@ impl Runtime {
                             actor.set_state_field("step_index", Value::int(n + 1));
                         }
                     }
-                    let seq = self.next_sequence(actor_id);
-                    let _ = self.persistence.append_workflow_event(
-                        actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            step_name,
-                        },
-                    );
+                    let _ = workflow::append_step_completed(self, actor_id, step_name);
                     self.checkpoint_actor(actor_id);
                 }
             }
@@ -2017,6 +2029,7 @@ impl Runtime {
                     actor_id,
                     JournalEntry {
                         sequence: seq,
+                        activation_id: None,
                         behavior_id,
                         payload,
                     },
@@ -3717,6 +3730,7 @@ impl Runtime {
                         actor_id,
                         JournalEntry {
                             sequence: seq,
+                            activation_id: None,
                             behavior_id: msg.behavior_id,
                             payload,
                         },
@@ -3753,6 +3767,7 @@ impl Runtime {
                         actor_id,
                         JournalEntry {
                             sequence: seq,
+                            activation_id: None,
                             behavior_id: msg.behavior_id,
                             payload,
                         },
@@ -3882,40 +3897,55 @@ impl Runtime {
                 }
             }
 
-            let mut processed = false;
-            if self.has_native_handler(actor_id, behavior_idx) {
-                // Journal the message before handling so recovery can replay it.
-                if self.actor_is_persistent(actor_id) {
-                    let seq = self.next_sequence(actor_id);
-                    let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                    let _ = self.persistence.append_journal(
-                        actor_id,
-                        JournalEntry {
-                            sequence: seq,
-                            behavior_id: msg.behavior_id,
-                            payload,
-                        },
-                    );
+            let has_native_handler = self.has_native_handler(actor_id, behavior_idx);
+            let has_bytecode_handler = self.has_bytecode_handler(actor_id, behavior_idx);
+
+            // Journal one accepted command before either backend runs. Workflow
+            // user steps additionally open a stable activation keyed by this
+            // command sequence. Internal runtime behaviors remain ordinary
+            // journal entries and do not open activations.
+            if self.actor_is_persistent(actor_id) && (has_native_handler || has_bytecode_handler) {
+                let seq = self.next_sequence(actor_id);
+                let activation_id = if self.actor_is_workflow(actor_id)
+                    && !self.is_internal_behavior(actor_id, behavior_idx)
+                {
+                    Some(WorkflowActivationId::new(actor_id, seq))
+                } else {
+                    None
+                };
+                let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
+                let append_result = self.persistence.append_journal(
+                    actor_id,
+                    JournalEntry {
+                        sequence: seq,
+                        activation_id,
+                        behavior_id: msg.behavior_id,
+                        payload,
+                    },
+                );
+                if let Some(id) = activation_id {
+                    if let Err(error) = append_result {
+                        tracing::error!(
+                            actor_id,
+                            command_sequence = seq,
+                            %error,
+                            "nulang-workflow: refusing to execute activation whose command was not durably accepted"
+                        );
+                        self.current_actor = None;
+                        return;
+                    }
+                    workflow::begin_workflow_activation(self, id, false);
                 }
+            }
+
+            let mut processed = false;
+            if has_native_handler {
                 processed = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload);
                 if processed {
                     self.checkpoint_actor(actor_id);
                 }
             }
-            if !processed && self.has_bytecode_handler(actor_id, behavior_idx) {
-                // Journal before executing bytecode as well.
-                if self.actor_is_persistent(actor_id) {
-                    let seq = self.next_sequence(actor_id);
-                    let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                    let _ = self.persistence.append_journal(
-                        actor_id,
-                        JournalEntry {
-                            sequence: seq,
-                            behavior_id: msg.behavior_id,
-                            payload,
-                        },
-                    );
-                }
+            if !processed && has_bytecode_handler {
                 let payload = msg.payload.clone();
                 // Enable non-blocking LLM suspension for this
                 // scheduler-driven behavior invocation. Nested synchronous
@@ -3947,15 +3977,12 @@ impl Runtime {
                         // run saga compensations for previously completed
                         // steps in reverse order.
                         if self.actor_is_workflow(actor_id) {
-                            let seq = self.next_sequence(actor_id);
                             let step_name = self.step_name_for(actor_id, behavior_idx);
-                            let _ = self.persistence.append_workflow_event(
+                            let _ = workflow::append_step_failed(
+                                self,
                                 actor_id,
-                                WorkflowEvent::StepFailed {
-                                    sequence: seq,
-                                    step_name,
-                                    error: format!("{}", e),
-                                },
+                                step_name,
+                                format!("{}", e),
                             );
                             self.run_saga_compensation(actor_id, behavior_idx);
                         }
@@ -3967,15 +3994,8 @@ impl Runtime {
                 && self.actor_is_workflow(actor_id)
                 && !self.is_internal_behavior(actor_id, behavior_idx)
             {
-                let seq = self.next_sequence(actor_id);
                 let step_name = self.step_name_for(actor_id, behavior_idx);
-                let _ = self.persistence.append_workflow_event(
-                    actor_id,
-                    WorkflowEvent::StepCompleted {
-                        sequence: seq,
-                        step_name,
-                    },
-                );
+                let _ = workflow::append_step_completed(self, actor_id, step_name);
                 // Synthetic parallel steps do not increment step_index in their
                 // bytecode (so signal-waiting branches do not double-increment);
                 // advance it here when the step completes.
@@ -4490,13 +4510,10 @@ impl Runtime {
                                 actor.set_state_field("step_index", Value::int(n + 1));
                             }
                         }
-                        let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        let _ = workflow::append_step_completed(
+                            &mut *self_ptr,
                             actor_id,
-                            crate::runtime::WorkflowEvent::StepCompleted {
-                                sequence: seq,
-                                step_name: suspended.step_name.clone(),
-                            },
+                            suspended.step_name.clone(),
                         );
                         (*self_ptr).checkpoint_actor(actor_id);
                     }
@@ -4583,13 +4600,10 @@ impl Runtime {
                                 actor.set_state_field("step_index", Value::int(n + 1));
                             }
                         }
-                        let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        let _ = workflow::append_step_completed(
+                            &mut *self_ptr,
                             actor_id,
-                            WorkflowEvent::StepCompleted {
-                                sequence: seq,
-                                step_name: suspended.step_name,
-                            },
+                            suspended.step_name,
                         );
                         (*self_ptr).checkpoint_actor(actor_id);
                     }
