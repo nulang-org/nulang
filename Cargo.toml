@@ -36,7 +36,11 @@ autobenches = false
 language-version = "1.0.0-frozen"
 
 [features]
-default = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
+# Keep the historical batteries-included default during the stabilization
+# window, but give it an explicit name so release/CI consumers can pin the
+# compatibility profile before the default is eventually minimized.
+default = ["full"]
+full = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
 # Cranelift-backed tiered JIT plus the current native/AOT backend.
 native-codegen = [
     "dep:cranelift",

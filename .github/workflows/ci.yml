@@ -301,6 +301,11 @@ jobs:
           cargo install cargo-audit --locked
           cargo audit
 
+      # Named batteries-included compatibility profile. Run it with
+      # defaults disabled so CI proves the aggregate is self-contained.
+      - name: Check explicit full profile
+        run: cargo check --locked --all-targets --no-default-features --features full
+
       # All-features compilation check.
       - name: Check all features
         run: cargo check --locked --all-features
