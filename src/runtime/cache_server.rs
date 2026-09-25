@@ -27,7 +27,7 @@ use super::resp_cache::{CacheCommandError, CacheCommandTarget};
 use super::cache_dispatch::{
     CacheDispatchConfigError, CacheDispatchWake, CacheDispatcher, CacheShardInbox,
 };
-use super::cache_pipeline::{CachePipelineError, CacheResponsePipeline};
+use super::cache_pipeline::{CacheAskingUpdate, CachePipelineError, CacheResponsePipeline};
 
 const LISTENER_TOKEN: Token = Token(0);
 const WAKE_TOKEN: Token = Token(1);
@@ -138,6 +138,7 @@ struct CacheConnection {
     output: Vec<u8>,
     output_start: usize,
     pipeline: CacheResponsePipeline,
+    asking: bool,
     writable_interest: bool,
 }
 
@@ -150,6 +151,7 @@ impl CacheConnection {
             output: Vec::with_capacity(4096),
             output_start: 0,
             pipeline: CacheResponsePipeline::new(max_pipeline_depth),
+            asking: false,
             writable_interest: false,
         }
     }
@@ -717,17 +719,24 @@ impl CacheShardServer {
             }
 
             let input = &connection.input[connection.input_start..];
-            let Some(submit) = connection.pipeline.submit_frame(
+            let Some(submit) = connection.pipeline.submit_frame_with_asking(
                 &self.dispatcher,
                 &mut self.store,
                 input,
                 self.clock.now_ms(),
                 &mut connection.output,
+                connection.asking,
             )?
             else {
                 connection.compact_input();
                 return Ok(());
             };
+
+            match submit.asking_update {
+                CacheAskingUpdate::Unchanged => {}
+                CacheAskingUpdate::Enable => connection.asking = true,
+                CacheAskingUpdate::Consume => connection.asking = false,
+            }
 
             if submit.remote.is_some() {
                 return Err(CachePipelineError::Dispatch(
@@ -867,7 +876,7 @@ mod tests {
     use super::super::cache_cluster::{CacheAdvertisedEndpoint, CacheEndpointMap};
     use super::super::cache_dispatch::CacheDispatchChannels;
     use super::super::cache_persistence::{recover_cache, CacheWal};
-    use super::super::cache_routing::CacheSlotMap;
+    use super::super::cache_routing::{CacheShardOwner, CacheSlotMap};
     use super::*;
     use std::net::TcpStream as StdTcpStream;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -1030,6 +1039,64 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn asking_authorizes_exactly_one_importing_slot_command_per_connection() {
+        let key = b"migrate-key";
+        let slot = crate::runtime::redis_slot(key);
+        let source = CacheShardOwner {
+            node_id: 1,
+            shard: 0,
+        };
+        let target = CacheShardOwner {
+            node_id: 2,
+            shard: 0,
+        };
+
+        let mut placement = CacheSlotMap::new_local(source.node_id, 1).unwrap();
+        placement.begin_migration(1, slot, target).unwrap();
+
+        let (channels, mut inboxes) = CacheDispatchChannels::new(1, 32).unwrap();
+        let mut endpoints = CacheEndpointMap::new();
+        endpoints.insert(source, CacheAdvertisedEndpoint::new("source", 7000));
+        endpoints.insert(target, CacheAdvertisedEndpoint::new("target", 7001));
+        let dispatcher = CacheDispatcher::new(target.node_id, target.shard, placement, channels)
+            .unwrap()
+            .with_cluster_redirects(endpoints);
+
+        let mut server = CacheShardServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            dispatcher,
+            inboxes.remove(0),
+            CacheStore::new(),
+            CacheServerConfig::default(),
+            CacheServerClock::new(),
+        )
+        .unwrap();
+
+        let address = server.local_addr().unwrap();
+        let mut client = StdTcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let request = [
+            b"*1\r\n$6\r\nASKING\r\n".as_slice(),
+            b"*3\r\n$3\r\nSET\r\n$11\r\nmigrate-key\r\n$5\r\nvalue\r\n".as_slice(),
+            b"*2\r\n$3\r\nGET\r\n$11\r\nmigrate-key\r\n".as_slice(),
+        ]
+        .concat();
+        client.write_all(&request).unwrap();
+
+        for _ in 0..12 {
+            server.poll_once(Some(Duration::from_millis(10))).unwrap();
+        }
+
+        let expected = format!("+OK\r\n+OK\r\n-MOVED {slot} source:7000\r\n");
+        let mut response = vec![0u8; expected.len()];
+        client.read_exact(&mut response).unwrap();
+        assert_eq!(response, expected.as_bytes());
     }
 
     #[test]

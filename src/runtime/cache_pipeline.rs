@@ -40,10 +40,18 @@ pub struct CacheSequencedRemoteRequest {
     pub request: CacheRemoteRequest,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheAskingUpdate {
+    Unchanged,
+    Enable,
+    Consume,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachePipelineSubmit {
     pub consumed: usize,
     pub remote: Option<CacheSequencedRemoteRequest>,
+    pub asking_update: CacheAskingUpdate,
 }
 
 enum PendingResponse {
@@ -114,6 +122,18 @@ impl CacheResponsePipeline {
         now_ms: u64,
         socket_out: &mut Vec<u8>,
     ) -> Result<Option<CachePipelineSubmit>, CachePipelineError> {
+        self.submit_frame_with_asking(dispatcher, store, input, now_ms, socket_out, false)
+    }
+
+    pub fn submit_frame_with_asking<T: CacheCommandTarget>(
+        &mut self,
+        dispatcher: &CacheDispatcher,
+        store: &mut T,
+        input: &[u8],
+        now_ms: u64,
+        socket_out: &mut Vec<u8>,
+        asking: bool,
+    ) -> Result<Option<CachePipelineSubmit>, CachePipelineError> {
         self.collect_ready_local()?;
         self.drain_ready(socket_out)?;
 
@@ -123,12 +143,33 @@ impl CacheResponsePipeline {
 
         self.direct_scratch.clear();
         let Some(outcome) =
-            dispatcher.dispatch_frame(store, input, now_ms, &mut self.direct_scratch)?
+            dispatcher.dispatch_frame_with_asking(
+                store,
+                input,
+                now_ms,
+                &mut self.direct_scratch,
+                asking,
+            )?
         else {
             return Ok(None);
         };
 
         let submit = match outcome {
+            CacheDispatchOutcome::AskingEnabled { consumed } => {
+                if self.pending.is_empty() {
+                    socket_out.extend_from_slice(&self.direct_scratch);
+                } else {
+                    self.pending_bytes =
+                        self.pending_bytes.saturating_add(self.direct_scratch.len());
+                    self.pending
+                        .push_back(PendingResponse::Ready(self.direct_scratch.clone()));
+                }
+                CachePipelineSubmit {
+                    consumed,
+                    remote: None,
+                    asking_update: CacheAskingUpdate::Enable,
+                }
+            }
             CacheDispatchOutcome::Executed { consumed }
             | CacheDispatchOutcome::Redirected { consumed, .. } => {
                 if self.pending.is_empty() {
@@ -142,6 +183,11 @@ impl CacheResponsePipeline {
                 CachePipelineSubmit {
                     consumed,
                     remote: None,
+                    asking_update: if asking {
+                        CacheAskingUpdate::Consume
+                    } else {
+                        CacheAskingUpdate::Unchanged
+                    },
                 }
             }
             CacheDispatchOutcome::LocalQueued {
@@ -152,6 +198,11 @@ impl CacheResponsePipeline {
                 CachePipelineSubmit {
                     consumed,
                     remote: None,
+                    asking_update: if asking {
+                        CacheAskingUpdate::Consume
+                    } else {
+                        CacheAskingUpdate::Unchanged
+                    },
                 }
             }
             CacheDispatchOutcome::Remote { consumed, request } => {
@@ -165,6 +216,11 @@ impl CacheResponsePipeline {
                         request_id,
                         request,
                     }),
+                    asking_update: if asking {
+                        CacheAskingUpdate::Consume
+                    } else {
+                        CacheAskingUpdate::Unchanged
+                    },
                 }
             }
         };

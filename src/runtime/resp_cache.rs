@@ -31,6 +31,14 @@ pub enum RespCommandSlot {
     CrossSlot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheCommandKeyPresence {
+    NoKeys,
+    AllPresent,
+    AllMissing,
+    Mixed,
+}
+
 #[derive(Debug)]
 pub enum CacheCommandError {
     Write(CacheWriteError),
@@ -275,6 +283,84 @@ pub fn command_slot(command: RespCommand<'_>) -> RespCommandSlot {
     }
 
     RespCommandSlot::Unkeyed
+}
+
+pub fn command_key_presence<T: CacheCommandTarget>(
+    store: &mut T,
+    command: RespCommand<'_>,
+    now_ms: u64,
+) -> CacheCommandKeyPresence {
+    let name = command.name();
+
+    if name.eq_ignore_ascii_case(b"GET")
+        || name.eq_ignore_ascii_case(b"SET")
+        || name.eq_ignore_ascii_case(b"INCR")
+        || name.eq_ignore_ascii_case(b"EXPIRE")
+        || name.eq_ignore_ascii_case(b"TTL")
+    {
+        return command
+            .arg0()
+            .map(|key| single_key_presence(store.exists(key, now_ms)))
+            .unwrap_or(CacheCommandKeyPresence::NoKeys);
+    }
+
+    if name.eq_ignore_ascii_case(b"DEL")
+        || name.eq_ignore_ascii_case(b"EXISTS")
+        || name.eq_ignore_ascii_case(b"MGET")
+    {
+        return key_presence(store, command.args(), now_ms);
+    }
+
+    if name.eq_ignore_ascii_case(b"MSET") {
+        let mut args = command.args();
+        let mut present = 0usize;
+        let mut missing = 0usize;
+        while let Some(key) = args.next() {
+            let _value = args.next();
+            if store.exists(key, now_ms) {
+                present += 1;
+            } else {
+                missing += 1;
+            }
+        }
+        return summarize_presence(present, missing);
+    }
+
+    CacheCommandKeyPresence::NoKeys
+}
+
+fn single_key_presence(present: bool) -> CacheCommandKeyPresence {
+    if present {
+        CacheCommandKeyPresence::AllPresent
+    } else {
+        CacheCommandKeyPresence::AllMissing
+    }
+}
+
+fn key_presence<T: CacheCommandTarget>(
+    store: &mut T,
+    keys: RespArgs<'_>,
+    now_ms: u64,
+) -> CacheCommandKeyPresence {
+    let mut present = 0usize;
+    let mut missing = 0usize;
+    for key in keys {
+        if store.exists(key, now_ms) {
+            present += 1;
+        } else {
+            missing += 1;
+        }
+    }
+    summarize_presence(present, missing)
+}
+
+fn summarize_presence(present: usize, missing: usize) -> CacheCommandKeyPresence {
+    match (present, missing) {
+        (0, 0) => CacheCommandKeyPresence::NoKeys,
+        (_, 0) => CacheCommandKeyPresence::AllPresent,
+        (0, _) => CacheCommandKeyPresence::AllMissing,
+        _ => CacheCommandKeyPresence::Mixed,
+    }
 }
 
 fn route_key_args(mut keys: RespArgs<'_>) -> RespCommandSlot {

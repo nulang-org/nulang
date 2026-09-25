@@ -249,6 +249,18 @@ candidate is also rejected so an uncommitted tail cannot become visible after
 failover. Such a candidate must first be reconstructed to the exact committed
 state.
 
+Live slot migration now uses Redis-compatible ASK/ASKING semantics without
+changing authoritative ownership prematurely. Beginning migration installs a
+target under a newer placement epoch while leaving the source as owner.
+Commands for keys still present on the source execute there; commands whose
+keys are fully absent receive ASK to the importing target. Mixed multi-key
+requests receive TRYAGAIN instead of being split across owners. The importing
+target still returns MOVED unless that client connection issued ASKING; ASKING
+authorization is consumed after exactly one complete command. Final cutover
+requires another newer placement epoch and atomically changes ownership to the
+target while clearing migration state. Generic placement updates are forbidden
+from overwriting a slot while its migration state is active.
+
 Transport integration remains follow-up work. The default cache path continues
 to run without WAL, replication, or consensus work.
 
@@ -288,15 +300,15 @@ surface.
 1. Add a multi-shard server builder that reserves/binds advertised endpoints,
    shares one `CacheServerClock`, pins reactor threads when requested, and
    starts/stops the shard set as one service.
-2. Add ASK/ASKING and migration-state redirects when live slot migration is
-   implemented.
+2. Connect migration state to the key-transfer transport and expose migration
+   progress/cutover through the cluster control plane.
 3. Add a separate transparent proxy endpoint only for non-cluster clients;
    keep the per-shard production listeners redirect-only.
 4. Connect remote transparent handoffs to a cache-specific cluster transport.
 5. Add asynchronous snapshot/compaction so periodic checkpoints do not block
    the shard reactor.
 6. Connect replication/ack/bootstrap messages to a cache transport and expose
-   the promotion fence through the cluster control plane.
+   promotion plus migration cutover through the cluster control plane.
 7. Add packed aggregate structures, then expand RESP compatibility and add
    Nulang-native leases, locks, semaphores,
    fencing tokens, queues, and stored functions where they fit the product
