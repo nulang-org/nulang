@@ -135,7 +135,6 @@ use super::{
     BytecodeRuntimeCallbacks, Runtime,
 };
 use crate::primitives::ActorRole;
-use crate::runtime::persistence::WorkflowEvent;
 use crate::vm::Value;
 
 /// Drain completed background LLM calls and resume any actors waiting for
@@ -466,22 +465,14 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                 if (*self_ptr).actor_is_workflow(actor_id) {
                     if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                         actor.waiting_signal = None;
-                        if let Some(n) =
-                            actor.get_state_field("step_index").and_then(|v| v.as_int())
-                        {
-                            actor.set_state_field("step_index", Value::int(n + 1));
-                        }
                     }
-                    let seq = (*self_ptr).next_sequence(actor_id);
-                    let _ = (*self_ptr).persistence.append_workflow_event(
+                    super::workflow::complete_workflow_step(
+                        &mut *self_ptr,
                         actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            activation: suspended.activation,
-                            step_name: suspended.step_name,
-                        },
+                        suspended.activation,
+                        suspended.step_name,
+                        true,
                     );
-                    (*self_ptr).checkpoint_actor(actor_id);
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
