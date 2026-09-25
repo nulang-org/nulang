@@ -5,6 +5,11 @@
 - **Tiered JIT stops before `INeg` for now.** The interpreter remains authoritative for dynamic unary-negation type errors and overflow until the JIT has an explicit runtime-error propagation channel.
 - **Differential regressions cover the nightly failures.** Tuple/function/bool operands and negative-exponent/nil paths are pinned by focused cross-backend tests.
 
+### WASM type-directed float arithmetic parity — 2026-09-25
+- **WASM now preserves the bytecode backend's F* arithmetic choice.** Statically-float MIR arithmetic normalizes tagged runtime fallback values to the same defaults used by `FAdd/FSub/FMul/FDiv/FMod/FPow` before invoking the existing host arithmetic ABI.
+- **No Cloud host ABI change is required.** Float normalization is emitted into guest WASM, preserving the existing import set and function indices.
+- **The nightly zero-division regression is pinned.** `-(0.1 + 1.0 / 0.0)` remains `-0.1`: `FDiv` yields nil, `FAdd` treats nil as `0.0`, then `FNeg` negates the float.
+
 ### Fail-closed WASM workflow admission — 2026-09-25
 - **The canonical WASM backend now rejects workflow declarations until durable workflow semantics are implemented there.** Previously simple workflows could compile to WASM even though the backend did not provide the bytecode runtime's durable step journal, signal suspension/resume, crash recovery, or saga compensation; only individual unsupported operations such as `Signal.wait` failed loudly.
 - **This is an integrity gate, not a workflow deprecation.** Bytecode/native workflows remain available while WASM parity is implemented, and Cloud admission can no longer mistake partial actor emulation for durable workflow execution.
