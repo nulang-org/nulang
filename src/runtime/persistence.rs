@@ -189,7 +189,18 @@ fn default_event_value() -> PersistedValue {
 ///
 /// The command journal sequence is allocated before user code executes and
 /// remains stable across suspension, replay, and terminal workflow events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct WorkflowActivationId {
     pub actor_id: u64,
     pub command_sequence: u64,
@@ -201,6 +212,51 @@ impl WorkflowActivationId {
             actor_id,
             command_sequence,
         }
+    }
+
+    pub const fn operation(self, ordinal: u32) -> WorkflowOperationId {
+        WorkflowOperationId::new(self, ordinal)
+    }
+}
+
+/// Stable identity of one replay-sensitive operation within a workflow activation.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct WorkflowOperationId {
+    pub activation: WorkflowActivationId,
+    pub ordinal: u32,
+}
+
+impl WorkflowOperationId {
+    pub const fn new(activation: WorkflowActivationId, ordinal: u32) -> Self {
+        Self {
+            activation,
+            ordinal,
+        }
+    }
+
+    /// Derive the durable external-effect identity for this operation.
+    pub fn durable_effect_id(self, effect_operation: &str) -> DurableEffectId {
+        let execution_key = format!(
+            "workflow-command:{}",
+            self.activation.command_sequence
+        );
+        DurableEffectId::derive(
+            self.activation.actor_id,
+            &execution_key,
+            self.ordinal,
+            effect_operation,
+        )
     }
 }
 
@@ -227,6 +283,8 @@ pub enum WorkflowEvent {
     /// A timer was set for a workflow.
     TimerSet {
         sequence: u64,
+        #[serde(default)]
+        operation: Option<WorkflowOperationId>,
         name: String,
         duration_ms: u64,
     },
@@ -239,10 +297,17 @@ pub enum WorkflowEvent {
         payload: Option<String>,
     },
     /// A saga step was compensated after failure.
-    SagaCompensated { sequence: u64, step_name: String },
+    SagaCompensated {
+        sequence: u64,
+        #[serde(default)]
+        operation: Option<WorkflowOperationId>,
+        step_name: String,
+    },
     /// A branch of a synthetic parallel step completed.
     ParallelBranchCompleted {
         sequence: u64,
+        #[serde(default)]
+        operation: Option<WorkflowOperationId>,
         parallel_step_name: String,
         branch_name: String,
     },
@@ -263,6 +328,8 @@ pub enum WorkflowEvent {
     /// Any other event emitted by a workflow handler.
     Custom {
         sequence: u64,
+        #[serde(default)]
+        operation: Option<WorkflowOperationId>,
         name: String,
         args: Vec<PersistedValue>,
     },
@@ -291,6 +358,20 @@ impl WorkflowEvent {
         match self {
             WorkflowEvent::StepCompleted { activation, .. }
             | WorkflowEvent::StepFailed { activation, .. } => *activation,
+            _ => None,
+        }
+    }
+
+    /// Return the deterministic identity of a replay-sensitive operation.
+    ///
+    /// External arrivals such as TimerFired and SignalReceived do not belong
+    /// to the activation's deterministic operation stream.
+    pub fn operation_id(&self) -> Option<WorkflowOperationId> {
+        match self {
+            WorkflowEvent::TimerSet { operation, .. }
+            | WorkflowEvent::SagaCompensated { operation, .. }
+            | WorkflowEvent::ParallelBranchCompleted { operation, .. }
+            | WorkflowEvent::Custom { operation, .. } => *operation,
             _ => None,
         }
     }
@@ -707,6 +788,7 @@ pub trait PersistenceStore: Send + Sync {
             actor_id,
             WorkflowEvent::TimerSet {
                 sequence,
+                operation: None,
                 name,
                 duration_ms,
             },
@@ -747,6 +829,7 @@ pub trait PersistenceStore: Send + Sync {
             actor_id,
             WorkflowEvent::SagaCompensated {
                 sequence,
+                operation: None,
                 step_name,
             },
         )
@@ -793,6 +876,7 @@ pub trait PersistenceStore: Send + Sync {
             actor_id,
             WorkflowEvent::ParallelBranchCompleted {
                 sequence,
+                operation: None,
                 parallel_step_name,
                 branch_name,
             },
@@ -3782,6 +3866,7 @@ mod postgres_store_tests {
                 actor_id,
                 WorkflowEvent::TimerSet {
                     sequence: 1,
+                    operation: None,
                     name: "t".to_string(),
                     duration_ms: 100,
                 },
@@ -4007,6 +4092,7 @@ mod libsql_atomic_transition_tests {
                 },
                 WorkflowEvent::Custom {
                     sequence,
+                    operation: None,
                     name: "audit".to_string(),
                     args: vec![PersistedValue::Int(sequence as i64)],
                 },

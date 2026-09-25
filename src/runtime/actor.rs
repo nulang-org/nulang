@@ -287,6 +287,12 @@ pub struct Actor {
     /// turn ends. If execution suspends, the identity is copied into
     /// `SuspendedExecution` so later resumes close the same activation.
     pub current_workflow_activation: Option<WorkflowActivationId>,
+    /// Next deterministic operation ordinal within the current activation.
+    ///
+    /// Reset to zero when a new workflow command is accepted. It is deliberately
+    /// not persisted in the completed-state snapshot: crash replay restarts the
+    /// activation from ordinal zero and consumes matching durable operations.
+    pub current_workflow_operation_ordinal: u32,
     /// Sentinel heap object used by the cycle detector to represent this
     /// actor as a holder of foreign references.
     cycle_sentinel: Option<*mut OrcaHeader>,
@@ -433,6 +439,7 @@ impl Actor {
             max_reductions: 1000,
             sequence: 0,
             current_workflow_activation: None,
+            current_workflow_operation_ordinal: 0,
             cycle_sentinel: None,
             suspended_execution: None,
             waiting_signal: None,
