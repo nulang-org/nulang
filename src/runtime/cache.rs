@@ -326,6 +326,24 @@ pub enum CacheValueView<'a> {
     Bytes(&'a [u8]),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheSnapshotValue {
+    Integer(i64),
+    Bytes(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheSnapshotEntry {
+    pub key: Vec<u8>,
+    pub value: CacheSnapshotValue,
+    /// Remaining lifetime relative to the caller-supplied cache clock.
+    ///
+    /// Persistence layers should convert this to a wall-clock deadline before
+    /// writing durable bytes; process-relative cache timestamps are not valid
+    /// across restart.
+    pub remaining_ttl_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheTtl {
     Missing,
@@ -1563,6 +1581,69 @@ impl CacheStore {
         self.stats
     }
 
+    /// Export live cache state without exposing shard-internal storage.
+    ///
+    /// Expired entries are omitted even if lazy expiration has not physically
+    /// reaped them yet. TTLs are returned as remaining durations so a durable
+    /// layer can translate them to wall-clock deadlines before restart.
+    pub fn snapshot_entries(&self, now_ms: u64) -> Vec<CacheSnapshotEntry> {
+        self.slots
+            .iter()
+            .filter_map(|slot| {
+                let entry = slot.entry.as_ref()?;
+                let remaining_ttl_ms = match entry.expires_at_ms {
+                    Some(deadline) if deadline <= now_ms => return None,
+                    Some(deadline) => Some(deadline - now_ms),
+                    None => None,
+                };
+                let value = match entry.value {
+                    CacheValue::Integer(value) => CacheSnapshotValue::Integer(value),
+                    CacheValue::Bytes(bytes) => CacheSnapshotValue::Bytes(
+                        bytes.as_slice(&self.arena).to_vec(),
+                    ),
+                };
+                Some(CacheSnapshotEntry {
+                    key: entry.key.as_slice(&self.arena).to_vec(),
+                    value,
+                    remaining_ttl_ms,
+                })
+            })
+            .collect()
+    }
+
+    /// Rebuild a fresh cache from an owned snapshot.
+    ///
+    /// Recovery is all-or-nothing to the caller: writes are applied to a new
+    /// store and the store is returned only if every live entry satisfies the
+    /// supplied cache limits.
+    pub fn from_snapshot(
+        config: CacheConfig,
+        eviction_policy: CacheEvictionPolicy,
+        entries: &[CacheSnapshotEntry],
+        now_ms: u64,
+    ) -> Result<Self, CacheWriteError> {
+        // Recovery must never silently evict older snapshot entries merely
+        // because the configured steady-state policy permits eviction. Restore
+        // fail-closed first, then enable the requested policy once every entry
+        // has been admitted.
+        let mut store = Self::with_config_and_eviction(config, CacheEvictionPolicy::None);
+        for entry in entries {
+            if entry.remaining_ttl_ms == Some(0) {
+                continue;
+            }
+            match &entry.value {
+                CacheSnapshotValue::Integer(value) => {
+                    store.try_set_integer(&entry.key, *value, entry.remaining_ttl_ms, now_ms)?;
+                }
+                CacheSnapshotValue::Bytes(value) => {
+                    store.try_set_bytes(&entry.key, value, entry.remaining_ttl_ms, now_ms)?;
+                }
+            }
+        }
+        store.eviction.policy = eviction_policy;
+        Ok(store)
+    }
+
     /// Release backing storage for arena slabs with no live blocks.
     ///
     /// Deletes normally retain empty slabs for fast same-class reuse. Call this
@@ -1686,6 +1767,73 @@ fn crc16_xmodem(bytes: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_export_and_restore_preserve_live_values_and_remaining_ttl() {
+        let mut store = CacheStore::new();
+        store.set_bytes(b"persistent", b"value", None, 100);
+        store.set_integer(b"ttl", 42, Some(5_000), 100);
+        store.set_integer(b"expired", 7, Some(5), 100);
+
+        let entries = store.snapshot_entries(200);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|entry| {
+            entry.key == b"persistent"
+                && entry.value == CacheSnapshotValue::Bytes(b"value".to_vec())
+                && entry.remaining_ttl_ms.is_none()
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.key == b"ttl"
+                && entry.value == CacheSnapshotValue::Integer(42)
+                && entry.remaining_ttl_ms == Some(4_900)
+        }));
+
+        let mut restored = CacheStore::from_snapshot(
+            CacheConfig::default(),
+            CacheEvictionPolicy::S3Fifo,
+            &entries,
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(
+            restored.get(b"persistent", 1_000),
+            Some(CacheValueView::Bytes(b"value"))
+        );
+        assert_eq!(
+            restored.get(b"ttl", 1_000),
+            Some(CacheValueView::Integer(42))
+        );
+        assert_eq!(restored.ttl(b"ttl", 1_000), CacheTtl::RemainingMs(4_900));
+        assert_eq!(restored.get(b"expired", 1_000), None);
+    }
+
+    #[test]
+    fn snapshot_restore_fails_closed_instead_of_evicting_entries() {
+        let entries = vec![
+            CacheSnapshotEntry {
+                key: b"a".to_vec(),
+                value: CacheSnapshotValue::Integer(1),
+                remaining_ttl_ms: None,
+            },
+            CacheSnapshotEntry {
+                key: b"b".to_vec(),
+                value: CacheSnapshotValue::Integer(2),
+                remaining_ttl_ms: None,
+            },
+        ];
+        let result = CacheStore::from_snapshot(
+            CacheConfig {
+                max_key_bytes: 64,
+                max_value_bytes: 64,
+                max_entries: 1,
+                max_arena_bytes: 1024,
+            },
+            CacheEvictionPolicy::S3Fifo,
+            &entries,
+            0,
+        );
+        assert!(matches!(result, Err(CacheWriteError::EntryLimitReached)));
+    }
 
     #[test]
     fn inline_values_do_not_touch_arena() {

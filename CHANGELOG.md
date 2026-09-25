@@ -57,6 +57,7 @@ version + migration.*
 - **RESP parsing caches the first two validated arguments on the command frame**, removing repeated bulk-header decoding from the common GET/SET/INCR/EXPIRE/TTL/PING path without changing the generic multi-key iterator.
 - **Open-addressed cache index growth and tombstone compaction now migrate incrementally**, probing both tables during migration and moving at most eight old buckets per mutation instead of rebuilding a large shard index synchronously.
 - **Cache CI now gates end-to-end sequential and pipelined RESP p99/p99.9 latency against Valkey on the same runner**, persisting a JSON report while using generous absolute floors plus relative thresholds to avoid shared-runner flakiness.
+- **The cache now has a versioned snapshot/WAL recovery substrate**, with BLAKE3 integrity checks, contiguous WAL sequence fencing, torn-tail truncation, atomic snapshot publication, WAL base sequences for rotation, and wall-clock TTL translation across restart; replication/failover and mutation-path durability selection remain follow-up work.
 - **A feature-gated `nulang-cache` process and path-scoped CI oracle compare the supported RESP core over TCP against Valkey 9.1**, including binary values, counters, TTL/expiry, same-slot MGET/MSET, deletion, and pipelining.
 
 ### JIT tier replacement and compile-time observability — 2026-09-24
