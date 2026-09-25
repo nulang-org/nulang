@@ -3099,6 +3099,23 @@ mod tests {
 
     #[test]
     #[cfg(all(test, feature = "wasm-backend"))]
+    fn test_wasm_dynamic_array_string_add_matches_vm_runtime_fallback() {
+        // Regression from the 2026-09-25 differential-fuzz nightly.
+        // The element type reaches MIR through a dynamic ArrayLoad, so the add
+        // may remain Binary(Add) instead of the statically-selected StrConcat.
+        // VM::IAdd still concatenates at runtime when either operand is a string.
+        let wasm = compile_source(r#"let a = ["x", "y"]; a[0] + 2"#).expect("compile");
+        let mut runtime = crate::wasm_runtime::WasmRuntime::new(&wasm, None).expect("runtime");
+        let value = runtime.run().expect("run");
+        assert_eq!(
+            runtime.string_value(&value).as_deref(),
+            Some("x2"),
+            "WASM dynamic add must preserve VM::IAdd string fallback"
+        );
+    }
+
+    #[test]
+    #[cfg(all(test, feature = "wasm-backend"))]
     fn test_wasm_array_index() {
         let value = run_source("let a = [10, 20, 30]; a[1]").expect("run");
         assert_eq!(value.as_int(), Some(20), "a[1] should be 20");
