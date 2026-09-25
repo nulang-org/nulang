@@ -186,7 +186,8 @@ impl CacheSlotMap {
 
         *owner = target;
         self.migration_targets[slot as usize] = None;
-        self.migration_count = self.migration_count.saturating_sub(1);
+        debug_assert!(self.migration_count > 0);
+        self.migration_count -= 1;
         self.epoch = proposed_epoch;
         Ok(())
     }
