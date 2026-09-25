@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Zero-copy non-reentrant JIT register entry — 2026-09-25
+- **JIT regions proven unable to re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
+- **Compiled-region metadata records whether native execution may grow or replace the VM frame stack.** Helper-backed direct-call regions retain detached register storage because interpreter re-entry may reallocate `VM::frames`; typed, SIMD, and scalar no-call regions use direct frame registers.
+- **The direct-frame path keeps interned-string semantics without exposing the parent VM.** A separate immutable active-`CodeModule` context serves string-aware helpers, and regression tests pin both direct-call fallback classification and hot string equality.
+
 ### Runtime hot-path benchmark decomposition — 2026-09-25
 - **The same-host A/B harness now reports a mailbox-only one-value admission lower bound alongside the full runtime enqueue sweep.** This exposes the cost above message construction/mailbox admission before actor-routing or scheduler changes are justified.
 - **The actor A/B harness now measures AOT against warmed bytecode/JIT on the exact same 50k-message actor drain.** Bytecode is warmed past tier-up, enqueue time is excluded for both paths, and the harness prints the direct AOT speedup while retaining the existing AOT history record.
