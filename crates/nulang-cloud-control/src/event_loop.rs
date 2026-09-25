@@ -191,11 +191,7 @@ impl ReconcileLoop {
                 event_id, deployment.deployment_id, deployment.revision
             );
             let deployment_id = deployment.deployment_id.clone();
-            let outcome = self.enqueue(ReconcileRequest::new(
-                evaluation_id,
-                cause,
-                deployment,
-            ))?;
+            let outcome = self.enqueue(ReconcileRequest::new(evaluation_id, cause, deployment))?;
             outcomes.push((deployment_id, outcome));
         }
         Ok(outcomes)
@@ -218,12 +214,7 @@ impl ReconcileLoop {
             return Ok(None);
         };
 
-        let result = reconcile_once(
-            store,
-            &request.evaluation,
-            &request.deployment,
-            nodes,
-        )?;
+        let result = reconcile_once(store, &request.evaluation, &request.deployment, nodes)?;
 
         self.pending.remove(&deployment_id);
         Ok(Some(ReconcileTurn {
@@ -269,7 +260,6 @@ mod tests {
     use nulang_capacity::{Architecture, TrustTier};
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
 
     fn deployment(id: &str, revision: u64) -> DeploymentSpec {
         DeploymentSpec {
@@ -330,7 +320,10 @@ mod tests {
             EnqueueOutcome::SupersededOlderRevision
         );
         assert_eq!(loop_.len(), 1);
-        assert_eq!(loop_.pending("api").unwrap().evaluation.evaluation_id, "new");
+        assert_eq!(
+            loop_.pending("api").unwrap().evaluation.evaluation_id,
+            "new"
+        );
         assert_eq!(loop_.pending("api").unwrap().deployment.revision, 2);
     }
 
@@ -355,7 +348,10 @@ mod tests {
                 .unwrap(),
             EnqueueOutcome::IgnoredStaleRevision
         );
-        assert_eq!(loop_.pending("api").unwrap().evaluation.evaluation_id, "new");
+        assert_eq!(
+            loop_.pending("api").unwrap().evaluation.evaluation_id,
+            "new"
+        );
     }
 
     #[test]
@@ -483,9 +479,7 @@ mod tests {
             self.inner.commit_plan(evaluation, plan)
         }
 
-        fn pending_commands(
-            &self,
-        ) -> Result<Vec<crate::store::AllocationCommand>, StoreError> {
+        fn pending_commands(&self) -> Result<Vec<crate::store::AllocationCommand>, StoreError> {
             self.inner.pending_commands()
         }
 
@@ -540,6 +534,9 @@ mod tests {
         let turns = loop_.reconcile_ready(&store, &[node(1)], 2).unwrap();
         assert_eq!(turns.len(), 2);
         assert_eq!(loop_.len(), 1);
-        assert_eq!(loop_.pending("c").unwrap().evaluation.evaluation_id, "eval-c");
+        assert_eq!(
+            loop_.pending("c").unwrap().evaluation.evaluation_id,
+            "eval-c"
+        );
     }
 }
