@@ -345,12 +345,54 @@ impl CacheReplicaAckTracker {
     pub fn satisfies(&self, sequence: u64, required_replicas: usize) -> bool {
         self.acked_replicas(sequence) >= required_replicas
     }
+
+    /// Highest sequence that satisfies the configured replica requirement.
+    ///
+    /// A requirement of zero means local acknowledgement only, so the local
+    /// WAL tail is the commit index. Otherwise this returns the Nth-highest
+    /// replica acknowledgement, capped by the local sequence.
+    pub fn committed_sequence(
+        &self,
+        local_sequence: u64,
+        required_replicas: usize,
+    ) -> Option<u64> {
+        if required_replicas == 0 {
+            return Some(local_sequence);
+        }
+        if required_replicas > self.acknowledgements.len() {
+            return None;
+        }
+
+        let mut sequences = self
+            .acknowledgements
+            .values()
+            .copied()
+            .map(|sequence| sequence.min(local_sequence))
+            .collect::<Vec<_>>();
+        sequences.sort_unstable_by(|left, right| right.cmp(left));
+        Some(sequences[required_replicas - 1])
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheReplicaApply {
     Applied { sequence: u64 },
     Duplicate { sequence: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePromotionError {
+    StaleEpoch { current: u64, proposed: u64 },
+    Behind { committed: u64, applied: u64 },
+    Ahead { committed: u64, applied: u64 },
+    Poisoned,
+}
+
+#[derive(Debug)]
+pub struct CachePromotedReplica {
+    pub placement_epoch: u64,
+    pub base_sequence: u64,
+    pub store: CacheStore,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -403,6 +445,47 @@ impl CacheReplicaApplier {
 
     pub fn into_store(self) -> CacheStore {
         self.store
+    }
+
+    /// Consume a replica and release its store for primary service only when
+    /// the control plane advances the epoch and the replica is exactly at the
+    /// declared committed sequence.
+    ///
+    /// A replica ahead of the commit index is rejected rather than exposing a
+    /// possibly uncommitted tail. Recovery/bootstrap must first reconstruct
+    /// the exact committed state.
+    pub fn promote(
+        self,
+        proposed_epoch: u64,
+        committed_sequence: u64,
+    ) -> Result<CachePromotedReplica, CachePromotionError> {
+        if self.poisoned {
+            return Err(CachePromotionError::Poisoned);
+        }
+        if proposed_epoch <= self.placement_epoch {
+            return Err(CachePromotionError::StaleEpoch {
+                current: self.placement_epoch,
+                proposed: proposed_epoch,
+            });
+        }
+        if self.applied_sequence < committed_sequence {
+            return Err(CachePromotionError::Behind {
+                committed: committed_sequence,
+                applied: self.applied_sequence,
+            });
+        }
+        if self.applied_sequence > committed_sequence {
+            return Err(CachePromotionError::Ahead {
+                committed: committed_sequence,
+                applied: self.applied_sequence,
+            });
+        }
+
+        Ok(CachePromotedReplica {
+            placement_epoch: proposed_epoch,
+            base_sequence: committed_sequence,
+            store: self.store,
+        })
     }
 
     /// Advance the fencing epoch after the control plane has installed a newer
