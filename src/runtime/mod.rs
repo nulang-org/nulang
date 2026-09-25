@@ -5317,9 +5317,7 @@ impl Runtime {
                 std::collections::HashSet::new();
             for event in &all_timer_events {
                 if let WorkflowEvent::TimerFired {
-                    operation_id,
-                    name,
-                    ..
+                    operation_id, name, ..
                 } = event
                 {
                     if let Some(operation_id) = operation_id {
