@@ -1367,6 +1367,7 @@ impl LibsqlStore {
                     sequence INTEGER NOT NULL,
                     state TEXT NOT NULL,
                     waiting_signal TEXT,
+                    waiting_signal_operation TEXT,
                     crdt_snapshot TEXT,
                     crdt_field_map TEXT,
                     authority_tokens TEXT
@@ -1378,6 +1379,14 @@ impl LibsqlStore {
             // Migrate databases created before the waiting_signal column existed.
             let _ = conn
                 .execute("ALTER TABLE snapshots ADD COLUMN waiting_signal TEXT", ())
+                .await;
+            // Activation replay metadata was added after the original signal
+            // suspension marker. Legacy rows restore with no operation id.
+            let _ = conn
+                .execute(
+                    "ALTER TABLE snapshots ADD COLUMN waiting_signal_operation TEXT",
+                    (),
+                )
                 .await;
             // Migrate databases created before the crdt_snapshot column existed.
             let _ = conn
@@ -1623,6 +1632,8 @@ impl PersistenceStore for LibsqlStore {
                 Ok::<_, io::Error>((
                     serde_json::to_string(&snapshot.state)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                    serde_json::to_string(&snapshot.waiting_signal_operation)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
                     serde_json::to_string(&snapshot.crdt_snapshot)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
                     serde_json::to_string(&snapshot.crdt_field_map)
@@ -1796,17 +1807,26 @@ impl PersistenceStore for LibsqlStore {
                 }
             }
 
-            if let (Some(snapshot), Some((state_json, crdt_json, crdt_field_map_json, authority_json))) =
-                (&transition.snapshot, &snapshot_data)
+            if let (
+                Some(snapshot),
+                Some((
+                    state_json,
+                    waiting_signal_operation_json,
+                    crdt_json,
+                    crdt_field_map_json,
+                    authority_json,
+                )),
+            ) = (&transition.snapshot, &snapshot_data)
             {
                 tx.execute(
                     "INSERT INTO snapshots
-                     (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     (actor_id, sequence, state, waiting_signal, waiting_signal_operation, crdt_snapshot, crdt_field_map, authority_tokens)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                      ON CONFLICT(actor_id) DO UPDATE SET
                        sequence=excluded.sequence,
                        state=excluded.state,
                        waiting_signal=excluded.waiting_signal,
+                       waiting_signal_operation=excluded.waiting_signal_operation,
                        crdt_snapshot=excluded.crdt_snapshot,
                        crdt_field_map=excluded.crdt_field_map,
                        authority_tokens=excluded.authority_tokens",
@@ -1815,6 +1835,7 @@ impl PersistenceStore for LibsqlStore {
                         snapshot.sequence as i64,
                         state_json.as_str(),
                         snapshot.waiting_signal.as_deref(),
+                        waiting_signal_operation_json.as_str(),
                         crdt_json.as_str(),
                         crdt_field_map_json.as_str(),
                         authority_json.as_str()
@@ -1977,6 +1998,9 @@ impl PersistenceStore for LibsqlStore {
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
         let state_json = serde_json::to_string(&snapshot.state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let waiting_signal_operation_json =
+            serde_json::to_string(&snapshot.waiting_signal_operation)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let crdt_json = serde_json::to_string(&snapshot.crdt_snapshot)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let crdt_field_map_json = serde_json::to_string(&snapshot.crdt_field_map)
@@ -1986,9 +2010,9 @@ impl PersistenceStore for LibsqlStore {
         let conn = self.conn();
         self.rt.block_on(async {
             conn.execute(
-                "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, authority_tokens=excluded.authority_tokens",
-                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), authority_json.as_str()],
+                "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, waiting_signal_operation, crdt_snapshot, crdt_field_map, authority_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, state=excluded.state, waiting_signal=excluded.waiting_signal, waiting_signal_operation=excluded.waiting_signal_operation, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, authority_tokens=excluded.authority_tokens",
+                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, state_json, snapshot.waiting_signal.as_deref(), waiting_signal_operation_json.as_str(), crdt_json.as_str(), crdt_field_map_json.as_str(), authority_json.as_str()],
             ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
         })
     }
@@ -1998,7 +2022,7 @@ impl PersistenceStore for LibsqlStore {
         self.rt.block_on(async {
             let mut rows = conn
                 .query(
-                    "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens FROM snapshots WHERE actor_id = ?1",
+                    "SELECT sequence, state, waiting_signal, waiting_signal_operation, crdt_snapshot, crdt_field_map, authority_tokens FROM snapshots WHERE actor_id = ?1",
                     libsql::params![actor_id as i64],
                 )
                 .await
@@ -2007,9 +2031,15 @@ impl PersistenceStore for LibsqlStore {
             let sequence: i64 = row.get(0).ok()?;
             let state_json: String = row.get(1).ok()?;
             let waiting_signal: Option<String> = row.get(2).ok()?;
-            let crdt_json: Option<String> = row.get(3).ok()?;
-            let crdt_field_map_json: Option<String> = row.get(4).ok()?;
-            let authority_json: Option<String> = row.get(5).ok()?;
+            let waiting_signal_operation_json: Option<String> = row.get(3).ok()?;
+            let crdt_json: Option<String> = row.get(4).ok()?;
+            let crdt_field_map_json: Option<String> = row.get(5).ok()?;
+            let authority_json: Option<String> = row.get(6).ok()?;
+            let waiting_signal_operation: Option<WorkflowOperationId> =
+                match waiting_signal_operation_json {
+                    Some(json) => serde_json::from_str(&json).ok()?,
+                    None => None,
+                };
             let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> = match crdt_json {
                 Some(j) => serde_json::from_str(&j).ok()?,
                 None => None,
@@ -2037,6 +2067,7 @@ impl PersistenceStore for LibsqlStore {
                 sequence: sequence as u64,
                 state,
                 waiting_signal,
+                waiting_signal_operation,
                 crdt_snapshot,
                 crdt_field_map,
                 authority_tokens,
@@ -2664,10 +2695,16 @@ impl PostgresStore {
                 sequence BIGINT NOT NULL,
                 state TEXT NOT NULL,
                 waiting_signal TEXT,
+                waiting_signal_operation TEXT,
                 crdt_snapshot TEXT,
                 crdt_field_map TEXT,
                 authority_tokens TEXT
             )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS waiting_signal_operation TEXT",
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -2719,6 +2756,9 @@ impl PersistenceStore for PostgresStore {
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
         let state_json = serde_json::to_string(&snapshot.state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let waiting_signal_operation_json =
+            serde_json::to_string(&snapshot.waiting_signal_operation)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let crdt_json = serde_json::to_string(&snapshot.crdt_snapshot)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let crdt_field_map_json = serde_json::to_string(&snapshot.crdt_field_map)
@@ -2727,12 +2767,13 @@ impl PersistenceStore for PostgresStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, waiting_signal_operation, crdt_snapshot, crdt_field_map, authority_tokens)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (actor_id) DO UPDATE SET
                sequence = EXCLUDED.sequence,
                state = EXCLUDED.state,
                waiting_signal = EXCLUDED.waiting_signal,
+               waiting_signal_operation = EXCLUDED.waiting_signal_operation,
                crdt_snapshot = EXCLUDED.crdt_snapshot,
                crdt_field_map = EXCLUDED.crdt_field_map,
                authority_tokens = EXCLUDED.authority_tokens",
@@ -2741,6 +2782,7 @@ impl PersistenceStore for PostgresStore {
                 &(snapshot.sequence as i64),
                 &state_json,
                 &snapshot.waiting_signal.as_deref(),
+                &waiting_signal_operation_json.as_str(),
                 &crdt_json.as_str(),
                 &crdt_field_map_json.as_str(),
                 &authority_json.as_str(),
@@ -2754,7 +2796,7 @@ impl PersistenceStore for PostgresStore {
         let mut conn = self.conn.lock().unwrap();
         let row = conn
             .query_one(
-                "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens
+                "SELECT sequence, state, waiting_signal, waiting_signal_operation, crdt_snapshot, crdt_field_map, authority_tokens
                  FROM snapshots WHERE actor_id = $1",
                 &[&(actor_id as i64)],
             )
@@ -2762,9 +2804,12 @@ impl PersistenceStore for PostgresStore {
         let sequence: i64 = row.get(0);
         let state_json: String = row.get(1);
         let waiting_signal: Option<String> = row.get(2);
-        let crdt_json: Option<String> = row.get(3);
-        let crdt_field_map_json: Option<String> = row.get(4);
-        let authority_json: Option<String> = row.get(5);
+        let waiting_signal_operation_json: Option<String> = row.get(3);
+        let crdt_json: Option<String> = row.get(4);
+        let crdt_field_map_json: Option<String> = row.get(5);
+        let authority_json: Option<String> = row.get(6);
+        let waiting_signal_operation: Option<WorkflowOperationId> =
+            waiting_signal_operation_json.and_then(|json| serde_json::from_str(&json).ok());
         let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> =
             crdt_json.and_then(|j| serde_json::from_str(&j).ok());
         let crdt_field_map: Option<HashMap<String, u64>> =
@@ -2788,6 +2833,7 @@ impl PersistenceStore for PostgresStore {
             sequence: sequence as u64,
             state,
             waiting_signal,
+            waiting_signal_operation,
             crdt_snapshot,
             crdt_field_map,
             authority_tokens,
@@ -3082,6 +3128,7 @@ mod json_file_store_tests {
                 sequence: 3,
                 state,
                 waiting_signal: None,
+                waiting_signal_operation: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 authority_tokens: Default::default(),
@@ -3146,6 +3193,7 @@ mod json_file_store_tests {
                 sequence: 5,
                 state: HashMap::new(),
                 waiting_signal: None,
+                waiting_signal_operation: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 authority_tokens: Default::default(),
@@ -3176,6 +3224,7 @@ mod json_file_store_tests {
                 sequence: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
+                waiting_signal_operation: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 authority_tokens: Default::default(),
@@ -3253,6 +3302,7 @@ mod json_file_store_tests {
                 sequence: 9,
                 state: HashMap::new(),
                 waiting_signal: None,
+                waiting_signal_operation: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 authority_tokens: Default::default(),
@@ -3374,6 +3424,7 @@ mod rocksdb_store_tests {
                 sequence: 3,
                 state,
                 waiting_signal: None,
+                waiting_signal_operation: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 authority_tokens: Default::default(),
@@ -3432,6 +3483,7 @@ mod rocksdb_store_tests {
                 sequence: 5,
                 state: HashMap::new(),
                 waiting_signal: None,
+                waiting_signal_operation: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 authority_tokens: Default::default(),
@@ -3462,6 +3514,7 @@ mod rocksdb_store_tests {
                 sequence: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
+                waiting_signal_operation: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 authority_tokens: Default::default(),
@@ -3638,6 +3691,7 @@ mod postgres_store_tests {
                 sequence: 5,
                 state: HashMap::new(),
                 waiting_signal: None,
+                waiting_signal_operation: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 authority_tokens: Default::default(),
@@ -3672,6 +3726,7 @@ mod postgres_store_tests {
                 sequence: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
+                waiting_signal_operation: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
                 authority_tokens: Default::default(),
