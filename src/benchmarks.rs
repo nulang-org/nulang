@@ -22,7 +22,9 @@ use std::time::Instant;
 
 use crate::lexer::Lexer;
 use crate::parser::Parser;
-use crate::runtime::{Mailbox, Message, MessagePayload, MessagePriority, Runtime, RuntimeVmCallbacks};
+use crate::runtime::{
+    Mailbox, Message, MessagePayload, MessagePriority, Runtime, RuntimeVmCallbacks,
+};
 use crate::typechecker::TypeChecker;
 use crate::vm::{Value, VM};
 
