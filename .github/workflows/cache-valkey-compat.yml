@@ -8,6 +8,7 @@ on:
       - "src/runtime/resp*.rs"
       - "src/bin/nulang_cache.rs"
       - "scripts/cache_valkey_diff.py"
+      - "scripts/cache_resp_latency.py"
       - "Cargo.toml"
       - ".github/workflows/cache-valkey-compat.yml"
   pull_request:
@@ -16,6 +17,7 @@ on:
       - "src/runtime/resp*.rs"
       - "src/bin/nulang_cache.rs"
       - "scripts/cache_valkey_diff.py"
+      - "scripts/cache_resp_latency.py"
       - "Cargo.toml"
       - ".github/workflows/cache-valkey-compat.yml"
 
@@ -52,15 +54,30 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build Nulang cache server
-        run: cargo build --locked --no-default-features --features cache-server --bin nulang-cache
+        run: cargo build --locked --release --no-default-features --features cache-server --bin nulang-cache
 
       - name: Start Nulang cache server
         run: |
-          ./target/debug/nulang-cache --bind 127.0.0.1:6380 >/tmp/nulang-cache.log 2>&1 &
+          ./target/release/nulang-cache --bind 127.0.0.1:6380 >/tmp/nulang-cache.log 2>&1 &
           echo $! >/tmp/nulang-cache.pid
 
       - name: Compare RESP core with Valkey
         run: python3 scripts/cache_valkey_diff.py --nulang 127.0.0.1:6380 --valkey 127.0.0.1:6379
+
+      - name: Gate p99 and p99.9 RESP latency
+        run: |
+          python3 scripts/cache_resp_latency.py \
+            --nulang 127.0.0.1:6380 \
+            --valkey 127.0.0.1:6379 \
+            --output cache-resp-latency.json
+
+      - name: Upload RESP latency report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cache-resp-latency
+          path: cache-resp-latency.json
+          if-no-files-found: ignore
 
       - name: Show Nulang cache log on failure
         if: failure()
