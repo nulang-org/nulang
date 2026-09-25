@@ -273,7 +273,9 @@ impl CacheCommandTarget for CacheServerStore {
     ) -> Result<(), CacheCommandError> {
         match self {
             Self::Memory(store) => CacheCommandTarget::set_bytes(store, key, value, ttl_ms, now_ms),
-            Self::Durable(store) => CacheCommandTarget::set_bytes(store, key, value, ttl_ms, now_ms),
+            Self::Durable(store) => {
+                CacheCommandTarget::set_bytes(store, key, value, ttl_ms, now_ms)
+            }
         }
     }
 
@@ -306,12 +308,7 @@ impl CacheCommandTarget for CacheServerStore {
         }
     }
 
-    fn increment(
-        &mut self,
-        key: &[u8],
-        delta: i64,
-        now_ms: u64,
-    ) -> Result<i64, CacheCommandError> {
+    fn increment(&mut self, key: &[u8], delta: i64, now_ms: u64) -> Result<i64, CacheCommandError> {
         match self {
             Self::Memory(store) => CacheCommandTarget::increment(store, key, delta, now_ms),
             Self::Durable(store) => CacheCommandTarget::increment(store, key, delta, now_ms),
@@ -973,12 +970,9 @@ mod tests {
             .with_cluster_redirects(endpoints);
 
         let wal = CacheWal::create_after(&wal_path, 0).unwrap();
-        let durable = DurableCacheStore::with_wal(
-            CacheStore::new(),
-            wal,
-            CacheDurabilityMode::SyncedJournal,
-        )
-        .unwrap();
+        let durable =
+            DurableCacheStore::with_wal(CacheStore::new(), wal, CacheDurabilityMode::SyncedJournal)
+                .unwrap();
         let clock = CacheServerClock::new();
         let mut server = CacheShardServer::bind_durable(
             "127.0.0.1:0".parse().unwrap(),
@@ -1054,13 +1048,20 @@ mod tests {
     fn idle_reactor_purges_expired_values() {
         let mut server = build_server();
         let now = server.clock.now_ms();
-        server.memory_store_mut().unwrap().set_bytes(b"ttl", b"value", Some(1), now);
+        server
+            .memory_store_mut()
+            .unwrap()
+            .set_bytes(b"ttl", b"value", Some(1), now);
 
         std::thread::sleep(Duration::from_millis(3));
         server.poll_once(Some(Duration::from_millis(1))).unwrap();
 
         let now = server.clock.now_ms();
-        assert!(server.memory_store_mut().unwrap().get(b"ttl", now).is_none());
+        assert!(server
+            .memory_store_mut()
+            .unwrap()
+            .get(b"ttl", now)
+            .is_none());
     }
 
     #[test]
