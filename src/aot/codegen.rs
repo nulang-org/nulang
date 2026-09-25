@@ -3559,7 +3559,7 @@ fn compile_unary(
             KnownType::Bool | KnownType::Unknown => Err(AotCompileError::Unsupported(
                 "native unary negation requires a statically numeric operand".into(),
             )),
-        }
+        },
         UnOp::Not => call_helper(builder, helpers, "nulang_not", &[val]),
         UnOp::Deref => Err(AotCompileError::Unsupported("UnOp::Deref".into())),
         UnOp::Ref(_) => Err(AotCompileError::Unsupported("UnOp::Ref".into())),
