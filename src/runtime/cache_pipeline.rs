@@ -287,7 +287,7 @@ enum FrontAction {
 
 #[cfg(test)]
 mod tests {
-    use super::super::cache::redis_slot;
+    use super::super::cache::{redis_slot, CacheStore};
     use super::super::cache_dispatch::CacheDispatchChannels;
     use super::super::cache_routing::{CacheShardOwner, CacheSlotMap, CacheSlotRange};
     use super::*;
