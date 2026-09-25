@@ -7587,3 +7587,160 @@ fn workflow_activation_analysis_rejects_untagged_terminal_after_upgrade() {
         )
     ));
 }
+
+#[test]
+fn workflow_custom_events_use_activation_operation_ordinals() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "OperationIdentityWorkflow",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    let activation = WorkflowActivationId::new(actor_id, 41);
+    super::workflow::begin_workflow_activation(&mut rt, activation, false);
+
+    rt.emit_event(actor_id, "first", &[Value::int(1)]);
+    rt.emit_event(actor_id, "second", &[Value::int(2)]);
+
+    let custom = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::Custom {
+                operation_id, name, ..
+            } => Some((operation_id, name)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        custom,
+        vec![
+            (Some(activation.operation(0)), "first".to_string()),
+            (Some(activation.operation(1)), "second".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn workflow_durable_effect_ids_share_activation_operation_sequence() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "DurableEffectIdentityWorkflow",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    let activation = WorkflowActivationId::new(actor_id, 51);
+    super::workflow::begin_workflow_activation(&mut rt, activation, false);
+
+    rt.emit_event(actor_id, "audit", &[]);
+    let effect_id = rt
+        .next_workflow_durable_effect_id(actor_id, "Provider.ask")
+        .expect("live activation should allocate durable effect identity");
+
+    assert_eq!(
+        effect_id,
+        crate::durable_effect::DurableEffectId::derive_from_workflow_operation(
+            activation.operation(1),
+            "Provider.ask",
+        )
+    );
+}
+
+#[test]
+fn workflow_operation_lookup_returns_committed_custom_event() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "OperationLookupWorkflow",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    let activation = WorkflowActivationId::new(actor_id, 61);
+    super::workflow::begin_workflow_activation(&mut rt, activation, false);
+
+    rt.emit_event(actor_id, "audit", &[Value::int(9)]);
+
+    let event = rt
+        .workflow_event_for_operation(actor_id, activation.operation(0))
+        .expect("operation history should be valid")
+        .expect("custom event should be addressable by operation id");
+
+    assert!(matches!(
+        event,
+        WorkflowEvent::Custom {
+            operation_id: Some(id),
+            name,
+            ..
+        } if id == activation.operation(0) && name == "audit"
+    ));
+}
+
+#[test]
+fn workflow_operation_lookup_rejects_duplicate_operation_identity() {
+    let actor_id = 99;
+    let operation = WorkflowActivationId::new(actor_id, 7).operation(0);
+    let mut store = MemoryStore::new();
+    for sequence in [8, 9] {
+        store
+            .append_workflow_event(
+                actor_id,
+                WorkflowEvent::Custom {
+                    sequence,
+                    operation_id: Some(operation),
+                    name: "duplicate".to_string(),
+                    args: vec![],
+                },
+            )
+            .unwrap();
+    }
+
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(store);
+
+    assert!(matches!(
+        rt.workflow_event_for_operation(actor_id, operation),
+        Err(WorkflowOperationAnalysisError::DuplicateOperationIdentity {
+            operation_id
+        }) if operation_id == operation
+    ));
+}
+
+#[test]
+fn workflow_timer_set_and_fire_preserve_operation_identity() {
+    let mut rt = Runtime::new();
+    rt.install_virtual_clock();
+    let actor_id =
+        rt.spawn_workflow_actor("TimerOperationWorkflow", Box::new(Vec::new), HashMap::new());
+    let activation = WorkflowActivationId::new(actor_id, 71);
+    super::workflow::begin_workflow_activation(&mut rt, activation, false);
+
+    rt.schedule_workflow_timer(actor_id, "wake", 5).unwrap();
+
+    let events = rt.persistence.read_workflow_events(actor_id);
+    let timer_operation = events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::TimerSet {
+                operation_id: Some(id),
+                name,
+                ..
+            } if name == "wake" => Some(*id),
+            _ => None,
+        })
+        .expect("TimerSet should carry activation operation identity");
+    assert_eq!(timer_operation, activation.operation(0));
+
+    rt.advance_time(std::time::Duration::from_millis(10));
+    rt.tick_timers();
+
+    let events = rt.persistence.read_workflow_events(actor_id);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        WorkflowEvent::TimerFired {
+            operation_id: Some(id),
+            name,
+            ..
+        } if *id == timer_operation && name == "wake"
+    )));
+}

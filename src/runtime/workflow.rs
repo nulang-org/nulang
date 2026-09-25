@@ -96,6 +96,92 @@ impl std::fmt::Display for WorkflowActivationAnalysisError {
 
 impl std::error::Error for WorkflowActivationAnalysisError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowOperationAnalysisError {
+    ActorMismatch {
+        actor_id: u64,
+        operation_id: WorkflowOperationId,
+    },
+    ForeignOperationIdentity {
+        event_sequence: u64,
+        operation_id: WorkflowOperationId,
+    },
+    DuplicateOperationIdentity {
+        operation_id: WorkflowOperationId,
+    },
+}
+
+impl std::fmt::Display for WorkflowOperationAnalysisError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ActorMismatch {
+                actor_id,
+                operation_id,
+            } => write!(
+                f,
+                "workflow operation {:?} does not belong to actor {actor_id}",
+                operation_id
+            ),
+            Self::ForeignOperationIdentity {
+                event_sequence,
+                operation_id,
+            } => write!(
+                f,
+                "workflow event {event_sequence} carries foreign operation identity {:?}",
+                operation_id
+            ),
+            Self::DuplicateOperationIdentity { operation_id } => write!(
+                f,
+                "workflow operation {:?} appears more than once in durable event history",
+                operation_id
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WorkflowOperationAnalysisError {}
+
+/// Find the durable event recorded for one activation-local operation.
+///
+/// Recovery uses this lookup instead of relying on workflow-event sequence
+/// position. Duplicate identities are rejected because replay could otherwise
+/// consume an arbitrary record and silently diverge.
+pub fn find_workflow_event_for_operation(
+    actor_id: u64,
+    operation_id: WorkflowOperationId,
+    events: &[WorkflowEvent],
+) -> Result<Option<WorkflowEvent>, WorkflowOperationAnalysisError> {
+    if operation_id.activation.actor_id != actor_id {
+        return Err(WorkflowOperationAnalysisError::ActorMismatch {
+            actor_id,
+            operation_id,
+        });
+    }
+
+    let mut found = None;
+    for event in events {
+        let Some(candidate) = event.operation_id() else {
+            continue;
+        };
+        if candidate.activation.actor_id != actor_id {
+            return Err(WorkflowOperationAnalysisError::ForeignOperationIdentity {
+                event_sequence: event.sequence(),
+                operation_id: candidate,
+            });
+        }
+        if candidate != operation_id {
+            continue;
+        }
+        if found.is_some() {
+            return Err(WorkflowOperationAnalysisError::DuplicateOperationIdentity {
+                operation_id,
+            });
+        }
+        found = Some(event.clone());
+    }
+    Ok(found)
+}
+
 /// Build an activation index from durable command and workflow journals.
 ///
 /// Only journal entries explicitly tagged with an activation id are considered
@@ -396,6 +482,11 @@ fn resolve_string_constant(rt: &Runtime, actor_id: u64, value: &Value) -> Option
 /// journal and a checkpoint is forced.
 pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[Value]) {
     let is_workflow = actor_is_workflow(rt, actor_id);
+    let operation_id = if is_workflow {
+        next_workflow_operation_id(rt, actor_id)
+    } else {
+        None
+    };
     let seq = next_sequence(rt, actor_id);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.event_log.push((event.to_string(), args.to_vec()));
@@ -445,11 +536,14 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
             let parallel_step_name =
                 resolve_string_constant(rt, actor_id, &args[0]).unwrap_or_default();
             let branch_name = resolve_string_constant(rt, actor_id, &args[1]).unwrap_or_default();
-            let _ = rt.persistence.append_parallel_branch_completed(
+            let _ = rt.persistence.append_workflow_event(
                 actor_id,
-                seq,
-                parallel_step_name,
-                branch_name,
+                WorkflowEvent::ParallelBranchCompleted {
+                    sequence: seq,
+                    operation_id,
+                    parallel_step_name,
+                    branch_name,
+                },
             );
             if let Some(actor) = rt.actors.get_mut(&actor_id) {
                 let current = actor
@@ -471,6 +565,7 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 actor_id,
                 WorkflowEvent::Custom {
                     sequence: seq,
+                    operation_id,
                     name: event.to_string(),
                     args: payload,
                 },
@@ -489,22 +584,37 @@ pub(crate) fn append_timer_set(
     actor_id: u64,
     name: &str,
     duration_ms: u64,
-) -> std::io::Result<()> {
+) -> std::io::Result<Option<WorkflowOperationId>> {
+    let operation_id = next_workflow_operation_id(rt, actor_id);
     let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_timer_set(actor_id, seq, name.to_string(), duration_ms)?;
+    rt.persistence.append_workflow_event(
+        actor_id,
+        WorkflowEvent::TimerSet {
+            sequence: seq,
+            operation_id,
+            name: name.to_string(),
+            duration_ms,
+        },
+    )?;
     try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+    Ok(operation_id)
 }
 
 pub(crate) fn append_timer_fired(
     rt: &mut Runtime,
     actor_id: u64,
     name: &str,
+    operation_id: Option<WorkflowOperationId>,
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_timer_fired(actor_id, seq, name.to_string())?;
+    rt.persistence.append_workflow_event(
+        actor_id,
+        WorkflowEvent::TimerFired {
+            sequence: seq,
+            operation_id,
+            name: name.to_string(),
+        },
+    )?;
     try_checkpoint_actor(rt, actor_id)?;
     Ok(())
 }
@@ -614,12 +724,14 @@ pub(crate) fn schedule_workflow_timer(
     name: &str,
     duration_ms: u64,
 ) -> std::io::Result<()> {
-    if actor_is_workflow(rt, actor_id) {
+    let operation_id = if actor_is_workflow(rt, actor_id) {
         // Never arm a live timer if its durable TimerSet/checkpoint failed.
         // Recovery can only reason about timers that were durably recorded.
-        append_timer_set(rt, actor_id, name, duration_ms)?;
-    }
-    rt.rearm_timer(actor_id, name, duration_ms);
+        append_timer_set(rt, actor_id, name, duration_ms)?
+    } else {
+        None
+    };
+    rt.rearm_timer(actor_id, name, duration_ms, operation_id);
     Ok(())
 }
 

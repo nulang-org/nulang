@@ -1,5 +1,14 @@
 # Nulang Changelog
 
+### Workflow replay operation identities — 2026-09-25
+- **Activation-local operations now have durable addresses.** Workflow custom events and synthetic parallel-branch completions carry backward-compatible optional `WorkflowOperationId` values allocated from the live activation's deterministic ordinal stream.
+- **Durable effects can derive identity directly from workflow replay position.** `DurableEffectId::derive_from_workflow_operation` binds actor id, accepted-command sequence, activation-local operation ordinal, and effect operation under a dedicated hash domain; `Runtime::next_workflow_durable_effect_id` shares the same ordinal stream as emitted workflow events.
+- **Recovery can look up committed workflow events by operation id.** `workflow_event_for_operation` rejects actor mismatches, foreign operation identities, and duplicate identities instead of choosing an arbitrary durable record.
+- **Durable timers preserve operation identity from set through fire and recovery re-arm.** `TimerSet` and `TimerFired` carry the same optional operation id, the timer wheel transports it in-memory, and recovery matches activation-aware timers by operation id instead of conflating repeated uses of the same timer name.
+- Temporal compatibility-created timer history remains explicitly legacy/unbound (`operation_id: None`) rather than fabricating Nulang activation identity.
+- This is an identity/addressing slice for #836, not automatic unfinished-activation replay. Signal-wait binding, LLM/effect receipt consumption, and fail-closed workflow-event emission remain follow-up work.
+
+
 ### Workflow activation replay identity foundation — 2026-09-24
 - **Accepted workflow commands now have stable activation identities.** Non-internal workflow messages are journaled with a `WorkflowActivationId(actor_id, command_sequence)` before execution; failure to durably accept the command prevents the activation from running.
 - **Terminal workflow events close an explicit activation.** `StepCompleted` and `StepFailed` carry a backward-compatible optional activation id, and every normal/signal/timer/receive/LLM completion path records the live activation before clearing it.

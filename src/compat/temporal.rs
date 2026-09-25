@@ -205,6 +205,7 @@ impl TemporalWorkflowTaskContext {
         validate_non_empty("timer_id", &timer_id)?;
         Ok(WorkflowEvent::TimerSet {
             sequence: self.transition_sequence,
+            operation_id: None,
             name: timer_id,
             duration_ms,
         })
@@ -218,6 +219,7 @@ impl TemporalWorkflowTaskContext {
         validate_non_empty("timer_id", &timer_id)?;
         Ok(WorkflowEvent::TimerFired {
             sequence: self.transition_sequence,
+            operation_id: None,
             name: timer_id,
         })
     }
@@ -1001,6 +1003,7 @@ mod tests {
                 sequence,
                 name,
                 duration_ms,
+                ..
             } => {
                 assert_eq!(sequence, 9);
                 assert_eq!(name, "retry");
