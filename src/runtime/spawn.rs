@@ -226,6 +226,7 @@ fn restore_persistent_state(
         actor.install_authority_manifest(&authority);
         actor.sequence = snapshot.sequence;
         actor.waiting_signal = snapshot.waiting_signal;
+        actor.waiting_signal_operation = snapshot.waiting_signal_operation;
         for (name, value) in snapshot.state {
             let v = value.to_value_on_heap(actor);
             actor.set_state_field(name, v);
