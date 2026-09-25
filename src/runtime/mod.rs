@@ -1269,6 +1269,7 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
+                                    activation: suspended.activation,
                                     step_name: suspended.step_name.clone(),
                                 });
                             actor.jit_yield_pending = true;
@@ -1294,6 +1295,7 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
+                                    activation: suspended.activation,
                                     step_name: suspended.step_name,
                                 });
                         }
@@ -1707,6 +1709,7 @@ impl Runtime {
                             Some(crate::runtime::actor::SuspendedExecution {
                                 vm_state,
                                 behavior_idx,
+                                activation: suspended.activation,
                                 step_name,
                             });
                     }
@@ -4510,6 +4513,7 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
+                                    activation: suspended.activation,
                                     step_name: suspended.step_name.clone(),
                                 });
                         }
@@ -4607,6 +4611,7 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
+                                    activation: suspended.activation,
                                     step_name: suspended.step_name,
                                 });
                         }
@@ -4628,6 +4633,7 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
+                                    activation: suspended.activation,
                                     step_name: suspended.step_name,
                                 });
                         }
@@ -4882,6 +4888,7 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: 0,
+                                    activation: actor.current_workflow_activation,
                                     step_name: String::new(),
                                 });
                             actor.jit_yield_pending = true;
@@ -4907,6 +4914,7 @@ impl Runtime {
                             Some(crate::runtime::actor::SuspendedExecution {
                                 vm_state,
                                 behavior_idx: 0,
+                                activation: actor.current_workflow_activation,
                                 step_name: String::new(),
                             });
                     }
