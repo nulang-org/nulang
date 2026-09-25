@@ -395,6 +395,12 @@ pub struct Runtime {
 
     // Persistence engine (v0.7)
     pub persistence: Box<dyn PersistenceStore>,
+    /// In-flight durable workflow turn per actor on this shard.
+    ///
+    /// Actor-keyed ownership stays correct even when VM-exit draining resumes
+    /// another actor synchronously and that nested actor itself suspends or
+    /// yields before the outer turn completes.
+    pub(crate) active_durable_turns: HashMap<u64, turn::ActiveDurableTurn>,
     // Immutable shared object store for large `val` buffers.
     pub object_store: ObjectStore,
     // Virtual actor (grain) type registry and resident mapping.
@@ -621,6 +627,7 @@ impl Runtime {
             process_groups: ProcessGroups::new(),
             pending_fetched_messages: HashMap::new(),
             persistence: Box::new(MemoryStore::new()),
+            active_durable_turns: HashMap::new(),
             object_store: ObjectStore::new(),
             grain_registry: GrainRegistry::new(),
             grain_residents: HashMap::new(),
@@ -1237,6 +1244,11 @@ impl Runtime {
             return;
         }
 
+        if let Err(error) = workflow::begin_active_continuation(self, actor_id) {
+            workflow::quarantine_after_commit_failure(self, actor_id, &error);
+            return;
+        }
+
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -1272,12 +1284,42 @@ impl Runtime {
                     }
                 }
                 Ok(_) => {
-                    // Behavior completed: clear suspension.
+                    // The behavior actually completed: a safepoint yield does
+                    // not commit the turn, but terminal completion does.
                     if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                         actor.jit_yield_pending = false;
                     }
+                    if (*self_ptr).actor_is_workflow(actor_id) {
+                        // Sequential workflow bytecode advances step_index
+                        // itself. Only synthetic parallel steps need the
+                        // runtime-side increment, matching the ordinary
+                        // non-JIT completion path.
+                        if (*self_ptr).is_parallel_step(actor_id, suspended.behavior_idx) {
+                            if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
+                                if let Some(n) =
+                                    actor.get_state_field("step_index").and_then(|v| v.as_int())
+                                {
+                                    actor.set_state_field("step_index", Value::int(n + 1));
+                                }
+                            }
+                        }
+                        if let Err(error) = workflow::commit_step_completed(
+                            &mut *self_ptr,
+                            actor_id,
+                            suspended.step_name.clone(),
+                        ) {
+                            workflow::quarantine_after_commit_failure(
+                                &mut *self_ptr,
+                                actor_id,
+                                &error,
+                            );
+                        }
+                    }
                 }
                 Err(crate::types::NuError::Suspended(_)) => {
+                    if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
+                        actor.jit_yield_pending = false;
+                    }
                     // Re-suspended (e.g. signal wait or receive-wait):
                     // re-capture VM state.
                     if let Some(vm_state) = vm.take_suspended_state() {
@@ -1312,10 +1354,27 @@ impl Runtime {
                         }
                     }
                 }
-                Err(_) => {
-                    // Other error: clear suspension.
+                Err(error) => {
                     if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                         actor.jit_yield_pending = false;
+                    }
+                    if (*self_ptr).actor_is_workflow(actor_id) {
+                        match workflow::commit_step_failed(
+                            &mut *self_ptr,
+                            actor_id,
+                            suspended.step_name.clone(),
+                            format!("{}", error),
+                        ) {
+                            Ok(()) => (*self_ptr)
+                                .run_saga_compensation(actor_id, suspended.behavior_idx),
+                            Err(commit_error) => {
+                                workflow::quarantine_after_commit_failure(
+                                    &mut *self_ptr,
+                                    actor_id,
+                                    &commit_error,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -1642,6 +1701,10 @@ impl Runtime {
 
         let behavior_idx = suspended.behavior_idx;
         let step_name = suspended.step_name;
+        if let Err(error) = workflow::begin_active_continuation(self, actor_id) {
+            workflow::quarantine_after_commit_failure(self, actor_id, &error);
+            return;
+        }
         let self_ptr: *mut Runtime = self;
         let result = unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -3706,8 +3769,6 @@ impl Runtime {
             let behavior_idx = msg.behavior_id as usize;
             let is_user_workflow_step = self.actor_is_workflow(actor_id)
                 && !self.is_internal_behavior(actor_id, behavior_idx);
-            let mut staged_workflow_command = is_user_workflow_step
-                .then(|| workflow::stage_command(self, actor_id, msg.behavior_id, &msg.payload));
 
             // ORCA receiver protocol: hold every heap pointer in the
             // received payload so the owning objects (and any retired
@@ -3909,6 +3970,16 @@ impl Runtime {
                 }
             }
 
+            if is_user_workflow_step {
+                let command =
+                    workflow::stage_command(self, actor_id, msg.behavior_id, &msg.payload);
+                if let Err(error) = workflow::begin_active_turn(self, actor_id, command) {
+                    workflow::quarantine_after_commit_failure(self, actor_id, &error);
+                    self.current_actor = None;
+                    return;
+                }
+            }
+
             let mut processed = false;
             if self.has_native_handler(actor_id, behavior_idx) {
                 // Journal the message before handling so recovery can replay it.
@@ -3953,24 +4024,24 @@ impl Runtime {
                 self.suspend_enabled = saved_suspend;
                 match result {
                     Ok(_) => {
-                        if !is_user_workflow_step {
-                            self.checkpoint_actor(actor_id);
+                        let jit_yield_pending = self
+                            .actors
+                            .get(&actor_id)
+                            .map(|actor| actor.jit_yield_pending)
+                            .unwrap_or(false);
+                        if !jit_yield_pending {
+                            if !is_user_workflow_step {
+                                self.checkpoint_actor(actor_id);
+                            }
+                            processed = true;
                         }
-                        processed = true;
                     }
                     Err(crate::types::NuError::Suspended(_)) => {
                         // The command and suspension marker form one durable
                         // transition. The snapshot is copied from the last
                         // committed state so partially-executed workflow
                         // mutations cannot leak across a crash.
-                        let command = if is_user_workflow_step {
-                            staged_workflow_command.take()
-                        } else {
-                            None
-                        };
-                        if let Err(error) =
-                            self.persist_suspension_marker_with_command(actor_id, command)
-                        {
+                        if let Err(error) = self.persist_suspension_marker(actor_id) {
                             if self.actor_is_workflow(actor_id) {
                                 workflow::quarantine_after_commit_failure(self, actor_id, &error);
                             } else {
@@ -3989,12 +4060,11 @@ impl Runtime {
                         // together or the activation is quarantined.
                         if self.actor_is_workflow(actor_id) {
                             let step_name = self.step_name_for(actor_id, behavior_idx);
-                            match workflow::commit_step_failed_with_command(
+                            match workflow::commit_step_failed(
                                 self,
                                 actor_id,
                                 step_name,
                                 format!("{}", e),
-                                staged_workflow_command.take(),
                             ) {
                                 Ok(()) => self.run_saga_compensation(actor_id, behavior_idx),
                                 Err(error) => {
@@ -4025,16 +4095,27 @@ impl Runtime {
                         }
                     }
                 }
-                if let Err(error) = workflow::commit_step_completed_with_command(
-                    self,
-                    actor_id,
-                    step_name,
-                    staged_workflow_command.take(),
-                ) {
+                if let Err(error) =
+                    workflow::commit_step_completed(self, actor_id, step_name)
+                {
                     workflow::quarantine_after_commit_failure(self, actor_id, &error);
                     processed = false;
                 }
             }
+            let jit_turn_still_running = self
+                .actors
+                .get(&actor_id)
+                .map(|actor| actor.jit_yield_pending)
+                .unwrap_or(false);
+            if is_user_workflow_step && !processed && !jit_turn_still_running {
+                // A normal completion/failure/suspension consumes the active
+                // turn. If no handler accepted the message, discard the
+                // uncommitted staging buffer so it cannot contaminate a later
+                // delivery. A JIT safepoint is not a durable boundary and
+                // therefore retains its active turn.
+                workflow::discard_active_turn(self, actor_id);
+            }
+
             let actor = match self.actors.get_mut(&actor_id) {
                 Some(a) => a,
                 None => {
@@ -4476,11 +4557,8 @@ impl Runtime {
     /// set a flag and relied on `poll_llm_completions` (ai-runtime only) to
     /// resume - the single-arg form permanently hung without that feature.
     fn fire_timer_sleep_wake(&mut self, actor_id: u64) {
-        if let Some(actor) = self.actors.get_mut(&actor_id) {
-            actor.timer_sleep_fired = true;
-        }
         // Resume the suspended PerformAsync execution so the re-executed
-        // opcode sees the flag and completes the sleep.  Modeled on
+        // opcode sees the flag and completes the sleep. Modeled on
         // resume_suspended_jit_yield without the JIT safepoint logic.
         let suspended = match self.actors.get_mut(&actor_id) {
             Some(actor) => actor.suspended_execution.take(),
@@ -4497,6 +4575,13 @@ impl Runtime {
             }
             self.enqueue_actor(actor_id);
             return;
+        }
+        if let Err(error) = workflow::begin_active_continuation(self, actor_id) {
+            workflow::quarantine_after_commit_failure(self, actor_id, &error);
+            return;
+        }
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.timer_sleep_fired = true;
         }
         let self_ptr: *mut Runtime = self;
         unsafe {
@@ -4633,6 +4718,10 @@ impl Runtime {
             if let Some(actor) = self.actors.get_mut(&actor_id) {
                 actor.suspended_execution = Some(suspended);
             }
+            return;
+        }
+        if let Err(error) = workflow::begin_active_continuation(self, actor_id) {
+            workflow::quarantine_after_commit_failure(self, actor_id, &error);
             return;
         }
 
@@ -4900,10 +4989,18 @@ impl Runtime {
                 .unwrap_or(0)
         };
         let result = self.run_bytecode_at_offset(actor_id, code_offset, args);
-        // If the step suspended waiting for a signal or a background LLM
-        // call, record which behavior and step name it was executing so
-        // recovery/resumption can continue.
-        if let Err(crate::types::NuError::Suspended(_)) = result {
+        // If the step suspended or yielded at a JIT safepoint, record which
+        // behavior and step name it was executing so the resume path can
+        // finish the same durable turn rather than inventing a new command.
+        let needs_resume_metadata = matches!(
+            &result,
+            Err(crate::types::NuError::Suspended(_))
+        ) || self
+            .actors
+            .get(&actor_id)
+            .map(|actor| actor.jit_yield_pending)
+            .unwrap_or(false);
+        if needs_resume_metadata {
             let step_name = self.step_name_for(actor_id, behavior_idx);
             if let Some(actor) = self.actors.get_mut(&actor_id) {
                 if let Some(ref mut suspended) = actor.suspended_execution {

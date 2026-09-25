@@ -1,11 +1,9 @@
 //! Canonical staging boundary for one runtime turn.
 //!
 //! Runtime code stages all Nulang-owned durable mutations in a `TurnOutcome`
-//! and lowers that outcome to exactly one `DurableTransition`.  Backends with
-//! atomic-transition support commit it all-or-nothing.  During the RFC 0022
-//! migration, legacy backends may use the compatibility fallback below for
-//! snapshot/journal/workflow/domain records only; durable effects and outbox
-//! messages never fall back because doing so would create false atomicity.
+//! and lowers that outcome to exactly one `DurableTransition`. Built-in
+//! persistence backends commit that transition all-or-nothing; unsupported
+//! custom stores fail closed rather than silently degrading durability.
 
 use std::io;
 
@@ -24,6 +22,32 @@ use super::persistence::{
 pub(crate) struct StagedCommand {
     pub(crate) behavior_id: u16,
     pub(crate) payload: Vec<super::persistence::PersistedValue>,
+}
+
+/// A timer that becomes live only after its containing durable transition
+/// commits successfully.
+#[derive(Debug, Clone)]
+pub(crate) enum StagedTimer {
+    Workflow {
+        name: String,
+        duration_ms: u64,
+    },
+    Sleep {
+        duration_ms: u64,
+    },
+}
+
+/// One in-flight durable workflow turn.
+///
+/// The sequence is reserved from the committed predecessor when execution
+/// starts. Nulang-owned consequences accumulate in `outcome`; live timer
+/// publication is deferred until the same transition commits.
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveDurableTurn {
+    pub(crate) expected_previous_sequence: u64,
+    pub(crate) sequence: u64,
+    pub(crate) outcome: TurnOutcome,
+    pub(crate) timers: Vec<StagedTimer>,
 }
 
 /// Everything one execution turn wants to make durable.
