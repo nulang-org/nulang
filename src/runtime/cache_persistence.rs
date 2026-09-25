@@ -157,7 +157,11 @@ impl DurableCacheStore {
         &self.store
     }
 
-    pub fn get<'a>(&'a mut self, key: &[u8], now_ms: u64) -> Option<super::cache::CacheValueView<'a>> {
+    pub fn get<'a>(
+        &'a mut self,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Option<super::cache::CacheValueView<'a>> {
         self.store.get(key, now_ms)
     }
 
@@ -272,9 +276,7 @@ impl DurableCacheStore {
         let mut mutations = Vec::new();
         for key in keys {
             if self.store.delete_at(key, store_now_ms) {
-                mutations.push(CacheWalMutation::Delete {
-                    key: key.to_vec(),
-                });
+                mutations.push(CacheWalMutation::Delete { key: key.to_vec() });
             }
         }
         let deleted = mutations.len();
@@ -359,8 +361,8 @@ impl DurableCacheStore {
         )
         .map_err(CacheDurabilityError::Persistence)?;
 
-        let rotated =
-            CacheWal::create_after(&wal_path, sequence).map_err(CacheDurabilityError::Persistence)?;
+        let rotated = CacheWal::create_after(&wal_path, sequence)
+            .map_err(CacheDurabilityError::Persistence)?;
         self.wal = Some(rotated);
         Ok(sequence)
     }
@@ -1151,12 +1153,9 @@ mod tests {
     fn journal_failure_poisons_durable_store() {
         let wal_path = test_path("poison-wal");
         let wal = CacheWal::create_after(&wal_path, 0).unwrap();
-        let mut durable = DurableCacheStore::with_wal(
-            CacheStore::new(),
-            wal,
-            CacheDurabilityMode::SyncedJournal,
-        )
-        .unwrap();
+        let mut durable =
+            DurableCacheStore::with_wal(CacheStore::new(), wal, CacheDurabilityMode::SyncedJournal)
+                .unwrap();
 
         let readonly = OpenOptions::new().read(true).open(&wal_path).unwrap();
         durable.wal.as_mut().unwrap().file = readonly;
