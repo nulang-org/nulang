@@ -59,12 +59,45 @@ pub struct BehaviorArtifact {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BehaviorActor {
     pub name: String,
+    #[serde(default)]
+    pub kind: BehaviorOwnerKind,
     pub persistence: BehaviorPersistence,
     pub schema_version: u32,
     pub state_schema_semantic_id: String,
     pub migration_identity: MigrationIdentityCoverage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub migrations: Vec<BehaviorMigrationStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<BehaviorWorkflow>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BehaviorOwnerKind {
+    Actor,
+    Workflow,
+    Agent,
+    Organization,
+}
+
+impl Default for BehaviorOwnerKind {
+    fn default() -> Self {
+        Self::Actor
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorWorkflow {
+    pub steps: Vec<BehaviorWorkflowStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorWorkflowStep {
+    pub name: String,
+    #[serde(default)]
+    pub compensation: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parallel_branches: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,11 +164,13 @@ impl BehaviorManifest {
 
             actors.push(BehaviorActor {
                 name: schema.actor_name.clone(),
+                kind: classify_owner_kind(actor),
                 persistence: classify_persistence(actor),
                 schema_version: schema.version,
                 state_schema_semantic_id: state_schema_semantic_id(&schema).to_string(),
                 migration_identity: MigrationIdentityCoverage::TopologyOnly,
                 migrations: migration_steps(&schema),
+                workflow: workflow_metadata(actor),
             });
         }
 
@@ -507,6 +542,36 @@ fn migration_steps(schema: &ActorStateSchema) -> Vec<BehaviorMigrationStep> {
     steps
 }
 
+fn classify_owner_kind(actor: &hir::ActorDef) -> BehaviorOwnerKind {
+    if actor.is_workflow {
+        BehaviorOwnerKind::Workflow
+    } else if actor.is_agent {
+        BehaviorOwnerKind::Agent
+    } else if actor.is_organization {
+        BehaviorOwnerKind::Organization
+    } else {
+        BehaviorOwnerKind::Actor
+    }
+}
+
+fn workflow_metadata(actor: &hir::ActorDef) -> Option<BehaviorWorkflow> {
+    if !actor.is_workflow {
+        return None;
+    }
+
+    Some(BehaviorWorkflow {
+        steps: actor
+            .behaviors
+            .iter()
+            .map(|behavior| BehaviorWorkflowStep {
+                name: behavior.name.clone(),
+                compensation: behavior.compensate.is_some(),
+                parallel_branches: behavior.parallel_branches.clone().unwrap_or_default(),
+            })
+            .collect(),
+    })
+}
+
 fn classify_persistence(actor: &hir::ActorDef) -> BehaviorPersistence {
     let mut durable = false;
     let mut event_sourced = false;
@@ -853,6 +918,7 @@ mod tests {
     fn actor(version: u32, schema_seed: &[u8]) -> BehaviorActor {
         BehaviorActor {
             name: "payments::Account".to_string(),
+            kind: BehaviorOwnerKind::Actor,
             persistence: BehaviorPersistence::Durable,
             schema_version: version,
             state_schema_semantic_id: schema_id(schema_seed),
@@ -869,6 +935,7 @@ mod tests {
                     })
                     .collect()
             },
+            workflow: None,
         }
     }
 
