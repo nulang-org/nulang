@@ -500,13 +500,18 @@ fn host_arith_fi(a: u64, b: u64, fop: fn(f64, f64) -> f64, iop: fn(i64, i64) -> 
     }
 }
 
-fn host_add(_caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<i64, Error> {
-    Ok(host_arith_fi(
-        a as u64,
-        b as u64,
-        |x, y| x + y,
-        |x, y| x + y,
-    ))
+fn host_add(caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<i64, Error> {
+    let a_raw = a as u64;
+    let b_raw = b as u64;
+    // Match VM::IAdd's dynamic string fallback. MIR can retain Binary(Add)
+    // when a string arrives through a runtime-typed path such as ArrayLoad,
+    // so WASM must not assume every Binary(Add) is numeric.
+    if (a_raw & value_layout::TAG_MASK) == value_layout::TAG_STRING
+        || (b_raw & value_layout::TAG_MASK) == value_layout::TAG_STRING
+    {
+        return host_str_concat(caller, a, b);
+    }
+    Ok(host_arith_fi(a_raw, b_raw, |x, y| x + y, |x, y| x + y))
 }
 fn host_sub(_caller: Caller<'_, HostState>, a: i64, b: i64) -> Result<i64, Error> {
     Ok(host_arith_fi(
