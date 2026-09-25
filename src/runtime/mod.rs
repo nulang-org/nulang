@@ -126,6 +126,7 @@ pub use supervisor::*;
 pub use timer::*;
 pub use workflow::{
     WorkflowActivationAnalysisError, WorkflowActivationRecord, WorkflowActivationTerminal,
+    WorkflowOperationAnalysisError,
 };
 
 use crate::types::{ExitReason, NuError, Span, VmSuspension};
@@ -1150,6 +1151,16 @@ impl Runtime {
         let journal = self.persistence.read_journal(actor_id);
         let events = self.persistence.read_workflow_events(actor_id);
         workflow::analyze_workflow_activations(actor_id, &journal, &events)
+    }
+
+    /// Return the durable workflow event bound to one replay operation id.
+    pub fn workflow_event_for_operation(
+        &self,
+        actor_id: u64,
+        operation_id: WorkflowOperationId,
+    ) -> Result<Option<WorkflowEvent>, WorkflowOperationAnalysisError> {
+        let events = self.persistence.read_workflow_events(actor_id);
+        workflow::find_workflow_event_for_operation(actor_id, operation_id, &events)
     }
 
     /// Allocate the next deterministic replay identity inside the live workflow
