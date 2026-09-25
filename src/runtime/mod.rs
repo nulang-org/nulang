@@ -1102,12 +1102,12 @@ impl Runtime {
         name: &str,
         duration_ms: u64,
     ) -> std::io::Result<()> {
-        workflow::append_timer_set(self, actor_id, name, duration_ms)
+        workflow::append_timer_set(self, actor_id, name, duration_ms).map(|_| ())
     }
 
     /// Append a `TimerFired` workflow event and checkpoint the actor.
     pub fn append_timer_fired(&mut self, actor_id: u64, name: &str) -> std::io::Result<()> {
-        workflow::append_timer_fired(self, actor_id, name)
+        workflow::append_timer_fired(self, actor_id, name, None)
     }
 
     /// Append a `SignalReceived` workflow event and checkpoint the actor.
@@ -4352,14 +4352,21 @@ impl Runtime {
 
     /// Re-arm a timer from the durable journal without appending a new event.
     /// Used during recovery to restore timers that have not yet fired.
-    pub(crate) fn rearm_timer(&mut self, actor_id: u64, name: &str, duration_ms: u64) {
+    pub(crate) fn rearm_timer(
+        &mut self,
+        actor_id: u64,
+        name: &str,
+        duration_ms: u64,
+        operation_id: Option<WorkflowOperationId>,
+    ) {
         let behavior_id = self.behavior_id_for(actor_id, "__timer_fired").unwrap_or(0);
-        self.timer_wheel.send_after_with_context(
+        self.timer_wheel.send_after_with_operation_context(
             std::time::Duration::from_millis(duration_ms),
             actor_id,
             behavior_id,
             vec![],
             name.to_string(),
+            operation_id,
         );
     }
 
@@ -4701,9 +4708,12 @@ impl Runtime {
                     behavior_id,
                     payload,
                     context,
+                    operation_id,
                 } => {
                     if self.actor_is_workflow(target_actor) {
-                        if let Err(error) = self.append_timer_fired(target_actor, &context) {
+                        if let Err(error) =
+                            workflow::append_timer_fired(self, target_actor, &context, operation_id)
+                        {
                             tracing::error!(
                                 actor_id = target_actor,
                                 timer = %context,
@@ -5302,20 +5312,36 @@ impl Runtime {
             // journal, not just events after the snapshot, because snapshots do
             // not capture pending timers.
             let all_timer_events = self.persistence.read_timer_events(actor_id);
-            let mut fired_timer_names: std::collections::HashSet<String> =
+            let mut fired_operations = std::collections::HashSet::new();
+            let mut fired_legacy_names: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             for event in &all_timer_events {
-                if let WorkflowEvent::TimerFired { name, .. } = event {
-                    fired_timer_names.insert(name.clone());
+                if let WorkflowEvent::TimerFired {
+                    operation_id,
+                    name,
+                    ..
+                } = event
+                {
+                    if let Some(operation_id) = operation_id {
+                        fired_operations.insert(*operation_id);
+                    } else {
+                        fired_legacy_names.insert(name.clone());
+                    }
                 }
             }
             for event in &all_timer_events {
                 if let WorkflowEvent::TimerSet {
-                    name, duration_ms, ..
+                    operation_id,
+                    name,
+                    duration_ms,
+                    ..
                 } = event
                 {
-                    if !fired_timer_names.contains(name) {
-                        self.rearm_timer(actor_id, name, *duration_ms);
+                    let already_fired = operation_id
+                        .map(|id| fired_operations.contains(&id))
+                        .unwrap_or_else(|| fired_legacy_names.contains(name));
+                    if !already_fired {
+                        self.rearm_timer(actor_id, name, *duration_ms, *operation_id);
                     }
                 }
             }
