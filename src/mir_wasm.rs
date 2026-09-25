@@ -2968,6 +2968,26 @@ mod tests {
     }
 
     #[test]
+    fn test_wasm_rejects_workflow_until_durable_semantics_are_supported() {
+        let error = compile_source(
+            r#"
+            workflow Order {
+                step reserve { 1 }
+                step charge { 2 }
+            }
+            "#,
+        )
+        .expect_err("WASM workflows must fail closed without durable semantics");
+
+        assert!(
+            error
+                .to_string()
+                .contains("WASM backend does not yet support durable workflow semantics"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn test_compile_literal_int() {
         let wasm = compile_source("42").expect("compile");
         assert_eq!(&wasm[0..4], b"\0asm");
