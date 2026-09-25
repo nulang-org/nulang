@@ -14,9 +14,10 @@ use super::cache_cluster::{
     execute_cluster_command, CacheClusterCommandError, CacheEndpointMap, CacheRoutingMode,
 };
 use super::cache_routing::{CacheShardOwner, CacheSlotMap};
-use super::resp::{parse_command, write_moved, RespParseError};
+use super::resp::{parse_command, write_ask, write_error, write_moved, write_simple, RespParseError};
 use super::resp_cache::{
-    command_slot, execute_command, execute_frame, CacheCommandTarget, RespCommandSlot,
+    command_key_presence, command_slot, execute_command, execute_frame, CacheCommandKeyPresence,
+    CacheCommandTarget, RespCommandSlot,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,11 +83,21 @@ pub struct CacheRemoteRequest {
     pub slot: u16,
     pub owner: CacheShardOwner,
     pub placement_epoch: u64,
+    pub asking: bool,
     pub frame: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheRedirectKind {
+    Moved,
+    Ask,
 }
 
 pub enum CacheDispatchOutcome {
     Executed {
+        consumed: usize,
+    },
+    AskingEnabled {
         consumed: usize,
     },
     LocalQueued {
@@ -102,6 +113,7 @@ pub enum CacheDispatchOutcome {
         consumed: usize,
         slot: u16,
         owner: CacheShardOwner,
+        kind: CacheRedirectKind,
     },
 }
 
@@ -310,9 +322,32 @@ impl CacheDispatcher {
         now_ms: u64,
         out: &mut Vec<u8>,
     ) -> Result<Option<CacheDispatchOutcome>, CacheDispatchError> {
+        self.dispatch_frame_with_asking(store, input, now_ms, out, false)
+    }
+
+    pub fn dispatch_frame_with_asking<T: CacheCommandTarget>(
+        &self,
+        store: &mut T,
+        input: &[u8],
+        now_ms: u64,
+        out: &mut Vec<u8>,
+        asking: bool,
+    ) -> Result<Option<CacheDispatchOutcome>, CacheDispatchError> {
         let Some((command, consumed)) = parse_command(input)? else {
             return Ok(None);
         };
+
+        if command.name().eq_ignore_ascii_case(b"ASKING") {
+            if command.argc() == 0 {
+                write_simple(out, b"OK");
+                return Ok(Some(CacheDispatchOutcome::AskingEnabled { consumed }));
+            }
+            write_error(
+                out,
+                b"ERR wrong number of arguments for 'asking' command",
+            );
+            return Ok(Some(CacheDispatchOutcome::Executed { consumed }));
+        }
 
         if let Some(result) =
             execute_cluster_command(command, &self.placement, &self.endpoints, out)
@@ -337,8 +372,84 @@ impl CacheDispatcher {
             .placement
             .owner_for_slot(slot)
             .ok_or(CacheDispatchError::UnknownSlot(slot))?;
+        let local_owner = CacheShardOwner {
+            node_id: self.local_node_id,
+            shard: self.local_shard,
+        };
+        let migration = self.placement.migration_for_slot(slot);
 
-        let is_local_owner = owner.node_id == self.local_node_id && owner.shard == self.local_shard;
+        // ASKING authorizes exactly one command on the importing target while
+        // authoritative ownership still points at the source.
+        if asking
+            && migration
+                .is_some_and(|migration| migration.target == local_owner)
+        {
+            execute_command(store, command, now_ms, out);
+            return Ok(Some(CacheDispatchOutcome::Executed { consumed }));
+        }
+
+        // The source continues serving keys that still exist locally. Missing
+        // keys are presumed to have crossed to the importing target. Mixed
+        // multi-key commands are retryable rather than split across owners.
+        if migration.is_some_and(|migration| migration.source == local_owner) {
+            match command_key_presence(store, command, now_ms) {
+                CacheCommandKeyPresence::Mixed => {
+                    write_error(
+                        out,
+                        b"TRYAGAIN Multiple keys request during rehashing of slot",
+                    );
+                    return Ok(Some(CacheDispatchOutcome::Executed { consumed }));
+                }
+                CacheCommandKeyPresence::AllMissing => {
+                    let target = migration.expect("migration disappeared").target;
+                    if self.routing_mode == CacheRoutingMode::Redirect {
+                        let endpoint = self
+                            .endpoints
+                            .get(target)
+                            .ok_or(CacheDispatchError::MissingEndpoint(target))?;
+                        write_ask(out, slot, endpoint.target());
+                        return Ok(Some(CacheDispatchOutcome::Redirected {
+                            consumed,
+                            slot,
+                            owner: target,
+                            kind: CacheRedirectKind::Ask,
+                        }));
+                    }
+
+                    if target.node_id != self.local_node_id {
+                        return Ok(Some(CacheDispatchOutcome::Remote {
+                            consumed,
+                            request: CacheRemoteRequest {
+                                slot,
+                                owner: target,
+                                placement_epoch: self.placement.epoch(),
+                                asking: true,
+                                frame: input[..consumed].to_vec(),
+                            },
+                        }));
+                    }
+
+                    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+                    self.channels.try_send(
+                        target.shard,
+                        CacheShardRequest {
+                            frame: input[..consumed].to_vec(),
+                            now_ms,
+                            reply: reply_tx,
+                            reply_wake: self.channels.waker_for(self.local_shard),
+                        },
+                    )?;
+                    return Ok(Some(CacheDispatchOutcome::LocalQueued {
+                        consumed,
+                        shard: target.shard,
+                        reply: CacheLocalReply { receiver: reply_rx },
+                    }));
+                }
+                CacheCommandKeyPresence::NoKeys | CacheCommandKeyPresence::AllPresent => {}
+            }
+        }
+
+        let is_local_owner = owner == local_owner;
 
         if !is_local_owner && self.routing_mode == CacheRoutingMode::Redirect {
             let endpoint = self
@@ -350,6 +461,7 @@ impl CacheDispatcher {
                 consumed,
                 slot,
                 owner,
+                kind: CacheRedirectKind::Moved,
             }));
         }
 
@@ -360,6 +472,7 @@ impl CacheDispatcher {
                     slot,
                     owner,
                     placement_epoch: self.placement.epoch(),
+                    asking: false,
                     frame: input[..consumed].to_vec(),
                 },
             }));
