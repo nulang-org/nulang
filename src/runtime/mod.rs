@@ -1130,7 +1130,12 @@ impl Runtime {
     /// The signal is appended to the durable workflow journal and, if the actor
     /// is currently suspended waiting for this signal, its execution is resumed.
     /// Deliver a signal to a workflow actor. Delegates to workflow subsystem.
-    pub fn signal_workflow(&mut self, actor_id: u64, name: &str, payload: Option<String>) {
+    pub fn signal_workflow(
+        &mut self,
+        actor_id: u64,
+        name: &str,
+        payload: Option<String>,
+    ) -> std::io::Result<()> {
         workflow::signal_workflow(self, actor_id, name, payload)
     }
 
@@ -4287,7 +4292,12 @@ impl Runtime {
     /// Appends a `TimerSet` event, checkpoints state, and arms the runtime's
     /// timer wheel. When the timer fires the runtime will append a
     /// `TimerFired` event and deliver a `__timer_fired` message to the actor.
-    pub fn schedule_workflow_timer(&mut self, actor_id: u64, name: &str, duration_ms: u64) {
+    pub fn schedule_workflow_timer(
+        &mut self,
+        actor_id: u64,
+        name: &str,
+        duration_ms: u64,
+    ) -> std::io::Result<()> {
         workflow::schedule_workflow_timer(self, actor_id, name, duration_ms)
     }
 
@@ -4650,7 +4660,15 @@ impl Runtime {
                     context,
                 } => {
                     if self.actor_is_workflow(target_actor) {
-                        let _ = self.append_timer_fired(target_actor, &context);
+                        if let Err(error) = self.append_timer_fired(target_actor, &context) {
+                            tracing::error!(
+                                actor_id = target_actor,
+                                timer = %context,
+                                %error,
+                                "nulang-workflow: refusing to deliver timer after durable TimerFired commit failed"
+                            );
+                            continue;
+                        }
                     }
                     self.send_message_by_id(target_actor, behavior_id, &payload);
                 }
