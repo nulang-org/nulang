@@ -29,6 +29,8 @@ use std::str::FromStr;
 
 const EFFECT_ID_DOMAIN: &[u8] = b"nulang.durable-effect.v1\0";
 const EFFECT_ID_SITE_DOMAIN: &[u8] = b"nulang.durable-effect-site.v1\0";
+const EFFECT_ID_WORKFLOW_OPERATION_DOMAIN: &[u8] =
+    b"nulang.durable-effect-workflow-operation.v1\0";
 const COMPENSATION_ID_DOMAIN: &[u8] = b"nulang.durable-compensation.v1\0";
 const REQUEST_DIGEST_DOMAIN: &[u8] = b"nulang.durable-effect-request.v1\0";
 
@@ -77,6 +79,27 @@ impl DurableEffectId {
         hash_len_prefixed(&mut hasher, execution_key.as_bytes());
         hasher.update(site_id.as_bytes());
         hasher.update(&occurrence_index.to_le_bytes());
+        Self(*hasher.finalize().as_bytes())
+    }
+
+    /// Derive a durable-effect identity directly from one workflow activation
+    /// operation. This avoids caller-invented string execution keys once a
+    /// workflow is running under the activation replay contract.
+    ///
+    /// The activation's command sequence plus the deterministic operation
+    /// ordinal are replay-stable. The effect operation remains part of the
+    /// digest so replaying a different effect at the same ordinal fails to
+    /// match the original identity.
+    pub fn derive_from_workflow_operation(
+        operation: crate::runtime::WorkflowOperationId,
+        effect_operation: &str,
+    ) -> Self {
+        let mut hasher = Hasher::new();
+        hasher.update(EFFECT_ID_WORKFLOW_OPERATION_DOMAIN);
+        hasher.update(&operation.activation.actor_id.to_le_bytes());
+        hasher.update(&operation.activation.command_sequence.to_le_bytes());
+        hasher.update(&operation.ordinal.to_le_bytes());
+        hash_len_prefixed(&mut hasher, effect_operation.as_bytes());
         Self(*hasher.finalize().as_bytes())
     }
 
