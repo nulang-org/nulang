@@ -1669,6 +1669,7 @@ impl Runtime {
                         actor_id,
                         WorkflowEvent::StepCompleted {
                             sequence: seq,
+                            activation: suspended.activation,
                             step_name,
                         },
                     );
@@ -4506,6 +4507,7 @@ impl Runtime {
                             actor_id,
                             crate::runtime::WorkflowEvent::StepCompleted {
                                 sequence: seq,
+                                activation: suspended.activation,
                                 step_name: suspended.step_name.clone(),
                             },
                         );
@@ -4600,6 +4602,7 @@ impl Runtime {
                             actor_id,
                             WorkflowEvent::StepCompleted {
                                 sequence: seq,
+                                activation: suspended.activation,
                                 step_name: suspended.step_name,
                             },
                         );
