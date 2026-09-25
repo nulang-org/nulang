@@ -224,14 +224,18 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
     }
     if is_workflow {
         if event == "ParallelBranchCompleted" && args.len() == 2 {
+            let operation = next_workflow_operation_id(rt, actor_id);
             let parallel_step_name =
                 resolve_string_constant(rt, actor_id, &args[0]).unwrap_or_default();
             let branch_name = resolve_string_constant(rt, actor_id, &args[1]).unwrap_or_default();
-            let _ = rt.persistence.append_parallel_branch_completed(
+            let _ = rt.persistence.append_workflow_event(
                 actor_id,
-                seq,
-                parallel_step_name,
-                branch_name,
+                WorkflowEvent::ParallelBranchCompleted {
+                    sequence: seq,
+                    operation,
+                    parallel_step_name,
+                    branch_name,
+                },
             );
             if let Some(actor) = rt.actors.get_mut(&actor_id) {
                 let current = actor
@@ -249,10 +253,12 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 .iter()
                 .map(|v| PersistedValue::from_value_resolved(v, module))
                 .collect();
+            let operation = next_workflow_operation_id(rt, actor_id);
             let _ = rt.persistence.append_workflow_event(
                 actor_id,
                 WorkflowEvent::Custom {
                     sequence: seq,
+                    operation,
                     name: event.to_string(),
                     args: payload,
                 },
@@ -272,8 +278,16 @@ pub(crate) fn append_timer_set(
     duration_ms: u64,
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_timer_set(actor_id, seq, name.to_string(), duration_ms)
+    let operation = next_workflow_operation_id(rt, actor_id);
+    rt.persistence.append_workflow_event(
+        actor_id,
+        WorkflowEvent::TimerSet {
+            sequence: seq,
+            operation,
+            name: name.to_string(),
+            duration_ms,
+        },
+    )
 }
 
 pub(crate) fn append_timer_fired(
@@ -303,8 +317,15 @@ pub(crate) fn append_saga_compensated(
     step_name: &str,
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_saga_compensated(actor_id, seq, step_name.to_string())
+    let operation = next_workflow_operation_id(rt, actor_id);
+    rt.persistence.append_workflow_event(
+        actor_id,
+        WorkflowEvent::SagaCompensated {
+            sequence: seq,
+            operation,
+            step_name: step_name.to_string(),
+        },
+    )
 }
 
 /// Durably close a successful workflow activation before advancing its
