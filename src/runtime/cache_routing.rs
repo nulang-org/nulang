@@ -21,6 +21,13 @@ pub struct CacheSlotRange {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheSlotMigration {
+    pub slot: u16,
+    pub source: CacheShardOwner,
+    pub target: CacheShardOwner,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachePlacementError {
     InvalidShardCount,
     InvalidRange {
@@ -37,6 +44,11 @@ pub enum CachePlacementError {
         current: u64,
         proposed: u64,
     },
+    InvalidMigrationSlot(u16),
+    MigrationAlreadyInProgress { slot: u16 },
+    MigrationInProgress { slot: u16 },
+    NoMigration { slot: u16 },
+    MigrationTargetMatchesSource { slot: u16 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +67,7 @@ pub enum CacheRoute {
 pub struct CacheSlotMap {
     epoch: u64,
     owners: Vec<CacheShardOwner>,
+    migration_targets: Vec<Option<CacheShardOwner>>,
 }
 
 impl CacheSlotMap {
@@ -76,7 +89,11 @@ impl CacheSlotMap {
             owners.push(CacheShardOwner { node_id, shard });
         }
 
-        Ok(Self { epoch: 0, owners })
+        Ok(Self {
+            epoch: 0,
+            migration_targets: vec![None; REDIS_CLUSTER_SLOTS as usize],
+            owners,
+        })
     }
 
     pub fn epoch(&self) -> u64 {
@@ -85,6 +102,84 @@ impl CacheSlotMap {
 
     pub fn owner_for_slot(&self, slot: u16) -> Option<CacheShardOwner> {
         self.owners.get(slot as usize).copied()
+    }
+
+    pub fn migration_for_slot(&self, slot: u16) -> Option<CacheSlotMigration> {
+        let source = self.owner_for_slot(slot)?;
+        let target = self
+            .migration_targets
+            .get(slot as usize)
+            .and_then(|target| *target)?;
+        Some(CacheSlotMigration {
+            slot,
+            source,
+            target,
+        })
+    }
+
+    /// Begin a slot migration without changing the authoritative owner.
+    ///
+    /// The new epoch fences stale control-plane/data-plane state immediately,
+    /// while source ownership remains stable until finish_migration installs a
+    /// second, newer epoch.
+    pub fn begin_migration(
+        &mut self,
+        proposed_epoch: u64,
+        slot: u16,
+        target: CacheShardOwner,
+    ) -> Result<(), CachePlacementError> {
+        if proposed_epoch <= self.epoch {
+            return Err(CachePlacementError::StaleEpoch {
+                current: self.epoch,
+                proposed: proposed_epoch,
+            });
+        }
+        let Some(source) = self.owner_for_slot(slot) else {
+            return Err(CachePlacementError::InvalidMigrationSlot(slot));
+        };
+        if source == target {
+            return Err(CachePlacementError::MigrationTargetMatchesSource { slot });
+        }
+        let target_slot = self
+            .migration_targets
+            .get_mut(slot as usize)
+            .ok_or(CachePlacementError::InvalidMigrationSlot(slot))?;
+        if target_slot.is_some() {
+            return Err(CachePlacementError::MigrationAlreadyInProgress { slot });
+        }
+
+        *target_slot = Some(target);
+        self.epoch = proposed_epoch;
+        Ok(())
+    }
+
+    /// Complete an in-progress migration by atomically changing ownership and
+    /// clearing migration state under a newer placement epoch.
+    pub fn finish_migration(
+        &mut self,
+        proposed_epoch: u64,
+        slot: u16,
+    ) -> Result<(), CachePlacementError> {
+        if proposed_epoch <= self.epoch {
+            return Err(CachePlacementError::StaleEpoch {
+                current: self.epoch,
+                proposed: proposed_epoch,
+            });
+        }
+        let target = self
+            .migration_targets
+            .get(slot as usize)
+            .and_then(|target| *target)
+            .ok_or(CachePlacementError::NoMigration { slot })?;
+        let owner = self
+            .owners
+            .get_mut(slot as usize)
+            .ok_or(CachePlacementError::InvalidMigrationSlot(slot))?;
+
+        *owner = target;
+        self.migration_targets[slot as usize] = None;
+        self.epoch = proposed_epoch;
+        Ok(())
     }
 
     pub fn owner_for_key(&self, key: &[u8]) -> CacheShardOwner {
@@ -178,6 +273,14 @@ impl CacheSlotMap {
                         second_start: second.start,
                         second_end: second.end,
                     });
+                }
+            }
+        }
+
+        for assignment in assignments {
+            for slot in assignment.start..=assignment.end {
+                if self.migration_targets[slot as usize].is_some() {
+                    return Err(CachePlacementError::MigrationInProgress { slot });
                 }
             }
         }
