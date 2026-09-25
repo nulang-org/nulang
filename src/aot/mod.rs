@@ -2041,12 +2041,10 @@ mod tests {
         let artifact = super::object::NativeObjectArtifact::compile(&mir, "native")
             .expect("native object string compilation");
         assert!(
-            artifact.constants().iter().any(
-                |constant| matches!(
-                    constant,
-                    crate::bytecode::Constant::String(value) if value == "artifact"
-                )
-            ),
+            artifact.constants().iter().any(|constant| matches!(
+                constant,
+                crate::bytecode::Constant::String(value) if value == "artifact"
+            )),
             "link/runtime packaging needs the exact constant pool used by native code"
         );
     }
@@ -2054,9 +2052,7 @@ mod tests {
     #[cfg(feature = "native-object")]
     #[test]
     fn test_native_object_actor_module_fails_closed_until_actor_exports_exist() {
-        let mir = native_object_test_mir(
-            "actor Counter { behavior get() { 1 } }",
-        );
+        let mir = native_object_test_mir("actor Counter { behavior get() { 1 } }");
         let err = super::object::NativeObjectArtifact::compile(&mir, "native")
             .err()
             .expect("actor object emission should fail closed in the first slice");
