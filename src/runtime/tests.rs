@@ -7838,3 +7838,44 @@ fn unrelated_signal_receipt_does_not_claim_pending_wait_identity() {
         Some(operation)
     );
 }
+
+
+#[test]
+fn workflow_recovery_matches_pending_signal_by_operation_even_before_snapshot_tail() {
+    let actor_id = 120_001;
+    let operation = WorkflowActivationId::new(actor_id, 7).operation(0);
+    let mut rt = Runtime::new();
+
+    rt.persistence
+        .append_workflow_event(
+            actor_id,
+            WorkflowEvent::SignalReceived {
+                sequence: 9,
+                operation_id: Some(operation),
+                name: "go".to_string(),
+                payload: Some("durable".to_string()),
+            },
+        )
+        .unwrap();
+    rt.persistence
+        .save_snapshot(ActorSnapshot {
+            actor_id,
+            sequence: 10,
+            state: HashMap::new(),
+            waiting_signal: Some("go".to_string()),
+            waiting_signal_operation: Some(operation),
+            crdt_snapshot: None,
+            crdt_field_map: None,
+            authority_tokens: Default::default(),
+        })
+        .unwrap();
+
+    rt.recover_actor(actor_id).expect("workflow should recover");
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert!(
+        actor
+            .received_signals
+            .contains(&("go".to_string(), Some("durable".to_string()))),
+        "operation-bound receipt must survive even when its event sequence is before the snapshot"
+    );
+}
