@@ -731,6 +731,131 @@ mod tests {
     }
 
     #[test]
+    fn chunked_bootstrap_installs_snapshot_and_resumes_at_snapshot_sequence() {
+        let mut source = CacheStore::new();
+        source.set_bytes(b"persistent", b"value", None, 100);
+        source.set_integer(b"ttl", 42, Some(10_000), 100);
+
+        let (manifest, snapshot) =
+            capture_replica_bootstrap(31, &source, 77, 1_100, 1_000_000).unwrap();
+        assert_eq!(manifest.placement_epoch, 31);
+        assert_eq!(manifest.snapshot_sequence, 77);
+        assert_eq!(manifest.snapshot_bytes, snapshot.len() as u64);
+
+        let chunks = replica_bootstrap_chunks(&manifest, &snapshot, 7).unwrap();
+        assert!(chunks.len() > 1);
+
+        let mut assembler =
+            CacheReplicaBootstrapAssembler::new(31, manifest, snapshot.len() + 1).unwrap();
+        for chunk in chunks {
+            assembler.push_chunk(chunk).unwrap();
+        }
+
+        let mut replica = assembler
+            .finish(
+                CacheConfig::default(),
+                CacheEvictionPolicy::S3Fifo,
+                50,
+                1_002_000,
+            )
+            .unwrap();
+        assert_eq!(replica.placement_epoch(), 31);
+        assert_eq!(replica.applied_sequence(), 77);
+        assert_eq!(
+            replica.store_mut().get(b"persistent", 50),
+            Some(CacheValueView::Bytes(b"value"))
+        );
+        assert_eq!(
+            replica.store_mut().get(b"ttl", 50),
+            Some(CacheValueView::Integer(42))
+        );
+        assert_eq!(
+            replica.store_mut().ttl(b"ttl", 50),
+            crate::runtime::CacheTtl::RemainingMs(7_000)
+        );
+    }
+
+    #[test]
+    fn bootstrap_rejects_out_of_order_chunk_before_install() {
+        let mut source = CacheStore::new();
+        source.set_integer(b"k", 1, None, 0);
+        let (manifest, snapshot) =
+            capture_replica_bootstrap(9, &source, 4, 0, 1_000).unwrap();
+        let mut chunks = replica_bootstrap_chunks(&manifest, &snapshot, 8).unwrap();
+        assert!(chunks.len() > 1);
+
+        let second = chunks.remove(1);
+        let mut assembler =
+            CacheReplicaBootstrapAssembler::new(9, manifest, snapshot.len()).unwrap();
+        let error = assembler.push_chunk(second).unwrap_err();
+        assert_eq!(
+            error,
+            CacheReplicaBootstrapError::OffsetMismatch {
+                expected: 0,
+                received: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn bootstrap_rejects_corrupted_snapshot_at_final_checksum() {
+        let mut source = CacheStore::new();
+        source.set_integer(b"k", 1, None, 0);
+        let (manifest, snapshot) =
+            capture_replica_bootstrap(9, &source, 4, 0, 1_000).unwrap();
+        let mut chunks = replica_bootstrap_chunks(&manifest, &snapshot, snapshot.len()).unwrap();
+        chunks[0].data[0] ^= 0x01;
+
+        let mut assembler =
+            CacheReplicaBootstrapAssembler::new(9, manifest, snapshot.len()).unwrap();
+        assembler.push_chunk(chunks.remove(0)).unwrap();
+        let error = assembler
+            .finish(
+                CacheConfig::default(),
+                CacheEvictionPolicy::S3Fifo,
+                0,
+                1_000,
+            )
+            .unwrap_err();
+        assert_eq!(error, CacheReplicaBootstrapError::ChecksumMismatch);
+    }
+
+    #[test]
+    fn bootstrap_manifest_is_fenced_by_expected_placement_epoch() {
+        let mut source = CacheStore::new();
+        source.set_integer(b"k", 1, None, 0);
+        let (manifest, _snapshot) =
+            capture_replica_bootstrap(12, &source, 4, 0, 1_000).unwrap();
+
+        let error = CacheReplicaBootstrapAssembler::new(13, manifest, usize::MAX).unwrap_err();
+        assert_eq!(
+            error,
+            CacheReplicaBootstrapError::EpochMismatch {
+                expected: 13,
+                received: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn bootstrap_manifest_respects_receiver_size_limit() {
+        let mut source = CacheStore::new();
+        source.set_bytes(b"k", &[7; 128], None, 0);
+        let (manifest, snapshot) =
+            capture_replica_bootstrap(2, &source, 1, 0, 1_000).unwrap();
+
+        let error =
+            CacheReplicaBootstrapAssembler::new(2, manifest, snapshot.len() - 1).unwrap_err();
+        assert_eq!(
+            error,
+            CacheReplicaBootstrapError::SnapshotTooLarge {
+                bytes: snapshot.len() as u64,
+                limit: (snapshot.len() - 1) as u64,
+            }
+        );
+    }
+
+    #[test]
     fn bootstrap_state_sets_epoch_and_resume_sequence() {
         let mut store = CacheStore::new();
         store.set_integer(b"k", 99, None, 0);
