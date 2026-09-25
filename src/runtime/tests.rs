@@ -3731,6 +3731,41 @@ fn test_workflow_operation_ordinals_are_monotonic_within_activation_and_reset_fo
 }
 
 #[test]
+fn test_replay_sensitive_events_receive_monotonic_operation_ids() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "OperationEventWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    let activation = WorkflowActivationId::new(actor_id, 7);
+    workflow::begin_workflow_activation(&mut rt, actor_id, activation);
+
+    rt.append_timer_set(actor_id, "retry", 100).unwrap();
+    rt.emit_event(actor_id, "audit", &[]);
+    rt.append_saga_compensated(actor_id, "charge").unwrap();
+    rt.append_timer_fired(actor_id, "retry").unwrap();
+    rt.append_signal_received(actor_id, "approved", None).unwrap();
+
+    let events = rt.persistence.read_workflow_events(actor_id);
+    let operation_ids: Vec<_> = events.iter().filter_map(WorkflowEvent::operation_id).collect();
+
+    assert_eq!(
+        operation_ids,
+        vec![
+            WorkflowOperationId::new(activation, 0),
+            WorkflowOperationId::new(activation, 1),
+            WorkflowOperationId::new(activation, 2),
+        ]
+    );
+    assert_eq!(events[4].operation_id(), None, "TimerFired is an external arrival");
+    assert_eq!(events[5].operation_id(), None, "SignalReceived is an external arrival");
+}
+
+#[test]
 fn test_workflow_actor_emits_started_event() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
