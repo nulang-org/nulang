@@ -66,11 +66,11 @@ pub enum EnqueueOutcome {
     SupersededOlderRevision,
     /// The incoming request was for an older revision than the queued request.
     IgnoredStaleRevision,
-    /// Same desired revision, but a newer trigger replaced the pending trigger.
+    /// Another trigger arrived for the same desired revision.
     ///
-    /// Reconciliation is state-based: one turn against the current durable
-    /// allocations and the supplied node snapshot subsumes older triggers for
-    /// the same desired revision.
+    /// The existing request and its evaluation id are retained. This matters
+    /// because a prior failed turn may already have durably recorded that
+    /// evaluation id before failing later in reconciliation.
     CoalescedSameRevision,
 }
 
@@ -158,13 +158,15 @@ impl ReconcileLoop {
             return Ok(EnqueueOutcome::IgnoredStaleRevision);
         }
 
-        let outcome = if request.deployment.revision > current.deployment.revision {
-            EnqueueOutcome::SupersededOlderRevision
-        } else {
-            EnqueueOutcome::CoalescedSameRevision
-        };
+        if request.deployment.revision == current.deployment.revision {
+            // Preserve the first evaluation identity for this desired revision.
+            // A failed prior turn may already have persisted that id in
+            // ControlStore even though the plan did not commit yet.
+            return Ok(EnqueueOutcome::CoalescedSameRevision);
+        }
+
         self.pending.insert(deployment_id, request);
-        Ok(outcome)
+        Ok(EnqueueOutcome::SupersededOlderRevision)
     }
 
     /// Enqueue one trigger for each desired deployment.
@@ -355,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn same_revision_trigger_coalesces_to_latest_event_identity() {
+    fn same_revision_trigger_preserves_first_evaluation_identity() {
         let mut loop_ = ReconcileLoop::new();
         loop_
             .enqueue(ReconcileRequest::new(
@@ -376,8 +378,8 @@ mod tests {
             EnqueueOutcome::CoalescedSameRevision
         );
         let request = loop_.pending("api").unwrap();
-        assert_eq!(request.evaluation.evaluation_id, "capacity-event-2");
-        assert_eq!(request.evaluation.cause, EvaluationCause::CapacityChanged);
+        assert_eq!(request.evaluation.evaluation_id, "node-event-1");
+        assert_eq!(request.evaluation.cause, EvaluationCause::NodeChanged);
     }
 
     #[test]
