@@ -3907,7 +3907,7 @@ impl Runtime {
                     }
                 }
                 processed = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload);
-                if processed {
+                if processed && !self.actor_is_workflow(actor_id) {
                     self.checkpoint_actor(actor_id);
                 }
             }
@@ -3944,7 +3944,9 @@ impl Runtime {
                 self.suspend_enabled = saved_suspend;
                 match result {
                     Ok(_) => {
-                        self.checkpoint_actor(actor_id);
+                        if !self.actor_is_workflow(actor_id) {
+                            self.checkpoint_actor(actor_id);
+                        }
                         processed = true;
                     }
                     Err(crate::types::NuError::Suspended(_)) => {
@@ -3958,25 +3960,31 @@ impl Runtime {
                         processed = false;
                     }
                     Err(e) => {
-                        self.checkpoint_actor(actor_id);
-                        // A workflow step failed: record the failure (durable
-                        // StepFailed event — SPEC2 §10 known-issue #5: step
-                        // failures were silent, exit 0, no diagnostic), then
-                        // run saga compensations for previously completed
-                        // steps in reverse order.
+                        // A workflow step failed: its mutated durable state is
+                        // not a safe recovery point until the terminal marker
+                        // is durable. Non-workflow actors retain the legacy
+                        // checkpoint behavior.
                         if self.actor_is_workflow(actor_id) {
                             let seq = self.next_sequence(actor_id);
                             let step_name = self.step_name_for(actor_id, behavior_idx);
-                            let _ = self.persistence.append_workflow_event(
-                                actor_id,
-                                WorkflowEvent::StepFailed {
-                                    sequence: seq,
-                                    activation: workflow_activation,
-                                    step_name,
-                                    error: format!("{}", e),
-                                },
-                            );
-                            self.run_saga_compensation(actor_id, behavior_idx);
+                            let terminal_committed = self
+                                .persistence
+                                .append_workflow_event(
+                                    actor_id,
+                                    WorkflowEvent::StepFailed {
+                                        sequence: seq,
+                                        activation: workflow_activation,
+                                        step_name,
+                                        error: format!("{}", e),
+                                    },
+                                )
+                                .is_ok();
+                            if terminal_committed {
+                                self.run_saga_compensation(actor_id, behavior_idx);
+                                self.checkpoint_actor(actor_id);
+                            }
+                        } else {
+                            self.checkpoint_actor(actor_id);
                         }
                         processed = false;
                     }
@@ -3988,27 +3996,33 @@ impl Runtime {
             {
                 let seq = self.next_sequence(actor_id);
                 let step_name = self.step_name_for(actor_id, behavior_idx);
-                let _ = self.persistence.append_workflow_event(
-                    actor_id,
-                    WorkflowEvent::StepCompleted {
-                        sequence: seq,
-                        activation: workflow_activation,
-                        step_name,
-                    },
-                );
-                // Synthetic parallel steps do not increment step_index in their
-                // bytecode (so signal-waiting branches do not double-increment);
-                // advance it here when the step completes.
-                if self.is_parallel_step(actor_id, behavior_idx) {
-                    if let Some(actor) = self.actors.get_mut(&actor_id) {
-                        if let Some(n) =
-                            actor.get_state_field("step_index").and_then(|v| v.as_int())
-                        {
-                            actor.set_state_field("step_index", Value::int(n + 1));
+                let terminal_committed = self
+                    .persistence
+                    .append_workflow_event(
+                        actor_id,
+                        WorkflowEvent::StepCompleted {
+                            sequence: seq,
+                            activation: workflow_activation,
+                            step_name,
+                        },
+                    )
+                    .is_ok();
+                if terminal_committed {
+                    // Synthetic parallel steps do not increment step_index in
+                    // their bytecode (so signal-waiting branches do not
+                    // double-increment); advance it only after the terminal
+                    // marker is durable.
+                    if self.is_parallel_step(actor_id, behavior_idx) {
+                        if let Some(actor) = self.actors.get_mut(&actor_id) {
+                            if let Some(n) =
+                                actor.get_state_field("step_index").and_then(|v| v.as_int())
+                            {
+                                actor.set_state_field("step_index", Value::int(n + 1));
+                            }
                         }
                     }
+                    self.checkpoint_actor(actor_id);
                 }
-                self.checkpoint_actor(actor_id);
             }
             let actor = match self.actors.get_mut(&actor_id) {
                 Some(a) => a,
