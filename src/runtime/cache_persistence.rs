@@ -826,7 +826,7 @@ fn scan_wal(bytes: &[u8]) -> io::Result<WalScan> {
     })
 }
 
-fn encode_mutation(mutation: &CacheWalMutation) -> io::Result<Vec<u8>> {
+pub(crate) fn encode_mutation(mutation: &CacheWalMutation) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     match mutation {
         CacheWalMutation::SetBytes {
@@ -879,7 +879,7 @@ fn encode_mutation(mutation: &CacheWalMutation) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn decode_mutation(bytes: &[u8]) -> io::Result<CacheWalMutation> {
+pub(crate) fn decode_mutation(bytes: &[u8]) -> io::Result<CacheWalMutation> {
     let mut decoder = Decoder::new(bytes);
     let mutation = match decoder.u8()? {
         0 => CacheWalMutation::SetBytes {
