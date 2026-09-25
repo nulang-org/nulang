@@ -377,6 +377,121 @@ impl WorkflowEvent {
     }
 }
 
+/// Replay-stable semantic description of an activation-local workflow operation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkflowOperationExpectation {
+    TimerSet {
+        name: String,
+        duration_ms: u64,
+    },
+    SagaCompensated {
+        step_name: String,
+    },
+    ParallelBranchCompleted {
+        parallel_step_name: String,
+        branch_name: String,
+    },
+    Custom {
+        name: String,
+        args: Vec<PersistedValue>,
+    },
+}
+
+/// Decision for one deterministic operation while replaying an activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowOperationReplay {
+    /// No durable receipt exists; live execution may append this operation.
+    Missing,
+    /// An exact durable receipt exists; replay must consume it without append.
+    Recorded { sequence: u64 },
+}
+
+impl WorkflowOperationExpectation {
+    fn matches_event(&self, event: &WorkflowEvent) -> bool {
+        match (self, event) {
+            (
+                Self::TimerSet { name, duration_ms },
+                WorkflowEvent::TimerSet {
+                    name: recorded_name,
+                    duration_ms: recorded_duration,
+                    ..
+                },
+            ) => name == recorded_name && duration_ms == recorded_duration,
+            (
+                Self::SagaCompensated { step_name },
+                WorkflowEvent::SagaCompensated {
+                    step_name: recorded_step,
+                    ..
+                },
+            ) => step_name == recorded_step,
+            (
+                Self::ParallelBranchCompleted {
+                    parallel_step_name,
+                    branch_name,
+                },
+                WorkflowEvent::ParallelBranchCompleted {
+                    parallel_step_name: recorded_parallel,
+                    branch_name: recorded_branch,
+                    ..
+                },
+            ) => {
+                parallel_step_name == recorded_parallel && branch_name == recorded_branch
+            }
+            (
+                Self::Custom { name, args },
+                WorkflowEvent::Custom {
+                    name: recorded_name,
+                    args: recorded_args,
+                    ..
+                },
+            ) => name == recorded_name && args == recorded_args,
+            _ => false,
+        }
+    }
+}
+
+/// Locate and validate a previously committed activation-local operation.
+///
+/// A duplicate identity or semantic mismatch is durable-history corruption and
+/// fails closed. Only an exact receipt may be consumed during replay.
+pub(crate) fn replay_workflow_operation(
+    events: &[WorkflowEvent],
+    operation: WorkflowOperationId,
+    expected: &WorkflowOperationExpectation,
+) -> io::Result<WorkflowOperationReplay> {
+    let mut matches = events
+        .iter()
+        .filter(|event| event.operation_id() == Some(operation));
+    let Some(recorded) = matches.next() else {
+        return Ok(WorkflowOperationReplay::Missing);
+    };
+    if matches.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "duplicate workflow operation receipt for actor {} command {} ordinal {}",
+                operation.activation.actor_id,
+                operation.activation.command_sequence,
+                operation.ordinal
+            ),
+        ));
+    }
+    if !expected.matches_event(recorded) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "workflow operation receipt mismatch for actor {} command {} ordinal {}",
+                operation.activation.actor_id,
+                operation.activation.command_sequence,
+                operation.ordinal
+            ),
+        ));
+    }
+    Ok(WorkflowOperationReplay::Recorded {
+        sequence: recorded.sequence(),
+    })
+}
+
 /// Return accepted workflow commands that do not yet have a durable terminal event.
 ///
 /// The caller supplies the command predicate because a workflow actor's message
