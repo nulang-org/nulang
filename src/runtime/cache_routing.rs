@@ -522,6 +522,7 @@ mod tests {
 
         map.begin_migration(1, slot, target).unwrap();
         assert_eq!(map.epoch(), 1);
+        assert!(map.has_migrations());
         assert_eq!(map.owner_for_slot(slot), Some(source));
         assert_eq!(
             map.migration_for_slot(slot),
@@ -534,6 +535,7 @@ mod tests {
 
         map.finish_migration(2, slot).unwrap();
         assert_eq!(map.epoch(), 2);
+        assert!(!map.has_migrations());
         assert_eq!(map.owner_for_slot(slot), Some(target));
         assert_eq!(map.migration_for_slot(slot), None);
     }
