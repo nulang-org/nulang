@@ -5099,6 +5099,44 @@ impl Runtime {
             .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_agent))
             .unwrap_or(false);
 
+        if is_workflow {
+            let journal = self.persistence.read_journal(actor_id);
+            let workflow_step_count = self
+                .recovery_modules
+                .get(&actor_id)
+                .map(|(_, offsets, _)| offsets.len());
+            let replay_plan = crate::runtime::persistence::workflow_replay_plan(
+                actor_id,
+                &journal,
+                &workflow_events,
+                |entry| {
+                    workflow_step_count
+                        .map(|count| (entry.behavior_id as usize) < count)
+                        .unwrap_or(true)
+                },
+            );
+            match replay_plan {
+                Ok(None) => {}
+                Ok(Some(plan)) => {
+                    warn!(
+                        actor_id,
+                        command_sequence = plan.activation.command_sequence,
+                        operation_receipts = plan.operations.len(),
+                        "nulang-recover: refusing unfinished workflow activation until deterministic replay execution is enabled"
+                    );
+                    return None;
+                }
+                Err(error) => {
+                    warn!(
+                        actor_id,
+                        %error,
+                        "nulang-recover: refusing ambiguous or corrupt workflow replay history"
+                    );
+                    return None;
+                }
+            }
+        }
+
         let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
         actor.persistent = true;
         actor.is_workflow = is_workflow;
@@ -5292,32 +5330,10 @@ impl Runtime {
                     }
                 }
             }
-            // If the workflow was in the middle of a step waiting on a signal,
-            // re-trigger that step so it can resume from replayed events. We
-            // use step_index as the behavior id because each step is compiled
-            // to a behavior at the same index.
-            let should_resume = self
-                .actors
-                .get(&actor_id)
-                .map(|a| a.waiting_signal.is_some() || a.suspended_execution.is_some())
-                .unwrap_or(false);
-            if should_resume {
-                let current_step = self
-                    .actors
-                    .get(&actor_id)
-                    .and_then(|a| a.get_state_field("step_index"))
-                    .and_then(|v| v.as_int())
-                    .unwrap_or(0) as u16;
-                let has_behavior = self
-                    .actors
-                    .get(&actor_id)
-                    .and_then(|a| a.bytecode_module.as_ref())
-                    .map(|m| (current_step as usize) < m.behaviors.len())
-                    .unwrap_or(false);
-                if has_behavior {
-                    self.send_message_by_id(actor_id, current_step, &[]);
-                }
-            }
+            // Unfinished activations are rejected by the replay-plan preflight
+            // above. Never synthesize a fresh mailbox command from a persisted
+            // wait marker: doing so would allocate a new command sequence and
+            // lose the original activation identity.
         } else {
             // Replay journal entries that arrived after the snapshot.
             let journal = self.persistence.read_journal(actor_id);
