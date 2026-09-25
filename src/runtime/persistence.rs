@@ -189,16 +189,7 @@ fn default_event_value() -> PersistedValue {
 ///
 /// The command journal sequence is allocated before user code executes and
 /// remains stable across suspension, replay, and terminal workflow events.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowActivationId {
     pub actor_id: u64,
     pub command_sequence: u64,
