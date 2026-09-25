@@ -16,6 +16,8 @@
 //! a linker — the trampoline calls into the JIT module at startup.
 
 pub mod codegen;
+#[cfg(feature = "native-object")]
+pub mod object;
 
 use cranelift::prelude::*;
 use cranelift_frontend::FunctionBuilderContext;
