@@ -4630,11 +4630,7 @@ mod tests {
 
     #[test]
     fn test_unary_neg_rejects_known_nonnumeric_operands() {
-        for source in [
-            "-false",
-            "-(1 + 2,)",
-            "-fn(x) { x + 1 }",
-        ] {
+        for source in ["-false", "-(1 + 2,)", "-fn(x) { x + 1 }"] {
             let result = check_src(source);
             assert!(
                 result.is_err(),
