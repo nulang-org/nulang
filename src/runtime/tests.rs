@@ -7709,3 +7709,46 @@ fn workflow_operation_lookup_rejects_duplicate_operation_identity() {
         }) if operation_id == operation
     ));
 }
+
+
+#[test]
+fn workflow_timer_set_and_fire_preserve_operation_identity() {
+    let mut rt = Runtime::new();
+    rt.install_virtual_clock();
+    let actor_id = rt.spawn_workflow_actor(
+        "TimerOperationWorkflow",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    let activation = WorkflowActivationId::new(actor_id, 71);
+    super::workflow::begin_workflow_activation(&mut rt, activation, false);
+
+    rt.schedule_workflow_timer(actor_id, "wake", 5).unwrap();
+
+    let events = rt.persistence.read_workflow_events(actor_id);
+    let timer_operation = events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::TimerSet {
+                operation_id: Some(id),
+                name,
+                ..
+            } if name == "wake" => Some(*id),
+            _ => None,
+        })
+        .expect("TimerSet should carry activation operation identity");
+    assert_eq!(timer_operation, activation.operation(0));
+
+    rt.advance_time(std::time::Duration::from_millis(10));
+    rt.tick_timers();
+
+    let events = rt.persistence.read_workflow_events(actor_id);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        WorkflowEvent::TimerFired {
+            operation_id: Some(id),
+            name,
+            ..
+        } if *id == timer_operation && name == "wake"
+    )));
+}
