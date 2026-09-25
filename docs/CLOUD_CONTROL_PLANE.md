@@ -158,14 +158,19 @@ Execution ordering is safety-biased:
   delivery, a compensating Stop is issued before ACK.
 
 This closes the crash-after-start/stale-outbox recovery case without requiring
-the executor to infer intent from current cluster state. The initial dispatcher
-assumes one logical dispatcher per control-store scope. Multiple concurrent
-dispatchers are safe only to the extent that the command sink is idempotent;
-durable command claiming/leases remain the next concurrency hardening step.
+the executor to infer intent from current cluster state.
+
+For active-active controllers, `dispatch_claimed_pending` uses durable leases.
+Claims are grouped by `(deployment_id, replica)`, not individual command, so
+one dispatcher owns the complete Stop/Start transition. Another dispatcher may
+take over only after the lease expires. The caller supplies `now_unix_ms` and
+the lease duration, preserving deterministic control-plane tests. Command sinks
+must remain idempotent because a lease may expire after a remote apply but
+before the durable ACK.
 ## Next implementation slices
 
-1. Durable command claiming/leases for active-active dispatchers.
-2. Reconciliation event loop for deployment/node/allocation changes.
+1. Reconciliation event loop for deployment/node/allocation changes.
+2. Node/runtime allocation sink with epoch-aware local admission.
 3. PostgreSQL state normalization only if measured contention/state size justifies it.
 4. Fabric-backed service directory with generation-tagged health advertisements.
 5. Workload identity and short-lived mTLS credentials bound to node/workload
