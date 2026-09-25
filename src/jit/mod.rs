@@ -135,6 +135,9 @@ pub struct JitSession {
     compiled: Vec<Vec<Option<CompiledRegion>>>,
     /// Number of occupied compiled-region slots across all modules.
     compiled_count: usize,
+    /// Aggregate compiler-only latency/count telemetry across every successful
+    /// native version installed during this session.
+    compile_stats: crate::backends::JitCompileStats,
     /// Per-region execution counters for already-compiled code. When a
     /// region crosses TIER2_THRESHOLD, a more aggressive compilation is
     /// attempted. Reset after each promotion attempt.
@@ -170,6 +173,7 @@ impl JitSession {
             codegen,
             compiled: Vec::new(),
             compiled_count: 0,
+            compile_stats: crate::backends::JitCompileStats::default(),
             hot_counts: Vec::new(),
             typed_regions: FxHashSet::default(),
             region_planner: RegionPlanner::default(),
@@ -226,6 +230,24 @@ impl JitSession {
         }
         if row[offset].is_none() {
             self.compiled_count += 1;
+        }
+        match optimization {
+            CodegenOptimization::Fast => {
+                self.compile_stats.fast_compiles =
+                    self.compile_stats.fast_compiles.saturating_add(1);
+                self.compile_stats.fast_compile_ns = self
+                    .compile_stats
+                    .fast_compile_ns
+                    .saturating_add(compile_time_ns);
+            }
+            CodegenOptimization::Optimized => {
+                self.compile_stats.optimized_compiles =
+                    self.compile_stats.optimized_compiles.saturating_add(1);
+                self.compile_stats.optimized_compile_ns = self
+                    .compile_stats
+                    .optimized_compile_ns
+                    .saturating_add(compile_time_ns);
+            }
         }
         row[offset] = Some(CompiledRegion {
             ptr,
@@ -868,6 +890,10 @@ impl crate::backends::JitBackend for JitSession {
 
     fn typed_compiled_count(&self) -> usize {
         self.typed_regions.len()
+    }
+
+    fn compile_stats(&self) -> crate::backends::JitCompileStats {
+        self.compile_stats
     }
 
     fn reset_hot_counters(&mut self) {
