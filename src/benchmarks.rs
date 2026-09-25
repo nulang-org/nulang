@@ -175,8 +175,8 @@ fn bench_ab_jit_tiering_crossover() {
         tc.check_module(&ast).expect("bench: typecheck failed");
         let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
         let mut mir = crate::mir_lower::lower_module(&hir).expect("bench: MIR lower failed");
-        let module =
-            crate::mir_codegen::compile_mir(&mut mir, "bench-ab-tiering").expect("bench: codegen failed");
+        let module = crate::mir_codegen::compile_mir(&mut mir, "bench-ab-tiering")
+            .expect("bench: codegen failed");
 
         let mut interp_vms: Vec<VM> = (0..REPEATS)
             .map(|_| {
