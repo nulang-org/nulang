@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Semantic verification contract — 2026-09-25
+- **Backend semantic status is now machine-readable.** `spec/invariants/v0alpha1.json` records scoped semantic/runtime invariants and evidence, while `spec/backend_conformance/v0alpha1.json` records bytecode/JIT/native/WASM support as reference, verified, partial, unsupported, or not-applicable instead of relying on prose claims.
+- **Semantic metadata now fails CI on drift.** `scripts/verify_semantics.py` validates ids, status values, backend coverage, invariant references, and evidence paths; focused Python unit tests are executed from the existing `verify_implementation.py` gate.
+- **Contributors and coding agents now have stable focused verification profiles.** `scripts/nula_verify.py` exposes `fast`, `native`, `wasm`, `durability`, and `full`; the full profile delegates to the existing local CI contract rather than duplicating it.
+- **Native-backend documentation now matches implementation reality.** `--backend native` eagerly compiles MIR to native code using Cranelift `JITModule` today; object-file/`ObjectModule` AOT remains a future artifact path that should share the same native semantic lowering.
+
 ### Native JIT codegen backend boundary — 2026-09-24
 - **`JitSession` no longer owns Cranelift modules or reusable Cranelift contexts.** `src/jit/native_codegen.rs` introduces `NativeCodegenBackend`, `NativeCompileRequest`, and specialization requests for scalar, typed, and SIMD lowering.
 - **`CraneliftCodegen` now exclusively owns both compiler tiers.** Fast code still uses `opt_level=none` + single-pass register allocation, optimized code still uses `opt_level=speed` + backtracking, but tier/cache orchestration only sees native entry pointers and compile success/failure.
