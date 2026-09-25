@@ -1001,6 +1001,7 @@ mod tests {
                 sequence,
                 name,
                 duration_ms,
+                ..
             } => {
                 assert_eq!(sequence, 9);
                 assert_eq!(name, "retry");
