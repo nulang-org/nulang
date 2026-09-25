@@ -346,6 +346,7 @@ impl Supervisor {
             }
             new_actor.sequence = snap.sequence;
             new_actor.waiting_signal = snap.waiting_signal.clone();
+            new_actor.waiting_signal_operation = snap.waiting_signal_operation;
         } else {
             for (name, value) in &template.state_data {
                 new_actor.set_state_field(name.clone(), *value);
