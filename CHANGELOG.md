@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Stable workflow activation identity — 2026-09-25
+- **Accepted workflow commands now receive a stable activation identity derived from `actor_id + command journal sequence`.** The identity is created only after durable command admission succeeds and is attached to terminal `StepCompleted` / `StepFailed` events.
+- **Suspended workflow execution retains the original activation identity across signal, timer, timed-receive, JIT-yield, and LLM re-suspension paths.** Later resume events therefore close the accepted command rather than inventing identity from a later event sequence.
+- **Legacy terminal workflow events remain readable.** Their new activation field is optional on deserialization so pre-change journals decode with `activation: None`; recovery classification of open activations remains follow-up work under #836.
+
 ### Hosted control-plane ownership boundary — 2026-09-25
 - **Hosted placement and reconciliation policy is no longer owned by the Nulang language/runtime workspace.** `crates/nulang-cloud-control` is frozen as a migration surface and excluded from ordinary workspace builds; Nulang Cloud's `nlc-placement` remains the authoritative hosted control plane.
 - **The boundary is explicit:** Nulang owns portable computation semantics and cloud-neutral contracts, while provider, region/cell, tenancy, billing, and deployment policy belong to Nulang Cloud.
