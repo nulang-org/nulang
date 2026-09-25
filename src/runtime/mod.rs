@@ -2032,6 +2032,7 @@ impl Runtime {
                     actor_id,
                     JournalEntry {
                         sequence: seq,
+                        activation_id: None,
                         behavior_id,
                         payload,
                     },
