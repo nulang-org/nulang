@@ -17,7 +17,6 @@
 use cranelift::codegen::ir::{BlockArg, FuncRef};
 use cranelift::prelude::*;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_jit::JITModule;
 use cranelift_module::{Linkage, Module};
 
 use std::collections::{HashMap, HashSet};
@@ -63,9 +62,9 @@ pub type AotResult<T> = Result<T, AotCompileError>;
 // ---------------------------------------------------------------------------
 
 /// State maintained during compilation of one MIR module.
-pub struct AotContext<'a> {
-    /// The Cranelift JIT module.
-    pub module: &'a mut JITModule,
+pub struct AotContext<'a, M: Module> {
+    /// Cranelift module receiving the generated definitions.
+    pub module: &'a mut M,
     /// Reusable function builder context.
     pub builder_context: &'a mut FunctionBuilderContext,
     /// Cranelift codegen context (holds the current function being compiled).
@@ -85,8 +84,8 @@ pub struct AotContext<'a> {
     /// Module foreign-function declarations, indexed by `RValue::FFICall.idx`.
     pub foreign_functions: Vec<mir::ForeignFunction>,
 }
-impl<'a> AotContext<'a> {
-    pub fn new(module: &'a mut JITModule, builder_context: &'a mut FunctionBuilderContext) -> Self {
+impl<'a, M: Module> AotContext<'a, M> {
+    pub fn new(module: &'a mut M, builder_context: &'a mut FunctionBuilderContext) -> Self {
         let codegen_ctx = module.make_context();
         AotContext {
             module,
@@ -1079,8 +1078,8 @@ pub fn is_all_int(func: &mir::Function) -> bool {
 
 /// Compile the body of a MIR function that was already declared.
 ///
-pub fn compile_mir_function_body(
-    aot: &mut AotContext,
+pub fn compile_mir_function_body<M: Module>(
+    aot: &mut AotContext<'_, M>,
     mir_func: &mir::Function,
     _func_index: usize,
     func_id: cranelift_module::FuncId,
@@ -1103,7 +1102,7 @@ pub fn compile_mir_function_body(
     // Extract refs to constants and field_map before the split.
     let constants: &[crate::bytecode::Constant] = &aot.constants;
     let field_map: &HashMap<String, u8> = &aot.field_map;
-    let module: &mut JITModule = aot.module;
+    let module: &mut M = aot.module;
     let codegen_ctx: &mut codegen::Context = &mut aot.codegen_ctx;
     let builder_ctx: &mut FunctionBuilderContext = aot.builder_context;
     let local_base = mir::FunctionBuilder::LOCAL_BASE;
@@ -1836,14 +1835,14 @@ pub fn compile_mir_function_body(
 /// variant, tags the result, and returns. This replaces the boxed body so
 /// that callers always go through the wrapper — the original boxed body
 /// is never compiled.
-pub fn compile_boxing_wrapper(
-    aot: &mut AotContext,
+pub fn compile_boxing_wrapper<M: Module>(
+    aot: &mut AotContext<'_, M>,
     param_count: usize,
     boxed_fid: cranelift_module::FuncId,
     unboxed_fid: cranelift_module::FuncId,
 ) -> AotResult<()> {
     // Split module and codegen_ctx for independent borrows.
-    let module: &mut JITModule = aot.module;
+    let module: &mut M = aot.module;
     let codegen_ctx: &mut codegen::Context = &mut aot.codegen_ctx;
     let builder_ctx: &mut FunctionBuilderContext = aot.builder_context;
     // Set up function signature: tagged i64 params, tagged i64 return.
@@ -1895,19 +1894,58 @@ pub fn compile_boxing_wrapper(
     Ok(())
 }
 
+/// Generate the stable zero-argument object-file entry wrapper.
+///
+/// The MIR entry function keeps its internal `nulang_fn_N` symbol so direct
+/// calls and JIT execution preserve the existing layout. Relocatable native
+/// artifacts additionally export `nulang_entry`, which forwards to that
+/// internal function and gives the linker/runtime a stable ABI surface.
+pub fn compile_entry_wrapper<M: Module>(
+    aot: &mut AotContext<'_, M>,
+    wrapper_fid: cranelift_module::FuncId,
+    entry_fid: cranelift_module::FuncId,
+) -> AotResult<()> {
+    let module: &mut M = aot.module;
+    let codegen_ctx: &mut codegen::Context = &mut aot.codegen_ctx;
+    let builder_ctx: &mut FunctionBuilderContext = aot.builder_context;
+
+    let mut sig = module.make_signature();
+    sig.returns.push(AbiParam::new(types::I64));
+    codegen_ctx.func.signature = sig;
+
+    let mut builder = FunctionBuilder::new(&mut codegen_ctx.func, builder_ctx);
+    let entry = builder.create_block();
+    builder.switch_to_block(entry);
+
+    let callee = module.declare_func_in_func(entry_fid, builder.func);
+    let call = builder.ins().call(callee, &[]);
+    let result = builder.inst_results(call)[0];
+    builder.ins().return_(&[result]);
+
+    builder.seal_all_blocks();
+    builder.finalize();
+
+    module
+        .define_function(wrapper_fid, codegen_ctx)
+        .map_err(|e| AotCompileError::Cranelift(e.to_string()))?;
+    module.clear_context(codegen_ctx);
+
+    Ok(())
+}
+
 /// Generate the stable runtime-facing entry wrapper for an actor behavior.
 ///
 /// Internal behavior functions keep their ordinary optimized signature
 /// (`fn(u64, ...) -> u64`). The scheduler calls only this wrapper, whose ABI
 /// is fixed to `NativeActorEntry`: a single `*mut NativeActorContext`
 /// parameter and a `NativeActorStatus` discriminant return value.
-pub fn compile_actor_entry_wrapper(
-    aot: &mut AotContext,
+pub fn compile_actor_entry_wrapper<M: Module>(
+    aot: &mut AotContext<'_, M>,
     param_count: usize,
     wrapper_fid: cranelift_module::FuncId,
     behavior_fid: cranelift_module::FuncId,
 ) -> AotResult<()> {
-    let module: &mut JITModule = aot.module;
+    let module: &mut M = aot.module;
     let codegen_ctx: &mut codegen::Context = &mut aot.codegen_ctx;
     let builder_ctx: &mut FunctionBuilderContext = aot.builder_context;
     let pointer_type = module.isa().pointer_type();

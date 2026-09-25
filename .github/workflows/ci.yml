@@ -220,6 +220,9 @@ jobs:
       - name: Check zero warnings
         run: cargo check --locked --tests --no-default-features
 
+      - name: Test native object artifact emission
+        run: cargo test --locked --no-default-features --features native-object native_object
+
       - name: Smoke test standalone Savina runner
         run: |
           output="$(cargo run --locked --no-default-features --features savina-bench --bin nulang-savina -- --benchmark ping_pong --format jsonl)"

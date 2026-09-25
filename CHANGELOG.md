@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Relocatable native object emission — 2026-09-25
+- **Nulang now has a true Cranelift `ObjectModule` artifact path behind the opt-in `native-object` feature.** Ordinary MIR functions compile into relocatable native object bytes with a stable exported `nulang_entry` symbol when a top-level entry exists; runtime helpers remain explicit unresolved imports for the later linker/runtime packaging layer.
+- **The MIR-to-CLIF AOT lowering is now generic over Cranelift's `Module` trait.** The executable JIT-backed native path and relocatable object path therefore share one native semantic lowering instead of maintaining parallel compilers.
+- **The first object slice fails closed on actor modules.** Actor object artifacts will land only after the existing stable `NativeActorEntry` wrapper ABI and behavior metadata are exported deliberately; library modules without `main` already emit objects without an entry symbol.
+- **Default/JIT-only dependency cost is unchanged.** `cranelift-object` is optional and activated only by `native-object`; CI executes the focused object-artifact tests under a no-default-features profile.
+
 ### Native JIT codegen backend boundary — 2026-09-24
 - **`JitSession` no longer owns Cranelift modules or reusable Cranelift contexts.** `src/jit/native_codegen.rs` introduces `NativeCodegenBackend`, `NativeCompileRequest`, and specialization requests for scalar, typed, and SIMD lowering.
 - **`CraneliftCodegen` now exclusively owns both compiler tiers.** Fast code still uses `opt_level=none` + single-pass register allocation, optimized code still uses `opt_level=speed` + backtracking, but tier/cache orchestration only sees native entry pointers and compile success/failure.
