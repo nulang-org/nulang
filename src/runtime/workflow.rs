@@ -450,6 +450,7 @@ pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::
         sequence: seq,
         state,
         waiting_signal: actor.waiting_signal.clone(),
+        waiting_signal_operation: actor.waiting_signal_operation,
         crdt_snapshot,
         crdt_field_map,
         authority_tokens,
