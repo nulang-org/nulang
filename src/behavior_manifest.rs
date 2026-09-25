@@ -21,6 +21,7 @@ use std::str::FromStr;
 
 pub const BEHAVIOR_MANIFEST_SCHEMA: &str = "nulang.behavior/v0alpha1";
 pub const BEHAVIOR_ARTIFACT_KIND_NBC_V1: &str = "nulang-bytecode-v1";
+pub const BEHAVIOR_ARTIFACT_KIND_WASM_MODULE: &str = "wasm-module";
 const BEHAVIOR_MANIFEST_DIGEST_DOMAIN: &[u8] = b"nulang.behavior-manifest.v0alpha1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,7 +183,7 @@ impl BehaviorManifest {
                 language_version: LANGUAGE_VERSION_STR.to_string(),
             },
             artifact: BehaviorArtifact {
-                kind: BEHAVIOR_ARTIFACT_KIND_NBC_V1.to_string(),
+                kind: behavior_artifact_kind(artifact)?.to_string(),
                 digest: artifact_digest(artifact_bytes),
                 source_id: artifact.source_id().map(|id| id.to_string()),
                 semantic_id: artifact.semantic_id().to_string(),
@@ -380,7 +381,9 @@ impl BehaviorManifest {
                 "package version must not be empty".to_string(),
             ));
         }
-        if self.artifact.kind != BEHAVIOR_ARTIFACT_KIND_NBC_V1 {
+        if self.artifact.kind != BEHAVIOR_ARTIFACT_KIND_NBC_V1
+            && self.artifact.kind != BEHAVIOR_ARTIFACT_KIND_WASM_MODULE
+        {
             return Err(BehaviorManifestError::UnsupportedArtifactKind(
                 self.artifact.kind.clone(),
             ));
@@ -467,6 +470,18 @@ impl BehaviorManifest {
             }
         }
         Ok(())
+    }
+}
+
+fn behavior_artifact_kind(
+    artifact: &ArtifactIdentityManifest,
+) -> Result<&'static str, BehaviorManifestError> {
+    match artifact.backend() {
+        "bytecode" => Ok(BEHAVIOR_ARTIFACT_KIND_NBC_V1),
+        "wasm" | "wasmfx" => Ok(BEHAVIOR_ARTIFACT_KIND_WASM_MODULE),
+        other => Err(BehaviorManifestError::UnsupportedArtifactBackend(
+            other.to_string(),
+        )),
     }
 }
 
@@ -637,6 +652,7 @@ pub enum BehaviorManifestError {
     Json(String),
     UnsupportedSchema(String),
     UnsupportedArtifactKind(String),
+    UnsupportedArtifactBackend(String),
     InvalidPackage(String),
     InvalidDigest {
         field: &'static str,
@@ -674,7 +690,11 @@ impl fmt::Display for BehaviorManifestError {
             ),
             Self::UnsupportedArtifactKind(kind) => write!(
                 f,
-                "unsupported behavior manifest artifact kind '{kind}'; expected {BEHAVIOR_ARTIFACT_KIND_NBC_V1}"
+                "unsupported behavior manifest artifact kind '{kind}'; expected {BEHAVIOR_ARTIFACT_KIND_NBC_V1} or {BEHAVIOR_ARTIFACT_KIND_WASM_MODULE}"
+            ),
+            Self::UnsupportedArtifactBackend(backend) => write!(
+                f,
+                "unsupported behavior manifest artifact backend '{backend}'"
             ),
             Self::InvalidPackage(message) => write!(f, "invalid behavior manifest package: {message}"),
             Self::InvalidDigest { field, message } => {
