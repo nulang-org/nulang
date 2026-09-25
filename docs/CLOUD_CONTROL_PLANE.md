@@ -160,16 +160,56 @@ This deliberately leaves process/WASM/microVM lifecycle details outside the
 control-plane crate. Concrete node agents implement `AllocationRuntime` and
 must make epoch fencing durable across their own restart.
 
+## Reconciliation event loop
+
+`ReconcileLoop` is the in-process orchestration layer above `reconcile_once`.
+It does not create a second durable queue or invent durable identities. Callers
+supply an event/evaluation identity from their durable event source; the loop
+coalesces transient wakeups while durable evaluation, plan, ownership, fencing,
+and outbox state remain in `ControlStore`.
+
+The loop keeps at most one pending request per deployment. Newer desired
+revisions supersede older pending revisions, stale revisions are ignored, and
+multiple triggers for the same desired revision coalesce into one state-based
+reconciliation turn while retaining the first evaluation id for that revision.
+This preserves idempotent retry when a failed turn already recorded the evaluation
+before a later trigger arrived. Processing order is deterministic by deployment id.
+
+A failed turn remains queued with the exact same evaluation id. Retrying
+therefore reaches `reconcile_once` with the same idempotency key instead of
+manufacturing a new plan identity. `reconcile_ready` also requires an explicit
+turn budget so an embedding controller retains backpressure and scheduling
+control.
+
+The resulting control-plane path is now:
+
+```text
+deployment / node / allocation / capacity event
+                    |
+                    v
+             ReconcileLoop
+                    |
+                    v
+             reconcile_once
+                    |
+                    v
+   durable plan + epoch + outbox commit
+                    |
+                    v
+        execute_pending_for_node
+                    |
+                    v
+      fenced node-local workload state
+```
+
 ## Next implementation slices
 
-1. Reconciliation event loop for deployment/node/allocation changes.
-2. Concrete node-agent `AllocationRuntime` adapter for the first production execution target.
-3. PostgreSQL state normalization only if measured contention/state size justifies it.
-4. Fabric-backed service directory with generation-tagged health advertisements.
-5. Workload identity and short-lived mTLS credentials bound to node/workload
-   identity.
-6. Capability-to-network-policy compilation, enforced in the NUL0 transport.
-7. Optional L7 waypoint for HTTP/gRPC policy; no per-actor sidecars.
+1. Concrete node-agent `AllocationRuntime` adapter for the first production execution target.
+2. Fabric-backed service directory with generation-tagged health advertisements.
+3. Workload identity and short-lived mTLS credentials bound to node/workload identity.
+4. Capability-to-network-policy compilation, enforced in the NUL0 transport.
+5. PostgreSQL state normalization only if measured contention/state size justifies it.
+6. Optional L7 waypoint for HTTP/gRPC policy; no per-actor sidecars.
 
 ## Non-goals
 
