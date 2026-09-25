@@ -3890,10 +3890,9 @@ impl Runtime {
                         )
                         .is_ok();
                     if journaled && self.actor_is_workflow(actor_id) {
-                        workflow_activation = Some(WorkflowActivationId::new(actor_id, seq));
-                        if let Some(actor) = self.actors.get_mut(&actor_id) {
-                            actor.current_workflow_activation = workflow_activation;
-                        }
+                        let activation = WorkflowActivationId::new(actor_id, seq);
+                        workflow_activation = Some(activation);
+                        workflow::begin_workflow_activation(self, actor_id, activation);
                     }
                 }
                 processed = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload);
@@ -3918,10 +3917,9 @@ impl Runtime {
                         )
                         .is_ok();
                     if journaled && self.actor_is_workflow(actor_id) {
-                        workflow_activation = Some(WorkflowActivationId::new(actor_id, seq));
-                        if let Some(actor) = self.actors.get_mut(&actor_id) {
-                            actor.current_workflow_activation = workflow_activation;
-                        }
+                        let activation = WorkflowActivationId::new(actor_id, seq);
+                        workflow_activation = Some(activation);
+                        workflow::begin_workflow_activation(self, actor_id, activation);
                     }
                 }
                 let payload = msg.payload.clone();
