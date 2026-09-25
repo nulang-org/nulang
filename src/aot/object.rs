@@ -43,7 +43,10 @@ impl NativeObjectArtifact {
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
             .map_err(|e| crate::types::NuError::VMError {
-                msg: format!("failed to finalize object ISA for target '{}': {}", target, e),
+                msg: format!(
+                    "failed to finalize object ISA for target '{}': {}",
+                    target, e
+                ),
                 span: Span::default(),
             })?;
 
@@ -90,11 +93,7 @@ impl NativeObjectArtifact {
             sig.returns.push(AbiParam::new(types::I64));
 
             let fid = module
-                .declare_function(
-                    &format!("nulang_fn_{}", idx),
-                    Linkage::Local,
-                    &sig,
-                )
+                .declare_function(&format!("nulang_fn_{}", idx), Linkage::Local, &sig)
                 .map_err(|e| crate::types::NuError::VMError {
                     msg: format!("failed to declare object function '{}': {}", func.name, e),
                     span: Span::default(),
@@ -213,12 +212,10 @@ impl NativeObjectArtifact {
         };
 
         let product = module.finish();
-        let bytes = product
-            .emit()
-            .map_err(|e| crate::types::NuError::VMError {
-                msg: format!("failed to serialize native object: {}", e),
-                span: Span::default(),
-            })?;
+        let bytes = product.emit().map_err(|e| crate::types::NuError::VMError {
+            msg: format!("failed to serialize native object: {}", e),
+            span: Span::default(),
+        })?;
 
         Ok(Self {
             bytes,
