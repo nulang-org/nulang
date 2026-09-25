@@ -1154,10 +1154,7 @@ impl Runtime {
 
     /// Allocate the next deterministic replay identity inside the live workflow
     /// activation, if one exists.
-    pub fn next_workflow_operation_id(
-        &mut self,
-        actor_id: u64,
-    ) -> Option<WorkflowOperationId> {
+    pub fn next_workflow_operation_id(&mut self, actor_id: u64) -> Option<WorkflowOperationId> {
         workflow::next_workflow_operation_id(self, actor_id)
     }
 
