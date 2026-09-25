@@ -15,6 +15,25 @@ pub const DURABLE_TRANSITION_PROTOCOL_VERSION: &str =
 const DURABLE_TRANSITION_DIGEST_DOMAIN: &[u8] =
     b"nulang.durable-transition-protocol.v0alpha1\0";
 
+mod u64_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse::<u64>().map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct DurableOwnerId(String);
@@ -52,13 +71,20 @@ impl fmt::Display for DurableOwnerId {
 pub struct DurableTransition {
     pub protocol: String,
     pub owner_id: DurableOwnerId,
+    #[serde(with = "u64_string")]
     pub activation_epoch: u64,
+    #[serde(with = "u64_string")]
     pub sequence: u64,
+    #[serde(with = "u64_string")]
     pub expected_previous_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<DurableCommand>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<DurableStateCheckpoint>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflow_events: Vec<DurableWorkflowEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_events: Vec<DurableDomainEvent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub timers: Vec<DurableTimerMutation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -95,6 +121,9 @@ impl DurableTransition {
             });
         }
 
+        if let Some(command) = &self.command {
+            command.validate()?;
+        }
         if let Some(state) = &self.state {
             for key in state.fields.keys() {
                 if key.trim().is_empty() {
@@ -102,8 +131,10 @@ impl DurableTransition {
                 }
             }
         }
-
         for event in &self.workflow_events {
+            event.validate()?;
+        }
+        for event in &self.domain_events {
             event.validate()?;
         }
         for timer in &self.timers {
@@ -132,12 +163,33 @@ impl DurableTransition {
 
     pub fn digest(&self) -> Result<String, DurableProtocolError> {
         self.validate()?;
-        let bytes = serde_json::to_vec(self)
+        let value = serde_json::to_value(self)
             .map_err(|error| DurableProtocolError::Serialization(error.to_string()))?;
+        let mut bytes = Vec::new();
+        write_canonical_json(&value, &mut bytes)?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(DURABLE_TRANSITION_DIGEST_DOMAIN);
         hasher.update(&bytes);
         Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableCommand {
+    pub command_id: String,
+    pub command_type: String,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+impl DurableCommand {
+    fn validate(&self) -> Result<(), DurableProtocolError> {
+        if self.command_id.trim().is_empty() || self.command_type.trim().is_empty() {
+            Err(DurableProtocolError::InvalidCommand)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -149,7 +201,7 @@ pub struct DurableStateCheckpoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum DurableWorkflowEvent {
     WorkflowStarted { workflow_name: String },
     StepCompleted { step_name: String },
@@ -196,11 +248,30 @@ impl DurableWorkflowEvent {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableDomainEvent {
+    pub event_type: String,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+impl DurableDomainEvent {
+    fn validate(&self) -> Result<(), DurableProtocolError> {
+        if self.event_type.trim().is_empty() {
+            Err(DurableProtocolError::InvalidDomainEvent)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum DurableTimerMutation {
     Set {
         timer_id: String,
+        #[serde(with = "u64_string")]
         due_at_unix_ms: u64,
     },
     Cancel {
@@ -226,18 +297,40 @@ impl DurableTimerMutation {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableEffectBoundary {
+    RuntimeOwned,
+    BackendOwned,
+    External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableDeliverySemantics {
+    AtLeastOnce,
+    EffectivelyOnceWithDeduplication,
+    BackendDefined,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum DurableEffectMutation {
     Prepared {
         effect_id: String,
         operation: String,
+        boundary: DurableEffectBoundary,
+        delivery: DurableDeliverySemantics,
         request_digest: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idempotency_key: Option<String>,
     },
     Completed {
         effect_id: String,
+        operation: String,
+        boundary: DurableEffectBoundary,
+        delivery: DurableDeliverySemantics,
+        request_digest: String,
         result_digest: String,
         #[serde(default)]
         result: Value,
@@ -252,6 +345,7 @@ impl DurableEffectMutation {
                 operation,
                 request_digest,
                 idempotency_key,
+                ..
             } => {
                 if effect_id.trim().is_empty()
                     || operation.trim().is_empty()
@@ -265,10 +359,16 @@ impl DurableEffectMutation {
             }
             Self::Completed {
                 effect_id,
+                operation,
+                request_digest,
                 result_digest,
                 ..
             } => {
-                if effect_id.trim().is_empty() || !valid_blake3_digest(result_digest) {
+                if effect_id.trim().is_empty()
+                    || operation.trim().is_empty()
+                    || !valid_blake3_digest(request_digest)
+                    || !valid_blake3_digest(result_digest)
+                {
                     return Err(DurableProtocolError::InvalidDurableEffect);
                 }
             }
@@ -316,7 +416,9 @@ impl DurableCommitRequest {
 #[serde(deny_unknown_fields)]
 pub struct DurableCommit {
     pub owner_id: DurableOwnerId,
+    #[serde(with = "u64_string")]
     pub activation_epoch: u64,
+    #[serde(with = "u64_string")]
     pub sequence: u64,
     pub digest: String,
 }
@@ -331,8 +433,10 @@ pub enum DurableProtocolError {
         expected_previous_sequence: u64,
         sequence: u64,
     },
+    InvalidCommand,
     InvalidStateField,
     InvalidWorkflowEvent,
+    InvalidDomainEvent,
     InvalidTimer,
     InvalidDurableEffect,
     InvalidOutboxMessage,
@@ -359,8 +463,10 @@ impl fmt::Display for DurableProtocolError {
                 f,
                 "durable transition sequence {sequence} does not follow predecessor {expected_previous_sequence}"
             ),
+            Self::InvalidCommand => write!(f, "invalid durable command record"),
             Self::InvalidStateField => write!(f, "durable state field name must not be empty"),
             Self::InvalidWorkflowEvent => write!(f, "invalid durable workflow event"),
+            Self::InvalidDomainEvent => write!(f, "invalid durable domain event"),
             Self::InvalidTimer => write!(f, "invalid durable timer mutation"),
             Self::InvalidDurableEffect => write!(f, "invalid durable effect mutation"),
             Self::InvalidOutboxMessage => write!(f, "invalid durable outbox message"),
@@ -390,6 +496,51 @@ fn valid_blake3_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn write_canonical_json(
+    value: &Value,
+    out: &mut Vec<u8>,
+) -> Result<(), DurableProtocolError> {
+    match value {
+        Value::Null => out.extend_from_slice(b"null"),
+        Value::Bool(value) => {
+            out.extend_from_slice(if *value { b"true" } else { b"false" });
+        }
+        Value::Number(value) => out.extend_from_slice(value.to_string().as_bytes()),
+        Value::String(value) => {
+            let encoded = serde_json::to_string(value)
+                .map_err(|error| DurableProtocolError::Serialization(error.to_string()))?;
+            out.extend_from_slice(encoded.as_bytes());
+        }
+        Value::Array(values) => {
+            out.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                write_canonical_json(value, out)?;
+            }
+            out.push(b']');
+        }
+        Value::Object(values) => {
+            let mut keys: Vec<_> = values.keys().collect();
+            keys.sort_unstable();
+            out.push(b'{');
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                let encoded = serde_json::to_string(key)
+                    .map_err(|error| DurableProtocolError::Serialization(error.to_string()))?;
+                out.extend_from_slice(encoded.as_bytes());
+                out.push(b':');
+                write_canonical_json(&values[key], out)?;
+            }
+            out.push(b'}');
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +554,11 @@ mod tests {
             activation_epoch: 7,
             sequence: 12,
             expected_previous_sequence: 11,
+            command: Some(DurableCommand {
+                command_id: "msg-11".into(),
+                command_type: "ChargeOrder".into(),
+                payload: json!({"order_id":"42"}),
+            }),
             state: Some(DurableStateCheckpoint {
                 fields: BTreeMap::from([
                     ("step_index".into(), json!(2)),
@@ -412,6 +568,10 @@ mod tests {
             workflow_events: vec![DurableWorkflowEvent::StepCompleted {
                 step_name: "charge".into(),
             }],
+            domain_events: vec![DurableDomainEvent {
+                event_type: "OrderCharged".into(),
+                payload: json!({"order_id":"42"}),
+            }],
             timers: vec![DurableTimerMutation::Set {
                 timer_id: "shipping-timeout".into(),
                 due_at_unix_ms: 1_800_000_000_000,
@@ -419,6 +579,8 @@ mod tests {
             durable_effects: vec![DurableEffectMutation::Prepared {
                 effect_id: "eff-01".into(),
                 operation: "Payment.charge".into(),
+                boundary: DurableEffectBoundary::External,
+                delivery: DurableDeliverySemantics::EffectivelyOnceWithDeduplication,
                 request_digest: "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
                 idempotency_key: Some("eff-01".into()),
             }],
@@ -436,6 +598,8 @@ mod tests {
         let value = serde_json::to_value(transition()).unwrap();
 
         assert_eq!(value["protocol"], DURABLE_TRANSITION_PROTOCOL_VERSION);
+        assert_eq!(value["activation_epoch"], "7");
+        assert_eq!(value["sequence"], "12");
         assert_eq!(value["workflow_events"][0]["kind"], "step_completed");
         assert_eq!(value["timers"][0]["kind"], "set");
         assert_eq!(value["durable_effects"][0]["kind"], "prepared");
@@ -465,21 +629,41 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_digest_ignores_state_insertion_order() {
+    fn fencing_counters_roundtrip_above_javascript_safe_integer_range() {
+        let mut large = transition();
+        large.activation_epoch = 9_007_199_254_740_993;
+        large.expected_previous_sequence = 9_007_199_254_740_993;
+        large.sequence = 9_007_199_254_740_994;
+
+        let encoded = serde_json::to_value(&large).unwrap();
+        assert_eq!(encoded["activation_epoch"], "9007199254740993");
+        assert_eq!(encoded["sequence"], "9007199254740994");
+
+        let decoded: DurableTransition = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.activation_epoch, large.activation_epoch);
+        assert_eq!(decoded.sequence, large.sequence);
+    }
+
+    #[test]
+    fn deterministic_digest_ignores_nested_json_object_insertion_order() {
         let mut first = transition();
         let mut second = transition();
 
+        let mut left = serde_json::Map::new();
+        left.insert("a".into(), json!(1));
+        left.insert("b".into(), json!({"x":1,"y":2}));
+        let mut right_nested = serde_json::Map::new();
+        right_nested.insert("y".into(), json!(2));
+        right_nested.insert("x".into(), json!(1));
+        let mut right = serde_json::Map::new();
+        right.insert("b".into(), Value::Object(right_nested));
+        right.insert("a".into(), json!(1));
+
         first.state = Some(DurableStateCheckpoint {
-            fields: BTreeMap::from([
-                ("a".into(), json!(1)),
-                ("b".into(), json!(2)),
-            ]),
+            fields: BTreeMap::from([("payload".into(), Value::Object(left))]),
         });
         second.state = Some(DurableStateCheckpoint {
-            fields: BTreeMap::from([
-                ("b".into(), json!(2)),
-                ("a".into(), json!(1)),
-            ]),
+            fields: BTreeMap::from([("payload".into(), Value::Object(right))]),
         });
 
         assert_eq!(first.digest().unwrap(), second.digest().unwrap());
@@ -509,6 +693,19 @@ mod tests {
     }
 
     #[test]
+    fn command_domain_and_effect_recovery_semantics_are_in_atomic_record() {
+        let value = serde_json::to_value(transition()).unwrap();
+
+        assert_eq!(value["command"]["command_id"], "msg-11");
+        assert_eq!(value["domain_events"][0]["event_type"], "OrderCharged");
+        assert_eq!(value["durable_effects"][0]["boundary"], "external");
+        assert_eq!(
+            value["durable_effects"][0]["delivery"],
+            "effectively_once_with_deduplication"
+        );
+    }
+
+    #[test]
     fn timer_and_signal_records_are_semantic_not_host_specific() {
         let records = vec![
             DurableWorkflowEvent::SignalAccepted {
@@ -528,5 +725,23 @@ mod tests {
         assert_eq!(encoded[0]["kind"], "signal_accepted");
         assert_eq!(encoded[1]["kind"], "saga_compensated");
         assert_eq!(encoded[2]["kind"], "parallel_branch_completed");
+    }
+
+    #[test]
+    fn unknown_semantic_record_fields_fail_closed() {
+        let value = json!({
+            "kind": "step_completed",
+            "step_name": "charge",
+            "typo_field": true
+        });
+        assert!(serde_json::from_value::<DurableWorkflowEvent>(value).is_err());
+
+        let value = json!({
+            "kind": "set",
+            "timer_id": "t1",
+            "due_at_unix_ms": "10",
+            "typo_field": true
+        });
+        assert!(serde_json::from_value::<DurableTimerMutation>(value).is_err());
     }
 }
