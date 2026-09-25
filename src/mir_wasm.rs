@@ -34,6 +34,9 @@ const IMPORT_NULANG_DISPATCH: u32 = 1;
 /// dispatch (i32 tag_ptr, i32 tag_len, i32 argv_ptr, i32 argc) -> i64.
 /// Appended last so existing function indices stay stable.
 const IMPORT_NULANG_DISPATCH_ARGS: u32 = 22;
+/// Function index of `env.arith_float` — bytecode F* arithmetic semantics.
+/// Appended after the existing stable import set so all previous indices remain stable.
+const IMPORT_ARITH_FLOAT: u32 = 23;
 
 /// Maximum positional args in one `perform` on the WASM backend. Must match
 /// the `argc` guard in nulang-cloud's `host_dispatch_args`.
@@ -77,7 +80,7 @@ const IMPORT_FFI_CALL_2: u32 = 18;
 const IMPORT_FFI_CALL_3: u32 = 19;
 const IMPORT_FFI_CALL_4: u32 = 20;
 /// Number of function imports. Module-defined functions start at this index.
-const FUNC_IMPORT_COUNT: u32 = 23;
+const FUNC_IMPORT_COUNT: u32 = 24;
 
 /// Module-global indices for the guest-side actor emulation (spawn/send/
 /// ask/state/receive all run inside one WASM instance — the pool delivers
@@ -646,6 +649,11 @@ impl WasmBackend {
             "nulang_dispatch_args",
             EntityType::Function(ty_dispatch),
         );
+        imports.import(
+            "env",
+            "arith_float",
+            EntityType::Function(TY_I64I64I64_TO_I64),
+        );
         self.imports = imports;
     }
 
@@ -1135,10 +1143,39 @@ impl WasmBackend {
                 body.instruction(&Instruction::LocalGet(self.mir_local(a, func)));
                 body.instruction(&Instruction::LocalGet(self.mir_local(b, func)));
                 use crate::ast::BinOp;
-                // Numeric ops route through host helpers so float operands
-                // (raw bit patterns the inline integer path would corrupt) get
-                // f64 arithmetic, matching the interpreter. Comparisons too.
+
+                let local_is_float = |id: &mir::LocalId| {
+                    func.locals
+                        .get(id.0 as usize)
+                        .map(|local| {
+                            local.ty
+                                == crate::types::Type::Primitive(
+                                    crate::types::PrimitiveType::Float,
+                                )
+                        })
+                        .unwrap_or(false)
+                };
+                let float_arithmetic = local_is_float(a) || local_is_float(b);
+
+                // Preserve mir_codegen's type-directed F* vs I* distinction.
+                // Runtime tags alone are insufficient: FDiv can yield nil,
+                // and a subsequent FAdd must still use float fallback semantics.
                 let import = match op {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow
+                        if float_arithmetic =>
+                    {
+                        let code = match op {
+                            BinOp::Add => 0,
+                            BinOp::Sub => 1,
+                            BinOp::Mul => 2,
+                            BinOp::Div => 3,
+                            BinOp::Mod => 4,
+                            BinOp::Pow => 5,
+                            _ => unreachable!(),
+                        };
+                        body.instruction(&Instruction::I64Const(code));
+                        Some(IMPORT_ARITH_FLOAT)
+                    }
                     BinOp::Add => Some(IMPORT_ARITH_ADD),
                     BinOp::Sub => Some(IMPORT_ARITH_SUB),
                     BinOp::Mul => Some(IMPORT_ARITH_MUL),
