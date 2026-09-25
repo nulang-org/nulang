@@ -1591,6 +1591,7 @@ fn test_tier2_counter_increments() {
         5,
         CompilationTier::Simd,
         CodegenOptimization::Optimized,
+        false,
         0,
     );
 
@@ -1627,6 +1628,7 @@ fn test_tier2_counters_are_per_session() {
         3,
         CompilationTier::Simd,
         CodegenOptimization::Optimized,
+        false,
         0,
     );
     jit_b.store_compiled_with_metadata(
@@ -1636,6 +1638,7 @@ fn test_tier2_counters_are_per_session() {
         3,
         CompilationTier::Simd,
         CodegenOptimization::Optimized,
+        false,
         0,
     );
 
@@ -1749,6 +1752,7 @@ fn test_tier2_replaces_typed_region_with_simd_code() {
         module.instructions.len(),
         CompilationTier::Typed,
         CodegenOptimization::Optimized,
+        false,
         0,
     );
     jit.typed_regions.insert((0, 0));
