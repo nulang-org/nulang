@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Hosted control-plane ownership boundary — 2026-09-25
+- **Hosted placement and reconciliation policy is no longer owned by the Nulang language/runtime workspace.** `crates/nulang-cloud-control` is frozen as a migration surface and excluded from ordinary workspace builds; Nulang Cloud's `nlc-placement` remains the authoritative hosted control plane.
+- **The boundary is explicit:** Nulang owns portable computation semantics and cloud-neutral contracts, while provider, region/cell, tenancy, billing, and deployment policy belong to Nulang Cloud.
+
 ### Atomic durable transition host protocol — 2026-09-25
 - **Durable transition semantics now have a runtime-neutral wire/data contract.** The new `nulang-durable-protocol` crate defines `nulang-durable-transition/v0alpha1` with opaque durable owner identity, activation-epoch and sequence fencing, deterministic BLAKE3 digests, state/workflow/timer/effect/outbox records, and fail-closed validation.
 - **Duplicate retries are explicit and safe.** Exact same-sequence duplicate commits can be identified deterministically, while conflicting content at the same durable identity/sequence is rejected.
