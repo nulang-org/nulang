@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Backend-neutral JIT compile telemetry — 2026-09-25
+- **JIT backends now expose aggregate Fast and Optimized compilation counts and compiler-only wall time through `JitCompileStats`.** The counters exclude interpreter warm-up and generated-code execution so tiering decisions can separate compile cost from runtime payoff.
+- **`VM::jit_compile_stats` exposes the telemetry without leaking Cranelift-specific APIs**, and the tier-promotion regression now requires one Fast plus one Optimized compile across the tested promotion.
+- **A dedicated `nulang-jit-bench` runner reports interpreter-checked first-run/warm execution together with compiler-only deltas** for numeric, call-heavy, and branch-heavy workloads in human or JSONL form.
+
 ### Zero-copy non-reentrant JIT register entry — 2026-09-25
 - **JIT regions proven unable to re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
 - **Compiled-region metadata records whether native execution may grow or replace the VM frame stack.** Helper-backed direct-call regions retain detached register storage because interpreter re-entry may reallocate `VM::frames`; typed, SIMD, and scalar no-call regions use direct frame registers.
