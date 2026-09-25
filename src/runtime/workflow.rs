@@ -9,7 +9,7 @@ use crate::bytecode::Constant;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{
-    EventEntry, PersistedValue, WorkflowActivationId, WorkflowEvent,
+    EventEntry, PersistedValue, WorkflowActivationId, WorkflowEvent, WorkflowOperationId,
 };
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
 use crate::vm::{Frame, Value, VM};
@@ -27,6 +27,29 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
         .get(&actor_id)
         .map(|a| matches!(a.role(), Ok(ActorRole::Workflow)))
         .unwrap_or(false)
+}
+
+/// Allocate the next deterministic replay ordinal for the active workflow command.
+pub(crate) fn next_workflow_operation_id(
+    rt: &mut Runtime,
+    actor_id: u64,
+) -> Option<WorkflowOperationId> {
+    let actor = rt.actors.get_mut(&actor_id)?;
+    let activation = actor.current_workflow_activation?;
+    let ordinal = actor.current_workflow_operation_ordinal;
+    let next = match ordinal.checked_add(1) {
+        Some(next) => next,
+        None => {
+            tracing::warn!(
+                actor_id,
+                command_sequence = activation.command_sequence,
+                "workflow operation ordinal overflow"
+            );
+            return None;
+        }
+    };
+    actor.current_workflow_operation_ordinal = next;
+    Some(WorkflowOperationId::new(activation, ordinal))
 }
 
 // ---------------------------------------------------------------------------
