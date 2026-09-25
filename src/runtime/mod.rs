@@ -79,6 +79,8 @@ pub(crate) use spawn::spawn_from_module_with_authority;
 mod timer;
 mod trace;
 mod workflow;
+mod workflow_control;
+pub use workflow_control::WorkflowControlHost;
 pub use trace::TraceContext;
 
 #[cfg(test)]
