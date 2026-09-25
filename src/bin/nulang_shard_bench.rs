@@ -14,6 +14,7 @@
 
 use std::env;
 use std::process::ExitCode;
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use nulang::runtime::{Actor, Runtime};
@@ -134,13 +135,29 @@ fn run_independent(shard_count: usize, total_messages: usize) -> Measurement {
         );
     }
 
-    let started = Instant::now();
-    std::thread::scope(|scope| {
-        for runtime in &mut runtimes {
-            scope.spawn(move || runtime.run_scheduler());
+    // Construct worker threads before timing, then release them together.
+    // This keeps thread-creation latency out of the scaling signal while still
+    // measuring scheduler execution plus normal thread scheduling/join time.
+    let start_barrier = Arc::new(Barrier::new(shard_count + 1));
+    let (runtimes, elapsed) = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(shard_count);
+        for mut runtime in runtimes {
+            let barrier = Arc::clone(&start_barrier);
+            handles.push(scope.spawn(move || {
+                barrier.wait();
+                runtime.run_scheduler();
+                runtime
+            }));
         }
+
+        let started = Instant::now();
+        start_barrier.wait();
+        let finished = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("shard benchmark worker panicked"))
+            .collect::<Vec<_>>();
+        (finished, started.elapsed())
     });
-    let elapsed = started.elapsed();
 
     let mut processed = 0usize;
     for ((runtime, actor_id), expected) in runtimes
