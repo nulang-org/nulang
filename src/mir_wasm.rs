@@ -1147,12 +1147,7 @@ impl WasmBackend {
                 // non-float denominator. This matters when an earlier FDiv
                 // returns nil but the enclosing expression remains Float.
                 if numeric && float_arithmetic {
-                    self.emit_float_operand(
-                        body,
-                        a,
-                        0.0,
-                        func,
-                    );
+                    self.emit_float_operand(body, a, 0.0, func);
                     let rhs_fallback = if matches!(op, BinOp::Div | BinOp::Mod) {
                         1.0
                     } else {
@@ -2159,8 +2154,7 @@ impl WasmBackend {
         func.locals
             .get(id.0 as usize)
             .map(|local| {
-                local.ty
-                    == crate::types::Type::Primitive(crate::types::PrimitiveType::Float)
+                local.ty == crate::types::Type::Primitive(crate::types::PrimitiveType::Float)
             })
             .unwrap_or(false)
     }
@@ -2205,7 +2199,7 @@ impl WasmBackend {
         body.instruction(&Instruction::LocalGet(local));
         body.instruction(&Instruction::Else);
         body.instruction(&Instruction::I64Const(
-            value_layout::float_bits(fallback) as i64,
+            value_layout::float_bits(fallback) as i64
         ));
         body.instruction(&Instruction::End);
     }
@@ -3177,8 +3171,7 @@ mod tests {
         // Regression from the 2026-09-25 differential-fuzz nightly.
         // Bytecode selects FDiv/FAdd/FNeg from MIR type information:
         // 1.0 / 0.0 -> nil, FAdd(0.1, nil) treats nil as 0.0, then FNeg -> -0.1.
-        let value = run_source("let x = 0.1; let y = 0.2; -(x + 1.0 / 0.0)")
-            .expect("run");
+        let value = run_source("let x = 0.1; let y = 0.2; -(x + 1.0 / 0.0)").expect("run");
         let got = value.as_float().expect("result must remain Float");
         assert!(
             (got - (-0.1)).abs() < f64::EPSILON,
