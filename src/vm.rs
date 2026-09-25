@@ -7005,6 +7005,10 @@ mod vm_tests {
         module.emit(Instruction::new3(OpCode::IAdd, 0, 0, 0)); // 4: post-call boundary
         module.emit(Instruction::new0(OpCode::Halt)); // 5: branch target
         module.entry_point = Some(0);
+        // Source-line metadata is diagnostic information, not an execution
+        // entry point. A straight-line statement start must not become a JIT
+        // probe site solely because it appears in the line table.
+        module.line_table.push((1, 123));
 
         let target = 5i16 - branch as i16;
         module.instructions[branch].op2 = ((target >> 8) & 0xff) as u8;
