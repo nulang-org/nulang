@@ -137,6 +137,10 @@ pub struct ActorSnapshot {
     /// suspended waiting for, if any.  This is part of the snapshot so that
     /// recovery can decide whether the in-flight step must be re-triggered.
     pub waiting_signal: Option<String>,
+    /// Activation-local operation identity for `waiting_signal`, when the
+    /// suspension was created by an activation-aware runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_signal_operation: Option<WorkflowOperationId>,
     /// CRDT state belonging to the runtime's CrdtManager, serialized as
     /// `Vec<(crdt_id, crdt_type_u8, payload_bytes)>`.
     #[serde(default)]
@@ -259,6 +263,8 @@ pub enum WorkflowEvent {
     /// An external signal was delivered to the workflow.
     SignalReceived {
         sequence: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<WorkflowOperationId>,
         name: String,
         payload: Option<String>,
     },
@@ -334,6 +340,7 @@ impl WorkflowEvent {
         match self {
             WorkflowEvent::TimerSet { operation_id, .. }
             | WorkflowEvent::TimerFired { operation_id, .. }
+            | WorkflowEvent::SignalReceived { operation_id, .. }
             | WorkflowEvent::ParallelBranchCompleted { operation_id, .. }
             | WorkflowEvent::Custom { operation_id, .. } => *operation_id,
             _ => None,
@@ -648,6 +655,7 @@ pub trait PersistenceStore: Send + Sync {
             actor_id,
             WorkflowEvent::SignalReceived {
                 sequence,
+                operation_id: None,
                 name,
                 payload,
             },
