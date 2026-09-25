@@ -27,6 +27,12 @@ backend correctness bug.
 
 ## Oracle
 
+There is no known-divergence whitelist. Once a backend accepts a generated
+program, any observable disagreement with the bytecode reference is a
+correctness failure. Historical campaign classes such as the August 2026
+48-bit-overflow mismatch remain documented below for provenance, but a
+recurrence is now an ordinary fatal divergence.
+
 `fuzz::differential_fuzz_one(source)`:
 
 - Compile once (lex → parse → typecheck → HIR → MIR → bytecode). Programs
@@ -160,7 +166,7 @@ Campaign results are recorded here (newest first).
 
 ### 2026-08-16 — initial bring-up (feat/differential-fuzzing, base 59cd4c6)
 
-#### Finding 1 (known class): 48-bit checked-overflow semantics differ across backends
+#### Finding 1 (historical): 48-bit checked-overflow semantics differed across backends
 
 The bytecode interpreter performs *checked* 48-bit arithmetic and raises
 `integer overflow: `<op>` on A and B exceeds the 48-bit range ...` when an
@@ -194,16 +200,15 @@ Reproduce any of these: `scripts/difffuzz.sh --seeds 1 --seed-base 0xD1FF0009`
 `seed * 0x9E3779B97F4A7C15 ^ 0xA5A55A5AD3C3B4A5`; earlier handoff seeds
 do not reproduce).
 
-Classification: every program that executes an overflowing int op is a
-divergence under the current backends, so the campaign classifies any
-divergence whose oracle message contains `exceeds the 48-bit range` into
-`CampaignStats::known_overflow` and persists it under
-`fuzz/differential/crashers/known-overflow/`; the top-level crashers
-directory remains reserved for untriaged classes. Per PLAN.md Phase 1,
-checked 48-bit arithmetic is Frozen-tier surface — this is a Sev-1
-correctness gap, not a fuzzer artifact. It needs a deliberate semantic
-decision (checked-everywhere vs wrap-everywhere) plus a JIT/AOT
-implementation pass; it is not fixable as a small generator-side change.
+Historical classification: the initial campaign temporarily separated
+overflow-related mismatches into `CampaignStats::known_overflow` so other
+new bug classes remained visible while arithmetic parity work was underway.
+That exception is no longer part of the oracle. Current JIT/AOT/WASM parity
+paths and the regression corpus are expected to agree with the bytecode
+reference on checked arithmetic; any recurrence of an overflow mismatch is
+now recorded with ordinary crashers and fails the campaign. Because checked
+48-bit arithmetic is a compatibility surface, such a regression remains a
+high-severity correctness bug.
 
 #### Finding 2 (fixed in generator): float division by zero — interp nil vs AOT value
 
