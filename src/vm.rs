@@ -7111,6 +7111,83 @@ mod vm_tests {
         assert_eq!(hot_result.as_int(), Some(6), "sum 0..4 = 6");
     }
 
+    /// String-aware scalar JIT helpers must retain constant-pool semantics on
+    /// the zero-copy register path. This loop tiers up after the hot threshold;
+    /// without the disjoint module context, compiled ICmpEq resolves both
+    /// interned strings as missing and the final value becomes false.
+    #[cfg(feature = "native-codegen")]
+    #[test]
+    fn test_jit_direct_frame_string_equality_keeps_module_context() {
+        let mut module = CodeModule::new("jit_string_context");
+        let c_limit = module.add_constant(Constant::Int(2_000));
+        let c_left = module.add_constant(Constant::String("same".to_string()));
+        let c_right = module.add_constant(Constant::String("same".to_string()));
+
+        // r0 = i/result, r1 = limit, r2 = loop condition, r4/r5 = strings,
+        // r6 = equality result, r7 = padding accumulator. Keep the loop body
+        // large enough to be a real JIT candidate so the test exercises the
+        // direct-frame path rather than merely validating interpreter behavior.
+        module.emit(Instruction::new3(
+            OpCode::ConstU,
+            ((c_limit >> 8) & 0xFF) as u8,
+            (c_limit & 0xFF) as u8,
+            1,
+        ));
+        module.emit(Instruction::new1(OpCode::Const0, 0));
+        module.emit(Instruction::new1(OpCode::Const0, 7));
+
+        let loop_start = module.current_offset();
+        module.emit(Instruction::new3(
+            OpCode::ConstU,
+            ((c_left >> 8) & 0xFF) as u8,
+            (c_left & 0xFF) as u8,
+            4,
+        ));
+        module.emit(Instruction::new3(
+            OpCode::ConstU,
+            ((c_right >> 8) & 0xFF) as u8,
+            (c_right & 0xFF) as u8,
+            5,
+        ));
+        module.emit(Instruction::new3(OpCode::ICmpEq, 4, 5, 6));
+        module.emit(Instruction::new1(OpCode::IInc, 7));
+        module.emit(Instruction::new1(OpCode::IInc, 7));
+        module.emit(Instruction::new1(OpCode::IInc, 7));
+        module.emit(Instruction::new1(OpCode::IInc, 0));
+        module.emit(Instruction::new3(OpCode::ICmpLt, 0, 1, 2));
+
+        let jmp_back = module.current_offset();
+        let back = loop_start as i64 - jmp_back as i64;
+        module.emit(Instruction::new3(
+            OpCode::JmpT,
+            2,
+            ((back as i16 >> 8) & 0xFF) as u8,
+            (back as i16 & 0xFF) as u8,
+        ));
+        module.emit(Instruction::new2(OpCode::Move, 6, 0));
+        module.emit(Instruction::new0(OpCode::Halt));
+        module.entry_point = Some(0);
+
+        let mut vm = VM::new();
+        vm.load_module(module);
+        let result = vm.run().expect("run");
+        assert_eq!(
+            result.as_bool(),
+            Some(true),
+            "hot string equality must preserve interned-string resolution"
+        );
+
+        let compiled = vm
+            .jit_session
+            .as_ref()
+            .map(|jit| jit.compiled_count())
+            .unwrap_or(0);
+        assert!(
+            compiled > 0,
+            "string equality loop must tier up for this regression to be meaningful"
+        );
+    }
+
     /// Regression test: a hot loop whose body is long enough to JIT and whose
     /// header has an early-exit conditional must produce the exact interpreter
     /// result. Guards the straight-line-region contract: compiled regions must
