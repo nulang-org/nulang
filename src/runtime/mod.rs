@@ -1264,6 +1264,7 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
+                                    activation: suspended.activation,
                                     step_name: suspended.step_name.clone(),
                                 });
                             actor.jit_yield_pending = true;
@@ -1289,6 +1290,7 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
+                                    activation: suspended.activation,
                                     step_name: suspended.step_name,
                                 });
                         }
@@ -1702,6 +1704,7 @@ impl Runtime {
                             Some(crate::runtime::actor::SuspendedExecution {
                                 vm_state,
                                 behavior_idx,
+                                activation: suspended.activation,
                                 step_name,
                             });
                     }
@@ -3642,7 +3645,10 @@ impl Runtime {
 
         let msg_opt = {
             let actor = match self.actors.get_mut(&actor_id) {
-                Some(a) => a,
+                Some(a) => {
+                    a.current_workflow_activation = None;
+                    a
+                },
                 None => {
                     self.current_actor = None;
                     return;
@@ -3878,11 +3884,18 @@ impl Runtime {
             }
 
             let mut processed = false;
+            let mut workflow_activation = None;
             if self.has_native_handler(actor_id, behavior_idx) {
                 // Journal the message before handling so recovery can replay it.
                 if self.actor_is_persistent(actor_id) {
                     let seq = self.next_sequence(actor_id);
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
+                    if self.actor_is_workflow(actor_id) {
+                        workflow_activation = Some(WorkflowActivationId::new(actor_id, seq));
+                        if let Some(actor) = self.actors.get_mut(&actor_id) {
+                            actor.current_workflow_activation = workflow_activation;
+                        }
+                    }
                     let _ = self.persistence.append_journal(
                         actor_id,
                         JournalEntry {
@@ -3902,6 +3915,12 @@ impl Runtime {
                 if self.actor_is_persistent(actor_id) {
                     let seq = self.next_sequence(actor_id);
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
+                    if self.actor_is_workflow(actor_id) {
+                        workflow_activation = Some(WorkflowActivationId::new(actor_id, seq));
+                        if let Some(actor) = self.actors.get_mut(&actor_id) {
+                            actor.current_workflow_activation = workflow_activation;
+                        }
+                    }
                     let _ = self.persistence.append_journal(
                         actor_id,
                         JournalEntry {
@@ -3948,6 +3967,7 @@ impl Runtime {
                                 actor_id,
                                 WorkflowEvent::StepFailed {
                                     sequence: seq,
+                                    activation: workflow_activation,
                                     step_name,
                                     error: format!("{}", e),
                                 },
@@ -3968,6 +3988,7 @@ impl Runtime {
                     actor_id,
                     WorkflowEvent::StepCompleted {
                         sequence: seq,
+                        activation: workflow_activation,
                         step_name,
                     },
                 );
@@ -4500,6 +4521,7 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
+                                    activation: suspended.activation,
                                     step_name: suspended.step_name.clone(),
                                 });
                         }
@@ -4597,6 +4619,7 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
+                                    activation: suspended.activation,
                                     step_name: suspended.step_name,
                                 });
                         }
@@ -4618,6 +4641,7 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
+                                    activation: suspended.activation,
                                     step_name: suspended.step_name,
                                 });
                         }
@@ -4864,6 +4888,7 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: 0,
+                                    activation: actor.current_workflow_activation,
                                     step_name: String::new(),
                                 });
                             actor.jit_yield_pending = true;
@@ -4889,6 +4914,7 @@ impl Runtime {
                             Some(crate::runtime::actor::SuspendedExecution {
                                 vm_state,
                                 behavior_idx: 0,
+                                activation: actor.current_workflow_activation,
                                 step_name: String::new(),
                             });
                     }
