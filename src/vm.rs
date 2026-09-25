@@ -7027,6 +7027,33 @@ mod vm_tests {
         assert!(candidates[5], "branch target must remain a candidate");
     }
 
+    #[cfg(feature = "native-codegen")]
+    #[test]
+    fn test_jit_candidate_pcs_do_not_use_debug_line_table_as_hotness_boundaries() {
+        let mut module = CodeModule::new("test_jit_debug_lines_not_candidates");
+        module.emit(Instruction::new1(OpCode::Const0, 0)); // 0: entry
+        module.emit(Instruction::new3(OpCode::IAdd, 0, 0, 0)); // 1: ordinary statement
+        module.emit(Instruction::new3(OpCode::IMul, 0, 0, 0)); // 2: ordinary statement
+        module.emit(Instruction::new0(OpCode::Halt)); // 3
+        module.entry_point = Some(0);
+
+        // Debug line metadata is for breakpoints/stepping. It must not make
+        // otherwise-straight-line bytecode pay a JIT hotness probe.
+        module.line_table.push((1, 10));
+        module.line_table.push((2, 11));
+
+        let candidates = compute_jit_candidate_pcs(&module);
+        assert!(candidates[0], "module entry remains a JIT candidate");
+        assert!(
+            !candidates[1],
+            "debug line metadata must not create a JIT candidate"
+        );
+        assert!(
+            !candidates[2],
+            "debug line metadata must not create a JIT candidate"
+        );
+    }
+
     /// Test 16: JIT-compiled hot loop produces the same result as the interpreter.
     #[test]
     fn test_jit_hot_loop_matches_interpreter() {
