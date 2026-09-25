@@ -223,8 +223,16 @@ A replica does not infer authority merely because it receives a higher epoch
 from a data-plane sender. This reuses the existing cache placement epoch rather
 than introducing a second leader-term system.
 
-Replica acknowledgement transport, bootstrap snapshot transfer, and promotion
-remain follow-up work. The default cache path continues to run without WAL,
+Primary-side acknowledgement state is tracked separately from mutation
+application. A `CacheReplicaAck` carries placement epoch, replica identity, and
+the highest applied WAL sequence. The tracker accepts acknowledgements only
+from configured replicas in the current epoch, rejects acknowledgements beyond
+the primary's local sequence, and keeps progress monotonic per replica. Epoch
+advancement clears prior-epoch acknowledgement credit so stale replicas cannot
+satisfy a new-term write requirement.
+
+Transport integration, bootstrap snapshot transfer, and promotion remain
+follow-up work. The default cache path continues to run without WAL,
 replication, or consensus work.
 
 ## Performance gates
@@ -270,8 +278,8 @@ surface.
 4. Connect remote transparent handoffs to a cache-specific cluster transport.
 5. Add asynchronous snapshot/compaction so periodic checkpoints do not block
    the shard reactor.
-6. Add replica acknowledgement, bootstrap snapshot transfer, and promotion /
-   failover fencing on top of the epoch-fenced replication core.
+6. Connect replication/ack frames to a cache transport, add bootstrap snapshot
+   transfer, then promotion / failover fencing.
 7. Add packed aggregate structures, then expand RESP compatibility and add
    Nulang-native leases, locks, semaphores,
    fencing tokens, queues, and stored functions where they fit the product
