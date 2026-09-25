@@ -27,7 +27,7 @@ use super::resp_cache::{CacheCommandError, CacheCommandTarget};
 use super::cache_dispatch::{
     CacheDispatchConfigError, CacheDispatchWake, CacheDispatcher, CacheShardInbox,
 };
-use super::cache_pipeline::{CachePipelineError, CacheResponsePipeline};
+use super::cache_pipeline::{CacheAskingUpdate, CachePipelineError, CacheResponsePipeline};
 
 const LISTENER_TOKEN: Token = Token(0);
 const WAKE_TOKEN: Token = Token(1);
@@ -138,6 +138,7 @@ struct CacheConnection {
     output: Vec<u8>,
     output_start: usize,
     pipeline: CacheResponsePipeline,
+    asking: bool,
     writable_interest: bool,
 }
 
@@ -150,6 +151,7 @@ impl CacheConnection {
             output: Vec::with_capacity(4096),
             output_start: 0,
             pipeline: CacheResponsePipeline::new(max_pipeline_depth),
+            asking: false,
             writable_interest: false,
         }
     }
@@ -717,17 +719,24 @@ impl CacheShardServer {
             }
 
             let input = &connection.input[connection.input_start..];
-            let Some(submit) = connection.pipeline.submit_frame(
+            let Some(submit) = connection.pipeline.submit_frame_with_asking(
                 &self.dispatcher,
                 &mut self.store,
                 input,
                 self.clock.now_ms(),
                 &mut connection.output,
+                connection.asking,
             )?
             else {
                 connection.compact_input();
                 return Ok(());
             };
+
+            match submit.asking_update {
+                CacheAskingUpdate::Unchanged => {}
+                CacheAskingUpdate::Enable => connection.asking = true,
+                CacheAskingUpdate::Consume => connection.asking = false,
+            }
 
             if submit.remote.is_some() {
                 return Err(CachePipelineError::Dispatch(
