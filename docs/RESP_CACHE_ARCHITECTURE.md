@@ -240,8 +240,17 @@ and whole-snapshot checksum before restoring `CacheStore`. The resulting
 replica applier resumes at the snapshot sequence, so incremental replication
 continues at sequence + 1 without a second state format.
 
-Transport integration and promotion remain follow-up work. The default cache
-path continues to run without WAL, replication, or consensus work.
+Failover promotion is fenced by both epoch and commit index. The acknowledgement
+tracker can compute the highest WAL sequence satisfying a requested number of
+replica acknowledgements. A replica may be promoted only under a strictly newer
+placement epoch and only when its applied sequence equals the declared commit
+index exactly. A behind candidate is rejected to prevent data loss; an ahead
+candidate is also rejected so an uncommitted tail cannot become visible after
+failover. Such a candidate must first be reconstructed to the exact committed
+state.
+
+Transport integration remains follow-up work. The default cache path continues
+to run without WAL, replication, or consensus work.
 
 ## Performance gates
 
@@ -286,8 +295,8 @@ surface.
 4. Connect remote transparent handoffs to a cache-specific cluster transport.
 5. Add asynchronous snapshot/compaction so periodic checkpoints do not block
    the shard reactor.
-6. Connect replication/ack/bootstrap messages to a cache transport, then add
-   promotion / failover fencing.
+6. Connect replication/ack/bootstrap messages to a cache transport and expose
+   the promotion fence through the cluster control plane.
 7. Add packed aggregate structures, then expand RESP compatibility and add
    Nulang-native leases, locks, semaphores,
    fencing tokens, queues, and stored functions where they fit the product
