@@ -539,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_exposes_source_operation_for_cloud_codegen() {
+    fn test_descriptor_exposes_source_operation_for_cloud_codegen() {
         let descriptor = host_effect_abi_descriptor().unwrap();
         let operations = descriptor["operations"].as_array().unwrap();
 
