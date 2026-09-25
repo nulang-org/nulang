@@ -1856,10 +1856,7 @@ mod tests {
         assert_eq!(store.index.len(), DEFAULT_INDEX_CAPACITY * 2);
 
         for (key, expected) in &inserted {
-            assert_eq!(
-                store.get(key, 0),
-                Some(CacheValueView::Integer(*expected))
-            );
+            assert_eq!(store.get(key, 0), Some(CacheValueView::Integer(*expected)));
         }
 
         let drive_key = inserted[0].0;
@@ -1869,10 +1866,7 @@ mod tests {
 
         assert_eq!(store.get(&drive_key, 0), Some(CacheValueView::Integer(999)));
         for (key, expected) in inserted.iter().skip(1) {
-            assert_eq!(
-                store.get(key, 0),
-                Some(CacheValueView::Integer(*expected))
-            );
+            assert_eq!(store.get(key, 0), Some(CacheValueView::Integer(*expected)));
         }
     }
 
