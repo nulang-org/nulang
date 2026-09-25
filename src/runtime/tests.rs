@@ -7744,3 +7744,95 @@ fn workflow_timer_set_and_fire_preserve_operation_identity() {
         } if *id == timer_operation && name == "wake"
     )));
 }
+
+
+#[test]
+fn workflow_signal_wait_allocates_one_stable_operation_and_persists_it() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "SignalIdentityWorkflow",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    let activation = WorkflowActivationId::new(actor_id, 81);
+    super::workflow::begin_workflow_activation(&mut rt, activation, false);
+
+    let first = rt
+        .begin_workflow_signal_wait(actor_id, "go")
+        .expect("activation-aware signal wait should have an operation id");
+    let retry = rt
+        .begin_workflow_signal_wait(actor_id, "go")
+        .expect("re-entering the same pending wait must reuse its id");
+
+    assert_eq!(first, activation.operation(0));
+    assert_eq!(retry, first);
+    assert_eq!(
+        rt.next_workflow_operation_id(actor_id),
+        Some(activation.operation(1))
+    );
+
+    rt.persist_suspension_marker(actor_id);
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(snapshot.waiting_signal.as_deref(), Some("go"));
+    assert_eq!(snapshot.waiting_signal_operation, Some(first));
+}
+
+#[test]
+fn workflow_signal_receipt_binds_to_the_pending_wait_operation() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "SignalReceiptWorkflow",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    let activation = WorkflowActivationId::new(actor_id, 91);
+    super::workflow::begin_workflow_activation(&mut rt, activation, false);
+    let operation = rt
+        .begin_workflow_signal_wait(actor_id, "go")
+        .expect("pending signal wait identity");
+
+    rt.signal_workflow(actor_id, "go", Some("payload".to_string()))
+        .unwrap();
+
+    let events = rt.persistence.read_workflow_events(actor_id);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        WorkflowEvent::SignalReceived {
+            operation_id: Some(id),
+            name,
+            payload: Some(payload),
+            ..
+        } if *id == operation && name == "go" && payload == "payload"
+    )));
+}
+
+#[test]
+fn unrelated_signal_receipt_does_not_claim_pending_wait_identity() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "SignalMismatchWorkflow",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    let activation = WorkflowActivationId::new(actor_id, 101);
+    super::workflow::begin_workflow_activation(&mut rt, activation, false);
+    let operation = rt
+        .begin_workflow_signal_wait(actor_id, "go")
+        .expect("pending signal wait identity");
+
+    rt.signal_workflow(actor_id, "other", None).unwrap();
+
+    let events = rt.persistence.read_workflow_events(actor_id);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        WorkflowEvent::SignalReceived {
+            operation_id: None,
+            name,
+            ..
+        } if name == "other"
+    )));
+    assert_eq!(
+        rt.actors.get(&actor_id).unwrap().waiting_signal_operation,
+        Some(operation)
+    );
+}
