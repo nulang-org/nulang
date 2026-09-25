@@ -3992,12 +3992,13 @@ impl Runtime {
                 && !self.is_internal_behavior(actor_id, behavior_idx)
             {
                 let step_name = self.step_name_for(actor_id, behavior_idx);
+                let advance_step_index = self.is_parallel_step(actor_id, behavior_idx);
                 workflow::complete_workflow_step(
                     self,
                     actor_id,
                     workflow_activation,
                     step_name,
-                    self.is_parallel_step(actor_id, behavior_idx),
+                    advance_step_index,
                 );
             }
             let actor = match self.actors.get_mut(&actor_id) {
