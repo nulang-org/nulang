@@ -1572,6 +1572,11 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                     return crate::vm::SignalWaitResult::Ready(crate::vm::Value::unit());
                 }
             }
+            crate::runtime::workflow::begin_workflow_signal_wait(
+                &mut *self.runtime,
+                self.actor_id,
+                name,
+            );
             crate::vm::SignalWaitResult::NotReady
         }
     }
