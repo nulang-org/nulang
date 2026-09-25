@@ -584,22 +584,37 @@ pub(crate) fn append_timer_set(
     actor_id: u64,
     name: &str,
     duration_ms: u64,
-) -> std::io::Result<()> {
+) -> std::io::Result<Option<WorkflowOperationId>> {
+    let operation_id = next_workflow_operation_id(rt, actor_id);
     let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_timer_set(actor_id, seq, name.to_string(), duration_ms)?;
+    rt.persistence.append_workflow_event(
+        actor_id,
+        WorkflowEvent::TimerSet {
+            sequence: seq,
+            operation_id,
+            name: name.to_string(),
+            duration_ms,
+        },
+    )?;
     try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+    Ok(operation_id)
 }
 
 pub(crate) fn append_timer_fired(
     rt: &mut Runtime,
     actor_id: u64,
     name: &str,
+    operation_id: Option<WorkflowOperationId>,
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_timer_fired(actor_id, seq, name.to_string())?;
+    rt.persistence.append_workflow_event(
+        actor_id,
+        WorkflowEvent::TimerFired {
+            sequence: seq,
+            operation_id,
+            name: name.to_string(),
+        },
+    )?;
     try_checkpoint_actor(rt, actor_id)?;
     Ok(())
 }
@@ -709,12 +724,14 @@ pub(crate) fn schedule_workflow_timer(
     name: &str,
     duration_ms: u64,
 ) -> std::io::Result<()> {
-    if actor_is_workflow(rt, actor_id) {
+    let operation_id = if actor_is_workflow(rt, actor_id) {
         // Never arm a live timer if its durable TimerSet/checkpoint failed.
         // Recovery can only reason about timers that were durably recorded.
-        append_timer_set(rt, actor_id, name, duration_ms)?;
-    }
-    rt.rearm_timer(actor_id, name, duration_ms);
+        append_timer_set(rt, actor_id, name, duration_ms)?
+    } else {
+        None
+    };
+    rt.rearm_timer(actor_id, name, duration_ms, operation_id);
     Ok(())
 }
 
