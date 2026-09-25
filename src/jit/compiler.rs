@@ -11,7 +11,7 @@
 //! |----------|---------|
 //! | Special | Nop, Halt, Const0-2, ConstM1 |
 //! | Register | Load, Store, Move, Swap, Dup |
-//! | Integer Arith | IAdd, ISub, IMul, IDiv, IMod, INeg, IInc, IDec |
+//! | Integer Arith | IAdd, ISub, IMul, IDiv, IMod, IInc, IDec |
 //! | Bitwise | Xor, Shl, Shr, BitAnd, BitOr |
 //! | Float Arith | FAdd, FSub, FMul, FDiv, FNeg |
 //! | Compare | ICmp{Eq,Lt,Gt,Le,Ge}, FCmp{Eq,Lt,Gt} |
@@ -58,7 +58,6 @@ pub fn is_opcode_compilable(op: OpCode) -> bool {
             | OpCode::IMul
             | OpCode::IDiv
             | OpCode::IMod
-            | OpCode::INeg
             | OpCode::IInc
             | OpCode::IDec
             | OpCode::IPow
@@ -1089,7 +1088,9 @@ mod tests {
     fn test_is_opcode_compilable_conversion() {
         assert!(is_opcode_compilable(OpCode::IToF));
         assert!(is_opcode_compilable(OpCode::FToI));
-        assert!(is_opcode_compilable(OpCode::INeg));
+        // INeg must remain in the interpreter until JIT runtime-error
+        // propagation can preserve checked overflow/type semantics.
+        assert!(!is_opcode_compilable(OpCode::INeg));
         assert!(is_opcode_compilable(OpCode::IInc));
         assert!(is_opcode_compilable(OpCode::IDec));
     }

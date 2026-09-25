@@ -2802,12 +2802,21 @@ impl TypeChecker {
         let (s, ty) = self.infer_expr(ctx, expr)?;
 
         match op {
-            // Negation: numeric -> numeric
+            // Negation: numeric -> numeric. Reject concrete nonnumeric
+            // operands statically; unresolved inference variables remain
+            // dynamic until a real numeric constraint/typeclass is introduced.
             Neg => {
-                let num_var = Type::Var(TypeVar::fresh());
-                let s2 = mgu(&apply_subst(&ty, &s), &num_var, span)?;
-                let final_subst = compose_subst(&s2, &s);
-                Ok((final_subst.clone(), apply_subst(&num_var, &final_subst)))
+                let resolved = apply_subst(&ty, &s);
+                match resolved {
+                    Type::Primitive(PrimitiveType::Int)
+                    | Type::Primitive(PrimitiveType::Float)
+                    | Type::Var(_) => Ok((s, resolved)),
+                    other => Err(NuError::type_mismatch(
+                        "Int or Float",
+                        format!("{}", other),
+                        span,
+                    )),
+                }
             }
             // Boolean not: Bool -> Bool
             Not => {
@@ -4626,6 +4635,17 @@ mod tests {
         let (s, ty) = tc.infer_expr(&ctx, &expr).unwrap();
         // Negation on Int should give Int
         assert_eq!(apply_subst(&ty, &s), Type::int());
+    }
+
+    #[test]
+    fn test_unary_neg_rejects_known_nonnumeric_operands() {
+        for source in ["-false", "-(1 + 2,)", "-fn(x) { x + 1 }"] {
+            let result = check_src(source);
+            assert!(
+                result.is_err(),
+                "unary negation must reject known nonnumeric operand: {source}"
+            );
+        }
     }
 
     #[test]

@@ -837,6 +837,24 @@ pub(crate) enum DiffOutcome {
 mod tests {
     use super::*;
 
+    #[test]
+    fn differential_unary_negation_preserves_reference_semantics() {
+        // Regression cases from the 2026-09-25 nightly differential-fuzz
+        // failures. These previously diverged because native/JIT INeg fast
+        // paths bypassed runtime type/overflow semantics.
+        for source in [
+            "--(1 + 2,)",
+            "-3 ** -2",
+            "-fn(x) { x + 1 }",
+            "fn pick(b) { if b then 1 else -1 }; pick(true) * pick(-false)",
+        ] {
+            assert!(
+                differential_fuzz_one(source).is_ok(),
+                "backend divergence for unary-negation regression: {source}"
+            );
+        }
+    }
+
     /// Quick differential fuzz: 300 iterations with a fixed seed, part of
     /// the default `cargo test --lib` run. Unlike `fuzz_typechecker_quick`
     /// (lex/parse/typecheck only), each iteration here compiles to
