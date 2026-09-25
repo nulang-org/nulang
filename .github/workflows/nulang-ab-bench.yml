@@ -27,6 +27,7 @@ on:
     paths:
       - '.github/workflows/nulang-ab-bench.yml'
       - 'scripts/nulang_ab_bench.py'
+      - 'scripts/tests/test_nulang_ab_bench.py'
       - 'src/runtime/**'
       - 'src/aot/**'
       - 'src/jit/**'
@@ -52,6 +53,9 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      - name: Test benchmark harness diagnostics
+        run: python3 -m unittest scripts/tests/test_nulang_ab_bench.py
 
       - name: Run same-host A/B
         env:
