@@ -392,6 +392,58 @@ mod tests {
     }
 
     #[test]
+    fn migration_keeps_source_owner_until_epoch_fenced_cutover() {
+        let mut map = CacheSlotMap::new_local(1, 1).unwrap();
+        let slot = redis_slot(b"migrate-me");
+        let source = map.owner_for_slot(slot).unwrap();
+        let target = CacheShardOwner {
+            node_id: 2,
+            shard: 0,
+        };
+
+        map.begin_migration(1, slot, target).unwrap();
+        assert_eq!(map.epoch(), 1);
+        assert_eq!(map.owner_for_slot(slot), Some(source));
+        assert_eq!(
+            map.migration_for_slot(slot),
+            Some(CacheSlotMigration {
+                slot,
+                source,
+                target,
+            })
+        );
+
+        map.finish_migration(2, slot).unwrap();
+        assert_eq!(map.epoch(), 2);
+        assert_eq!(map.owner_for_slot(slot), Some(target));
+        assert_eq!(map.migration_for_slot(slot), None);
+    }
+
+    #[test]
+    fn generic_epoch_update_cannot_overwrite_slot_mid_migration() {
+        let mut map = CacheSlotMap::new_local(1, 1).unwrap();
+        let slot = redis_slot(b"migrate-me");
+        let target = CacheShardOwner {
+            node_id: 2,
+            shard: 0,
+        };
+        map.begin_migration(1, slot, target).unwrap();
+
+        let error = map
+            .apply_epoch(
+                2,
+                &[CacheSlotRange {
+                    start: slot,
+                    end: slot,
+                    owner: target,
+                }],
+            )
+            .unwrap_err();
+        assert_eq!(error, CachePlacementError::MigrationInProgress { slot });
+        assert_eq!(map.epoch(), 1);
+    }
+
+    #[test]
     fn invalid_shard_counts_are_rejected() {
         assert!(matches!(
             CacheSlotMap::new_local(1, 0),
