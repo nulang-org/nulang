@@ -76,8 +76,13 @@ ranking; see the cross-runtime README for the full interpretation constraints.
 `scripts/nulang_ab_bench.py` compares the current checkout against an exact
 base ref on one host. Both variants are built before measurement, runs alternate
 base/candidate order to reduce thermal/load drift bias, and measured processes
-default to the same logical CPU. The report includes each workload's median
-throughput plus candidate-vs-base throughput, latency, and speedup deltas.
+default to the same logical CPU. The report retains each workload's aggregate
+median throughput for compatibility, but optimization evidence is also computed
+from **round-aligned base/candidate pairs**. It reports the median paired
+throughput/latency change, median speedup, and a deterministic percentile-
+bootstrap 95% interval for the paired speedup. Pairing reduces the effect of
+host-load and thermal drift that a ratio of two independent medians cannot
+cancel.
 
 The `Nulang actor A/B benchmarks` workflow uses the pull request's exact base
 SHA rather than a moving branch name. This makes stacked performance PRs

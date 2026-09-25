@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import platform
+import random
 import re
 import shutil
 import statistics
@@ -205,6 +206,109 @@ def comparisons(
     return out
 
 
+def _bootstrap_median_ci(
+    values: list[float],
+    *,
+    iterations: int = 4_000,
+) -> tuple[float, float]:
+    """Deterministic percentile bootstrap CI for a paired median."""
+    if not values:
+        raise ValueError("bootstrap requires at least one value")
+    if len(values) == 1:
+        return values[0], values[0]
+
+    rng = random.Random(0x4E554C41)
+    n = len(values)
+    medians = [
+        statistics.median(values[rng.randrange(n)] for _ in range(n))
+        for _ in range(iterations)
+    ]
+    medians.sort()
+    lower_idx = int(0.025 * (iterations - 1))
+    upper_idx = int(0.975 * (iterations - 1))
+    return medians[lower_idx], medians[upper_idx]
+
+
+def paired_comparisons(
+    samples: dict[str, dict[str, list[dict[str, int]]]]
+) -> dict[str, dict[str, float | int]]:
+    """Compare base/candidate samples from the same measurement round.
+
+    The runner alternates execution order per round, but rows are appended in
+    round order for each variant. Pairing by index therefore cancels a large
+    part of monotonic host/thermal drift that a ratio of independent medians
+    cannot remove.
+    """
+    out: dict[str, dict[str, float | int]] = {}
+    common = set(samples["base"]) & set(samples["candidate"])
+    for name in sorted(common):
+        base_rows = samples["base"][name]
+        candidate_rows = samples["candidate"][name]
+        if not base_rows or not candidate_rows:
+            continue
+        if len(base_rows) != len(candidate_rows):
+            raise RuntimeError(
+                f"{name}: paired sample count changed "
+                f"(base={len(base_rows)}, candidate={len(candidate_rows)})"
+            )
+
+        speedups: list[float] = []
+        throughput_changes: list[float] = []
+        latency_changes: list[float] = []
+        for index, (base, candidate) in enumerate(zip(base_rows, candidate_rows)):
+            if base["messages"] != candidate["messages"]:
+                raise RuntimeError(
+                    f"{name}: operation count changed in pair {index} "
+                    f"(base={base['messages']}, candidate={candidate['messages']})"
+                )
+            base_ns = float(base["elapsed_ns"])
+            candidate_ns = float(candidate["elapsed_ns"])
+            if base_ns <= 0 or candidate_ns <= 0:
+                raise RuntimeError(f"{name}: elapsed_ns must be positive")
+            speedup = base_ns / candidate_ns
+            speedups.append(speedup)
+            throughput_changes.append((speedup - 1.0) * 100.0)
+            latency_changes.append((candidate_ns / base_ns - 1.0) * 100.0)
+
+        lower, upper = _bootstrap_median_ci(speedups)
+        out[name] = {
+            "pairs": len(speedups),
+            "median_speedup_x": statistics.median(speedups),
+            "median_throughput_change_pct": statistics.median(throughput_changes),
+            "median_latency_change_pct": statistics.median(latency_changes),
+            "speedup_ci95_lower": lower,
+            "speedup_ci95_upper": upper,
+        }
+    return out
+
+
+def print_paired_table(
+    paired: dict[str, dict[str, float | int]],
+) -> None:
+    if not paired:
+        return
+
+    print()
+    print("paired round-aligned A/B")
+    print(
+        "benchmark            pairs   median throughput delta   median speedup   95% bootstrap CI"
+    )
+    print(
+        "-------------------  -----   -----------------------   --------------   ----------------"
+    )
+    ordered = [name for name in BENCHMARKS if name in paired]
+    ordered.extend(sorted(name for name in paired if name not in BENCHMARKS))
+    for name in ordered:
+        row = paired[name]
+        print(
+            f"{name:<19}  {int(row['pairs']):>5}   "
+            f"{float(row['median_throughput_change_pct']):>+22.2f}%   "
+            f"{float(row['median_speedup_x']):>13.3f}x   "
+            f"[{float(row['speedup_ci95_lower']):.3f}, "
+            f"{float(row['speedup_ci95_upper']):.3f}]"
+        )
+
+
 def print_table(
     summary: dict[str, dict[str, dict[str, float | int]]],
     compare: dict[str, dict[str, float]],
@@ -326,7 +430,9 @@ def main() -> int:
 
         summary = summarize(samples)
         compare = comparisons(summary)
+        paired = paired_comparisons(samples)
         print_table(summary, compare)
+        print_paired_table(paired)
         print_candidate_only(summary)
 
         allowed = (
@@ -335,8 +441,8 @@ def main() -> int:
             else None
         )
         report = {
-            "schema": 1,
-            "methodology": "same-host same-CPU Nulang base-vs-candidate actor A/B",
+            "schema": 2,
+            "methodology": "same-host same-CPU round-paired Nulang base-vs-candidate actor A/B",
             "base_ref": args.base_ref,
             "base_sha": maybe_output(["git", "rev-parse", "HEAD"], cwd=base),
             "candidate_sha": maybe_output(["git", "rev-parse", "HEAD"]),
@@ -371,6 +477,7 @@ def main() -> int:
             "samples": samples,
             "summary": summary,
             "comparison": compare,
+            "paired_comparison": paired,
         }
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
