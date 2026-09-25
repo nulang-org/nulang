@@ -376,7 +376,11 @@ impl CacheDispatcher {
             node_id: self.local_node_id,
             shard: self.local_shard,
         };
-        let migration = self.placement.migration_for_slot(slot);
+        let migration = if self.placement.has_migrations() {
+            self.placement.migration_for_slot(slot)
+        } else {
+            None
+        };
 
         // ASKING authorizes exactly one command on the importing target while
         // authoritative ownership still points at the source.
