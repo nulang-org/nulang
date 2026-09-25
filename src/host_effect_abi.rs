@@ -363,9 +363,9 @@ pub fn lookup_host_operation_by_identity(
 /// Build the compiler-owned external ABI descriptor consumed by conformance
 /// tooling and, eventually, Cloud admission/runtime adapters.
 ///
-/// The descriptor intentionally omits source operation spellings such as
-/// `Storage.write`. Consumers receive only canonical host identity plus the
-/// compiler-produced request/response/authority/replay contract.
+/// The descriptor includes source identity as structured `effect` / `operation`
+/// fields so compatibility adapters can be generated without duplicating the
+/// compiler's mapping. Canonical host identity remains the execution contract.
 pub fn host_effect_abi_descriptor() -> Result<serde_json::Value, serde_json::Error> {
     let mut operations = Vec::with_capacity(HOST_OPERATIONS.len());
 
@@ -392,6 +392,10 @@ pub fn host_effect_abi_descriptor() -> Result<serde_json::Value, serde_json::Err
 
         operations.push(serde_json::json!({
             "canonical_id": operation.canonical_id(),
+            "source": {
+                "effect": operation.source_effect,
+                "operation": operation.source_operation
+            },
             "effect_id": operation.effect_id,
             "operation_id": operation.operation_id,
             "request": {
@@ -532,6 +536,20 @@ mod tests {
             HostReplayClass::ExternalNonreplayable.manifest_class(),
             "external-nonreplayable"
         );
+    }
+
+    #[test]
+    fn test_descriptor_exposes_source_operation_for_cloud_codegen() {
+        let descriptor = host_effect_abi_descriptor().unwrap();
+        let operations = descriptor["operations"].as_array().unwrap();
+
+        for operation in operations {
+            let source = operation["source"].as_object().expect(
+                "host-effect descriptor must expose compiler-owned source identity",
+            );
+            assert!(source["effect"].as_str().is_some());
+            assert!(source["operation"].as_str().is_some());
+        }
     }
 
     #[test]
