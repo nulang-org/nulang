@@ -7,12 +7,16 @@
 //! into a deterministic placement plan that can be persisted, validated, fenced,
 //! and then committed by a higher-level reconciler.
 
+pub mod event_loop;
 pub mod executor;
 pub mod model;
 pub mod reconciler;
 pub mod scheduler;
 pub mod store;
 
+pub use event_loop::{
+    EnqueueOutcome, ReconcileLoop, ReconcileLoopError, ReconcileRequest, ReconcileTurn,
+};
 pub use executor::{
     execute_pending_for_node, AllocationRuntime, ExecutionReport, ExecutorError,
     NodeAllocationObservation, NodeAllocationStatus,
