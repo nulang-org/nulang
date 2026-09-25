@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+use crate::runtime::WorkflowOperationId;
 use crate::vm::Value;
 
 /// Unique identifier for a timer.
@@ -32,6 +33,10 @@ pub enum TimerMessage {
         behavior_id: u16,
         payload: Vec<Value>,
         context: String,
+        /// Stable workflow operation identity carried from durable TimerSet
+        /// through live delivery and recovery re-arm. Generic actor timers use
+        /// `None`.
+        operation_id: Option<WorkflowOperationId>,
     },
     /// Exit the target actor with a reason.
     Exit { reason: String },
@@ -181,6 +186,27 @@ impl TimerWheel {
         payload: Vec<Value>,
         context: String,
     ) -> TimerId {
+        self.send_after_with_operation_context(
+            delay,
+            target_actor,
+            behavior_id,
+            payload,
+            context,
+            None,
+        )
+    }
+
+    /// Schedule a workflow timer while preserving its replay-stable operation
+    /// identity through the in-memory timer wheel.
+    pub fn send_after_with_operation_context(
+        &self,
+        delay: Duration,
+        target_actor: u64,
+        behavior_id: u16,
+        payload: Vec<Value>,
+        context: String,
+        operation_id: Option<WorkflowOperationId>,
+    ) -> TimerId {
         let id = TimerId(self.next_id.fetch_add(1, Ordering::SeqCst));
         let fire_at = Instant::now() + delay;
 
@@ -191,6 +217,7 @@ impl TimerWheel {
                 behavior_id,
                 payload,
                 context,
+                operation_id,
             },
             fire_at,
             cancelled: AtomicBool::new(false),
