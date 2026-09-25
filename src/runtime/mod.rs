@@ -14,8 +14,8 @@ mod actor;
 mod blocking_executor;
 pub mod cache;
 pub mod cache_cluster;
-pub mod cache_persistence;
 pub mod cache_dispatch;
+pub mod cache_persistence;
 pub mod cache_pipeline;
 pub mod cache_routing;
 #[cfg(feature = "cache-server")]
@@ -95,8 +95,8 @@ pub use actor::*;
 pub use blocking_executor::*;
 pub use cache::*;
 pub use cache_cluster::*;
-pub use cache_persistence::*;
 pub use cache_dispatch::*;
+pub use cache_persistence::*;
 pub use cache_pipeline::*;
 pub use cache_routing::*;
 #[cfg(feature = "cache-server")]
