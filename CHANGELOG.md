@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Fail-closed WASM workflow admission — 2026-09-25
+- **The canonical WASM backend now rejects workflow declarations until durable workflow semantics are implemented there.** Previously simple workflows could compile to WASM even though the backend did not provide the bytecode runtime's durable step journal, signal suspension/resume, crash recovery, or saga compensation; only individual unsupported operations such as `Signal.wait` failed loudly.
+- **This is an integrity gate, not a workflow deprecation.** Bytecode/native workflows remain available while WASM parity is implemented, and Cloud admission can no longer mistake partial actor emulation for durable workflow execution.
+
 ### Native JIT codegen backend boundary — 2026-09-24
 - **`JitSession` no longer owns Cranelift modules or reusable Cranelift contexts.** `src/jit/native_codegen.rs` introduces `NativeCodegenBackend`, `NativeCompileRequest`, and specialization requests for scalar, typed, and SIMD lowering.
 - **`CraneliftCodegen` now exclusively owns both compiler tiers.** Fast code still uses `opt_level=none` + single-pass register allocation, optimized code still uses `opt_level=speed` + backtracking, but tier/cache orchestration only sees native entry pointers and compile success/failure.
