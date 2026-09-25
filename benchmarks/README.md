@@ -89,10 +89,20 @@ core VM/JIT/AOT/actor runtime from unrelated optional integrations. Longer
 manual runs can use the default feature set when production-profile validation
 is needed.
 
-Nulang-only A/B probes include a 0/1/4/5/16-value enqueue sweep around the
-small-message inline boundary and an AOT actor-drain workload for native
-dispatch changes. They are emitted as `[ab-bench]` records and are never
-folded into the cross-language Rust/Go/Erlang comparison.
+Nulang-only A/B probes include a mailbox-only one-value admission lower bound,
+a 0/1/4/5/16-value runtime enqueue sweep around the small-message inline
+boundary, a matched warmed-bytecode/JIT vs AOT actor-drain comparison over the
+same actor source, and first-run JIT-vs-interpreter crossover probes at 3k, 4k,
+5k, and 7.5k loop trips. The actor comparison warms bytecode past the tier-up
+threshold before timing and excludes enqueue time for both backends; it also
+emits a `[backend-bench]` AOT speedup line. The tiering probes preconstruct
+fresh VMs so their timed sections include interpreter execution and JIT
+compilation/native execution, but not source compilation or VM/module setup.
+The mailbox-vs-runtime pair is diagnostic: it isolates how much local-send cost
+lives above message construction and mailbox admission before routing or
+scheduler changes are attempted. The ordinary Nulang-only timings are emitted
+as `[ab-bench]` records and are never folded into the cross-language
+Rust/Go/Erlang comparison.
 
 ## Interpretation rules
 
@@ -106,6 +116,13 @@ Examples:
   execution for messages already queued in setup.
 - `actor/lifecycle_spawn_send_receive_gc` is an end-to-end lifecycle cost and
   is intentionally not a message-throughput benchmark.
+- `gc/orca_throughput` exercises admitted primitive actor traffic plus the
+  runtime's GC cadence; primitive values do not create ORCA foreign-reference
+  bookkeeping.
+- `gc/orca_foreign_ref_send/256` measures real local cross-actor pointer-send
+  bookkeeping (message admission, foreign-count bump, coordinator submission,
+  cycle-edge registration, and ready publication), excluding handler execution
+  and pending-op draining.
 - `dist/crdt_delta_compute` and `dist/gossip_membership_merge_4` are local
   algorithmic microbenchmarks, not network synchronization/convergence.
 - `dist/nul0_actor_message_{encode,decode}/*` measures wire codec work only,

@@ -22,7 +22,9 @@ use std::time::Instant;
 
 use crate::lexer::Lexer;
 use crate::parser::Parser;
-use crate::runtime::{Runtime, RuntimeVmCallbacks};
+use crate::runtime::{
+    Mailbox, Message, MessagePayload, MessagePriority, Runtime, RuntimeVmCallbacks,
+};
 use crate::typechecker::TypeChecker;
 use crate::vm::{Value, VM};
 
@@ -72,6 +74,38 @@ fn report_ab(name: &str, operations: u64, elapsed: std::time::Duration) {
 }
 
 fn ab_noop_handler(_actor: &mut crate::runtime::Actor, _args: &[Value]) {}
+
+/// Lower-bound local mailbox admission probe for one inline primitive value.
+///
+/// This intentionally bypasses actor lookup, routing/grain checks, ORCA
+/// pointer handling, ready-state publication, and receive-wait wake logic.
+/// Comparing it with `enqueue_payload_1` on the same host quantifies how much
+/// of local-send cost lives above the mailbox itself before changing runtime
+/// semantics.
+#[test]
+fn bench_ab_mailbox_push_inline_1() {
+    const N: usize = 100_000;
+
+    let mut mailbox = Mailbox::new(0);
+    let payload = [Value::int(1)];
+
+    let start = Instant::now();
+    for _ in 0..N {
+        mailbox
+            .push_local(Message {
+                behavior_id: 0,
+                payload: MessagePayload::from_slice(&payload),
+                sender: 0,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            })
+            .expect("unbounded benchmark mailbox must admit message");
+    }
+    let elapsed = start.elapsed();
+
+    assert_eq!(mailbox.len(), N, "mailbox probe must admit every message");
+    report_ab("mailbox_push_inline_1", N as u64, elapsed);
+}
 
 /// Local enqueue hot-path sweep around the inline-payload boundary.
 ///
@@ -126,9 +160,76 @@ fn bench_ab_enqueue_payload_sweep() {
 
 #[cfg(feature = "native-codegen")]
 #[test]
+fn bench_ab_jit_tiering_crossover() {
+    const REPEATS: usize = 20;
+
+    for trips in [3_000usize, 4_000, 5_000, 7_500] {
+        let source = format!(
+            "var sum = 0; var i = 0; while i < {trips} {{ sum = sum + i * 3 - i / 7; i = i + 1; }}; sum"
+        );
+        let tokens = Lexer::new(&source).lex().expect("bench: lex failed");
+        let ast = Parser::new(tokens)
+            .parse_module()
+            .expect("bench: parse failed");
+        let mut tc = TypeChecker::new();
+        tc.check_module(&ast).expect("bench: typecheck failed");
+        let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+        let mut mir = crate::mir_lower::lower_module(&hir).expect("bench: MIR lower failed");
+        let module = crate::mir_codegen::compile_mir(&mut mir, "bench-ab-tiering")
+            .expect("bench: codegen failed");
+
+        let mut interp_vms: Vec<VM> = (0..REPEATS)
+            .map(|_| {
+                let mut vm = VM::new_without_jit();
+                vm.load_module(module.clone());
+                vm
+            })
+            .collect();
+        let interp_start = Instant::now();
+        let mut interp_result = None;
+        for vm in &mut interp_vms {
+            interp_result = Some(vm.run().expect("bench: interpreter run failed"));
+        }
+        let interp_elapsed = interp_start.elapsed();
+
+        let mut jit_vms: Vec<VM> = (0..REPEATS)
+            .map(|_| {
+                let mut vm = VM::new();
+                vm.load_module(module.clone());
+                vm
+            })
+            .collect();
+        let jit_start = Instant::now();
+        let mut jit_result = None;
+        for vm in &mut jit_vms {
+            jit_result = Some(vm.run().expect("bench: first-run JIT failed"));
+        }
+        let jit_elapsed = jit_start.elapsed();
+
+        assert_eq!(
+            interp_result.and_then(|value| value.as_int()),
+            jit_result.and_then(|value| value.as_int()),
+            "tiering crossover probe must preserve interpreter/JIT parity"
+        );
+        report_ab(
+            &format!("tier_interp_{trips}"),
+            REPEATS as u64,
+            interp_elapsed,
+        );
+        report_ab(
+            &format!("tier_jit_first_{trips}"),
+            REPEATS as u64,
+            jit_elapsed,
+        );
+    }
+}
+
+#[cfg(feature = "native-codegen")]
+#[test]
 fn bench_ab_aot_actor_drain() {
     use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
 
+    const WARMUP: usize = 2_000;
     const N: usize = 50_000;
     let source = r#"
         actor Counter {
@@ -162,39 +263,89 @@ fn bench_ab_aot_actor_drain() {
     let code =
         crate::mir_codegen::compile_mir(&mut mir, "bench-ab-aot").expect("bench: codegen failed");
 
-    let mut rt = Runtime::new();
-    rt.register_aot_module(aot);
-    let actor_id = rt
+    // Matched bytecode/JIT path. Warm past the current tier-up threshold so
+    // the timed drain represents steady-state tiered execution rather than
+    // first-run compilation cost. Enqueue remains outside the timed region,
+    // matching the AOT measurement below.
+    let mut bytecode_rt = Runtime::new();
+    let bytecode_actor = bytecode_rt
         .spawn_from_module(&code, 0, Vec::new())
         .as_actor_id()
-        .expect("bench: actor spawn failed");
-
-    // One untimed delivery verifies native wiring and warms the dispatch path.
-    rt.send_message_by_id(actor_id, 0, &[Value::int(1)]);
-    rt.run_scheduler();
-    rt.actors
-        .get_mut(&actor_id)
-        .expect("actor live after warmup")
+        .expect("bench: bytecode actor spawn failed");
+    for _ in 0..WARMUP {
+        bytecode_rt.send_message_by_id(bytecode_actor, 0, &[Value::int(1)]);
+    }
+    bytecode_rt.run_scheduler();
+    bytecode_rt
+        .actors
+        .get_mut(&bytecode_actor)
+        .expect("bytecode actor live after warmup")
         .set_state_field("total", Value::int(0));
 
     for _ in 0..N {
-        rt.send_message_by_id(actor_id, 0, &[Value::int(1)]);
+        bytecode_rt.send_message_by_id(bytecode_actor, 0, &[Value::int(1)]);
     }
-    let start = Instant::now();
-    rt.run_scheduler();
-    let elapsed = start.elapsed();
+    let bytecode_start = Instant::now();
+    bytecode_rt.run_scheduler();
+    let bytecode_elapsed = bytecode_start.elapsed();
 
-    let total = rt
+    let bytecode_total = bytecode_rt
         .actors
-        .get(&actor_id)
+        .get(&bytecode_actor)
         .and_then(|actor| actor.get_state_field("total"))
         .and_then(|value| value.as_int());
     assert_eq!(
-        total,
+        bytecode_total,
+        Some(N as i64),
+        "warmed bytecode/JIT actor must process every message"
+    );
+    report_ab("bytecode_actor_drain_warm", N as u64, bytecode_elapsed);
+
+    // AOT path over the exact same source and bytecode companion module.
+    let mut aot_rt = Runtime::new();
+    aot_rt.register_aot_module(aot);
+    let aot_actor = aot_rt
+        .spawn_from_module(&code, 0, Vec::new())
+        .as_actor_id()
+        .expect("bench: AOT actor spawn failed");
+
+    // One untimed delivery verifies native wiring and warms non-codegen
+    // runtime state; AOT itself has no tier-up phase.
+    aot_rt.send_message_by_id(aot_actor, 0, &[Value::int(1)]);
+    aot_rt.run_scheduler();
+    aot_rt
+        .actors
+        .get_mut(&aot_actor)
+        .expect("AOT actor live after warmup")
+        .set_state_field("total", Value::int(0));
+
+    for _ in 0..N {
+        aot_rt.send_message_by_id(aot_actor, 0, &[Value::int(1)]);
+    }
+    let aot_start = Instant::now();
+    aot_rt.run_scheduler();
+    let aot_elapsed = aot_start.elapsed();
+
+    let aot_total = aot_rt
+        .actors
+        .get(&aot_actor)
+        .and_then(|actor| actor.get_state_field("total"))
+        .and_then(|value| value.as_int());
+    assert_eq!(
+        aot_total,
         Some(N as i64),
         "AOT actor must process every message"
     );
-    report_ab("aot_actor_drain", N as u64, elapsed);
+    report_ab("aot_actor_drain", N as u64, aot_elapsed);
+
+    let bytecode_ns = bytecode_elapsed.as_nanos() as f64;
+    let aot_ns = aot_elapsed.as_nanos() as f64;
+    println!(
+        "[backend-bench] workload=actor_drain messages={N} bytecode_jit_ns={} aot_ns={} aot_speedup_x={:.3}",
+        bytecode_elapsed.as_nanos(),
+        aot_elapsed.as_nanos(),
+        bytecode_ns / aot_ns
+    );
 }
 
 /// Counting: one actor, main thread floods it with N messages.
