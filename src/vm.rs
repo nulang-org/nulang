@@ -3,7 +3,7 @@
 //! ## Architecture
 //!
 //! - **256 general-purpose registers** per activation frame
-//! - **NaN-boxing** for efficient tagged values (int/float/bool/nil/actor_ref)
+//! - **Canonical 64-bit tagged words** for values (16-bit tag + 48-bit payload; raw IEEE-754 bits for floats)
 //! - **Bytecode modules** with constant pools and function tables
 //! - **Algebraic effects** via handler stack (Perform/Resume/Unwind/Handle)
 //!
@@ -20,9 +20,9 @@
 //!
 //! ## Value Representation
 //!
-//! Uses NaN boxing: all non-float values are encoded in the quiet-NaN
-//! payload of an f64. This gives us 51 bits of payload space for
-//! pointers, integers, and type tags.
+//! Uses the canonical i64/u64 tagged-word ABI from `value_layout`: tagged values use
+//! a 16-bit tag and 48-bit payload, while floats retain raw IEEE-754 bits with
+//! NaNs canonicalized to a reserved non-tag pattern.
 
 use std::ffi::{c_char, CStr, CString};
 
