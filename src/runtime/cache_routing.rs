@@ -68,6 +68,7 @@ pub struct CacheSlotMap {
     epoch: u64,
     owners: Vec<CacheShardOwner>,
     migration_targets: Vec<Option<CacheShardOwner>>,
+    migration_count: usize,
 }
 
 impl CacheSlotMap {
@@ -92,12 +93,18 @@ impl CacheSlotMap {
         Ok(Self {
             epoch: 0,
             migration_targets: vec![None; REDIS_CLUSTER_SLOTS as usize],
+            migration_count: 0,
             owners,
         })
     }
 
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    #[inline]
+    pub fn has_migrations(&self) -> bool {
+        self.migration_count != 0
     }
 
     pub fn owner_for_slot(&self, slot: u16) -> Option<CacheShardOwner> {
@@ -149,6 +156,7 @@ impl CacheSlotMap {
         }
 
         *target_slot = Some(target);
+        self.migration_count += 1;
         self.epoch = proposed_epoch;
         Ok(())
     }
@@ -178,6 +186,7 @@ impl CacheSlotMap {
 
         *owner = target;
         self.migration_targets[slot as usize] = None;
+        self.migration_count = self.migration_count.saturating_sub(1);
         self.epoch = proposed_epoch;
         Ok(())
     }
@@ -492,6 +501,12 @@ mod tests {
         assert_eq!(map.epoch(), 0);
         assert_eq!(map.owner_for_slot(10), before_10);
         assert_eq!(map.owner_for_slot(12), before_12);
+    }
+
+    #[test]
+    fn stable_placement_fast_path_reports_no_migrations() {
+        let map = CacheSlotMap::new_local(1, 4).unwrap();
+        assert!(!map.has_migrations());
     }
 
     #[test]
