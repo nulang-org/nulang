@@ -1158,6 +1158,24 @@ impl Runtime {
         workflow::next_workflow_operation_id(self, actor_id)
     }
 
+    /// Allocate the next workflow operation identity and derive the stable
+    /// durable-effect id for that exact replay position.
+    ///
+    /// Returns `None` outside an activation-aware workflow turn.
+    pub fn next_workflow_durable_effect_id(
+        &mut self,
+        actor_id: u64,
+        effect_operation: &str,
+    ) -> Option<crate::durable_effect::DurableEffectId> {
+        let operation = workflow::next_workflow_operation_id(self, actor_id)?;
+        Some(
+            crate::durable_effect::DurableEffectId::derive_from_workflow_operation(
+                operation,
+                effect_operation,
+            ),
+        )
+    }
+
     /// Register a read-only query handler on a workflow actor.
     ///
     /// The handler is a function/closure value invoked by `query_workflow`
