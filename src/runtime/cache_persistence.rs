@@ -9,8 +9,8 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::cache::{
-    CacheConfig, CacheEvictionPolicy, CacheSnapshotEntry, CacheSnapshotValue, CacheStore,
-    CacheWriteError,
+    CacheConfig, CacheEvictionPolicy, CacheIncrementError, CacheSnapshotEntry, CacheSnapshotValue,
+    CacheStore, CacheTtl, CacheWriteError,
 };
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"NLCACH01";
@@ -24,6 +24,43 @@ const MAX_WAL_RECORD_BYTES: usize = 128 * 1024 * 1024;
 pub enum CacheWalSync {
     Buffered,
     Data,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheDurabilityMode {
+    Memory,
+    BufferedJournal,
+    SyncedJournal,
+}
+
+#[derive(Debug)]
+pub enum CacheDurabilityError {
+    Store(CacheWriteError),
+    Increment(CacheIncrementError),
+    Persistence(io::Error),
+    Poisoned,
+    InvalidMode(&'static str),
+}
+
+impl std::fmt::Display for CacheDurabilityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Store(error) => write!(formatter, "cache mutation rejected: {error:?}"),
+            Self::Increment(error) => write!(formatter, "cache increment rejected: {error:?}"),
+            Self::Persistence(error) => write!(formatter, "cache persistence failed: {error}"),
+            Self::Poisoned => write!(formatter, "cache durability layer is poisoned"),
+            Self::InvalidMode(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for CacheDurabilityError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Persistence(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +81,9 @@ pub enum CacheWalMutation {
     ExpireAt {
         key: Vec<u8>,
         expires_unix_ms: u64,
+    },
+    Batch {
+        mutations: Vec<CacheWalMutation>,
     },
 }
 
@@ -67,6 +107,262 @@ pub struct CacheWal {
     file: File,
     base_sequence: u64,
     last_sequence: u64,
+}
+
+#[derive(Debug)]
+pub struct DurableCacheStore {
+    store: CacheStore,
+    wal: Option<CacheWal>,
+    mode: CacheDurabilityMode,
+    poisoned: bool,
+}
+
+impl DurableCacheStore {
+    pub fn memory(store: CacheStore) -> Self {
+        Self {
+            store,
+            wal: None,
+            mode: CacheDurabilityMode::Memory,
+            poisoned: false,
+        }
+    }
+
+    pub fn with_wal(
+        store: CacheStore,
+        wal: CacheWal,
+        mode: CacheDurabilityMode,
+    ) -> Result<Self, CacheDurabilityError> {
+        if mode == CacheDurabilityMode::Memory {
+            return Err(CacheDurabilityError::InvalidMode(
+                "memory durability must use DurableCacheStore::memory",
+            ));
+        }
+        Ok(Self {
+            store,
+            wal: Some(wal),
+            mode,
+            poisoned: false,
+        })
+    }
+
+    pub fn store(&self) -> &CacheStore {
+        &self.store
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    pub fn durability_mode(&self) -> CacheDurabilityMode {
+        self.mode
+    }
+
+    pub fn set_bytes(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        ttl_ms: Option<u64>,
+        store_now_ms: u64,
+        wall_now_ms: u64,
+    ) -> Result<(), CacheDurabilityError> {
+        self.ensure_healthy()?;
+        self.store
+            .try_set_bytes(key, value, ttl_ms, store_now_ms)
+            .map_err(CacheDurabilityError::Store)?;
+        self.record(CacheWalMutation::SetBytes {
+            key: key.to_vec(),
+            value: value.to_vec(),
+            expires_unix_ms: ttl_ms.map(|ttl| wall_now_ms.saturating_add(ttl)),
+        })
+    }
+
+    pub fn set_integer(
+        &mut self,
+        key: &[u8],
+        value: i64,
+        ttl_ms: Option<u64>,
+        store_now_ms: u64,
+        wall_now_ms: u64,
+    ) -> Result<(), CacheDurabilityError> {
+        self.ensure_healthy()?;
+        self.store
+            .try_set_integer(key, value, ttl_ms, store_now_ms)
+            .map_err(CacheDurabilityError::Store)?;
+        self.record(CacheWalMutation::SetInteger {
+            key: key.to_vec(),
+            value,
+            expires_unix_ms: ttl_ms.map(|ttl| wall_now_ms.saturating_add(ttl)),
+        })
+    }
+
+    pub fn set_many_bytes(
+        &mut self,
+        pairs: &[(&[u8], &[u8])],
+        store_now_ms: u64,
+        wall_now_ms: u64,
+    ) -> Result<(), CacheDurabilityError> {
+        self.ensure_healthy()?;
+        self.store
+            .try_set_many_bytes(pairs, None, store_now_ms)
+            .map_err(CacheDurabilityError::Store)?;
+        let mutations = pairs
+            .iter()
+            .map(|(key, value)| CacheWalMutation::SetBytes {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                expires_unix_ms: None,
+            })
+            .collect();
+        let _ = wall_now_ms;
+        self.record(CacheWalMutation::Batch { mutations })
+    }
+
+    pub fn delete_at(
+        &mut self,
+        key: &[u8],
+        store_now_ms: u64,
+    ) -> Result<bool, CacheDurabilityError> {
+        self.ensure_healthy()?;
+        let removed = self.store.delete_at(key, store_now_ms);
+        if removed {
+            self.record(CacheWalMutation::Delete { key: key.to_vec() })?;
+        }
+        Ok(removed)
+    }
+
+    pub fn delete_many_at(
+        &mut self,
+        keys: &[&[u8]],
+        store_now_ms: u64,
+    ) -> Result<usize, CacheDurabilityError> {
+        self.ensure_healthy()?;
+        let mut mutations = Vec::new();
+        for key in keys {
+            if self.store.delete_at(key, store_now_ms) {
+                mutations.push(CacheWalMutation::Delete {
+                    key: key.to_vec(),
+                });
+            }
+        }
+        let deleted = mutations.len();
+        if deleted != 0 {
+            self.record(CacheWalMutation::Batch { mutations })?;
+        }
+        Ok(deleted)
+    }
+
+    pub fn expire_ms(
+        &mut self,
+        key: &[u8],
+        ttl_ms: u64,
+        store_now_ms: u64,
+        wall_now_ms: u64,
+    ) -> Result<bool, CacheDurabilityError> {
+        self.ensure_healthy()?;
+        let changed = self.store.expire_ms(key, ttl_ms, store_now_ms);
+        if changed {
+            if ttl_ms == 0 {
+                self.record(CacheWalMutation::Delete { key: key.to_vec() })?;
+            } else {
+                self.record(CacheWalMutation::ExpireAt {
+                    key: key.to_vec(),
+                    expires_unix_ms: wall_now_ms.saturating_add(ttl_ms),
+                })?;
+            }
+        }
+        Ok(changed)
+    }
+
+    pub fn increment(
+        &mut self,
+        key: &[u8],
+        delta: i64,
+        store_now_ms: u64,
+        wall_now_ms: u64,
+    ) -> Result<i64, CacheDurabilityError> {
+        self.ensure_healthy()?;
+        let value = self
+            .store
+            .increment(key, delta, store_now_ms)
+            .map_err(CacheDurabilityError::Increment)?;
+        let expires_unix_ms = match self.store.ttl(key, store_now_ms) {
+            CacheTtl::Persistent => None,
+            CacheTtl::RemainingMs(remaining) => Some(wall_now_ms.saturating_add(remaining)),
+            CacheTtl::Missing => {
+                return Err(CacheDurabilityError::InvalidMode(
+                    "increment succeeded but cache entry disappeared before journaling",
+                ));
+            }
+        };
+        self.record(CacheWalMutation::SetInteger {
+            key: key.to_vec(),
+            value,
+            expires_unix_ms,
+        })?;
+        Ok(value)
+    }
+
+    pub fn snapshot_and_rotate(
+        &mut self,
+        snapshot_path: impl AsRef<Path>,
+        store_now_ms: u64,
+        wall_now_ms: u64,
+    ) -> Result<u64, CacheDurabilityError> {
+        self.ensure_healthy()?;
+        let Some(wal) = self.wal.as_ref() else {
+            return Err(CacheDurabilityError::InvalidMode(
+                "snapshot/WAL rotation requires a journaled durability mode",
+            ));
+        };
+        let sequence = wal.last_sequence();
+        let wal_path = wal.path().to_path_buf();
+
+        write_cache_snapshot(
+            snapshot_path,
+            &self.store,
+            sequence,
+            store_now_ms,
+            wall_now_ms,
+        )
+        .map_err(CacheDurabilityError::Persistence)?;
+
+        let rotated =
+            CacheWal::create_after(&wal_path, sequence).map_err(CacheDurabilityError::Persistence)?;
+        self.wal = Some(rotated);
+        Ok(sequence)
+    }
+
+    fn ensure_healthy(&self) -> Result<(), CacheDurabilityError> {
+        if self.poisoned {
+            Err(CacheDurabilityError::Poisoned)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn record(&mut self, mutation: CacheWalMutation) -> Result<(), CacheDurabilityError> {
+        let sync = match self.mode {
+            CacheDurabilityMode::Memory => return Ok(()),
+            CacheDurabilityMode::BufferedJournal => CacheWalSync::Buffered,
+            CacheDurabilityMode::SyncedJournal => CacheWalSync::Data,
+        };
+
+        let result = self
+            .wal
+            .as_mut()
+            .ok_or(CacheDurabilityError::InvalidMode(
+                "journaled durability mode has no WAL",
+            ))
+            .and_then(|wal| {
+                wal.append(&mutation, sync)
+                    .map(|_| ())
+                    .map_err(CacheDurabilityError::Persistence)
+            });
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
 }
 
 impl CacheWal {
@@ -306,6 +602,12 @@ pub fn apply_wal_mutation(
             }
             Ok(())
         }
+        CacheWalMutation::Batch { mutations } => {
+            for mutation in mutations {
+                apply_wal_mutation(store, mutation, store_now_ms, wall_now_ms)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -529,6 +831,20 @@ fn encode_mutation(mutation: &CacheWalMutation) -> io::Result<Vec<u8>> {
             encode_bytes(&mut bytes, key)?;
             bytes.extend_from_slice(&expires_unix_ms.to_le_bytes());
         }
+        CacheWalMutation::Batch { mutations } => {
+            bytes.push(4);
+            let count = u32::try_from(mutations.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cache WAL batch mutation count exceeds u32",
+                )
+            })?;
+            bytes.extend_from_slice(&count.to_le_bytes());
+            for mutation in mutations {
+                let encoded = encode_mutation(mutation)?;
+                encode_bytes(&mut bytes, &encoded)?;
+            }
+        }
     }
     Ok(bytes)
 }
@@ -553,6 +869,15 @@ fn decode_mutation(bytes: &[u8]) -> io::Result<CacheWalMutation> {
             key: decoder.bytes()?,
             expires_unix_ms: decoder.u64()?,
         },
+        4 => {
+            let count = decoder.u32()? as usize;
+            let mut mutations = Vec::with_capacity(count);
+            for _ in 0..count {
+                let encoded = decoder.bytes()?;
+                mutations.push(decode_mutation(&encoded)?);
+            }
+            CacheWalMutation::Batch { mutations }
+        }
         _ => return Err(invalid_data("invalid cache WAL mutation tag")),
     };
     decoder.finish()?;
@@ -715,6 +1040,98 @@ mod tests {
             "nulang-cache-{name}-{}-{id}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn durable_store_journals_mutations_and_rotates_after_snapshot() {
+        let snapshot = test_path("durable-snapshot");
+        let wal_path = test_path("durable-wal");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let mut durable = DurableCacheStore::with_wal(
+            CacheStore::new(),
+            wal,
+            CacheDurabilityMode::SyncedJournal,
+        )
+        .unwrap();
+
+        durable
+            .set_bytes(b"a", b"one", Some(10_000), 0, 1_000)
+            .unwrap();
+        durable
+            .set_many_bytes(&[(b"b".as_slice(), b"two".as_slice())], 0, 1_000)
+            .unwrap();
+        assert_eq!(durable.increment(b"n", 1, 0, 1_000).unwrap(), 1);
+
+        let snapshot_sequence = durable
+            .snapshot_and_rotate(&snapshot, 0, 1_000)
+            .unwrap();
+        assert_eq!(snapshot_sequence, 3);
+
+        durable.delete_at(b"b", 0).unwrap();
+        drop(durable);
+
+        let (mut recovered, report) = recover_cache(
+            &snapshot,
+            &wal_path,
+            CacheConfig::default(),
+            CacheEvictionPolicy::S3Fifo,
+            100,
+            2_000,
+        )
+        .unwrap();
+        assert_eq!(report.snapshot_sequence, 3);
+        assert_eq!(report.wal_base_sequence, 3);
+        assert_eq!(report.wal_last_sequence, 4);
+        assert_eq!(report.replayed_records, 1);
+        assert_eq!(
+            recovered.get(b"a", 100),
+            Some(CacheValueView::Bytes(b"one"))
+        );
+        assert_eq!(recovered.get(b"b", 100), None);
+        assert_eq!(recovered.get(b"n", 100), Some(CacheValueView::Integer(1)));
+
+        let _ = fs::remove_file(snapshot);
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn journal_failure_poisons_durable_store() {
+        let wal_path = test_path("poison-wal");
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let mut durable = DurableCacheStore::with_wal(
+            CacheStore::new(),
+            wal,
+            CacheDurabilityMode::SyncedJournal,
+        )
+        .unwrap();
+
+        let readonly = OpenOptions::new().read(true).open(&wal_path).unwrap();
+        durable.wal.as_mut().unwrap().file = readonly;
+
+        let first = durable.set_integer(b"k", 1, None, 0, 0);
+        assert!(matches!(first, Err(CacheDurabilityError::Persistence(_))));
+        assert!(durable.is_poisoned());
+
+        let second = durable.set_integer(b"k2", 2, None, 0, 0);
+        assert!(matches!(second, Err(CacheDurabilityError::Poisoned)));
+
+        let _ = fs::remove_file(wal_path);
+    }
+
+    #[test]
+    fn batch_wal_round_trip_preserves_atomic_record_boundary() {
+        let mutation = CacheWalMutation::Batch {
+            mutations: vec![
+                CacheWalMutation::SetBytes {
+                    key: b"a".to_vec(),
+                    value: b"1".to_vec(),
+                    expires_unix_ms: None,
+                },
+                CacheWalMutation::Delete { key: b"b".to_vec() },
+            ],
+        };
+        let encoded = encode_mutation(&mutation).unwrap();
+        assert_eq!(decode_mutation(&encoded).unwrap(), mutation);
     }
 
     #[test]
