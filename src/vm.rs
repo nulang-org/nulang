@@ -2462,13 +2462,6 @@ fn compute_jit_candidate_pcs(module: &CodeModule) -> Vec<bool> {
     for info in &module.debug_functions {
         mark(info.code_offset);
     }
-    // Statement starts are cheap compiler-provided region boundaries and also
-    // cover less-common control-flow constructs whose jump tables are not
-    // decoded here (for example Switch).
-    for &(pc, _) in &module.line_table {
-        mark(pc);
-    }
-
     for (pc, instr) in module.instructions.iter().enumerate() {
         let next = pc + 1;
         match instr.opcode {
