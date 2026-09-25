@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Differential oracle fail-closed — 2026-09-25
+- **Cross-backend differential campaigns no longer whitelist 48-bit overflow mismatches as a known divergence class** (`src/difffuzz.rs`, `src/bin/nula_difffuzz.rs`). Once a backend accepts a program, any VM/JIT/native/WASM disagreement is an ordinary fatal divergence, is written to the main crasher directory, and makes the standalone campaign exit nonzero.
+- **Historical overflow crashers remain provenance, not policy.** The differential-fuzzing documentation now distinguishes the August 2026 bring-up findings from the current fail-closed oracle.
+
 ### Native JIT codegen backend boundary — 2026-09-24
 - **`JitSession` no longer owns Cranelift modules or reusable Cranelift contexts.** `src/jit/native_codegen.rs` introduces `NativeCodegenBackend`, `NativeCompileRequest`, and specialization requests for scalar, typed, and SIMD lowering.
 - **`CraneliftCodegen` now exclusively owns both compiler tiers.** Fast code still uses `opt_level=none` + single-pass register allocation, optimized code still uses `opt_level=speed` + backtracking, but tier/cache orchestration only sees native entry pointers and compile success/failure.
