@@ -7507,7 +7507,6 @@ fn workflow_timer_fire_is_not_delivered_when_durable_fire_append_fails() {
     let _ = std::fs::remove_file(path);
 }
 
-
 #[test]
 fn workflow_activation_operation_ids_are_stable_and_monotonic() {
     let id = WorkflowActivationId::new(42, 7);
