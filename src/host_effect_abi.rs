@@ -392,6 +392,10 @@ pub fn host_effect_abi_descriptor() -> Result<serde_json::Value, serde_json::Err
 
         operations.push(serde_json::json!({
             "canonical_id": operation.canonical_id(),
+            "source": {
+                "effect": operation.source_effect,
+                "operation": operation.source_operation
+            },
             "effect_id": operation.effect_id,
             "operation_id": operation.operation_id,
             "request": {
