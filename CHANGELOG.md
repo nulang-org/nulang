@@ -1,5 +1,13 @@
 # Nulang Changelog
 
+### Cloud reconciliation event loop — 2026-09-25
+- **Nulang Cloud now has a deterministic in-process reconciliation queue above `reconcile_once`.** `ReconcileLoop` coalesces deployment/node/allocation/capacity wakeups while durable ownership, plans, fencing, evaluations, and outbox state remain in `ControlStore`.
+- **Pending work is state-based and bounded.** At most one request is queued per deployment; newer revisions supersede older pending revisions, stale revisions are ignored, and same-revision triggers coalesce.
+- **Failed turns preserve the same durable evaluation identity.** A failed reconcile remains queued and retry reaches `reconcile_once` with the identical evaluation id, preserving its idempotency contract.
+- **Controller backpressure stays explicit.** `reconcile_ready` requires a caller-supplied turn budget and processes deployments in deterministic lexical order.
+- Combined with the fenced node executor, the control-plane foundation now closes the pure-plan → durable commit/outbox → node execution loop without embedding provider SDKs into the scheduler.
+
+
 ### Cloud node allocation executor — 2026-09-24
 - **Nulang Cloud now has a provider-neutral node executor for the durable Start/Stop outbox.** `execute_pending_for_node` filters commands by node, orders them deterministically, invokes an `AllocationRuntime`, verifies the resulting local epoch, and ACKs only after the node mutation is proven.
 - **Allocation epochs are enforced again at the execution boundary.** Older delayed commands are ACKed without touching a newer owner; Stop advances the durable fence even when no workload is present; a delayed Start cannot resurrect an epoch already fenced as stopped.
