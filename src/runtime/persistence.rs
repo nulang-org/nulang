@@ -296,6 +296,68 @@ impl WorkflowEvent {
     }
 }
 
+/// Return accepted workflow commands that do not yet have a durable terminal event.
+///
+/// The caller supplies the command predicate because a workflow actor's message
+/// journal also contains internal runtime messages (for example timer delivery)
+/// that intentionally do not receive StepCompleted/StepFailed markers.
+///
+/// Legacy terminal events without activation identity make classification
+/// ambiguous and therefore fail closed rather than guessing by event sequence.
+pub(crate) fn unfinished_workflow_commands<F>(
+    actor_id: u64,
+    journal: &[JournalEntry],
+    events: &[WorkflowEvent],
+    is_activation_command: F,
+) -> io::Result<Vec<JournalEntry>>
+where
+    F: Fn(&JournalEntry) -> bool,
+{
+    let mut closed = BTreeSet::new();
+    for event in events {
+        match event {
+            WorkflowEvent::StepCompleted { activation, .. }
+            | WorkflowEvent::StepFailed { activation, .. } => {
+                let activation = activation.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "legacy workflow terminal event lacks activation identity",
+                    )
+                })?;
+                if activation.actor_id != actor_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "workflow terminal activation belongs to actor {}, expected {}",
+                            activation.actor_id, actor_id
+                        ),
+                    ));
+                }
+                closed.insert(activation.command_sequence);
+            }
+            _ => {}
+        }
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut unfinished = Vec::new();
+    for entry in journal.iter().filter(|entry| is_activation_command(entry)) {
+        if !seen.insert(entry.sequence) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "duplicate workflow command journal sequence {} for actor {}",
+                    entry.sequence, actor_id
+                ),
+            ));
+        }
+        if !closed.contains(&entry.sequence) {
+            unfinished.push(entry.clone());
+        }
+    }
+    Ok(unfinished)
+}
+
 #[cfg(test)]
 mod workflow_activation_classification_tests {
     use super::*;
