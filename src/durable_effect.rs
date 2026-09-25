@@ -29,8 +29,7 @@ use std::str::FromStr;
 
 const EFFECT_ID_DOMAIN: &[u8] = b"nulang.durable-effect.v1\0";
 const EFFECT_ID_SITE_DOMAIN: &[u8] = b"nulang.durable-effect-site.v1\0";
-const EFFECT_ID_WORKFLOW_OPERATION_DOMAIN: &[u8] =
-    b"nulang.durable-effect-workflow-operation.v1\0";
+const EFFECT_ID_WORKFLOW_OPERATION_DOMAIN: &[u8] = b"nulang.durable-effect-workflow-operation.v1\0";
 const COMPENSATION_ID_DOMAIN: &[u8] = b"nulang.durable-compensation.v1\0";
 const REQUEST_DIGEST_DOMAIN: &[u8] = b"nulang.durable-effect-request.v1\0";
 
