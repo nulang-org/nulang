@@ -4644,9 +4644,19 @@ impl Runtime {
                         }
                     }
                 }
-                // Other errors: the wait is over; the send-path result is
-                // discarded anyway, matching step_actor semantics.
-                Err(_) => (*self_ptr).clear_receive_wait(actor_id),
+                Err(error) => {
+                    (*self_ptr).clear_receive_wait(actor_id);
+                    if (*self_ptr).actor_is_workflow(actor_id) {
+                        workflow::fail_workflow_step(
+                            &mut *self_ptr,
+                            actor_id,
+                            suspended.activation,
+                            suspended.step_name.clone(),
+                            error.to_string(),
+                            suspended.behavior_idx,
+                        );
+                    }
+                }
             }
             // End the VM-execution window only after any suspend-state
             // re-capture above: draining deferred wakes runs other actors
