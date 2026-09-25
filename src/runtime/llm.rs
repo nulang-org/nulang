@@ -442,6 +442,7 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         return;
     }
 
+    super::workflow::resume_workflow_activation(rt, actor_id, suspended.activation);
     let self_ptr: *mut Runtime = rt;
     unsafe {
         let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -509,6 +510,7 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         // wakes of other actors are not lost when THIS one suspends.
         (*self_ptr).vm_exec_end();
     }
+    super::workflow::clear_workflow_activation(rt, actor_id);
     // The suspension resolved (completed or failed): if messages queued
     // up while the behavior was suspended, schedule the actor to drain
     // them — step_actor leaves mail untouched while a suspension is live.
