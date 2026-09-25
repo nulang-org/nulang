@@ -9,21 +9,18 @@ fn value_layout_manifest_is_derived_from_canonical_core_constants() {
     assert_eq!(manifest.tag_bits, 16);
     assert_eq!(manifest.payload_bits, 48);
     assert_eq!(manifest.tag_shift, nulang::value_layout::TAG_SHIFT);
-    assert_eq!(manifest.tag_mask, nulang::value_layout::TAG_MASK);
-    assert_eq!(manifest.payload_mask, nulang::value_layout::PAYLOAD_MASK);
-    assert_eq!(manifest.sign_bit, nulang::value_layout::SIGN_BIT);
-    assert_eq!(
-        manifest.canonical_nan_bits,
-        nulang::value_layout::CANONICAL_NAN_BITS
-    );
+    assert_eq!(manifest.tag_mask, "0xffff000000000000");
+    assert_eq!(manifest.payload_mask, "0x0000ffffffffffff");
+    assert_eq!(manifest.sign_bit, "0x0000800000000000");
+    assert_eq!(manifest.canonical_nan_bits, "0xfff8000000000001");
 
     assert_eq!(
-        manifest.tags.get("object"),
-        Some(&nulang::value_layout::TAG_OBJECT)
+        manifest.tags.get("object").map(String::as_str),
+        Some("0x7ff5000000000000")
     );
     assert_eq!(
-        manifest.tags.get("int"),
-        Some(&nulang::value_layout::TAG_INT)
+        manifest.tags.get("int").map(String::as_str),
+        Some("0x7ffb000000000000")
     );
 }
 
@@ -37,8 +34,7 @@ fn value_layout_manifest_json_is_stable_and_machine_readable() {
     assert_eq!(parsed["tag_bits"], 16);
     assert_eq!(parsed["payload_bits"], 48);
     assert_eq!(parsed["float_encoding"], "raw-ieee754-with-canonical-nan");
-    assert_eq!(
-        parsed["tags"]["object"],
-        serde_json::json!(nulang::value_layout::TAG_OBJECT)
-    );
+    assert_eq!(parsed["tag_mask"], "0xffff000000000000");
+    assert_eq!(parsed["canonical_nan_bits"], "0xfff8000000000001");
+    assert_eq!(parsed["tags"]["object"], "0x7ff5000000000000");
 }
