@@ -10,10 +10,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-pub const DURABLE_TRANSITION_PROTOCOL_VERSION: &str =
-    "nulang-durable-transition/v0alpha1";
-const DURABLE_TRANSITION_DIGEST_DOMAIN: &[u8] =
-    b"nulang.durable-transition-protocol.v0alpha1\0";
+pub const DURABLE_TRANSITION_PROTOCOL_VERSION: &str = "nulang-durable-transition/v0alpha1";
+const DURABLE_TRANSITION_DIGEST_DOMAIN: &[u8] = b"nulang.durable-transition-protocol.v0alpha1\0";
 
 mod u64_string {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -203,15 +201,24 @@ pub struct DurableStateCheckpoint {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum DurableWorkflowEvent {
-    WorkflowStarted { workflow_name: String },
-    StepCompleted { step_name: String },
-    StepFailed { step_name: String, error: String },
+    WorkflowStarted {
+        workflow_name: String,
+    },
+    StepCompleted {
+        step_name: String,
+    },
+    StepFailed {
+        step_name: String,
+        error: String,
+    },
     SignalAccepted {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         payload: Option<Value>,
     },
-    SagaCompensated { step_name: String },
+    SagaCompensated {
+        step_name: String,
+    },
     ParallelBranchCompleted {
         step_name: String,
         branch_name: String,
@@ -227,8 +234,9 @@ impl DurableWorkflowEvent {
     fn validate(&self) -> Result<(), DurableProtocolError> {
         let valid = match self {
             Self::WorkflowStarted { workflow_name } => !workflow_name.trim().is_empty(),
-            Self::StepCompleted { step_name }
-            | Self::SagaCompensated { step_name } => !step_name.trim().is_empty(),
+            Self::StepCompleted { step_name } | Self::SagaCompensated { step_name } => {
+                !step_name.trim().is_empty()
+            }
             Self::StepFailed { step_name, error } => {
                 !step_name.trim().is_empty() && !error.trim().is_empty()
             }
@@ -557,7 +565,10 @@ pub enum DurableProtocolError {
     InvalidOutboxMessage,
     DuplicateOutboxOrdinal(u32),
     Serialization(String),
-    DigestMismatch { expected: String, actual: String },
+    DigestMismatch {
+        expected: String,
+        actual: String,
+    },
 }
 
 impl fmt::Display for DurableProtocolError {
@@ -617,10 +628,7 @@ fn valid_blake3_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn write_canonical_json(
-    value: &Value,
-    out: &mut Vec<u8>,
-) -> Result<(), DurableProtocolError> {
+fn write_canonical_json(value: &Value, out: &mut Vec<u8>) -> Result<(), DurableProtocolError> {
     match value {
         Value::Null => out.extend_from_slice(b"null"),
         Value::Bool(value) => {
