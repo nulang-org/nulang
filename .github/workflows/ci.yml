@@ -212,12 +212,7 @@ jobs:
       # No python3-dev installed here on purpose: this job proves the
       # no-default-features build has zero PyO3/SQLite/LSP dependencies.
       - name: Build
-        run: |
-          cargo build --all-targets --no-default-features
-          echo "::group::Canonical Cargo.lock delta"
-          git diff -- Cargo.lock
-          echo "::endgroup::"
-          test -z "$(git status --porcelain Cargo.lock)"
+        run: cargo build --locked --all-targets --no-default-features
 
       - name: Test
         run: cargo test --locked --no-default-features
