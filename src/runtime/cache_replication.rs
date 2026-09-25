@@ -1,7 +1,244 @@
-//! Cache replication protocol and ordered replica application.
+//! Epoch-fenced ordered replication for the RESP cache.
 //!
-//! Tests are intentionally written first. The implementation below this test
-//! contract is added in the following commit.
+//! Replication reuses the cache placement epoch as its fencing term. Replica
+//! application is strictly sequence-ordered and uses the same canonical
+//! mutation representation as the local WAL.
+
+use std::io;
+
+use super::cache::CacheStore;
+use super::cache_persistence::{
+    apply_wal_mutation, decode_mutation, encode_mutation, CacheWalMutation,
+};
+
+const REPLICATION_MAGIC: &[u8; 8] = b"NLCREP01";
+const REPLICATION_VERSION: u16 = 1;
+const REPLICATION_HEADER_BYTES: usize = 8 + 2 + 8 + 8 + 4;
+const CHECKSUM_BYTES: usize = 32;
+const MAX_REPLICATION_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheReplicationRecord {
+    pub placement_epoch: u64,
+    pub sequence: u64,
+    pub mutation: CacheWalMutation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheReplicaApply {
+    Applied { sequence: u64 },
+    Duplicate { sequence: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheReplicaError {
+    StaleEpoch { current: u64, received: u64 },
+    FutureEpoch { current: u64, received: u64 },
+    SequenceGap { expected: u64, received: u64 },
+    SequenceExhausted,
+    ApplyFailed(io::ErrorKind),
+    Poisoned,
+}
+
+#[derive(Debug)]
+pub struct CacheReplicaApplier {
+    placement_epoch: u64,
+    applied_sequence: u64,
+    store: CacheStore,
+    poisoned: bool,
+}
+
+impl CacheReplicaApplier {
+    pub fn new(placement_epoch: u64, applied_sequence: u64, store: CacheStore) -> Self {
+        Self {
+            placement_epoch,
+            applied_sequence,
+            store,
+            poisoned: false,
+        }
+    }
+
+    pub fn placement_epoch(&self) -> u64 {
+        self.placement_epoch
+    }
+
+    pub fn applied_sequence(&self) -> u64 {
+        self.applied_sequence
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    pub fn store(&self) -> &CacheStore {
+        &self.store
+    }
+
+    pub fn store_mut(&mut self) -> &mut CacheStore {
+        &mut self.store
+    }
+
+    pub fn into_store(self) -> CacheStore {
+        self.store
+    }
+
+    /// Advance the fencing epoch after the control plane has installed a newer
+    /// placement snapshot. Equal epochs are idempotent; older epochs are
+    /// rejected.
+    pub fn fence_epoch(&mut self, proposed_epoch: u64) -> Result<(), CacheReplicaError> {
+        if proposed_epoch < self.placement_epoch {
+            return Err(CacheReplicaError::StaleEpoch {
+                current: self.placement_epoch,
+                received: proposed_epoch,
+            });
+        }
+        self.placement_epoch = proposed_epoch;
+        Ok(())
+    }
+
+    /// Apply exactly one canonical mutation from the current placement epoch.
+    ///
+    /// Records must be contiguous. Retransmissions at or below the already
+    /// applied sequence are acknowledged as duplicates without executing the
+    /// mutation again. A store-application error poisons the replica so it
+    /// cannot silently continue from divergent state.
+    pub fn apply(
+        &mut self,
+        record: &CacheReplicationRecord,
+        store_now_ms: u64,
+        wall_now_ms: u64,
+    ) -> Result<CacheReplicaApply, CacheReplicaError> {
+        if self.poisoned {
+            return Err(CacheReplicaError::Poisoned);
+        }
+        if record.placement_epoch < self.placement_epoch {
+            return Err(CacheReplicaError::StaleEpoch {
+                current: self.placement_epoch,
+                received: record.placement_epoch,
+            });
+        }
+        if record.placement_epoch > self.placement_epoch {
+            return Err(CacheReplicaError::FutureEpoch {
+                current: self.placement_epoch,
+                received: record.placement_epoch,
+            });
+        }
+        if record.sequence <= self.applied_sequence {
+            return Ok(CacheReplicaApply::Duplicate {
+                sequence: record.sequence,
+            });
+        }
+
+        let expected = self
+            .applied_sequence
+            .checked_add(1)
+            .ok_or(CacheReplicaError::SequenceExhausted)?;
+        if record.sequence != expected {
+            return Err(CacheReplicaError::SequenceGap {
+                expected,
+                received: record.sequence,
+            });
+        }
+
+        if let Err(error) =
+            apply_wal_mutation(&mut self.store, &record.mutation, store_now_ms, wall_now_ms)
+        {
+            self.poisoned = true;
+            return Err(CacheReplicaError::ApplyFailed(error.kind()));
+        }
+
+        self.applied_sequence = record.sequence;
+        Ok(CacheReplicaApply::Applied {
+            sequence: record.sequence,
+        })
+    }
+}
+
+pub fn encode_replication_frame(record: &CacheReplicationRecord) -> io::Result<Vec<u8>> {
+    let payload = encode_mutation(&record.mutation)?;
+    if payload.len() > MAX_REPLICATION_PAYLOAD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cache replication payload exceeds maximum size",
+        ));
+    }
+    let payload_len = u32::try_from(payload.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cache replication payload length exceeds u32",
+        )
+    })?;
+
+    let mut bytes = Vec::with_capacity(REPLICATION_HEADER_BYTES + payload.len() + CHECKSUM_BYTES);
+    bytes.extend_from_slice(REPLICATION_MAGIC);
+    bytes.extend_from_slice(&REPLICATION_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&record.placement_epoch.to_le_bytes());
+    bytes.extend_from_slice(&record.sequence.to_le_bytes());
+    bytes.extend_from_slice(&payload_len.to_le_bytes());
+    bytes.extend_from_slice(&payload);
+
+    let checksum = blake3::hash(&bytes);
+    bytes.extend_from_slice(checksum.as_bytes());
+    Ok(bytes)
+}
+
+pub fn decode_replication_frame(bytes: &[u8]) -> io::Result<CacheReplicationRecord> {
+    if bytes.len() < REPLICATION_HEADER_BYTES + CHECKSUM_BYTES {
+        return Err(invalid_data("cache replication frame is truncated"));
+    }
+
+    let body_len = bytes.len() - CHECKSUM_BYTES;
+    let (body, stored_checksum) = bytes.split_at(body_len);
+    let checksum = blake3::hash(body);
+    if checksum.as_bytes() != stored_checksum {
+        return Err(invalid_data("cache replication checksum mismatch"));
+    }
+    if &body[..8] != REPLICATION_MAGIC {
+        return Err(invalid_data("invalid cache replication magic"));
+    }
+
+    let version = u16::from_le_bytes([body[8], body[9]]);
+    if version != REPLICATION_VERSION {
+        return Err(invalid_data("unsupported cache replication version"));
+    }
+
+    let placement_epoch = u64::from_le_bytes(
+        body[10..18]
+            .try_into()
+            .expect("fixed replication epoch slice"),
+    );
+    let sequence = u64::from_le_bytes(
+        body[18..26]
+            .try_into()
+            .expect("fixed replication sequence slice"),
+    );
+    let payload_len = u32::from_le_bytes(
+        body[26..30]
+            .try_into()
+            .expect("fixed replication payload-length slice"),
+    ) as usize;
+    if payload_len > MAX_REPLICATION_PAYLOAD_BYTES {
+        return Err(invalid_data("cache replication payload exceeds maximum size"));
+    }
+
+    let expected_len = REPLICATION_HEADER_BYTES
+        .checked_add(payload_len)
+        .ok_or_else(|| invalid_data("cache replication frame length overflow"))?;
+    if body.len() != expected_len {
+        return Err(invalid_data("cache replication frame length mismatch"));
+    }
+
+    let mutation = decode_mutation(&body[REPLICATION_HEADER_BYTES..])?;
+    Ok(CacheReplicationRecord {
+        placement_epoch,
+        sequence,
+        mutation,
+    })
+}
+
+fn invalid_data(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
 
 #[cfg(test)]
 mod tests {
