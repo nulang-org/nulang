@@ -1995,6 +1995,30 @@ fn collect_rvalue_field_and_consts(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "native-object")]
+    #[test]
+    fn test_native_object_emits_relocatable_entry_symbol() {
+        let source = "fn main() -> Int { 40 + 2 }";
+        let tokens = crate::lexer::Lexer::new(source).lex().unwrap();
+        let ast = crate::parser::Parser::new(tokens).parse_module().unwrap();
+        let mut tc = crate::typechecker::TypeChecker::new();
+        tc.check_module(&ast).unwrap();
+        let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+        let mir = crate::mir_lower::lower_module(&hir).unwrap();
+
+        let artifact = super::object::NativeObjectArtifact::compile(&mir, "native")
+            .expect("native object compilation");
+        assert!(!artifact.bytes().is_empty());
+        assert_eq!(artifact.entry_symbol(), Some("nulang_entry"));
+        assert!(
+            artifact
+                .bytes()
+                .windows(b"nulang_entry".len())
+                .any(|window| window == b"nulang_entry"),
+            "object symbol table should contain the stable nulang_entry symbol"
+        );
+    }
+
     /// End-to-end: `"hello" + 2 + 3` must concatenate with coercion ("hello23"),
     /// not fall through to integer arithmetic on the string's tag bits. Replicates
     /// `AotModule::run`'s heap + constants setup but keeps the heap alive so the
