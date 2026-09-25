@@ -862,6 +862,7 @@ dependencies = [
  "cranelift-entity 0.132.3",
  "cranelift-module",
  "cranelift-native 0.132.3",
+ "cranelift-object",
  "libc",
  "log",
  "memmap2",
@@ -901,6 +902,21 @@ checksum = "7107a4ae4a2ba48b5df8648365e638b08322fa1da11e86206bf5eddb862b21dd"
 dependencies = [
  "cranelift-codegen 0.133.3",
  "libc",
+ "target-lexicon",
+]
+
+[[package]]
+name = "cranelift-object"
+version = "0.132.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a476f25c5740a43ad0ba7ac398fb5484f1e9dfd662bba127a111d591e90350d"
+dependencies = [
+ "anyhow",
+ "cranelift-codegen 0.132.3",
+ "cranelift-control 0.132.3",
+ "cranelift-module",
+ "log",
+ "object",
  "target-lexicon",
 ]
 
