@@ -574,6 +574,8 @@ mod tests {
             }],
             timers: vec![DurableTimerMutation::Set {
                 timer_id: "shipping-timeout".into(),
+                set_activation_epoch: 7,
+                set_sequence: 12,
                 due_at_unix_ms: 1_800_000_000_000,
             }],
             durable_effects: vec![DurableEffectMutation::Prepared {
@@ -702,6 +704,106 @@ mod tests {
         assert_eq!(
             value["durable_effects"][0]["delivery"],
             "effectively_once_with_deduplication"
+        );
+    }
+
+    #[test]
+    fn timer_generation_is_stable_across_rearm_and_fire() {
+        let set = DurableTimerMutation::Set {
+            timer_id: "shipping-timeout".into(),
+            set_activation_epoch: 7,
+            set_sequence: 12,
+            due_at_unix_ms: 1_800_000_000_000,
+        };
+        let fired = DurableTimerMutation::Fired {
+            timer_id: "shipping-timeout".into(),
+            set_activation_epoch: 7,
+            set_sequence: 12,
+        };
+        let rearmed = DurableTimerMutation::Set {
+            timer_id: "shipping-timeout".into(),
+            set_activation_epoch: 8,
+            set_sequence: 19,
+            due_at_unix_ms: 1_900_000_000_000,
+        };
+
+        let set_value = serde_json::to_value(&set).unwrap();
+        let fired_value = serde_json::to_value(&fired).unwrap();
+        let rearmed_value = serde_json::to_value(&rearmed).unwrap();
+
+        assert_eq!(set_value["set_activation_epoch"], "7");
+        assert_eq!(set_value["set_sequence"], "12");
+        assert_eq!(fired_value["set_activation_epoch"], "7");
+        assert_eq!(fired_value["set_sequence"], "12");
+        assert_ne!(
+            (set_value["set_activation_epoch"].clone(), set_value["set_sequence"].clone()),
+            (
+                rearmed_value["set_activation_epoch"].clone(),
+                rearmed_value["set_sequence"].clone()
+            )
+        );
+    }
+
+    #[test]
+    fn timer_set_generation_must_match_committing_transition() {
+        let mut invalid = transition();
+        invalid.timers = vec![DurableTimerMutation::Set {
+            timer_id: "shipping-timeout".into(),
+            set_activation_epoch: invalid.activation_epoch,
+            set_sequence: invalid.sequence - 1,
+            due_at_unix_ms: 1_800_000_000_000,
+        }];
+
+        assert_eq!(
+            invalid.validate().unwrap_err(),
+            DurableProtocolError::InvalidTimerGeneration
+        );
+    }
+
+    #[test]
+    fn compensation_effect_records_preserve_original_linkage() {
+        let mutation = DurableEffectMutation::CompensationPrepared {
+            original_effect_id: "eff-original".into(),
+            compensation_ordinal: 2,
+            effect_id: "eff-compensation".into(),
+            operation: "Payment.refund".into(),
+            boundary: DurableEffectBoundary::External,
+            delivery: DurableDeliverySemantics::EffectivelyOnceWithDeduplication,
+            request_digest:
+                "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .into(),
+            idempotency_key: Some("eff-compensation".into()),
+        };
+
+        let value = serde_json::to_value(&mutation).unwrap();
+        assert_eq!(value["kind"], "compensation_prepared");
+        assert_eq!(value["original_effect_id"], "eff-original");
+        assert_eq!(value["compensation_ordinal"], 2);
+        assert_eq!(value["effect_id"], "eff-compensation");
+
+        let decoded: DurableEffectMutation = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, mutation);
+    }
+
+    #[test]
+    fn compensation_effect_requires_original_identity() {
+        let mut invalid = transition();
+        invalid.durable_effects = vec![DurableEffectMutation::CompensationPrepared {
+            original_effect_id: " ".into(),
+            compensation_ordinal: 0,
+            effect_id: "eff-compensation".into(),
+            operation: "Payment.refund".into(),
+            boundary: DurableEffectBoundary::External,
+            delivery: DurableDeliverySemantics::AtLeastOnce,
+            request_digest:
+                "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .into(),
+            idempotency_key: None,
+        }];
+
+        assert_eq!(
+            invalid.validate().unwrap_err(),
+            DurableProtocolError::InvalidCompensation
         );
     }
 
