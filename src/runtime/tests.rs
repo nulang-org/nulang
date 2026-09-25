@@ -7588,7 +7588,6 @@ fn workflow_activation_analysis_rejects_untagged_terminal_after_upgrade() {
     ));
 }
 
-
 #[test]
 fn workflow_custom_events_use_activation_operation_ordinals() {
     let mut rt = Runtime::new();
@@ -7609,9 +7608,7 @@ fn workflow_custom_events_use_activation_operation_ordinals() {
         .into_iter()
         .filter_map(|event| match event {
             WorkflowEvent::Custom {
-                operation_id,
-                name,
-                ..
+                operation_id, name, ..
             } => Some((operation_id, name)),
             _ => None,
         })
@@ -7650,7 +7647,6 @@ fn workflow_durable_effect_ids_share_activation_operation_sequence() {
         )
     );
 }
-
 
 #[test]
 fn workflow_operation_lookup_returns_committed_custom_event() {
@@ -7710,16 +7706,12 @@ fn workflow_operation_lookup_rejects_duplicate_operation_identity() {
     ));
 }
 
-
 #[test]
 fn workflow_timer_set_and_fire_preserve_operation_identity() {
     let mut rt = Runtime::new();
     rt.install_virtual_clock();
-    let actor_id = rt.spawn_workflow_actor(
-        "TimerOperationWorkflow",
-        Box::new(Vec::new),
-        HashMap::new(),
-    );
+    let actor_id =
+        rt.spawn_workflow_actor("TimerOperationWorkflow", Box::new(Vec::new), HashMap::new());
     let activation = WorkflowActivationId::new(actor_id, 71);
     super::workflow::begin_workflow_activation(&mut rt, activation, false);
 
