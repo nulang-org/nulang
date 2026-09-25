@@ -589,6 +589,119 @@ mod tests {
     }
 
     #[test]
+    fn migrating_source_returns_ask_for_missing_key_but_serves_existing_key() {
+        let mut map = CacheSlotMap::new_local(1, 1).unwrap();
+        let key = b"migrate-key";
+        let slot = redis_slot(key);
+        let source = map.owner_for_slot(slot).unwrap();
+        let target = CacheShardOwner {
+            node_id: 2,
+            shard: 0,
+        };
+        map.begin_migration(1, slot, target).unwrap();
+
+        let (channels, _inboxes) = CacheDispatchChannels::new(1, 8).unwrap();
+        let mut endpoints = CacheEndpointMap::new();
+        endpoints.insert(source, CacheAdvertisedEndpoint::new("source", 7000));
+        endpoints.insert(target, CacheAdvertisedEndpoint::new("target", 7001));
+        let dispatcher = CacheDispatcher::new(1, 0, map, channels)
+            .unwrap()
+            .with_cluster_redirects(endpoints);
+
+        let command = frame(&[b"GET", key]);
+        let mut store = CacheStore::new();
+        let mut out = Vec::new();
+        let outcome = dispatcher
+            .dispatch_frame_with_asking(&mut store, &command, 0, &mut out, false)
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            CacheDispatchOutcome::Redirected {
+                kind: CacheRedirectKind::Ask,
+                ..
+            }
+        ));
+        assert_eq!(out, format!("-ASK {slot} target:7001\r\n").as_bytes());
+
+        store.set_bytes(key, b"value", None, 0);
+        out.clear();
+        let outcome = dispatcher
+            .dispatch_frame_with_asking(&mut store, &command, 0, &mut out, false)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, CacheDispatchOutcome::Executed { .. }));
+        assert_eq!(out, b"$5\r\nvalue\r\n");
+    }
+
+    #[test]
+    fn importing_target_requires_asking_for_one_command_authorization() {
+        let mut map = CacheSlotMap::new_local(1, 1).unwrap();
+        let key = b"migrate-key";
+        let slot = redis_slot(key);
+        let source = map.owner_for_slot(slot).unwrap();
+        let target = CacheShardOwner {
+            node_id: 2,
+            shard: 0,
+        };
+        map.begin_migration(1, slot, target).unwrap();
+
+        let (channels, _inboxes) = CacheDispatchChannels::new(1, 8).unwrap();
+        let mut endpoints = CacheEndpointMap::new();
+        endpoints.insert(source, CacheAdvertisedEndpoint::new("source", 7000));
+        endpoints.insert(target, CacheAdvertisedEndpoint::new("target", 7001));
+        let dispatcher = CacheDispatcher::new(2, 0, map, channels)
+            .unwrap()
+            .with_cluster_redirects(endpoints);
+
+        let command = frame(&[b"SET", key, b"value"]);
+        let mut store = CacheStore::new();
+        let mut out = Vec::new();
+
+        let outcome = dispatcher
+            .dispatch_frame_with_asking(&mut store, &command, 0, &mut out, false)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            CacheDispatchOutcome::Redirected {
+                kind: CacheRedirectKind::Moved,
+                ..
+            }
+        ));
+        assert!(store.get(key, 0).is_none());
+
+        out.clear();
+        let outcome = dispatcher
+            .dispatch_frame_with_asking(&mut store, &command, 0, &mut out, true)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, CacheDispatchOutcome::Executed { .. }));
+        assert_eq!(out, b"+OK\r\n");
+        assert_eq!(store.get(key, 0), Some(CacheValueView::Bytes(b"value")));
+    }
+
+    #[test]
+    fn asking_command_enables_connection_state_without_touching_store() {
+        let map = CacheSlotMap::new_local(1, 1).unwrap();
+        let (channels, _inboxes) = CacheDispatchChannels::new(1, 8).unwrap();
+        let dispatcher = CacheDispatcher::new(1, 0, map, channels).unwrap();
+        let command = frame(&[b"ASKING"]);
+        let mut store = CacheStore::new();
+        let mut out = Vec::new();
+
+        let outcome = dispatcher
+            .dispatch_frame_with_asking(&mut store, &command, 0, &mut out, false)
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(outcome, CacheDispatchOutcome::AskingEnabled { .. }));
+        assert_eq!(out, b"+OK\r\n");
+        assert!(store.is_empty());
+    }
+
+    #[test]
     fn redirect_mode_returns_moved_for_remote_node() {
         let mut map = CacheSlotMap::new_local(1, 2).unwrap();
         let key = b"remote-redirect";
