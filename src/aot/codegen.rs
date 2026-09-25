@@ -3537,22 +3537,28 @@ fn compile_unary(
 
     use crate::ast::UnOp;
     match op {
-        UnOp::Neg => {
-            if type_meta.is_known(reg as usize, KnownType::Int) {
+        UnOp::Neg => match type_meta.get_type(reg as usize) {
+            KnownType::Int => {
+                // INeg is checked language semantics, not merely a machine
+                // integer negate: INT48_MIN must overflow and dynamic nil
+                // results from preceding arithmetic must still fail. Route
+                // through the authoritative helper instead of bypassing it.
                 if mode == CompileMode::Unboxed {
-                    Ok(builder.ins().ineg(val))
+                    let boxed = emit_tag_int(builder, val);
+                    let checked = call_helper(builder, helpers, "nulang_ineg", &[boxed])?;
+                    Ok(emit_sext48(builder, checked))
                 } else {
-                    let payload = emit_sext48(builder, val);
-                    let neg = builder.ins().ineg(payload);
-                    Ok(emit_tag_int(builder, neg))
+                    call_helper(builder, helpers, "nulang_ineg", &[val])
                 }
-            } else if type_meta.is_known(reg as usize, KnownType::Float) {
-                let f = builder.ins().bitcast(types::F64, MemFlags::new(), val);
-                let neg = builder.ins().fneg(f);
-                Ok(builder.ins().bitcast(types::I64, MemFlags::new(), neg))
-            } else {
-                call_helper(builder, helpers, "nulang_ineg", &[val])
             }
+            KnownType::Float => call_helper(builder, helpers, "nulang_ineg", &[val]),
+            // Compound values and closures may share low-level boxed
+            // representations with numeric values. Until the native backend
+            // has a runtime semantic-type guard for those values, fail closed
+            // at compilation rather than silently accepting invalid negation.
+            KnownType::Bool | KnownType::Unknown => Err(AotCompileError::Unsupported(
+                "native unary negation requires a statically numeric operand".into(),
+            )),
         }
         UnOp::Not => call_helper(builder, helpers, "nulang_not", &[val]),
         UnOp::Deref => Err(AotCompileError::Unsupported("UnOp::Deref".into())),
