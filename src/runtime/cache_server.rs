@@ -22,6 +22,7 @@ use super::cache_cluster::CacheRoutingMode;
 use super::cache_persistence::{
     CacheDurabilityError, CacheDurabilityMode, CacheDurabilityStatus, DurableCacheStore,
 };
+use super::resp::RespArgs;
 use super::resp_cache::{CacheCommandError, CacheCommandTarget};
 use super::cache_dispatch::{
     CacheDispatchConfigError, CacheDispatchWake, CacheDispatcher, CacheShardInbox,
@@ -287,10 +288,21 @@ impl CacheCommandTarget for CacheServerStore {
         }
     }
 
-    fn delete_many(&mut self, keys: &[&[u8]], now_ms: u64) -> Result<usize, CacheCommandError> {
+    fn delete_keys<'a>(
+        &mut self,
+        keys: RespArgs<'a>,
+        now_ms: u64,
+    ) -> Result<usize, CacheCommandError> {
         match self {
-            Self::Memory(store) => CacheCommandTarget::delete_many(store, keys, now_ms),
-            Self::Durable(store) => CacheCommandTarget::delete_many(store, keys, now_ms),
+            Self::Memory(store) => CacheCommandTarget::delete_keys(store, keys, now_ms),
+            Self::Durable(store) => CacheCommandTarget::delete_keys(store, keys, now_ms),
+        }
+    }
+
+    fn delete_key(&mut self, key: &[u8], now_ms: u64) -> Result<bool, CacheCommandError> {
+        match self {
+            Self::Memory(store) => CacheCommandTarget::delete_key(store, key, now_ms),
+            Self::Durable(store) => CacheCommandTarget::delete_key(store, key, now_ms),
         }
     }
 
