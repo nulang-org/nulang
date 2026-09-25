@@ -1,15 +1,17 @@
 # RFC 0004: Deprecate `agent`, `workflow`, and `database` as Language Keywords
 
-- **Status:** Draft
+- **Status:** Historical draft — not accepted; architectural direction superseded by RFC 0024
 - **Tier:** Stable
 - **Author:** AI assistant review
 - **Created:** 2026-07-21
 - **Resolved:** (pending)
 - **Language-version at effect:** 1.0.0-frozen
 - **Supersedes:** none
-- **Superseded by:** none
+- **Superseded by:** RFC 0024 (architectural direction)
 
 ## Summary
+
+> **Historical note (2026-09-25):** This proposal was never accepted and is not current migration guidance. RFC 0024 established the current orthogonal execution model: local computation, scoped tasks, and actors are distinct execution forms, while durability and identity compose with them. Current `workflow` support remains an Experimental first-class ergonomic surface while its semantics are stabilized; `agent` is increasingly treated as composition over ordinary runtime primitives. Consult `SPEC2.md`, `docs/IMPLEMENTATION_STATUS.md`, and accepted RFCs for current behavior.
 
 Move the `agent`, `workflow`, and `database` top-level declarations out of the Stable language surface and reclassify them as Experimental Cloud SDK / library concerns. The declarations remain functional for the deprecation cycle (≥2 major language versions) but emit warnings. The breaking phase removes the AST nodes, parser productions, typechecker cases, and bytecode opcodes, replacing them with ordinary actor declarations that import `nlc.ai`, `nlc.workflow`, and `nlc.storage` packages.
 
