@@ -96,6 +96,92 @@ impl std::fmt::Display for WorkflowActivationAnalysisError {
 
 impl std::error::Error for WorkflowActivationAnalysisError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowOperationAnalysisError {
+    ActorMismatch {
+        actor_id: u64,
+        operation_id: WorkflowOperationId,
+    },
+    ForeignOperationIdentity {
+        event_sequence: u64,
+        operation_id: WorkflowOperationId,
+    },
+    DuplicateOperationIdentity {
+        operation_id: WorkflowOperationId,
+    },
+}
+
+impl std::fmt::Display for WorkflowOperationAnalysisError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ActorMismatch {
+                actor_id,
+                operation_id,
+            } => write!(
+                f,
+                "workflow operation {:?} does not belong to actor {actor_id}",
+                operation_id
+            ),
+            Self::ForeignOperationIdentity {
+                event_sequence,
+                operation_id,
+            } => write!(
+                f,
+                "workflow event {event_sequence} carries foreign operation identity {:?}",
+                operation_id
+            ),
+            Self::DuplicateOperationIdentity { operation_id } => write!(
+                f,
+                "workflow operation {:?} appears more than once in durable event history",
+                operation_id
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WorkflowOperationAnalysisError {}
+
+/// Find the durable event recorded for one activation-local operation.
+///
+/// Recovery uses this lookup instead of relying on workflow-event sequence
+/// position. Duplicate identities are rejected because replay could otherwise
+/// consume an arbitrary record and silently diverge.
+pub fn find_workflow_event_for_operation(
+    actor_id: u64,
+    operation_id: WorkflowOperationId,
+    events: &[WorkflowEvent],
+) -> Result<Option<WorkflowEvent>, WorkflowOperationAnalysisError> {
+    if operation_id.activation.actor_id != actor_id {
+        return Err(WorkflowOperationAnalysisError::ActorMismatch {
+            actor_id,
+            operation_id,
+        });
+    }
+
+    let mut found = None;
+    for event in events {
+        let Some(candidate) = event.operation_id() else {
+            continue;
+        };
+        if candidate.activation.actor_id != actor_id {
+            return Err(WorkflowOperationAnalysisError::ForeignOperationIdentity {
+                event_sequence: event.sequence(),
+                operation_id: candidate,
+            });
+        }
+        if candidate != operation_id {
+            continue;
+        }
+        if found.is_some() {
+            return Err(
+                WorkflowOperationAnalysisError::DuplicateOperationIdentity { operation_id },
+            );
+        }
+        found = Some(event.clone());
+    }
+    Ok(found)
+}
+
 /// Build an activation index from durable command and workflow journals.
 ///
 /// Only journal entries explicitly tagged with an activation id are considered
