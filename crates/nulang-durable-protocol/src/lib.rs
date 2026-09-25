@@ -704,7 +704,8 @@ mod tests {
                 operation: "Payment.charge".into(),
                 boundary: DurableEffectBoundary::External,
                 delivery: DurableDeliverySemantics::EffectivelyOnceWithDeduplication,
-                request_digest: "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                request_digest:
+                    "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
                 idempotency_key: Some("eff-01".into()),
             }],
             outbox: vec![DurableOutboxMessage {
@@ -857,7 +858,10 @@ mod tests {
         assert_eq!(fired_value["set_activation_epoch"], "7");
         assert_eq!(fired_value["set_sequence"], "12");
         assert_ne!(
-            (set_value["set_activation_epoch"].clone(), set_value["set_sequence"].clone()),
+            (
+                set_value["set_activation_epoch"].clone(),
+                set_value["set_sequence"].clone()
+            ),
             (
                 rearmed_value["set_activation_epoch"].clone(),
                 rearmed_value["set_sequence"].clone()
@@ -891,8 +895,7 @@ mod tests {
             boundary: DurableEffectBoundary::External,
             delivery: DurableDeliverySemantics::EffectivelyOnceWithDeduplication,
             request_digest:
-                "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    .into(),
+                "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             idempotency_key: Some("eff-compensation".into()),
         };
 
@@ -916,11 +919,9 @@ mod tests {
             boundary: DurableEffectBoundary::External,
             delivery: DurableDeliverySemantics::EffectivelyOnceWithDeduplication,
             request_digest:
-                "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    .into(),
+                "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             result_digest:
-                "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                    .into(),
+                "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
             result: json!({"refunded": true}),
         };
 
@@ -945,8 +946,7 @@ mod tests {
             boundary: DurableEffectBoundary::External,
             delivery: DurableDeliverySemantics::AtLeastOnce,
             request_digest:
-                "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    .into(),
+                "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             idempotency_key: None,
         }];
 
