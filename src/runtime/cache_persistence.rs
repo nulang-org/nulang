@@ -413,11 +413,7 @@ impl CacheWal {
         &self.path
     }
 
-    pub fn append(
-        &mut self,
-        mutation: &CacheWalMutation,
-        sync: CacheWalSync,
-    ) -> io::Result<u64> {
+    pub fn append(&mut self, mutation: &CacheWalMutation, sync: CacheWalSync) -> io::Result<u64> {
         let sequence = self
             .last_sequence
             .checked_add(1)
@@ -506,8 +502,7 @@ pub fn recover_cache(
     store_now_ms: u64,
     wall_now_ms: u64,
 ) -> io::Result<(CacheStore, CacheRecoveryReport)> {
-    let (snapshot_sequence, entries) =
-        load_cache_snapshot(snapshot_path.as_ref(), wall_now_ms)?;
+    let (snapshot_sequence, entries) = load_cache_snapshot(snapshot_path.as_ref(), wall_now_ms)?;
     let mut store = CacheStore::from_snapshot(config, eviction_policy, &entries, store_now_ms)
         .map_err(cache_write_error)?;
 
@@ -923,8 +918,9 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn encode_bytes(out: &mut Vec<u8>, value: &[u8]) -> io::Result<()> {
-    let len = u32::try_from(value.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cache byte string exceeds u32"))?;
+    let len = u32::try_from(value.len()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "cache byte string exceeds u32")
+    })?;
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(value);
     Ok(())
@@ -1028,18 +1024,15 @@ fn invalid_data(message: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::cache::{CacheTtl, CacheValueView};
+    use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
 
     fn test_path(name: &str) -> PathBuf {
         let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "nulang-cache-{name}-{}-{id}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("nulang-cache-{name}-{}-{id}", std::process::id()))
     }
 
     #[test]
@@ -1047,12 +1040,9 @@ mod tests {
         let snapshot = test_path("durable-snapshot");
         let wal_path = test_path("durable-wal");
         let wal = CacheWal::create_after(&wal_path, 0).unwrap();
-        let mut durable = DurableCacheStore::with_wal(
-            CacheStore::new(),
-            wal,
-            CacheDurabilityMode::SyncedJournal,
-        )
-        .unwrap();
+        let mut durable =
+            DurableCacheStore::with_wal(CacheStore::new(), wal, CacheDurabilityMode::SyncedJournal)
+                .unwrap();
 
         durable
             .set_bytes(b"a", b"one", Some(10_000), 0, 1_000)
@@ -1062,9 +1052,7 @@ mod tests {
             .unwrap();
         assert_eq!(durable.increment(b"n", 1, 0, 1_000).unwrap(), 1);
 
-        let snapshot_sequence = durable
-            .snapshot_and_rotate(&snapshot, 0, 1_000)
-            .unwrap();
+        let snapshot_sequence = durable.snapshot_and_rotate(&snapshot, 0, 1_000).unwrap();
         assert_eq!(snapshot_sequence, 3);
 
         durable.delete_at(b"b", 0).unwrap();
