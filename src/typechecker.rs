@@ -2802,12 +2802,21 @@ impl TypeChecker {
         let (s, ty) = self.infer_expr(ctx, expr)?;
 
         match op {
-            // Negation: numeric -> numeric
+            // Negation: numeric -> numeric. Reject concrete nonnumeric
+            // operands statically; unresolved inference variables remain
+            // dynamic until a real numeric constraint/typeclass is introduced.
             Neg => {
-                let num_var = Type::Var(TypeVar::fresh());
-                let s2 = mgu(&apply_subst(&ty, &s), &num_var, span)?;
-                let final_subst = compose_subst(&s2, &s);
-                Ok((final_subst.clone(), apply_subst(&num_var, &final_subst)))
+                let resolved = apply_subst(&ty, &s);
+                match resolved {
+                    Type::Primitive(PrimitiveType::Int)
+                    | Type::Primitive(PrimitiveType::Float)
+                    | Type::Var(_) => Ok((s, resolved)),
+                    other => Err(NuError::type_mismatch(
+                        "Int or Float",
+                        format!("{}", other),
+                        span,
+                    )),
+                }
             }
             // Boolean not: Bool -> Bool
             Not => {
