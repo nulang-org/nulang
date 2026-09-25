@@ -185,6 +185,25 @@ fn default_event_value() -> PersistedValue {
     PersistedValue::Int(1)
 }
 
+/// Stable identity of one accepted workflow command activation.
+///
+/// The command journal sequence is allocated before user code executes and
+/// remains stable across suspension, replay, and terminal workflow events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowActivationId {
+    pub actor_id: u64,
+    pub command_sequence: u64,
+}
+
+impl WorkflowActivationId {
+    pub const fn new(actor_id: u64, command_sequence: u64) -> Self {
+        Self {
+            actor_id,
+            command_sequence,
+        }
+    }
+}
+
 /// A workflow event records a durable, replayable step in a workflow actor.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "tag", content = "value")]
@@ -196,7 +215,15 @@ pub enum WorkflowEvent {
         state: Vec<PersistedValue>,
     },
     /// A workflow step completed successfully.
-    StepCompleted { sequence: u64, step_name: String },
+    StepCompleted {
+        sequence: u64,
+        /// Stable identity of the accepted command this terminal event closes.
+        /// Missing on legacy journal records written before activation identity
+        /// was persisted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activation: Option<WorkflowActivationId>,
+        step_name: String,
+    },
     /// A timer was set for a workflow.
     TimerSet {
         sequence: u64,
@@ -225,6 +252,11 @@ pub enum WorkflowEvent {
     /// silent — exit 0, no diagnostic).
     StepFailed {
         sequence: u64,
+        /// Stable identity of the accepted command this terminal event closes.
+        /// Missing on legacy journal records written before activation identity
+        /// was persisted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activation: Option<WorkflowActivationId>,
         step_name: String,
         error: String,
     },
@@ -249,6 +281,17 @@ impl WorkflowEvent {
             | WorkflowEvent::ParallelBranchCompleted { sequence, .. }
             | WorkflowEvent::StepFailed { sequence, .. }
             | WorkflowEvent::Custom { sequence, .. } => *sequence,
+        }
+    }
+
+    /// Return the accepted command activation closed by a terminal event.
+    ///
+    /// Legacy events return `None` and remain readable for compatibility.
+    pub fn activation_id(&self) -> Option<WorkflowActivationId> {
+        match self {
+            WorkflowEvent::StepCompleted { activation, .. }
+            | WorkflowEvent::StepFailed { activation, .. } => *activation,
+            _ => None,
         }
     }
 }
@@ -372,6 +415,25 @@ impl DurableTransition {
                 "durable transition workflow event sequence does not match transition sequence",
             ));
         }
+        for event in &self.workflow_events {
+            if let Some(activation) = event.activation_id() {
+                if activation.actor_id != self.actor_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "durable transition workflow activation actor does not match transition actor",
+                    ));
+                }
+                if let Some(command) = &self.command {
+                    if activation.command_sequence != command.sequence {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "durable transition workflow activation command sequence does not match accepted command",
+                        ));
+                    }
+                }
+            }
+        }
+
         if self
             .domain_events
             .iter()
@@ -3661,6 +3723,7 @@ mod durable_transition_tests {
             snapshot: Some(snapshot(actor_id, sequence, &[("count", sequence as i64)])),
             workflow_events: vec![WorkflowEvent::StepCompleted {
                 sequence,
+                activation: Some(WorkflowActivationId::new(actor_id, sequence)),
                 step_name: format!("step-{sequence}"),
             }],
             domain_events: vec![EventEntry {
@@ -3678,6 +3741,52 @@ mod durable_transition_tests {
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }],
         }
+    }
+
+    #[test]
+    fn legacy_terminal_event_serialization_omits_absent_activation() {
+        let event = WorkflowEvent::StepCompleted {
+            sequence: 1,
+            activation: None,
+            step_name: "legacy".to_string(),
+        };
+
+        let encoded = serde_json::to_value(event).unwrap();
+        let value = encoded
+            .get("value")
+            .and_then(serde_json::Value::as_object)
+            .expect("StepCompleted content object");
+
+        assert!(
+            !value.contains_key("activation"),
+            "legacy serialization must not add activation:null and change durable digests"
+        );
+    }
+
+    #[test]
+    fn durable_transition_rejects_terminal_activation_for_wrong_actor() {
+        let mut candidate = transition(10, 1, 1);
+        candidate.workflow_events = vec![WorkflowEvent::StepCompleted {
+            sequence: 1,
+            activation: Some(WorkflowActivationId::new(11, 1)),
+            step_name: "step-1".to_string(),
+        }];
+
+        let error = candidate.digest().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn durable_transition_rejects_terminal_activation_for_wrong_command_sequence() {
+        let mut candidate = transition(10, 1, 1);
+        candidate.workflow_events = vec![WorkflowEvent::StepCompleted {
+            sequence: 1,
+            activation: Some(WorkflowActivationId::new(10, 99)),
+            step_name: "step-1".to_string(),
+        }];
+
+        let error = candidate.digest().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -3823,6 +3932,7 @@ mod libsql_atomic_transition_tests {
             workflow_events: vec![
                 WorkflowEvent::StepCompleted {
                     sequence,
+                    activation: Some(WorkflowActivationId::new(actor_id, sequence)),
                     step_name: "persist".to_string(),
                 },
                 WorkflowEvent::Custom {
