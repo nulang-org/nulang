@@ -143,12 +143,13 @@ fn main() -> Result<(), String> {
             // Before new writes, advance the WAL base to the snapshot sequence
             // so future records are never assigned sequence numbers recovery
             // would treat as already included in the snapshot.
-            let wal = if !wal_path.exists() || report.wal_last_sequence < report.snapshot_sequence {
-                CacheWal::create_after(&wal_path, report.snapshot_sequence)
-            } else {
-                CacheWal::open(&wal_path)
-            }
-            .map_err(|error| format!("failed to open cache WAL: {error}"))?;
+            let wal =
+                if !wal_path.exists() || report.wal_last_sequence < report.snapshot_sequence {
+                    CacheWal::create_after(&wal_path, report.snapshot_sequence)
+                } else {
+                    CacheWal::open(&wal_path)
+                }
+                .map_err(|error| format!("failed to open cache WAL: {error}"))?;
 
             eprintln!(
                 "nulang-cache recovered snapshot_seq={} wal_base={} wal_last={} replayed={}",
@@ -160,14 +161,7 @@ fn main() -> Result<(), String> {
 
             let durable = DurableCacheStore::with_wal(store, wal, args.durability)
                 .map_err(|error| format!("failed to configure cache durability: {error}"))?;
-            CacheShardServer::bind_durable(
-                args.bind,
-                dispatcher,
-                inbox,
-                durable,
-                config,
-                clock,
-            )
+            CacheShardServer::bind_durable(args.bind, dispatcher, inbox, durable, config, clock)
         }
     }
     .map_err(|error| format!("failed to bind cache server: {error:?}"))?;
