@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Actor A/B benchmark build diagnostics — 2026-09-25
+- **Failed base/candidate Cargo builds now preserve their captured compiler output in CI logs.** The same-host A/B harness re-emits combined stdout/stderr before raising, so build-stage failures no longer collapse into an opaque Python `CalledProcessError`; a focused Python regression test pins the behavior.
+
 ### Runtime hot-path benchmark decomposition — 2026-09-25
 - **The same-host A/B harness now reports a mailbox-only one-value admission lower bound alongside the full runtime enqueue sweep.** This exposes the cost above message construction/mailbox admission before actor-routing or scheduler changes are justified.
 - **The actor A/B harness now measures AOT against warmed bytecode/JIT on the exact same 50k-message actor drain.** Bytecode is warmed past tier-up, enqueue time is excluded for both paths, and the harness prints the direct AOT speedup while retaining the existing AOT history record.
