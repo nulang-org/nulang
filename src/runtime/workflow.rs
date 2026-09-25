@@ -29,6 +29,37 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// Begin a newly accepted workflow command and reset its deterministic operation stream.
+pub(crate) fn begin_workflow_activation(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: WorkflowActivationId,
+) {
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.current_workflow_activation = Some(activation);
+        actor.current_workflow_operation_ordinal = 0;
+    }
+}
+
+/// Restore an in-memory suspended activation without resetting its operation cursor.
+pub(crate) fn resume_workflow_activation(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<WorkflowActivationId>,
+) {
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.current_workflow_activation = activation;
+    }
+}
+
+/// Clear active execution ownership while retaining the ordinal for a possible
+/// in-memory resume. A later newly accepted command resets the ordinal to zero.
+pub(crate) fn clear_workflow_activation(rt: &mut Runtime, actor_id: u64) {
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.current_workflow_activation = None;
+    }
+}
+
 /// Allocate the next deterministic replay ordinal for the active workflow command.
 pub(crate) fn next_workflow_operation_id(
     rt: &mut Runtime,
