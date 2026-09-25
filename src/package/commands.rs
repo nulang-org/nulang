@@ -2596,6 +2596,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wasm_build_compiler_args_include_bound_behavior_sidecar() {
+        let args = wasm_build_compiler_args(
+            "orders",
+            "0.4.0",
+            "src/main.nula",
+            ".nula/dist/orders.wasm",
+            ".nula/dist/orders.behavior.json",
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "--backend",
+                "wasm-aot",
+                "--out",
+                ".nula/dist/orders.wasm",
+                "--emit-behavior-manifest",
+                ".nula/dist/orders.behavior.json",
+                "--behavior-package-name",
+                "orders",
+                "--behavior-package-version",
+                "0.4.0",
+                "src/main.nula",
+            ]
+        );
+    }
+
+    #[test]
     fn test_manifest_language_pin() {
         let dir = std::env::temp_dir().join(format!("nulang_lang_pin_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
