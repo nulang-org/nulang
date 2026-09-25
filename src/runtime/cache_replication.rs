@@ -597,7 +597,9 @@ pub fn decode_replication_frame(bytes: &[u8]) -> io::Result<CacheReplicationReco
             .expect("fixed replication payload-length slice"),
     ) as usize;
     if payload_len > MAX_REPLICATION_PAYLOAD_BYTES {
-        return Err(invalid_data("cache replication payload exceeds maximum size"));
+        return Err(invalid_data(
+            "cache replication payload exceeds maximum size",
+        ));
     }
 
     let expected_len = REPLICATION_HEADER_BYTES
@@ -678,11 +680,15 @@ mod tests {
         );
 
         assert_eq!(
-            replica.apply(&integer_record(11, 1, b"k", 1), 0, 1_000).unwrap(),
+            replica
+                .apply(&integer_record(11, 1, b"k", 1), 0, 1_000)
+                .unwrap(),
             CacheReplicaApply::Applied { sequence: 1 }
         );
         assert_eq!(
-            replica.apply(&integer_record(11, 2, b"k", 2), 0, 1_000).unwrap(),
+            replica
+                .apply(&integer_record(11, 2, b"k", 2), 0, 1_000)
+                .unwrap(),
             CacheReplicaApply::Applied { sequence: 2 }
         );
         assert_eq!(replica.applied_sequence(), 2);
@@ -745,7 +751,9 @@ mod tests {
 
         replica.fence_epoch(9).unwrap();
         assert_eq!(
-            replica.apply(&integer_record(9, 4, b"k", 4), 0, 1_000).unwrap(),
+            replica
+                .apply(&integer_record(9, 4, b"k", 4), 0, 1_000)
+                .unwrap(),
             CacheReplicaApply::Applied { sequence: 4 }
         );
     }
