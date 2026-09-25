@@ -1787,6 +1787,88 @@ fn run_frontend(
     Ok((ast, type_checker))
 }
 
+#[derive(Clone, Copy)]
+struct BehaviorManifestOutput<'a> {
+    path: &'a str,
+    package_name: &'a str,
+    package_version: &'a str,
+}
+
+#[cfg(feature = "wasm-backend")]
+fn build_wasm_behavior_manifest(
+    source: &str,
+    package_name: &str,
+    package_version: &str,
+    hir: &nulang::hir::Module,
+    mir: &nulang::mir::Module,
+    wasm_bytes: &[u8],
+) -> NuResult<nulang::behavior_manifest::BehaviorManifest> {
+    let artifact_identity = nulang::compiler_identity::artifact_identity_for_typed_program(
+        Some(source.as_bytes()),
+        hir,
+        mir,
+        [],
+        concat!("nulang-rust-", env!("CARGO_PKG_VERSION")),
+        "wasm32",
+        nulang::host_effect_abi::HOST_EFFECT_ABI_SCHEMA,
+        "wasm",
+        std::iter::empty::<&str>(),
+    )
+    .map_err(|error| nulang::types::NuError::VMError {
+        msg: format!("failed to derive WASM artifact semantic identity: {error}"),
+        span: Span::default(),
+    })?;
+
+    nulang::behavior_manifest::BehaviorManifest::from_typed_hir(
+        package_name,
+        package_version,
+        &artifact_identity,
+        wasm_bytes,
+        hir,
+    )
+    .map_err(|error| nulang::types::NuError::VMError {
+        msg: format!("failed to build WASM behavior manifest: {error}"),
+        span: Span::default(),
+    })
+}
+
+#[cfg(feature = "wasm-backend")]
+fn emit_wasm_behavior_manifest(
+    source: &str,
+    hir: &nulang::hir::Module,
+    mir: &nulang::mir::Module,
+    wasm_bytes: &[u8],
+    output: BehaviorManifestOutput<'_>,
+) -> NuResult<()> {
+    let manifest = build_wasm_behavior_manifest(
+        source,
+        output.package_name,
+        output.package_version,
+        hir,
+        mir,
+        wasm_bytes,
+    )?;
+    let bytes = manifest
+        .to_json()
+        .map_err(|error| nulang::types::NuError::VMError {
+            msg: format!("failed to serialize WASM behavior manifest: {error}"),
+            span: Span::default(),
+        })?;
+    std::fs::write(output.path, bytes).map_err(|error| nulang::types::NuError::VMError {
+        msg: format!("failed to write behavior manifest {}: {error}", output.path),
+        span: Span::default(),
+    })?;
+    println!(
+        "Wrote {} ({}, {})",
+        output.path,
+        manifest.schema,
+        manifest
+            .digest()
+            .unwrap_or_else(|_| "digest-unavailable".to_string())
+    );
+    Ok(())
+}
+
 #[cfg_attr(not(feature = "wasm-backend"), allow(unused_variables))]
 fn run_source(
     source: &str,
@@ -1799,6 +1881,7 @@ fn run_source(
     with_capabilities: &[String],
     store_path: Option<&str>,
     deny_warnings: bool,
+    behavior_manifest_output: Option<BehaviorManifestOutput<'_>>,
 ) -> NuResult<()> {
     let (ast, type_checker) =
         run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
