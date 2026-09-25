@@ -3738,6 +3738,7 @@ mod durable_transition_tests {
             expected_previous_sequence: sequence - 1,
             command: Some(JournalEntry {
                 sequence,
+                activation_id: None,
                 behavior_id: 7,
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }),
@@ -3900,6 +3901,7 @@ mod libsql_atomic_transition_tests {
             expected_previous_sequence: sequence - 1,
             command: Some(JournalEntry {
                 sequence,
+                activation_id: None,
                 behavior_id: 3,
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }),
