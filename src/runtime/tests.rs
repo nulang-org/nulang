@@ -7587,3 +7587,66 @@ fn workflow_activation_analysis_rejects_untagged_terminal_after_upgrade() {
         )
     ));
 }
+
+
+#[test]
+fn workflow_custom_events_use_activation_operation_ordinals() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "OperationIdentityWorkflow",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    let activation = WorkflowActivationId::new(actor_id, 41);
+    super::workflow::begin_workflow_activation(&mut rt, activation, false);
+
+    rt.emit_event(actor_id, "first", &[Value::int(1)]);
+    rt.emit_event(actor_id, "second", &[Value::int(2)]);
+
+    let custom = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::Custom {
+                operation_id,
+                name,
+                ..
+            } => Some((operation_id, name)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        custom,
+        vec![
+            (Some(activation.operation(0)), "first".to_string()),
+            (Some(activation.operation(1)), "second".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn workflow_durable_effect_ids_share_activation_operation_sequence() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "DurableEffectIdentityWorkflow",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    let activation = WorkflowActivationId::new(actor_id, 51);
+    super::workflow::begin_workflow_activation(&mut rt, activation, false);
+
+    rt.emit_event(actor_id, "audit", &[]);
+    let effect_id = rt
+        .next_workflow_durable_effect_id(actor_id, "Provider.ask")
+        .expect("live activation should allocate durable effect identity");
+
+    assert_eq!(
+        effect_id,
+        crate::durable_effect::DurableEffectId::derive_from_workflow_operation(
+            activation.operation(1),
+            "Provider.ask",
+        )
+    );
+}
