@@ -3725,6 +3725,52 @@ mod durable_transition_tests {
     }
 
     #[test]
+    fn legacy_terminal_event_serialization_omits_absent_activation() {
+        let event = WorkflowEvent::StepCompleted {
+            sequence: 1,
+            activation: None,
+            step_name: "legacy".to_string(),
+        };
+
+        let encoded = serde_json::to_value(event).unwrap();
+        let value = encoded
+            .get("value")
+            .and_then(serde_json::Value::as_object)
+            .expect("StepCompleted content object");
+
+        assert!(
+            !value.contains_key("activation"),
+            "legacy serialization must not add activation:null and change durable digests"
+        );
+    }
+
+    #[test]
+    fn durable_transition_rejects_terminal_activation_for_wrong_actor() {
+        let mut candidate = transition(10, 1, 1);
+        candidate.workflow_events = vec![WorkflowEvent::StepCompleted {
+            sequence: 1,
+            activation: Some(WorkflowActivationId::new(11, 1)),
+            step_name: "step-1".to_string(),
+        }];
+
+        let error = candidate.digest().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn durable_transition_rejects_terminal_activation_for_wrong_command_sequence() {
+        let mut candidate = transition(10, 1, 1);
+        candidate.workflow_events = vec![WorkflowEvent::StepCompleted {
+            sequence: 1,
+            activation: Some(WorkflowActivationId::new(10, 99)),
+            step_name: "step-1".to_string(),
+        }];
+
+        let error = candidate.digest().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn memory_store_commits_transition_as_one_logical_unit() {
         let mut store = MemoryStore::new();
         let committed = store.commit_transition(transition(10, 1, 1)).unwrap();
