@@ -7,11 +7,12 @@
 use std::collections::HashMap;
 use std::io;
 
-use super::cache::CacheStore;
-use super::cache_routing::CacheShardOwner;
+use super::cache::{CacheConfig, CacheEvictionPolicy, CacheStore};
 use super::cache_persistence::{
-    apply_wal_mutation, decode_mutation, encode_mutation, CacheWalMutation,
+    apply_wal_mutation, decode_mutation, encode_cache_snapshot, encode_mutation,
+    restore_cache_snapshot, CacheWalMutation,
 };
+use super::cache_routing::CacheShardOwner;
 
 const REPLICATION_MAGIC: &[u8; 8] = b"NLCREP01";
 const REPLICA_ACK_MAGIC: &[u8; 8] = b"NLCACK01";
@@ -59,6 +60,213 @@ pub enum CacheReplicaAckError {
 pub struct CacheReplicaAckTracker {
     placement_epoch: u64,
     acknowledgements: HashMap<CacheShardOwner, u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheReplicaBootstrapManifest {
+    pub placement_epoch: u64,
+    pub snapshot_sequence: u64,
+    pub snapshot_bytes: u64,
+    pub snapshot_checksum: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheReplicaBootstrapChunk {
+    pub placement_epoch: u64,
+    pub snapshot_sequence: u64,
+    pub offset: u64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheReplicaBootstrapError {
+    EpochMismatch { expected: u64, received: u64 },
+    SequenceMismatch { expected: u64, received: u64 },
+    OffsetMismatch { expected: u64, received: u64 },
+    SnapshotTooLarge { bytes: u64, limit: u64 },
+    SizeExceeded { expected: u64, received: u64 },
+    Incomplete { expected: u64, received: u64 },
+    ChecksumMismatch,
+    SnapshotSequenceMismatch { manifest: u64, decoded: u64 },
+    RestoreFailed(io::ErrorKind),
+}
+
+#[derive(Debug)]
+pub struct CacheReplicaBootstrapAssembler {
+    manifest: CacheReplicaBootstrapManifest,
+    bytes: Vec<u8>,
+}
+
+impl CacheReplicaBootstrapAssembler {
+    pub fn new(
+        expected_epoch: u64,
+        manifest: CacheReplicaBootstrapManifest,
+        max_snapshot_bytes: usize,
+    ) -> Result<Self, CacheReplicaBootstrapError> {
+        if manifest.placement_epoch != expected_epoch {
+            return Err(CacheReplicaBootstrapError::EpochMismatch {
+                expected: expected_epoch,
+                received: manifest.placement_epoch,
+            });
+        }
+        let limit = max_snapshot_bytes as u64;
+        if manifest.snapshot_bytes > limit {
+            return Err(CacheReplicaBootstrapError::SnapshotTooLarge {
+                bytes: manifest.snapshot_bytes,
+                limit,
+            });
+        }
+        let capacity = usize::try_from(manifest.snapshot_bytes).map_err(|_| {
+            CacheReplicaBootstrapError::SnapshotTooLarge {
+                bytes: manifest.snapshot_bytes,
+                limit,
+            }
+        })?;
+        Ok(Self {
+            manifest,
+            bytes: Vec::with_capacity(capacity),
+        })
+    }
+
+    pub fn received_bytes(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    pub fn push_chunk(
+        &mut self,
+        chunk: CacheReplicaBootstrapChunk,
+    ) -> Result<(), CacheReplicaBootstrapError> {
+        if chunk.placement_epoch != self.manifest.placement_epoch {
+            return Err(CacheReplicaBootstrapError::EpochMismatch {
+                expected: self.manifest.placement_epoch,
+                received: chunk.placement_epoch,
+            });
+        }
+        if chunk.snapshot_sequence != self.manifest.snapshot_sequence {
+            return Err(CacheReplicaBootstrapError::SequenceMismatch {
+                expected: self.manifest.snapshot_sequence,
+                received: chunk.snapshot_sequence,
+            });
+        }
+
+        let expected_offset = self.bytes.len() as u64;
+        if chunk.offset != expected_offset {
+            return Err(CacheReplicaBootstrapError::OffsetMismatch {
+                expected: expected_offset,
+                received: chunk.offset,
+            });
+        }
+
+        let received = expected_offset.saturating_add(chunk.data.len() as u64);
+        if received > self.manifest.snapshot_bytes {
+            return Err(CacheReplicaBootstrapError::SizeExceeded {
+                expected: self.manifest.snapshot_bytes,
+                received,
+            });
+        }
+        self.bytes.extend_from_slice(&chunk.data);
+        Ok(())
+    }
+
+    pub fn finish(
+        self,
+        config: CacheConfig,
+        eviction_policy: CacheEvictionPolicy,
+        store_now_ms: u64,
+        wall_now_ms: u64,
+    ) -> Result<CacheReplicaApplier, CacheReplicaBootstrapError> {
+        let received = self.bytes.len() as u64;
+        if received != self.manifest.snapshot_bytes {
+            return Err(CacheReplicaBootstrapError::Incomplete {
+                expected: self.manifest.snapshot_bytes,
+                received,
+            });
+        }
+
+        let checksum = blake3::hash(&self.bytes);
+        if checksum.as_bytes() != &self.manifest.snapshot_checksum {
+            return Err(CacheReplicaBootstrapError::ChecksumMismatch);
+        }
+
+        let (store, decoded_sequence) = restore_cache_snapshot(
+            &self.bytes,
+            config,
+            eviction_policy,
+            store_now_ms,
+            wall_now_ms,
+        )
+        .map_err(|error| CacheReplicaBootstrapError::RestoreFailed(error.kind()))?;
+        if decoded_sequence != self.manifest.snapshot_sequence {
+            return Err(CacheReplicaBootstrapError::SnapshotSequenceMismatch {
+                manifest: self.manifest.snapshot_sequence,
+                decoded: decoded_sequence,
+            });
+        }
+
+        Ok(CacheReplicaApplier::new(
+            self.manifest.placement_epoch,
+            decoded_sequence,
+            store,
+        ))
+    }
+}
+
+pub fn capture_replica_bootstrap(
+    placement_epoch: u64,
+    store: &CacheStore,
+    snapshot_sequence: u64,
+    store_now_ms: u64,
+    wall_now_ms: u64,
+) -> io::Result<(CacheReplicaBootstrapManifest, Vec<u8>)> {
+    let snapshot = encode_cache_snapshot(store, snapshot_sequence, store_now_ms, wall_now_ms)?;
+    let snapshot_checksum = *blake3::hash(&snapshot).as_bytes();
+    Ok((
+        CacheReplicaBootstrapManifest {
+            placement_epoch,
+            snapshot_sequence,
+            snapshot_bytes: snapshot.len() as u64,
+            snapshot_checksum,
+        },
+        snapshot,
+    ))
+}
+
+pub fn replica_bootstrap_chunks(
+    manifest: &CacheReplicaBootstrapManifest,
+    snapshot: &[u8],
+    chunk_size: usize,
+) -> io::Result<Vec<CacheReplicaBootstrapChunk>> {
+    if chunk_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cache replica bootstrap chunk size must be non-zero",
+        ));
+    }
+    if snapshot.len() as u64 != manifest.snapshot_bytes {
+        return Err(invalid_data(
+            "cache replica bootstrap snapshot size mismatch",
+        ));
+    }
+    if blake3::hash(snapshot).as_bytes() != &manifest.snapshot_checksum {
+        return Err(invalid_data(
+            "cache replica bootstrap snapshot checksum mismatch",
+        ));
+    }
+
+    let mut chunks = Vec::with_capacity(snapshot.len().div_ceil(chunk_size));
+    for (index, data) in snapshot.chunks(chunk_size).enumerate() {
+        let offset = index
+            .checked_mul(chunk_size)
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| invalid_data("cache replica bootstrap offset overflow"))?;
+        chunks.push(CacheReplicaBootstrapChunk {
+            placement_epoch: manifest.placement_epoch,
+            snapshot_sequence: manifest.snapshot_sequence,
+            offset,
+            data: data.to_vec(),
+        });
+    }
+    Ok(chunks)
 }
 
 impl CacheReplicaAckTracker {
@@ -746,6 +954,128 @@ mod tests {
             CacheReplicaAckError::StaleEpoch {
                 current: 6,
                 received: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn chunked_bootstrap_installs_snapshot_and_resumes_at_snapshot_sequence() {
+        let mut source = CacheStore::new();
+        source.set_bytes(b"persistent", b"value", None, 100);
+        source.set_integer(b"ttl", 42, Some(10_000), 100);
+
+        let (manifest, snapshot) =
+            capture_replica_bootstrap(31, &source, 77, 1_100, 1_000_000).unwrap();
+        assert_eq!(manifest.placement_epoch, 31);
+        assert_eq!(manifest.snapshot_sequence, 77);
+        assert_eq!(manifest.snapshot_bytes, snapshot.len() as u64);
+
+        let chunks = replica_bootstrap_chunks(&manifest, &snapshot, 7).unwrap();
+        assert!(chunks.len() > 1);
+
+        let mut assembler =
+            CacheReplicaBootstrapAssembler::new(31, manifest, snapshot.len() + 1).unwrap();
+        for chunk in chunks {
+            assembler.push_chunk(chunk).unwrap();
+        }
+
+        let mut replica = assembler
+            .finish(
+                CacheConfig::default(),
+                CacheEvictionPolicy::S3Fifo,
+                50,
+                1_002_000,
+            )
+            .unwrap();
+        assert_eq!(replica.placement_epoch(), 31);
+        assert_eq!(replica.applied_sequence(), 77);
+        assert_eq!(
+            replica.store_mut().get(b"persistent", 50),
+            Some(CacheValueView::Bytes(b"value"))
+        );
+        assert_eq!(
+            replica.store_mut().get(b"ttl", 50),
+            Some(CacheValueView::Integer(42))
+        );
+        assert_eq!(
+            replica.store_mut().ttl(b"ttl", 50),
+            crate::runtime::CacheTtl::RemainingMs(7_000)
+        );
+    }
+
+    #[test]
+    fn bootstrap_rejects_out_of_order_chunk_before_install() {
+        let mut source = CacheStore::new();
+        source.set_integer(b"k", 1, None, 0);
+        let (manifest, snapshot) = capture_replica_bootstrap(9, &source, 4, 0, 1_000).unwrap();
+        let mut chunks = replica_bootstrap_chunks(&manifest, &snapshot, 8).unwrap();
+        assert!(chunks.len() > 1);
+
+        let second = chunks.remove(1);
+        let mut assembler =
+            CacheReplicaBootstrapAssembler::new(9, manifest, snapshot.len()).unwrap();
+        let error = assembler.push_chunk(second).unwrap_err();
+        assert_eq!(
+            error,
+            CacheReplicaBootstrapError::OffsetMismatch {
+                expected: 0,
+                received: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn bootstrap_rejects_corrupted_snapshot_at_final_checksum() {
+        let mut source = CacheStore::new();
+        source.set_integer(b"k", 1, None, 0);
+        let (manifest, snapshot) =
+            capture_replica_bootstrap(9, &source, 4, 0, 1_000).unwrap();
+        let mut chunks = replica_bootstrap_chunks(&manifest, &snapshot, snapshot.len()).unwrap();
+        chunks[0].data[0] ^= 0x01;
+
+        let mut assembler =
+            CacheReplicaBootstrapAssembler::new(9, manifest, snapshot.len()).unwrap();
+        assembler.push_chunk(chunks.remove(0)).unwrap();
+        let error = assembler
+            .finish(
+                CacheConfig::default(),
+                CacheEvictionPolicy::S3Fifo,
+                0,
+                1_000,
+            )
+            .unwrap_err();
+        assert_eq!(error, CacheReplicaBootstrapError::ChecksumMismatch);
+    }
+
+    #[test]
+    fn bootstrap_manifest_is_fenced_by_expected_placement_epoch() {
+        let mut source = CacheStore::new();
+        source.set_integer(b"k", 1, None, 0);
+        let (manifest, _snapshot) = capture_replica_bootstrap(12, &source, 4, 0, 1_000).unwrap();
+
+        let error = CacheReplicaBootstrapAssembler::new(13, manifest, usize::MAX).unwrap_err();
+        assert_eq!(
+            error,
+            CacheReplicaBootstrapError::EpochMismatch {
+                expected: 13,
+                received: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn bootstrap_manifest_respects_receiver_size_limit() {
+        let mut source = CacheStore::new();
+        source.set_bytes(b"k", &[7; 128], None, 0);
+        let (manifest, snapshot) = capture_replica_bootstrap(2, &source, 1, 0, 1_000).unwrap();
+
+        let error =
+            CacheReplicaBootstrapAssembler::new(2, manifest, snapshot.len() - 1).unwrap_err();
+        assert_eq!(
+            error,
+            CacheReplicaBootstrapError::SnapshotTooLarge {
+                bytes: snapshot.len() as u64,
+                limit: (snapshot.len() - 1) as u64,
             }
         );
     }

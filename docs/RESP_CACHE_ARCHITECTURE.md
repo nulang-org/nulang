@@ -231,9 +231,17 @@ the primary's local sequence, and keeps progress monotonic per replica. Epoch
 advancement clears prior-epoch acknowledgement credit so stale replicas cannot
 satisfy a new-term write requirement.
 
-Transport integration, bootstrap snapshot transfer, and promotion remain
-follow-up work. The default cache path continues to run without WAL,
-replication, or consensus work.
+Replica bootstrap now uses the exact snapshot codec used for local crash
+recovery. The sender captures a manifest containing placement epoch, snapshot
+WAL sequence, byte length, and BLAKE3 digest, then slices the snapshot into
+bounded chunks. The receiver requires the expected placement epoch, exact
+contiguous offsets, a configured maximum snapshot size, exact final byte count,
+and whole-snapshot checksum before restoring `CacheStore`. The resulting
+replica applier resumes at the snapshot sequence, so incremental replication
+continues at sequence + 1 without a second state format.
+
+Transport integration and promotion remain follow-up work. The default cache
+path continues to run without WAL, replication, or consensus work.
 
 ## Performance gates
 
@@ -278,8 +286,8 @@ surface.
 4. Connect remote transparent handoffs to a cache-specific cluster transport.
 5. Add asynchronous snapshot/compaction so periodic checkpoints do not block
    the shard reactor.
-6. Connect replication/ack frames to a cache transport, add bootstrap snapshot
-   transfer, then promotion / failover fencing.
+6. Connect replication/ack/bootstrap messages to a cache transport, then add
+   promotion / failover fencing.
 7. Add packed aggregate structures, then expand RESP compatibility and add
    Nulang-native leases, locks, semaphores,
    fencing tokens, queues, and stored functions where they fit the product

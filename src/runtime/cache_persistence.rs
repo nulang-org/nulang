@@ -487,13 +487,12 @@ impl CacheWal {
     }
 }
 
-pub fn write_cache_snapshot(
-    path: impl AsRef<Path>,
+pub fn encode_cache_snapshot(
     store: &CacheStore,
     wal_sequence: u64,
     store_now_ms: u64,
     wall_now_ms: u64,
-) -> io::Result<()> {
+) -> io::Result<Vec<u8>> {
     let entries = store.snapshot_entries(store_now_ms);
     let mut bytes = Vec::new();
     bytes.extend_from_slice(SNAPSHOT_MAGIC);
@@ -526,6 +525,17 @@ pub fn write_cache_snapshot(
 
     let checksum = blake3::hash(&bytes);
     bytes.extend_from_slice(checksum.as_bytes());
+    Ok(bytes)
+}
+
+pub fn write_cache_snapshot(
+    path: impl AsRef<Path>,
+    store: &CacheStore,
+    wal_sequence: u64,
+    store_now_ms: u64,
+    wall_now_ms: u64,
+) -> io::Result<()> {
+    let bytes = encode_cache_snapshot(store, wal_sequence, store_now_ms, wall_now_ms)?;
     atomic_write(path.as_ref(), &bytes)
 }
 
@@ -649,15 +659,10 @@ fn recovered_ttl(expires_unix_ms: Option<u64>, wall_now_ms: u64) -> Option<Optio
     }
 }
 
-fn load_cache_snapshot(
-    path: &Path,
+pub fn decode_cache_snapshot(
+    bytes: &[u8],
     wall_now_ms: u64,
 ) -> io::Result<(u64, Vec<CacheSnapshotEntry>)> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((0, Vec::new())),
-        Err(error) => return Err(error),
-    };
     if bytes.len() < 8 + 2 + 8 + 8 + 8 + CHECKSUM_BYTES {
         return Err(invalid_data("cache snapshot is truncated"));
     }
@@ -711,6 +716,31 @@ fn load_cache_snapshot(
     }
     decoder.finish()?;
     Ok((wal_sequence, entries))
+}
+
+pub fn restore_cache_snapshot(
+    bytes: &[u8],
+    config: CacheConfig,
+    eviction_policy: CacheEvictionPolicy,
+    store_now_ms: u64,
+    wall_now_ms: u64,
+) -> io::Result<(CacheStore, u64)> {
+    let (wal_sequence, entries) = decode_cache_snapshot(bytes, wall_now_ms)?;
+    let store = CacheStore::from_snapshot(config, eviction_policy, &entries, store_now_ms)
+        .map_err(cache_write_error)?;
+    Ok((store, wal_sequence))
+}
+
+fn load_cache_snapshot(
+    path: &Path,
+    wall_now_ms: u64,
+) -> io::Result<(u64, Vec<CacheSnapshotEntry>)> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((0, Vec::new())),
+        Err(error) => return Err(error),
+    };
+    decode_cache_snapshot(&bytes, wall_now_ms)
 }
 
 struct WalScan {
