@@ -172,65 +172,7 @@ fn bench_ab_enqueue_payload_sweep() {
 }
 
 #[cfg(feature = "native-codegen")]
-#[test]
-fn bench_ab_jit_tiering_crossover() {
-    const REPEATS: usize = 20;
-
-    for trips in [3_000usize, 4_000, 5_000, 7_500] {
-        let source = format!(
-            "var sum = 0; var i = 0; while i < {trips} {{ sum = sum + i * 3 - i / 7; i = i + 1; }}; sum"
-        );
-        let module = compile_ab_module(&source, "bench-ab-tiering");
-
-        let mut interp_vms: Vec<VM> = (0..REPEATS)
-            .map(|_| {
-                let mut vm = VM::new_without_jit();
-                vm.load_module(module.clone());
-                vm
-            })
-            .collect();
-        let interp_start = Instant::now();
-        let mut interp_result = None;
-        for vm in &mut interp_vms {
-            interp_result = Some(vm.run().expect("bench: interpreter run failed"));
-        }
-        let interp_elapsed = interp_start.elapsed();
-
-        let mut jit_vms: Vec<VM> = (0..REPEATS)
-            .map(|_| {
-                let mut vm = VM::new();
-                vm.load_module(module.clone());
-                vm
-            })
-            .collect();
-        let jit_start = Instant::now();
-        let mut jit_result = None;
-        for vm in &mut jit_vms {
-            jit_result = Some(vm.run().expect("bench: first-run JIT failed"));
-        }
-        let jit_elapsed = jit_start.elapsed();
-
-        assert_eq!(
-            interp_result.and_then(|value| value.as_int()),
-            jit_result.and_then(|value| value.as_int()),
-            "tiering crossover probe must preserve interpreter/JIT parity"
-        );
-        report_ab(
-            &format!("tier_interp_{trips}"),
-            REPEATS as u64,
-            interp_elapsed,
-        );
-        report_ab(
-            &format!("tier_jit_first_{trips}"),
-            REPEATS as u64,
-            jit_elapsed,
-        );
-    }
-}
-
-#[cfg(feature = "native-codegen")]
-#[test]
-fn bench_ab_jit_warm_execution() {
+fn run_ab_jit_warm_execution_probe() {
     const REPEATS: usize = 10;
     const TRIPS: usize = 100_000;
 
@@ -295,6 +237,69 @@ fn bench_ab_jit_warm_execution() {
         );
         report_ab(name, REPEATS as u64, elapsed);
     }
+}
+
+
+#[cfg(feature = "native-codegen")]
+#[test]
+fn bench_ab_jit_tiering_crossover() {
+    const REPEATS: usize = 20;
+
+    for trips in [3_000usize, 4_000, 5_000, 7_500] {
+        let source = format!(
+            "var sum = 0; var i = 0; while i < {trips} {{ sum = sum + i * 3 - i / 7; i = i + 1; }}; sum"
+        );
+        let module = compile_ab_module(&source, "bench-ab-tiering");
+
+        let mut interp_vms: Vec<VM> = (0..REPEATS)
+            .map(|_| {
+                let mut vm = VM::new_without_jit();
+                vm.load_module(module.clone());
+                vm
+            })
+            .collect();
+        let interp_start = Instant::now();
+        let mut interp_result = None;
+        for vm in &mut interp_vms {
+            interp_result = Some(vm.run().expect("bench: interpreter run failed"));
+        }
+        let interp_elapsed = interp_start.elapsed();
+
+        let mut jit_vms: Vec<VM> = (0..REPEATS)
+            .map(|_| {
+                let mut vm = VM::new();
+                vm.load_module(module.clone());
+                vm
+            })
+            .collect();
+        let jit_start = Instant::now();
+        let mut jit_result = None;
+        for vm in &mut jit_vms {
+            jit_result = Some(vm.run().expect("bench: first-run JIT failed"));
+        }
+        let jit_elapsed = jit_start.elapsed();
+
+        assert_eq!(
+            interp_result.and_then(|value| value.as_int()),
+            jit_result.and_then(|value| value.as_int()),
+            "tiering crossover probe must preserve interpreter/JIT parity"
+        );
+        report_ab(
+            &format!("tier_interp_{trips}"),
+            REPEATS as u64,
+            interp_elapsed,
+        );
+        report_ab(
+            &format!("tier_jit_first_{trips}"),
+            REPEATS as u64,
+            jit_elapsed,
+        );
+    }
+    // Keep warmed execution controls inside this already-established A/B test
+    // so the same cargo test filter that emits the tiering records cannot
+    // silently omit the direct-transition signal.
+    run_ab_jit_warm_execution_probe();
+
 }
 
 #[cfg(feature = "native-codegen")]
