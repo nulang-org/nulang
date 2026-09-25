@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Backend-neutral JIT compile telemetry — 2026-09-25
+- **JIT backends now expose compiler-only compile counts and wall time separately from execution timing.** `JitCompileStats` distinguishes fast and optimized native compilations, and `VM::jit_compile_stats` exposes the aggregate without leaking Cranelift internals.
+- **Tier-promotion regressions pin telemetry across fast → optimized replacement.** The existing promotion test now verifies one compile in each tier and consistent aggregate timing.
+- **`nulang-jit-bench` measures cold and warm execution alongside compiler work while checking results against the interpreter oracle.** The JSONL schema in `benchmarks/JIT_CODEGEN.md` is backend-neutral so future native artifact/codegen experiments can be compared without changing the harness.
+
 ### Native JIT codegen backend boundary — 2026-09-24
 - **`JitSession` no longer owns Cranelift modules or reusable Cranelift contexts.** `src/jit/native_codegen.rs` introduces `NativeCodegenBackend`, `NativeCompileRequest`, and specialization requests for scalar, typed, and SIMD lowering.
 - **`CraneliftCodegen` now exclusively owns both compiler tiers.** Fast code still uses `opt_level=none` + single-pass register allocation, optimized code still uses `opt_level=speed` + backtracking, but tier/cache orchestration only sees native entry pointers and compile success/failure.
