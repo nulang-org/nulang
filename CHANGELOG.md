@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Workflow runtime control protocol — 2026-09-25
+- **Added the experimental `nulang-workflow-control/v0alpha1` transport-neutral protocol.** Hosts can start, inspect, signal, cancel, and query Nulang-owned workflows through opaque workflow identifiers without importing runtime internals.
+- **The protocol separates runtime semantics from hosting concerns.** It carries lifecycle snapshots, wait reasons, query results, idempotency keys, and explicit retryable error codes, but no Cloud workflow graph, actor-local ID, persistence record, or transport implementation.
+
 ### Native JIT codegen backend boundary — 2026-09-24
 - **`JitSession` no longer owns Cranelift modules or reusable Cranelift contexts.** `src/jit/native_codegen.rs` introduces `NativeCodegenBackend`, `NativeCompileRequest`, and specialization requests for scalar, typed, and SIMD lowering.
 - **`CraneliftCodegen` now exclusively owns both compiler tiers.** Fast code still uses `opt_level=none` + single-pass register allocation, optimized code still uses `opt_level=speed` + backtracking, but tier/cache orchestration only sees native entry pointers and compile success/failure.
