@@ -333,6 +333,11 @@ impl DurableTimerMutation {
         if set_activation_epoch == 0 || set_sequence == 0 {
             return Err(DurableProtocolError::InvalidTimerGeneration);
         }
+        if set_activation_epoch > transition_activation_epoch
+            || set_sequence > transition_sequence
+        {
+            return Err(DurableProtocolError::InvalidTimerGeneration);
+        }
         if is_set
             && (set_activation_epoch != transition_activation_epoch
                 || set_sequence != transition_sequence)
@@ -342,6 +347,77 @@ impl DurableTimerMutation {
 
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DurableEffectIdValue([u8; 32]);
+
+impl DurableEffectIdValue {
+    pub fn parse(value: &str) -> Result<Self, DurableProtocolError> {
+        if value.len() != 64 {
+            return Err(DurableProtocolError::InvalidDurableEffect);
+        }
+        let bytes = value.as_bytes();
+        let mut out = [0u8; 32];
+        for (index, slot) in out.iter_mut().enumerate() {
+            let hi = decode_hex_lower(bytes[index * 2])
+                .ok_or(DurableProtocolError::InvalidDurableEffect)?;
+            let lo = decode_hex_lower(bytes[index * 2 + 1])
+                .ok_or(DurableProtocolError::InvalidDurableEffect)?;
+            *slot = (hi << 4) | lo;
+        }
+        Ok(Self(out))
+    }
+
+    pub fn derive_compensation(self, compensation_ordinal: u32, operation: &str) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(DURABLE_COMPENSATION_ID_DOMAIN);
+        hasher.update(&self.0);
+        hasher.update(&compensation_ordinal.to_le_bytes());
+        hash_len_prefixed(&mut hasher, operation.as_bytes());
+        Self(*hasher.finalize().as_bytes())
+    }
+}
+
+impl fmt::Display for DurableEffectIdValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for DurableEffectIdValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for DurableEffectIdValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+fn decode_hex_lower(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn hash_len_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,7 +440,7 @@ pub enum DurableDeliverySemantics {
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum DurableEffectMutation {
     Prepared {
-        effect_id: String,
+        effect_id: DurableEffectIdValue,
         operation: String,
         boundary: DurableEffectBoundary,
         delivery: DurableDeliverySemantics,
@@ -373,7 +449,7 @@ pub enum DurableEffectMutation {
         idempotency_key: Option<String>,
     },
     Completed {
-        effect_id: String,
+        effect_id: DurableEffectIdValue,
         operation: String,
         boundary: DurableEffectBoundary,
         delivery: DurableDeliverySemantics,
@@ -383,9 +459,9 @@ pub enum DurableEffectMutation {
         result: Value,
     },
     CompensationPrepared {
-        original_effect_id: String,
+        original_effect_id: DurableEffectIdValue,
         compensation_ordinal: u32,
-        effect_id: String,
+        effect_id: DurableEffectIdValue,
         operation: String,
         boundary: DurableEffectBoundary,
         delivery: DurableDeliverySemantics,
@@ -394,9 +470,9 @@ pub enum DurableEffectMutation {
         idempotency_key: Option<String>,
     },
     CompensationCompleted {
-        original_effect_id: String,
+        original_effect_id: DurableEffectIdValue,
         compensation_ordinal: u32,
-        effect_id: String,
+        effect_id: DurableEffectIdValue,
         operation: String,
         boundary: DurableEffectBoundary,
         delivery: DurableDeliverySemantics,
@@ -411,37 +487,36 @@ impl DurableEffectMutation {
     fn validate(&self) -> Result<(), DurableProtocolError> {
         match self {
             Self::Prepared {
-                effect_id,
                 operation,
                 request_digest,
                 idempotency_key,
                 ..
             } => validate_prepared_effect(
-                effect_id,
                 operation,
                 request_digest,
                 idempotency_key.as_deref(),
             ),
             Self::Completed {
-                effect_id,
                 operation,
                 request_digest,
                 result_digest,
                 ..
-            } => validate_completed_effect(effect_id, operation, request_digest, result_digest),
+            } => validate_completed_effect(operation, request_digest, result_digest),
             Self::CompensationPrepared {
                 original_effect_id,
+                compensation_ordinal,
                 effect_id,
                 operation,
                 request_digest,
                 idempotency_key,
                 ..
             } => {
-                if original_effect_id.trim().is_empty() {
+                if original_effect_id.derive_compensation(*compensation_ordinal, operation)
+                    != *effect_id
+                {
                     return Err(DurableProtocolError::InvalidCompensation);
                 }
                 validate_prepared_effect(
-                    effect_id,
                     operation,
                     request_digest,
                     idempotency_key.as_deref(),
@@ -449,29 +524,30 @@ impl DurableEffectMutation {
             }
             Self::CompensationCompleted {
                 original_effect_id,
+                compensation_ordinal,
                 effect_id,
                 operation,
                 request_digest,
                 result_digest,
                 ..
             } => {
-                if original_effect_id.trim().is_empty() {
+                if original_effect_id.derive_compensation(*compensation_ordinal, operation)
+                    != *effect_id
+                {
                     return Err(DurableProtocolError::InvalidCompensation);
                 }
-                validate_completed_effect(effect_id, operation, request_digest, result_digest)
+                validate_completed_effect(operation, request_digest, result_digest)
             }
         }
     }
 }
 
 fn validate_prepared_effect(
-    effect_id: &str,
     operation: &str,
     request_digest: &str,
     idempotency_key: Option<&str>,
 ) -> Result<(), DurableProtocolError> {
-    if effect_id.trim().is_empty()
-        || operation.trim().is_empty()
+    if operation.trim().is_empty()
         || !valid_blake3_digest(request_digest)
         || idempotency_key.is_some_and(|key| key.trim().is_empty())
     {
@@ -482,13 +558,11 @@ fn validate_prepared_effect(
 }
 
 fn validate_completed_effect(
-    effect_id: &str,
     operation: &str,
     request_digest: &str,
     result_digest: &str,
 ) -> Result<(), DurableProtocolError> {
-    if effect_id.trim().is_empty()
-        || operation.trim().is_empty()
+    if operation.trim().is_empty()
         || !valid_blake3_digest(request_digest)
         || !valid_blake3_digest(result_digest)
     {
@@ -708,7 +782,10 @@ mod tests {
                 due_at_unix_ms: 1_800_000_000_000,
             }],
             durable_effects: vec![DurableEffectMutation::Prepared {
-                effect_id: "eff-01".into(),
+                effect_id: DurableEffectIdValue::parse(
+                    "0101010101010101010101010101010101010101010101010101010101010101",
+                )
+                .unwrap(),
                 operation: "Payment.charge".into(),
                 boundary: DurableEffectBoundary::External,
                 delivery: DurableDeliverySemantics::EffectivelyOnceWithDeduplication,
@@ -896,9 +973,16 @@ mod tests {
     #[test]
     fn compensation_effect_records_preserve_original_linkage() {
         let mutation = DurableEffectMutation::CompensationPrepared {
-            original_effect_id: "eff-original".into(),
+            original_effect_id: DurableEffectIdValue::parse(
+                "1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .unwrap(),
             compensation_ordinal: 2,
-            effect_id: "eff-compensation".into(),
+            effect_id: DurableEffectIdValue::parse(
+                "1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .unwrap()
+            .derive_compensation(2, "Payment.refund"),
             operation: "Payment.refund".into(),
             boundary: DurableEffectBoundary::External,
             delivery: DurableDeliverySemantics::EffectivelyOnceWithDeduplication,
@@ -909,9 +993,20 @@ mod tests {
 
         let value = serde_json::to_value(&mutation).unwrap();
         assert_eq!(value["kind"], "compensation_prepared");
-        assert_eq!(value["original_effect_id"], "eff-original");
+        assert_eq!(
+            value["original_effect_id"],
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        );
         assert_eq!(value["compensation_ordinal"], 2);
-        assert_eq!(value["effect_id"], "eff-compensation");
+        assert_eq!(
+            value["effect_id"],
+            DurableEffectIdValue::parse(
+                "1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .unwrap()
+            .derive_compensation(2, "Payment.refund")
+            .to_string()
+        );
 
         let decoded: DurableEffectMutation = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, mutation);
@@ -920,9 +1015,16 @@ mod tests {
     #[test]
     fn completed_compensation_preserves_linkage_and_result() {
         let mutation = DurableEffectMutation::CompensationCompleted {
-            original_effect_id: "eff-original".into(),
+            original_effect_id: DurableEffectIdValue::parse(
+                "1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .unwrap(),
             compensation_ordinal: 2,
-            effect_id: "eff-compensation".into(),
+            effect_id: DurableEffectIdValue::parse(
+                "1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .unwrap()
+            .derive_compensation(2, "Payment.refund"),
             operation: "Payment.refund".into(),
             boundary: DurableEffectBoundary::External,
             delivery: DurableDeliverySemantics::EffectivelyOnceWithDeduplication,
@@ -935,7 +1037,10 @@ mod tests {
 
         let value = serde_json::to_value(&mutation).unwrap();
         assert_eq!(value["kind"], "compensation_completed");
-        assert_eq!(value["original_effect_id"], "eff-original");
+        assert_eq!(
+            value["original_effect_id"],
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        );
         assert_eq!(value["compensation_ordinal"], 2);
         assert_eq!(value["result"]["refunded"], true);
 
@@ -945,53 +1050,50 @@ mod tests {
 
     #[test]
     fn compensation_effect_requires_original_identity() {
-        let mut invalid = transition();
-        invalid.durable_effects = vec![DurableEffectMutation::CompensationPrepared {
-            original_effect_id: " ".into(),
-            compensation_ordinal: 0,
-            effect_id: "eff-compensation".into(),
-            operation: "Payment.refund".into(),
-            boundary: DurableEffectBoundary::External,
-            delivery: DurableDeliverySemantics::AtLeastOnce,
-            request_digest:
-                "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            idempotency_key: None,
-        }];
+        let value = json!({
+            "kind": "compensation_prepared",
+            "original_effect_id": " ",
+            "compensation_ordinal": 0,
+            "effect_id":
+                "2222222222222222222222222222222222222222222222222222222222222222",
+            "operation": "Payment.refund",
+            "boundary": "external",
+            "delivery": "at_least_once",
+            "request_digest":
+                "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
 
-        assert_eq!(
-            invalid.validate().unwrap_err(),
-            DurableProtocolError::InvalidCompensation
-        );
+        assert!(serde_json::from_value::<DurableEffectMutation>(value).is_err());
     }
 
     #[test]
     fn durable_effect_ids_must_match_runtime_identity_shape() {
-        let mut invalid = transition();
-        invalid.durable_effects = vec![DurableEffectMutation::Prepared {
-            effect_id: "eff-01".into(),
-            operation: "Payment.charge".into(),
-            boundary: DurableEffectBoundary::External,
-            delivery: DurableDeliverySemantics::AtLeastOnce,
-            request_digest:
-                "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            idempotency_key: None,
-        }];
+        let value = json!({
+            "kind": "prepared",
+            "effect_id": "eff-01",
+            "operation": "Payment.charge",
+            "boundary": "external",
+            "delivery": "at_least_once",
+            "request_digest":
+                "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
 
-        assert_eq!(
-            invalid.validate().unwrap_err(),
-            DurableProtocolError::InvalidDurableEffect
-        );
+        assert!(serde_json::from_value::<DurableEffectMutation>(value).is_err());
     }
 
     #[test]
     fn compensation_effect_id_must_match_runtime_derivation() {
         let mut invalid = transition();
         invalid.durable_effects = vec![DurableEffectMutation::CompensationPrepared {
-            original_effect_id:
-                "1111111111111111111111111111111111111111111111111111111111111111".into(),
+            original_effect_id: DurableEffectIdValue::parse(
+                "1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .unwrap(),
             compensation_ordinal: 2,
-            effect_id:
-                "2222222222222222222222222222222222222222222222222222222222222222".into(),
+            effect_id: DurableEffectIdValue::parse(
+                "2222222222222222222222222222222222222222222222222222222222222222",
+            )
+            .unwrap(),
             operation: "Payment.refund".into(),
             boundary: DurableEffectBoundary::External,
             delivery: DurableDeliverySemantics::AtLeastOnce,
