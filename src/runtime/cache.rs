@@ -1598,9 +1598,9 @@ impl CacheStore {
                 };
                 let value = match entry.value {
                     CacheValue::Integer(value) => CacheSnapshotValue::Integer(value),
-                    CacheValue::Bytes(bytes) => CacheSnapshotValue::Bytes(
-                        bytes.as_slice(&self.arena).to_vec(),
-                    ),
+                    CacheValue::Bytes(bytes) => {
+                        CacheSnapshotValue::Bytes(bytes.as_slice(&self.arena).to_vec())
+                    }
                 };
                 Some(CacheSnapshotEntry {
                     key: entry.key.as_slice(&self.arena).to_vec(),
