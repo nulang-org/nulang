@@ -26,6 +26,13 @@ cargo run --release --bin nulang-jit-bench -- \
 Run one workload with `--workload numeric_loop`, `call_loop`, or
 `branch_loop`. Use `--list` to print the workload names.
 
+The `JIT codegen benchmarks` workflow runs the correctness/telemetry
+regression and emits the JSONL runner output as an artifact. Pull requests use
+one repetition as a validation signal; manual dispatches default to five.
+Shared-runner absolute compiler timings are diagnostic rather than a
+longitudinal performance gate—use same-host comparisons or controlled hardware
+for optimization decisions.
+
 ## Metrics
 
 Each JSONL row contains:
