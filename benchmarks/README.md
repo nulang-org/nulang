@@ -43,9 +43,16 @@ again. Only a regression reproduced by that confirmation sample fails `main`.
 The confirmation result becomes the canonical JSON persisted for that commit,
 so a known first-pass outlier does not contaminate the rolling history.
 
-This intentionally does not need a dedicated non-shared runner: the
-noise-adaptive threshold plus confirmation measurement filters isolated shared-
-runner outliers without weakening the regression threshold.
+This intentionally does not need a dedicated non-shared runner for the
+coarse regression gate: the noise-adaptive threshold plus confirmation
+measurement filters isolated shared-runner outliers without weakening the
+regression threshold.
+
+**Do not use cross-commit shared-runner deltas to choose or justify a runtime
+optimization.** They are regression signals, not controlled A/B measurements.
+Performance PRs should use the same-runner Nulang A/B workflow below as the
+primary before/after evidence; a fixed self-hosted runner is preferred when
+longitudinal absolute numbers matter.
 
 ## Cross-runtime Savina baselines
 
