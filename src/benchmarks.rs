@@ -239,7 +239,6 @@ fn run_ab_jit_warm_execution_probe() {
     }
 }
 
-
 #[cfg(feature = "native-codegen")]
 #[test]
 fn bench_ab_jit_tiering_crossover() {
@@ -299,7 +298,6 @@ fn bench_ab_jit_tiering_crossover() {
     // so the same cargo test filter that emits the tiering records cannot
     // silently omit the direct-transition signal.
     run_ab_jit_warm_execution_probe();
-
 }
 
 #[cfg(feature = "native-codegen")]
