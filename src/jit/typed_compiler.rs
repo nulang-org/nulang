@@ -273,7 +273,11 @@ fn apply_type_transfer(instr: &Instruction, module: &CodeModule, state: &mut [Kn
             state[op3] = KnownType::Unknown;
         }
         OpCode::INeg => {
-            state[op2] = KnownType::Int;
+            state[op2] = match state[op1] {
+                KnownType::Int => KnownType::Int,
+                KnownType::Float => KnownType::Float,
+                KnownType::Bool | KnownType::Unknown => KnownType::Unknown,
+            };
         }
         OpCode::IInc | OpCode::IDec => {
             state[op1] = KnownType::Int;
@@ -843,7 +847,13 @@ fn apply_local_type_transfer(instr: &Instruction, state: &mut [KnownType; 256]) 
         | OpCode::BitAnd
         | OpCode::BitOr => state[op3] = KnownType::Int,
         OpCode::IDiv | OpCode::IMod => state[op3] = KnownType::Unknown,
-        OpCode::INeg => state[op2] = KnownType::Int,
+        OpCode::INeg => {
+            state[op2] = match state[op1] {
+                KnownType::Int => KnownType::Int,
+                KnownType::Float => KnownType::Float,
+                KnownType::Bool | KnownType::Unknown => KnownType::Unknown,
+            };
+        }
         OpCode::IInc | OpCode::IDec => state[op1] = KnownType::Int,
         OpCode::FAdd | OpCode::FSub | OpCode::FMul | OpCode::FNeg => {
             state[op3] = KnownType::Float;
@@ -1596,7 +1606,6 @@ pub fn is_opcode_supported_typed(op: OpCode) -> bool {
             | OpCode::IMul
             | OpCode::IDiv
             | OpCode::IMod
-            | OpCode::INeg
             | OpCode::IInc
             | OpCode::IDec
             | OpCode::Xor
