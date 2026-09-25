@@ -302,6 +302,32 @@ pub(crate) fn next_workflow_operation_id(
         .map(WorkflowActivationContext::next_operation_id)
 }
 
+
+/// Begin or re-enter one suspended signal wait.
+///
+/// A re-execution of the same pending wait reuses its identity; only a new
+/// logical wait consumes the next activation-local operation ordinal.
+pub(crate) fn begin_workflow_signal_wait(
+    rt: &mut Runtime,
+    actor_id: u64,
+    name: &str,
+) -> Option<WorkflowOperationId> {
+    if let Some(actor) = rt.actors.get(&actor_id) {
+        if actor.waiting_signal.as_deref() == Some(name) {
+            if let Some(operation_id) = actor.waiting_signal_operation {
+                return Some(operation_id);
+            }
+        }
+    }
+
+    let operation_id = next_workflow_operation_id(rt, actor_id);
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.waiting_signal = Some(name.to_string());
+        actor.waiting_signal_operation = operation_id;
+    }
+    operation_id
+}
+
 fn close_workflow_activation(rt: &mut Runtime, actor_id: u64, id: Option<WorkflowActivationId>) {
     let Some(id) = id else {
         return;
@@ -624,10 +650,18 @@ pub(crate) fn append_signal_received(
     actor_id: u64,
     name: &str,
     payload: Option<String>,
+    operation_id: Option<WorkflowOperationId>,
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_signal_received(actor_id, seq, name.to_string(), payload)?;
+    rt.persistence.append_workflow_event(
+        actor_id,
+        WorkflowEvent::SignalReceived {
+            sequence: seq,
+            operation_id,
+            name: name.to_string(),
+            payload,
+        },
+    )?;
     try_checkpoint_actor(rt, actor_id)?;
     Ok(())
 }
@@ -660,7 +694,14 @@ pub(crate) fn signal_workflow(
     // its durable journal write and checkpoint both succeeded. This remains
     // the legacy two-write path until activation replay (#836) lets workflow
     // events move safely onto RFC 0022's atomic transition tail.
-    append_signal_received(rt, actor_id, name, payload.clone())?;
+    let operation_id = rt.actors.get(&actor_id).and_then(|actor| {
+        if actor.waiting_signal.as_deref() == Some(name) {
+            actor.waiting_signal_operation
+        } else {
+            None
+        }
+    });
+    append_signal_received(rt, actor_id, name, payload.clone(), operation_id)?;
 
     let should_resume = {
         if let Some(actor) = rt.actors.get_mut(&actor_id) {
