@@ -118,15 +118,15 @@ pub use network::*;
 pub use object_store::*;
 pub use orca_cycle::*;
 pub use persistence::*;
-pub use workflow::{
-    WorkflowActivationAnalysisError, WorkflowActivationRecord, WorkflowActivationTerminal,
-};
 pub use process_groups::*;
 pub use registry::*;
 pub use resp_cache::*;
 pub use scheduler::*;
 pub use supervisor::*;
 pub use timer::*;
+pub use workflow::{
+    WorkflowActivationAnalysisError, WorkflowActivationRecord, WorkflowActivationTerminal,
+};
 
 use crate::types::{ExitReason, NuError, Span, VmSuspension};
 use crate::vm::Value;
@@ -1154,7 +1154,7 @@ impl Runtime {
 
     /// Allocate the next deterministic replay identity inside the live workflow
     /// activation, if one exists.
-    pub(crate) fn next_workflow_operation_id(
+    pub fn next_workflow_operation_id(
         &mut self,
         actor_id: u64,
     ) -> Option<WorkflowOperationId> {
