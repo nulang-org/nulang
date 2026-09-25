@@ -1,6 +1,7 @@
 # Nulang Changelog
 ### Runtime hot-path benchmark decomposition — 2026-09-25
 - **The same-host A/B harness now reports a mailbox-only one-value admission lower bound alongside the full runtime enqueue sweep.** This exposes the cost above message construction/mailbox admission before actor-routing or scheduler changes are justified.
+- **The actor A/B harness now measures AOT against warmed bytecode/JIT on the exact same 50k-message actor drain.** Bytecode is warmed past tier-up, enqueue time is excluded for both paths, and the harness prints the direct AOT speedup while retaining the existing AOT history record.
 - **GC benchmarks now include real cross-actor ORCA pointer-send bookkeeping.** The new `gc/orca_foreign_ref_send/256` fixture uses live actor-heap pointers and measures message admission, foreign-count bumps, coordinator submission, cycle-detector edge registration, and ready-state publication with semantic assertions.
 - **The benchmark contract now distinguishes primitive actor/GC cadence from foreign-reference ORCA work.** Existing history keeps its name while new measurements state exactly which runtime layers are timed.
 
