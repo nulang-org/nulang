@@ -554,6 +554,131 @@ where
     Ok(unfinished)
 }
 
+/// Fully validated durable history required to replay one unfinished workflow command.
+///
+/// Construction is deliberately stricter than the low-level unfinished-command
+/// classifier: a workflow can have at most one executing activation, every
+/// activation-local operation after that command must carry the same activation
+/// identity, and operation ordinals must be contiguous from zero in durable
+/// event order.
+#[derive(Debug, Clone)]
+pub struct WorkflowReplayPlan {
+    pub activation: WorkflowActivationId,
+    pub command: JournalEntry,
+    pub operations: Vec<WorkflowEvent>,
+}
+
+/// Build the replay plan for the actor's single unfinished workflow activation.
+///
+/// Ok(None) means there is nothing to replay. Ambiguous legacy history,
+/// multiple open activations, foreign operation identities, or ordinal gaps
+/// fail closed before user code is allowed to execute.
+pub(crate) fn workflow_replay_plan<F>(
+    actor_id: u64,
+    journal: &[JournalEntry],
+    events: &[WorkflowEvent],
+    is_activation_command: F,
+) -> io::Result<Option<WorkflowReplayPlan>>
+where
+    F: Fn(&JournalEntry) -> bool,
+{
+    let unfinished =
+        unfinished_workflow_commands(actor_id, journal, events, is_activation_command)?;
+    if unfinished.is_empty() {
+        return Ok(None);
+    }
+    if unfinished.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "workflow actor {actor_id} has {} unfinished command activations; expected at most one",
+                unfinished.len()
+            ),
+        ));
+    }
+
+    let command = unfinished.into_iter().next().expect("one unfinished command");
+    let activation = WorkflowActivationId::new(actor_id, command.sequence);
+    let mut operations = Vec::new();
+
+    for event in events.iter().filter(|event| event.sequence() > command.sequence) {
+        match event {
+            WorkflowEvent::TimerSet { operation, .. }
+            | WorkflowEvent::SagaCompensated { operation, .. }
+            | WorkflowEvent::ParallelBranchCompleted { operation, .. }
+            | WorkflowEvent::Custom { operation, .. } => {
+                let operation = operation.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "legacy replay-sensitive workflow event at sequence {} lacks operation identity",
+                            event.sequence()
+                        ),
+                    )
+                })?;
+                if operation.activation != activation {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "workflow operation at sequence {} belongs to actor {} command {}, expected actor {} command {}",
+                            event.sequence(),
+                            operation.activation.actor_id,
+                            operation.activation.command_sequence,
+                            activation.actor_id,
+                            activation.command_sequence
+                        ),
+                    ));
+                }
+                operations.push(event.clone());
+            }
+            WorkflowEvent::StepCompleted {
+                activation: Some(closed),
+                ..
+            }
+            | WorkflowEvent::StepFailed {
+                activation: Some(closed),
+                ..
+            } if *closed == activation => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unfinished workflow activation unexpectedly has a terminal event",
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    operations.sort_by_key(WorkflowEvent::sequence);
+    for (expected_ordinal, event) in operations.iter().enumerate() {
+        let operation = event
+            .operation_id()
+            .expect("validated replay-sensitive event has operation identity");
+        let expected_ordinal = u32::try_from(expected_ordinal).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "workflow operation count exceeds u32 ordinal space",
+            )
+        })?;
+        if operation.ordinal != expected_ordinal {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "workflow operation ordinal gap/out-of-order at sequence {}: found {}, expected {}",
+                    event.sequence(),
+                    operation.ordinal,
+                    expected_ordinal
+                ),
+            ));
+        }
+    }
+
+    Ok(Some(WorkflowReplayPlan {
+        activation,
+        command,
+        operations,
+    }))
+}
+
 #[cfg(test)]
 mod workflow_replay_plan_tests {
     use super::*;
