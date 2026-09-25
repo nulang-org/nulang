@@ -97,7 +97,6 @@ pub struct SchedulerStats {
 /// counter traffic does not false-share with scheduler queue metadata.
 #[repr(align(64))]
 struct SchedulerStatsInternal {
-    total_tasks_processed: AtomicU64,
     tasks_from_local_queue: AtomicU64,
     tasks_from_global_queue: AtomicU64,
     tasks_from_steal: AtomicU64,
@@ -108,11 +107,17 @@ struct SchedulerStatsInternal {
 
 impl SchedulerStatsInternal {
     fn snapshot(&self) -> SchedulerStats {
+        let local = self.tasks_from_local_queue.load(Ordering::Relaxed);
+        let global = self.tasks_from_global_queue.load(Ordering::Relaxed);
+        let stolen = self.tasks_from_steal.load(Ordering::Relaxed);
         SchedulerStats {
-            total_tasks_processed: self.total_tasks_processed.load(Ordering::Relaxed),
-            tasks_from_local_queue: self.tasks_from_local_queue.load(Ordering::Relaxed),
-            tasks_from_global_queue: self.tasks_from_global_queue.load(Ordering::Relaxed),
-            tasks_from_steal: self.tasks_from_steal.load(Ordering::Relaxed),
+            // Every successful retrieval is classified into exactly one of
+            // local/global/stolen. Derive the public total at snapshot time
+            // instead of paying a second atomic RMW on every dispatch.
+            total_tasks_processed: local.wrapping_add(global).wrapping_add(stolen),
+            tasks_from_local_queue: local,
+            tasks_from_global_queue: global,
+            tasks_from_steal: stolen,
             steal_attempts: self.steal_attempts.load(Ordering::Relaxed),
             steal_successes: self.steal_successes.load(Ordering::Relaxed),
             empty_polls: self.empty_polls.load(Ordering::Relaxed),
@@ -120,7 +125,6 @@ impl SchedulerStatsInternal {
     }
 
     fn reset(&self) {
-        self.total_tasks_processed.store(0, Ordering::Relaxed);
         self.tasks_from_local_queue.store(0, Ordering::Relaxed);
         self.tasks_from_global_queue.store(0, Ordering::Relaxed);
         self.tasks_from_steal.store(0, Ordering::Relaxed);
@@ -187,7 +191,6 @@ impl Scheduler {
             worker_count,
             processed_count: AtomicUsize::new(0),
             stats: SchedulerStatsInternal {
-                total_tasks_processed: AtomicU64::new(0),
                 tasks_from_local_queue: AtomicU64::new(0),
                 tasks_from_global_queue: AtomicU64::new(0),
                 tasks_from_steal: AtomicU64::new(0),
@@ -228,18 +231,12 @@ impl Scheduler {
     #[inline]
     fn record_local_task(&self) {
         self.stats
-            .total_tasks_processed
-            .fetch_add(1, Ordering::Relaxed);
-        self.stats
             .tasks_from_local_queue
             .fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
     fn record_global_task(&self) {
-        self.stats
-            .total_tasks_processed
-            .fetch_add(1, Ordering::Relaxed);
         self.stats
             .tasks_from_global_queue
             .fetch_add(1, Ordering::Relaxed);
@@ -256,9 +253,6 @@ impl Scheduler {
 
     #[inline]
     fn record_stolen_task(&self, attempts: u64) {
-        self.stats
-            .total_tasks_processed
-            .fetch_add(1, Ordering::Relaxed);
         self.stats.tasks_from_steal.fetch_add(1, Ordering::Relaxed);
         self.stats.steal_successes.fetch_add(1, Ordering::Relaxed);
         self.record_steal_attempts(attempts);
@@ -820,6 +814,34 @@ mod scheduler_tests {
         assert_eq!(stats.steal_successes, 1);
         assert!(stats.steal_attempts >= 1);
         assert_eq!(stats.empty_polls, 0);
+    }
+
+    #[test]
+    fn test_stats_total_is_derived_from_task_sources() {
+        let s = Scheduler::new(3);
+
+        // Global source.
+        s.enqueue(1);
+        assert_eq!(s.next_task(0), Some(1));
+
+        // Local source.
+        s.enqueue_local(0, 2);
+        assert_eq!(s.next_task(0), Some(2));
+
+        // Peer-steal source.
+        s.enqueue_local(1, 3);
+        assert_eq!(s.next_task(0), Some(3));
+
+        let stats = s.stats();
+        assert_eq!(stats.tasks_from_global_queue, 1);
+        assert_eq!(stats.tasks_from_local_queue, 1);
+        assert_eq!(stats.tasks_from_steal, 1);
+        assert_eq!(
+            stats.total_tasks_processed,
+            stats.tasks_from_local_queue
+                + stats.tasks_from_global_queue
+                + stats.tasks_from_steal
+        );
     }
 
     #[test]
