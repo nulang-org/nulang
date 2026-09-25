@@ -1821,6 +1821,61 @@ struct BehaviorManifestOutput<'a> {
     package_version: &'a str,
 }
 
+fn normalized_output_path(path: &str) -> std::path::PathBuf {
+    use std::path::Component;
+
+    let path = std::path::Path::new(path);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(path)
+    };
+
+    let mut normalized = std::path::PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn validate_wasm_output_paths(
+    wasm_path: &str,
+    cwasm_path: Option<&str>,
+    behavior_output: Option<BehaviorManifestOutput<'_>>,
+) -> NuResult<()> {
+    let Some(behavior_output) = behavior_output else {
+        return Ok(());
+    };
+
+    let behavior = normalized_output_path(behavior_output.path);
+    let wasm = normalized_output_path(wasm_path);
+    let cwasm = cwasm_path.map(normalized_output_path);
+
+    if behavior == wasm || cwasm.as_ref().is_some_and(|path| *path == behavior) {
+        return Err(nulang::types::NuError::VMError {
+            msg: format!(
+                "behavior manifest, WASM, and AOT output paths must be distinct (manifest: {}, wasm: {}{})",
+                behavior_output.path,
+                wasm_path,
+                cwasm_path
+                    .map(|path| format!(", cwasm: {path}"))
+                    .unwrap_or_default()
+            ),
+            span: Span::default(),
+        });
+    }
+
+    Ok(())
+}
+
 #[cfg(feature = "wasm-backend")]
 fn build_wasm_behavior_manifest(
     source: &str,
@@ -1916,6 +1971,7 @@ fn run_source(
         #[cfg(feature = "wasm-backend")]
         "wasm" => {
             let wasm_file = out_file.unwrap_or("out.wasm");
+            validate_wasm_output_paths(wasm_file, None, behavior_manifest_output)?;
             let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
             let mir = nulang::mir_lower::lower_module(&hir)?;
             use nulang::backends::WasmBackend;
@@ -1976,6 +2032,11 @@ fn run_source(
             } else {
                 cwasm_file
             };
+            validate_wasm_output_paths(
+                wasm_file,
+                Some(&cwasm_file),
+                behavior_manifest_output,
+            )?;
             let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
             let mir = nulang::mir_lower::lower_module(&hir)?;
             use nulang::backends::WasmBackend;
@@ -2958,6 +3019,43 @@ mod tests {
         assert_eq!(manifest.artifact.backend, "wasm");
         manifest.verify_artifact_bytes(&wasm).unwrap();
         assert!(manifest.verify_artifact_bytes(b"different").is_err());
+    }
+
+    #[test]
+    fn behavior_manifest_output_must_not_collide_with_wasm_outputs() {
+        let output = BehaviorManifestOutput {
+            path: "dist/app.wasm",
+            package_name: "app",
+            package_version: "0.1.0",
+        };
+        let error =
+            validate_wasm_output_paths("dist/app.wasm", None, Some(output)).unwrap_err();
+        assert!(error.to_string().contains("must be distinct"));
+
+        let output = BehaviorManifestOutput {
+            path: "dist/app.cwasm",
+            package_name: "app",
+            package_version: "0.1.0",
+        };
+        let error = validate_wasm_output_paths(
+            "dist/app.wasm",
+            Some("dist/app.cwasm"),
+            Some(output),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must be distinct"));
+    }
+
+    #[test]
+    fn behavior_manifest_output_normalizes_parent_components_for_collision_check() {
+        let output = BehaviorManifestOutput {
+            path: "dist/tmp/../app.wasm",
+            package_name: "app",
+            package_version: "0.1.0",
+        };
+        assert!(
+            validate_wasm_output_paths("dist/app.wasm", None, Some(output)).is_err()
+        );
     }
 
     /// An actor program run through the CLI path must create real actors
