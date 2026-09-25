@@ -1674,6 +1674,7 @@ impl Runtime {
                         actor_id,
                         WorkflowEvent::StepCompleted {
                             sequence: seq,
+                            activation: suspended.activation,
                             step_name,
                         },
                     );
@@ -3886,19 +3887,29 @@ impl Runtime {
             }
 
             let mut processed = false;
+            let mut workflow_activation = None;
             if self.has_native_handler(actor_id, behavior_idx) {
                 // Journal the message before handling so recovery can replay it.
                 if self.actor_is_persistent(actor_id) {
                     let seq = self.next_sequence(actor_id);
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                    let _ = self.persistence.append_journal(
-                        actor_id,
-                        JournalEntry {
-                            sequence: seq,
-                            behavior_id: msg.behavior_id,
-                            payload,
-                        },
-                    );
+                    let journaled = self
+                        .persistence
+                        .append_journal(
+                            actor_id,
+                            JournalEntry {
+                                sequence: seq,
+                                behavior_id: msg.behavior_id,
+                                payload,
+                            },
+                        )
+                        .is_ok();
+                    if journaled && self.actor_is_workflow(actor_id) {
+                        workflow_activation = Some(WorkflowActivationId::new(actor_id, seq));
+                        if let Some(actor) = self.actors.get_mut(&actor_id) {
+                            actor.current_workflow_activation = workflow_activation;
+                        }
+                    }
                 }
                 processed = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload);
                 if processed {
@@ -3910,14 +3921,23 @@ impl Runtime {
                 if self.actor_is_persistent(actor_id) {
                     let seq = self.next_sequence(actor_id);
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                    let _ = self.persistence.append_journal(
-                        actor_id,
-                        JournalEntry {
-                            sequence: seq,
-                            behavior_id: msg.behavior_id,
-                            payload,
-                        },
-                    );
+                    let journaled = self
+                        .persistence
+                        .append_journal(
+                            actor_id,
+                            JournalEntry {
+                                sequence: seq,
+                                behavior_id: msg.behavior_id,
+                                payload,
+                            },
+                        )
+                        .is_ok();
+                    if journaled && self.actor_is_workflow(actor_id) {
+                        workflow_activation = Some(WorkflowActivationId::new(actor_id, seq));
+                        if let Some(actor) = self.actors.get_mut(&actor_id) {
+                            actor.current_workflow_activation = workflow_activation;
+                        }
+                    }
                 }
                 let payload = msg.payload.clone();
                 // Enable non-blocking LLM suspension for this
@@ -3956,6 +3976,7 @@ impl Runtime {
                                 actor_id,
                                 WorkflowEvent::StepFailed {
                                     sequence: seq,
+                                    activation: workflow_activation,
                                     step_name,
                                     error: format!("{}", e),
                                 },
@@ -3976,6 +3997,7 @@ impl Runtime {
                     actor_id,
                     WorkflowEvent::StepCompleted {
                         sequence: seq,
+                        activation: workflow_activation,
                         step_name,
                     },
                 );
@@ -4000,6 +4022,7 @@ impl Runtime {
                     return;
                 }
             };
+            actor.current_workflow_activation = None;
             actor.increment_reductions(1);
             // Turn ownership now lives in finish_actor_turn. Keep reductions
             // live across the whole batch so should_yield observes cumulative
@@ -4498,6 +4521,7 @@ impl Runtime {
                             actor_id,
                             crate::runtime::WorkflowEvent::StepCompleted {
                                 sequence: seq,
+                                activation: suspended.activation,
                                 step_name: suspended.step_name.clone(),
                             },
                         );
@@ -4592,6 +4616,7 @@ impl Runtime {
                             actor_id,
                             WorkflowEvent::StepCompleted {
                                 sequence: seq,
+                                activation: suspended.activation,
                                 step_name: suspended.step_name,
                             },
                         );
