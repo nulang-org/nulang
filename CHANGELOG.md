@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Actor A/B benchmark build diagnostics — 2026-09-25
+- **Failed base/candidate Cargo builds now preserve their captured compiler output in CI logs.** The same-host A/B harness re-emits combined stdout/stderr before raising, so build-stage failures no longer collapse into an opaque Python `CalledProcessError`; a focused Python regression test pins the behavior.
+
 ### Native JIT codegen backend boundary — 2026-09-24
 - **`JitSession` no longer owns Cranelift modules or reusable Cranelift contexts.** `src/jit/native_codegen.rs` introduces `NativeCodegenBackend`, `NativeCompileRequest`, and specialization requests for scalar, typed, and SIMD lowering.
 - **`CraneliftCodegen` now exclusively owns both compiler tiers.** Fast code still uses `opt_level=none` + single-pass register allocation, optimized code still uses `opt_level=speed` + backtracking, but tier/cache orchestration only sees native entry pointers and compile success/failure.
