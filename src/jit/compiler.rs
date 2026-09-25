@@ -1088,7 +1088,9 @@ mod tests {
     fn test_is_opcode_compilable_conversion() {
         assert!(is_opcode_compilable(OpCode::IToF));
         assert!(is_opcode_compilable(OpCode::FToI));
-        assert!(is_opcode_compilable(OpCode::INeg));
+        // INeg must remain in the interpreter until JIT runtime-error
+        // propagation can preserve checked overflow/type semantics.
+        assert!(!is_opcode_compilable(OpCode::INeg));
         assert!(is_opcode_compilable(OpCode::IInc));
         assert!(is_opcode_compilable(OpCode::IDec));
     }
