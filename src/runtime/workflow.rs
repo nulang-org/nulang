@@ -173,9 +173,9 @@ pub fn find_workflow_event_for_operation(
             continue;
         }
         if found.is_some() {
-            return Err(
-                WorkflowOperationAnalysisError::DuplicateOperationIdentity { operation_id },
-            );
+            return Err(WorkflowOperationAnalysisError::DuplicateOperationIdentity {
+                operation_id,
+            });
         }
         found = Some(event.clone());
     }
