@@ -4629,6 +4629,21 @@ mod tests {
     }
 
     #[test]
+    fn test_unary_neg_rejects_known_nonnumeric_operands() {
+        for source in [
+            "-false",
+            "-(1 + 2,)",
+            "-fn(x) { x + 1 }",
+        ] {
+            let result = check_src(source);
+            assert!(
+                result.is_err(),
+                "unary negation must reject known nonnumeric operand: {source}"
+            );
+        }
+    }
+
+    #[test]
     fn test_infer_unary_not() {
         let mut tc = TypeChecker::new();
         let ctx = TypeContext::new();
