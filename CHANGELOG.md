@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Semantic verification contract — 2026-09-25
+- **Backend semantic status is now machine-readable.** `spec/invariants/v0alpha1.json` records scoped semantic/runtime invariants and evidence, while `spec/backend_conformance/v0alpha1.json` records bytecode/JIT/native/WASM support as reference, verified, partial, unsupported, or not-applicable instead of relying on prose claims.
+- **Semantic metadata now fails CI on drift.** `scripts/verify_semantics.py` validates ids, status values, backend coverage, invariant references, and evidence paths; focused Python unit tests are executed from the existing `verify_implementation.py` gate.
+- **Contributors and coding agents now have stable focused verification profiles.** `scripts/nula_verify.py` exposes `fast`, `native`, `wasm`, `durability`, and `full`; the full profile delegates to the existing local CI contract rather than duplicating it.
+- **Native-backend documentation now matches implementation reality.** `--backend native` eagerly compiles MIR to native code using Cranelift `JITModule` today; object-file/`ObjectModule` AOT remains a future artifact path that should share the same native semantic lowering.
+
 ### Fail-closed WASM workflow admission — 2026-09-25
 - **The canonical WASM backend now rejects workflow declarations until durable workflow semantics are implemented there.** Previously simple workflows could compile to WASM even though the backend did not provide the bytecode runtime's durable step journal, signal suspension/resume, crash recovery, or saga compensation; only individual unsupported operations such as `Signal.wait` failed loudly.
 - **This is an integrity gate, not a workflow deprecation.** Bytecode/native workflows remain available while WASM parity is implemented, and Cloud admission can no longer mistake partial actor emulation for durable workflow execution.

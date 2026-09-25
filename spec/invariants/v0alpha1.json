@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "updated": "2026-09-25",
+  "invariants": [
+    {
+      "id": "SEM-CROSSBACKEND-001",
+      "domain": "semantics",
+      "status": "partial",
+      "summary": "For a program accepted by an execution backend with a comparable observable result, that result must match the bytecode VM semantic reference.",
+      "evidence": [
+        "src/difffuzz.rs",
+        "docs/DIFFERENTIAL_FUZZING.md"
+      ]
+    },
+    {
+      "id": "SEM-INT-001",
+      "domain": "semantics",
+      "status": "partial",
+      "summary": "Integer representation, arithmetic, overflow behavior, and error class must agree across enabled execution backends.",
+      "evidence": [
+        "src/value_layout.rs",
+        "src/jit/runtime.rs",
+        "src/aot/codegen.rs",
+        "docs/DIFFERENTIAL_FUZZING.md"
+      ]
+    },
+    {
+      "id": "SEM-FLOAT-001",
+      "domain": "semantics",
+      "status": "partial",
+      "summary": "Float boxing, unboxing, arithmetic, NaN handling, and observable results must agree across enabled execution backends.",
+      "evidence": [
+        "src/value_layout.rs",
+        "src/aot/codegen.rs",
+        "docs/DIFFERENTIAL_FUZZING.md"
+      ]
+    },
+    {
+      "id": "ACTOR-NATIVE-001",
+      "domain": "actors",
+      "status": "enforced",
+      "summary": "Native actor behavior dispatch uses the stable runtime-facing native entry ABI and preserves outer runtime helper state across nested dispatch.",
+      "evidence": [
+        "src/aot/mod.rs",
+        "src/aot/codegen.rs",
+        "src/jit/runtime.rs"
+      ]
+    },
+    {
+      "id": "DUR-ATOMIC-001",
+      "domain": "durability",
+      "status": "enforced",
+      "summary": "A persistence backend that supports atomic durable transitions must commit all Nulang-owned records in one logical transition together; unsupported backends fail closed.",
+      "evidence": [
+        "src/runtime/persistence.rs",
+        "tests/durable_effect_recovery_store.rs",
+        "RFC/0022-atomic-durable-transitions.md"
+      ]
+    },
+    {
+      "id": "DUR-FENCE-001",
+      "domain": "durability",
+      "status": "partial",
+      "summary": "Durable transition commits are fenced by activation epoch and monotonic sequence so stale or reordered activations cannot advance committed state.",
+      "evidence": [
+        "src/runtime/persistence.rs",
+        "RFC/0022-atomic-durable-transitions.md"
+      ]
+    }
+  ]
+}

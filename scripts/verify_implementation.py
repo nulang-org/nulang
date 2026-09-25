@@ -96,6 +96,53 @@ def check_stdlib_manifest():
     return True
 
 
+def check_semantic_contracts():
+    """Fail when semantic invariants or backend conformance metadata drift."""
+    print("Checking semantic invariant registry and backend conformance matrix...")
+    res = subprocess.run(
+        [sys.executable, "scripts/verify_semantics.py"],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        print("Error: semantic contract validation failed.")
+        if res.stdout:
+            print(res.stdout)
+        if res.stderr:
+            print(res.stderr)
+        return False
+    print(res.stdout.strip())
+    return True
+
+
+def check_verification_tooling_tests():
+    """Run focused stdlib-only tests for the verification tooling itself."""
+    print("Running verification tooling unit tests...")
+    res = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "scripts/tests",
+            "-p",
+            "test_*.py",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        print("Error: verification tooling unit tests failed.")
+        if res.stdout:
+            print(res.stdout)
+        if res.stderr:
+            print(res.stderr)
+        return False
+    print("Success: verification tooling unit tests passed.")
+    return True
+
+
 def verify_files():
     # 1. (compiler.rs has been removed; MIR pipeline is now exclusive.)
     # 2. Check vm.rs for Frame caller and leaked SConcat
@@ -202,6 +249,12 @@ def verify_files():
         return False
 
     if not check_stdlib_manifest():
+        return False
+
+    if not check_semantic_contracts():
+        return False
+
+    if not check_verification_tooling_tests():
         return False
 
     print("Success: All files passed implementation checks!")
