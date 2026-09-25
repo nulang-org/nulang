@@ -11,7 +11,7 @@
 //! |----------|---------|
 //! | Special | Nop, Halt, Const0-2, ConstM1 |
 //! | Register | Load, Store, Move, Swap, Dup |
-//! | Integer Arith | IAdd, ISub, IMul, IDiv, IMod, INeg, IInc, IDec |
+//! | Integer Arith | IAdd, ISub, IMul, IDiv, IMod, IInc, IDec |
 //! | Bitwise | Xor, Shl, Shr, BitAnd, BitOr |
 //! | Float Arith | FAdd, FSub, FMul, FDiv, FNeg |
 //! | Compare | ICmp{Eq,Lt,Gt,Le,Ge}, FCmp{Eq,Lt,Gt} |
@@ -58,7 +58,6 @@ pub fn is_opcode_compilable(op: OpCode) -> bool {
             | OpCode::IMul
             | OpCode::IDiv
             | OpCode::IMod
-            | OpCode::INeg
             | OpCode::IInc
             | OpCode::IDec
             | OpCode::IPow
