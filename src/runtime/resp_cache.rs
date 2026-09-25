@@ -53,7 +53,12 @@ pub trait CacheCommandTarget {
         pairs: &[(&[u8], &[u8])],
         now_ms: u64,
     ) -> Result<(), CacheCommandError>;
-    fn delete_many(&mut self, keys: &[&[u8]], now_ms: u64) -> Result<usize, CacheCommandError>;
+    fn delete_keys<'a>(
+        &mut self,
+        keys: RespArgs<'a>,
+        now_ms: u64,
+    ) -> Result<usize, CacheCommandError>;
+    fn delete_key(&mut self, key: &[u8], now_ms: u64) -> Result<bool, CacheCommandError>;
     fn increment(&mut self, key: &[u8], delta: i64, now_ms: u64)
         -> Result<i64, CacheCommandError>;
     fn expire_ms(
@@ -94,11 +99,16 @@ impl CacheCommandTarget for CacheStore {
             .map_err(CacheCommandError::Write)
     }
 
-    fn delete_many(&mut self, keys: &[&[u8]], now_ms: u64) -> Result<usize, CacheCommandError> {
-        Ok(keys
-            .iter()
-            .filter(|key| self.delete_at(key, now_ms))
-            .count())
+    fn delete_keys<'a>(
+        &mut self,
+        keys: RespArgs<'a>,
+        now_ms: u64,
+    ) -> Result<usize, CacheCommandError> {
+        Ok(keys.filter(|key| self.delete_at(key, now_ms)).count())
+    }
+
+    fn delete_key(&mut self, key: &[u8], now_ms: u64) -> Result<bool, CacheCommandError> {
+        Ok(self.delete_at(key, now_ms))
     }
 
     fn increment(
@@ -153,9 +163,18 @@ impl CacheCommandTarget for DurableCacheStore {
             .map_err(command_durability_error)
     }
 
-    fn delete_many(&mut self, keys: &[&[u8]], now_ms: u64) -> Result<usize, CacheCommandError> {
-        self.delete_many_at(keys, now_ms)
+    fn delete_keys<'a>(
+        &mut self,
+        keys: RespArgs<'a>,
+        now_ms: u64,
+    ) -> Result<usize, CacheCommandError> {
+        let keys = keys.collect::<Vec<_>>();
+        self.delete_many_at(&keys, now_ms)
             .map_err(command_durability_error)
+    }
+
+    fn delete_key(&mut self, key: &[u8], now_ms: u64) -> Result<bool, CacheCommandError> {
+        self.delete_at(key, now_ms).map_err(command_durability_error)
     }
 
     fn increment(
@@ -405,8 +424,7 @@ fn execute_del<T: CacheCommandTarget>(store: &mut T, command: RespCommand<'_>, n
         return;
     }
 
-    let keys = command.args().collect::<Vec<_>>();
-    match store.delete_many(&keys, now_ms) {
+    match store.delete_keys(command.args(), now_ms) {
         Ok(deleted) => write_integer(out, deleted as i64),
         Err(error) => write_command_error(out, error),
     }
@@ -472,8 +490,8 @@ fn execute_expire<T: CacheCommandTarget>(
     };
 
     if seconds <= 0 {
-        match store.delete_many(&[key], now_ms) {
-            Ok(deleted) => write_integer(out, if deleted != 0 { 1 } else { 0 }),
+        match store.delete_key(key, now_ms) {
+            Ok(deleted) => write_integer(out, if deleted { 1 } else { 0 }),
             Err(error) => write_command_error(out, error),
         }
         return;
