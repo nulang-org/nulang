@@ -352,12 +352,54 @@ impl CacheReplicaAckTracker {
     pub fn satisfies(&self, sequence: u64, required_replicas: usize) -> bool {
         self.acked_replicas(sequence) >= required_replicas
     }
+
+    /// Highest sequence that satisfies the configured replica requirement.
+    ///
+    /// A requirement of zero means local acknowledgement only, so the local
+    /// WAL tail is the commit index. Otherwise this returns the Nth-highest
+    /// replica acknowledgement, capped by the local sequence.
+    pub fn committed_sequence(
+        &self,
+        local_sequence: u64,
+        required_replicas: usize,
+    ) -> Option<u64> {
+        if required_replicas == 0 {
+            return Some(local_sequence);
+        }
+        if required_replicas > self.acknowledgements.len() {
+            return None;
+        }
+
+        let mut sequences = self
+            .acknowledgements
+            .values()
+            .copied()
+            .map(|sequence| sequence.min(local_sequence))
+            .collect::<Vec<_>>();
+        sequences.sort_unstable_by(|left, right| right.cmp(left));
+        Some(sequences[required_replicas - 1])
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheReplicaApply {
     Applied { sequence: u64 },
     Duplicate { sequence: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePromotionError {
+    StaleEpoch { current: u64, proposed: u64 },
+    Behind { committed: u64, applied: u64 },
+    Ahead { committed: u64, applied: u64 },
+    Poisoned,
+}
+
+#[derive(Debug)]
+pub struct CachePromotedReplica {
+    pub placement_epoch: u64,
+    pub base_sequence: u64,
+    pub store: CacheStore,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -410,6 +452,47 @@ impl CacheReplicaApplier {
 
     pub fn into_store(self) -> CacheStore {
         self.store
+    }
+
+    /// Consume a replica and release its store for primary service only when
+    /// the control plane advances the epoch and the replica is exactly at the
+    /// declared committed sequence.
+    ///
+    /// A replica ahead of the commit index is rejected rather than exposing a
+    /// possibly uncommitted tail. Recovery/bootstrap must first reconstruct
+    /// the exact committed state.
+    pub fn promote(
+        self,
+        proposed_epoch: u64,
+        committed_sequence: u64,
+    ) -> Result<CachePromotedReplica, CachePromotionError> {
+        if self.poisoned {
+            return Err(CachePromotionError::Poisoned);
+        }
+        if proposed_epoch <= self.placement_epoch {
+            return Err(CachePromotionError::StaleEpoch {
+                current: self.placement_epoch,
+                proposed: proposed_epoch,
+            });
+        }
+        if self.applied_sequence < committed_sequence {
+            return Err(CachePromotionError::Behind {
+                committed: committed_sequence,
+                applied: self.applied_sequence,
+            });
+        }
+        if self.applied_sequence > committed_sequence {
+            return Err(CachePromotionError::Ahead {
+                committed: committed_sequence,
+                applied: self.applied_sequence,
+            });
+        }
+
+        Ok(CachePromotedReplica {
+            placement_epoch: proposed_epoch,
+            base_sequence: committed_sequence,
+            store: self.store,
+        })
     }
 
     /// Advance the fencing epoch after the control plane has installed a newer
@@ -1077,6 +1160,93 @@ mod tests {
                 bytes: snapshot.len() as u64,
                 limit: (snapshot.len() - 1) as u64,
             }
+        );
+    }
+
+    #[test]
+    fn acknowledgement_tracker_computes_replica_commit_index() {
+        let first = CacheShardOwner {
+            node_id: 2,
+            shard: 0,
+        };
+        let second = CacheShardOwner {
+            node_id: 3,
+            shard: 0,
+        };
+        let mut tracker = CacheReplicaAckTracker::new(5, &[first, second]);
+
+        tracker
+            .observe(
+                &CacheReplicaAck {
+                    placement_epoch: 5,
+                    replica: first,
+                    applied_sequence: 10,
+                },
+                12,
+            )
+            .unwrap();
+        tracker
+            .observe(
+                &CacheReplicaAck {
+                    placement_epoch: 5,
+                    replica: second,
+                    applied_sequence: 8,
+                },
+                12,
+            )
+            .unwrap();
+
+        assert_eq!(tracker.committed_sequence(12, 0), Some(12));
+        assert_eq!(tracker.committed_sequence(12, 1), Some(10));
+        assert_eq!(tracker.committed_sequence(12, 2), Some(8));
+        assert_eq!(tracker.committed_sequence(12, 3), None);
+    }
+
+    #[test]
+    fn promotion_requires_strictly_newer_epoch_and_exact_commit_sequence() {
+        let replica = CacheReplicaApplier::new(7, 20, CacheStore::new());
+        let error = replica.promote(7, 20).unwrap_err();
+        assert_eq!(
+            error,
+            CachePromotionError::StaleEpoch {
+                current: 7,
+                proposed: 7,
+            }
+        );
+
+        let replica = CacheReplicaApplier::new(7, 19, CacheStore::new());
+        let error = replica.promote(8, 20).unwrap_err();
+        assert_eq!(
+            error,
+            CachePromotionError::Behind {
+                committed: 20,
+                applied: 19,
+            }
+        );
+
+        let replica = CacheReplicaApplier::new(7, 21, CacheStore::new());
+        let error = replica.promote(8, 20).unwrap_err();
+        assert_eq!(
+            error,
+            CachePromotionError::Ahead {
+                committed: 20,
+                applied: 21,
+            }
+        );
+    }
+
+    #[test]
+    fn exact_commit_replica_promotes_into_new_epoch() {
+        let mut store = CacheStore::new();
+        store.set_integer(b"k", 42, None, 0);
+        let replica = CacheReplicaApplier::new(7, 20, store);
+
+        let mut promoted = replica.promote(8, 20).unwrap();
+        assert_eq!(promoted.placement_epoch, 8);
+        assert_eq!(promoted.base_sequence, 20);
+        assert_eq!(
+            promoted.store.get(b"k", 0),
+            Some(CacheValueView::Integer(42))
         );
     }
 
