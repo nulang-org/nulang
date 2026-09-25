@@ -120,6 +120,7 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
+                opts.behavior_manifest_output(),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -576,8 +577,13 @@ fn main() {
         i += 1;
     }
 
-    if opts.emit_behavior_manifest.is_some() && !opts.emit_nbc {
-        eprintln!("Error: --emit-behavior-manifest currently requires --emit-nbc");
+    if opts.emit_behavior_manifest.is_some()
+        && !opts.emit_nbc
+        && !matches!(opts.backend.as_str(), "wasm" | "wasm-aot")
+    {
+        eprintln!(
+            "Error: --emit-behavior-manifest requires --emit-nbc or an artifact-producing WASM backend"
+        );
         std::process::exit(1);
     }
 
@@ -721,6 +727,7 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                         opts.deny_warnings,
+                        opts.behavior_manifest_output(),
                     ) {
                         print_error(&e, uc);
                     }
@@ -768,6 +775,7 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                         opts.deny_warnings,
+                        opts.behavior_manifest_output(),
                     )
                 },
                 n,
@@ -787,6 +795,7 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
+                opts.behavior_manifest_output(),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -955,6 +964,7 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                         opts.deny_warnings,
+                        opts.behavior_manifest_output(),
                     )
                 },
                 n,
@@ -974,6 +984,7 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
+                opts.behavior_manifest_output(),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -1080,6 +1091,21 @@ struct Options {
     /// Escalate warnings (e.g. RFC 0015 deprecations) to a hard error.
     deny_warnings: bool,
 }
+impl Options {
+    fn behavior_manifest_output(&self) -> Option<BehaviorManifestOutput<'_>> {
+        self.emit_behavior_manifest
+            .as_deref()
+            .map(|path| BehaviorManifestOutput {
+                path,
+                package_name: self.behavior_package_name.as_deref().unwrap_or("main"),
+                package_version: self
+                    .behavior_package_version
+                    .as_deref()
+                    .unwrap_or("0.0.0"),
+            })
+    }
+}
+
 impl Default for Options {
     fn default() -> Self {
         Options {
@@ -1903,6 +1929,9 @@ fn run_source(
                     span: Span::default(),
                 }
             })?;
+            if let Some(output) = behavior_manifest_output {
+                emit_wasm_behavior_manifest(source, &hir, &mir, &wasm_bytes, output)?;
+            }
             println!("Wrote {} ({} bytes)", wasm_file, wasm_bytes.len());
             return Ok(());
         }
@@ -1960,6 +1989,9 @@ fn run_source(
                     span: Span::default(),
                 }
             })?;
+            if let Some(output) = behavior_manifest_output {
+                emit_wasm_behavior_manifest(source, &hir, &mir, &wasm_bytes, output)?;
+            }
             println!("Wrote {} ({} bytes)", wasm_file, wasm_bytes.len());
             nulang::wasm_runtime::aot_compile(&wasm_file, &cwasm_file)?;
             println!("Wrote {} (precompiled)", cwasm_file);
