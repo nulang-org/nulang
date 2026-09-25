@@ -3891,20 +3891,23 @@ impl Runtime {
                 if self.actor_is_persistent(actor_id) {
                     let seq = self.next_sequence(actor_id);
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                    if self.actor_is_workflow(actor_id) {
+                    let journaled = self
+                        .persistence
+                        .append_journal(
+                            actor_id,
+                            JournalEntry {
+                                sequence: seq,
+                                behavior_id: msg.behavior_id,
+                                payload,
+                            },
+                        )
+                        .is_ok();
+                    if journaled && self.actor_is_workflow(actor_id) {
                         workflow_activation = Some(WorkflowActivationId::new(actor_id, seq));
                         if let Some(actor) = self.actors.get_mut(&actor_id) {
                             actor.current_workflow_activation = workflow_activation;
                         }
                     }
-                    let _ = self.persistence.append_journal(
-                        actor_id,
-                        JournalEntry {
-                            sequence: seq,
-                            behavior_id: msg.behavior_id,
-                            payload,
-                        },
-                    );
                 }
                 processed = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload);
                 if processed {
@@ -3916,20 +3919,23 @@ impl Runtime {
                 if self.actor_is_persistent(actor_id) {
                     let seq = self.next_sequence(actor_id);
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                    if self.actor_is_workflow(actor_id) {
+                    let journaled = self
+                        .persistence
+                        .append_journal(
+                            actor_id,
+                            JournalEntry {
+                                sequence: seq,
+                                behavior_id: msg.behavior_id,
+                                payload,
+                            },
+                        )
+                        .is_ok();
+                    if journaled && self.actor_is_workflow(actor_id) {
                         workflow_activation = Some(WorkflowActivationId::new(actor_id, seq));
                         if let Some(actor) = self.actors.get_mut(&actor_id) {
                             actor.current_workflow_activation = workflow_activation;
                         }
                     }
-                    let _ = self.persistence.append_journal(
-                        actor_id,
-                        JournalEntry {
-                            sequence: seq,
-                            behavior_id: msg.behavior_id,
-                            payload,
-                        },
-                    );
                 }
                 let payload = msg.payload.clone();
                 // Enable non-blocking LLM suspension for this
