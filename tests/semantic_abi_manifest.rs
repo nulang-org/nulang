@@ -80,5 +80,8 @@ fn full_semantic_abi_json_nests_the_value_layout_contract() {
         parsed["host_effect_abi_schema"],
         nulang::host_effect_abi::HOST_EFFECT_ABI_SCHEMA
     );
-    assert_eq!(parsed["value_layout"]["tags"]["object"], "0x7ff5000000000000");
+    assert_eq!(
+        parsed["value_layout"]["tags"]["object"],
+        "0x7ff5000000000000"
+    );
 }
