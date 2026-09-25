@@ -257,6 +257,13 @@ impl WasmBackend {
     // ── Compile ───────────────────────────────────────────────────
 
     pub fn compile(&mut self, mir: &mir::Module, _module_name: &str) -> NuResult<Vec<u8>> {
+        if mir.actor_metadata.iter().any(|meta| meta.is_workflow) {
+            return Err(crate::types::NuError::VMError {
+                msg: "WASM backend does not yet support durable workflow semantics; use the bytecode/native runtime until workflow journaling, suspension, recovery, and compensation are implemented for WASM".into(),
+                span: crate::types::Span::default(),
+            });
+        }
+
         self.foreign_functions = mir.foreign_functions.clone();
         // Pre-scan: build the module-wide record field name → slot index map
         // (mirrors the AOT backend) so Record literals and LoadFieldNamed agree.
