@@ -163,6 +163,7 @@ fn bench_ab_enqueue_payload_sweep() {
 fn bench_ab_aot_actor_drain() {
     use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
 
+    const WARMUP: usize = 2_000;
     const N: usize = 50_000;
     let source = r#"
         actor Counter {
@@ -196,39 +197,89 @@ fn bench_ab_aot_actor_drain() {
     let code =
         crate::mir_codegen::compile_mir(&mut mir, "bench-ab-aot").expect("bench: codegen failed");
 
-    let mut rt = Runtime::new();
-    rt.register_aot_module(aot);
-    let actor_id = rt
+    // Matched bytecode/JIT path. Warm past the current tier-up threshold so
+    // the timed drain represents steady-state tiered execution rather than
+    // first-run compilation cost. Enqueue remains outside the timed region,
+    // matching the AOT measurement below.
+    let mut bytecode_rt = Runtime::new();
+    let bytecode_actor = bytecode_rt
         .spawn_from_module(&code, 0, Vec::new())
         .as_actor_id()
-        .expect("bench: actor spawn failed");
-
-    // One untimed delivery verifies native wiring and warms the dispatch path.
-    rt.send_message_by_id(actor_id, 0, &[Value::int(1)]);
-    rt.run_scheduler();
-    rt.actors
-        .get_mut(&actor_id)
-        .expect("actor live after warmup")
+        .expect("bench: bytecode actor spawn failed");
+    for _ in 0..WARMUP {
+        bytecode_rt.send_message_by_id(bytecode_actor, 0, &[Value::int(1)]);
+    }
+    bytecode_rt.run_scheduler();
+    bytecode_rt
+        .actors
+        .get_mut(&bytecode_actor)
+        .expect("bytecode actor live after warmup")
         .set_state_field("total", Value::int(0));
 
     for _ in 0..N {
-        rt.send_message_by_id(actor_id, 0, &[Value::int(1)]);
+        bytecode_rt.send_message_by_id(bytecode_actor, 0, &[Value::int(1)]);
     }
-    let start = Instant::now();
-    rt.run_scheduler();
-    let elapsed = start.elapsed();
+    let bytecode_start = Instant::now();
+    bytecode_rt.run_scheduler();
+    let bytecode_elapsed = bytecode_start.elapsed();
 
-    let total = rt
+    let bytecode_total = bytecode_rt
         .actors
-        .get(&actor_id)
+        .get(&bytecode_actor)
         .and_then(|actor| actor.get_state_field("total"))
         .and_then(|value| value.as_int());
     assert_eq!(
-        total,
+        bytecode_total,
+        Some(N as i64),
+        "warmed bytecode/JIT actor must process every message"
+    );
+    report_ab("bytecode_actor_drain_warm", N as u64, bytecode_elapsed);
+
+    // AOT path over the exact same source and bytecode companion module.
+    let mut aot_rt = Runtime::new();
+    aot_rt.register_aot_module(aot);
+    let aot_actor = aot_rt
+        .spawn_from_module(&code, 0, Vec::new())
+        .as_actor_id()
+        .expect("bench: AOT actor spawn failed");
+
+    // One untimed delivery verifies native wiring and warms non-codegen
+    // runtime state; AOT itself has no tier-up phase.
+    aot_rt.send_message_by_id(aot_actor, 0, &[Value::int(1)]);
+    aot_rt.run_scheduler();
+    aot_rt
+        .actors
+        .get_mut(&aot_actor)
+        .expect("AOT actor live after warmup")
+        .set_state_field("total", Value::int(0));
+
+    for _ in 0..N {
+        aot_rt.send_message_by_id(aot_actor, 0, &[Value::int(1)]);
+    }
+    let aot_start = Instant::now();
+    aot_rt.run_scheduler();
+    let aot_elapsed = aot_start.elapsed();
+
+    let aot_total = aot_rt
+        .actors
+        .get(&aot_actor)
+        .and_then(|actor| actor.get_state_field("total"))
+        .and_then(|value| value.as_int());
+    assert_eq!(
+        aot_total,
         Some(N as i64),
         "AOT actor must process every message"
     );
-    report_ab("aot_actor_drain", N as u64, elapsed);
+    report_ab("aot_actor_drain", N as u64, aot_elapsed);
+
+    let bytecode_ns = bytecode_elapsed.as_nanos() as f64;
+    let aot_ns = aot_elapsed.as_nanos() as f64;
+    println!(
+        "[backend-bench] workload=actor_drain messages={N} bytecode_jit_ns={} aot_ns={} aot_speedup_x={:.3}",
+        bytecode_elapsed.as_nanos(),
+        aot_elapsed.as_nanos(),
+        bytecode_ns / aot_ns
+    );
 }
 
 /// Counting: one actor, main thread floods it with N messages.
