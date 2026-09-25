@@ -1,4 +1,252 @@
 //! Versioned transport-neutral workflow runtime control protocol.
+//!
+//! This crate owns only the control-plane vocabulary shared by Nulang runtimes
+//! and hosts. It deliberately contains no runtime implementation, storage
+//! backend, transport client, Cloud API model, or workflow-definition graph.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::fmt;
+
+pub const WORKFLOW_CONTROL_PROTOCOL_VERSION: &str = "nulang-workflow-control/v0alpha1";
+
+macro_rules! string_id {
+    ($name:ident) => {
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(pub String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Self {
+                Self(value.into())
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(value: &str) -> Self {
+                Self(value.to_owned())
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(value: String) -> Self {
+                Self(value)
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+    };
+}
+
+string_id!(WorkflowDefinitionId);
+string_id!(WorkflowInstanceId);
+string_id!(WorkflowRequestId);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowLifecycleStatus {
+    Pending,
+    Running,
+    Waiting,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkflowWait {
+    Signal { name: String },
+    Timer { name: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowFailure {
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowSnapshot {
+    pub instance_id: WorkflowInstanceId,
+    pub definition_id: WorkflowDefinitionId,
+    pub status: WorkflowLifecycleStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<WorkflowWait>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<WorkflowFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum WorkflowControlCommand {
+    Start {
+        definition_id: WorkflowDefinitionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id: Option<WorkflowInstanceId>,
+        #[serde(default)]
+        input: BTreeMap<String, Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
+    },
+    Inspect {
+        instance_id: WorkflowInstanceId,
+    },
+    Signal {
+        instance_id: WorkflowInstanceId,
+        signal: String,
+        #[serde(default)]
+        payload: Value,
+    },
+    Cancel {
+        instance_id: WorkflowInstanceId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    Query {
+        instance_id: WorkflowInstanceId,
+        query: String,
+        #[serde(default)]
+        args: Vec<Value>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowControlRequest {
+    pub protocol: String,
+    pub request_id: WorkflowRequestId,
+    pub command: WorkflowControlCommand,
+}
+
+impl WorkflowControlRequest {
+    pub fn new(
+        request_id: impl Into<WorkflowRequestId>,
+        command: WorkflowControlCommand,
+    ) -> Self {
+        Self {
+            protocol: WORKFLOW_CONTROL_PROTOCOL_VERSION.to_owned(),
+            request_id: request_id.into(),
+            command,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), WorkflowProtocolError> {
+        validate_protocol_version(&self.protocol)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkflowControlReply {
+    Started { workflow: WorkflowSnapshot },
+    Inspected { workflow: WorkflowSnapshot },
+    Signaled { workflow: WorkflowSnapshot },
+    Cancelled { workflow: WorkflowSnapshot },
+    QueryResult { value: Value },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowControlErrorCode {
+    NotFound,
+    InvalidRequest,
+    Conflict,
+    Unavailable,
+    Unsupported,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowControlError {
+    pub code: WorkflowControlErrorCode,
+    pub message: String,
+    #[serde(default)]
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WorkflowControlResult {
+    Ok { reply: WorkflowControlReply },
+    Error { error: WorkflowControlError },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowControlResponse {
+    pub protocol: String,
+    pub request_id: WorkflowRequestId,
+    pub result: WorkflowControlResult,
+}
+
+impl WorkflowControlResponse {
+    pub fn ok(
+        request_id: impl Into<WorkflowRequestId>,
+        reply: WorkflowControlReply,
+    ) -> Self {
+        Self {
+            protocol: WORKFLOW_CONTROL_PROTOCOL_VERSION.to_owned(),
+            request_id: request_id.into(),
+            result: WorkflowControlResult::Ok { reply },
+        }
+    }
+
+    pub fn error(
+        request_id: impl Into<WorkflowRequestId>,
+        error: WorkflowControlError,
+    ) -> Self {
+        Self {
+            protocol: WORKFLOW_CONTROL_PROTOCOL_VERSION.to_owned(),
+            request_id: request_id.into(),
+            result: WorkflowControlResult::Error { error },
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), WorkflowProtocolError> {
+        validate_protocol_version(&self.protocol)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowProtocolError {
+    UnsupportedVersion(String),
+}
+
+impl fmt::Display for WorkflowProtocolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedVersion(version) => {
+                write!(f, "unsupported workflow control protocol: {version}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WorkflowProtocolError {}
+
+pub fn validate_protocol_version(protocol: &str) -> Result<(), WorkflowProtocolError> {
+    if protocol == WORKFLOW_CONTROL_PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(WorkflowProtocolError::UnsupportedVersion(
+            protocol.to_owned(),
+        ))
+    }
+}
 
 #[cfg(test)]
 mod tests {
