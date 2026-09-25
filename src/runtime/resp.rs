@@ -423,5 +423,9 @@ mod tests {
         out.clear();
         write_moved(&mut out, 3999, b"127.0.0.1:6381");
         assert_eq!(out, b"-MOVED 3999 127.0.0.1:6381\r\n");
+
+        out.clear();
+        write_ask(&mut out, 3999, b"127.0.0.1:6382");
+        assert_eq!(out, b"-ASK 3999 127.0.0.1:6382\r\n");
     }
 }
