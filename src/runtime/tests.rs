@@ -2054,6 +2054,7 @@ fn test_memory_store_latest_sequence() {
             1,
             JournalEntry {
                 sequence: 7,
+                activation_id: None,
                 behavior_id: 0,
                 payload: vec![],
             },
@@ -2094,6 +2095,7 @@ fn test_libsql_store_append_read_journal() {
             1,
             JournalEntry {
                 sequence: 1,
+                activation_id: None,
                 behavior_id: 0,
                 payload: vec![PersistedValue::Int(10)],
             },
@@ -2104,6 +2106,7 @@ fn test_libsql_store_append_read_journal() {
             1,
             JournalEntry {
                 sequence: 2,
+                activation_id: None,
                 behavior_id: 1,
                 payload: vec![PersistedValue::Int(20)],
             },
@@ -2137,6 +2140,7 @@ fn test_libsql_store_latest_sequence() {
             1,
             JournalEntry {
                 sequence: 7,
+                activation_id: None,
                 behavior_id: 0,
                 payload: vec![],
             },
@@ -2165,6 +2169,7 @@ fn test_libsql_store_clear() {
             1,
             JournalEntry {
                 sequence: 2,
+                activation_id: None,
                 behavior_id: 0,
                 payload: vec![],
             },
@@ -2201,6 +2206,7 @@ fn test_libsql_store_persists_to_disk() {
                 1,
                 JournalEntry {
                     sequence: 2,
+                    activation_id: None,
                     behavior_id: 0,
                     payload: vec![PersistedValue::Bool(true)],
                 },
