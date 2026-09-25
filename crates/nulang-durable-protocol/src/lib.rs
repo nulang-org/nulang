@@ -957,6 +957,63 @@ mod tests {
     }
 
     #[test]
+    fn durable_effect_ids_must_match_runtime_identity_shape() {
+        let mut invalid = transition();
+        invalid.durable_effects = vec![DurableEffectMutation::Prepared {
+            effect_id: "eff-01".into(),
+            operation: "Payment.charge".into(),
+            boundary: DurableEffectBoundary::External,
+            delivery: DurableDeliverySemantics::AtLeastOnce,
+            request_digest:
+                "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            idempotency_key: None,
+        }];
+
+        assert_eq!(
+            invalid.validate().unwrap_err(),
+            DurableProtocolError::InvalidDurableEffect
+        );
+    }
+
+    #[test]
+    fn compensation_effect_id_must_match_runtime_derivation() {
+        let mut invalid = transition();
+        invalid.durable_effects = vec![DurableEffectMutation::CompensationPrepared {
+            original_effect_id:
+                "1111111111111111111111111111111111111111111111111111111111111111".into(),
+            compensation_ordinal: 2,
+            effect_id:
+                "2222222222222222222222222222222222222222222222222222222222222222".into(),
+            operation: "Payment.refund".into(),
+            boundary: DurableEffectBoundary::External,
+            delivery: DurableDeliverySemantics::AtLeastOnce,
+            request_digest:
+                "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            idempotency_key: None,
+        }];
+
+        assert_eq!(
+            invalid.validate().unwrap_err(),
+            DurableProtocolError::InvalidCompensation
+        );
+    }
+
+    #[test]
+    fn future_timer_generation_is_rejected() {
+        let mut invalid = transition();
+        invalid.timers = vec![DurableTimerMutation::Fired {
+            timer_id: "shipping-timeout".into(),
+            set_activation_epoch: invalid.activation_epoch + 1,
+            set_sequence: invalid.sequence + 1,
+        }];
+
+        assert_eq!(
+            invalid.validate().unwrap_err(),
+            DurableProtocolError::InvalidTimerGeneration
+        );
+    }
+
+    #[test]
     fn timer_and_signal_records_are_semantic_not_host_specific() {
         let records = vec![
             DurableWorkflowEvent::SignalAccepted {
