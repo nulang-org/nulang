@@ -831,6 +831,18 @@ mod tests {
         )
     }
 
+    fn wasm_artifact() -> ArtifactIdentityManifest {
+        ArtifactIdentityManifest::new(
+            Some(SourceId::from_bytes(b"actor Counter {}")),
+            SemanticId::from_canonical_bytes(b"program", []),
+            "nulang-rust-0.1.0",
+            "wasm32",
+            "nulang-host-effects-v0alpha1",
+            "wasm",
+            ["opt=0"],
+        )
+    }
+
     fn typed_hir(version: u32) -> Module {
         let migrations = if version > 1 {
             vec![MigrationDecl {
@@ -937,6 +949,23 @@ mod tests {
             },
             workflow: None,
         }
+    }
+
+    #[test]
+    fn typed_hir_binds_wasm_artifact_kind_to_exact_bytes() {
+        let manifest = BehaviorManifest::from_typed_hir(
+            "demo",
+            "0.1.0",
+            &wasm_artifact(),
+            b"canonical-wasm-bytes",
+            &typed_hir(1),
+        )
+        .unwrap();
+
+        assert_eq!(manifest.artifact.kind, BEHAVIOR_ARTIFACT_KIND_WASM_MODULE);
+        manifest
+            .verify_artifact_bytes(b"canonical-wasm-bytes")
+            .unwrap();
     }
 
     #[test]
