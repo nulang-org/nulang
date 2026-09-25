@@ -786,6 +786,34 @@ mod tests {
     }
 
     #[test]
+    fn completed_compensation_preserves_linkage_and_result() {
+        let mutation = DurableEffectMutation::CompensationCompleted {
+            original_effect_id: "eff-original".into(),
+            compensation_ordinal: 2,
+            effect_id: "eff-compensation".into(),
+            operation: "Payment.refund".into(),
+            boundary: DurableEffectBoundary::External,
+            delivery: DurableDeliverySemantics::EffectivelyOnceWithDeduplication,
+            request_digest:
+                "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .into(),
+            result_digest:
+                "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .into(),
+            result: json!({"refunded": true}),
+        };
+
+        let value = serde_json::to_value(&mutation).unwrap();
+        assert_eq!(value["kind"], "compensation_completed");
+        assert_eq!(value["original_effect_id"], "eff-original");
+        assert_eq!(value["compensation_ordinal"], 2);
+        assert_eq!(value["result"]["refunded"], true);
+
+        let decoded: DurableEffectMutation = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, mutation);
+    }
+
+    #[test]
     fn compensation_effect_requires_original_identity() {
         let mut invalid = transition();
         invalid.durable_effects = vec![DurableEffectMutation::CompensationPrepared {
