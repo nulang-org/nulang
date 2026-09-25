@@ -1894,6 +1894,45 @@ pub fn compile_boxing_wrapper<M: Module>(
     Ok(())
 }
 
+/// Generate the stable zero-argument object-file entry wrapper.
+///
+/// The MIR entry function keeps its internal `nulang_fn_N` symbol so direct
+/// calls and JIT execution preserve the existing layout. Relocatable native
+/// artifacts additionally export `nulang_entry`, which forwards to that
+/// internal function and gives the linker/runtime a stable ABI surface.
+pub fn compile_entry_wrapper<M: Module>(
+    aot: &mut AotContext<'_, M>,
+    wrapper_fid: cranelift_module::FuncId,
+    entry_fid: cranelift_module::FuncId,
+) -> AotResult<()> {
+    let module: &mut M = aot.module;
+    let codegen_ctx: &mut codegen::Context = &mut aot.codegen_ctx;
+    let builder_ctx: &mut FunctionBuilderContext = aot.builder_context;
+
+    let mut sig = module.make_signature();
+    sig.returns.push(AbiParam::new(types::I64));
+    codegen_ctx.func.signature = sig;
+
+    let mut builder = FunctionBuilder::new(&mut codegen_ctx.func, builder_ctx);
+    let entry = builder.create_block();
+    builder.switch_to_block(entry);
+
+    let callee = module.declare_func_in_func(entry_fid, builder.func);
+    let call = builder.ins().call(callee, &[]);
+    let result = builder.inst_results(call)[0];
+    builder.ins().return_(&[result]);
+
+    builder.seal_all_blocks();
+    builder.finalize();
+
+    module
+        .define_function(wrapper_fid, codegen_ctx)
+        .map_err(|e| AotCompileError::Cranelift(e.to_string()))?;
+    module.clear_context(codegen_ctx);
+
+    Ok(())
+}
+
 /// Generate the stable runtime-facing entry wrapper for an actor behavior.
 ///
 /// Internal behavior functions keep their ordinary optimized signature
