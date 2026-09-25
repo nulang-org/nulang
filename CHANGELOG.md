@@ -1,5 +1,13 @@
 # Nulang Changelog
 
+### Workflow activation replay identity foundation — 2026-09-24
+- **Accepted workflow commands now have stable activation identities.** Non-internal workflow messages are journaled with a `WorkflowActivationId(actor_id, command_sequence)` before execution; failure to durably accept the command prevents the activation from running.
+- **Terminal workflow events close an explicit activation.** `StepCompleted` and `StepFailed` carry a backward-compatible optional activation id, and every normal/signal/timer/receive/LLM completion path records the live activation before clearing it.
+- **Replay-sensitive operations have deterministic identities.** A live activation owns a monotonic operation ordinal and `Runtime::next_workflow_operation_id` returns the stable `(activation, ordinal)` identity that later timer/event/effect replay will use.
+- **Recovery can identify unfinished activations without guessing from snapshot sequence.** `workflow_activation_records` folds activation-aware command and terminal history, preserves legacy records, and rejects ambiguous untagged terminal history after the activation-aware boundary.
+- This is the #836 identity/recovery-analysis foundation only. Automatic re-execution and replay consumption of intermediate timer/signal/custom-event/LLM/effect records remain separate follow-up work.
+
+
 ### Workflow durability fail-closed boundary — 2026-09-24
 - **Durable workflow timers no longer become live after a failed persistence write.** `schedule_workflow_timer` now returns the storage error and arms the timer wheel only after `TimerSet` plus the current checkpoint succeed; VM timer effects turn that failure into an unhandled-effect error rather than continuing.
 - **Workflow signals no longer resume or enter in-memory signal state after a failed durable append/checkpoint.** `signal_workflow` now returns `io::Result` and mutates/resumes only after persistence succeeds.
