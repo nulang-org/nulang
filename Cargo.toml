@@ -4,7 +4,7 @@ members = ["crates/nulang-ai", "crates/nulang-ai-core", "crates/nulang-ai-protoc
 # and builds only for wasm32-unknown-unknown; it is intentionally standalone
 # (its own lockfile, minimal pure-Rust dep set) and excluded from workspace
 # builds/tests so `cargo test --workspace` is unaffected.
-# The legacy cloud-control crate is excluded deliberately. Hosted control-plane\n# policy belongs in Nulang Cloud; only cloud-neutral contracts should remain\n# in the language/runtime workspace.\nexclude = ["crates/nulang-playground", "crates/nulang-cloud-control"]
+exclude = ["crates/nulang-playground"]
 
 [package]
 name = "nulang"
