@@ -440,6 +440,132 @@ where
 }
 
 #[cfg(test)]
+mod workflow_operation_replay_tests {
+    use super::*;
+
+    fn operation(ordinal: u32) -> WorkflowOperationId {
+        WorkflowOperationId::new(WorkflowActivationId::new(42, 7), ordinal)
+    }
+
+    #[test]
+    fn missing_operation_is_safe_to_execute() {
+        let replay = replay_workflow_operation(
+            &[],
+            operation(0),
+            &WorkflowOperationExpectation::Custom {
+                name: "audit".into(),
+                args: vec![PersistedValue::Int(1)],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(replay, WorkflowOperationReplay::Missing);
+    }
+
+    #[test]
+    fn matching_recorded_operation_is_consumed_without_reappend() {
+        let id = operation(0);
+        let events = vec![WorkflowEvent::Custom {
+            sequence: 9,
+            operation: Some(id),
+            name: "audit".into(),
+            args: vec![PersistedValue::Int(1)],
+        }];
+
+        let replay = replay_workflow_operation(
+            &events,
+            id,
+            &WorkflowOperationExpectation::Custom {
+                name: "audit".into(),
+                args: vec![PersistedValue::Int(1)],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            replay,
+            WorkflowOperationReplay::Recorded { sequence: 9 }
+        );
+    }
+
+    #[test]
+    fn recorded_operation_payload_drift_fails_closed() {
+        let id = operation(0);
+        let events = vec![WorkflowEvent::TimerSet {
+            sequence: 9,
+            operation: Some(id),
+            name: "retry".into(),
+            duration_ms: 100,
+        }];
+
+        let error = replay_workflow_operation(
+            &events,
+            id,
+            &WorkflowOperationExpectation::TimerSet {
+                name: "retry".into(),
+                duration_ms: 200,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn recorded_operation_kind_drift_fails_closed() {
+        let id = operation(0);
+        let events = vec![WorkflowEvent::Custom {
+            sequence: 9,
+            operation: Some(id),
+            name: "audit".into(),
+            args: vec![],
+        }];
+
+        let error = replay_workflow_operation(
+            &events,
+            id,
+            &WorkflowOperationExpectation::SagaCompensated {
+                step_name: "charge".into(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn duplicate_operation_identity_fails_closed() {
+        let id = operation(0);
+        let events = vec![
+            WorkflowEvent::Custom {
+                sequence: 9,
+                operation: Some(id),
+                name: "audit".into(),
+                args: vec![],
+            },
+            WorkflowEvent::Custom {
+                sequence: 10,
+                operation: Some(id),
+                name: "audit".into(),
+                args: vec![],
+            },
+        ];
+
+        let error = replay_workflow_operation(
+            &events,
+            id,
+            &WorkflowOperationExpectation::Custom {
+                name: "audit".into(),
+                args: vec![],
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+}
+
+#[cfg(test)]
 mod workflow_activation_classification_tests {
     use super::*;
 
