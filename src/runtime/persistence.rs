@@ -555,6 +555,152 @@ where
 }
 
 #[cfg(test)]
+mod workflow_replay_plan_tests {
+    use super::*;
+
+    fn command(sequence: u64, behavior_id: u16) -> JournalEntry {
+        JournalEntry {
+            sequence,
+            behavior_id,
+            payload: vec![PersistedValue::Int(sequence as i64)],
+        }
+    }
+
+    fn operation(
+        activation: WorkflowActivationId,
+        ordinal: u32,
+        sequence: u64,
+    ) -> WorkflowEvent {
+        WorkflowEvent::Custom {
+            sequence,
+            operation: Some(WorkflowOperationId::new(activation, ordinal)),
+            name: format!("op-{ordinal}"),
+            args: vec![],
+        }
+    }
+
+    #[test]
+    fn replay_plan_collects_single_open_activation_and_contiguous_receipts() {
+        let actor_id = 42;
+        let activation = WorkflowActivationId::new(actor_id, 7);
+        let journal = vec![command(7, 1)];
+        let events = vec![
+            operation(activation, 0, 8),
+            operation(activation, 1, 9),
+        ];
+
+        let plan = workflow_replay_plan(actor_id, &journal, &events, |_| true)
+            .unwrap()
+            .expect("one activation should need replay");
+
+        assert_eq!(plan.activation, activation);
+        assert_eq!(plan.command.sequence, 7);
+        assert_eq!(plan.operations.len(), 2);
+        assert_eq!(plan.operations[0].operation_id().unwrap().ordinal, 0);
+        assert_eq!(plan.operations[1].operation_id().unwrap().ordinal, 1);
+    }
+
+    #[test]
+    fn replay_plan_returns_none_when_all_commands_are_terminal() {
+        let actor_id = 42;
+        let activation = WorkflowActivationId::new(actor_id, 7);
+        let journal = vec![command(7, 1)];
+        let events = vec![WorkflowEvent::StepCompleted {
+            sequence: 8,
+            activation: Some(activation),
+            step_name: "done".into(),
+        }];
+
+        assert!(
+            workflow_replay_plan(actor_id, &journal, &events, |_| true)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn replay_plan_rejects_multiple_open_activations() {
+        let actor_id = 42;
+        let journal = vec![command(7, 1), command(9, 2)];
+
+        let error = workflow_replay_plan(actor_id, &journal, &[], |_| true).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn replay_plan_rejects_operation_ordinal_gap() {
+        let actor_id = 42;
+        let activation = WorkflowActivationId::new(actor_id, 7);
+        let journal = vec![command(7, 1)];
+        let events = vec![
+            operation(activation, 0, 8),
+            operation(activation, 2, 9),
+        ];
+
+        let error = workflow_replay_plan(actor_id, &journal, &events, |_| true).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn replay_plan_rejects_foreign_operation_activation() {
+        let actor_id = 42;
+        let activation = WorkflowActivationId::new(actor_id, 7);
+        let foreign = WorkflowActivationId::new(actor_id, 99);
+        let journal = vec![command(7, 1)];
+        let events = vec![operation(foreign, 0, 8)];
+
+        let error = workflow_replay_plan(actor_id, &journal, &events, |_| true).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(activation.command_sequence, 7);
+    }
+
+    #[test]
+    fn replay_plan_rejects_legacy_replay_sensitive_event_after_open_command() {
+        let actor_id = 42;
+        let journal = vec![command(7, 1)];
+        let events = vec![WorkflowEvent::Custom {
+            sequence: 8,
+            operation: None,
+            name: "legacy".into(),
+            args: vec![],
+        }];
+
+        let error = workflow_replay_plan(actor_id, &journal, &events, |_| true).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn replay_plan_ignores_external_arrivals_for_operation_ordinals() {
+        let actor_id = 42;
+        let activation = WorkflowActivationId::new(actor_id, 7);
+        let journal = vec![command(7, 1)];
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                sequence: 8,
+                name: "approved".into(),
+                payload: None,
+            },
+            operation(activation, 0, 9),
+            WorkflowEvent::TimerFired {
+                sequence: 10,
+                name: "retry".into(),
+            },
+        ];
+
+        let plan = workflow_replay_plan(actor_id, &journal, &events, |_| true)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(plan.operations.len(), 1);
+        assert_eq!(plan.operations[0].operation_id().unwrap().ordinal, 0);
+    }
+}
+
+#[cfg(test)]
 mod workflow_operation_replay_tests {
     use super::*;
 
