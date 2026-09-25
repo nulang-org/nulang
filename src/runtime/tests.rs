@@ -3916,6 +3916,95 @@ fn test_workflow_actor_step_event_and_checkpoint() {
 }
 
 #[test]
+fn test_workflow_recovery_refuses_unfinished_activation_until_replay_driver_exists() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "OpenActivationWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    let command_sequence = rt.persistence.latest_sequence(actor_id) + 1;
+    rt.persistence
+        .append_journal(
+            actor_id,
+            JournalEntry {
+                sequence: command_sequence,
+                behavior_id: 1,
+                payload: vec![],
+            },
+        )
+        .unwrap();
+
+    rt.actors.remove(&actor_id);
+
+    assert_eq!(
+        rt.recover_actor(actor_id),
+        None,
+        "recovery must not turn an unfinished durable command into a fresh activation"
+    );
+    assert!(!rt.actors.contains_key(&actor_id));
+    assert_eq!(
+        rt.persistence.read_journal(actor_id).len(),
+        1,
+        "fail-closed recovery must not mutate durable command history"
+    );
+}
+
+#[test]
+fn test_workflow_recovery_does_not_redrive_stale_wait_marker_after_terminal_event() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "ClosedActivationWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    let mut snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    snapshot.waiting_signal = Some("approved".into());
+    rt.persistence.save_snapshot(snapshot).unwrap();
+
+    let command_sequence = rt.persistence.latest_sequence(actor_id) + 1;
+    let activation = WorkflowActivationId::new(actor_id, command_sequence);
+    rt.persistence
+        .append_journal(
+            actor_id,
+            JournalEntry {
+                sequence: command_sequence,
+                behavior_id: 1,
+                payload: vec![],
+            },
+        )
+        .unwrap();
+    let terminal_sequence = rt.persistence.latest_sequence(actor_id) + 1;
+    rt.persistence
+        .append_workflow_event(
+            actor_id,
+            WorkflowEvent::StepCompleted {
+                sequence: terminal_sequence,
+                activation: Some(activation),
+                step_name: "done".into(),
+            },
+        )
+        .unwrap();
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+
+    let journal_len = rt.persistence.read_journal(actor_id).len();
+    run_ready_actor_turn(&mut rt, actor_id);
+    assert_eq!(
+        rt.persistence.read_journal(actor_id).len(),
+        journal_len,
+        "a stale wait marker from a closed activation must not enqueue a new command"
+    );
+}
+
+#[test]
 fn test_workflow_actor_recovery_replays_step_index() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
