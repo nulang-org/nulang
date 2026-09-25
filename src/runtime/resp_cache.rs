@@ -59,8 +59,7 @@ pub trait CacheCommandTarget {
         now_ms: u64,
     ) -> Result<usize, CacheCommandError>;
     fn delete_key(&mut self, key: &[u8], now_ms: u64) -> Result<bool, CacheCommandError>;
-    fn increment(&mut self, key: &[u8], delta: i64, now_ms: u64)
-        -> Result<i64, CacheCommandError>;
+    fn increment(&mut self, key: &[u8], delta: i64, now_ms: u64) -> Result<i64, CacheCommandError>;
     fn expire_ms(
         &mut self,
         key: &[u8],
@@ -111,12 +110,7 @@ impl CacheCommandTarget for CacheStore {
         Ok(self.delete_at(key, now_ms))
     }
 
-    fn increment(
-        &mut self,
-        key: &[u8],
-        delta: i64,
-        now_ms: u64,
-    ) -> Result<i64, CacheCommandError> {
+    fn increment(&mut self, key: &[u8], delta: i64, now_ms: u64) -> Result<i64, CacheCommandError> {
         CacheStore::increment(self, key, delta, now_ms).map_err(CacheCommandError::Increment)
     }
 
@@ -174,15 +168,11 @@ impl CacheCommandTarget for DurableCacheStore {
     }
 
     fn delete_key(&mut self, key: &[u8], now_ms: u64) -> Result<bool, CacheCommandError> {
-        self.delete_at(key, now_ms).map_err(command_durability_error)
+        self.delete_at(key, now_ms)
+            .map_err(command_durability_error)
     }
 
-    fn increment(
-        &mut self,
-        key: &[u8],
-        delta: i64,
-        now_ms: u64,
-    ) -> Result<i64, CacheCommandError> {
+    fn increment(&mut self, key: &[u8], delta: i64, now_ms: u64) -> Result<i64, CacheCommandError> {
         self.increment(key, delta, now_ms, unix_now_ms())
             .map_err(command_durability_error)
     }
@@ -361,7 +351,12 @@ fn execute_ping(command: RespCommand<'_>, out: &mut Vec<u8>) {
     }
 }
 
-fn execute_get<T: CacheCommandTarget>(store: &mut T, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_get<T: CacheCommandTarget>(
+    store: &mut T,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() != 1 {
         wrong_arity(out, b"get");
         return;
@@ -371,7 +366,12 @@ fn execute_get<T: CacheCommandTarget>(store: &mut T, command: RespCommand<'_>, n
     write_value(store.get(key, now_ms), out);
 }
 
-fn execute_set<T: CacheCommandTarget>(store: &mut T, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_set<T: CacheCommandTarget>(
+    store: &mut T,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() != 2 && command.argc() != 4 {
         wrong_arity(out, b"set");
         return;
@@ -414,7 +414,12 @@ fn execute_set<T: CacheCommandTarget>(store: &mut T, command: RespCommand<'_>, n
     }
 }
 
-fn execute_del<T: CacheCommandTarget>(store: &mut T, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_del<T: CacheCommandTarget>(
+    store: &mut T,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() == 0 {
         wrong_arity(out, b"del");
         return;
@@ -454,7 +459,12 @@ fn execute_exists<T: CacheCommandTarget>(
     write_integer(out, count);
 }
 
-fn execute_incr<T: CacheCommandTarget>(store: &mut T, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_incr<T: CacheCommandTarget>(
+    store: &mut T,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() != 1 {
         wrong_arity(out, b"incr");
         return;
@@ -507,7 +517,12 @@ fn execute_expire<T: CacheCommandTarget>(
     }
 }
 
-fn execute_ttl<T: CacheCommandTarget>(store: &mut T, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_ttl<T: CacheCommandTarget>(
+    store: &mut T,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() != 1 {
         wrong_arity(out, b"ttl");
         return;
@@ -522,7 +537,12 @@ fn execute_ttl<T: CacheCommandTarget>(store: &mut T, command: RespCommand<'_>, n
     write_integer(out, ttl);
 }
 
-fn execute_mget<T: CacheCommandTarget>(store: &mut T, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_mget<T: CacheCommandTarget>(
+    store: &mut T,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() == 0 {
         wrong_arity(out, b"mget");
         return;
@@ -538,7 +558,12 @@ fn execute_mget<T: CacheCommandTarget>(store: &mut T, command: RespCommand<'_>, 
     }
 }
 
-fn execute_mset<T: CacheCommandTarget>(store: &mut T, command: RespCommand<'_>, now_ms: u64, out: &mut Vec<u8>) {
+fn execute_mset<T: CacheCommandTarget>(
+    store: &mut T,
+    command: RespCommand<'_>,
+    now_ms: u64,
+    out: &mut Vec<u8>,
+) {
     if command.argc() == 0 || command.argc() % 2 != 0 {
         wrong_arity(out, b"mset");
         return;
