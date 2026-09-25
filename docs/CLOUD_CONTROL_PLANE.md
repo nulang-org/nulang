@@ -171,7 +171,9 @@ and outbox state remain in `ControlStore`.
 The loop keeps at most one pending request per deployment. Newer desired
 revisions supersede older pending revisions, stale revisions are ignored, and
 multiple triggers for the same desired revision coalesce into one state-based
-reconciliation turn. Processing order is deterministic by deployment id.
+reconciliation turn while retaining the first evaluation id for that revision.
+This preserves idempotent retry when a failed turn already recorded the evaluation
+before a later trigger arrived. Processing order is deterministic by deployment id.
 
 A failed turn remains queued with the exact same evaluation id. Retrying
 therefore reaches `reconcile_once` with the same idempotency key instead of
