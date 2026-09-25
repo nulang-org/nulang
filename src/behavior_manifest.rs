@@ -873,6 +873,84 @@ mod tests {
     }
 
     #[test]
+    fn typed_hir_emits_ordered_workflow_step_metadata() {
+        let mut module = typed_hir(1);
+        let hir::Decl::Actor(actor) = &mut module.decls[0] else {
+            panic!("expected actor");
+        };
+        actor.name = "ApprovalFlow".into();
+        actor.is_workflow = true;
+        actor.behaviors = vec![
+            crate::hir::BehaviorDef {
+                name: "reserve".into(),
+                params: Vec::new(),
+                ret: Type::unit(),
+                effect: crate::types::EffectRow::empty(),
+                cap: crate::types::Capability::Ref,
+                body: crate::hir::Body::default(),
+                compensate: Some(crate::hir::Body::default()),
+                parallel_branches: None,
+                span: Span::default(),
+            },
+            crate::hir::BehaviorDef {
+                name: "parallel_0".into(),
+                params: Vec::new(),
+                ret: Type::unit(),
+                effect: crate::types::EffectRow::empty(),
+                cap: crate::types::Capability::Ref,
+                body: crate::hir::Body::default(),
+                compensate: None,
+                parallel_branches: Some(vec!["email".into(), "sms".into()]),
+                span: Span::default(),
+            },
+        ];
+
+        let manifest = BehaviorManifest::from_typed_hir(
+            "demo",
+            "0.1.0",
+            &artifact(),
+            b"compiled-nbc",
+            &module,
+        )
+        .unwrap();
+
+        let owner = &manifest.actors[0];
+        assert_eq!(owner.kind, BehaviorOwnerKind::Workflow);
+        assert_eq!(
+            owner.workflow,
+            Some(BehaviorWorkflow {
+                steps: vec![
+                    BehaviorWorkflowStep {
+                        name: "reserve".into(),
+                        compensation: true,
+                        parallel_branches: Vec::new(),
+                    },
+                    BehaviorWorkflowStep {
+                        name: "parallel_0".into(),
+                        compensation: false,
+                        parallel_branches: vec!["email".into(), "sms".into()],
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn non_workflow_actor_omits_workflow_metadata() {
+        let manifest = BehaviorManifest::from_typed_hir(
+            "demo",
+            "0.1.0",
+            &artifact(),
+            b"compiled-nbc",
+            &typed_hir(1),
+        )
+        .unwrap();
+
+        assert_eq!(manifest.actors[0].kind, BehaviorOwnerKind::Actor);
+        assert_eq!(manifest.actors[0].workflow, None);
+    }
+
+    #[test]
     fn typed_hir_emits_durable_schema_and_migration_metadata() {
         let manifest = BehaviorManifest::from_typed_hir(
             "demo",
