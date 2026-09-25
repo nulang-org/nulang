@@ -185,6 +185,34 @@ fn default_event_value() -> PersistedValue {
     PersistedValue::Int(1)
 }
 
+/// Stable identity of one accepted workflow command activation.
+///
+/// The command journal sequence is allocated before user code executes and
+/// remains stable across suspension, replay, and terminal workflow events.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct WorkflowActivationId {
+    pub actor_id: u64,
+    pub command_sequence: u64,
+}
+
+impl WorkflowActivationId {
+    pub const fn new(actor_id: u64, command_sequence: u64) -> Self {
+        Self {
+            actor_id,
+            command_sequence,
+        }
+    }
+}
+
 /// A workflow event records a durable, replayable step in a workflow actor.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "tag", content = "value")]
@@ -196,7 +224,15 @@ pub enum WorkflowEvent {
         state: Vec<PersistedValue>,
     },
     /// A workflow step completed successfully.
-    StepCompleted { sequence: u64, step_name: String },
+    StepCompleted {
+        sequence: u64,
+        /// Stable identity of the accepted command this terminal event closes.
+        /// Missing on legacy journal records written before activation identity
+        /// was persisted.
+        #[serde(default)]
+        activation: Option<WorkflowActivationId>,
+        step_name: String,
+    },
     /// A timer was set for a workflow.
     TimerSet {
         sequence: u64,
@@ -225,6 +261,11 @@ pub enum WorkflowEvent {
     /// silent — exit 0, no diagnostic).
     StepFailed {
         sequence: u64,
+        /// Stable identity of the accepted command this terminal event closes.
+        /// Missing on legacy journal records written before activation identity
+        /// was persisted.
+        #[serde(default)]
+        activation: Option<WorkflowActivationId>,
         step_name: String,
         error: String,
     },
@@ -249,6 +290,17 @@ impl WorkflowEvent {
             | WorkflowEvent::ParallelBranchCompleted { sequence, .. }
             | WorkflowEvent::StepFailed { sequence, .. }
             | WorkflowEvent::Custom { sequence, .. } => *sequence,
+        }
+    }
+
+    /// Return the accepted command activation closed by a terminal event.
+    ///
+    /// Legacy events return `None` and remain readable for compatibility.
+    pub fn activation_id(&self) -> Option<WorkflowActivationId> {
+        match self {
+            WorkflowEvent::StepCompleted { activation, .. }
+            | WorkflowEvent::StepFailed { activation, .. } => *activation,
+            _ => None,
         }
     }
 }
