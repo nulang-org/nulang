@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use std::io;
 
 use super::cache::{CacheConfig, CacheEvictionPolicy, CacheStore};
-use super::cache_routing::CacheShardOwner;
 use super::cache_persistence::{
     apply_wal_mutation, decode_mutation, encode_cache_snapshot, encode_mutation,
     restore_cache_snapshot, CacheWalMutation,
 };
+use super::cache_routing::CacheShardOwner;
 
 const REPLICATION_MAGIC: &[u8; 8] = b"NLCREP01";
 const REPLICA_ACK_MAGIC: &[u8; 8] = b"NLCACK01";
@@ -218,8 +218,7 @@ pub fn capture_replica_bootstrap(
     store_now_ms: u64,
     wall_now_ms: u64,
 ) -> io::Result<(CacheReplicaBootstrapManifest, Vec<u8>)> {
-    let snapshot =
-        encode_cache_snapshot(store, snapshot_sequence, store_now_ms, wall_now_ms)?;
+    let snapshot = encode_cache_snapshot(store, snapshot_sequence, store_now_ms, wall_now_ms)?;
     let snapshot_checksum = *blake3::hash(&snapshot).as_bytes();
     Ok((
         CacheReplicaBootstrapManifest {
@@ -244,10 +243,14 @@ pub fn replica_bootstrap_chunks(
         ));
     }
     if snapshot.len() as u64 != manifest.snapshot_bytes {
-        return Err(invalid_data("cache replica bootstrap snapshot size mismatch"));
+        return Err(invalid_data(
+            "cache replica bootstrap snapshot size mismatch",
+        ));
     }
     if blake3::hash(snapshot).as_bytes() != &manifest.snapshot_checksum {
-        return Err(invalid_data("cache replica bootstrap snapshot checksum mismatch"));
+        return Err(invalid_data(
+            "cache replica bootstrap snapshot checksum mismatch",
+        ));
     }
 
     let mut chunks = Vec::with_capacity(snapshot.len().div_ceil(chunk_size));
@@ -270,7 +273,11 @@ impl CacheReplicaAckTracker {
     pub fn new(placement_epoch: u64, replicas: &[CacheShardOwner]) -> Self {
         Self {
             placement_epoch,
-            acknowledgements: replicas.iter().copied().map(|replica| (replica, 0)).collect(),
+            acknowledgements: replicas
+                .iter()
+                .copied()
+                .map(|replica| (replica, 0))
+                .collect(),
         }
     }
 
@@ -603,13 +610,17 @@ pub fn encode_replica_ack(ack: &CacheReplicaAck) -> Vec<u8> {
 
 pub fn decode_replica_ack(bytes: &[u8]) -> io::Result<CacheReplicaAck> {
     if bytes.len() != REPLICA_ACK_BODY_BYTES + CHECKSUM_BYTES {
-        return Err(invalid_data("cache replica acknowledgement length mismatch"));
+        return Err(invalid_data(
+            "cache replica acknowledgement length mismatch",
+        ));
     }
 
     let (body, stored_checksum) = bytes.split_at(REPLICA_ACK_BODY_BYTES);
     let checksum = blake3::hash(body);
     if checksum.as_bytes() != stored_checksum {
-        return Err(invalid_data("cache replica acknowledgement checksum mismatch"));
+        return Err(invalid_data(
+            "cache replica acknowledgement checksum mismatch",
+        ));
     }
     if &body[..8] != REPLICA_ACK_MAGIC {
         return Err(invalid_data("invalid cache replica acknowledgement magic"));
@@ -617,12 +628,16 @@ pub fn decode_replica_ack(bytes: &[u8]) -> io::Result<CacheReplicaAck> {
 
     let version = u16::from_le_bytes([body[8], body[9]]);
     if version != REPLICATION_VERSION {
-        return Err(invalid_data("unsupported cache replica acknowledgement version"));
+        return Err(invalid_data(
+            "unsupported cache replica acknowledgement version",
+        ));
     }
 
     Ok(CacheReplicaAck {
         placement_epoch: u64::from_le_bytes(
-            body[10..18].try_into().expect("fixed acknowledgement epoch slice"),
+            body[10..18]
+                .try_into()
+                .expect("fixed acknowledgement epoch slice"),
         ),
         replica: CacheShardOwner {
             node_id: u64::from_le_bytes(
@@ -1075,8 +1090,7 @@ mod tests {
     fn bootstrap_rejects_out_of_order_chunk_before_install() {
         let mut source = CacheStore::new();
         source.set_integer(b"k", 1, None, 0);
-        let (manifest, snapshot) =
-            capture_replica_bootstrap(9, &source, 4, 0, 1_000).unwrap();
+        let (manifest, snapshot) = capture_replica_bootstrap(9, &source, 4, 0, 1_000).unwrap();
         let mut chunks = replica_bootstrap_chunks(&manifest, &snapshot, 8).unwrap();
         assert!(chunks.len() > 1);
 
@@ -1120,8 +1134,7 @@ mod tests {
     fn bootstrap_manifest_is_fenced_by_expected_placement_epoch() {
         let mut source = CacheStore::new();
         source.set_integer(b"k", 1, None, 0);
-        let (manifest, _snapshot) =
-            capture_replica_bootstrap(12, &source, 4, 0, 1_000).unwrap();
+        let (manifest, _snapshot) = capture_replica_bootstrap(12, &source, 4, 0, 1_000).unwrap();
 
         let error = CacheReplicaBootstrapAssembler::new(13, manifest, usize::MAX).unwrap_err();
         assert_eq!(
@@ -1137,8 +1150,7 @@ mod tests {
     fn bootstrap_manifest_respects_receiver_size_limit() {
         let mut source = CacheStore::new();
         source.set_bytes(b"k", &[7; 128], None, 0);
-        let (manifest, snapshot) =
-            capture_replica_bootstrap(2, &source, 1, 0, 1_000).unwrap();
+        let (manifest, snapshot) = capture_replica_bootstrap(2, &source, 1, 0, 1_000).unwrap();
 
         let error =
             CacheReplicaBootstrapAssembler::new(2, manifest, snapshot.len() - 1).unwrap_err();
