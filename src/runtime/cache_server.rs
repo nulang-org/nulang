@@ -800,9 +800,30 @@ fn validate_config(config: &CacheServerConfig) -> Result<(), CacheServerError> {
 mod tests {
     use super::super::cache_cluster::{CacheAdvertisedEndpoint, CacheEndpointMap};
     use super::super::cache_dispatch::CacheDispatchChannels;
+    use super::super::cache_persistence::{recover_cache, CacheWal};
     use super::super::cache_routing::CacheSlotMap;
     use super::*;
     use std::net::TcpStream as StdTcpStream;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_CACHE_SERVER_TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn test_path(name: &str) -> std::path::PathBuf {
+        let id = NEXT_CACHE_SERVER_TEST_ID.fetch_add(1, AtomicOrdering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "nulang-cache-server-{name}-{}-{id}",
+            std::process::id()
+        ))
+    }
+
+    fn wall_now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64
+    }
 
     fn build_server() -> CacheShardServer {
         let placement = CacheSlotMap::new_local(1, 1).unwrap();
@@ -852,6 +873,77 @@ mod tests {
         let mut response = [0u8; 16];
         client.read_exact(&mut response).unwrap();
         assert_eq!(&response, b"+OK\r\n$5\r\nvalue\r\n");
+    }
+
+    #[test]
+    fn durable_reactor_journals_real_resp_mutation_and_recovers_it() {
+        let wal_path = test_path("durable-wal");
+        let snapshot_path = test_path("durable-snapshot");
+
+        let placement = CacheSlotMap::new_local(1, 1).unwrap();
+        let owner = placement.owner_for_slot(0).unwrap();
+        let (channels, mut inboxes) = CacheDispatchChannels::new(1, 32).unwrap();
+        let mut endpoints = CacheEndpointMap::new();
+        endpoints.insert(owner, CacheAdvertisedEndpoint::new("127.0.0.1", 7000));
+        let dispatcher = CacheDispatcher::new(1, 0, placement, channels)
+            .unwrap()
+            .with_cluster_redirects(endpoints);
+
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let durable = DurableCacheStore::with_wal(
+            CacheStore::new(),
+            wal,
+            CacheDurabilityMode::SyncedJournal,
+        )
+        .unwrap();
+        let clock = CacheServerClock::new();
+        let mut server = CacheShardServer::bind_durable(
+            "127.0.0.1:0".parse().unwrap(),
+            dispatcher,
+            inboxes.remove(0),
+            durable,
+            CacheServerConfig::default(),
+            clock,
+        )
+        .unwrap();
+
+        let address = server.local_addr().unwrap();
+        let mut client = StdTcpStream::connect(address).unwrap();
+        client.set_nodelay(true).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client
+            .write_all(b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n")
+            .unwrap();
+
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(10))).unwrap();
+        }
+        let mut response = [0u8; 5];
+        client.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"+OK\r\n");
+        drop(client);
+        drop(server);
+
+        let (mut recovered, report) = recover_cache(
+            &snapshot_path,
+            &wal_path,
+            CacheConfig::default(),
+            CacheEvictionPolicy::S3Fifo,
+            0,
+            wall_now_ms(),
+        )
+        .unwrap();
+        assert_eq!(report.snapshot_sequence, 0);
+        assert_eq!(report.wal_last_sequence, 1);
+        assert_eq!(report.replayed_records, 1);
+        assert_eq!(
+            recovered.get(b"key", 0),
+            Some(CacheValueView::Bytes(b"value"))
+        );
+
+        let _ = std::fs::remove_file(wal_path);
     }
 
     #[test]
