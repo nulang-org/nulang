@@ -244,7 +244,8 @@ fn invalid_data(message: &'static str) -> io::Error {
 mod tests {
     use super::*;
     use crate::runtime::{
-        CacheConfig, CacheEvictionPolicy, CacheStore, CacheValueView, CacheWalMutation,
+        CacheConfig, CacheEvictionPolicy, CacheShardOwner, CacheStore, CacheValueView,
+        CacheWalMutation,
     };
 
     fn integer_record(epoch: u64, sequence: u64, key: &[u8], value: i64) -> CacheReplicationRecord {
@@ -386,6 +387,172 @@ mod tests {
         assert_eq!(
             replica.store_mut().get(b"counter", 0),
             Some(CacheValueView::Integer(5))
+        );
+    }
+
+    #[test]
+    fn replica_ack_frame_round_trips_identity_epoch_and_sequence() {
+        let ack = CacheReplicaAck {
+            placement_epoch: 13,
+            replica: CacheShardOwner {
+                node_id: 44,
+                shard: 2,
+            },
+            applied_sequence: 808,
+        };
+
+        let encoded = encode_replica_ack(&ack);
+        assert_eq!(decode_replica_ack(&encoded).unwrap(), ack);
+    }
+
+    #[test]
+    fn replica_ack_tracker_counts_distinct_replicas_at_or_above_sequence() {
+        let first = CacheShardOwner {
+            node_id: 2,
+            shard: 0,
+        };
+        let second = CacheShardOwner {
+            node_id: 3,
+            shard: 0,
+        };
+        let mut tracker = CacheReplicaAckTracker::new(5, &[first, second]);
+
+        assert_eq!(
+            tracker
+                .observe(
+                    &CacheReplicaAck {
+                        placement_epoch: 5,
+                        replica: first,
+                        applied_sequence: 10,
+                    },
+                    10,
+                )
+                .unwrap(),
+            CacheReplicaAckObservation::Advanced {
+                replica: first,
+                sequence: 10,
+            }
+        );
+        assert_eq!(tracker.acked_replicas(10), 1);
+        assert!(!tracker.satisfies(10, 2));
+
+        tracker
+            .observe(
+                &CacheReplicaAck {
+                    placement_epoch: 5,
+                    replica: second,
+                    applied_sequence: 10,
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(tracker.acked_replicas(10), 2);
+        assert!(tracker.satisfies(10, 2));
+    }
+
+    #[test]
+    fn replica_ack_cannot_claim_sequence_primary_has_not_produced() {
+        let replica = CacheShardOwner {
+            node_id: 2,
+            shard: 0,
+        };
+        let mut tracker = CacheReplicaAckTracker::new(5, &[replica]);
+        let error = tracker
+            .observe(
+                &CacheReplicaAck {
+                    placement_epoch: 5,
+                    replica,
+                    applied_sequence: 11,
+                },
+                10,
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            CacheReplicaAckError::FutureSequence {
+                local: 10,
+                received: 11,
+            }
+        );
+        assert_eq!(tracker.acked_replicas(1), 0);
+    }
+
+    #[test]
+    fn replica_ack_is_monotonic_per_replica() {
+        let replica = CacheShardOwner {
+            node_id: 2,
+            shard: 0,
+        };
+        let mut tracker = CacheReplicaAckTracker::new(5, &[replica]);
+        tracker
+            .observe(
+                &CacheReplicaAck {
+                    placement_epoch: 5,
+                    replica,
+                    applied_sequence: 9,
+                },
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(
+            tracker
+                .observe(
+                    &CacheReplicaAck {
+                        placement_epoch: 5,
+                        replica,
+                        applied_sequence: 8,
+                    },
+                    10,
+                )
+                .unwrap(),
+            CacheReplicaAckObservation::Duplicate {
+                replica,
+                sequence: 9,
+            }
+        );
+        assert_eq!(tracker.acked_replicas(9), 1);
+    }
+
+    #[test]
+    fn epoch_fence_clears_old_acknowledgements_and_rejects_old_epoch() {
+        let replica = CacheShardOwner {
+            node_id: 2,
+            shard: 0,
+        };
+        let mut tracker = CacheReplicaAckTracker::new(5, &[replica]);
+        tracker
+            .observe(
+                &CacheReplicaAck {
+                    placement_epoch: 5,
+                    replica,
+                    applied_sequence: 10,
+                },
+                10,
+            )
+            .unwrap();
+        assert!(tracker.satisfies(10, 1));
+
+        tracker.fence_epoch(6).unwrap();
+        assert!(!tracker.satisfies(10, 1));
+
+        let error = tracker
+            .observe(
+                &CacheReplicaAck {
+                    placement_epoch: 5,
+                    replica,
+                    applied_sequence: 10,
+                },
+                10,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            CacheReplicaAckError::StaleEpoch {
+                current: 6,
+                received: 5,
+            }
         );
     }
 
