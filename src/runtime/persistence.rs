@@ -260,6 +260,8 @@ pub enum WorkflowEvent {
     /// A branch of a synthetic parallel step completed.
     ParallelBranchCompleted {
         sequence: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<WorkflowOperationId>,
         parallel_step_name: String,
         branch_name: String,
     },
@@ -277,6 +279,8 @@ pub enum WorkflowEvent {
     /// Any other event emitted by a workflow handler.
     Custom {
         sequence: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<WorkflowOperationId>,
         name: String,
         args: Vec<PersistedValue>,
     },
@@ -313,6 +317,18 @@ impl WorkflowEvent {
             self,
             WorkflowEvent::StepCompleted { .. } | WorkflowEvent::StepFailed { .. }
         )
+    }
+
+    /// Stable activation-local identity for replay-sensitive emitted events.
+    ///
+    /// Legacy records and workflow events that have not yet migrated to the
+    /// activation replay contract return `None`.
+    pub fn operation_id(&self) -> Option<WorkflowOperationId> {
+        match self {
+            WorkflowEvent::ParallelBranchCompleted { operation_id, .. }
+            | WorkflowEvent::Custom { operation_id, .. } => *operation_id,
+            _ => None,
+        }
     }
 }
 
@@ -678,6 +694,7 @@ pub trait PersistenceStore: Send + Sync {
             actor_id,
             WorkflowEvent::ParallelBranchCompleted {
                 sequence,
+                operation_id: None,
                 parallel_step_name,
                 branch_name,
             },
@@ -3910,6 +3927,7 @@ mod libsql_atomic_transition_tests {
                 },
                 WorkflowEvent::Custom {
                     sequence,
+                    operation_id: None,
                     name: "audit".to_string(),
                     args: vec![PersistedValue::Int(sequence as i64)],
                 },
