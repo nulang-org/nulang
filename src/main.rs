@@ -1020,6 +1020,7 @@ fn main() {
             &opts.with_capabilities,
             opts.store_path.as_deref(),
             opts.deny_warnings,
+            opts.behavior_manifest_output(),
         ) {
             print_error(&e, use_color);
             std::process::exit(exit_code(&e));
