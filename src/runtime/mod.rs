@@ -3967,18 +3967,25 @@ impl Runtime {
                         if self.actor_is_workflow(actor_id) {
                             let seq = self.next_sequence(actor_id);
                             let step_name = self.step_name_for(actor_id, behavior_idx);
-                            let terminal_committed = self
-                                .persistence
-                                .append_workflow_event(
-                                    actor_id,
-                                    WorkflowEvent::StepFailed {
-                                        sequence: seq,
-                                        activation: workflow_activation,
-                                        step_name,
-                                        error: format!("{}", e),
-                                    },
-                                )
-                                .is_ok();
+                            let terminal_committed = match self.persistence.append_workflow_event(
+                                actor_id,
+                                WorkflowEvent::StepFailed {
+                                    sequence: seq,
+                                    activation: workflow_activation,
+                                    step_name,
+                                    error: format!("{}", e),
+                                },
+                            ) {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    warn!(
+                                        actor_id,
+                                        %error,
+                                        "failed to persist terminal StepFailed event"
+                                    );
+                                    false
+                                }
+                            };
                             if terminal_committed {
                                 self.run_saga_compensation(actor_id, behavior_idx);
                                 self.checkpoint_actor(actor_id);
@@ -3996,17 +4003,24 @@ impl Runtime {
             {
                 let seq = self.next_sequence(actor_id);
                 let step_name = self.step_name_for(actor_id, behavior_idx);
-                let terminal_committed = self
-                    .persistence
-                    .append_workflow_event(
-                        actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            activation: workflow_activation,
-                            step_name,
-                        },
-                    )
-                    .is_ok();
+                let terminal_committed = match self.persistence.append_workflow_event(
+                    actor_id,
+                    WorkflowEvent::StepCompleted {
+                        sequence: seq,
+                        activation: workflow_activation,
+                        step_name,
+                    },
+                ) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!(
+                            actor_id,
+                            %error,
+                            "failed to persist terminal StepCompleted event"
+                        );
+                        false
+                    }
+                };
                 if terminal_committed {
                     // Synthetic parallel steps do not increment step_index in
                     // their bytecode (so signal-waiting branches do not
