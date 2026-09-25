@@ -91,14 +91,18 @@ is needed.
 
 Nulang-only A/B probes include a mailbox-only one-value admission lower bound,
 a 0/1/4/5/16-value runtime enqueue sweep around the small-message inline
-boundary, and a matched warmed-bytecode/JIT vs AOT actor-drain comparison over
-the same actor source. The actor comparison warms bytecode past the tier-up
+boundary, a matched warmed-bytecode/JIT vs AOT actor-drain comparison over the
+same actor source, and first-run JIT-vs-interpreter crossover probes at 3k, 4k,
+5k, and 7.5k loop trips. The actor comparison warms bytecode past the tier-up
 threshold before timing and excludes enqueue time for both backends; it also
-emits a `[backend-bench]` AOT speedup line. The mailbox-vs-runtime pair is
-diagnostic: it isolates how much local-send cost lives above message
-construction and mailbox admission before routing or scheduler changes are
-attempted. The ordinary Nulang-only timings are emitted as `[ab-bench]`
-records and are never folded into the cross-language Rust/Go/Erlang comparison.
+emits a `[backend-bench]` AOT speedup line. The tiering probes preconstruct
+fresh VMs so their timed sections include interpreter execution and JIT
+compilation/native execution, but not source compilation or VM/module setup.
+The mailbox-vs-runtime pair is diagnostic: it isolates how much local-send cost
+lives above message construction and mailbox admission before routing or
+scheduler changes are attempted. The ordinary Nulang-only timings are emitted
+as `[ab-bench]` records and are never folded into the cross-language
+Rust/Go/Erlang comparison.
 
 ## Interpretation rules
 
