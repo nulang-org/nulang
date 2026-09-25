@@ -3071,6 +3071,17 @@ impl VM {
             .unwrap_or(0)
     }
 
+    /// Aggregate native compiler latency/count telemetry for this VM.
+    ///
+    /// The values cover compiler wall time only and remain separate from
+    /// interpreter warm-up and generated-code execution time.
+    pub fn jit_compile_stats(&self) -> crate::backends::JitCompileStats {
+        self.jit_session
+            .as_ref()
+            .map(|j| j.compile_stats())
+            .unwrap_or_default()
+    }
+
     /// Discard all closure capture environments.
     ///
     /// Only call this when no live value can reference an existing
