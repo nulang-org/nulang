@@ -3313,7 +3313,7 @@ impl Runtime {
     /// updating the actor's own sequence/dirty tracking.
     fn build_actor_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
         let mut state = std::collections::HashMap::new();
-        let (waiting_signal, authority_tokens) = {
+        let (waiting_signal, waiting_signal_operation, authority_tokens) = {
             let actor = self.actors.get(&actor_id)?;
             for (name, value) in &actor.state_data {
                 let model = actor
@@ -3357,7 +3357,11 @@ impl Runtime {
                     return None;
                 }
             };
-            (actor.waiting_signal.clone(), authority_tokens)
+            (
+                actor.waiting_signal.clone(),
+                actor.waiting_signal_operation,
+                authority_tokens,
+            )
         };
         let sequence = self.next_sequence(actor_id);
         let crdt_snapshot = self.crdt_manager.as_ref().map(|m| {
@@ -3378,6 +3382,7 @@ impl Runtime {
             sequence,
             state,
             waiting_signal,
+            waiting_signal_operation,
             crdt_snapshot,
             crdt_field_map,
             authority_tokens,
