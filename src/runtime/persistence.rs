@@ -3713,6 +3713,7 @@ mod durable_transition_tests {
             snapshot: Some(snapshot(actor_id, sequence, &[("count", sequence as i64)])),
             workflow_events: vec![WorkflowEvent::StepCompleted {
                 sequence,
+                activation: Some(WorkflowActivationId::new(actor_id, sequence)),
                 step_name: format!("step-{sequence}"),
             }],
             domain_events: vec![EventEntry {
@@ -3875,6 +3876,7 @@ mod libsql_atomic_transition_tests {
             workflow_events: vec![
                 WorkflowEvent::StepCompleted {
                     sequence,
+                    activation: Some(WorkflowActivationId::new(actor_id, sequence)),
                     step_name: "persist".to_string(),
                 },
                 WorkflowEvent::Custom {
