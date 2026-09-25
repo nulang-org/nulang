@@ -296,6 +296,79 @@ impl WorkflowEvent {
     }
 }
 
+#[cfg(test)]
+mod workflow_activation_classification_tests {
+    use super::*;
+
+    fn command(sequence: u64, behavior_id: u16) -> JournalEntry {
+        JournalEntry {
+            sequence,
+            behavior_id,
+            payload: vec![],
+        }
+    }
+
+    #[test]
+    fn unfinished_commands_exclude_terminal_and_internal_entries() {
+        let actor_id = 42;
+        let journal = vec![command(7, 0), command(8, 99), command(11, 1)];
+        let events = vec![WorkflowEvent::StepCompleted {
+            sequence: 9,
+            activation: Some(WorkflowActivationId::new(actor_id, 7)),
+            step_name: "first".into(),
+        }];
+
+        let unfinished = unfinished_workflow_commands(
+            actor_id,
+            &journal,
+            &events,
+            |entry| entry.behavior_id != 99,
+        )
+        .unwrap();
+
+        assert_eq!(
+            unfinished
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![11]
+        );
+    }
+
+    #[test]
+    fn legacy_terminal_event_fails_classification_closed() {
+        let actor_id = 42;
+        let journal = vec![command(7, 0)];
+        let events = vec![WorkflowEvent::StepCompleted {
+            sequence: 9,
+            activation: None,
+            step_name: "legacy".into(),
+        }];
+
+        let error =
+            unfinished_workflow_commands(actor_id, &journal, &events, |_| true).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn foreign_terminal_activation_fails_classification_closed() {
+        let actor_id = 42;
+        let journal = vec![command(7, 0)];
+        let events = vec![WorkflowEvent::StepFailed {
+            sequence: 9,
+            activation: Some(WorkflowActivationId::new(99, 7)),
+            step_name: "foreign".into(),
+            error: "boom".into(),
+        }];
+
+        let error =
+            unfinished_workflow_commands(actor_id, &journal, &events, |_| true).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+}
+
 /// Version of the atomic durable-transition persistence contract.
 pub const DURABLE_TRANSITION_VERSION: u16 = 1;
 
