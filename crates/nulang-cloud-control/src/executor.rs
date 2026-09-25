@@ -1,6 +1,4 @@
-use crate::store::{
-    AllocationCommand, AllocationCommandKind, ControlStore, StoreError,
-};
+use crate::store::{AllocationCommand, AllocationCommandKind, ControlStore, StoreError};
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -337,10 +335,7 @@ mod tests {
             Ok(())
         }
 
-        fn evaluation(
-            &self,
-            _evaluation_id: &str,
-        ) -> Result<Option<EvaluationRecord>, StoreError> {
+        fn evaluation(&self, _evaluation_id: &str) -> Result<Option<EvaluationRecord>, StoreError> {
             Ok(None)
         }
 
@@ -477,8 +472,13 @@ mod tests {
 
     #[test]
     fn starts_local_allocation_then_acknowledges() {
-        let control =
-            TestControlStore::with_commands(vec![command("start", 7, 3, 1, AllocationCommandKind::Start)]);
+        let control = TestControlStore::with_commands(vec![command(
+            "start",
+            7,
+            3,
+            1,
+            AllocationCommandKind::Start,
+        )]);
         let mut runtime = TestRuntime::default();
 
         let report = execute_pending_for_node(&control, 7, &mut runtime).unwrap();
@@ -491,8 +491,13 @@ mod tests {
 
     #[test]
     fn ack_failure_retries_without_restarting_same_epoch() {
-        let control =
-            TestControlStore::with_commands(vec![command("start", 7, 3, 4, AllocationCommandKind::Start)]);
+        let control = TestControlStore::with_commands(vec![command(
+            "start",
+            7,
+            3,
+            4,
+            AllocationCommandKind::Start,
+        )]);
         control.fail_one_ack();
         let mut runtime = TestRuntime::default();
 
@@ -504,15 +509,23 @@ mod tests {
         assert_eq!(control.pending_ids(), vec!["start".to_string()]);
 
         let report = execute_pending_for_node(&control, 7, &mut runtime).unwrap();
-        assert_eq!(runtime.starts, 1, "retry must not start the same epoch twice");
+        assert_eq!(
+            runtime.starts, 1,
+            "retry must not start the same epoch twice"
+        );
         assert_eq!(report.idempotent_acks, 1);
         assert!(control.pending_ids().is_empty());
     }
 
     #[test]
     fn stale_start_is_acknowledged_without_touching_newer_epoch() {
-        let control =
-            TestControlStore::with_commands(vec![command("old-start", 7, 2, 4, AllocationCommandKind::Start)]);
+        let control = TestControlStore::with_commands(vec![command(
+            "old-start",
+            7,
+            2,
+            4,
+            AllocationCommandKind::Start,
+        )]);
         let mut runtime = TestRuntime::default();
         runtime.seed("orders", 0, 3, 5, NodeAllocationStatus::Running);
 
@@ -520,16 +533,18 @@ mod tests {
 
         assert_eq!(runtime.starts, 0);
         assert_eq!(report.stale_acks, 1);
-        assert_eq!(
-            runtime.observe("orders", 0).unwrap().unwrap().epoch,
-            5
-        );
+        assert_eq!(runtime.observe("orders", 0).unwrap().unwrap().epoch, 5);
     }
 
     #[test]
     fn stale_stop_never_kills_newer_owner() {
-        let control =
-            TestControlStore::with_commands(vec![command("old-stop", 7, 2, 4, AllocationCommandKind::Stop)]);
+        let control = TestControlStore::with_commands(vec![command(
+            "old-stop",
+            7,
+            2,
+            4,
+            AllocationCommandKind::Stop,
+        )]);
         let mut runtime = TestRuntime::default();
         runtime.seed("orders", 0, 3, 5, NodeAllocationStatus::Running);
 
@@ -545,8 +560,13 @@ mod tests {
 
     #[test]
     fn stop_advances_fence_even_when_node_has_no_local_allocation() {
-        let control =
-            TestControlStore::with_commands(vec![command("stop", 7, 3, 6, AllocationCommandKind::Stop)]);
+        let control = TestControlStore::with_commands(vec![command(
+            "stop",
+            7,
+            3,
+            6,
+            AllocationCommandKind::Stop,
+        )]);
         let mut runtime = TestRuntime::default();
 
         let report = execute_pending_for_node(&control, 7, &mut runtime).unwrap();
@@ -565,8 +585,13 @@ mod tests {
 
     #[test]
     fn stopped_epoch_cannot_be_resurrected_by_delayed_start() {
-        let control =
-            TestControlStore::with_commands(vec![command("late-start", 7, 3, 6, AllocationCommandKind::Start)]);
+        let control = TestControlStore::with_commands(vec![command(
+            "late-start",
+            7,
+            3,
+            6,
+            AllocationCommandKind::Start,
+        )]);
         let mut runtime = TestRuntime::default();
         runtime.seed("orders", 0, 3, 6, NodeAllocationStatus::Stopped);
 
@@ -580,8 +605,13 @@ mod tests {
 
     #[test]
     fn commands_for_other_nodes_remain_pending() {
-        let control =
-            TestControlStore::with_commands(vec![command("remote", 9, 3, 1, AllocationCommandKind::Start)]);
+        let control = TestControlStore::with_commands(vec![command(
+            "remote",
+            9,
+            3,
+            1,
+            AllocationCommandKind::Start,
+        )]);
         let mut runtime = TestRuntime::default();
 
         let report = execute_pending_for_node(&control, 7, &mut runtime).unwrap();
