@@ -1657,23 +1657,13 @@ impl Runtime {
         match result {
             Ok(_) => {
                 if self.actor_is_workflow(actor_id) {
-                    if let Some(actor) = self.actors.get_mut(&actor_id) {
-                        if let Some(n) =
-                            actor.get_state_field("step_index").and_then(|v| v.as_int())
-                        {
-                            actor.set_state_field("step_index", Value::int(n + 1));
-                        }
-                    }
-                    let seq = self.next_sequence(actor_id);
-                    let _ = self.persistence.append_workflow_event(
+                    workflow::complete_workflow_step(
+                        self,
                         actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            activation: suspended.activation,
-                            step_name,
-                        },
+                        suspended.activation,
+                        step_name,
+                        true,
                     );
-                    self.checkpoint_actor(actor_id);
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
@@ -3967,18 +3957,25 @@ impl Runtime {
                         if self.actor_is_workflow(actor_id) {
                             let seq = self.next_sequence(actor_id);
                             let step_name = self.step_name_for(actor_id, behavior_idx);
-                            let terminal_committed = self
-                                .persistence
-                                .append_workflow_event(
-                                    actor_id,
-                                    WorkflowEvent::StepFailed {
-                                        sequence: seq,
-                                        activation: workflow_activation,
-                                        step_name,
-                                        error: format!("{}", e),
-                                    },
-                                )
-                                .is_ok();
+                            let terminal_committed = match self.persistence.append_workflow_event(
+                                actor_id,
+                                WorkflowEvent::StepFailed {
+                                    sequence: seq,
+                                    activation: workflow_activation,
+                                    step_name,
+                                    error: format!("{}", e),
+                                },
+                            ) {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    warn!(
+                                        actor_id,
+                                        %error,
+                                        "failed to persist terminal StepFailed event"
+                                    );
+                                    false
+                                }
+                            };
                             if terminal_committed {
                                 self.run_saga_compensation(actor_id, behavior_idx);
                                 self.checkpoint_actor(actor_id);
@@ -3994,35 +3991,15 @@ impl Runtime {
                 && self.actor_is_workflow(actor_id)
                 && !self.is_internal_behavior(actor_id, behavior_idx)
             {
-                let seq = self.next_sequence(actor_id);
                 let step_name = self.step_name_for(actor_id, behavior_idx);
-                let terminal_committed = self
-                    .persistence
-                    .append_workflow_event(
-                        actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            activation: workflow_activation,
-                            step_name,
-                        },
-                    )
-                    .is_ok();
-                if terminal_committed {
-                    // Synthetic parallel steps do not increment step_index in
-                    // their bytecode (so signal-waiting branches do not
-                    // double-increment); advance it only after the terminal
-                    // marker is durable.
-                    if self.is_parallel_step(actor_id, behavior_idx) {
-                        if let Some(actor) = self.actors.get_mut(&actor_id) {
-                            if let Some(n) =
-                                actor.get_state_field("step_index").and_then(|v| v.as_int())
-                            {
-                                actor.set_state_field("step_index", Value::int(n + 1));
-                            }
-                        }
-                    }
-                    self.checkpoint_actor(actor_id);
-                }
+                let advance_step_index = self.is_parallel_step(actor_id, behavior_idx);
+                workflow::complete_workflow_step(
+                    self,
+                    actor_id,
+                    workflow_activation,
+                    step_name,
+                    advance_step_index,
+                );
             }
             let actor = match self.actors.get_mut(&actor_id) {
                 Some(a) => a,
@@ -4513,23 +4490,13 @@ impl Runtime {
                     // step's body finishes but the workflow never advances
                     // — SPEC2 known-issue #4's permanent stall.
                     if (*self_ptr).actor_is_workflow(actor_id) {
-                        if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
-                            if let Some(n) =
-                                actor.get_state_field("step_index").and_then(|v| v.as_int())
-                            {
-                                actor.set_state_field("step_index", Value::int(n + 1));
-                            }
-                        }
-                        let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        workflow::complete_workflow_step(
+                            &mut *self_ptr,
                             actor_id,
-                            crate::runtime::WorkflowEvent::StepCompleted {
-                                sequence: seq,
-                                activation: suspended.activation,
-                                step_name: suspended.step_name.clone(),
-                            },
+                            suspended.activation,
+                            suspended.step_name.clone(),
+                            true,
                         );
-                        (*self_ptr).checkpoint_actor(actor_id);
                     }
                 }
                 Err(crate::types::NuError::Suspended(_)) => {
@@ -4609,22 +4576,14 @@ impl Runtime {
                     if (*self_ptr).actor_is_workflow(actor_id) {
                         if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                             actor.waiting_signal = None;
-                            if let Some(n) =
-                                actor.get_state_field("step_index").and_then(|v| v.as_int())
-                            {
-                                actor.set_state_field("step_index", Value::int(n + 1));
-                            }
                         }
-                        let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        workflow::complete_workflow_step(
+                            &mut *self_ptr,
                             actor_id,
-                            WorkflowEvent::StepCompleted {
-                                sequence: seq,
-                                activation: suspended.activation,
-                                step_name: suspended.step_name,
-                            },
+                            suspended.activation,
+                            suspended.step_name,
+                            true,
                         );
-                        (*self_ptr).checkpoint_actor(actor_id);
                     }
                 }
                 Err(crate::types::NuError::Suspended(VmSuspension::ReceiveWait)) => {
