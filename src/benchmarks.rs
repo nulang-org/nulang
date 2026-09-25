@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use crate::lexer::Lexer;
 use crate::parser::Parser;
-use crate::runtime::{Runtime, RuntimeVmCallbacks};
+use crate::runtime::{Mailbox, Message, MessagePayload, MessagePriority, Runtime, RuntimeVmCallbacks};
 use crate::typechecker::TypeChecker;
 use crate::vm::{Value, VM};
 
@@ -72,6 +72,38 @@ fn report_ab(name: &str, operations: u64, elapsed: std::time::Duration) {
 }
 
 fn ab_noop_handler(_actor: &mut crate::runtime::Actor, _args: &[Value]) {}
+
+/// Lower-bound local mailbox admission probe for one inline primitive value.
+///
+/// This intentionally bypasses actor lookup, routing/grain checks, ORCA
+/// pointer handling, ready-state publication, and receive-wait wake logic.
+/// Comparing it with `enqueue_payload_1` on the same host quantifies how much
+/// of local-send cost lives above the mailbox itself before changing runtime
+/// semantics.
+#[test]
+fn bench_ab_mailbox_push_inline_1() {
+    const N: usize = 100_000;
+
+    let mut mailbox = Mailbox::new(0);
+    let payload = [Value::int(1)];
+
+    let start = Instant::now();
+    for _ in 0..N {
+        mailbox
+            .push_local(Message {
+                behavior_id: 0,
+                payload: MessagePayload::from_slice(&payload),
+                sender: 0,
+                priority: MessagePriority::Normal,
+                trace_id: None,
+            })
+            .expect("unbounded benchmark mailbox must admit message");
+    }
+    let elapsed = start.elapsed();
+
+    assert_eq!(mailbox.len(), N, "mailbox probe must admit every message");
+    report_ab("mailbox_push_inline_1", N as u64, elapsed);
+}
 
 /// Local enqueue hot-path sweep around the inline-payload boundary.
 ///
