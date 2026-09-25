@@ -5368,6 +5368,62 @@ impl Runtime {
                     }
                 }
             }
+            // A signal receipt may have been durably appended immediately
+            // before a later suspension-marker checkpoint. In that crash
+            // window its event sequence is <= snapshot.sequence, so ordinary
+            // post-snapshot replay would skip it. Activation-aware waits carry
+            // a stable operation id; resolve that id against the full workflow
+            // journal instead of guessing from sequence or signal name.
+            if let Some(operation_id) = snapshot.waiting_signal_operation {
+                match workflow::find_workflow_event_for_operation(
+                    actor_id,
+                    operation_id,
+                    &workflow_events,
+                ) {
+                    Ok(Some(WorkflowEvent::SignalReceived {
+                        name,
+                        payload,
+                        ..
+                    })) => {
+                        if snapshot.waiting_signal.as_deref() != Some(name.as_str()) {
+                            warn!(
+                                actor_id,
+                                ?operation_id,
+                                expected_signal = ?snapshot.waiting_signal,
+                                received_signal = %name,
+                                "nulang-recover: refusing mismatched operation-bound signal receipt"
+                            );
+                            return None;
+                        }
+                        if let Some(actor) = self.actors.get_mut(&actor_id) {
+                            let receipt = (name, payload);
+                            if !actor.received_signals.contains(&receipt) {
+                                actor.received_signals.push(receipt);
+                            }
+                        }
+                    }
+                    Ok(Some(other)) => {
+                        warn!(
+                            actor_id,
+                            ?operation_id,
+                            event = ?other,
+                            "nulang-recover: pending signal operation resolves to a non-signal event"
+                        );
+                        return None;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(
+                            actor_id,
+                            ?operation_id,
+                            %error,
+                            "nulang-recover: refusing ambiguous signal operation history"
+                        );
+                        return None;
+                    }
+                }
+            }
+
             // If the workflow was in the middle of a step waiting on a signal,
             // re-trigger that step so it can resume from replayed events. We
             // use step_index as the behavior id because each step is compiled
