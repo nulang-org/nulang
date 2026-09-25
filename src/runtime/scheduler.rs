@@ -838,9 +838,7 @@ mod scheduler_tests {
         assert_eq!(stats.tasks_from_steal, 1);
         assert_eq!(
             stats.total_tasks_processed,
-            stats.tasks_from_local_queue
-                + stats.tasks_from_global_queue
-                + stats.tasks_from_steal
+            stats.tasks_from_local_queue + stats.tasks_from_global_queue + stats.tasks_from_steal
         );
     }
 
