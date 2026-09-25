@@ -2,7 +2,7 @@
 ### Machine-readable value-layout semantic ABI — 2026-09-25
 - **Nulang now exports the canonical value-layout contract as deterministic machine-readable JSON.** `semantic_abi::value_layout_manifest()` derives directly from `src/value_layout.rs`, and the `nulang-semantic-abi` CLI emits the manifest for downstream compatibility checks.
 - **64-bit masks, tags, and canonical NaN bits are encoded as fixed-width hexadecimal strings.** This preserves exact bit patterns for JSON consumers such as JavaScript that cannot represent arbitrary `u64` integers exactly.
-- **The first ABI slice covers the full Core value layout, including `TAG_OBJECT`.** Broader Behavior Manifest, effect/authority, WIT, and compiler semantic-identity exports remain follow-up work under #1046.
+- **The first ABI slice covers the full Core value layout, including `TAG_OBJECT`, and indexes existing versioned runtime contracts.** The top-level manifest also exports the language version, artifact-identity manifest version, Behavior Manifest schema, and host-effect ABI schema from their canonical constants. Authority, WIT world metadata, and typed-program semantic-schema export remain follow-up work under #1046.
 
 ### Hosted control-plane ownership boundary — 2026-09-25
 - **Hosted placement and reconciliation policy is no longer owned by the Nulang language/runtime workspace.** `crates/nulang-cloud-control` is frozen as a migration surface and excluded from ordinary workspace builds; Nulang Cloud's `nlc-placement` remains the authoritative hosted control plane.
