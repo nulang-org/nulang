@@ -220,7 +220,7 @@ pub enum WorkflowEvent {
         /// Stable identity of the accepted command this terminal event closes.
         /// Missing on legacy journal records written before activation identity
         /// was persisted.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         activation: Option<WorkflowActivationId>,
         step_name: String,
     },
@@ -255,7 +255,7 @@ pub enum WorkflowEvent {
         /// Stable identity of the accepted command this terminal event closes.
         /// Missing on legacy journal records written before activation identity
         /// was persisted.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         activation: Option<WorkflowActivationId>,
         step_name: String,
         error: String,
@@ -415,6 +415,25 @@ impl DurableTransition {
                 "durable transition workflow event sequence does not match transition sequence",
             ));
         }
+        for event in &self.workflow_events {
+            if let Some(activation) = event.activation_id() {
+                if activation.actor_id != self.actor_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "durable transition workflow activation actor does not match transition actor",
+                    ));
+                }
+                if let Some(command) = &self.command {
+                    if activation.command_sequence != command.sequence {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "durable transition workflow activation command sequence does not match accepted command",
+                        ));
+                    }
+                }
+            }
+        }
+
         if self
             .domain_events
             .iter()
