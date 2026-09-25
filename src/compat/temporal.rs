@@ -233,6 +233,7 @@ impl TemporalWorkflowTaskContext {
         validate_non_empty("signal_name", &signal_name)?;
         Ok(WorkflowEvent::SignalReceived {
             sequence: self.transition_sequence,
+            operation_id: None,
             name: signal_name,
             payload,
         })
@@ -1017,6 +1018,7 @@ mod tests {
                 sequence,
                 name,
                 payload,
+                ..
             } => {
                 assert_eq!(sequence, 9);
                 assert_eq!(name, "approved");
