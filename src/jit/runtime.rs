@@ -471,12 +471,36 @@ pub fn clear_jit_callbacks() {
 // JIT string resolution
 // ---------------------------------------------------------------------------
 
+thread_local! {
+    /// Immutable module context used by zero-copy JIT entries. Keeping this
+    /// separate from JIT_VM lets string-aware helpers resolve interned strings
+    /// without constructing an immutable reference to the parent VM while its
+    /// frame register array is mutably exposed to native code.
+    static JIT_STRING_MODULE: Cell<*const crate::bytecode::CodeModule> =
+        const { Cell::new(std::ptr::null()) };
+}
+
+/// Install the active module for synchronous native string resolution.
+///
+/// # Safety
+/// `module` must remain valid and immutable until `clear_jit_string_module`.
+/// The VM installs this only for non-reentrant compiled regions, so native
+/// execution cannot mutate or reallocate `VM::modules` while the pointer is live.
+pub unsafe fn set_jit_string_module(module: *const crate::bytecode::CodeModule) {
+    JIT_STRING_MODULE.with(|cell| cell.set(module));
+}
+
+pub fn clear_jit_string_module() {
+    JIT_STRING_MODULE.with(|cell| cell.set(std::ptr::null()));
+}
+
 /// Resolve a raw u64 value to its string content (for comparison).
 ///
-/// Interned strings are resolved through the active VM plus its module index.
-/// No borrowed constant-pool slice is stored in thread-local state, so native
-/// execution retains no Rust reference into VM-owned module storage across a
-/// re-entrant interpreter call.
+/// Interned strings are resolved through either the direct-frame path's
+/// immutable active-module pointer or the detached path's VM + module index.
+/// No borrowed constant-pool slice is stored in thread-local state; the module
+/// pointer is installed only while non-reentrant native execution keeps
+/// `VM::modules` fixed in place.
 fn resolve_jit_string(raw: u64) -> Option<String> {
     if (raw & TAG_MASK) == TAG_STRING {
         let id = (raw & PAYLOAD_MASK) as u32;
@@ -614,13 +638,29 @@ fn get_jit_module_idx() -> Option<usize> {
 }
 
 fn resolve_active_vm_string(id: u32) -> Option<String> {
+    let module_ptr = JIT_STRING_MODULE.with(|cell| cell.get());
+    if !module_ptr.is_null() {
+        // SAFETY: the zero-copy VM path installs a pointer to the active
+        // CodeModule for exactly the synchronous native call. That path cannot
+        // re-enter the VM, so `VM::modules` cannot move while this pointer is
+        // live. The module is disjoint from the mutably-borrowed frame regs.
+        return unsafe {
+            (&*module_ptr)
+                .constants
+                .get(id as usize)
+                .and_then(|constant| match constant {
+                    crate::bytecode::Constant::String(value) => Some(value.clone()),
+                    _ => None,
+                })
+        };
+    }
+
     let vm_ptr = get_jit_vm();
     let module_idx = get_jit_module_idx()?;
     if vm_ptr.is_null() {
         return None;
     }
-    // SAFETY: JIT_VM is installed only for synchronous native execution.
-    // This creates a short-lived immutable lookup borrow only for this call.
+    // Detached/re-entrant regions retain the existing VM lookup path.
     unsafe { (&*vm_ptr).constant_string(module_idx, id) }
 }
 

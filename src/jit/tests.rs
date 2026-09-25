@@ -771,6 +771,59 @@ fn test_jit_compile_bitwise_ops() {
 }
 
 #[test]
+fn test_jit_region_reentry_metadata_tracks_direct_calls() {
+    let mut plain = make_jit();
+    let plain_instructions = vec![
+        Instruction::new3(OpCode::IAdd, 0, 1, 2),
+        Instruction::new3(OpCode::IAdd, 2, 1, 2),
+        Instruction::new0(OpCode::Halt),
+    ];
+    unsafe {
+        plain.compile_region(
+            0,
+            0,
+            plain_instructions.len(),
+            &plain_instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("plain region should compile");
+    assert!(
+        !plain
+            .compiled_entry(0, 0)
+            .expect("plain cache entry")
+            .requires_vm_reentry,
+        "regions without VM-reentrant helpers should be eligible for direct frame registers"
+    );
+
+    let mut calling = make_jit();
+    let call_instructions = vec![
+        Instruction::new3(OpCode::Call, 254, 1, 0),
+        Instruction::new0(OpCode::Nop),
+        Instruction::new0(OpCode::Halt),
+    ];
+    let mut native_calls = std::collections::HashMap::new();
+    native_calls.insert(0usize, 0usize);
+    unsafe {
+        calling.compile_region(
+            0,
+            0,
+            call_instructions.len(),
+            &call_instructions,
+            &native_calls,
+        )
+    }
+    .expect("direct-call region should compile");
+    assert!(
+        calling
+            .compiled_entry(0, 0)
+            .expect("direct-call cache entry")
+            .requires_vm_reentry,
+        "helper-backed direct calls must retain detached register storage"
+    );
+}
+
+#[test]
 fn test_jit_compile_fneg() {
     let mut jit = make_jit();
     let instructions = vec![
@@ -1538,6 +1591,7 @@ fn test_tier2_counter_increments() {
         5,
         CompilationTier::Simd,
         CodegenOptimization::Optimized,
+        false,
         0,
     );
 
@@ -1574,6 +1628,7 @@ fn test_tier2_counters_are_per_session() {
         3,
         CompilationTier::Simd,
         CodegenOptimization::Optimized,
+        false,
         0,
     );
     jit_b.store_compiled_with_metadata(
@@ -1583,6 +1638,7 @@ fn test_tier2_counters_are_per_session() {
         3,
         CompilationTier::Simd,
         CodegenOptimization::Optimized,
+        false,
         0,
     );
 
@@ -1696,6 +1752,7 @@ fn test_tier2_replaces_typed_region_with_simd_code() {
         module.instructions.len(),
         CompilationTier::Typed,
         CodegenOptimization::Optimized,
+        false,
         0,
     );
     jit.typed_regions.insert((0, 0));
