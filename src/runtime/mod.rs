@@ -3646,10 +3646,7 @@ impl Runtime {
 
         let msg_opt = {
             let actor = match self.actors.get_mut(&actor_id) {
-                Some(a) => {
-                    a.current_workflow_activation = None;
-                    a
-                },
+                Some(a) => a,
                 None => {
                     self.current_actor = None;
                     return;
@@ -4020,6 +4017,7 @@ impl Runtime {
                     return;
                 }
             };
+            actor.current_workflow_activation = None;
             actor.increment_reductions(1);
             // Turn ownership now lives in finish_actor_turn. Keep reductions
             // live across the whole batch so should_yield observes cumulative
