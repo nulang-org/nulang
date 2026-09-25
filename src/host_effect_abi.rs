@@ -363,9 +363,9 @@ pub fn lookup_host_operation_by_identity(
 /// Build the compiler-owned external ABI descriptor consumed by conformance
 /// tooling and, eventually, Cloud admission/runtime adapters.
 ///
-/// The descriptor intentionally omits source operation spellings such as
-/// `Storage.write`. Consumers receive only canonical host identity plus the
-/// compiler-produced request/response/authority/replay contract.
+/// The descriptor includes source identity as structured `effect` / `operation`
+/// fields so compatibility adapters can be generated without duplicating the
+/// compiler's mapping. Canonical host identity remains the execution contract.
 pub fn host_effect_abi_descriptor() -> Result<serde_json::Value, serde_json::Error> {
     let mut operations = Vec::with_capacity(HOST_OPERATIONS.len());
 
