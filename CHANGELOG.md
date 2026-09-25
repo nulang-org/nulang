@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Transport-neutral atomic durable transition protocol — 2026-09-25
+- **Added the experimental `nulang-durable-transition/v0alpha1` host contract for RFC 0022.** The data-only protocol carries opaque durable owner identity, activation epoch and sequence fencing, state checkpoints, workflow events, timer mutations, durable-effect Prepared/Completed records, and durable outbox messages without choosing a persistence backend or Cloud transport.
+- **Commit retry identity is deterministic.** A domain-separated BLAKE3 digest covers the validated transition content, allowing hosts to distinguish an exact duplicate commit from a conflicting retry at the same owner/epoch/sequence. Unknown protocol versions, invalid fencing, malformed semantic records, and duplicate outbox ordinals fail closed.
+
 ### Native JIT codegen backend boundary — 2026-09-24
 - **`JitSession` no longer owns Cranelift modules or reusable Cranelift contexts.** `src/jit/native_codegen.rs` introduces `NativeCodegenBackend`, `NativeCompileRequest`, and specialization requests for scalar, typed, and SIMD lowering.
 - **`CraneliftCodegen` now exclusively owns both compiler tiers.** Fast code still uses `opt_level=none` + single-pass register allocation, optimized code still uses `opt_level=speed` + backtracking, but tier/cache orchestration only sees native entry pointers and compile success/failure.
