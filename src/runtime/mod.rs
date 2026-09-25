@@ -1236,6 +1236,7 @@ impl Runtime {
             return;
         }
 
+        workflow::resume_workflow_activation(self, actor_id, suspended.activation);
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -1306,6 +1307,7 @@ impl Runtime {
             }
             (*self_ptr).vm_exec_end();
         }
+        workflow::clear_workflow_activation(self, actor_id);
         self.requeue_if_mail_pending(actor_id);
     }
 
@@ -1627,6 +1629,7 @@ impl Runtime {
 
         let behavior_idx = suspended.behavior_idx;
         let step_name = suspended.step_name;
+        workflow::resume_workflow_activation(self, actor_id, suspended.activation);
         let self_ptr: *mut Runtime = self;
         let result = unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -1717,6 +1720,7 @@ impl Runtime {
         // bytecode whose own begin/end must stay inside this window. Runs
         // on every path so wakes of other actors are not lost.
         self.vm_exec_end();
+        workflow::clear_workflow_activation(self, actor_id);
         // The suspension resolved (completed or failed): drain any mail
         // that queued up while the step was suspended.
         self.requeue_if_mail_pending(actor_id);
@@ -4463,6 +4467,7 @@ impl Runtime {
             self.enqueue_actor(actor_id);
             return;
         }
+        workflow::resume_workflow_activation(self, actor_id, suspended.activation);
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -4522,6 +4527,7 @@ impl Runtime {
             }
             (*self_ptr).vm_exec_end();
         }
+        workflow::clear_workflow_activation(self, actor_id);
         // Re-enqueue so the scheduler can continue processing the actor.
         self.enqueue_actor(actor_id);
     }
@@ -4548,6 +4554,7 @@ impl Runtime {
             return;
         }
 
+        workflow::resume_workflow_activation(self, actor_id, suspended.activation);
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -4636,6 +4643,7 @@ impl Runtime {
             // wakes of other actors are not lost when THIS one suspends.
             (*self_ptr).vm_exec_end();
         }
+        workflow::clear_workflow_activation(self, actor_id);
         // The suspension resolved (completed or failed): if messages queued
         // up while the behavior was suspended, schedule the actor to drain
         // them - step_actor leaves mail untouched while a suspension is live.
