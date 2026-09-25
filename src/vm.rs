@@ -3072,6 +3072,16 @@ impl VM {
             .unwrap_or(0)
     }
 
+    /// Compiler-only telemetry for this VM's JIT session.
+    ///
+    /// This excludes interpreter warm-up and generated-code execution time.
+    pub fn jit_compile_stats(&self) -> crate::backends::JitCompileStats {
+        self.jit_session
+            .as_ref()
+            .map(|jit| jit.compile_stats())
+            .unwrap_or_default()
+    }
+
     /// Discard all closure capture environments.
     ///
     /// Only call this when no live value can reference an existing
