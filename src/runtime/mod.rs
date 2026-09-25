@@ -1117,7 +1117,7 @@ impl Runtime {
         name: &str,
         payload: Option<String>,
     ) -> std::io::Result<()> {
-        workflow::append_signal_received(self, actor_id, name, payload)
+        workflow::append_signal_received(self, actor_id, name, payload, None)
     }
 
     /// Append a `SagaCompensated` workflow event and checkpoint the actor.
@@ -1161,6 +1161,16 @@ impl Runtime {
     ) -> Result<Option<WorkflowEvent>, WorkflowOperationAnalysisError> {
         let events = self.persistence.read_workflow_events(actor_id);
         workflow::find_workflow_event_for_operation(actor_id, operation_id, &events)
+    }
+
+    /// Begin or re-enter a workflow signal wait, returning its stable replay
+    /// operation identity when the workflow is activation-aware.
+    pub fn begin_workflow_signal_wait(
+        &mut self,
+        actor_id: u64,
+        name: &str,
+    ) -> Option<WorkflowOperationId> {
+        workflow::begin_workflow_signal_wait(self, actor_id, name)
     }
 
     /// Allocate the next deterministic replay identity inside the live workflow
@@ -1678,6 +1688,13 @@ impl Runtime {
 
         let behavior_idx = suspended.behavior_idx;
         let step_name = suspended.step_name;
+        // The matching signal was durably recorded before this resume. Clear
+        // the consumed wait before re-entering the VM so a chained Signal.wait
+        // can allocate and retain a fresh operation identity.
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.waiting_signal = None;
+            actor.waiting_signal_operation = None;
+        }
         let self_ptr: *mut Runtime = self;
         let result = unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -1700,10 +1717,6 @@ impl Runtime {
             (*self_ptr).suspend_enabled = saved_suspend;
             result
         };
-
-        if let Some(actor) = self.actors.get_mut(&actor_id) {
-            actor.waiting_signal = None;
-        }
 
         match result {
             Ok(_) => {
@@ -4767,15 +4780,21 @@ impl Runtime {
     /// last pre-step checkpoint.  A no-op when the actor has no snapshot
     /// yet - without one there is nothing to recover anyway.
     fn persist_suspension_marker(&mut self, actor_id: u64) {
-        let waiting_signal = match self.actors.get(&actor_id) {
-            Some(actor) if actor.persistent => actor.waiting_signal.clone(),
+        let (waiting_signal, waiting_signal_operation) = match self.actors.get(&actor_id) {
+            Some(actor) if actor.persistent => (
+                actor.waiting_signal.clone(),
+                actor.waiting_signal_operation,
+            ),
             _ => return,
         };
         if let Some(mut snapshot) = self.persistence.load_snapshot(actor_id) {
-            if snapshot.waiting_signal == waiting_signal {
+            if snapshot.waiting_signal == waiting_signal
+                && snapshot.waiting_signal_operation == waiting_signal_operation
+            {
                 return;
             }
             snapshot.waiting_signal = waiting_signal;
+            snapshot.waiting_signal_operation = waiting_signal_operation;
             let _ = self.persistence.save_snapshot(snapshot);
         }
     }
@@ -5142,6 +5161,7 @@ impl Runtime {
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
         actor.waiting_signal = snapshot.waiting_signal;
+        actor.waiting_signal_operation = snapshot.waiting_signal_operation;
         actor.install_authority_manifest(&authority_manifest);
         // Restore CRDT state if present in the snapshot.
         if let Some(crdt_snap) = &snapshot.crdt_snapshot {
@@ -5448,6 +5468,7 @@ impl Runtime {
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
         actor.waiting_signal = snapshot.waiting_signal.clone();
+        actor.waiting_signal_operation = snapshot.waiting_signal_operation;
         actor.install_authority_manifest(&authority_manifest);
         actor.bytecode_module = Some(module.clone());
         actor.bytecode_offsets = offsets;
