@@ -396,6 +396,11 @@ fn resolve_string_constant(rt: &Runtime, actor_id: u64, value: &Value) -> Option
 /// journal and a checkpoint is forced.
 pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[Value]) {
     let is_workflow = actor_is_workflow(rt, actor_id);
+    let operation_id = if is_workflow {
+        next_workflow_operation_id(rt, actor_id)
+    } else {
+        None
+    };
     let seq = next_sequence(rt, actor_id);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.event_log.push((event.to_string(), args.to_vec()));
@@ -445,11 +450,14 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
             let parallel_step_name =
                 resolve_string_constant(rt, actor_id, &args[0]).unwrap_or_default();
             let branch_name = resolve_string_constant(rt, actor_id, &args[1]).unwrap_or_default();
-            let _ = rt.persistence.append_parallel_branch_completed(
+            let _ = rt.persistence.append_workflow_event(
                 actor_id,
-                seq,
-                parallel_step_name,
-                branch_name,
+                WorkflowEvent::ParallelBranchCompleted {
+                    sequence: seq,
+                    operation_id,
+                    parallel_step_name,
+                    branch_name,
+                },
             );
             if let Some(actor) = rt.actors.get_mut(&actor_id) {
                 let current = actor
@@ -471,6 +479,7 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 actor_id,
                 WorkflowEvent::Custom {
                     sequence: seq,
+                    operation_id,
                     name: event.to_string(),
                     args: payload,
                 },
