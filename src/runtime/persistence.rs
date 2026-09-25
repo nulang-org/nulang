@@ -159,9 +159,7 @@ pub struct ActorSnapshot {
 /// The command's journal sequence is the stable activation identity within one
 /// actor. Pairing it with the actor id makes the identity globally meaningful
 /// for replay-sensitive operations and durable-effect ids.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowActivationId {
     pub actor_id: u64,
     pub command_sequence: u64,
@@ -184,9 +182,7 @@ impl WorkflowActivationId {
 }
 
 /// Stable identity of one replay-sensitive operation inside an activation.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowOperationId {
     pub activation: WorkflowActivationId,
     pub ordinal: u32,
