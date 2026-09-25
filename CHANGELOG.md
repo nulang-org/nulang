@@ -1,4 +1,11 @@
 # Nulang Changelog
+
+### Cloud node allocation executor — 2026-09-24
+- **Nulang Cloud now has a provider-neutral node executor for the durable Start/Stop outbox.** `execute_pending_for_node` filters commands by node, orders them deterministically, invokes an `AllocationRuntime`, verifies the resulting local epoch, and ACKs only after the node mutation is proven.
+- **Allocation epochs are enforced again at the execution boundary.** Older delayed commands are ACKed without touching a newer owner; Stop advances the durable fence even when no workload is present; a delayed Start cannot resurrect an epoch already fenced as stopped.
+- **The ACK crash window is explicitly idempotent.** Node runtimes must durably install the epoch before returning success, so a failed control-plane ACK can be retried without executing the same Start/Stop twice.
+- Focused tests cover ACK failure/retry, stale Start and Stop commands, stop-only fencing, same-epoch resurrection rejection, deterministic Start-before-Stop ordering, and commands for other nodes.
+
 ### Native JIT codegen backend boundary — 2026-09-24
 - **`JitSession` no longer owns Cranelift modules or reusable Cranelift contexts.** `src/jit/native_codegen.rs` introduces `NativeCodegenBackend`, `NativeCompileRequest`, and specialization requests for scalar, typed, and SIMD lowering.
 - **`CraneliftCodegen` now exclusively owns both compiler tiers.** Fast code still uses `opt_level=none` + single-pass register allocation, optimized code still uses `opt_level=speed` + backtracking, but tier/cache orchestration only sees native entry pointers and compile success/failure.
