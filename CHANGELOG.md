@@ -2,6 +2,7 @@
 ### Benchmark signal and scheduler dispatch accounting — 2026-09-25
 - **The ORCA benchmark now measures admitted actor traffic instead of rejected sends.** Benchmark actors register the measured `handle` behavior and assert that all 380 intended messages reached mailboxes before scheduler/GC processing begins.
 - **JIT tiering profitability now samples the 2k–10k crossover densely.** New 3k, 4k, 5k, and 7.5k trip points make future threshold changes evidence-based, and the call-heavy benchmark documentation now reflects the shipped direct-call helper path.
+- **Debug/source line metadata no longer creates JIT hotness probe sites.** Function/behavior entries, branch targets/fallthroughs, and post-boundary PCs remain candidates, while debugger line mappings stay independent; a regression test pins the separation so breakpoint fidelity does not tax cold straight-line execution.
 - **Scheduler total-task telemetry is derived from local/global/stolen source counters at snapshot time.** The public metric is unchanged while successful dispatch avoids one redundant atomic read-modify-write; a regression test pins the source-sum invariant.
 - **Benchmark guidance now treats shared-runner history as a regression signal, not optimization evidence.** Same-runner base/candidate A/B remains the primary before/after measurement for performance PRs.
 
