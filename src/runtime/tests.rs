@@ -3546,6 +3546,46 @@ fn test_workflow_terminal_failure_keeps_last_safe_snapshot() {
 }
 
 #[test]
+fn test_terminal_completion_helper_does_not_advance_state_when_marker_fails() {
+    let mut rt = Runtime::new();
+    let store = FailTerminalWorkflowStore::new();
+    let probe = store.clone();
+    rt.persistence = Box::new(store);
+
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "ResumeTerminalWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    probe.fail_terminal_events();
+    let committed = workflow::complete_workflow_step(
+        &mut rt,
+        actor_id,
+        Some(WorkflowActivationId::new(actor_id, 7)),
+        "resume",
+        true,
+    );
+
+    assert!(!committed, "terminal append failure must be observable");
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
+        Some(0),
+        "step progression must wait for the durable terminal marker"
+    );
+    assert_eq!(
+        probe.load_snapshot(actor_id).unwrap().state.get("step_index"),
+        Some(&PersistedValue::Int(0))
+    );
+}
+
+#[test]
 fn test_workflow_custom_event_does_not_checkpoint_partial_state() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
