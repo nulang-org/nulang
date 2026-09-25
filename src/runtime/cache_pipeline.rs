@@ -6,11 +6,11 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use super::cache::CacheStore;
 use super::cache_dispatch::{
     CacheDispatchError, CacheDispatchOutcome, CacheDispatcher, CacheLocalReply, CacheRemoteRequest,
     CacheReplyError,
 };
+use super::resp_cache::CacheCommandTarget;
 
 const DEFAULT_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
@@ -106,10 +106,10 @@ impl CacheResponsePipeline {
     ///
     /// socket_out receives only responses that are safe to send in-order.
     /// Ok(None) means more input bytes are required.
-    pub fn submit_frame(
+    pub fn submit_frame<T: CacheCommandTarget>(
         &mut self,
         dispatcher: &CacheDispatcher,
-        store: &mut CacheStore,
+        store: &mut T,
         input: &[u8],
         now_ms: u64,
         socket_out: &mut Vec<u8>,
@@ -287,7 +287,7 @@ enum FrontAction {
 
 #[cfg(test)]
 mod tests {
-    use super::super::cache::redis_slot;
+    use super::super::cache::{redis_slot, CacheStore};
     use super::super::cache_dispatch::CacheDispatchChannels;
     use super::super::cache_routing::{CacheShardOwner, CacheSlotMap, CacheSlotRange};
     use super::*;

@@ -15,7 +15,9 @@ use super::cache_cluster::{
 };
 use super::cache_routing::{CacheShardOwner, CacheSlotMap};
 use super::resp::{parse_command, write_moved, RespParseError};
-use super::resp_cache::{command_slot, execute_command, execute_frame, RespCommandSlot};
+use super::resp_cache::{
+    command_slot, execute_command, execute_frame, CacheCommandTarget, RespCommandSlot,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheDispatchConfigError {
@@ -199,7 +201,7 @@ impl CacheShardInbox {
         self.shard
     }
 
-    pub fn try_process_one(&mut self, store: &mut CacheStore) -> bool {
+    pub fn try_process_one<T: CacheCommandTarget>(&mut self, store: &mut T) -> bool {
         let request = match self.receiver.try_recv() {
             Ok(request) => request,
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => return false,
@@ -220,7 +222,7 @@ impl CacheShardInbox {
         true
     }
 
-    pub fn drain(&mut self, store: &mut CacheStore, max_commands: usize) -> usize {
+    pub fn drain<T: CacheCommandTarget>(&mut self, store: &mut T, max_commands: usize) -> usize {
         let mut processed = 0;
         while processed < max_commands && self.try_process_one(store) {
             processed += 1;
@@ -301,9 +303,9 @@ impl CacheDispatcher {
         self.channels.install_waker(shard, waker)
     }
 
-    pub fn dispatch_frame(
+    pub fn dispatch_frame<T: CacheCommandTarget>(
         &self,
-        store: &mut CacheStore,
+        store: &mut T,
         input: &[u8],
         now_ms: u64,
         out: &mut Vec<u8>,

@@ -148,6 +148,22 @@ semantics; process-relative timestamps are not sent to remote nodes. Input,
 output, connection count, pipeline depth, inbox drain size, and expiry work are
 all bounded by configuration.
 
+The server store is now an explicit `CacheServerStore`: Memory mode owns a raw
+`CacheStore`, while journaled modes own `DurableCacheStore`. RESP execution,
+routing, local dispatch, and response pipelining operate through the shared
+`CacheCommandTarget` interface, so a journaled server cannot reach mutation
+methods on the inner `CacheStore` by accident. Raw mutable store access is
+exposed only for Memory mode.
+
+The standalone `nulang-cache` process accepts
+`--durability memory|buffered|synced`. Buffered and synced modes require
+`--data-dir`; startup reconstructs the store from `cache.snapshot` plus
+`cache.wal` before the listener is bound. Corrupt state or missing required
+WAL history therefore fails startup rather than serving an empty/divergent
+cache. If a valid snapshot is newer than the surviving WAL tail, startup
+rotates the WAL base forward to the snapshot sequence before accepting new
+writes, preserving monotonic recovery sequence numbers.
+
 ## Durability
 
 Durability remains outside the cache kernel. `src/runtime/cache_persistence.rs`
@@ -230,9 +246,9 @@ surface.
 3. Add a separate transparent proxy endpoint only for non-cluster clients;
    keep the per-shard production listeners redirect-only.
 4. Connect remote transparent handoffs to a cache-specific cluster transport.
-5. Wire the durability wrapper into the production RESP server configuration
-   and expose explicit recovery/bootstrap policy.
-6. Add cache replication, replica acknowledgement, recovery bootstrap, and
+5. Add periodic/administrative snapshot rotation and explicit durability
+   health/status surfaces for operators.
+6. Add cache replication, replica acknowledgement, bootstrap transfer, and
    failover fencing.
 7. Add packed aggregate structures, then expand RESP compatibility and add
    Nulang-native leases, locks, semaphores,

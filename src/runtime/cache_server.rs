@@ -17,12 +17,15 @@ use std::time::{Duration, Instant};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 
-use super::cache::CacheStore;
+use super::cache::{CacheStore, CacheTtl, CacheValueView};
 use super::cache_cluster::CacheRoutingMode;
 use super::cache_dispatch::{
     CacheDispatchConfigError, CacheDispatchWake, CacheDispatcher, CacheShardInbox,
 };
+use super::cache_persistence::{CacheDurabilityMode, DurableCacheStore};
 use super::cache_pipeline::{CachePipelineError, CacheResponsePipeline};
+use super::resp::RespArgs;
+use super::resp_cache::{CacheCommandError, CacheCommandTarget};
 
 const LISTENER_TOKEN: Token = Token(0);
 const WAKE_TOKEN: Token = Token(1);
@@ -181,6 +184,127 @@ impl CacheConnection {
     }
 }
 
+pub enum CacheServerStore {
+    Memory(CacheStore),
+    Durable(DurableCacheStore),
+}
+
+impl CacheServerStore {
+    fn cache_store(&self) -> &CacheStore {
+        match self {
+            Self::Memory(store) => store,
+            Self::Durable(store) => store.store(),
+        }
+    }
+
+    fn purge_expired(&mut self, now_ms: u64, max_items: usize) -> usize {
+        match self {
+            Self::Memory(store) => store.purge_expired(now_ms, max_items),
+            Self::Durable(store) => store.purge_expired(now_ms, max_items),
+        }
+    }
+
+    pub fn durability_mode(&self) -> CacheDurabilityMode {
+        match self {
+            Self::Memory(_) => CacheDurabilityMode::Memory,
+            Self::Durable(store) => store.durability_mode(),
+        }
+    }
+
+    fn memory_store_mut(&mut self) -> Option<&mut CacheStore> {
+        match self {
+            Self::Memory(store) => Some(store),
+            Self::Durable(_) => None,
+        }
+    }
+}
+
+impl CacheCommandTarget for CacheServerStore {
+    fn get<'a>(&'a mut self, key: &[u8], now_ms: u64) -> Option<CacheValueView<'a>> {
+        match self {
+            Self::Memory(store) => CacheCommandTarget::get(store, key, now_ms),
+            Self::Durable(store) => CacheCommandTarget::get(store, key, now_ms),
+        }
+    }
+
+    fn exists(&mut self, key: &[u8], now_ms: u64) -> bool {
+        match self {
+            Self::Memory(store) => CacheCommandTarget::exists(store, key, now_ms),
+            Self::Durable(store) => CacheCommandTarget::exists(store, key, now_ms),
+        }
+    }
+
+    fn set_bytes(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        ttl_ms: Option<u64>,
+        now_ms: u64,
+    ) -> Result<(), CacheCommandError> {
+        match self {
+            Self::Memory(store) => CacheCommandTarget::set_bytes(store, key, value, ttl_ms, now_ms),
+            Self::Durable(store) => {
+                CacheCommandTarget::set_bytes(store, key, value, ttl_ms, now_ms)
+            }
+        }
+    }
+
+    fn set_many_bytes(
+        &mut self,
+        pairs: &[(&[u8], &[u8])],
+        now_ms: u64,
+    ) -> Result<(), CacheCommandError> {
+        match self {
+            Self::Memory(store) => CacheCommandTarget::set_many_bytes(store, pairs, now_ms),
+            Self::Durable(store) => CacheCommandTarget::set_many_bytes(store, pairs, now_ms),
+        }
+    }
+
+    fn delete_keys<'a>(
+        &mut self,
+        keys: RespArgs<'a>,
+        now_ms: u64,
+    ) -> Result<usize, CacheCommandError> {
+        match self {
+            Self::Memory(store) => CacheCommandTarget::delete_keys(store, keys, now_ms),
+            Self::Durable(store) => CacheCommandTarget::delete_keys(store, keys, now_ms),
+        }
+    }
+
+    fn delete_key(&mut self, key: &[u8], now_ms: u64) -> Result<bool, CacheCommandError> {
+        match self {
+            Self::Memory(store) => CacheCommandTarget::delete_key(store, key, now_ms),
+            Self::Durable(store) => CacheCommandTarget::delete_key(store, key, now_ms),
+        }
+    }
+
+    fn increment(&mut self, key: &[u8], delta: i64, now_ms: u64) -> Result<i64, CacheCommandError> {
+        match self {
+            Self::Memory(store) => CacheCommandTarget::increment(store, key, delta, now_ms),
+            Self::Durable(store) => CacheCommandTarget::increment(store, key, delta, now_ms),
+        }
+    }
+
+    fn expire_ms(
+        &mut self,
+        key: &[u8],
+        ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<bool, CacheCommandError> {
+        match self {
+            Self::Memory(store) => CacheCommandTarget::expire_ms(store, key, ttl_ms, now_ms),
+            Self::Durable(store) => CacheCommandTarget::expire_ms(store, key, ttl_ms, now_ms),
+        }
+    }
+
+    fn ttl(&mut self, key: &[u8], now_ms: u64) -> CacheTtl {
+        match self {
+            Self::Memory(store) => CacheCommandTarget::ttl(store, key, now_ms),
+            Self::Durable(store) => CacheCommandTarget::ttl(store, key, now_ms),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ReadyEvent {
     token: Token,
@@ -203,7 +327,7 @@ pub struct CacheShardServer {
     listener: TcpListener,
     dispatcher: CacheDispatcher,
     inbox: CacheShardInbox,
-    store: CacheStore,
+    store: CacheServerStore,
     connections: HashMap<Token, CacheConnection>,
     next_connection_token: usize,
     config: CacheServerConfig,
@@ -219,6 +343,42 @@ impl CacheShardServer {
         dispatcher: CacheDispatcher,
         inbox: CacheShardInbox,
         store: CacheStore,
+        config: CacheServerConfig,
+        clock: CacheServerClock,
+    ) -> Result<Self, CacheServerError> {
+        Self::bind_store(
+            bind_addr,
+            dispatcher,
+            inbox,
+            CacheServerStore::Memory(store),
+            config,
+            clock,
+        )
+    }
+
+    pub fn bind_durable(
+        bind_addr: SocketAddr,
+        dispatcher: CacheDispatcher,
+        inbox: CacheShardInbox,
+        store: DurableCacheStore,
+        config: CacheServerConfig,
+        clock: CacheServerClock,
+    ) -> Result<Self, CacheServerError> {
+        Self::bind_store(
+            bind_addr,
+            dispatcher,
+            inbox,
+            CacheServerStore::Durable(store),
+            config,
+            clock,
+        )
+    }
+
+    fn bind_store(
+        bind_addr: SocketAddr,
+        dispatcher: CacheDispatcher,
+        inbox: CacheShardInbox,
+        store: CacheServerStore,
         config: CacheServerConfig,
         clock: CacheServerClock,
     ) -> Result<Self, CacheServerError> {
@@ -280,11 +440,19 @@ impl CacheShardServer {
     }
 
     pub fn store(&self) -> &CacheStore {
-        &self.store
+        self.store.cache_store()
     }
 
-    pub fn store_mut(&mut self) -> &mut CacheStore {
-        &mut self.store
+    /// Mutable access is intentionally available only for Memory mode.
+    ///
+    /// Returning None for journaled modes prevents callers from bypassing the
+    /// durability wrapper and mutating CacheStore without a WAL record.
+    pub fn memory_store_mut(&mut self) -> Option<&mut CacheStore> {
+        self.store.memory_store_mut()
+    }
+
+    pub fn durability_mode(&self) -> CacheDurabilityMode {
+        self.store.durability_mode()
     }
 
     pub fn run(&mut self) -> Result<(), CacheServerError> {
@@ -641,9 +809,30 @@ fn validate_config(config: &CacheServerConfig) -> Result<(), CacheServerError> {
 mod tests {
     use super::super::cache_cluster::{CacheAdvertisedEndpoint, CacheEndpointMap};
     use super::super::cache_dispatch::CacheDispatchChannels;
+    use super::super::cache_persistence::{recover_cache, CacheWal};
     use super::super::cache_routing::CacheSlotMap;
     use super::*;
     use std::net::TcpStream as StdTcpStream;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_CACHE_SERVER_TEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn test_path(name: &str) -> std::path::PathBuf {
+        let id = NEXT_CACHE_SERVER_TEST_ID.fetch_add(1, AtomicOrdering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "nulang-cache-server-{name}-{}-{id}",
+            std::process::id()
+        ))
+    }
+
+    fn wall_now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64
+    }
 
     fn build_server() -> CacheShardServer {
         let placement = CacheSlotMap::new_local(1, 1).unwrap();
@@ -696,6 +885,74 @@ mod tests {
     }
 
     #[test]
+    fn durable_reactor_journals_real_resp_mutation_and_recovers_it() {
+        let wal_path = test_path("durable-wal");
+        let snapshot_path = test_path("durable-snapshot");
+
+        let placement = CacheSlotMap::new_local(1, 1).unwrap();
+        let owner = placement.owner_for_slot(0).unwrap();
+        let (channels, mut inboxes) = CacheDispatchChannels::new(1, 32).unwrap();
+        let mut endpoints = CacheEndpointMap::new();
+        endpoints.insert(owner, CacheAdvertisedEndpoint::new("127.0.0.1", 7000));
+        let dispatcher = CacheDispatcher::new(1, 0, placement, channels)
+            .unwrap()
+            .with_cluster_redirects(endpoints);
+
+        let wal = CacheWal::create_after(&wal_path, 0).unwrap();
+        let durable =
+            DurableCacheStore::with_wal(CacheStore::new(), wal, CacheDurabilityMode::SyncedJournal)
+                .unwrap();
+        let clock = CacheServerClock::new();
+        let mut server = CacheShardServer::bind_durable(
+            "127.0.0.1:0".parse().unwrap(),
+            dispatcher,
+            inboxes.remove(0),
+            durable,
+            CacheServerConfig::default(),
+            clock,
+        )
+        .unwrap();
+
+        let address = server.local_addr().unwrap();
+        let mut client = StdTcpStream::connect(address).unwrap();
+        client.set_nodelay(true).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client
+            .write_all(b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n")
+            .unwrap();
+
+        for _ in 0..8 {
+            server.poll_once(Some(Duration::from_millis(10))).unwrap();
+        }
+        let mut response = [0u8; 5];
+        client.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"+OK\r\n");
+        drop(client);
+        drop(server);
+
+        let (mut recovered, report) = recover_cache(
+            &snapshot_path,
+            &wal_path,
+            CacheConfig::default(),
+            CacheEvictionPolicy::S3Fifo,
+            0,
+            wall_now_ms(),
+        )
+        .unwrap();
+        assert_eq!(report.snapshot_sequence, 0);
+        assert_eq!(report.wal_last_sequence, 1);
+        assert_eq!(report.replayed_records, 1);
+        assert_eq!(
+            recovered.get(b"key", 0),
+            Some(CacheValueView::Bytes(b"value"))
+        );
+
+        let _ = std::fs::remove_file(wal_path);
+    }
+
+    #[test]
     fn shutdown_control_wakes_blocked_reactor() {
         let mut server = build_server();
         let control = server.control();
@@ -711,13 +968,20 @@ mod tests {
     fn idle_reactor_purges_expired_values() {
         let mut server = build_server();
         let now = server.clock.now_ms();
-        server.store_mut().set_bytes(b"ttl", b"value", Some(1), now);
+        server
+            .memory_store_mut()
+            .unwrap()
+            .set_bytes(b"ttl", b"value", Some(1), now);
 
         std::thread::sleep(Duration::from_millis(3));
         server.poll_once(Some(Duration::from_millis(1))).unwrap();
 
         let now = server.clock.now_ms();
-        assert!(server.store_mut().get(b"ttl", now).is_none());
+        assert!(server
+            .memory_store_mut()
+            .unwrap()
+            .get(b"ttl", now)
+            .is_none());
     }
 
     #[test]
