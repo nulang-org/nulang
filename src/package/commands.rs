@@ -1238,6 +1238,28 @@ fn nulang_exe_output(args: &[&str]) -> NuResult<std::process::Output> {
 
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm.
 /// `nula build-wasm`: compile package to .wasm + AOT .cwasm in .nula/dist/.
+fn wasm_build_compiler_args(
+    package_name: &str,
+    package_version: &str,
+    entry: &str,
+    wasm_path: &str,
+    behavior_path: &str,
+) -> Vec<String> {
+    vec![
+        "--backend".into(),
+        "wasm-aot".into(),
+        "--out".into(),
+        wasm_path.into(),
+        "--emit-behavior-manifest".into(),
+        behavior_path.into(),
+        "--behavior-package-name".into(),
+        package_name.into(),
+        "--behavior-package-version".into(),
+        package_version.into(),
+        entry.into(),
+    ]
+}
+
 fn cmd_build_wasm() -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
@@ -1246,6 +1268,7 @@ fn cmd_build_wasm() -> NuResult<()> {
         span: Span::default(),
     })?;
     let name = manifest.package.name.clone();
+    let version = manifest.package.version.clone();
 
     let entry = prepare_package()?;
     let entry_str = entry.to_string_lossy().into_owned();
@@ -1258,11 +1281,24 @@ fn cmd_build_wasm() -> NuResult<()> {
 
     let wasm_path = dist_dir.join(format!("{}.wasm", name));
     let wasm_path_str = wasm_path.to_string_lossy().into_owned();
+    let behavior_path = dist_dir.join(format!("{}.behavior.json", name));
+    let behavior_path_str = behavior_path.to_string_lossy().into_owned();
+    let args = wasm_build_compiler_args(
+        &name,
+        &version,
+        &entry_str,
+        &wasm_path_str,
+        &behavior_path_str,
+    );
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
     eprintln!("Building {} (WASM AOT)...", name);
     eprintln!("  Compiling {} to WASM...", entry.display());
-    nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
-    println!("WASM AOT build succeeded.");
+    nulang_exe(&arg_refs)?;
+    println!(
+        "WASM AOT build succeeded (behavior manifest: {}).",
+        behavior_path.display()
+    );
     Ok(())
 }
 
@@ -2594,6 +2630,34 @@ fn cmd_remove(name: Option<&str>) -> NuResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wasm_build_compiler_args_include_bound_behavior_sidecar() {
+        let args = wasm_build_compiler_args(
+            "orders",
+            "0.4.0",
+            "src/main.nula",
+            ".nula/dist/orders.wasm",
+            ".nula/dist/orders.behavior.json",
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "--backend",
+                "wasm-aot",
+                "--out",
+                ".nula/dist/orders.wasm",
+                "--emit-behavior-manifest",
+                ".nula/dist/orders.behavior.json",
+                "--behavior-package-name",
+                "orders",
+                "--behavior-package-version",
+                "0.4.0",
+                "src/main.nula",
+            ]
+        );
+    }
 
     #[test]
     fn test_manifest_language_pin() {

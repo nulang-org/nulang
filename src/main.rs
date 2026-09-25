@@ -120,6 +120,7 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
+                opts.behavior_manifest_output(),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -576,8 +577,13 @@ fn main() {
         i += 1;
     }
 
-    if opts.emit_behavior_manifest.is_some() && !opts.emit_nbc {
-        eprintln!("Error: --emit-behavior-manifest currently requires --emit-nbc");
+    if opts.emit_behavior_manifest.is_some()
+        && !opts.emit_nbc
+        && !matches!(opts.backend.as_str(), "wasm" | "wasm-aot")
+    {
+        eprintln!(
+            "Error: --emit-behavior-manifest requires --emit-nbc or an artifact-producing WASM backend"
+        );
         std::process::exit(1);
     }
 
@@ -721,6 +727,7 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                         opts.deny_warnings,
+                        opts.behavior_manifest_output(),
                     ) {
                         print_error(&e, uc);
                     }
@@ -768,6 +775,7 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                         opts.deny_warnings,
+                        opts.behavior_manifest_output(),
                     )
                 },
                 n,
@@ -787,6 +795,7 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
+                opts.behavior_manifest_output(),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -955,6 +964,7 @@ fn main() {
                         &opts.with_capabilities,
                         opts.store_path.as_deref(),
                         opts.deny_warnings,
+                        opts.behavior_manifest_output(),
                     )
                 },
                 n,
@@ -974,6 +984,7 @@ fn main() {
                 &opts.with_capabilities,
                 opts.store_path.as_deref(),
                 opts.deny_warnings,
+                opts.behavior_manifest_output(),
             ) {
                 print_error(&e, use_color);
                 std::process::exit(exit_code(&e));
@@ -1009,6 +1020,7 @@ fn main() {
             &opts.with_capabilities,
             opts.store_path.as_deref(),
             opts.deny_warnings,
+            opts.behavior_manifest_output(),
         ) {
             print_error(&e, use_color);
             std::process::exit(exit_code(&e));
@@ -1080,6 +1092,21 @@ struct Options {
     /// Escalate warnings (e.g. RFC 0015 deprecations) to a hard error.
     deny_warnings: bool,
 }
+impl Options {
+    fn behavior_manifest_output(&self) -> Option<BehaviorManifestOutput<'_>> {
+        self.emit_behavior_manifest
+            .as_deref()
+            .map(|path| BehaviorManifestOutput {
+                path,
+                package_name: self.behavior_package_name.as_deref().unwrap_or("main"),
+                package_version: self
+                    .behavior_package_version
+                    .as_deref()
+                    .unwrap_or("0.0.0"),
+            })
+    }
+}
+
 impl Default for Options {
     fn default() -> Self {
         Options {
@@ -1787,6 +1814,143 @@ fn run_frontend(
     Ok((ast, type_checker))
 }
 
+#[derive(Clone, Copy)]
+struct BehaviorManifestOutput<'a> {
+    path: &'a str,
+    package_name: &'a str,
+    package_version: &'a str,
+}
+
+fn normalized_output_path(path: &str) -> std::path::PathBuf {
+    use std::path::Component;
+
+    let path = std::path::Path::new(path);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(path)
+    };
+
+    let mut normalized = std::path::PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn validate_wasm_output_paths(
+    wasm_path: &str,
+    cwasm_path: Option<&str>,
+    behavior_output: Option<BehaviorManifestOutput<'_>>,
+) -> NuResult<()> {
+    let Some(behavior_output) = behavior_output else {
+        return Ok(());
+    };
+
+    let behavior = normalized_output_path(behavior_output.path);
+    let wasm = normalized_output_path(wasm_path);
+    let cwasm = cwasm_path.map(normalized_output_path);
+
+    if behavior == wasm || cwasm.as_ref().is_some_and(|path| *path == behavior) {
+        return Err(nulang::types::NuError::VMError {
+            msg: format!(
+                "behavior manifest, WASM, and AOT output paths must be distinct (manifest: {}, wasm: {}{})",
+                behavior_output.path,
+                wasm_path,
+                cwasm_path
+                    .map(|path| format!(", cwasm: {path}"))
+                    .unwrap_or_default()
+            ),
+            span: Span::default(),
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "wasm-backend")]
+fn build_wasm_behavior_manifest(
+    source: &str,
+    package_name: &str,
+    package_version: &str,
+    hir: &nulang::hir::Module,
+    mir: &nulang::mir::Module,
+    wasm_bytes: &[u8],
+) -> NuResult<nulang::behavior_manifest::BehaviorManifest> {
+    let artifact_identity = nulang::compiler_identity::artifact_identity_for_typed_program(
+        Some(source.as_bytes()),
+        hir,
+        mir,
+        [],
+        concat!("nulang-rust-", env!("CARGO_PKG_VERSION")),
+        "wasm32",
+        nulang::host_effect_abi::HOST_EFFECT_ABI_SCHEMA,
+        "wasm",
+        std::iter::empty::<&str>(),
+    )
+    .map_err(|error| nulang::types::NuError::VMError {
+        msg: format!("failed to derive WASM artifact semantic identity: {error}"),
+        span: Span::default(),
+    })?;
+
+    nulang::behavior_manifest::BehaviorManifest::from_typed_hir(
+        package_name,
+        package_version,
+        &artifact_identity,
+        wasm_bytes,
+        hir,
+    )
+    .map_err(|error| nulang::types::NuError::VMError {
+        msg: format!("failed to build WASM behavior manifest: {error}"),
+        span: Span::default(),
+    })
+}
+
+#[cfg(feature = "wasm-backend")]
+fn emit_wasm_behavior_manifest(
+    source: &str,
+    hir: &nulang::hir::Module,
+    mir: &nulang::mir::Module,
+    wasm_bytes: &[u8],
+    output: BehaviorManifestOutput<'_>,
+) -> NuResult<()> {
+    let manifest = build_wasm_behavior_manifest(
+        source,
+        output.package_name,
+        output.package_version,
+        hir,
+        mir,
+        wasm_bytes,
+    )?;
+    let bytes = manifest
+        .to_json()
+        .map_err(|error| nulang::types::NuError::VMError {
+            msg: format!("failed to serialize WASM behavior manifest: {error}"),
+            span: Span::default(),
+        })?;
+    std::fs::write(output.path, bytes).map_err(|error| nulang::types::NuError::VMError {
+        msg: format!("failed to write behavior manifest {}: {error}", output.path),
+        span: Span::default(),
+    })?;
+    println!(
+        "Wrote {} ({}, {})",
+        output.path,
+        manifest.schema,
+        manifest
+            .digest()
+            .unwrap_or_else(|_| "digest-unavailable".to_string())
+    );
+    Ok(())
+}
+
 #[cfg_attr(not(feature = "wasm-backend"), allow(unused_variables))]
 fn run_source(
     source: &str,
@@ -1799,6 +1963,7 @@ fn run_source(
     with_capabilities: &[String],
     store_path: Option<&str>,
     deny_warnings: bool,
+    behavior_manifest_output: Option<BehaviorManifestOutput<'_>>,
 ) -> NuResult<()> {
     let (ast, type_checker) =
         run_frontend(source, file_path, verbose, with_capabilities, deny_warnings)?;
@@ -1806,6 +1971,7 @@ fn run_source(
         #[cfg(feature = "wasm-backend")]
         "wasm" => {
             let wasm_file = out_file.unwrap_or("out.wasm");
+            validate_wasm_output_paths(wasm_file, None, behavior_manifest_output)?;
             let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
             let mir = nulang::mir_lower::lower_module(&hir)?;
             use nulang::backends::WasmBackend;
@@ -1820,6 +1986,9 @@ fn run_source(
                     span: Span::default(),
                 }
             })?;
+            if let Some(output) = behavior_manifest_output {
+                emit_wasm_behavior_manifest(source, &hir, &mir, &wasm_bytes, output)?;
+            }
             println!("Wrote {} ({} bytes)", wasm_file, wasm_bytes.len());
             return Ok(());
         }
@@ -1863,6 +2032,11 @@ fn run_source(
             } else {
                 cwasm_file
             };
+            validate_wasm_output_paths(
+                wasm_file,
+                Some(&cwasm_file),
+                behavior_manifest_output,
+            )?;
             let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
             let mir = nulang::mir_lower::lower_module(&hir)?;
             use nulang::backends::WasmBackend;
@@ -1877,6 +2051,9 @@ fn run_source(
                     span: Span::default(),
                 }
             })?;
+            if let Some(output) = behavior_manifest_output {
+                emit_wasm_behavior_manifest(source, &hir, &mir, &wasm_bytes, output)?;
+            }
             println!("Wrote {} ({} bytes)", wasm_file, wasm_bytes.len());
             nulang::wasm_runtime::aot_compile(&wasm_file, &cwasm_file)?;
             println!("Wrote {} (precompiled)", cwasm_file);
@@ -2807,6 +2984,79 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "wasm-backend")]
+    fn wasm_behavior_sidecar_binds_canonical_wasm_bytes() {
+        let source = r#"
+            actor Counter {
+                state count: Int = 0
+                behavior inc() { self.count = self.count + 1 }
+            }
+        "#;
+        let (ast, type_checker) =
+            run_frontend(source, None, false, &[], false).expect("frontend");
+        let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
+        let mir = nulang::mir_lower::lower_module(&hir).expect("mir");
+        use nulang::backends::WasmBackend;
+        let mut backend = nulang::backends::DefaultWasmBackend;
+        let wasm = backend.compile(&mir, "test").expect("wasm");
+
+        let manifest = build_wasm_behavior_manifest(
+            source,
+            "demo",
+            "0.1.0",
+            &hir,
+            &mir,
+            &wasm,
+        )
+        .expect("behavior manifest");
+
+        assert_eq!(
+            manifest.artifact.kind,
+            nulang::behavior_manifest::BEHAVIOR_ARTIFACT_KIND_WASM_MODULE
+        );
+        assert_eq!(manifest.artifact.backend, "wasm");
+        manifest.verify_artifact_bytes(&wasm).unwrap();
+        assert!(manifest.verify_artifact_bytes(b"different").is_err());
+    }
+
+    #[test]
+    fn behavior_manifest_output_must_not_collide_with_wasm_outputs() {
+        let output = BehaviorManifestOutput {
+            path: "dist/app.wasm",
+            package_name: "app",
+            package_version: "0.1.0",
+        };
+        let error =
+            validate_wasm_output_paths("dist/app.wasm", None, Some(output)).unwrap_err();
+        assert!(error.to_string().contains("must be distinct"));
+
+        let output = BehaviorManifestOutput {
+            path: "dist/app.cwasm",
+            package_name: "app",
+            package_version: "0.1.0",
+        };
+        let error = validate_wasm_output_paths(
+            "dist/app.wasm",
+            Some("dist/app.cwasm"),
+            Some(output),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must be distinct"));
+    }
+
+    #[test]
+    fn behavior_manifest_output_normalizes_parent_components_for_collision_check() {
+        let output = BehaviorManifestOutput {
+            path: "dist/tmp/../app.wasm",
+            package_name: "app",
+            package_version: "0.1.0",
+        };
+        assert!(
+            validate_wasm_output_paths("dist/app.wasm", None, Some(output)).is_err()
+        );
+    }
 
     /// An actor program run through the CLI path must create real actors
     /// and deliver sent messages: with the bare standalone VM the stub

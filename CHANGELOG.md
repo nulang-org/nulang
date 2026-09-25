@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Canonical WASM Behavior Manifest sidecars — 2026-09-25
+- **Artifact-producing WASM builds can now emit RFC 0020 Behavior Manifest sidecars bound to the exact `.wasm` bytes.** The compiler derives `SourceId`, `SemanticId`, and `ArtifactId` from the same typed HIR/MIR used for WASM generation, records the compiler-owned host-effect ABI identity, and verifies the executable digest against the portable WASM artifact rather than the host-specific `.cwasm` cache.
+- **`nula build-wasm` now requests `<package>.behavior.json` automatically** beside `<package>.wasm` and `<package>.cwasm`, carrying the package name/version into the manifest. Workflow packages remain rejected by the canonical WASM backend until durable workflow runtime parity is implemented.
+
 ### Compiler-owned workflow behavior metadata — 2026-09-25
 - **Behavior Manifests now identify workflow owners and preserve their ordered execution structure.** Compiler-derived actor entries distinguish ordinary actors, workflows, agents, and organizations; workflow entries include ordered step names, compensation presence, and synthesized parallel-branch names.
 - **The metadata remains declarative rather than executable.** It carries no workflow body bytecode, runtime actor IDs, placement data, persistence records, or Cloud transport details, giving the canonical WASM guest enough semantic structure for a future durable workflow host without creating another workflow engine.
