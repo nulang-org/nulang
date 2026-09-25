@@ -146,10 +146,11 @@ fn resolve_string_constant(rt: &Runtime, actor_id: u64, value: &Value) -> Option
         })
 }
 
-/// Emit a durable event for a workflow or event-sourced actor. For workflow
-/// actors this appends to the durable journal and forces a checkpoint. For
-/// event-sourced (non-workflow) actors the event is persisted to the event
-/// journal and a checkpoint is forced.
+/// Emit a durable event for a workflow or event-sourced actor.
+///
+/// Workflow events are journaled without advancing the completed-state
+/// snapshot. Until resumable continuations exist, only a terminal
+/// StepCompleted/StepFailed boundary may checkpoint in-flight workflow state.
 pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[Value]) {
     let is_workflow = actor_is_workflow(rt, actor_id);
     let seq = next_sequence(rt, actor_id);
@@ -232,7 +233,6 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 },
             );
         }
-        checkpoint_actor(rt, actor_id);
     }
 }
 
@@ -248,9 +248,7 @@ pub(crate) fn append_timer_set(
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
     rt.persistence
-        .append_timer_set(actor_id, seq, name.to_string(), duration_ms)?;
-    try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+        .append_timer_set(actor_id, seq, name.to_string(), duration_ms)
 }
 
 pub(crate) fn append_timer_fired(
@@ -260,9 +258,7 @@ pub(crate) fn append_timer_fired(
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
     rt.persistence
-        .append_timer_fired(actor_id, seq, name.to_string())?;
-    try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+        .append_timer_fired(actor_id, seq, name.to_string())
 }
 
 pub(crate) fn append_signal_received(
@@ -273,9 +269,7 @@ pub(crate) fn append_signal_received(
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
     rt.persistence
-        .append_signal_received(actor_id, seq, name.to_string(), payload)?;
-    try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+        .append_signal_received(actor_id, seq, name.to_string(), payload)
 }
 
 pub(crate) fn append_saga_compensated(
@@ -285,9 +279,7 @@ pub(crate) fn append_saga_compensated(
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
     rt.persistence
-        .append_saga_compensated(actor_id, seq, step_name.to_string())?;
-    try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+        .append_saga_compensated(actor_id, seq, step_name.to_string())
 }
 
 // ---------------------------------------------------------------------------
