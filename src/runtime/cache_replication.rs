@@ -65,7 +65,11 @@ impl CacheReplicaAckTracker {
     pub fn new(placement_epoch: u64, replicas: &[CacheShardOwner]) -> Self {
         Self {
             placement_epoch,
-            acknowledgements: replicas.iter().copied().map(|replica| (replica, 0)).collect(),
+            acknowledgements: replicas
+                .iter()
+                .copied()
+                .map(|replica| (replica, 0))
+                .collect(),
         }
     }
 
@@ -315,13 +319,17 @@ pub fn encode_replica_ack(ack: &CacheReplicaAck) -> Vec<u8> {
 
 pub fn decode_replica_ack(bytes: &[u8]) -> io::Result<CacheReplicaAck> {
     if bytes.len() != REPLICA_ACK_BODY_BYTES + CHECKSUM_BYTES {
-        return Err(invalid_data("cache replica acknowledgement length mismatch"));
+        return Err(invalid_data(
+            "cache replica acknowledgement length mismatch",
+        ));
     }
 
     let (body, stored_checksum) = bytes.split_at(REPLICA_ACK_BODY_BYTES);
     let checksum = blake3::hash(body);
     if checksum.as_bytes() != stored_checksum {
-        return Err(invalid_data("cache replica acknowledgement checksum mismatch"));
+        return Err(invalid_data(
+            "cache replica acknowledgement checksum mismatch",
+        ));
     }
     if &body[..8] != REPLICA_ACK_MAGIC {
         return Err(invalid_data("invalid cache replica acknowledgement magic"));
@@ -329,12 +337,16 @@ pub fn decode_replica_ack(bytes: &[u8]) -> io::Result<CacheReplicaAck> {
 
     let version = u16::from_le_bytes([body[8], body[9]]);
     if version != REPLICATION_VERSION {
-        return Err(invalid_data("unsupported cache replica acknowledgement version"));
+        return Err(invalid_data(
+            "unsupported cache replica acknowledgement version",
+        ));
     }
 
     Ok(CacheReplicaAck {
         placement_epoch: u64::from_le_bytes(
-            body[10..18].try_into().expect("fixed acknowledgement epoch slice"),
+            body[10..18]
+                .try_into()
+                .expect("fixed acknowledgement epoch slice"),
         ),
         replica: CacheShardOwner {
             node_id: u64::from_le_bytes(
