@@ -209,9 +209,23 @@ snapshot. A crash before rotation can replay the older log and skip records
 already covered by the snapshot; a crash after rotation recovers from the new
 base sequence.
 
-Replica and quorum acknowledgement modes remain future work, as does wiring
-the durability wrapper into the production RESP server configuration. The
-default cache path continues to run without WAL or consensus work.
+Replication now has an epoch-fenced ordered application core in
+`src/runtime/cache_replication.rs`. Replication frames carry the current cache
+placement epoch, WAL sequence, canonical mutation, and BLAKE3 checksum. A
+replica applies only the exact next sequence for its currently installed
+placement epoch; stale epochs, future epochs, and sequence gaps are rejected
+before mutation. Retransmissions at or below the applied sequence are
+idempotent and do not execute the mutation twice. Store-application failure
+poisons the replica.
+
+Epoch advancement is explicit through the control-plane-facing fence operation.
+A replica does not infer authority merely because it receives a higher epoch
+from a data-plane sender. This reuses the existing cache placement epoch rather
+than introducing a second leader-term system.
+
+Replica acknowledgement transport, bootstrap snapshot transfer, and promotion
+remain follow-up work. The default cache path continues to run without WAL,
+replication, or consensus work.
 
 ## Performance gates
 
@@ -256,8 +270,8 @@ surface.
 4. Connect remote transparent handoffs to a cache-specific cluster transport.
 5. Add asynchronous snapshot/compaction so periodic checkpoints do not block
    the shard reactor.
-6. Add cache replication, replica acknowledgement, bootstrap transfer, and
-   failover fencing.
+6. Add replica acknowledgement, bootstrap snapshot transfer, and promotion /
+   failover fencing on top of the epoch-fenced replication core.
 7. Add packed aggregate structures, then expand RESP compatibility and add
    Nulang-native leases, locks, semaphores,
    fencing tokens, queues, and stored functions where they fit the product
