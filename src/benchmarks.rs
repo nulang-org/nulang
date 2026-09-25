@@ -160,6 +160,72 @@ fn bench_ab_enqueue_payload_sweep() {
 
 #[cfg(feature = "native-codegen")]
 #[test]
+fn bench_ab_jit_tiering_crossover() {
+    const REPEATS: usize = 20;
+
+    for trips in [3_000usize, 4_000, 5_000, 7_500] {
+        let source = format!(
+            "var sum = 0; var i = 0; while i < {trips} {{ sum = sum + i * 3 - i / 7; i = i + 1; }}; sum"
+        );
+        let tokens = Lexer::new(&source).lex().expect("bench: lex failed");
+        let ast = Parser::new(tokens)
+            .parse_module()
+            .expect("bench: parse failed");
+        let mut tc = TypeChecker::new();
+        tc.check_module(&ast).expect("bench: typecheck failed");
+        let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+        let mut mir = crate::mir_lower::lower_module(&hir).expect("bench: MIR lower failed");
+        let module =
+            crate::mir_codegen::compile_mir(&mut mir, "bench-ab-tiering").expect("bench: codegen failed");
+
+        let mut interp_vms: Vec<VM> = (0..REPEATS)
+            .map(|_| {
+                let mut vm = VM::new_without_jit();
+                vm.load_module(module.clone());
+                vm
+            })
+            .collect();
+        let interp_start = Instant::now();
+        let mut interp_result = None;
+        for vm in &mut interp_vms {
+            interp_result = Some(vm.run().expect("bench: interpreter run failed"));
+        }
+        let interp_elapsed = interp_start.elapsed();
+
+        let mut jit_vms: Vec<VM> = (0..REPEATS)
+            .map(|_| {
+                let mut vm = VM::new();
+                vm.load_module(module.clone());
+                vm
+            })
+            .collect();
+        let jit_start = Instant::now();
+        let mut jit_result = None;
+        for vm in &mut jit_vms {
+            jit_result = Some(vm.run().expect("bench: first-run JIT failed"));
+        }
+        let jit_elapsed = jit_start.elapsed();
+
+        assert_eq!(
+            interp_result.and_then(|value| value.as_int()),
+            jit_result.and_then(|value| value.as_int()),
+            "tiering crossover probe must preserve interpreter/JIT parity"
+        );
+        report_ab(
+            &format!("tier_interp_{trips}"),
+            REPEATS as u64,
+            interp_elapsed,
+        );
+        report_ab(
+            &format!("tier_jit_first_{trips}"),
+            REPEATS as u64,
+            jit_elapsed,
+        );
+    }
+}
+
+#[cfg(feature = "native-codegen")]
+#[test]
 fn bench_ab_aot_actor_drain() {
     use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
 
