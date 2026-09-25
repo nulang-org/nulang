@@ -149,6 +149,22 @@ impl DurableCacheStore {
         &self.store
     }
 
+    pub fn get<'a>(&'a mut self, key: &[u8], now_ms: u64) -> Option<super::cache::CacheValueView<'a>> {
+        self.store.get(key, now_ms)
+    }
+
+    pub fn exists(&mut self, key: &[u8], now_ms: u64) -> bool {
+        self.store.exists(key, now_ms)
+    }
+
+    pub fn ttl(&mut self, key: &[u8], now_ms: u64) -> CacheTtl {
+        self.store.ttl(key, now_ms)
+    }
+
+    pub fn purge_expired(&mut self, now_ms: u64, max_items: usize) -> usize {
+        self.store.purge_expired(now_ms, max_items)
+    }
+
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
