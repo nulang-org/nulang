@@ -469,6 +469,28 @@ mod tests {
     }
 
     #[test]
+    fn workflow_operation_identity_derives_stable_effect_id_without_string_keys() {
+        let activation = crate::runtime::WorkflowActivationId::new(42, 7);
+        let operation = activation.operation(3);
+
+        let first = DurableEffectId::derive_from_workflow_operation(operation, "Payment.charge");
+        let replay = DurableEffectId::derive_from_workflow_operation(operation, "Payment.charge");
+
+        assert_eq!(first, replay);
+        assert_ne!(
+            first,
+            DurableEffectId::derive_from_workflow_operation(
+                activation.operation(4),
+                "Payment.charge",
+            )
+        );
+        assert_ne!(
+            first,
+            DurableEffectId::derive_from_workflow_operation(operation, "Email.send")
+        );
+    }
+
+    #[test]
     fn operation_id_is_stable_for_replay() {
         let first = DurableEffectId::derive(42, "charge-order-7", 0, "Payment.charge");
         let replay = DurableEffectId::derive(42, "charge-order-7", 0, "Payment.charge");
