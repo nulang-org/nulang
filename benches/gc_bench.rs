@@ -5,6 +5,8 @@ use nulang::runtime::Runtime;
 use nulang::types::ExitReason;
 use nulang::vm::Value;
 
+fn noop_handler(_actor: &mut nulang::runtime::Actor, _args: &[Value]) {}
+
 fn bench_orca_throughput(c: &mut Criterion) {
     c.bench_function("gc/orca_throughput", |b| {
         b.iter(|| {
@@ -12,6 +14,10 @@ fn bench_orca_throughput(c: &mut Criterion) {
             let mut actors = Vec::new();
             for _ in 0..20 {
                 let a = rt.spawn_actor(Box::new(|| vec![]));
+                rt.actors
+                    .get_mut(&a)
+                    .expect("spawned actor")
+                    .register_behavior("handle", noop_handler);
                 actors.push(a);
             }
             let msg = Value::int(42);
@@ -22,6 +28,11 @@ fn bench_orca_throughput(c: &mut Criterion) {
                     }
                 }
             }
+            let admitted: usize = actors
+                .iter()
+                .map(|id| rt.actors.get(id).expect("benchmark actor").mailbox.len())
+                .sum();
+            assert_eq!(admitted, 20 * 19, "ORCA benchmark must time admitted actor traffic");
             for _ in 0..200 {
                 rt.run_scheduler();
                 rt.process_gc_ops();
