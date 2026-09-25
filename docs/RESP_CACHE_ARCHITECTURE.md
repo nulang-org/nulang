@@ -164,6 +164,14 @@ cache. If a valid snapshot is newer than the surviving WAL tail, startup
 rotates the WAL base forward to the snapshot sequence before accepting new
 writes, preserving monotonic recovery sequence numbers.
 
+`CacheShardServer::durability_status` exposes the selected mode, poison state,
+and current WAL base/tail sequence. `snapshot_now` provides an explicit
+administrative checkpoint boundary that writes a durable snapshot and rotates
+the WAL. Snapshotting is deliberately not implicit in the reactor loop: the
+current implementation performs serialization and fsync synchronously, so
+operators/embedders must schedule it where a latency pause is acceptable until
+an asynchronous snapshot/compaction path is implemented.
+
 ## Durability
 
 Durability remains outside the cache kernel. `src/runtime/cache_persistence.rs`
@@ -246,8 +254,8 @@ surface.
 3. Add a separate transparent proxy endpoint only for non-cluster clients;
    keep the per-shard production listeners redirect-only.
 4. Connect remote transparent handoffs to a cache-specific cluster transport.
-5. Add periodic/administrative snapshot rotation and explicit durability
-   health/status surfaces for operators.
+5. Add asynchronous snapshot/compaction so periodic checkpoints do not block
+   the shard reactor.
 6. Add cache replication, replica acknowledgement, bootstrap transfer, and
    failover fencing.
 7. Add packed aggregate structures, then expand RESP compatibility and add

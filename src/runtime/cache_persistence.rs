@@ -33,6 +33,14 @@ pub enum CacheDurabilityMode {
     SyncedJournal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheDurabilityStatus {
+    pub mode: CacheDurabilityMode,
+    pub poisoned: bool,
+    pub wal_base_sequence: Option<u64>,
+    pub wal_last_sequence: Option<u64>,
+}
+
 #[derive(Debug)]
 pub enum CacheDurabilityError {
     Store(CacheWriteError),
@@ -171,6 +179,15 @@ impl DurableCacheStore {
 
     pub fn durability_mode(&self) -> CacheDurabilityMode {
         self.mode
+    }
+
+    pub fn durability_status(&self) -> CacheDurabilityStatus {
+        CacheDurabilityStatus {
+            mode: self.mode,
+            poisoned: self.poisoned,
+            wal_base_sequence: self.wal.as_ref().map(CacheWal::base_sequence),
+            wal_last_sequence: self.wal.as_ref().map(CacheWal::last_sequence),
+        }
     }
 
     pub fn set_bytes(
@@ -1049,6 +1066,38 @@ mod tests {
     fn test_path(name: &str) -> PathBuf {
         let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("nulang-cache-{name}-{}-{id}", std::process::id()))
+    }
+
+    #[test]
+    fn durability_status_tracks_wal_sequences_and_poison_state() {
+        let wal_path = test_path("status-wal");
+        let wal = CacheWal::create_after(&wal_path, 7).unwrap();
+        let mut durable = DurableCacheStore::with_wal(
+            CacheStore::new(),
+            wal,
+            CacheDurabilityMode::BufferedJournal,
+        )
+        .unwrap();
+
+        assert_eq!(
+            durable.durability_status(),
+            CacheDurabilityStatus {
+                mode: CacheDurabilityMode::BufferedJournal,
+                poisoned: false,
+                wal_base_sequence: Some(7),
+                wal_last_sequence: Some(7),
+            }
+        );
+
+        durable.set_integer(b"k", 1, None, 0, 0).unwrap();
+        assert_eq!(durable.durability_status().wal_last_sequence, Some(8));
+
+        let readonly = OpenOptions::new().read(true).open(&wal_path).unwrap();
+        durable.wal.as_mut().unwrap().file = readonly;
+        assert!(durable.set_integer(b"k2", 2, None, 0, 0).is_err());
+        assert!(durable.durability_status().poisoned);
+
+        let _ = fs::remove_file(wal_path);
     }
 
     #[test]

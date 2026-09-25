@@ -12,14 +12,16 @@ use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
 
 use super::cache::{CacheStore, CacheTtl, CacheValueView};
 use super::cache_cluster::CacheRoutingMode;
-use super::cache_persistence::{CacheDurabilityMode, DurableCacheStore};
+use super::cache_persistence::{
+    CacheDurabilityError, CacheDurabilityMode, CacheDurabilityStatus, DurableCacheStore,
+};
 use super::resp_cache::{CacheCommandError, CacheCommandTarget};
 use super::cache_dispatch::{
     CacheDispatchConfigError, CacheDispatchWake, CacheDispatcher, CacheShardInbox,
@@ -207,6 +209,34 @@ impl CacheServerStore {
         match self {
             Self::Memory(_) => CacheDurabilityMode::Memory,
             Self::Durable(store) => store.durability_mode(),
+        }
+    }
+
+    pub fn durability_status(&self) -> CacheDurabilityStatus {
+        match self {
+            Self::Memory(_) => CacheDurabilityStatus {
+                mode: CacheDurabilityMode::Memory,
+                poisoned: false,
+                wal_base_sequence: None,
+                wal_last_sequence: None,
+            },
+            Self::Durable(store) => store.durability_status(),
+        }
+    }
+
+    fn snapshot_and_rotate(
+        &mut self,
+        snapshot_path: &std::path::Path,
+        store_now_ms: u64,
+        wall_now_ms: u64,
+    ) -> Result<u64, CacheDurabilityError> {
+        match self {
+            Self::Memory(_) => Err(CacheDurabilityError::InvalidMode(
+                "snapshot/WAL rotation requires a journaled durability mode",
+            )),
+            Self::Durable(store) => {
+                store.snapshot_and_rotate(snapshot_path, store_now_ms, wall_now_ms)
+            }
         }
     }
 
@@ -444,6 +474,33 @@ impl CacheShardServer {
 
     pub fn durability_mode(&self) -> CacheDurabilityMode {
         self.store.durability_mode()
+    }
+
+    pub fn durability_status(&self) -> CacheDurabilityStatus {
+        self.store.durability_status()
+    }
+
+    /// Publish a durable snapshot and rotate the WAL at the captured sequence.
+    ///
+    /// This operation is explicit because snapshot serialization and fsync can
+    /// be expensive. Callers should schedule it at an operationally suitable
+    /// boundary instead of running it implicitly on the latency-sensitive
+    /// reactor path.
+    pub fn snapshot_now(
+        &mut self,
+        snapshot_path: impl AsRef<std::path::Path>,
+    ) -> Result<u64, CacheDurabilityError> {
+        let store_now_ms = self.clock.now_ms();
+        let wall_now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .map_err(|error| {
+                CacheDurabilityError::Persistence(io::Error::other(format!(
+                    "system clock is before Unix epoch: {error}"
+                )))
+            })?;
+        self.store
+            .snapshot_and_rotate(snapshot_path.as_ref(), store_now_ms, wall_now_ms)
     }
 
     pub fn run(&mut self) -> Result<(), CacheServerError> {
@@ -876,6 +933,20 @@ mod tests {
     }
 
     #[test]
+    fn memory_server_reports_memory_durability_status() {
+        let server = build_server();
+        assert_eq!(
+            server.durability_status(),
+            CacheDurabilityStatus {
+                mode: CacheDurabilityMode::Memory,
+                poisoned: false,
+                wal_base_sequence: None,
+                wal_last_sequence: None,
+            }
+        );
+    }
+
+    #[test]
     fn durable_reactor_journals_real_resp_mutation_and_recovers_it() {
         let wal_path = test_path("durable-wal");
         let snapshot_path = test_path("durable-snapshot");
@@ -924,6 +995,14 @@ mod tests {
         client.read_exact(&mut response).unwrap();
         assert_eq!(&response, b"+OK\r\n");
         drop(client);
+
+        let status = server.durability_status();
+        assert_eq!(status.mode, CacheDurabilityMode::SyncedJournal);
+        assert_eq!(status.wal_last_sequence, Some(1));
+
+        let snapshot_sequence = server.snapshot_now(&snapshot_path).unwrap();
+        assert_eq!(snapshot_sequence, 1);
+        assert_eq!(server.durability_status().wal_base_sequence, Some(1));
         drop(server);
 
         let (mut recovered, report) = recover_cache(
@@ -935,9 +1014,10 @@ mod tests {
             wall_now_ms(),
         )
         .unwrap();
-        assert_eq!(report.snapshot_sequence, 0);
+        assert_eq!(report.snapshot_sequence, 1);
+        assert_eq!(report.wal_base_sequence, 1);
         assert_eq!(report.wal_last_sequence, 1);
-        assert_eq!(report.replayed_records, 1);
+        assert_eq!(report.replayed_records, 0);
         assert_eq!(
             recovered.get(b"key", 0),
             Some(CacheValueView::Bytes(b"value"))
