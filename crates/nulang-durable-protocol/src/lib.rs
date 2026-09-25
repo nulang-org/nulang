@@ -138,7 +138,7 @@ impl DurableTransition {
             event.validate()?;
         }
         for timer in &self.timers {
-            timer.validate()?;
+            timer.validate(self.activation_epoch, self.sequence)?;
         }
         for effect in &self.durable_effects {
             effect.validate()?;
@@ -272,28 +272,67 @@ pub enum DurableTimerMutation {
     Set {
         timer_id: String,
         #[serde(with = "u64_string")]
+        set_activation_epoch: u64,
+        #[serde(with = "u64_string")]
+        set_sequence: u64,
+        #[serde(with = "u64_string")]
         due_at_unix_ms: u64,
     },
     Cancel {
         timer_id: String,
+        #[serde(with = "u64_string")]
+        set_activation_epoch: u64,
+        #[serde(with = "u64_string")]
+        set_sequence: u64,
     },
     Fired {
         timer_id: String,
+        #[serde(with = "u64_string")]
+        set_activation_epoch: u64,
+        #[serde(with = "u64_string")]
+        set_sequence: u64,
     },
 }
 
 impl DurableTimerMutation {
-    fn validate(&self) -> Result<(), DurableProtocolError> {
-        let timer_id = match self {
-            Self::Set { timer_id, .. } | Self::Cancel { timer_id } | Self::Fired { timer_id } => {
-                timer_id
+    fn validate(
+        &self,
+        transition_activation_epoch: u64,
+        transition_sequence: u64,
+    ) -> Result<(), DurableProtocolError> {
+        let (timer_id, set_activation_epoch, set_sequence, is_set) = match self {
+            Self::Set {
+                timer_id,
+                set_activation_epoch,
+                set_sequence,
+                ..
+            } => (timer_id, *set_activation_epoch, *set_sequence, true),
+            Self::Cancel {
+                timer_id,
+                set_activation_epoch,
+                set_sequence,
             }
+            | Self::Fired {
+                timer_id,
+                set_activation_epoch,
+                set_sequence,
+            } => (timer_id, *set_activation_epoch, *set_sequence, false),
         };
+
         if timer_id.trim().is_empty() {
-            Err(DurableProtocolError::InvalidTimer)
-        } else {
-            Ok(())
+            return Err(DurableProtocolError::InvalidTimer);
         }
+        if set_activation_epoch == 0 || set_sequence == 0 {
+            return Err(DurableProtocolError::InvalidTimerGeneration);
+        }
+        if is_set
+            && (set_activation_epoch != transition_activation_epoch
+                || set_sequence != transition_sequence)
+        {
+            return Err(DurableProtocolError::InvalidTimerGeneration);
+        }
+
+        Ok(())
     }
 }
 
@@ -335,6 +374,29 @@ pub enum DurableEffectMutation {
         #[serde(default)]
         result: Value,
     },
+    CompensationPrepared {
+        original_effect_id: String,
+        compensation_ordinal: u32,
+        effect_id: String,
+        operation: String,
+        boundary: DurableEffectBoundary,
+        delivery: DurableDeliverySemantics,
+        request_digest: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
+    },
+    CompensationCompleted {
+        original_effect_id: String,
+        compensation_ordinal: u32,
+        effect_id: String,
+        operation: String,
+        boundary: DurableEffectBoundary,
+        delivery: DurableDeliverySemantics,
+        request_digest: String,
+        result_digest: String,
+        #[serde(default)]
+        result: Value,
+    },
 }
 
 impl DurableEffectMutation {
@@ -346,33 +408,84 @@ impl DurableEffectMutation {
                 request_digest,
                 idempotency_key,
                 ..
-            } => {
-                if effect_id.trim().is_empty()
-                    || operation.trim().is_empty()
-                    || !valid_blake3_digest(request_digest)
-                    || idempotency_key
-                        .as_ref()
-                        .is_some_and(|key| key.trim().is_empty())
-                {
-                    return Err(DurableProtocolError::InvalidDurableEffect);
-                }
-            }
+            } => validate_prepared_effect(
+                effect_id,
+                operation,
+                request_digest,
+                idempotency_key.as_deref(),
+            ),
             Self::Completed {
                 effect_id,
                 operation,
                 request_digest,
                 result_digest,
                 ..
+            } => validate_completed_effect(effect_id, operation, request_digest, result_digest),
+            Self::CompensationPrepared {
+                original_effect_id,
+                effect_id,
+                operation,
+                request_digest,
+                idempotency_key,
+                ..
             } => {
-                if effect_id.trim().is_empty()
-                    || operation.trim().is_empty()
-                    || !valid_blake3_digest(request_digest)
-                    || !valid_blake3_digest(result_digest)
-                {
-                    return Err(DurableProtocolError::InvalidDurableEffect);
+                if original_effect_id.trim().is_empty() {
+                    return Err(DurableProtocolError::InvalidCompensation);
                 }
+                validate_prepared_effect(
+                    effect_id,
+                    operation,
+                    request_digest,
+                    idempotency_key.as_deref(),
+                )
+            }
+            Self::CompensationCompleted {
+                original_effect_id,
+                effect_id,
+                operation,
+                request_digest,
+                result_digest,
+                ..
+            } => {
+                if original_effect_id.trim().is_empty() {
+                    return Err(DurableProtocolError::InvalidCompensation);
+                }
+                validate_completed_effect(effect_id, operation, request_digest, result_digest)
             }
         }
+    }
+}
+
+fn validate_prepared_effect(
+    effect_id: &str,
+    operation: &str,
+    request_digest: &str,
+    idempotency_key: Option<&str>,
+) -> Result<(), DurableProtocolError> {
+    if effect_id.trim().is_empty()
+        || operation.trim().is_empty()
+        || !valid_blake3_digest(request_digest)
+        || idempotency_key.is_some_and(|key| key.trim().is_empty())
+    {
+        Err(DurableProtocolError::InvalidDurableEffect)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_completed_effect(
+    effect_id: &str,
+    operation: &str,
+    request_digest: &str,
+    result_digest: &str,
+) -> Result<(), DurableProtocolError> {
+    if effect_id.trim().is_empty()
+        || operation.trim().is_empty()
+        || !valid_blake3_digest(request_digest)
+        || !valid_blake3_digest(result_digest)
+    {
+        Err(DurableProtocolError::InvalidDurableEffect)
+    } else {
         Ok(())
     }
 }
@@ -438,7 +551,9 @@ pub enum DurableProtocolError {
     InvalidWorkflowEvent,
     InvalidDomainEvent,
     InvalidTimer,
+    InvalidTimerGeneration,
     InvalidDurableEffect,
+    InvalidCompensation,
     InvalidOutboxMessage,
     DuplicateOutboxOrdinal(u32),
     Serialization(String),
@@ -468,7 +583,13 @@ impl fmt::Display for DurableProtocolError {
             Self::InvalidWorkflowEvent => write!(f, "invalid durable workflow event"),
             Self::InvalidDomainEvent => write!(f, "invalid durable domain event"),
             Self::InvalidTimer => write!(f, "invalid durable timer mutation"),
+            Self::InvalidTimerGeneration => {
+                write!(f, "invalid durable timer generation identity")
+            }
             Self::InvalidDurableEffect => write!(f, "invalid durable effect mutation"),
+            Self::InvalidCompensation => {
+                write!(f, "invalid durable compensation linkage")
+            }
             Self::InvalidOutboxMessage => write!(f, "invalid durable outbox message"),
             Self::DuplicateOutboxOrdinal(ordinal) => {
                 write!(f, "duplicate durable outbox ordinal {ordinal}")
@@ -869,6 +990,8 @@ mod tests {
         let value = json!({
             "kind": "set",
             "timer_id": "t1",
+            "set_activation_epoch": "1",
+            "set_sequence": "1",
             "due_at_unix_ms": "10",
             "typo_field": true
         });
