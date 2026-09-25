@@ -1061,6 +1061,93 @@ mod tests {
     }
 
     #[test]
+    fn acknowledgement_tracker_computes_replica_commit_index() {
+        let first = CacheShardOwner {
+            node_id: 2,
+            shard: 0,
+        };
+        let second = CacheShardOwner {
+            node_id: 3,
+            shard: 0,
+        };
+        let mut tracker = CacheReplicaAckTracker::new(5, &[first, second]);
+
+        tracker
+            .observe(
+                &CacheReplicaAck {
+                    placement_epoch: 5,
+                    replica: first,
+                    applied_sequence: 10,
+                },
+                12,
+            )
+            .unwrap();
+        tracker
+            .observe(
+                &CacheReplicaAck {
+                    placement_epoch: 5,
+                    replica: second,
+                    applied_sequence: 8,
+                },
+                12,
+            )
+            .unwrap();
+
+        assert_eq!(tracker.committed_sequence(12, 0), Some(12));
+        assert_eq!(tracker.committed_sequence(12, 1), Some(10));
+        assert_eq!(tracker.committed_sequence(12, 2), Some(8));
+        assert_eq!(tracker.committed_sequence(12, 3), None);
+    }
+
+    #[test]
+    fn promotion_requires_strictly_newer_epoch_and_exact_commit_sequence() {
+        let replica = CacheReplicaApplier::new(7, 20, CacheStore::new());
+        let error = replica.promote(7, 20).unwrap_err();
+        assert_eq!(
+            error,
+            CachePromotionError::StaleEpoch {
+                current: 7,
+                proposed: 7,
+            }
+        );
+
+        let replica = CacheReplicaApplier::new(7, 19, CacheStore::new());
+        let error = replica.promote(8, 20).unwrap_err();
+        assert_eq!(
+            error,
+            CachePromotionError::Behind {
+                committed: 20,
+                applied: 19,
+            }
+        );
+
+        let replica = CacheReplicaApplier::new(7, 21, CacheStore::new());
+        let error = replica.promote(8, 20).unwrap_err();
+        assert_eq!(
+            error,
+            CachePromotionError::Ahead {
+                committed: 20,
+                applied: 21,
+            }
+        );
+    }
+
+    #[test]
+    fn exact_commit_replica_promotes_into_new_epoch() {
+        let mut store = CacheStore::new();
+        store.set_integer(b"k", 42, None, 0);
+        let replica = CacheReplicaApplier::new(7, 20, store);
+
+        let mut promoted = replica.promote(8, 20).unwrap();
+        assert_eq!(promoted.placement_epoch, 8);
+        assert_eq!(promoted.base_sequence, 20);
+        assert_eq!(
+            promoted.store.get(b"k", 0),
+            Some(CacheValueView::Integer(42))
+        );
+    }
+
+    #[test]
     fn bootstrap_state_sets_epoch_and_resume_sequence() {
         let mut store = CacheStore::new();
         store.set_integer(b"k", 99, None, 0);
