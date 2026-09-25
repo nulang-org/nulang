@@ -220,6 +220,24 @@ def print_table(
             f"{delta:>+16.2f}%  {speedup:>6.3f}x"
         )
 
+def print_candidate_only(
+    summary: dict[str, dict[str, dict[str, float | int]]]
+) -> None:
+    base_names = set(summary["base"])
+    candidate_only = sorted(set(summary["candidate"]) - base_names)
+    if not candidate_only:
+        return
+
+    print()
+    print("candidate-only diagnostics")
+    print("--------------------------")
+    for name in candidate_only:
+        row = summary["candidate"][name]
+        ops = float(row["median_messages_per_second"])
+        ns_per_op = float(row["median_ns_per_message"])
+        print(f"{name:<32} {ops:>14,.0f} ops/s  {ns_per_op:>10.1f} ns/op")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-ref", required=True)
@@ -301,6 +319,7 @@ def main() -> int:
         summary = summarize(samples)
         compare = comparisons(summary)
         print_table(summary, compare)
+        print_candidate_only(summary)
 
         allowed = (
             sorted(os.sched_getaffinity(0))
