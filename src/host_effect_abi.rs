@@ -535,6 +535,20 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_exposes_source_operation_for_cloud_codegen() {
+        let descriptor = host_effect_abi_descriptor().unwrap();
+        let operations = descriptor["operations"].as_array().unwrap();
+
+        for operation in operations {
+            let source = operation["source"].as_object().expect(
+                "host-effect descriptor must expose compiler-owned source identity",
+            );
+            assert!(source["effect"].as_str().is_some());
+            assert!(source["operation"].as_str().is_some());
+        }
+    }
+
+    #[test]
     fn checked_in_descriptor_fixture_matches_compiler_contract() {
         let actual: serde_json::Value =
             serde_json::from_str(include_str!("../spec/host-effects/v0alpha1.json")).unwrap();
