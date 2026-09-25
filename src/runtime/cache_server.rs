@@ -19,6 +19,9 @@ use mio::{Events, Interest, Poll, Token, Waker};
 
 use super::cache::{CacheStore, CacheTtl, CacheValueView};
 use super::cache_cluster::CacheRoutingMode;
+use super::cache_dispatch::{
+    CacheDispatchConfigError, CacheDispatchWake, CacheDispatcher, CacheShardInbox,
+};
 use super::cache_persistence::{
     CacheDurabilityError, CacheDurabilityMode, CacheDurabilityStatus, DurableCacheStore,
 };
