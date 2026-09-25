@@ -47,6 +47,9 @@ native-codegen = [
     "dep:cranelift-codegen",
     "dep:target-lexicon",
 ]
+# Relocatable native object emission. Kept out of the default native-codegen
+# feature so JIT-only embedders do not pull object-file writing support.
+native-object = ["native-codegen", "dep:cranelift-object"]
 # Marker profile for embedded mobile runtimes. Intentionally empty: the
 # bytecode interpreter and pre-registered host callbacks need no JIT.
 mobile-runtime = []
@@ -122,6 +125,7 @@ rustyline = { version = "15", default-features = false, features = ["with-file-h
 cranelift = { version = "0.132", optional = true }
 cranelift-jit = { version = "0.132", optional = true }
 cranelift-module = { version = "0.132", optional = true }
+cranelift-object = { version = "0.132", optional = true }
 cranelift-native = { version = "0.132", optional = true }
 cranelift-frontend = { version = "0.132", optional = true }
 cranelift-codegen = { version = "0.132", features = ["riscv64"], optional = true }
