@@ -78,6 +78,7 @@ mod spawn;
 pub(crate) use spawn::spawn_from_module_with_authority;
 mod timer;
 mod trace;
+mod turn;
 mod workflow;
 pub use trace::TraceContext;
 
@@ -1292,7 +1293,23 @@ impl Runtime {
                                     step_name: suspended.step_name,
                                 });
                         }
-                        (*self_ptr).maybe_schedule_receive_wait(actor_id, receive_timeout);
+                        match (*self_ptr).persist_suspension_marker(actor_id) {
+                            Ok(()) => {
+                                (*self_ptr).maybe_schedule_receive_wait(actor_id, receive_timeout)
+                            }
+                            Err(error) if (*self_ptr).actor_is_workflow(actor_id) => {
+                                workflow::quarantine_after_commit_failure(
+                                    &mut *self_ptr,
+                                    actor_id,
+                                    &error,
+                                );
+                            }
+                            Err(error) => tracing::warn!(
+                                actor_id,
+                                %error,
+                                "nulang-persist: re-suspension marker commit failed"
+                            ),
+                        }
                     }
                 }
                 Err(_) => {
@@ -1662,15 +1679,9 @@ impl Runtime {
                             actor.set_state_field("step_index", Value::int(n + 1));
                         }
                     }
-                    let seq = self.next_sequence(actor_id);
-                    let _ = self.persistence.append_workflow_event(
-                        actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            step_name,
-                        },
-                    );
-                    self.checkpoint_actor(actor_id);
+                    if let Err(error) = workflow::commit_step_completed(self, actor_id, step_name) {
+                        workflow::quarantine_after_commit_failure(self, actor_id, &error);
+                    }
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
@@ -1705,15 +1716,32 @@ impl Runtime {
                                 step_name,
                             });
                     }
-                    // A chained receive-after suspend arms its timeout
-                    // here; a no-op for the other sentinels.
-                    self.maybe_schedule_receive_wait(actor_id, receive_timeout);
+                    // Persist the new suspension boundary before arming a
+                    // timeout that could make the activation externally
+                    // observable again.
+                    match self.persist_suspension_marker(actor_id) {
+                        Ok(()) => self.maybe_schedule_receive_wait(actor_id, receive_timeout),
+                        Err(error) => {
+                            workflow::quarantine_after_commit_failure(self, actor_id, &error);
+                        }
+                    }
                 }
             }
-            Err(_) => {
-                // Step failed after resumption: run saga compensations.
+            Err(error) => {
+                // A resumed workflow failure follows the same atomic failure
+                // path as a scheduler-driven step.
                 if self.actor_is_workflow(actor_id) {
-                    self.run_saga_compensation(actor_id, behavior_idx);
+                    match workflow::commit_step_failed(
+                        self,
+                        actor_id,
+                        step_name,
+                        format!("{}", error),
+                    ) {
+                        Ok(()) => self.run_saga_compensation(actor_id, behavior_idx),
+                        Err(commit_error) => {
+                            workflow::quarantine_after_commit_failure(self, actor_id, &commit_error)
+                        }
+                    }
                 }
             }
         }
@@ -3676,6 +3704,10 @@ impl Runtime {
                 actor.idle_ms = 0;
             }
             let behavior_idx = msg.behavior_id as usize;
+            let is_user_workflow_step = self.actor_is_workflow(actor_id)
+                && !self.is_internal_behavior(actor_id, behavior_idx);
+            let mut staged_workflow_command = is_user_workflow_step
+                .then(|| workflow::stage_command(self, actor_id, msg.behavior_id, &msg.payload));
 
             // ORCA receiver protocol: hold every heap pointer in the
             // received payload so the owning objects (and any retired
@@ -3705,7 +3737,7 @@ impl Runtime {
             let behavior_name = self.step_name_for(actor_id, behavior_idx);
             #[cfg(feature = "ai-runtime")]
             if self.actor_is_agent(actor_id) && self.is_semantic_memory_behavior(&behavior_name) {
-                if self.actor_is_persistent(actor_id) {
+                if self.actor_is_persistent(actor_id) && !is_user_workflow_step {
                     let seq = self.next_sequence(actor_id);
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
                     let _ = self.persistence.append_journal(
@@ -3741,7 +3773,7 @@ impl Runtime {
             // Intercept procedural-memory behaviors generated by compile_agent.
             #[cfg(feature = "ai-runtime")]
             if self.actor_is_agent(actor_id) && self.is_procedural_memory_behavior(&behavior_name) {
-                if self.actor_is_persistent(actor_id) {
+                if self.actor_is_persistent(actor_id) && !is_user_workflow_step {
                     let seq = self.next_sequence(actor_id);
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
                     let _ = self.persistence.append_journal(
@@ -3880,7 +3912,7 @@ impl Runtime {
             let mut processed = false;
             if self.has_native_handler(actor_id, behavior_idx) {
                 // Journal the message before handling so recovery can replay it.
-                if self.actor_is_persistent(actor_id) {
+                if self.actor_is_persistent(actor_id) && !is_user_workflow_step {
                     let seq = self.next_sequence(actor_id);
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
                     let _ = self.persistence.append_journal(
@@ -3893,13 +3925,13 @@ impl Runtime {
                     );
                 }
                 processed = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload);
-                if processed {
+                if processed && !is_user_workflow_step {
                     self.checkpoint_actor(actor_id);
                 }
             }
             if !processed && self.has_bytecode_handler(actor_id, behavior_idx) {
                 // Journal before executing bytecode as well.
-                if self.actor_is_persistent(actor_id) {
+                if self.actor_is_persistent(actor_id) && !is_user_workflow_step {
                     let seq = self.next_sequence(actor_id);
                     let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
                     let _ = self.persistence.append_journal(
@@ -3921,59 +3953,69 @@ impl Runtime {
                 self.suspend_enabled = saved_suspend;
                 match result {
                     Ok(_) => {
-                        self.checkpoint_actor(actor_id);
+                        if !is_user_workflow_step {
+                            self.checkpoint_actor(actor_id);
+                        }
                         processed = true;
                     }
                     Err(crate::types::NuError::Suspended(_)) => {
-                        // The step yielded waiting for a signal or a
-                        // background LLM call. Do not mark it completed, do
-                        // not run compensations, and do not checkpoint the
-                        // partially-mutated durable state: persist only the
-                        // suspension marker so recovery can re-drive the
-                        // step from its last pre-suspend checkpoint.
-                        self.persist_suspension_marker(actor_id);
+                        // The command and suspension marker form one durable
+                        // transition. The snapshot is copied from the last
+                        // committed state so partially-executed workflow
+                        // mutations cannot leak across a crash.
+                        let command = if is_user_workflow_step {
+                            staged_workflow_command.take()
+                        } else {
+                            None
+                        };
+                        if let Err(error) =
+                            self.persist_suspension_marker_with_command(actor_id, command)
+                        {
+                            if self.actor_is_workflow(actor_id) {
+                                workflow::quarantine_after_commit_failure(self, actor_id, &error);
+                            } else {
+                                tracing::warn!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-persist: suspension marker commit failed"
+                                );
+                            }
+                        }
                         processed = false;
                     }
                     Err(e) => {
-                        self.checkpoint_actor(actor_id);
-                        // A workflow step failed: record the failure (durable
-                        // StepFailed event — SPEC2 §10 known-issue #5: step
-                        // failures were silent, exit 0, no diagnostic), then
-                        // run saga compensations for previously completed
-                        // steps in reverse order.
+                        // A workflow failure is one durable transition: the
+                        // failed state and StepFailed marker either commit
+                        // together or the activation is quarantined.
                         if self.actor_is_workflow(actor_id) {
-                            let seq = self.next_sequence(actor_id);
                             let step_name = self.step_name_for(actor_id, behavior_idx);
-                            let _ = self.persistence.append_workflow_event(
+                            match workflow::commit_step_failed_with_command(
+                                self,
                                 actor_id,
-                                WorkflowEvent::StepFailed {
-                                    sequence: seq,
-                                    step_name,
-                                    error: format!("{}", e),
-                                },
-                            );
-                            self.run_saga_compensation(actor_id, behavior_idx);
+                                step_name,
+                                format!("{}", e),
+                                staged_workflow_command.take(),
+                            ) {
+                                Ok(()) => self.run_saga_compensation(actor_id, behavior_idx),
+                                Err(error) => {
+                                    workflow::quarantine_after_commit_failure(
+                                        self, actor_id, &error,
+                                    );
+                                }
+                            }
+                        } else {
+                            self.checkpoint_actor(actor_id);
                         }
                         processed = false;
                     }
                 }
             }
-            if processed
-                && self.actor_is_workflow(actor_id)
-                && !self.is_internal_behavior(actor_id, behavior_idx)
-            {
-                let seq = self.next_sequence(actor_id);
+            if processed && is_user_workflow_step {
                 let step_name = self.step_name_for(actor_id, behavior_idx);
-                let _ = self.persistence.append_workflow_event(
-                    actor_id,
-                    WorkflowEvent::StepCompleted {
-                        sequence: seq,
-                        step_name,
-                    },
-                );
                 // Synthetic parallel steps do not increment step_index in their
                 // bytecode (so signal-waiting branches do not double-increment);
-                // advance it here when the step completes.
+                // advance it before the durable commit so the new state and
+                // StepCompleted marker share one transition.
                 if self.is_parallel_step(actor_id, behavior_idx) {
                     if let Some(actor) = self.actors.get_mut(&actor_id) {
                         if let Some(n) =
@@ -3983,7 +4025,15 @@ impl Runtime {
                         }
                     }
                 }
-                self.checkpoint_actor(actor_id);
+                if let Err(error) = workflow::commit_step_completed_with_command(
+                    self,
+                    actor_id,
+                    step_name,
+                    staged_workflow_command.take(),
+                ) {
+                    workflow::quarantine_after_commit_failure(self, actor_id, &error);
+                    processed = false;
+                }
             }
             let actor = match self.actors.get_mut(&actor_id) {
                 Some(a) => a,
@@ -4480,22 +4530,29 @@ impl Runtime {
                                 actor.set_state_field("step_index", Value::int(n + 1));
                             }
                         }
-                        let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        if let Err(error) = workflow::commit_step_completed(
+                            &mut *self_ptr,
                             actor_id,
-                            crate::runtime::WorkflowEvent::StepCompleted {
-                                sequence: seq,
-                                step_name: suspended.step_name.clone(),
-                            },
-                        );
-                        (*self_ptr).checkpoint_actor(actor_id);
+                            suspended.step_name.clone(),
+                        ) {
+                            workflow::quarantine_after_commit_failure(
+                                &mut *self_ptr,
+                                actor_id,
+                                &error,
+                            );
+                        }
                     }
                 }
                 Err(crate::types::NuError::Suspended(_)) => {
-                    // Re-suspended (e.g. a chained Timer.sleep): re-capture
-                    // the VM state so the next timer fire can resume it.
+                    // Re-suspended (another timer, signal, receive, or LLM
+                    // boundary): capture its recovery marker and persist it
+                    // before the activation can be resumed again.
                     if let Some(vm_state) = vm.take_suspended_state() {
+                        let signal_name = vm.suspended_signal_name.take();
+                        let receive_timeout = vm.suspended_receive_timeout.take();
                         if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
+                            let marker = suspension_marker(actor, signal_name);
+                            actor.waiting_signal = marker;
                             actor.suspended_execution =
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
@@ -4503,11 +4560,49 @@ impl Runtime {
                                     step_name: suspended.step_name.clone(),
                                 });
                         }
+                        match (*self_ptr).persist_suspension_marker(actor_id) {
+                            Ok(()) => {
+                                (*self_ptr).maybe_schedule_receive_wait(actor_id, receive_timeout)
+                            }
+                            Err(error) if (*self_ptr).actor_is_workflow(actor_id) => {
+                                workflow::quarantine_after_commit_failure(
+                                    &mut *self_ptr,
+                                    actor_id,
+                                    &error,
+                                );
+                            }
+                            Err(error) => tracing::warn!(
+                                actor_id,
+                                %error,
+                                "nulang-persist: timer re-suspension marker commit failed"
+                            ),
+                        }
                     }
                 }
-                Err(e) => {
-                    // VM error during resume - log and clean up.
-                    tracing::warn!("Timer.sleep resume error for actor {}: {:?}", actor_id, e);
+                Err(error) => {
+                    if (*self_ptr).actor_is_workflow(actor_id) {
+                        match workflow::commit_step_failed(
+                            &mut *self_ptr,
+                            actor_id,
+                            suspended.step_name.clone(),
+                            format!("{}", error),
+                        ) {
+                            Ok(()) => {
+                                (*self_ptr).run_saga_compensation(actor_id, suspended.behavior_idx)
+                            }
+                            Err(commit_error) => workflow::quarantine_after_commit_failure(
+                                &mut *self_ptr,
+                                actor_id,
+                                &commit_error,
+                            ),
+                        }
+                    } else {
+                        tracing::warn!(
+                            "Timer.sleep resume error for actor {}: {:?}",
+                            actor_id,
+                            error
+                        );
+                    }
                     if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                         actor.suspended_execution = None;
                     }
@@ -4573,15 +4668,17 @@ impl Runtime {
                                 actor.set_state_field("step_index", Value::int(n + 1));
                             }
                         }
-                        let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        if let Err(error) = workflow::commit_step_completed(
+                            &mut *self_ptr,
                             actor_id,
-                            WorkflowEvent::StepCompleted {
-                                sequence: seq,
-                                step_name: suspended.step_name,
-                            },
-                        );
-                        (*self_ptr).checkpoint_actor(actor_id);
+                            suspended.step_name,
+                        ) {
+                            workflow::quarantine_after_commit_failure(
+                                &mut *self_ptr,
+                                actor_id,
+                                &error,
+                            );
+                        }
                     }
                 }
                 Err(crate::types::NuError::Suspended(VmSuspension::ReceiveWait)) => {
@@ -4600,7 +4697,21 @@ impl Runtime {
                                     step_name: suspended.step_name,
                                 });
                         }
-                        (*self_ptr).maybe_schedule_receive_wait(actor_id, timeout);
+                        match (*self_ptr).persist_suspension_marker(actor_id) {
+                            Ok(()) => (*self_ptr).maybe_schedule_receive_wait(actor_id, timeout),
+                            Err(error) if (*self_ptr).actor_is_workflow(actor_id) => {
+                                workflow::quarantine_after_commit_failure(
+                                    &mut *self_ptr,
+                                    actor_id,
+                                    &error,
+                                );
+                            }
+                            Err(error) => tracing::warn!(
+                                actor_id,
+                                %error,
+                                "nulang-persist: receive re-suspension marker commit failed"
+                            ),
+                        }
                     }
                 }
                 Err(crate::types::NuError::Suspended(_)) => {
@@ -4621,11 +4732,43 @@ impl Runtime {
                                     step_name: suspended.step_name,
                                 });
                         }
+                        if let Err(error) = (*self_ptr).persist_suspension_marker(actor_id) {
+                            if (*self_ptr).actor_is_workflow(actor_id) {
+                                workflow::quarantine_after_commit_failure(
+                                    &mut *self_ptr,
+                                    actor_id,
+                                    &error,
+                                );
+                            } else {
+                                tracing::warn!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-persist: receive suspension marker commit failed"
+                                );
+                            }
+                        }
                     }
                 }
-                // Other errors: the wait is over; the send-path result is
-                // discarded anyway, matching step_actor semantics.
-                Err(_) => (*self_ptr).clear_receive_wait(actor_id),
+                Err(error) => {
+                    (*self_ptr).clear_receive_wait(actor_id);
+                    if (*self_ptr).actor_is_workflow(actor_id) {
+                        match workflow::commit_step_failed(
+                            &mut *self_ptr,
+                            actor_id,
+                            suspended.step_name.clone(),
+                            format!("{}", error),
+                        ) {
+                            Ok(()) => {
+                                (*self_ptr).run_saga_compensation(actor_id, suspended.behavior_idx)
+                            }
+                            Err(commit_error) => workflow::quarantine_after_commit_failure(
+                                &mut *self_ptr,
+                                actor_id,
+                                &commit_error,
+                            ),
+                        }
+                    }
+                }
             }
             // End the VM-execution window only after any suspend-state
             // re-capture above: draining deferred wakes runs other actors
@@ -4650,7 +4793,10 @@ impl Runtime {
                     context,
                 } => {
                     if self.actor_is_workflow(target_actor) {
-                        let _ = self.append_timer_fired(target_actor, &context);
+                        if let Err(error) = self.append_timer_fired(target_actor, &context) {
+                            workflow::quarantine_after_commit_failure(self, target_actor, &error);
+                            continue;
+                        }
                     }
                     self.send_message_by_id(target_actor, behavior_id, &payload);
                 }
@@ -4695,18 +4841,37 @@ impl Runtime {
     /// in-flight step must be re-driven; the state it re-runs from is the
     /// last pre-step checkpoint.  A no-op when the actor has no snapshot
     /// yet - without one there is nothing to recover anyway.
-    fn persist_suspension_marker(&mut self, actor_id: u64) {
+    fn persist_suspension_marker(&mut self, actor_id: u64) -> std::io::Result<()> {
+        self.persist_suspension_marker_with_command(actor_id, None)
+    }
+
+    fn persist_suspension_marker_with_command(
+        &mut self,
+        actor_id: u64,
+        command: Option<turn::StagedCommand>,
+    ) -> std::io::Result<()> {
+        if self.actor_is_workflow(actor_id) {
+            return workflow::commit_suspension(self, actor_id, command);
+        }
+        if command.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "staged workflow command supplied for non-workflow suspension",
+            ));
+        }
+
         let waiting_signal = match self.actors.get(&actor_id) {
             Some(actor) if actor.persistent => actor.waiting_signal.clone(),
-            _ => return,
+            _ => return Ok(()),
         };
         if let Some(mut snapshot) = self.persistence.load_snapshot(actor_id) {
             if snapshot.waiting_signal == waiting_signal {
-                return;
+                return Ok(());
             }
             snapshot.waiting_signal = waiting_signal;
-            let _ = self.persistence.save_snapshot(snapshot);
+            self.persistence.save_snapshot(snapshot)?;
         }
+        Ok(())
     }
 
     /// Lay out a workflow actor's native behavior table so that bytecode step
@@ -4953,7 +5118,10 @@ impl Runtime {
                 // Compensation failed: do not record it as completed.
                 continue;
             }
-            let _ = self.append_saga_compensated(actor_id, &step_name);
+            if let Err(error) = self.append_saga_compensated(actor_id, &step_name) {
+                workflow::quarantine_after_commit_failure(self, actor_id, &error);
+                return;
+            }
             if let Some(actor) = self.actors.get_mut(&actor_id) {
                 if !actor.compensated_steps.contains(&step_name) {
                     actor.compensated_steps.push(step_name);
@@ -5071,6 +5239,37 @@ impl Runtime {
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
         actor.waiting_signal = snapshot.waiting_signal;
+        if is_workflow {
+            // A workflow event committed atomically with a snapshot has the
+            // same sequence as that snapshot. Reconstruct auxiliary history
+            // that is not represented inside ActorSnapshot at or before the
+            // snapshot boundary. State-bearing events are intentionally not
+            // re-applied here; doing so would double-apply StepCompleted and
+            // parallel-progress mutations already captured by the snapshot.
+            for event in workflow_events
+                .iter()
+                .filter(|event| event.sequence() <= snapshot.sequence)
+            {
+                match event {
+                    WorkflowEvent::SignalReceived { name, payload, .. } => {
+                        actor.received_signals.push((name.clone(), payload.clone()));
+                    }
+                    WorkflowEvent::SagaCompensated { step_name, .. } => {
+                        if !actor.compensated_steps.contains(step_name) {
+                            actor.compensated_steps.push(step_name.clone());
+                        }
+                    }
+                    WorkflowEvent::Custom { name, args, .. } => {
+                        let mut values = Vec::with_capacity(args.len());
+                        for value in args {
+                            values.push(value.to_value_on_heap(&mut actor));
+                        }
+                        actor.event_log.push((name.clone(), values));
+                    }
+                    _ => {}
+                }
+            }
+        }
         actor.install_authority_manifest(&authority_manifest);
         // Restore CRDT state if present in the snapshot.
         if let Some(crdt_snap) = &snapshot.crdt_snapshot {
@@ -5684,7 +5883,10 @@ impl Runtime {
                 actor.set_state_field("parallel_progress", Value::int(current + 1));
             }
             WorkflowEvent::Custom { name, args, .. } => {
-                let values: Vec<Value> = args.iter().map(|a| a.to_value()).collect();
+                let mut values = Vec::with_capacity(args.len());
+                for value in args {
+                    values.push(value.to_value_on_heap(actor));
+                }
                 actor.event_log.push((name.clone(), values));
             }
         }

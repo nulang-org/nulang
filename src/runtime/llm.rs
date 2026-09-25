@@ -135,7 +135,6 @@ use super::{
     BytecodeRuntimeCallbacks, Runtime,
 };
 use crate::primitives::ActorRole;
-use crate::runtime::persistence::WorkflowEvent;
 use crate::vm::Value;
 
 /// Drain completed background LLM calls and resume any actors waiting for
@@ -472,15 +471,17 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                             actor.set_state_field("step_index", Value::int(n + 1));
                         }
                     }
-                    let seq = (*self_ptr).next_sequence(actor_id);
-                    let _ = (*self_ptr).persistence.append_workflow_event(
+                    if let Err(error) = crate::runtime::workflow::commit_step_completed(
+                        &mut *self_ptr,
                         actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            step_name: suspended.step_name,
-                        },
-                    );
-                    (*self_ptr).checkpoint_actor(actor_id);
+                        suspended.step_name,
+                    ) {
+                        crate::runtime::workflow::quarantine_after_commit_failure(
+                            &mut *self_ptr,
+                            actor_id,
+                            &error,
+                        );
+                    }
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
@@ -500,14 +501,46 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                                 step_name: suspended.step_name,
                             });
                     }
-                    // A chained receive-after suspend arms its timeout
-                    // here; a no-op for the other sentinels.
-                    (*self_ptr).maybe_schedule_receive_wait(actor_id, receive_timeout);
+                    match (*self_ptr).persist_suspension_marker(actor_id) {
+                        Ok(()) => {
+                            (*self_ptr).maybe_schedule_receive_wait(actor_id, receive_timeout)
+                        }
+                        Err(error) if (*self_ptr).actor_is_workflow(actor_id) => {
+                            crate::runtime::workflow::quarantine_after_commit_failure(
+                                &mut *self_ptr,
+                                actor_id,
+                                &error,
+                            );
+                        }
+                        Err(error) => tracing::warn!(
+                            actor_id,
+                            %error,
+                            "nulang-persist: LLM re-suspension marker commit failed"
+                        ),
+                    }
                 }
             }
-            // Other errors: the send-path result is discarded anyway,
-            // matching step_actor semantics.
-            Err(_) => {}
+            Err(error) => {
+                if (*self_ptr).actor_is_workflow(actor_id) {
+                    match crate::runtime::workflow::commit_step_failed(
+                        &mut *self_ptr,
+                        actor_id,
+                        suspended.step_name.clone(),
+                        format!("{}", error),
+                    ) {
+                        Ok(()) => {
+                            (*self_ptr).run_saga_compensation(actor_id, suspended.behavior_idx)
+                        }
+                        Err(commit_error) => {
+                            crate::runtime::workflow::quarantine_after_commit_failure(
+                                &mut *self_ptr,
+                                actor_id,
+                                &commit_error,
+                            );
+                        }
+                    }
+                }
+            }
         }
         // End the VM-execution window only after any suspend-state
         // re-capture above: draining deferred wakes runs other actors

@@ -155,7 +155,6 @@ fn try_spawn_actor_with_id(
     }
     rt.actors.insert(id, actor);
     if workflow.is_some() {
-        let seq = crate::runtime::workflow::next_sequence(rt, id);
         let state = {
             let actor = rt.actors.get(&id).unwrap();
             let mut state = Vec::new();
@@ -174,17 +173,12 @@ fn try_spawn_actor_with_id(
             }
             state
         };
-        let commit = rt
-            .persistence
-            .append_workflow_event(
-                id,
-                WorkflowEvent::WorkflowStarted {
-                    sequence: seq,
-                    name: workflow_name.as_ref().unwrap().clone(),
-                    state,
-                },
-            )
-            .and_then(|_| crate::runtime::workflow::try_checkpoint_actor(rt, id));
+        let commit = crate::runtime::workflow::commit_workflow_started(
+            rt,
+            id,
+            workflow_name.as_ref().unwrap().clone(),
+            state,
+        );
         if let Err(error) = commit {
             rt.actors.remove(&id);
             if let Some(ref mut mgr) = rt.crdt_manager {
@@ -579,6 +573,28 @@ mod authority_tests {
     }
 
     impl crate::runtime::persistence::PersistenceStore for RecordingStore {
+        fn load_durable_tail(
+            &self,
+            actor_id: u64,
+        ) -> std::io::Result<Option<crate::runtime::persistence::DurableTail>> {
+            self.inner.lock().unwrap().load_durable_tail(actor_id)
+        }
+
+        fn commit_transition(
+            &mut self,
+            transition: crate::runtime::persistence::DurableTransition,
+        ) -> std::io::Result<crate::runtime::persistence::DurableCommit> {
+            self.last_actor_id
+                .store(transition.actor_id, std::sync::atomic::Ordering::Relaxed);
+            if self.fail_snapshot && transition.snapshot.is_some() {
+                return Err(std::io::Error::other("injected snapshot failure"));
+            }
+            if self.fail_workflow_event && !transition.workflow_events.is_empty() {
+                return Err(std::io::Error::other("injected workflow event failure"));
+            }
+            self.inner.lock().unwrap().commit_transition(transition)
+        }
+
         fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
             self.last_actor_id
                 .store(snapshot.actor_id, std::sync::atomic::Ordering::Relaxed);

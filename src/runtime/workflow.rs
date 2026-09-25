@@ -8,7 +8,8 @@
 use crate::bytecode::Constant;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
-use crate::runtime::persistence::{EventEntry, PersistedValue, WorkflowEvent};
+use crate::runtime::persistence::{ActorSnapshot, EventEntry, PersistedValue, WorkflowEvent};
+use crate::runtime::turn::{commit_turn, StagedCommand, TurnOutcome};
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
 use crate::vm::{Frame, Value, VM};
 
@@ -28,24 +29,38 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Checkpoint
+// Durable turn commit + checkpoint compatibility
 // ---------------------------------------------------------------------------
 
-/// Persist one checkpoint for a durable actor.
-///
-/// Unlike the compatibility wrapper below, this function is fallible. Callers
-/// that gate externally visible durable transitions (workflow creation, timer
-/// commits, signals, compensation) must use this path so storage failure cannot
-/// be mistaken for a committed transition.
-pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::Result<()> {
+fn activation_epoch(rt: &Runtime, actor_id: u64) -> std::io::Result<u64> {
+    let placement_epoch = rt
+        .respawn_opted
+        .get(&actor_id)
+        .copied()
+        .filter(|epoch| *epoch != 0)
+        .unwrap_or(0);
+    let persisted_epoch = rt
+        .persistence
+        .load_durable_tail(actor_id)?
+        .map(|tail| tail.activation_epoch)
+        .unwrap_or(0);
+
+    Ok(placement_epoch.max(persisted_epoch).max(1))
+}
+
+fn build_actor_snapshot(
+    rt: &Runtime,
+    actor_id: u64,
+    sequence: u64,
+) -> std::io::Result<Option<ActorSnapshot>> {
     let actor = match rt.actors.get(&actor_id) {
-        Some(a) => a,
-        None => return Ok(()),
+        Some(actor) => actor,
+        None => return Ok(None),
     };
     if !actor.persistent {
-        return Ok(());
+        return Ok(None);
     }
-    let seq = next_sequence(rt, actor_id);
+
     let mut state = std::collections::HashMap::new();
     for (name, value) in &actor.state_data {
         let model = actor
@@ -66,57 +81,344 @@ pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::
             state.insert(name.clone(), persisted);
         }
     }
+
     let authority_tokens = actor
         .authority_manifest()
-        .map_err(|err| {
+        .map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("invalid actor authority manifest: {err}"),
+                format!("invalid actor authority manifest: {error}"),
             )
         })?
         .canonical_token_set();
-    // Snapshot the global CRDT state alongside durable actor fields.
-    let crdt_snapshot = rt.crdt_manager.as_ref().map(|m| {
-        m.snapshot()
+
+    let crdt_snapshot = rt.crdt_manager.as_ref().map(|manager| {
+        manager
+            .snapshot()
             .into_iter()
             .map(|(id, (ty, bytes))| (id.0, ty.to_u8(), bytes))
             .collect()
     });
-    let crdt_field_map = rt.crdt_manager.as_ref().map(|m| {
-        m.field_map
+    let crdt_field_map = rt.crdt_manager.as_ref().map(|manager| {
+        manager
+            .field_map
             .iter()
             .filter(|((aid, _), _)| *aid == actor_id)
             .map(|((_, name), id)| (name.clone(), id.0))
             .collect()
     });
-    let snapshot = crate::runtime::persistence::ActorSnapshot {
+
+    Ok(Some(ActorSnapshot {
         actor_id,
-        sequence: seq,
+        sequence,
         state,
         waiting_signal: actor.waiting_signal.clone(),
         crdt_snapshot,
         crdt_field_map,
         authority_tokens,
-    };
-    // The local persistence store is authoritative. Publish a shadow replica
-    // only after the local snapshot commit succeeds; otherwise a failed local
-    // checkpoint could leave a remote replica for an actor/transition that was
-    // never durably committed at home.
-    rt.persistence.save_snapshot(snapshot.clone())?;
-    rt.maybe_shadow_replicate(actor_id, &snapshot);
+    }))
+}
+
+fn finish_snapshot_commit(
+    rt: &mut Runtime,
+    actor_id: u64,
+    snapshot: &ActorSnapshot,
+    clear_dirty_fields: bool,
+) {
+    rt.maybe_shadow_replicate(actor_id, snapshot);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
-        actor.sequence = seq;
-        actor.dirty_fields.clear();
+        actor.sequence = snapshot.sequence;
+        if clear_dirty_fields {
+            actor.dirty_fields.clear();
+        }
+    }
+}
+
+fn commit_prepared_outcome(
+    rt: &mut Runtime,
+    actor_id: u64,
+    expected_previous_sequence: u64,
+    outcome: TurnOutcome,
+    snapshot: Option<ActorSnapshot>,
+    clear_dirty_fields: bool,
+) -> std::io::Result<()> {
+    if matches!(
+        rt.actors.get(&actor_id).map(|actor| actor.state),
+        Some(crate::runtime::ActorState::Suspended | crate::runtime::ActorState::Terminated)
+    ) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "durable transition refused for quarantined or terminated actor",
+        ));
+    }
+
+    let sequence = expected_previous_sequence.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "durable transition sequence overflow",
+        )
+    })?;
+    let transition = outcome.into_transition(
+        actor_id,
+        activation_epoch(rt, actor_id)?,
+        expected_previous_sequence,
+        snapshot.clone(),
+    )?;
+
+    commit_turn(rt.persistence.as_mut(), transition)?;
+
+    if let Some(snapshot) = snapshot.as_ref() {
+        finish_snapshot_commit(rt, actor_id, snapshot, clear_dirty_fields);
     }
     Ok(())
 }
 
-/// Snapshot the durable and CRDT state of a persistent actor.
+fn commit_outcome_at(
+    rt: &mut Runtime,
+    actor_id: u64,
+    expected_previous_sequence: u64,
+    outcome: TurnOutcome,
+) -> std::io::Result<()> {
+    let sequence = expected_previous_sequence.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "durable transition sequence overflow",
+        )
+    })?;
+    let snapshot = build_actor_snapshot(rt, actor_id, sequence)?;
+    commit_prepared_outcome(
+        rt,
+        actor_id,
+        expected_previous_sequence,
+        outcome,
+        snapshot,
+        true,
+    )
+}
+
+fn commit_outcome_from_last_snapshot(
+    rt: &mut Runtime,
+    actor_id: u64,
+    outcome: TurnOutcome,
+    waiting_signal: Option<String>,
+) -> std::io::Result<()> {
+    let previous = rt.persistence.latest_sequence(actor_id);
+    let sequence = previous.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "durable transition sequence overflow",
+        )
+    })?;
+    let mut snapshot = rt.persistence.load_snapshot(actor_id).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "durable workflow transition requires an existing committed snapshot",
+        )
+    })?;
+    snapshot.sequence = sequence;
+    snapshot.waiting_signal = waiting_signal;
+
+    commit_prepared_outcome(rt, actor_id, previous, outcome, Some(snapshot), false)
+}
+
+fn commit_workflow_event_with_command(
+    rt: &mut Runtime,
+    actor_id: u64,
+    command: Option<StagedCommand>,
+    make_event: impl FnOnce(u64) -> WorkflowEvent,
+) -> std::io::Result<()> {
+    let previous = rt.persistence.latest_sequence(actor_id);
+    let sequence = previous.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "workflow transition sequence overflow",
+        )
+    })?;
+    let mut outcome = TurnOutcome::workflow_event(make_event(sequence));
+    outcome.command = command;
+    commit_outcome_at(rt, actor_id, previous, outcome)
+}
+
+fn commit_workflow_event(
+    rt: &mut Runtime,
+    actor_id: u64,
+    make_event: impl FnOnce(u64) -> WorkflowEvent,
+) -> std::io::Result<()> {
+    commit_workflow_event_with_command(rt, actor_id, None, make_event)
+}
+
+pub(crate) fn stage_command(
+    rt: &Runtime,
+    actor_id: u64,
+    behavior_id: u16,
+    payload: &[Value],
+) -> StagedCommand {
+    let module = rt
+        .actors
+        .get(&actor_id)
+        .and_then(|actor| actor.bytecode_module.as_ref());
+    StagedCommand {
+        behavior_id,
+        payload: payload
+            .iter()
+            .map(|value| PersistedValue::from_value_resolved(value, module))
+            .collect(),
+    }
+}
+
+pub(crate) fn commit_workflow_started(
+    rt: &mut Runtime,
+    actor_id: u64,
+    name: String,
+    state: Vec<PersistedValue>,
+) -> std::io::Result<()> {
+    commit_workflow_event(rt, actor_id, move |sequence| {
+        WorkflowEvent::WorkflowStarted {
+            sequence,
+            name,
+            state,
+        }
+    })
+}
+
+pub(crate) fn commit_step_completed(
+    rt: &mut Runtime,
+    actor_id: u64,
+    step_name: String,
+) -> std::io::Result<()> {
+    commit_step_completed_with_command(rt, actor_id, step_name, None)
+}
+
+pub(crate) fn commit_step_completed_with_command(
+    rt: &mut Runtime,
+    actor_id: u64,
+    step_name: String,
+    command: Option<StagedCommand>,
+) -> std::io::Result<()> {
+    commit_workflow_event_with_command(rt, actor_id, command, move |sequence| {
+        WorkflowEvent::StepCompleted {
+            sequence,
+            step_name,
+        }
+    })
+}
+
+pub(crate) fn commit_step_failed(
+    rt: &mut Runtime,
+    actor_id: u64,
+    step_name: String,
+    error: String,
+) -> std::io::Result<()> {
+    commit_step_failed_with_command(rt, actor_id, step_name, error, None)
+}
+
+pub(crate) fn commit_step_failed_with_command(
+    rt: &mut Runtime,
+    actor_id: u64,
+    step_name: String,
+    error: String,
+    command: Option<StagedCommand>,
+) -> std::io::Result<()> {
+    commit_workflow_event_with_command(rt, actor_id, command, move |sequence| {
+        WorkflowEvent::StepFailed {
+            sequence,
+            step_name,
+            error,
+        }
+    })
+}
+
+pub(crate) fn commit_suspension(
+    rt: &mut Runtime,
+    actor_id: u64,
+    command: Option<StagedCommand>,
+) -> std::io::Result<()> {
+    let waiting_signal = rt
+        .actors
+        .get(&actor_id)
+        .and_then(|actor| actor.waiting_signal.clone());
+
+    if command.is_none()
+        && rt
+            .persistence
+            .load_snapshot(actor_id)
+            .map(|snapshot| snapshot.waiting_signal == waiting_signal)
+            .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    let mut outcome = TurnOutcome::default();
+    outcome.command = command;
+    commit_outcome_from_last_snapshot(rt, actor_id, outcome, waiting_signal)
+}
+
+fn restore_last_committed_workflow_snapshot(rt: &mut Runtime, actor_id: u64) -> bool {
+    let Some(snapshot) = rt.persistence.load_snapshot(actor_id) else {
+        return false;
+    };
+    let Some(actor) = rt.actors.get_mut(&actor_id) else {
+        return false;
+    };
+
+    // A failed turn may already have mutated live durable fields. Remove every
+    // snapshot-owned field first so values introduced only by the rejected
+    // turn cannot survive in memory, then rebuild from the committed image.
+    let snapshot_owned_fields: Vec<String> = actor
+        .state_models
+        .iter()
+        .filter(|(_, model)| **model == StateModel::Durable || model.is_crdt())
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in snapshot_owned_fields {
+        actor.state_data.remove(&name);
+    }
+    for (name, value) in snapshot.state {
+        let value = value.to_value_on_heap(actor);
+        actor.set_state_field(name, value);
+    }
+
+    actor.sequence = snapshot.sequence;
+    actor.waiting_signal = snapshot.waiting_signal;
+    actor.dirty_fields.clear();
+    true
+}
+
+pub(crate) fn quarantine_after_commit_failure(
+    rt: &mut Runtime,
+    actor_id: u64,
+    error: &std::io::Error,
+) {
+    let restored = restore_last_committed_workflow_snapshot(rt, actor_id);
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.state = crate::runtime::ActorState::Suspended;
+    }
+    tracing::error!(
+        actor_id,
+        restored_committed_snapshot = restored,
+        %error,
+        "nulang-persist: durable transition failed; actor restored to its last committed snapshot and suspended"
+    );
+}
+
+/// Persist one legacy checkpoint for a durable actor.
 ///
-/// This wrapper intentionally preserves the legacy best-effort API for call
-/// sites where checkpoint failure is diagnostic rather than a commit boundary.
-/// New durable transitions should call `try_checkpoint_actor` and propagate
-/// the error.
+/// New workflow transitions must use the turn commit helpers above so their
+/// state and semantic event share one commit boundary.  This function remains
+/// for non-workflow compatibility paths while message journaling is migrated
+/// onto `TurnOutcome`.
+pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::Result<()> {
+    let sequence = next_sequence(rt, actor_id);
+    let Some(snapshot) = build_actor_snapshot(rt, actor_id, sequence)? else {
+        return Ok(());
+    };
+
+    rt.persistence.save_snapshot(snapshot.clone())?;
+    finish_snapshot_commit(rt, actor_id, &snapshot, true);
+    Ok(())
+}
+
+/// Best-effort compatibility checkpoint used by non-transition call sites.
 pub(crate) fn checkpoint_actor(rt: &mut Runtime, actor_id: u64) {
     if let Err(error) = try_checkpoint_actor(rt, actor_id) {
         tracing::warn!(
@@ -197,16 +499,10 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
         }
     }
     if is_workflow {
-        if event == "ParallelBranchCompleted" && args.len() == 2 {
+        let commit = if event == "ParallelBranchCompleted" && args.len() == 2 {
             let parallel_step_name =
                 resolve_string_constant(rt, actor_id, &args[0]).unwrap_or_default();
             let branch_name = resolve_string_constant(rt, actor_id, &args[1]).unwrap_or_default();
-            let _ = rt.persistence.append_parallel_branch_completed(
-                actor_id,
-                seq,
-                parallel_step_name,
-                branch_name,
-            );
             if let Some(actor) = rt.actors.get_mut(&actor_id) {
                 let current = actor
                     .get_state_field("parallel_progress")
@@ -214,6 +510,13 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                     .unwrap_or(0);
                 actor.set_state_field("parallel_progress", Value::int(current + 1));
             }
+            commit_workflow_event(rt, actor_id, move |sequence| {
+                WorkflowEvent::ParallelBranchCompleted {
+                    sequence,
+                    parallel_step_name,
+                    branch_name,
+                }
+            })
         } else {
             let module = rt
                 .actors
@@ -223,21 +526,22 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 .iter()
                 .map(|v| PersistedValue::from_value_resolved(v, module))
                 .collect();
-            let _ = rt.persistence.append_workflow_event(
-                actor_id,
-                WorkflowEvent::Custom {
-                    sequence: seq,
-                    name: event.to_string(),
-                    args: payload,
-                },
-            );
+            let name = event.to_string();
+            commit_workflow_event(rt, actor_id, move |sequence| WorkflowEvent::Custom {
+                sequence,
+                name,
+                args: payload,
+            })
+        };
+
+        if let Err(error) = commit {
+            quarantine_after_commit_failure(rt, actor_id, &error);
         }
-        checkpoint_actor(rt, actor_id);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Append wrappers
+// Workflow transition wrappers
 // ---------------------------------------------------------------------------
 
 pub(crate) fn append_timer_set(
@@ -246,11 +550,12 @@ pub(crate) fn append_timer_set(
     name: &str,
     duration_ms: u64,
 ) -> std::io::Result<()> {
-    let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_timer_set(actor_id, seq, name.to_string(), duration_ms)?;
-    try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+    let name = name.to_string();
+    commit_workflow_event(rt, actor_id, move |sequence| WorkflowEvent::TimerSet {
+        sequence,
+        name,
+        duration_ms,
+    })
 }
 
 pub(crate) fn append_timer_fired(
@@ -258,11 +563,11 @@ pub(crate) fn append_timer_fired(
     actor_id: u64,
     name: &str,
 ) -> std::io::Result<()> {
-    let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_timer_fired(actor_id, seq, name.to_string())?;
-    try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+    let name = name.to_string();
+    commit_workflow_event(rt, actor_id, move |sequence| WorkflowEvent::TimerFired {
+        sequence,
+        name,
+    })
 }
 
 pub(crate) fn append_signal_received(
@@ -271,11 +576,34 @@ pub(crate) fn append_signal_received(
     name: &str,
     payload: Option<String>,
 ) -> std::io::Result<()> {
-    let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_signal_received(actor_id, seq, name.to_string(), payload)?;
-    try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+    let preserve_committed_state = rt
+        .actors
+        .get(&actor_id)
+        .map(|actor| actor.suspended_execution.is_some() || actor.waiting_signal.is_some())
+        .unwrap_or(false);
+    let waiting_signal = rt
+        .actors
+        .get(&actor_id)
+        .and_then(|actor| actor.waiting_signal.clone());
+    let previous = rt.persistence.latest_sequence(actor_id);
+    let sequence = previous.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "workflow transition sequence overflow",
+        )
+    })?;
+    let event = WorkflowEvent::SignalReceived {
+        sequence,
+        name: name.to_string(),
+        payload,
+    };
+    let outcome = TurnOutcome::workflow_event(event);
+
+    if preserve_committed_state {
+        commit_outcome_from_last_snapshot(rt, actor_id, outcome, waiting_signal)
+    } else {
+        commit_outcome_at(rt, actor_id, previous, outcome)
+    }
 }
 
 pub(crate) fn append_saga_compensated(
@@ -283,11 +611,13 @@ pub(crate) fn append_saga_compensated(
     actor_id: u64,
     step_name: &str,
 ) -> std::io::Result<()> {
-    let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_saga_compensated(actor_id, seq, step_name.to_string())?;
-    try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+    let step_name = step_name.to_string();
+    commit_workflow_event(rt, actor_id, move |sequence| {
+        WorkflowEvent::SagaCompensated {
+            sequence,
+            step_name,
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +632,10 @@ pub(crate) fn signal_workflow(
     name: &str,
     payload: Option<String>,
 ) {
-    let _ = append_signal_received(rt, actor_id, name, payload.clone());
+    if let Err(error) = append_signal_received(rt, actor_id, name, payload.clone()) {
+        quarantine_after_commit_failure(rt, actor_id, &error);
+        return;
+    }
 
     let should_resume = {
         if let Some(actor) = rt.actors.get_mut(&actor_id) {
@@ -335,7 +668,12 @@ pub(crate) fn register_workflow_query(rt: &mut Runtime, actor_id: u64, name: &st
 pub(crate) fn query_workflow(rt: &mut Runtime, actor_id: u64, name: &str) -> Option<Value> {
     let (handler, module) = {
         let actor = rt.actors.get(&actor_id)?;
-        if !matches!(actor.role(), Ok(ActorRole::Workflow)) {
+        if !matches!(actor.role(), Ok(ActorRole::Workflow))
+            || matches!(
+                actor.state,
+                crate::runtime::ActorState::Suspended | crate::runtime::ActorState::Terminated
+            )
+        {
             return None;
         }
         let handler = *actor.query_handlers.get(name)?;
@@ -366,7 +704,10 @@ pub(crate) fn schedule_workflow_timer(
     duration_ms: u64,
 ) {
     if actor_is_workflow(rt, actor_id) {
-        let _ = append_timer_set(rt, actor_id, name, duration_ms);
+        if let Err(error) = append_timer_set(rt, actor_id, name, duration_ms) {
+            quarantine_after_commit_failure(rt, actor_id, &error);
+            return;
+        }
     }
     rt.rearm_timer(actor_id, name, duration_ms);
 }

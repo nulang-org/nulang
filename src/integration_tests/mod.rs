@@ -33,6 +33,20 @@ mod tests {
     }
 
     impl PersistenceStore for SharedMemoryStore {
+        fn load_durable_tail(
+            &self,
+            actor_id: u64,
+        ) -> std::io::Result<Option<crate::runtime::DurableTail>> {
+            self.0.lock().unwrap().load_durable_tail(actor_id)
+        }
+
+        fn commit_transition(
+            &mut self,
+            transition: crate::runtime::DurableTransition,
+        ) -> std::io::Result<crate::runtime::DurableCommit> {
+            self.0.lock().unwrap().commit_transition(transition)
+        }
+
         fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
             self.0.lock().unwrap().save_snapshot(snapshot)
         }

@@ -3405,6 +3405,50 @@ fn test_receiver_hold_survives_sender_drop_until_release() {
 // ========================================================================
 
 #[test]
+fn workflow_suspension_commit_preserves_pre_step_state_and_stages_command() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "SuspensionWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.set_state_field("step_index", Value::int(99));
+        actor.waiting_signal = Some("resume".to_string());
+    }
+
+    let command = workflow::stage_command(&rt, actor_id, 7, &[Value::int(42)]);
+    rt.persist_suspension_marker_with_command(actor_id, Some(command))
+        .unwrap();
+
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(snapshot.waiting_signal.as_deref(), Some("resume"));
+    assert_eq!(
+        snapshot.state.get("step_index"),
+        Some(&PersistedValue::Int(0)),
+        "suspension must preserve the last committed state, not partial execution"
+    );
+
+    let journal = rt.persistence.read_journal(actor_id);
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].sequence, snapshot.sequence);
+    assert_eq!(journal[0].behavior_id, 7);
+    assert_eq!(journal[0].payload, vec![PersistedValue::Int(42)]);
+
+    let events = rt.persistence.read_workflow_events(actor_id);
+    assert_eq!(
+        events.len(),
+        1,
+        "suspension does not fabricate a workflow event"
+    );
+    assert!(matches!(&events[0], WorkflowEvent::WorkflowStarted { .. }));
+}
+
+#[test]
 fn test_workflow_actor_emits_started_event() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
