@@ -2462,12 +2462,10 @@ fn compute_jit_candidate_pcs(module: &CodeModule) -> Vec<bool> {
     for info in &module.debug_functions {
         mark(info.code_offset);
     }
-    // Statement starts are cheap compiler-provided region boundaries and also
-    // cover less-common control-flow constructs whose jump tables are not
-    // decoded here (for example Switch).
-    for &(pc, _) in &module.line_table {
-        mark(pc);
-    }
+    // Debug/source line metadata is intentionally not consulted here. MIR
+    // statements can share a basic block, so treating every line-table entry
+    // as a hotness boundary makes cold straight-line code probe the JIT far
+    // more often without exposing a new compilable control-flow entry.
 
     for (pc, instr) in module.instructions.iter().enumerate() {
         let next = pc + 1;
@@ -2545,7 +2543,9 @@ pub struct VM {
     /// Most interpreted instructions are not useful region entry points.
     /// Skipping the JIT vtable call and counter update at those PCs keeps cold
     /// execution close to the pure-interpreter path while retaining function,
-    /// behavior, statement, branch, and post-boundary entries.
+    /// behavior, branch-target/fallthrough, and post-boundary entries. Debug
+    /// line metadata remains independent so breakpoint/stepping fidelity does
+    /// not add hotness probes.
     #[cfg(feature = "native-codegen")]
     jit_candidate_pcs: Vec<Vec<bool>>,
     /// Runtime error raised by a re-entrant JIT direct call (taken from the
