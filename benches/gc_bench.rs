@@ -32,7 +32,11 @@ fn bench_orca_throughput(c: &mut Criterion) {
                 .iter()
                 .map(|id| rt.actors.get(id).expect("benchmark actor").mailbox.len())
                 .sum();
-            assert_eq!(admitted, 20 * 19, "ORCA benchmark must time admitted actor traffic");
+            assert_eq!(
+                admitted,
+                20 * 19,
+                "ORCA benchmark must time admitted actor traffic"
+            );
             for _ in 0..200 {
                 rt.run_scheduler();
                 rt.process_gc_ops();
