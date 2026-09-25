@@ -9,7 +9,7 @@ import re
 import sys
 from typing import Any
 
-INVARIANT_ID = re.compile(r"^[A-Z]+(?:-[A-Z]+)*-\\d{3}$")
+INVARIANT_ID = re.compile(r"^[A-Z]+(?:-[A-Z]+)*-\d{3}$")
 INVARIANT_STATUSES = {"enforced", "partial", "target"}
 BACKEND_STATUSES = {"primary", "enabled", "experimental"}
 SUPPORT_STATUSES = {"reference", "verified", "partial", "unsupported", "not-applicable"}
