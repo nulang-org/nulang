@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Workflow control host on Runtime — 2026-09-25
+- **The Nulang runtime can now host the experimental workflow-control protocol without introducing a second workflow engine.** Admitted compiled workflow definitions are mapped to durable workflow actors; lifecycle start/inspect/signal/cancel/query operations delegate to the existing actor scheduler, workflow journal, suspension/resume, query, timer, and saga machinery.
+- **Status snapshots are derived from runtime-owned durable events and suspension state.** The host does not persist a parallel workflow state machine. v0alpha1 intentionally rejects arbitrary start-input objects and non-string signal payloads until those values have an explicit durable typed mapping.
+
 ### Workflow runtime control protocol — 2026-09-25
 - **Added the experimental `nulang-workflow-control/v0alpha1` transport-neutral protocol.** Hosts can start, inspect, signal, cancel, and query Nulang-owned workflows through opaque workflow identifiers without importing runtime internals.
 - **The protocol separates runtime semantics from hosting concerns.** It carries lifecycle snapshots, wait reasons, query results, idempotency keys, and explicit retryable error codes, but no Cloud workflow graph, actor-local ID, persistence record, or transport implementation.
