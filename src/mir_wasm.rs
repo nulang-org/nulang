@@ -3088,6 +3088,21 @@ mod tests {
 
     #[test]
     #[cfg(all(test, feature = "wasm-backend"))]
+    fn test_wasm_float_add_after_zero_division_matches_bytecode_fallbacks() {
+        // Regression from the 2026-09-25 differential-fuzz nightly.
+        // Bytecode selects FDiv/FAdd/FNeg from MIR type information:
+        // 1.0 / 0.0 -> nil, FAdd(0.1, nil) treats nil as 0.0, then FNeg -> -0.1.
+        let value = run_source("let x = 0.1; let y = 0.2; -(x + 1.0 / 0.0)")
+            .expect("run");
+        let got = value.as_float().expect("result must remain Float");
+        assert!(
+            (got - (-0.1)).abs() < f64::EPSILON,
+            "WASM float arithmetic must preserve bytecode fallback semantics, got {got}"
+        );
+    }
+
+    #[test]
+    #[cfg(all(test, feature = "wasm-backend"))]
     fn test_wasm_neg_heap_value_reports_type_error() {
         let err = run_source("-(1 + 2,)").expect_err("heap tuple negation must fail");
         assert!(
