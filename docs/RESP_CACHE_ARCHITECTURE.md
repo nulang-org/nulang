@@ -258,8 +258,10 @@ requests receive TRYAGAIN instead of being split across owners. The importing
 target still returns MOVED unless that client connection issued ASKING; ASKING
 authorization is consumed after exactly one complete command. Final cutover
 requires another newer placement epoch and atomically changes ownership to the
-target while clearing migration state. Generic placement updates are forbidden
-from overwriting a slot while its migration state is active.
+target while clearing migration state. A failed transfer can instead be
+cancelled under a newer epoch, which clears the importing target while
+preserving source ownership. Generic placement updates are forbidden from
+overwriting a slot while its migration state is active.
 
 Transport integration remains follow-up work. The default cache path continues
 to run without WAL, replication, or consensus work.
