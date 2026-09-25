@@ -7,8 +7,11 @@
 
 use crate::bytecode::Constant;
 use crate::primitives::ActorRole;
-use crate::runtime::actor::Actor;
-use crate::runtime::persistence::{EventEntry, PersistedValue, WorkflowEvent};
+use crate::runtime::actor::{Actor, WorkflowActivationContext};
+use crate::runtime::persistence::{
+    EventEntry, JournalEntry, PersistedValue, WorkflowActivationId, WorkflowEvent,
+    WorkflowOperationId,
+};
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
 use crate::vm::{Frame, Value, VM};
 
@@ -25,6 +28,247 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
         .get(&actor_id)
         .map(|a| matches!(a.role(), Ok(ActorRole::Workflow)))
         .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowActivationTerminal {
+    Completed { event_sequence: u64 },
+    Failed { event_sequence: u64 },
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowActivationRecord {
+    pub id: WorkflowActivationId,
+    pub command: JournalEntry,
+    pub terminal: Option<WorkflowActivationTerminal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowActivationAnalysisError {
+    InvalidCommandIdentity {
+        actor_id: u64,
+        command_sequence: u64,
+        tagged_actor_id: u64,
+        tagged_command_sequence: u64,
+    },
+    ForeignTerminalIdentity {
+        event_sequence: u64,
+        actor_id: u64,
+    },
+    DuplicateTerminal {
+        command_sequence: u64,
+    },
+    UntaggedTerminalAfterActivationUpgrade {
+        event_sequence: u64,
+    },
+}
+
+impl std::fmt::Display for WorkflowActivationAnalysisError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidCommandIdentity {
+                actor_id,
+                command_sequence,
+                tagged_actor_id,
+                tagged_command_sequence,
+            } => write!(
+                f,
+                "workflow actor {actor_id} journal command {command_sequence} carries invalid activation id ({tagged_actor_id}, {tagged_command_sequence})"
+            ),
+            Self::ForeignTerminalIdentity {
+                event_sequence,
+                actor_id,
+            } => write!(
+                f,
+                "workflow terminal event {event_sequence} refers to foreign actor {actor_id}"
+            ),
+            Self::DuplicateTerminal { command_sequence } => write!(
+                f,
+                "workflow activation command {command_sequence} has more than one terminal event"
+            ),
+            Self::UntaggedTerminalAfterActivationUpgrade { event_sequence } => write!(
+                f,
+                "workflow terminal event {event_sequence} has no activation id after activation-aware commands begin"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WorkflowActivationAnalysisError {}
+
+/// Build an activation index from durable command and workflow journals.
+///
+/// Only journal entries explicitly tagged with an activation id are considered
+/// activation-opening user commands. This excludes legacy entries and internal
+/// runtime messages. Once activation-aware commands begin, an untagged terminal
+/// event is ambiguous and therefore rejected instead of guessed.
+pub fn analyze_workflow_activations(
+    actor_id: u64,
+    journal: &[JournalEntry],
+    events: &[WorkflowEvent],
+) -> Result<Vec<WorkflowActivationRecord>, WorkflowActivationAnalysisError> {
+    let mut commands = Vec::new();
+    let mut first_activation_sequence = None;
+
+    for command in journal {
+        let Some(id) = command.activation_id else {
+            continue;
+        };
+        if id.actor_id != actor_id || id.command_sequence != command.sequence {
+            return Err(WorkflowActivationAnalysisError::InvalidCommandIdentity {
+                actor_id,
+                command_sequence: command.sequence,
+                tagged_actor_id: id.actor_id,
+                tagged_command_sequence: id.command_sequence,
+            });
+        }
+        first_activation_sequence = Some(
+            first_activation_sequence
+                .map(|current: u64| current.min(command.sequence))
+                .unwrap_or(command.sequence),
+        );
+        commands.push(command.clone());
+    }
+
+    let Some(first_activation_sequence) = first_activation_sequence else {
+        return Ok(Vec::new());
+    };
+
+    let mut terminals = std::collections::BTreeMap::new();
+    for event in events {
+        if !event.is_terminal() {
+            continue;
+        }
+        let Some(id) = event.terminal_activation_id() else {
+            if event.sequence() >= first_activation_sequence {
+                return Err(
+                    WorkflowActivationAnalysisError::UntaggedTerminalAfterActivationUpgrade {
+                        event_sequence: event.sequence(),
+                    },
+                );
+            }
+            continue;
+        };
+        if id.actor_id != actor_id {
+            return Err(WorkflowActivationAnalysisError::ForeignTerminalIdentity {
+                event_sequence: event.sequence(),
+                actor_id: id.actor_id,
+            });
+        }
+        let terminal = match event {
+            WorkflowEvent::StepCompleted { .. } => WorkflowActivationTerminal::Completed {
+                event_sequence: event.sequence(),
+            },
+            WorkflowEvent::StepFailed { .. } => WorkflowActivationTerminal::Failed {
+                event_sequence: event.sequence(),
+            },
+            _ => unreachable!("terminal predicate only matches terminal workflow events"),
+        };
+        if terminals.insert(id.command_sequence, terminal).is_some() {
+            return Err(WorkflowActivationAnalysisError::DuplicateTerminal {
+                command_sequence: id.command_sequence,
+            });
+        }
+    }
+
+    commands.sort_by_key(|command| command.sequence);
+    Ok(commands
+        .into_iter()
+        .map(|command| {
+            let id = command
+                .activation_id
+                .expect("activation commands were filtered above");
+            WorkflowActivationRecord {
+                id,
+                terminal: terminals.get(&id.command_sequence).copied(),
+                command,
+            }
+        })
+        .collect())
+}
+
+pub(crate) fn begin_workflow_activation(
+    rt: &mut Runtime,
+    id: WorkflowActivationId,
+    replaying: bool,
+) {
+    if let Some(actor) = rt.actors.get_mut(&id.actor_id) {
+        actor.workflow_activation = Some(WorkflowActivationContext::new(id, replaying));
+    }
+}
+
+pub(crate) fn current_workflow_activation_id(
+    rt: &Runtime,
+    actor_id: u64,
+) -> Option<WorkflowActivationId> {
+    rt.actors
+        .get(&actor_id)
+        .and_then(|actor| actor.workflow_activation.map(|context| context.id))
+}
+
+pub(crate) fn next_workflow_operation_id(
+    rt: &mut Runtime,
+    actor_id: u64,
+) -> Option<WorkflowOperationId> {
+    rt.actors
+        .get_mut(&actor_id)
+        .and_then(|actor| actor.workflow_activation.as_mut())
+        .map(WorkflowActivationContext::next_operation_id)
+}
+
+fn close_workflow_activation(rt: &mut Runtime, actor_id: u64, id: Option<WorkflowActivationId>) {
+    let Some(id) = id else {
+        return;
+    };
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        if actor
+            .workflow_activation
+            .map(|context| context.id == id)
+            .unwrap_or(false)
+        {
+            actor.workflow_activation = None;
+        }
+    }
+}
+
+pub(crate) fn append_step_completed(
+    rt: &mut Runtime,
+    actor_id: u64,
+    step_name: String,
+) -> std::io::Result<()> {
+    let activation_id = current_workflow_activation_id(rt, actor_id);
+    let sequence = next_sequence(rt, actor_id);
+    rt.persistence.append_workflow_event(
+        actor_id,
+        WorkflowEvent::StepCompleted {
+            sequence,
+            activation_id,
+            step_name,
+        },
+    )?;
+    close_workflow_activation(rt, actor_id, activation_id);
+    Ok(())
+}
+
+pub(crate) fn append_step_failed(
+    rt: &mut Runtime,
+    actor_id: u64,
+    step_name: String,
+    error: String,
+) -> std::io::Result<()> {
+    let activation_id = current_workflow_activation_id(rt, actor_id);
+    let sequence = next_sequence(rt, actor_id);
+    rt.persistence.append_workflow_event(
+        actor_id,
+        WorkflowEvent::StepFailed {
+            sequence,
+            activation_id,
+            step_name,
+            error,
+        },
+    )?;
+    close_workflow_activation(rt, actor_id, activation_id);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
