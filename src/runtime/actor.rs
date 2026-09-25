@@ -300,6 +300,12 @@ pub struct Actor {
     pub jit_yield_pending: bool,
     /// Name of the signal this workflow actor is currently waiting for, if any.
     pub waiting_signal: Option<String>,
+    /// Replay-stable activation operation for the pending signal wait.
+    ///
+    /// Kept separate from the signal name so external receipt can bind to the
+    /// exact wait that is currently suspended. Legacy/recovered snapshots may
+    /// have a name without an operation id.
+    pub waiting_signal_operation: Option<WorkflowOperationId>,
     /// Signals that have been received by this workflow actor (name, payload).
     pub received_signals: Vec<(String, Option<String>)>,
     /// Read-only query handlers registered on a workflow actor, keyed by
@@ -462,6 +468,7 @@ impl Actor {
             cycle_sentinel: None,
             suspended_execution: None,
             waiting_signal: None,
+            waiting_signal_operation: None,
             received_signals: Vec::new(),
             query_handlers: HashMap::new(),
             is_agent: false,
