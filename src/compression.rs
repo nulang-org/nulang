@@ -40,6 +40,15 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+fn validate_decoded_len(decoded_len: usize, max_decoded_len: usize) -> io::Result<()> {
+    if decoded_len > max_decoded_len {
+        return Err(invalid_data(format!(
+            "runtime blob decoded length {decoded_len} exceeds limit {max_decoded_len}"
+        )));
+    }
+    Ok(())
+}
+
 fn encode_envelope(codec: BlobCodec, original_len: usize, payload: &[u8]) -> io::Result<Vec<u8>> {
     let original_len =
         u64::try_from(original_len).map_err(|_| invalid_data("runtime blob length exceeds u64"))?;
@@ -72,6 +81,20 @@ pub fn encode_blob(input: &[u8]) -> io::Result<Vec<u8>> {
 /// and emits a raw envelope. This keeps minimal builds free of the native zstd
 /// dependency while preserving the envelope contract.
 pub fn encode_blob_with_threshold(input: &[u8], threshold: usize) -> io::Result<Vec<u8>> {
+    encode_blob_with_threshold_and_limit(
+        input,
+        threshold,
+        DEFAULT_MAX_DECODED_BLOB_SIZE,
+    )
+}
+
+fn encode_blob_with_threshold_and_limit(
+    input: &[u8],
+    threshold: usize,
+    max_decoded_len: usize,
+) -> io::Result<Vec<u8>> {
+    validate_decoded_len(input.len(), max_decoded_len)?;
+
     #[cfg(feature = "zstd-compression")]
     if input.len() >= threshold {
         let compressed = zstd::stream::encode_all(Cursor::new(input), DEFAULT_ZSTD_LEVEL)?;
@@ -123,11 +146,7 @@ pub fn decode_blob_with_limit(encoded: &[u8], max_decoded_len: usize) -> io::Res
     );
     let expected_len = usize::try_from(expected_len_u64)
         .map_err(|_| invalid_data("runtime blob length exceeds platform usize"))?;
-    if expected_len > max_decoded_len {
-        return Err(invalid_data(format!(
-            "runtime blob decoded length {expected_len} exceeds limit {max_decoded_len}"
-        )));
-    }
+    validate_decoded_len(expected_len, max_decoded_len)?;
     let payload = &encoded[BLOB_HEADER_LEN..];
 
     let decoded = match encoded[5] {
@@ -213,6 +232,16 @@ pub fn envelope_codec(bytes: &[u8]) -> Option<BlobCodec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoder_rejects_payloads_above_default_decode_contract() {
+        let input = b"abc";
+        let error = encode_blob_with_threshold_and_limit(input, usize::MAX, input.len() - 1)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("limit"));
+    }
 
     #[test]
     fn small_payload_uses_raw_codec_and_round_trips() {
