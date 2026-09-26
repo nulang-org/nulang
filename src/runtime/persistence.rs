@@ -210,12 +210,12 @@ impl WorkflowActivationId {
 /// same activation must derive the same ordinal sequence so recovery can
 /// recognize already-committed operations instead of appending them twice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct WorkflowReplayId {
+pub struct WorkflowOperationId {
     pub activation: WorkflowActivationId,
     pub ordinal: u32,
 }
 
-impl WorkflowReplayId {
+impl WorkflowOperationId {
     pub const fn new(activation: WorkflowActivationId, ordinal: u32) -> Self {
         Self {
             activation,
@@ -285,7 +285,7 @@ pub enum WorkflowEvent {
         sequence: u64,
         /// Replay-stable activation-local identity. Missing on legacy history.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        replay_id: Option<WorkflowReplayId>,
+        operation: Option<WorkflowOperationId>,
         name: String,
         args: Vec<PersistedValue>,
     },
@@ -322,9 +322,9 @@ impl WorkflowEvent {
     ///
     /// Legacy records and event kinds without activation-local identity return
     /// `None`.
-    pub fn replay_id(&self) -> Option<WorkflowReplayId> {
+    pub fn operation(&self) -> Option<WorkflowOperationId> {
         match self {
-            WorkflowEvent::Custom { replay_id, .. } => *replay_id,
+            WorkflowEvent::Custom { operation, .. } => *operation,
             _ => None,
         }
     }
@@ -452,7 +452,7 @@ impl DurableTransition {
         for event in &self.workflow_events {
             let activation = event
                 .activation_id()
-                .or_else(|| event.replay_id().map(|id| id.activation));
+                .or_else(|| event.operation().map(|id| id.activation));
             if let Some(activation) = activation {
                 if activation.actor_id != self.actor_id {
                     return Err(io::Error::new(
@@ -3973,7 +3973,7 @@ mod libsql_atomic_transition_tests {
                 },
                 WorkflowEvent::Custom {
                     sequence,
-                    replay_id: None,
+                    operation: None,
                     name: "audit".to_string(),
                     args: vec![PersistedValue::Int(sequence as i64)],
                 },
