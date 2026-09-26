@@ -21,6 +21,12 @@ pub(crate) struct RegionPlan {
     pub(crate) len: usize,
     pub(crate) native_calls: HashMap<usize, usize>,
     pub(crate) type_metadata: TypeMetadata,
+    /// Smallest prefix of the 256-register frame that native code may touch.
+    ///
+    /// A value of N means registers r0..r(N-1) must be materialized at the
+    /// interpreter/JIT boundary. Unknown access patterns conservatively use
+    /// the full 256-register frame.
+    pub(crate) register_span: usize,
 }
 
 impl RegionPlan {
@@ -32,6 +38,113 @@ impl RegionPlan {
             Some(&self.type_metadata)
         }
     }
+}
+
+#[inline]
+fn span1(a: u8) -> usize {
+    a as usize + 1
+}
+
+#[inline]
+fn span2(a: u8, b: u8) -> usize {
+    span1(a.max(b))
+}
+
+#[inline]
+fn span3(a: u8, b: u8, c: u8) -> usize {
+    span1(a.max(b).max(c))
+}
+
+/// Return the smallest register-file prefix a compiled bytecode region may
+/// access. The analysis mirrors the JIT compiler's operand interpretation,
+/// deliberately ignoring immediate/offset bytes that share Instruction fields.
+///
+/// Any opcode not explicitly understood falls back to 256. That makes adding a
+/// new compilable opcode safe by default: performance may regress until its
+/// register operands are described here, but native code never receives an
+/// under-materialized frame.
+pub(crate) fn register_span(
+    instructions: &[crate::bytecode::Instruction],
+    offset: usize,
+    len: usize,
+) -> usize {
+    use crate::bytecode::OpCode;
+
+    let end = offset.saturating_add(len).min(instructions.len());
+    let mut span = 0usize;
+
+    for instr in &instructions[offset.min(end)..end] {
+        let instruction_span = match instr.opcode {
+            OpCode::Nop
+            | OpCode::Halt
+            | OpCode::Jmp
+            | OpCode::DbgPrint
+            | OpCode::Ret
+            | OpCode::RetVal
+            | OpCode::PerformDirect => 0,
+
+            OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
+                span1(instr.op1)
+            }
+            // op1/op2 encode the constant-pool immediate; op3 is the register.
+            OpCode::ConstU => span1(instr.op3),
+
+            OpCode::Load | OpCode::Store | OpCode::Move | OpCode::Dup | OpCode::Swap => {
+                span2(instr.op1, instr.op2)
+            }
+
+            OpCode::IAdd
+            | OpCode::ISub
+            | OpCode::IMul
+            | OpCode::IDiv
+            | OpCode::IMod
+            | OpCode::IPow
+            | OpCode::FPow
+            | OpCode::Xor
+            | OpCode::Shl
+            | OpCode::Shr
+            | OpCode::BitAnd
+            | OpCode::BitOr
+            | OpCode::FAdd
+            | OpCode::FSub
+            | OpCode::FMul
+            | OpCode::FDiv
+            | OpCode::ICmpEq
+            | OpCode::ICmpLt
+            | OpCode::ICmpGt
+            | OpCode::ICmpLe
+            | OpCode::ICmpGe
+            | OpCode::FCmpEq
+            | OpCode::FCmpLt
+            | OpCode::FCmpGt
+            | OpCode::And
+            | OpCode::Or
+            | OpCode::ArrLoad
+            | OpCode::ArrStore
+            | OpCode::FieldL => span3(instr.op1, instr.op2, instr.op3),
+
+            OpCode::INeg | OpCode::Not | OpCode::IToF | OpCode::FToI | OpCode::ArrLen => {
+                span2(instr.op1, instr.op2)
+            }
+            OpCode::IInc | OpCode::IDec | OpCode::JmpT | OpCode::JmpF => span1(instr.op1),
+            // FNeg uses op3 as its destination in the scalar compiler.
+            OpCode::FNeg => span2(instr.op1, instr.op3),
+
+            // Direct-call folding invokes a helper that can read argument
+            // registers plus the staged function register r254. Keep the
+            // conservative full-frame boundary for this uncommon case.
+            OpCode::Call => 256,
+
+            // Unknown or newly compilable opcode: fail safe, never narrow.
+            _ => 256,
+        };
+        span = span.max(instruction_span);
+        if span == 256 {
+            break;
+        }
+    }
+
+    span
 }
 
 /// Caches module-level safety analysis and produces region plans.
@@ -69,6 +182,7 @@ impl RegionPlanner {
             len,
             native_calls,
             type_metadata: typed_compiler::infer_reg_types(module, pc),
+            register_span: register_span(&module.instructions, pc, len),
         }
     }
 }
