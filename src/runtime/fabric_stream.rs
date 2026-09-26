@@ -643,19 +643,17 @@ impl FileFabricStreamStore {
         }
 
         let segments = list_segments(&dir)?;
-        let active_segments: Vec<_> = segments
-            .iter()
-            .filter(|(base, _)| *base >= current_first_sequence)
-            .collect();
 
         let effective_first_sequence = if requested_first_sequence == next_sequence {
             next_sequence
         } else {
-            active_segments
+            segments
                 .iter()
-                .rev()
-                .find(|(base, _)| *base <= requested_first_sequence)
+                .filter(|(base, _)| {
+                    *base >= current_first_sequence && *base <= requested_first_sequence
+                })
                 .map(|(base, _)| *base)
+                .max()
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
