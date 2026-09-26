@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Zero-copy non-reentrant JIT register entry — 2026-09-26
+- **JIT regions proven unable to re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
+- **Compiled-region metadata records whether native execution may grow or replace the VM frame stack.** Helper-backed direct-call regions retain detached register storage because interpreter re-entry may reallocate `VM::frames`; typed, SIMD, and scalar no-call regions use direct frame registers.
+- **The direct-frame path keeps interned-string semantics without exposing the parent VM.** A separate immutable active-`CodeModule` context serves string-aware helpers, and regression tests pin both direct-call fallback classification and hot string equality.
+- **This replay is now benchmarked against the warmed JIT controls in #1098**, so mergeability depends on measured hot-loop benefit rather than architectural plausibility alone.
+
 ### Warm JIT transition A/B controls — 2026-09-25
 - **The same-host A/B harness now includes warmed 100k-iteration JIT execution probes for a non-reentrant arithmetic loop and a call-heavy re-entrant control.** Both compile once before timing, assert interpreter-equivalent results, and require a real JIT region so register-transition optimizations can be measured on their actual hot path instead of inferred from unrelated actor enqueue benchmarks.
 - **The benchmark helper now shares frontend-to-bytecode compilation across JIT A/B probes,** keeping the crossover and warmed-execution fixtures on one compilation path without changing timed work.
