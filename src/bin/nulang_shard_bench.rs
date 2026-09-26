@@ -85,9 +85,7 @@ fn parse_shards(raw: &str) -> Result<Vec<usize>, String> {
 
 fn spawn_counter_for_shard(runtime: &mut Runtime, shard_index: usize, shard_count: usize) -> u64 {
     loop {
-        let actor_id = runtime.spawn_actor(Box::new(|| {
-            vec![("count".to_string(), Value::int(0))]
-        }));
+        let actor_id = runtime.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
         if actor_id % shard_count as u64 == shard_index as u64 {
             runtime
                 .actors
@@ -264,9 +262,8 @@ fn emit(
     baseline: Option<&Measurement>,
     format: OutputFormat,
 ) {
-    let speedup = baseline.map(|base| {
-        base.elapsed.as_secs_f64() / measurement.elapsed.as_secs_f64()
-    });
+    let speedup =
+        baseline.map(|base| base.elapsed.as_secs_f64() / measurement.elapsed.as_secs_f64());
     let efficiency = speedup.map(|value| value / measurement.shards as f64);
     let available_parallelism = std::thread::available_parallelism()
         .map(|count| count.get())
@@ -332,7 +329,9 @@ fn main() -> ExitCode {
             .iter()
             .map(|&shards| run_independent(shards, config.messages))
             .collect();
-        let baseline = measurements.iter().find(|measurement| measurement.shards == 1);
+        let baseline = measurements
+            .iter()
+            .find(|measurement| measurement.shards == 1);
 
         for measurement in &measurements {
             emit(measurement, iteration, baseline, config.format);
