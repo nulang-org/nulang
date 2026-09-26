@@ -1279,5 +1279,4 @@ fn view() -> Html {
             "only string form fields are currently part of the action wire payload"
         );
     }
-
 }
