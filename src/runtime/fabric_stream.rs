@@ -74,10 +74,21 @@ pub struct FabricConsumerDelivery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricStreamRetentionReport {
+    pub requested_first_sequence: u64,
+    pub effective_first_sequence: u64,
+    pub deleted_segments: usize,
+    pub deleted_records: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FabricStreamInfo {
     pub name: String,
     pub segment_max_bytes: u64,
     pub segment_count: usize,
+    /// Oldest sequence still retained locally. When this equals
+    /// `next_sequence`, the retained log is currently empty.
+    pub first_sequence: u64,
     pub next_sequence: u64,
     pub last_sequence: Option<u64>,
     /// Highest sequence known committed by the stream's replication policy.
@@ -95,6 +106,12 @@ struct StreamMetadata {
 struct CursorFile {
     version: u16,
     cursors: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RetentionFile {
+    version: u16,
+    first_sequence: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,6 +262,15 @@ impl Default for CursorFile {
     }
 }
 
+impl Default for RetentionFile {
+    fn default() -> Self {
+        Self {
+            version: STREAM_FORMAT_VERSION,
+            first_sequence: 1,
+        }
+    }
+}
+
 impl Default for ConsumerDeliveryFile {
     fn default() -> Self {
         Self {
@@ -257,6 +283,7 @@ impl Default for ConsumerDeliveryFile {
 #[derive(Debug, Clone)]
 struct StreamState {
     config: FabricStreamConfig,
+    first_sequence: u64,
     next_sequence: u64,
     current_segment_base: u64,
     current_segment_len: u64,
@@ -311,6 +338,7 @@ impl FileFabricStreamStore {
             name.to_string(),
             StreamState {
                 config,
+                first_sequence: 1,
                 next_sequence: 1,
                 current_segment_base: 1,
                 current_segment_len: 0,
@@ -345,13 +373,17 @@ impl FileFabricStreamStore {
             .states
             .get(name)
             .expect("stream state must exist after ensure_state");
-        let segment_count = list_segments(&self.stream_dir(name))?.len();
+        let segment_count = list_segments(&self.stream_dir(name))?
+            .into_iter()
+            .filter(|(base, _)| *base >= state.first_sequence)
+            .count();
         let committed_sequence =
             read_commit(&self.stream_dir(name).join("commit.json"))?.committed_sequence;
         Ok(FabricStreamInfo {
             name: name.to_string(),
             segment_max_bytes: state.config.segment_max_bytes,
             segment_count,
+            first_sequence: state.first_sequence,
             next_sequence: state.next_sequence,
             last_sequence: state.next_sequence.checked_sub(1).filter(|&seq| seq > 0),
             committed_sequence,
@@ -381,11 +413,21 @@ impl FileFabricStreamStore {
         payload: &[u8],
     ) -> io::Result<bool> {
         self.ensure_state(name)?;
-        let next_sequence = self
+        let state = self
             .states
             .get(name)
-            .expect("stream state must exist after ensure_state")
-            .next_sequence;
+            .expect("stream state must exist after ensure_state");
+        let first_sequence = state.first_sequence;
+        let next_sequence = state.next_sequence;
+
+        if sequence < first_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Fabric replica sequence {sequence} is below retained floor {first_sequence}"
+                ),
+            ));
+        }
 
         if sequence < next_sequence {
             let existing = self.read_from(name, sequence, 1)?;
@@ -515,8 +557,18 @@ impl FileFabricStreamStore {
             return Ok(Vec::new());
         }
 
+        let first_sequence = self
+            .states
+            .get(name)
+            .expect("stream state must exist after ensure_state")
+            .first_sequence;
+        let start_sequence = start_sequence.max(first_sequence);
+
         let mut result = Vec::with_capacity(limit.min(256));
         for (base, path) in list_segments(&self.stream_dir(name))? {
+            if base < first_sequence {
+                continue;
+            }
             let records = decode_segment(&path, base, false)?;
             for record in records {
                 if record.sequence < start_sequence {
@@ -529,6 +581,178 @@ impl FileFabricStreamStore {
             }
         }
         Ok(result)
+    }
+
+    /// Advance the local retention floor without deleting any record at or
+    /// after the requested sequence.
+    ///
+    /// Retention is segment-granular: when the requested sequence falls inside
+    /// a segment, the effective floor is rounded down to that segment's base.
+    /// The durable floor is persisted before segment deletion, so a crash may
+    /// leave stale files behind but cannot make already-retained history
+    /// visible again.
+    ///
+    /// This first retention primitive is intentionally local-only. Replicated
+    /// streams require a coordinated retention protocol so a leader cannot
+    /// discard history still needed for follower catch-up.
+    pub fn retain_from_sequence(
+        &mut self,
+        name: &str,
+        requested_first_sequence: u64,
+    ) -> io::Result<FabricStreamRetentionReport> {
+        if requested_first_sequence == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric retention sequence must be non-zero",
+            ));
+        }
+
+        self.ensure_state(name)?;
+        let dir = self.stream_dir(name);
+        let (current_first_sequence, next_sequence) = {
+            let state = self
+                .states
+                .get(name)
+                .expect("stream state must exist after ensure_state");
+            (state.first_sequence, state.next_sequence)
+        };
+
+        if requested_first_sequence > next_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Fabric retention floor {requested_first_sequence} is beyond next sequence {next_sequence}"
+                ),
+            ));
+        }
+
+        if requested_first_sequence <= current_first_sequence {
+            return Ok(FabricStreamRetentionReport {
+                requested_first_sequence,
+                effective_first_sequence: current_first_sequence,
+                deleted_segments: 0,
+                deleted_records: 0,
+            });
+        }
+
+        if read_replication_policy(&dir.join("replication_policy.json"))?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Fabric retention for replicated streams requires coordinated replica retention",
+            ));
+        }
+
+        let segments = list_segments(&dir)?;
+
+        let effective_first_sequence = if requested_first_sequence == next_sequence {
+            next_sequence
+        } else {
+            segments
+                .iter()
+                .filter(|(base, _)| {
+                    *base >= current_first_sequence && *base <= requested_first_sequence
+                })
+                .map(|(base, _)| *base)
+                .max()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Fabric retention could not locate sequence {requested_first_sequence} in retained segments"
+                        ),
+                    )
+                })?
+        };
+
+        if effective_first_sequence <= current_first_sequence {
+            return Ok(FabricStreamRetentionReport {
+                requested_first_sequence,
+                effective_first_sequence: current_first_sequence,
+                deleted_segments: 0,
+                deleted_records: 0,
+            });
+        }
+
+        let required_cursor = effective_first_sequence.saturating_sub(1);
+        let cursors = read_cursors(&dir.join("cursors.json"))?;
+        if let Some((consumer, cursor)) = cursors
+            .cursors
+            .iter()
+            .find(|(_, cursor)| **cursor < required_cursor)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Fabric retention floor {effective_first_sequence} would overrun consumer {consumer} at cursor {cursor}"
+                ),
+            ));
+        }
+
+        let deliveries = read_consumer_deliveries(&dir.join("deliveries.json"))?;
+        let default_cursor = current_first_sequence.saturating_sub(1);
+        for (consumer, state) in &deliveries.consumers {
+            if state.inflight.is_empty() && state.acked.is_empty() {
+                continue;
+            }
+            let cursor = cursors
+                .cursors
+                .get(consumer)
+                .copied()
+                .unwrap_or(default_cursor);
+            if cursor < required_cursor {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Fabric retention floor {effective_first_sequence} would overrun active consumer {consumer} at cursor {cursor}"
+                    ),
+                ));
+            }
+        }
+
+        let mut deleted_segments = 0_usize;
+        let mut deleted_records = 0_usize;
+        let mut paths_to_delete = Vec::new();
+        for (base, path) in &segments {
+            if *base >= effective_first_sequence {
+                continue;
+            }
+            let records = decode_segment(path, *base, false)?;
+            deleted_segments += 1;
+            deleted_records = deleted_records.saturating_add(records.len());
+            paths_to_delete.push(path.clone());
+        }
+
+        write_json_atomic(
+            &dir.join("retention.json"),
+            &RetentionFile {
+                version: STREAM_FORMAT_VERSION,
+                first_sequence: effective_first_sequence,
+            },
+        )?;
+
+        {
+            let state = self
+                .states
+                .get_mut(name)
+                .expect("stream state must exist after retention commit");
+            state.first_sequence = effective_first_sequence;
+            if effective_first_sequence == state.next_sequence {
+                state.current_segment_base = state.next_sequence;
+                state.current_segment_len = 0;
+            }
+        }
+
+        for path in paths_to_delete {
+            fs::remove_file(path)?;
+        }
+        sync_dir(&dir)?;
+
+        Ok(FabricStreamRetentionReport {
+            requested_first_sequence,
+            effective_first_sequence,
+            deleted_segments,
+            deleted_records,
+        })
     }
 
     /// Highest sequence made visible by the stream replication policy.
@@ -1331,9 +1555,19 @@ impl FileFabricStreamStore {
             ));
         }
 
+        let default_cursor = self
+            .states
+            .get(name)
+            .expect("stream state must exist after ensure_state")
+            .first_sequence
+            .saturating_sub(1);
         let path = self.stream_dir(name).join("cursors.json");
         let mut cursors = read_cursors(&path)?;
-        let current = cursors.cursors.get(consumer).copied().unwrap_or(0);
+        let current = cursors
+            .cursors
+            .get(consumer)
+            .copied()
+            .unwrap_or(default_cursor);
         if sequence < current {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1348,12 +1582,18 @@ impl FileFabricStreamStore {
     pub fn cursor(&mut self, name: &str, consumer: &str) -> io::Result<u64> {
         validate_name("consumer", consumer)?;
         self.ensure_state(name)?;
+        let default_cursor = self
+            .states
+            .get(name)
+            .expect("stream state must exist after ensure_state")
+            .first_sequence
+            .saturating_sub(1);
         let path = self.stream_dir(name).join("cursors.json");
         Ok(read_cursors(&path)?
             .cursors
             .get(consumer)
             .copied()
-            .unwrap_or(0))
+            .unwrap_or(default_cursor))
     }
 
     fn stream_dir(&self, name: &str) -> PathBuf {
@@ -1398,6 +1638,15 @@ impl Runtime {
     ) -> io::Result<Vec<FabricStreamRecord>> {
         self.fabric_stream_store_mut()?
             .read_from(name, start_sequence, limit)
+    }
+
+    pub fn fabric_stream_retain_from_sequence(
+        &mut self,
+        name: &str,
+        first_sequence: u64,
+    ) -> io::Result<FabricStreamRetentionReport> {
+        self.fabric_stream_store_mut()?
+            .retain_from_sequence(name, first_sequence)
     }
 
     pub fn fabric_stream_read_consumer(
@@ -1689,10 +1938,15 @@ fn recover_stream(dir: &Path) -> io::Result<StreamState> {
         ));
     }
     let config = metadata.config.validate()?;
+    let retention = read_retention(&dir.join("retention.json"))?;
+    let first_sequence = retention.first_sequence;
 
-    let segments = list_segments(dir)?;
-    let mut expected_sequence = 1_u64;
-    let mut current_segment_base = 1_u64;
+    let segments: Vec<_> = list_segments(dir)?
+        .into_iter()
+        .filter(|(base, _)| *base >= first_sequence)
+        .collect();
+    let mut expected_sequence = first_sequence;
+    let mut current_segment_base = first_sequence;
     let mut current_segment_len = 0_u64;
 
     for (index, (base, path)) in segments.iter().enumerate() {
@@ -1719,6 +1973,7 @@ fn recover_stream(dir: &Path) -> io::Result<StreamState> {
 
     Ok(StreamState {
         config,
+        first_sequence,
         next_sequence: expected_sequence,
         current_segment_base,
         current_segment_len,
@@ -2013,6 +2268,21 @@ fn read_replication(path: &Path) -> io::Result<ReplicationFile> {
         ));
     }
     Ok(replication)
+}
+
+fn read_retention(path: &Path) -> io::Result<RetentionFile> {
+    if !path.exists() {
+        return Ok(RetentionFile::default());
+    }
+    let bytes = fs::read(path)?;
+    let retention: RetentionFile = serde_json::from_slice(&bytes).map_err(json_error)?;
+    if retention.version != STREAM_FORMAT_VERSION || retention.first_sequence == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid durable Fabric retention state",
+        ));
+    }
+    Ok(retention)
 }
 
 fn read_commit(path: &Path) -> io::Result<CommitFile> {

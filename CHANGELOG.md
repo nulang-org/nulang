@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Crash-safe local Fabric sequence retention — 2026-09-26
+- **Fabric Streams can now prune complete local segments below a requested sequence floor without ever deleting the requested record or newer history.** Requests inside a segment round down to that segment base and report the effective floor.
+- **The retained floor is durable and restart-safe.** Fabric persists `retention.json` before deleting segment files, recovery ignores stale segments below the floor, and sequence numbers are never reused after all retained history is removed.
+- **Retention is fenced by consumer progress and replication safety.** Named cursors and active delivery leases block destructive pruning, new consumers start at the retained floor, and replicated streams fail closed until retention can be coordinated across replicas.
+
 ### Durable Fabric consumer ACK/NACK delivery — 2026-09-25
 - **Fabric Streams now persist per-consumer delivery leases and delivery attempts.** Unacknowledged records become eligible again after their ACK deadline, explicit NACK makes a lease immediately redeliverable, and restart preserves in-flight state.
 - **Out-of-order ACKs cannot skip durable work.** ACK gaps are persisted and the consumer cursor advances only across the longest contiguous acknowledged prefix; already-committed ACKs remain idempotent.
