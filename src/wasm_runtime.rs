@@ -135,11 +135,7 @@ impl WasmRuntime {
             .func_wrap("env", "nulang_dispatch_args", host_dispatch_args)
             .map_err(map_wasmtime_err)?;
         linker
-            .func_wrap(
-                "env",
-                "nulang_commit_transition",
-                host_commit_transition,
-            )
+            .func_wrap("env", "nulang_commit_transition", host_commit_transition)
             .map_err(map_wasmtime_err)?;
         linker
             .func_wrap("env", "log", host_log)
@@ -898,9 +894,7 @@ fn host_commit_transition(
         .lock()
         .clone()
         .ok_or_else(|| {
-            Error::msg(
-                "nulang_commit_transition called but no durable commit handler registered",
-            )
+            Error::msg("nulang_commit_transition called but no durable commit handler registered")
         })?;
 
     let payload = {
@@ -941,12 +935,12 @@ fn host_commit_transition(
         let base = crate::mir_wasm::RING_BUFFER_BASE as usize;
         let mem = get_memory(&mut caller)?;
         let data = mem.data_mut(&mut caller);
-        let end = base.checked_add(result.len()).ok_or_else(|| {
-            Error::msg("nulang_commit_transition result ring overflow")
-        })?;
-        let target = data.get_mut(base..end).ok_or_else(|| {
-            Error::msg("nulang_commit_transition result ring out of bounds")
-        })?;
+        let end = base
+            .checked_add(result.len())
+            .ok_or_else(|| Error::msg("nulang_commit_transition result ring overflow"))?;
+        let target = data
+            .get_mut(base..end)
+            .ok_or_else(|| Error::msg("nulang_commit_transition result ring out of bounds"))?;
         target.copy_from_slice(&result);
     }
 
@@ -1141,11 +1135,7 @@ pub fn load_precompiled(cwasm_bytes: &[u8]) -> NuResult<WasmRuntime> {
         .func_wrap("env", "nulang_dispatch_args", host_dispatch_args)
         .map_err(map_wasmtime_err)?;
     linker
-        .func_wrap(
-            "env",
-            "nulang_commit_transition",
-            host_commit_transition,
-        )
+        .func_wrap("env", "nulang_commit_transition", host_commit_transition)
         .map_err(map_wasmtime_err)?;
     linker
         .func_wrap("env", "log", host_log)
@@ -1343,10 +1333,7 @@ mod tests {
         runtime.set_durable_commit_result(Some(vec![1]));
         runtime.run().unwrap();
 
-        assert_eq!(
-            runtime.take_last_durable_commit(),
-            Some(b"{}".to_vec())
-        );
+        assert_eq!(runtime.take_last_durable_commit(), Some(b"{}".to_vec()));
     }
 
     #[test]
