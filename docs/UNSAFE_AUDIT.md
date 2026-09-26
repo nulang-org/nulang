@@ -103,21 +103,22 @@ registered `Signature` — a wrong signature is instant UB at call time.
 stable; for FFI, this is inherent to dynamic loading — the library allowlist
 (`ffi/native.rs::is_lib_allowed`) is the real mitigation.
 
-### F6 — MEDIUM — `unsafe impl Send/Sync` on raw-pointer callback/graph types
-The runtime callback portion is now resolved: `BytecodeRuntimeCallbacks` and
-`BytecodeDistributedCallbacks` no longer manually implement `Send` or
-`Sync`. Their `*mut Runtime` fields therefore keep them thread-confined by
-default, raw-pointer construction goes through an `unsafe fn from_raw` with
-an explicit live/exclusive scheduler-ownership contract, and the repository
-verifier rejects any future reintroduction of those auto-trait impls.
+### F6 — MEDIUM — `unsafe impl Send/Sync` on raw-pointer runtime types
+Two scheduler-local subsets are now resolved:
 
-Remaining sites are `src/runtime/orca_cycle.rs` (`ForeignEdge`,
-`ForeignRefNode`), `src/ffi/native.rs` (`NativeFunction`), and
-`src/runtime/heap.rs` (`ActorHeap`). Those still require separate proofs or
-representation changes; this hardening does not broaden their guarantees.
-**Recommended next fix:** audit the ORCA graph wrappers first, because removing
-unnecessary auto-trait overrides there can shrink the same class of cross-thread
-aliasing assumptions without changing actor semantics.
+- `BytecodeRuntimeCallbacks` / `BytecodeDistributedCallbacks` no longer
+  override `Send` or `Sync`; raw Runtime-pointer construction is an explicit
+  unsafe `from_raw` boundary pinned by the repository verifier.
+- `ForeignEdge` / `ForeignRefNode` no longer override `Send`/`Sync`.
+  They are graph records owned by the single-threaded `CycleDetector`, which
+  is already non-`Send` because its `Suspect` queue carries raw pointers.
+  Repository verification rejects reintroducing those graph auto-traits.
+
+Remaining sites are `src/ffi/native.rs` (`NativeFunction`) and
+`src/runtime/heap.rs` (`ActorHeap`). Those have materially different
+requirements: native function pointers may live in a shared registry, while
+`ActorHeap: Send` is intended to support actor migration between scheduler
+threads. They should be audited independently rather than removed mechanically.
 
 ### F7 — LOW — heap serializer trusts recorded payload sizes
 `src/runtime/heap_serialize.rs:342`, `431`, `692`, `706`:
