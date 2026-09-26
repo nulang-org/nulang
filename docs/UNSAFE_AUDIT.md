@@ -20,7 +20,7 @@ classified as:
 | `src/runtime/heap.rs` | 64 | mostly sound-with-proof-comment | intrusive free/live lists, header arithmetic; `unsafe fn free`/`header_of` carry proper contracts |
 | `src/vm.rs` | 53 | mixed — **suspicious** | `Value::from_raw`/`from_bits` safe constructors; `Value::ptr` 48-bit truncation; `CStr::from_ptr` on heap strings |
 | `src/runtime/gc.rs` | 75 | sound-with-proof-comment | ORCA barriers; pointer methods are `unsafe fn` with contracts |
-| `src/runtime/callbacks.rs` | 49 | sound-by-convention | `BytecodeRuntimeCallbacks` Send/Sync now documented; `RuntimeVmCallbacks` derefs rely on VM-owned pointers |
+| `src/runtime/callbacks.rs` | 49 | sound-by-convention | bytecode callback bridges are thread-confined and constructed through unsafe `from_raw`; `RuntimeVmCallbacks` derefs rely on VM-owned pointers |
 | `src/jit/runtime.rs` | 91 | sound-by-convention | fat-pointer transmutes, `'static` constant pool, extern "C" helpers trusting raw u64 values |
 | `src/runtime/orca_cycle.rs` | 35 | sound-with-proof-comment | `ForeignRefNode::is_alive` relies on free-notification protocol |
 | `src/ffi/c_api.rs` | 24 | sound-with-proof-comment | null checks present on all entry points |
@@ -153,8 +153,9 @@ assertions enforce the ownership invariant in test/debug builds.
 3. `src/jit/runtime.rs` — new bounded `heap_string_payload()` helper replaces
    both bare `CStr::from_ptr` derefs; `alloc_string_value` gained a
    `debug_assert!` against 48-bit truncation; missing SAFETY comments added.
-4. `src/runtime/callbacks.rs` — SAFETY comments for the
-   `BytecodeRuntimeCallbacks` Send/Sync impls.
+4. `src/runtime/callbacks.rs` — bytecode runtime/distributed callback bridges
+   no longer override `Send`/`Sync`; raw-pointer construction is explicit and
+   gated by unsafe `from_raw` constructors plus CI invariants.
 5. `src/runtime/heap.rs` — `debug_assert!` on out-of-range size class in
    `free()`.
 
