@@ -342,7 +342,7 @@ pub struct DurableCommit {
 }
 
 impl DurableTransition {
-    fn validate_structure(&self) -> io::Result<()> {
+    pub(crate) fn validate_structure(&self) -> io::Result<()> {
         if self.version != DURABLE_TRANSITION_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
