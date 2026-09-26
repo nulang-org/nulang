@@ -739,6 +739,14 @@ pub fn render_route_handler(
     }
 }
 
+fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<HttpResponse> {
+    captured.ui_message_error.as_ref().map(|error| HttpResponse {
+        status: 400,
+        headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+        body: format!("Invalid UI action envelope: {error}").into_bytes(),
+    })
+}
+
 /// Dev server that dispatches registered `Web.route` handlers and falls back
 /// to static files for unmatched paths.
 #[derive(Debug)]
@@ -929,23 +937,26 @@ impl WebDevServer {
                                     &request.headers,
                                     &request.body,
                                 );
-                                let values = captured.values(&params, &request.headers);
-                                let ctx = RequestContext {
-                                    request: request.clone(),
-                                    params: params.clone(),
-                                };
-                                let rendered = with_request_context(ctx, || {
-                                    match render_direct_request(route, &values) {
-                                        Ok(Some(rendered)) => Ok(Some(rendered)),
-                                        Ok(None) => Ok(render_route_handler(
-                                            &route.route.handler_module,
-                                            route.route.handler_func_idx,
-                                            None,
-                                        )),
-                                        Err(error) => Err(error),
-                                    }
-                                });
-                                match rendered {
+                                if let Some(response) = invalid_ui_action_response(&captured) {
+                                    response
+                                } else {
+                                    let values = captured.values(&params, &request.headers);
+                                    let ctx = RequestContext {
+                                        request: request.clone(),
+                                        params: params.clone(),
+                                    };
+                                    let rendered = with_request_context(ctx, || {
+                                        match render_direct_request(route, &values) {
+                                            Ok(Some(rendered)) => Ok(Some(rendered)),
+                                            Ok(None) => Ok(render_route_handler(
+                                                &route.route.handler_module,
+                                                route.route.handler_func_idx,
+                                                None,
+                                            )),
+                                            Err(error) => Err(error),
+                                        }
+                                    });
+                                    match rendered {
                                     Ok(Some(html)) => HttpResponse {
                                         status: 200,
                                         headers: vec![(
@@ -978,6 +989,7 @@ impl WebDevServer {
                                             body: b"Internal server error".to_vec(),
                                         }
                                     }
+                                }
                                 }
                             } else {
                                 Self::serve_static(
@@ -1175,6 +1187,26 @@ mod tests {
                 assert_eq!(form_value("missing"), None);
             },
         );
+    }
+
+    #[test]
+    fn invalid_ui_action_envelope_is_rejected_before_route_dispatch() {
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let captured = HttpRequestBindingInputs::capture(
+            "/",
+            &headers,
+            b"__nulang_ui_message=%7B%22type%22%3A%22invoke_action%22%7D",
+        );
+
+        let response = invalid_ui_action_response(&captured)
+            .expect("malformed envelope must fail closed before route dispatch");
+        assert_eq!(response.status, 400);
+        assert!(String::from_utf8(response.body)
+            .unwrap()
+            .contains("Invalid UI action envelope"));
     }
 
     #[test]
