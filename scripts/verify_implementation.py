@@ -244,6 +244,29 @@ def verify_files():
         )
         return False
 
+    # 10. ORCA graph pointer records are scheduler-local implementation data.
+    # CycleDetector is already non-Send (its Suspect queue contains raw
+    # pointers without auto-trait overrides), so manually making graph nodes
+    # Send/Sync only widens the unsafe surface without enabling detector moves.
+    orca_cycle_path = "src/runtime/orca_cycle.rs"
+    if not os.path.exists(orca_cycle_path):
+        print(f"Error: {orca_cycle_path} does not exist.")
+        return False
+    with open(orca_cycle_path, "r", encoding="utf-8") as f:
+        orca_cycle_content = f.read()
+
+    for graph_type in ("ForeignEdge", "ForeignRefNode"):
+        for auto_trait in ("Send", "Sync"):
+            forbidden = f"unsafe impl {auto_trait} for {graph_type}"
+            if forbidden in orca_cycle_content:
+                print(
+                    "Error: ORCA graph pointer type manually implements "
+                    f"{auto_trait}: {graph_type}. Keep CycleDetector graph "
+                    "records scheduler-local instead of widening raw-pointer "
+                    "thread-safety guarantees."
+                )
+                return False
+
     if not check_stdlib_manifest():
         return False
 
