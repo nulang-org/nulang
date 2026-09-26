@@ -8,7 +8,9 @@
 use crate::bytecode::Constant;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
-use crate::runtime::persistence::{EventEntry, PersistedValue, WorkflowEvent};
+use crate::runtime::persistence::{
+    EventEntry, PersistedValue, WorkflowEvent, WorkflowReplayId,
+};
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
 use crate::vm::{Frame, Value, VM};
 
@@ -223,15 +225,31 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 .iter()
                 .map(|v| PersistedValue::from_value_resolved(v, module))
                 .collect();
-            let _ = rt.persistence.append_workflow_event(
-                actor_id,
-                WorkflowEvent::Custom {
-                    sequence: seq,
-                    replay_id: None,
-                    name: event.to_string(),
-                    args: payload,
-                },
-            );
+            let replay_id = rt.actors.get(&actor_id).and_then(|actor| {
+                actor.current_workflow_activation.map(|activation| {
+                    WorkflowReplayId::new(activation, actor.next_workflow_replay_ordinal)
+                })
+            });
+            let persisted = rt
+                .persistence
+                .append_workflow_event(
+                    actor_id,
+                    WorkflowEvent::Custom {
+                        sequence: seq,
+                        replay_id,
+                        name: event.to_string(),
+                        args: payload,
+                    },
+                )
+                .is_ok();
+            if persisted && replay_id.is_some() {
+                if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                    actor.next_workflow_replay_ordinal = actor
+                        .next_workflow_replay_ordinal
+                        .checked_add(1)
+                        .expect("workflow replay ordinal overflow");
+                }
+            }
         }
         checkpoint_actor(rt, actor_id);
     }
