@@ -3715,6 +3715,50 @@ pub async fn run_lsp_server() {
 mod lsp_tests {
     use super::*;
 
+    #[test]
+    fn test_apply_content_changes_applies_ranges_sequentially() {
+        let changes = vec![
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 0), Position::new(0, 1))),
+                range_length: Some(1),
+                text: "hello".to_string(),
+            },
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 5), Position::new(0, 6))),
+                range_length: Some(1),
+                text: "B".to_string(),
+            },
+        ];
+
+        assert_eq!(apply_content_changes("abc", &changes).unwrap(), "helloBc");
+    }
+
+    #[test]
+    fn test_apply_content_changes_rejects_mid_surrogate_position() {
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(0, 1), Position::new(0, 2))),
+            range_length: Some(1),
+            text: "x".to_string(),
+        }];
+
+        let error = apply_content_changes("😀", &changes).unwrap_err();
+        assert!(
+            error.contains("invalid didChange start position"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_apply_content_changes_handles_multiline_utf16_range() {
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(0, 1), Position::new(1, 2))),
+            range_length: None,
+            text: "-".to_string(),
+        }];
+
+        assert_eq!(apply_content_changes("a😀\nbc", &changes).unwrap(), "a-c");
+    }
+
     /// Function parameter without type annotation gets an inlay hint.
     #[test]
     fn test_type_inlay_for_fn_param() {
