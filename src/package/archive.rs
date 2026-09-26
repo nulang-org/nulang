@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Cursor, Read, Write};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveCompression {
@@ -8,24 +8,94 @@ pub enum ArchiveCompression {
 
 impl ArchiveCompression {
     pub fn content_type(self) -> &'static str {
-        todo!("RED: archive content type")
+        match self {
+            Self::Gzip => "application/gzip",
+            Self::Zstd => "application/zstd",
+        }
     }
 
     pub fn extension(self) -> &'static str {
-        todo!("RED: archive extension")
+        match self {
+            Self::Gzip => ".tar.gz",
+            Self::Zstd => ".tar.zst",
+        }
     }
 }
 
-pub fn detect_archive_compression(_bytes: &[u8]) -> Option<ArchiveCompression> {
-    todo!("RED: archive magic detection")
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+pub fn detect_archive_compression(bytes: &[u8]) -> Option<ArchiveCompression> {
+    if bytes.starts_with(&GZIP_MAGIC) {
+        Some(ArchiveCompression::Gzip)
+    } else if bytes.starts_with(&ZSTD_MAGIC) {
+        Some(ArchiveCompression::Zstd)
+    } else {
+        None
+    }
 }
 
-pub fn compress_tar(_tar_bytes: &[u8], _compression: ArchiveCompression) -> io::Result<Vec<u8>> {
-    todo!("RED: archive compression")
+pub fn compress_tar(tar_bytes: &[u8], compression: ArchiveCompression) -> io::Result<Vec<u8>> {
+    match compression {
+        ArchiveCompression::Gzip => {
+            let mut output = Vec::new();
+            {
+                let mut encoder =
+                    flate2::write::GzEncoder::new(&mut output, flate2::Compression::default());
+                encoder.write_all(tar_bytes)?;
+                encoder.finish()?;
+            }
+            Ok(output)
+        }
+        ArchiveCompression::Zstd => {
+            #[cfg(feature = "zstd-compression")]
+            {
+                zstd::stream::encode_all(Cursor::new(tar_bytes), crate::compression::DEFAULT_ZSTD_LEVEL)
+            }
+            #[cfg(not(feature = "zstd-compression"))]
+            {
+                let _ = tar_bytes;
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "zstd package archives require the 'zstd-compression' feature",
+                ))
+            }
+        }
+    }
 }
 
-pub fn decode_archive(_archive_bytes: &[u8]) -> io::Result<Vec<u8>> {
-    todo!("RED: archive decoding")
+pub fn decode_archive(archive_bytes: &[u8]) -> io::Result<Vec<u8>> {
+    match detect_archive_compression(archive_bytes) {
+        Some(ArchiveCompression::Gzip) => {
+            let mut decoder = flate2::read::GzDecoder::new(Cursor::new(archive_bytes));
+            let mut output = Vec::new();
+            decoder.read_to_end(&mut output)?;
+            Ok(output)
+        }
+        Some(ArchiveCompression::Zstd) => {
+            #[cfg(feature = "zstd-compression")]
+            {
+                zstd::stream::decode_all(Cursor::new(archive_bytes)).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid zstd package archive: {error}"),
+                    )
+                })
+            }
+            #[cfg(not(feature = "zstd-compression"))]
+            {
+                let _ = archive_bytes;
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "zstd package archive requires the 'zstd-compression' feature",
+                ))
+            }
+        }
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unknown package archive compression",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -61,6 +131,19 @@ mod tests {
         assert_eq!(detect_archive_compression(&archive), Some(ArchiveCompression::Zstd));
         assert!(archive.len() < tar.len() / 4);
         assert_eq!(decode_archive(&archive).unwrap(), tar);
+    }
+
+    #[cfg(not(feature = "zstd-compression"))]
+    #[test]
+    fn zstd_encode_fails_cleanly_without_feature() {
+        let error = compress_tar(b"tar", ArchiveCompression::Zstd).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn unknown_archive_fails_closed() {
+        let error = decode_archive(b"not-an-archive").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
