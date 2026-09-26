@@ -71,6 +71,29 @@ jobs:
           test -s docs/dist/playground/nulang_playground.wasm
 
   # -----------------------------------------------------------------------
+  # Cloudflare R2 package-registry worker
+  # -----------------------------------------------------------------------
+  registry-worker-test:
+    name: Registry Worker Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Install registry worker dependencies
+        working-directory: registry-worker
+        run: npm ci
+
+      - name: Test registry worker
+        working-directory: registry-worker
+        run: npm test
+
+  # -----------------------------------------------------------------------
   # Primary build & test (default features)
   # -----------------------------------------------------------------------
   test:
