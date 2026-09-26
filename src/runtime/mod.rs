@@ -70,6 +70,7 @@ mod llm;
 mod metrics;
 mod persistence;
 mod process_groups;
+mod reactive;
 mod registry;
 pub mod resp;
 pub mod resp_cache;
@@ -119,6 +120,7 @@ pub use object_store::*;
 pub use orca_cycle::*;
 pub use persistence::*;
 pub use process_groups::*;
+pub use reactive::{StateReadSet, StateVersion};
 pub use registry::*;
 pub use resp_cache::*;
 pub use scheduler::*;
@@ -316,6 +318,10 @@ pub struct Runtime {
     /// stamp their outgoing `traceparent` as a child of this context, so
     /// causal chains span actor, shard, and node boundaries.
     pub current_trace: Option<TraceContext>,
+    /// Stackable dependency tracker for reactive workflow queries. This is
+    /// runtime-local and ephemeral; durable subscription identity belongs in
+    /// the higher-level subscription layer.
+    reactive_reads: reactive::ReactiveReadTracker,
     // Fallback heap/GC for allocation performed OUTSIDE any actor's
     // behavior (e.g. `main()`'s own top-level bytecode: string
     // concatenation, `Int.to_string`, and similar). See
@@ -585,6 +591,7 @@ impl Runtime {
             scheduler: Scheduler::new(4),
             current_actor: None,
             current_trace: None,
+            reactive_reads: reactive::ReactiveReadTracker::default(),
             main_heap: {
                 let mut heap = ActorHeap::new(64 * 1024);
                 heap.set_actor_id(MAIN_HEAP_ACTOR_ID);
@@ -661,6 +668,47 @@ impl Runtime {
             cross_shard_tx: None,
             cross_shard_rx: None,
         }
+    }
+
+    pub(crate) fn begin_reactive_query_tracking(&self) {
+        self.reactive_reads.begin();
+    }
+
+    pub(crate) fn finish_reactive_query_tracking(&self) -> Option<StateReadSet> {
+        self.reactive_reads.finish()
+    }
+
+    /// Record one actor-state read in every currently active query scope.
+    ///
+    /// VM callbacks call this immediately before returning a state value.
+    /// Reads outside a tracked query are effectively free apart from the
+    /// empty-scope check inside the tracker.
+    #[inline]
+    pub(crate) fn record_reactive_state_read(&self, actor_id: u64, field: &str) {
+        if !self.reactive_reads.is_active() {
+            return;
+        }
+        if let Some(actor) = self.actors.get(&actor_id) {
+            self.reactive_reads.record(
+                actor_id,
+                field,
+                StateVersion {
+                    incarnation: actor.state_incarnation(),
+                    revision: actor.state_revision(field),
+                },
+            );
+        }
+    }
+
+    /// Check whether every field observed by a prior query still has the same
+    /// revision. Missing actors are stale.
+    pub fn state_read_set_is_current(&self, reads: &StateReadSet) -> bool {
+        reads.is_current_with(|actor_id, field| {
+            self.actors.get(&actor_id).map(|actor| StateVersion {
+                incarnation: actor.state_incarnation(),
+                revision: actor.state_revision(field),
+            })
+        })
     }
 
     /// Compute the BLAKE3 hash of `data` using the configured [`CryptoProvider`].
@@ -1161,6 +1209,20 @@ impl Runtime {
     /// Invoke a registered query handler on a workflow actor. Delegates to workflow subsystem.
     pub fn query_workflow(&mut self, actor_id: u64, name: &str) -> Option<Value> {
         workflow::query_workflow(self, actor_id, name)
+    }
+
+    /// Invoke a workflow query and return both its value and the exact
+    /// actor-state dependencies observed while evaluating it.
+    ///
+    /// Nested workflow queries are folded into the outer read set, including
+    /// reads from other actors. This is the low-level primitive used by a
+    /// future subscription/cache layer to invalidate only affected queries.
+    pub fn query_workflow_with_dependencies(
+        &mut self,
+        actor_id: u64,
+        name: &str,
+    ) -> Option<(Value, StateReadSet)> {
+        workflow::query_workflow_with_dependencies(self, actor_id, name)
     }
 
     /// Drain completed background LLM calls and resume the suspended actors

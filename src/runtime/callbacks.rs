@@ -719,6 +719,7 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
     fn get_state_field(&self, field: &str) -> crate::vm::Value {
         let rt = self.runtime.borrow();
         if let Some(actor_id) = rt.current_actor {
+            rt.record_reactive_state_read(actor_id, field);
             if let Some(actor) = rt.actors.get(&actor_id) {
                 return actor
                     .get_state_field(field)
@@ -1517,7 +1518,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
 
     fn get_state_field(&self, field: &str) -> crate::vm::Value {
         unsafe {
-            if let Some(actor) = (*self.runtime).actors.get(&self.actor_id) {
+            let rt = &*self.runtime;
+            rt.record_reactive_state_read(self.actor_id, field);
+            if let Some(actor) = rt.actors.get(&self.actor_id) {
                 return actor
                     .get_state_field(field)
                     .unwrap_or(crate::vm::Value::nil());

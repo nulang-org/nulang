@@ -333,6 +333,30 @@ pub(crate) fn register_workflow_query(rt: &mut Runtime, actor_id: u64, name: &st
 
 /// Invoke a registered query handler on a workflow actor and return its result.
 pub(crate) fn query_workflow(rt: &mut Runtime, actor_id: u64, name: &str) -> Option<Value> {
+    execute_workflow_query(rt, actor_id, name, false).map(|(value, _)| value)
+}
+
+/// Invoke a workflow query while collecting field-level state dependencies.
+///
+/// Tracking is opt-in: the legacy `query_workflow` path does not allocate or
+/// populate a read set. Nested tracked queries create nested scopes; every
+/// state read is recorded in each active scope so an outer result inherits
+/// cross-actor dependencies.
+pub(crate) fn query_workflow_with_dependencies(
+    rt: &mut Runtime,
+    actor_id: u64,
+    name: &str,
+) -> Option<(Value, super::StateReadSet)> {
+    let (value, reads) = execute_workflow_query(rt, actor_id, name, true)?;
+    Some((value, reads.unwrap_or_default()))
+}
+
+fn execute_workflow_query(
+    rt: &mut Runtime,
+    actor_id: u64,
+    name: &str,
+    track_dependencies: bool,
+) -> Option<(Value, Option<super::StateReadSet>)> {
     let (handler, module) = {
         let actor = rt.actors.get(&actor_id)?;
         if !matches!(actor.role(), Ok(ActorRole::Workflow)) {
@@ -351,7 +375,15 @@ pub(crate) fn query_workflow(rt: &mut Runtime, actor_id: u64, name: &str) -> Opt
     let mut frame = Frame::new(None, 0);
     frame.pc = offset;
     vm.set_current_frame(frame);
-    vm.run_from(0, offset).ok()
+
+    if track_dependencies {
+        rt.begin_reactive_query_tracking();
+    }
+    let result = vm.run_from(0, offset).ok();
+    let reads = track_dependencies
+        .then(|| rt.finish_reactive_query_tracking().unwrap_or_default());
+
+    result.map(|value| (value, reads))
 }
 
 // ---------------------------------------------------------------------------
