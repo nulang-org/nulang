@@ -3600,6 +3600,12 @@ impl VM {
             return false;
         }
 
+        // Materialize only the register prefix this compiled region can touch.
+        // The backend defaults to 256 when footprint metadata is unavailable,
+        // so alternate JITs and conservative/direct-call regions retain the
+        // old full-frame behavior.
+        let register_span = jit.compiled_register_span(module_idx, pc).min(256);
+
         // Detach the raw-bit constant cache as well. No slice into VM-owned
         // storage may survive a re-entrant &mut VM call.
         let constants = if module_idx < self.jit_constants.len() {
@@ -3608,12 +3614,14 @@ impl VM {
             Vec::new()
         };
 
-        // Snapshot registers into stack-local storage. This deliberately keeps
-        // the current conservative 256-register ABI; register-copy reduction
-        // is a separate optimization and must not be entangled with this
-        // ownership fix.
+        // Keep the fixed 256-register ABI so compiled code and re-entrant
+        // helpers remain unchanged, but only copy the prefix the region may
+        // access. The unused suffix stays zeroed and is never copied back.
         let mut regs: [u64; 256] = [0; 256];
-        for (i, r) in self.frames[frame_idx].regs.iter().enumerate() {
+        for (i, r) in self.frames[frame_idx].regs[..register_span]
+            .iter()
+            .enumerate()
+        {
             regs[i] = r.to_bits();
         }
 
@@ -3647,7 +3655,7 @@ impl VM {
         }
 
         if action != TieredAction::Interpret {
-            for (i, bits) in regs.iter().enumerate() {
+            for (i, bits) in regs[..register_span].iter().enumerate() {
                 self.frames[frame_idx].regs[i] = unsafe { Value::from_bits(*bits) };
             }
 
