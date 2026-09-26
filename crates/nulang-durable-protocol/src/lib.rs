@@ -252,9 +252,7 @@ impl DurableWorkflowEvent {
             }
             Self::StepFailed {
                 step_name, error, ..
-            } => {
-                !step_name.trim().is_empty() && !error.trim().is_empty()
-            }
+            } => !step_name.trim().is_empty() && !error.trim().is_empty(),
             Self::SignalAccepted { name, .. } | Self::Custom { name, .. } => {
                 !name.trim().is_empty()
             }
@@ -1153,7 +1151,6 @@ mod tests {
         assert_eq!(encoded[2]["kind"], "parallel_branch_completed");
     }
 
-
     #[test]
     fn terminal_workflow_activation_identity_roundtrips_exact_u64_values() {
         let activation = DurableWorkflowActivation {
@@ -1167,10 +1164,7 @@ mod tests {
 
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["activation"]["actor_id"], "9007199254740993");
-        assert_eq!(
-            value["activation"]["command_sequence"],
-            "9007199254740994"
-        );
+        assert_eq!(value["activation"]["command_sequence"], "9007199254740994");
 
         let decoded: DurableWorkflowEvent = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, event);
@@ -1193,7 +1187,6 @@ mod tests {
         );
         assert_eq!(serde_json::to_value(event).unwrap(), legacy);
     }
-
 
     #[test]
     fn unknown_semantic_record_fields_fail_closed() {
