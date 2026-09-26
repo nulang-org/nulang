@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Durable journal string replay — 2026-09-26
+- **Persistent actor and virtual-actor journal replay now materializes persisted string payloads on the recovering actor heap.** Previously `PersistedValue::String` passed through the context-free `to_value()` conversion and became `nil`, so post-snapshot commands could replay with different arguments than were durably recorded.
+- **A focused recovery regression pins the round trip.** It checkpoints a persistent actor, appends a string-bearing journal command, removes the actor, recovers it, and proves the bytecode behavior observes the original string.
+
 ### Same-host A/B Cargo target isolation — 2026-09-25
 - **Base and candidate benchmark builds now use separate Cargo target directories.** The repository config points every checkout at one absolute target path; sharing it across the detached base worktree and candidate could reuse the base library artifact while compiling candidate integration tests, producing false build failures or invalid A/B binaries.
 - **The isolation applies to both prebuild and measured Cargo invocations.** Persistent per-variant target directories retain ordinary Cargo caching while preventing cross-variant artifact contamination.
