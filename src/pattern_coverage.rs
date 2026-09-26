@@ -216,7 +216,7 @@ fn warnings_from_report(report: CoverageReport, span: Span) -> Vec<NuWarning> {
             msg: format!("non-exhaustive match: missing {missing}"),
             span,
             help: Some(format!(
-                "add arm{} for {missing}; without one, an uncovered value keeps the frozen runtime non-exhaustive-match behavior",
+                "add arm{} for {missing}; without one, an uncovered value keeps the existing runtime non-exhaustive-match behavior",
                 if report.missing.len() == 1 { "" } else { "s" }
             )),
         });
