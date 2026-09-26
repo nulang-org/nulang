@@ -1136,6 +1136,48 @@ mod tests {
         assert_eq!(encoded[2]["kind"], "parallel_branch_completed");
     }
 
+
+    #[test]
+    fn terminal_workflow_activation_identity_roundtrips_exact_u64_values() {
+        let activation = DurableWorkflowActivation {
+            actor_id: 9_007_199_254_740_993,
+            command_sequence: 9_007_199_254_740_994,
+        };
+        let event = DurableWorkflowEvent::StepCompleted {
+            activation: Some(activation.clone()),
+            step_name: "charge".into(),
+        };
+
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["activation"]["actor_id"], "9007199254740993");
+        assert_eq!(
+            value["activation"]["command_sequence"],
+            "9007199254740994"
+        );
+
+        let decoded: DurableWorkflowEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn legacy_terminal_workflow_event_without_activation_remains_digest_compatible() {
+        let legacy = json!({
+            "kind": "step_completed",
+            "step_name": "charge"
+        });
+        let event: DurableWorkflowEvent = serde_json::from_value(legacy.clone()).unwrap();
+
+        assert_eq!(
+            event,
+            DurableWorkflowEvent::StepCompleted {
+                activation: None,
+                step_name: "charge".into(),
+            }
+        );
+        assert_eq!(serde_json::to_value(event).unwrap(), legacy);
+    }
+
+
     #[test]
     fn unknown_semantic_record_fields_fail_closed() {
         let value = json!({
