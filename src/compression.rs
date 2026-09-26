@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn legacy_unwrapped_payload_is_borrowed_without_copy() {
-        let legacy = b"NHS0 legacy continuation bytes";
+        let legacy = b"NLCS legacy continuation bytes";
         let decoded = decode_blob_or_raw(legacy).unwrap();
 
         assert!(matches!(decoded, Cow::Borrowed(_)));
@@ -242,6 +242,46 @@ mod tests {
         encoded[8..16].copy_from_slice(&4u64.to_be_bytes());
 
         let error = decode_blob(&encoded).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn unknown_version_fails_closed() {
+        let mut encoded = encode_blob_with_threshold(b"abc", usize::MAX).unwrap();
+        encoded[4] = BLOB_VERSION.wrapping_add(1);
+
+        let error = decode_blob(&encoded).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn nonzero_reserved_bits_fail_closed() {
+        let mut encoded = encode_blob_with_threshold(b"abc", usize::MAX).unwrap();
+        encoded[6] = 1;
+
+        let error = decode_blob(&encoded).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn declared_length_above_limit_fails_closed() {
+        let mut encoded = encode_blob_with_threshold(b"abc", usize::MAX).unwrap();
+        encoded[8..16].copy_from_slice(&2048u64.to_be_bytes());
+
+        let error = decode_blob_with_limit(&encoded, 1024).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("limit"));
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
+    fn zstd_output_larger_than_declared_length_fails_bounded_decode() {
+        let input = vec![b'x'; 256 * 1024];
+        let mut encoded = encode_blob_with_threshold(&input, 0).unwrap();
+        assert_eq!(envelope_codec(&encoded), Some(BlobCodec::Zstd));
+        encoded[8..16].copy_from_slice(&1024u64.to_be_bytes());
+
+        let error = decode_blob_with_limit(&encoded, 1024).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
