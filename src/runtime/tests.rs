@@ -3458,11 +3458,7 @@ fn workflow_resume_context_preserves_next_replay_ordinal() {
 #[test]
 fn workflow_custom_events_receive_activation_local_replay_ids() {
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_workflow_actor(
-        "ReplayWorkflow",
-        Box::new(Vec::new),
-        HashMap::new(),
-    );
+    let actor_id = rt.spawn_workflow_actor("ReplayWorkflow", Box::new(Vec::new), HashMap::new());
     let activation = WorkflowActivationId::new(actor_id, 77);
     rt.actors
         .get_mut(&actor_id)
