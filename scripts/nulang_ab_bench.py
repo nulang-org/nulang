@@ -119,6 +119,7 @@ def cargo_command(extra_args: list[str]) -> list[str]:
         "cargo",
         "test",
         "--release",
+        "--lib",
         *extra_args,
         "benchmarks::bench_",
         "--",
@@ -133,6 +134,7 @@ def cargo_build_command(extra_args: list[str]) -> list[str]:
         "test",
         "--release",
         "--no-run",
+        "--lib",
         *extra_args,
         "benchmarks::bench_",
     ]
