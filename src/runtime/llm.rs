@@ -449,7 +449,7 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         // Re-install callbacks bound to THIS actor: other actors may have
         // run on the shared VM while this one was suspended.
         vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::from_raw(self_ptr, actor_id)));
-        vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks { runtime: self_ptr }));
+        vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks::from_raw(self_ptr)));
         vm.restore_suspended_state(suspended.vm_state);
         let saved_suspend = (*self_ptr).suspend_enabled;
         (*self_ptr).suspend_enabled = true;
