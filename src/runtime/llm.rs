@@ -443,6 +443,7 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         return;
     }
 
+    crate::runtime::workflow::restore_replay_context(rt, actor_id, suspended.activation);
     let self_ptr: *mut Runtime = rt;
     unsafe {
         let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -516,6 +517,7 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         // on the shared VM, which would clobber the frames an
         // un-captured suspend still needs. Runs on every path, so
         // wakes of other actors are not lost when THIS one suspends.
+        crate::runtime::workflow::clear_replay_context(&mut *self_ptr, actor_id);
         (*self_ptr).vm_exec_end();
     }
     // The suspension resolved (completed or failed): if messages queued
