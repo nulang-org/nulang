@@ -1,0 +1,11 @@
+[package]
+name = "nulang-durable-protocol"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Versioned transport-neutral atomic durable transition protocol for Nulang hosts"
+
+[dependencies]
+blake3 = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
