@@ -204,6 +204,26 @@ impl WorkflowActivationId {
     }
 }
 
+/// Replay-stable identity of one deterministic workflow operation.
+///
+/// The ordinal is local to an accepted command activation. Re-executing the
+/// same activation must derive the same ordinal sequence so recovery can
+/// recognize already-committed operations instead of appending them twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowReplayId {
+    pub activation: WorkflowActivationId,
+    pub ordinal: u32,
+}
+
+impl WorkflowReplayId {
+    pub const fn new(activation: WorkflowActivationId, ordinal: u32) -> Self {
+        Self {
+            activation,
+            ordinal,
+        }
+    }
+}
+
 /// A workflow event records a durable, replayable step in a workflow actor.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "tag", content = "value")]
@@ -263,6 +283,9 @@ pub enum WorkflowEvent {
     /// Any other event emitted by a workflow handler.
     Custom {
         sequence: u64,
+        /// Replay-stable activation-local identity. Missing on legacy history.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replay_id: Option<WorkflowReplayId>,
         name: String,
         args: Vec<PersistedValue>,
     },
@@ -291,6 +314,17 @@ impl WorkflowEvent {
         match self {
             WorkflowEvent::StepCompleted { activation, .. }
             | WorkflowEvent::StepFailed { activation, .. } => *activation,
+            _ => None,
+        }
+    }
+
+    /// Return the replay identity carried by a deterministic workflow event.
+    ///
+    /// Legacy records and event kinds without activation-local identity return
+    /// `None`.
+    pub fn replay_id(&self) -> Option<WorkflowReplayId> {
+        match self {
+            WorkflowEvent::Custom { replay_id, .. } => *replay_id,
             _ => None,
         }
     }
@@ -3936,6 +3970,7 @@ mod libsql_atomic_transition_tests {
                 },
                 WorkflowEvent::Custom {
                     sequence,
+                    replay_id: None,
                     name: "audit".to_string(),
                     args: vec![PersistedValue::Int(sequence as i64)],
                 },
