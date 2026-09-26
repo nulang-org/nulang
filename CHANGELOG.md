@@ -1771,6 +1771,11 @@ everything before it is implicitly Experimental.
 
 ## Experimental tier
 
+### Fabric service directory foundation — 2026-09-24
+- **Fabric now has a typed generation-fenced service directory** (`src/runtime/service_directory.rs`, `src/runtime/distributed_context.rs`). Service endpoints bind service/deployment/replica identity to an allocation epoch, node, protocol, host/port, and health without creating a second broker or control plane.
+- **Service health is routing metadata, not ownership.** Only `Serving` endpoints resolve; remote endpoints additionally require healthy cluster membership. A lower allocation epoch cannot replace a newer one, one remote snapshot cannot advertise conflicting epochs for the same deployment replica, and confirmed node cleanup removes endpoints plus remembered generations.
+- **Service metadata reuses Fabric's existing convergence mechanics.** Local endpoint changes share the process-wide Fabric generation counter and cross-shard metadata channel; complete remote snapshots ignore duplicate/stale generations and bounded export refuses destructive partial snapshots. Automatic carriage in the NUL0 gossip tail remains the next integration slice.
+
 ### Cloud control-plane placement foundation — 2026-09-24
 - **Nulang Cloud now has an isolated deterministic control-plane planner** (`crates/nulang-cloud-control`) that turns deployment intent plus node/allocation snapshots into a pure `PlacementPlan` without mutating runtimes or provisioning infrastructure.
 - **Placement separates hard feasibility from soft ranking.** Node state, architecture, region/zone, trust tier, required labels/capabilities, resource availability, and per-node replica limits reject candidates before region-locality, failure-domain spread, node spread, and headroom scoring.
