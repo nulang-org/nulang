@@ -652,6 +652,7 @@ mod planner_tests {
 
         assert_eq!(plan.len, 8);
         assert!(plan.native_calls.is_empty());
+        assert_eq!(plan.register_span, 2);
         assert!(
             plan.type_metadata().is_some(),
             "planner should preserve type facts for the backend"
@@ -695,5 +696,6 @@ mod planner_tests {
 
         assert_eq!(plan.len, 0);
         assert!(plan.native_calls.is_empty());
+        assert_eq!(plan.register_span, 0);
     }
 }
