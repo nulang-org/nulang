@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Actor-aware durable journal payload serialization — 2026-09-26
+- **Legacy persistent message and synchronous native-ask journaling now preserve runtime strings before they reach storage.** String-pool ids resolve against the originating actor module first and the durable target as a fallback; heap-backed strings are resolved by exact live-allocation provenance across active, main, and retired actor heaps.
+- **Pointer serialization now fails closed by runtime type.** Only live allocations tagged `TypeTag::String` are decoded as UTF-8; raw/FFI/non-string pointers remain `PersistedValue::Nil` instead of being interpreted as C strings.
+- **One canonical `persist_journal_payload` path now feeds scheduler, AI-memory, bytecode/native, and synchronous native-ask journal writers.** This is the serializer that the RFC 0022 durable-inbox stack should reuse when #1002 is restacked.
+
 ### Durable journal string replay — 2026-09-26
 - **Persistent actor and virtual-actor journal replay now materializes persisted string payloads on the recovering actor heap.** Previously `PersistedValue::String` passed through the context-free `to_value()` conversion and became `nil`, so post-snapshot commands could replay with different arguments than were durably recorded.
 - **A focused recovery regression pins the round trip.** It checkpoints a persistent actor, appends a string-bearing journal command, removes the actor, recovers it, and proves the bytecode behavior observes the original string.
