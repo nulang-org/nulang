@@ -1,5 +1,11 @@
 # Nulang Changelog
 
+### Workflow durability fail-closed boundary — 2026-09-25
+- **Durable workflow timers no longer become live after a failed persistence write.** `schedule_workflow_timer` now returns the storage error and arms the timer wheel only after `TimerSet` plus the current checkpoint succeed; VM timer effects turn that failure into an unhandled-effect error rather than continuing.
+- **Workflow signals no longer resume or enter in-memory signal state after a failed durable append/checkpoint.** `signal_workflow` now returns `io::Result` and mutates/resumes only after persistence succeeds.
+- **Timer expiry is fail-closed.** If `TimerFired` cannot be durably recorded, the runtime suppresses the corresponding actor message instead of executing an event that recovery cannot prove happened.
+- This deliberately preserves the legacy two-write event/checkpoint path until activation replay identity from #836 is implemented; it does not pretend intermediate workflow events are RFC 0022 atomic transitions yet.
+
 ### Same-host A/B Cargo target isolation — 2026-09-25
 - **Base and candidate benchmark builds now use separate Cargo target directories.** The repository config points every checkout at one absolute target path; sharing it across the detached base worktree and candidate could reuse the base library artifact while compiling candidate integration tests, producing false build failures or invalid A/B binaries.
 - **The isolation applies to both prebuild and measured Cargo invocations.** Persistent per-variant target directories retain ordinary Cargo caching while preventing cross-variant artifact contamination.
