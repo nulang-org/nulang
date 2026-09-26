@@ -16,13 +16,16 @@ use std::borrow::Cow;
 use std::io;
 
 #[cfg(feature = "zstd-compression")]
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 
 pub const BLOB_MAGIC: [u8; 4] = *b"NUZ0";
 pub const BLOB_VERSION: u8 = 1;
 pub const BLOB_HEADER_LEN: usize = 16;
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 pub const DEFAULT_COMPRESSION_THRESHOLD: usize = 4 * 1024;
+/// Default upper bound for a decoded runtime blob. Callers with a stricter
+/// domain-specific bound should use `decode_blob_with_limit`.
+pub const DEFAULT_MAX_DECODED_BLOB_SIZE: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -85,6 +88,16 @@ pub fn encode_blob_with_threshold(input: &[u8], threshold: usize) -> io::Result<
 /// envelopes fail closed. A zstd envelope also fails with Unsupported when
 /// decoded by a build that intentionally omitted zstd-compression.
 pub fn decode_blob(encoded: &[u8]) -> io::Result<Vec<u8>> {
+    decode_blob_with_limit(encoded, DEFAULT_MAX_DECODED_BLOB_SIZE)
+}
+
+/// Decode one versioned runtime blob while enforcing a decoded-size limit.
+///
+/// The declared original length is rejected before allocation when it exceeds
+/// `max_decoded_len`. Zstd decoding is additionally capped at one byte beyond
+/// the declared length so malformed or hostile frames cannot expand without
+/// bound before the length mismatch is detected.
+pub fn decode_blob_with_limit(encoded: &[u8], max_decoded_len: usize) -> io::Result<Vec<u8>> {
     if encoded.len() < BLOB_HEADER_LEN {
         return Err(invalid_data("truncated runtime blob envelope"));
     }
@@ -108,6 +121,11 @@ pub fn decode_blob(encoded: &[u8]) -> io::Result<Vec<u8>> {
     );
     let expected_len = usize::try_from(expected_len_u64)
         .map_err(|_| invalid_data("runtime blob length exceeds platform usize"))?;
+    if expected_len > max_decoded_len {
+        return Err(invalid_data(format!(
+            "runtime blob decoded length {expected_len} exceeds limit {max_decoded_len}"
+        )));
+    }
     let payload = &encoded[BLOB_HEADER_LEN..];
 
     let decoded = match encoded[5] {
@@ -123,8 +141,14 @@ pub fn decode_blob(encoded: &[u8]) -> io::Result<Vec<u8>> {
         value if value == BlobCodec::Zstd as u8 => {
             #[cfg(feature = "zstd-compression")]
             {
-                zstd::stream::decode_all(Cursor::new(payload))
-                    .map_err(|error| invalid_data(format!("invalid zstd runtime blob: {error}")))?
+                let decoder = zstd::stream::read::Decoder::new(Cursor::new(payload))
+                    .map_err(|error| invalid_data(format!("invalid zstd runtime blob: {error}")))?;
+                let mut limited = decoder.take(expected_len_u64.saturating_add(1));
+                let mut output = Vec::new();
+                limited
+                    .read_to_end(&mut output)
+                    .map_err(|error| invalid_data(format!("invalid zstd runtime blob: {error}")))?;
+                output
             }
 
             #[cfg(not(feature = "zstd-compression"))]
