@@ -104,19 +104,20 @@ stable; for FFI, this is inherent to dynamic loading — the library allowlist
 (`ffi/native.rs::is_lib_allowed`) is the real mitigation.
 
 ### F6 — MEDIUM — `unsafe impl Send/Sync` on raw-pointer callback/graph types
-`src/runtime/callbacks.rs:807-808` (`BytecodeRuntimeCallbacks`, wraps
-`*mut Runtime`), `src/runtime/orca_cycle.rs:131-132` (`ForeignEdge`),
-`185` (`ForeignRefNode`), `src/ffi/native.rs:75-78` (`NativeFunction`),
-`src/runtime/heap.rs:306` (`ActorHeap`).
-All are sound only under the single-scheduler-thread-per-runtime
-convention; `BytecodeRuntimeCallbacks: Sync` is the most fragile (a shared
-reference allows cross-thread `&mut Runtime` aliasing if the value is ever
-shared). These impls previously had **no** SAFETY comment for
-`BytecodeRuntimeCallbacks`.
-**Fix applied:** SAFETY comments added stating the convention.
-**Recommended fix (future):** remove `Sync` for `BytecodeRuntimeCallbacks`
-if no consumer requires it, or wrap the runtime pointer in a type that only
-yields `&mut Runtime` from `&mut self`.
+The runtime callback portion is now resolved: `BytecodeRuntimeCallbacks` and
+`BytecodeDistributedCallbacks` no longer manually implement `Send` or
+`Sync`. Their `*mut Runtime` fields therefore keep them thread-confined by
+default, raw-pointer construction goes through an `unsafe fn from_raw` with
+an explicit live/exclusive scheduler-ownership contract, and the repository
+verifier rejects any future reintroduction of those auto-trait impls.
+
+Remaining sites are `src/runtime/orca_cycle.rs` (`ForeignEdge`,
+`ForeignRefNode`), `src/ffi/native.rs` (`NativeFunction`), and
+`src/runtime/heap.rs` (`ActorHeap`). Those still require separate proofs or
+representation changes; this hardening does not broaden their guarantees.
+**Recommended next fix:** audit the ORCA graph wrappers first, because removing
+unnecessary auto-trait overrides there can shrink the same class of cross-thread
+aliasing assumptions without changing actor semantics.
 
 ### F7 — LOW — heap serializer trusts recorded payload sizes
 `src/runtime/heap_serialize.rs:342`, `431`, `692`, `706`:
