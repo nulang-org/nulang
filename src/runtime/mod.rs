@@ -1239,10 +1239,12 @@ impl Runtime {
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
-            vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::new(self_ptr, actor_id)));
-            vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks {
-                runtime: self_ptr,
-            }));
+            vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::from_raw(
+                self_ptr, actor_id,
+            )));
+            vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks::from_raw(
+                self_ptr,
+            )));
             vm.restore_suspended_state(suspended.vm_state);
 
             // Reset the safepoint budget and wire the pointer for JIT code.
@@ -1632,10 +1634,12 @@ impl Runtime {
             // run on the shared VM while this one was suspended, and a resumed
             // `LLM.ask` must record its in-flight call (and later completion)
             // on this actor - same as resume_suspended_llm_step.
-            vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks {
-                runtime: self_ptr,
-            }));
-            vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::new(self_ptr, actor_id)));
+            vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks::from_raw(
+                self_ptr,
+            )));
+            vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::from_raw(
+                self_ptr, actor_id,
+            )));
             vm.restore_suspended_state(suspended.vm_state);
             // A signal-resumed step is still scheduler-context execution: a
             // `perform LLM.ask` after the wait must suspend (non-blocking)
@@ -4451,10 +4455,12 @@ impl Runtime {
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
-            vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::new(self_ptr, actor_id)));
-            vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks {
-                runtime: self_ptr,
-            }));
+            vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::from_raw(
+                self_ptr, actor_id,
+            )));
+            vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks::from_raw(
+                self_ptr,
+            )));
             vm.restore_suspended_state(suspended.vm_state);
             (*self_ptr).vm_exec_begin();
             let result = vm.resume();
@@ -4546,10 +4552,12 @@ impl Runtime {
             let vm = (*self_ptr).vm.as_mut().unwrap();
             // Re-install callbacks bound to THIS actor: other actors may have
             // run on the shared VM while this one was suspended.
-            vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks {
-                runtime: self_ptr,
-            }));
-            vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::new(self_ptr, actor_id)));
+            vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks::from_raw(
+                self_ptr,
+            )));
+            vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::from_raw(
+                self_ptr, actor_id,
+            )));
             vm.restore_suspended_state(suspended.vm_state);
             // A resumed behavior is still scheduler-context execution: a
             // `perform LLM.ask` after the wait must suspend (non-blocking).
@@ -4829,10 +4837,12 @@ impl Runtime {
                 idx
             };
 
-            vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::new(self_ptr, actor_id)));
-            vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks {
-                runtime: self_ptr,
-            }));
+            vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::from_raw(
+                self_ptr, actor_id,
+            )));
+            vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks::from_raw(
+                self_ptr,
+            )));
 
             let mut frame = crate::vm::Frame::new(None, module_idx);
             frame.pc = code_offset;

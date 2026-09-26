@@ -1443,8 +1443,14 @@ impl crate::vm::ActorVmCallbacks for AotRuntimeCallbacks {
         // Actor/IO/Timer/Workflow builtin effects through the real Runtime.
         // `AotRuntimeCallbacks` has the same shape (runtime + actor_id), so
         // this gives AOT-compiled `perform` the exact bytecode semantics.
-        let mut bc =
-            crate::runtime::callbacks::BytecodeRuntimeCallbacks::new(self.runtime, self.actor_id);
+        // SAFETY: this callback is invoked only while the owning runtime keeps
+        // `self.runtime` live and scheduler-confined for the native call.
+        let mut bc = unsafe {
+            crate::runtime::callbacks::BytecodeRuntimeCallbacks::from_raw(
+                self.runtime,
+                self.actor_id,
+            )
+        };
         bc.perform_builtin_effect_in_module(effect_name, op_name, module, regs)
     }
 
@@ -1457,8 +1463,14 @@ impl crate::vm::ActorVmCallbacks for AotRuntimeCallbacks {
         // Delegate to the bytecode callbacks, which route the async-effect
         // family (Inference/LLM.ask, Timer.sleep, Pipeline.*, Supervisor.*)
         // through the real Runtime — the exact bytecode PerformAsync path.
-        let mut bc =
-            crate::runtime::callbacks::BytecodeRuntimeCallbacks::new(self.runtime, self.actor_id);
+        // SAFETY: this callback is invoked only while the owning runtime keeps
+        // `self.runtime` live and scheduler-confined for the native call.
+        let mut bc = unsafe {
+            crate::runtime::callbacks::BytecodeRuntimeCallbacks::from_raw(
+                self.runtime,
+                self.actor_id,
+            )
+        };
         bc.perform_async(effect_op, constants, args)
     }
 
@@ -1717,8 +1729,11 @@ impl crate::vm::ActorVmCallbacks for AotTopLevelCallbacks {
         regs: &[crate::vm::Value],
     ) -> Option<crate::vm::Value> {
         let actor_id = self.current_actor_id().unwrap_or(0);
-        let mut bc =
-            crate::runtime::callbacks::BytecodeRuntimeCallbacks::new(self.runtime, actor_id);
+        // SAFETY: `self.runtime` is the live runtime pointer installed for
+        // this AOT callback invocation; the callback is not retained afterward.
+        let mut bc = unsafe {
+            crate::runtime::callbacks::BytecodeRuntimeCallbacks::from_raw(self.runtime, actor_id)
+        };
         bc.perform_builtin_effect_in_module(effect_name, op_name, module, regs)
     }
 
@@ -1729,8 +1744,11 @@ impl crate::vm::ActorVmCallbacks for AotTopLevelCallbacks {
         args: &[crate::vm::Value],
     ) -> crate::vm::PerformAsyncResult {
         let actor_id = self.current_actor_id().unwrap_or(0);
-        let mut bc =
-            crate::runtime::callbacks::BytecodeRuntimeCallbacks::new(self.runtime, actor_id);
+        // SAFETY: `self.runtime` is the live runtime pointer installed for
+        // this AOT callback invocation; the callback is not retained afterward.
+        let mut bc = unsafe {
+            crate::runtime::callbacks::BytecodeRuntimeCallbacks::from_raw(self.runtime, actor_id)
+        };
         bc.perform_async(effect_op, constants, args)
     }
 

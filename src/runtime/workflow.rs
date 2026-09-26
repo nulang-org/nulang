@@ -346,8 +346,14 @@ pub(crate) fn query_workflow(rt: &mut Runtime, actor_id: u64, name: &str) -> Opt
     let mut vm = VM::new();
     vm.load_module(module);
     let offset = vm.function_offset_for_value(0, handler).ok()?;
-    vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::new(self_ptr, actor_id)));
-    vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks { runtime: self_ptr }));
+    // SAFETY: self_ptr comes from the live `rt` borrow above. The callbacks
+    // are installed only for this synchronous VM invocation and do not outlive it.
+    unsafe {
+        vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::from_raw(
+            self_ptr, actor_id,
+        )));
+        vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks::from_raw(self_ptr)));
+    }
     let mut frame = Frame::new(None, 0);
     frame.pc = offset;
     vm.set_current_frame(frame);
