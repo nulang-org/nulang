@@ -1809,6 +1809,118 @@ impl Runtime {
             .map(|b| b.name.clone())
     }
 
+    /// Resolve a pointer-tagged value only when it is the exact payload
+    /// address of a live ActorHeap string allocation. This deliberately does
+    /// not call `CStr::from_ptr` on arbitrary TAG_PTR values: safe code can
+    /// carry trusted non-string pointers from FFI/raw objects, and journal
+    /// serialization must fail closed for those values.
+    fn live_heap_string(heap: &ActorHeap, ptr: *mut u8) -> Option<String> {
+        let mut resolved = None;
+        heap.iter_live_objects(|header, payload, _| {
+            if resolved.is_some() || payload != ptr {
+                return;
+            }
+
+            // SAFETY: iter_live_objects only yields headers/payloads for live
+            // allocations owned by this heap. Equality with `ptr` proves the
+            // Value points at this exact allocation before we inspect metadata
+            // or bytes.
+            let header = unsafe { &*header };
+            if header.type_tag != TypeTag::String || header.payload_size == 0 {
+                return;
+            }
+
+            // SAFETY: payload_size is the requested live allocation size from
+            // the validated header above, so this slice stays within the
+            // allocation. Runtime strings are UTF-8 plus a trailing NUL.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(payload as *const u8, header.payload_size) };
+            let Some(nul) = bytes.iter().position(|byte| *byte == 0) else {
+                return;
+            };
+            let Ok(text) = std::str::from_utf8(&bytes[..nul]) else {
+                return;
+            };
+            resolved = Some(text.to_owned());
+        });
+        resolved
+    }
+
+    fn resolve_live_heap_string(&self, ptr: *mut u8) -> Option<String> {
+        if let Some(text) = Self::live_heap_string(&self.main_heap, ptr) {
+            return Some(text);
+        }
+        for actor in self.actors.values() {
+            if let Some(text) = Self::live_heap_string(&actor.heap, ptr) {
+                return Some(text);
+            }
+        }
+        for heap in &self.retired_heaps {
+            if let Some(text) = Self::live_heap_string(heap, ptr) {
+                return Some(text);
+            }
+        }
+        None
+    }
+
+    fn resolve_actor_module_string(&self, actor_id: u64, id: u32) -> Option<String> {
+        self.actors
+            .get(&actor_id)
+            .and_then(|actor| actor.bytecode_module.as_ref())
+            .and_then(|module| module.constants.get(id as usize))
+            .and_then(|constant| match constant {
+                crate::bytecode::Constant::String(text) => Some(text.clone()),
+                _ => None,
+            })
+    }
+
+    /// Canonical serializer for message/ask payloads that are about to cross
+    /// the durable journal boundary. String-pool ids are resolved against the
+    /// sender first (where they originated), then the target as a fallback.
+    /// Heap strings are accepted only after proving exact live allocation
+    /// provenance and `TypeTag::String`; all other pointers normalize to Nil.
+    pub(crate) fn persist_journal_payload(
+        &self,
+        target_actor_id: u64,
+        source_actor_id: Option<u64>,
+        values: &[Value],
+    ) -> Vec<PersistedValue> {
+        values
+            .iter()
+            .map(|value| {
+                if let Some(id) = value.as_string_id() {
+                    if let Some(source_actor_id) = source_actor_id {
+                        if let Some(text) =
+                            self.resolve_actor_module_string(source_actor_id, id)
+                        {
+                            return PersistedValue::String(text);
+                        }
+                    }
+                    if source_actor_id != Some(target_actor_id) {
+                        if let Some(text) =
+                            self.resolve_actor_module_string(target_actor_id, id)
+                        {
+                            return PersistedValue::String(text);
+                        }
+                    }
+                    return PersistedValue::Nil;
+                }
+
+                if let Some(ptr) = value.as_ptr() {
+                    if ptr.is_null() {
+                        return PersistedValue::Nil;
+                    }
+                    return self
+                        .resolve_live_heap_string(ptr)
+                        .map(PersistedValue::String)
+                        .unwrap_or(PersistedValue::Nil);
+                }
+
+                PersistedValue::from_value(value)
+            })
+            .collect()
+    }
+
     /// Synchronously run a single behavior on an actor and return its result.
     /// Used by the VM's `Ask` opcode when a real runtime is attached.
     pub fn ask_actor_sync(
@@ -2004,10 +2116,12 @@ impl Runtime {
             .map(|e| !e.name.is_empty())
             .unwrap_or(false);
         if is_native {
+            let journal_source_actor = self.current_actor;
             self.current_actor = Some(actor_id);
             if self.actor_is_persistent(actor_id) {
                 let seq = self.next_sequence(actor_id);
-                let payload = args.iter().map(PersistedValue::from_value).collect();
+                let payload =
+                    self.persist_journal_payload(actor_id, journal_source_actor, args);
                 let _ = self.persistence.append_journal(
                     actor_id,
                     JournalEntry {
@@ -3676,6 +3790,7 @@ impl Runtime {
                 actor.idle_ms = 0;
             }
             let behavior_idx = msg.behavior_id as usize;
+            let journal_source_actor = (msg.sender != 0).then_some(msg.sender);
 
             // ORCA receiver protocol: hold every heap pointer in the
             // received payload so the owning objects (and any retired
@@ -3707,7 +3822,8 @@ impl Runtime {
             if self.actor_is_agent(actor_id) && self.is_semantic_memory_behavior(&behavior_name) {
                 if self.actor_is_persistent(actor_id) {
                     let seq = self.next_sequence(actor_id);
-                    let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
+                    let payload =
+                        self.persist_journal_payload(actor_id, journal_source_actor, &msg.payload);
                     let _ = self.persistence.append_journal(
                         actor_id,
                         JournalEntry {
@@ -3743,7 +3859,8 @@ impl Runtime {
             if self.actor_is_agent(actor_id) && self.is_procedural_memory_behavior(&behavior_name) {
                 if self.actor_is_persistent(actor_id) {
                     let seq = self.next_sequence(actor_id);
-                    let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
+                    let payload =
+                        self.persist_journal_payload(actor_id, journal_source_actor, &msg.payload);
                     let _ = self.persistence.append_journal(
                         actor_id,
                         JournalEntry {
@@ -3882,7 +3999,8 @@ impl Runtime {
                 // Journal the message before handling so recovery can replay it.
                 if self.actor_is_persistent(actor_id) {
                     let seq = self.next_sequence(actor_id);
-                    let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
+                    let payload =
+                        self.persist_journal_payload(actor_id, journal_source_actor, &msg.payload);
                     let _ = self.persistence.append_journal(
                         actor_id,
                         JournalEntry {
@@ -3901,7 +4019,8 @@ impl Runtime {
                 // Journal before executing bytecode as well.
                 if self.actor_is_persistent(actor_id) {
                     let seq = self.next_sequence(actor_id);
-                    let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
+                    let payload =
+                        self.persist_journal_payload(actor_id, journal_source_actor, &msg.payload);
                     let _ = self.persistence.append_journal(
                         actor_id,
                         JournalEntry {
