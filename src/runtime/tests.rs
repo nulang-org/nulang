@@ -1964,6 +1964,76 @@ fn test_persistent_string_state_survives_checkpoint_and_recovery() {
     assert!(!restored.is_nil(), "restored string must not be nil");
 }
 #[test]
+fn test_journal_replay_restores_persisted_string_payload_on_actor_heap() {
+    use crate::bytecode::{BehaviorTableEntry, CodeModule, Constant, Instruction, OpCode};
+
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("seen".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_persistent_actor(
+        Box::new(|| vec![("seen".to_string(), Value::nil())]),
+        models,
+    );
+
+    // Behavior "Recorder.set": self.seen = arg0.
+    let mut module = CodeModule::new("journal-string-replay");
+    let field_idx = module.add_constant(Constant::String("seen".to_string()));
+    module.add_behavior(BehaviorTableEntry {
+        name: "Recorder.set".to_string(),
+        param_count: 1,
+        code_offset: 0,
+        local_count: 1,
+        effect_mask: 0,
+        compensate_offset: None,
+        content_hash: None,
+        source_location: None,
+        parallel_branches: None,
+    });
+    module.emit(Instruction::new3(
+        OpCode::StateSet,
+        ((field_idx >> 8) & 0xFF) as u8,
+        (field_idx & 0xFF) as u8,
+        0,
+    ));
+    module.emit(Instruction::new1(OpCode::RetVal, 0));
+
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    // Persist a checkpoint followed by a journal command containing a string.
+    // Recovery must materialize the persisted string into the new actor heap
+    // before invoking the behavior.
+    rt.checkpoint_actor(actor_id);
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    rt.persistence
+        .append_journal(
+            actor_id,
+            JournalEntry {
+                sequence: snapshot.sequence + 1,
+                behavior_id: 0,
+                payload: vec![PersistedValue::String("replayed value".to_string())],
+            },
+        )
+        .unwrap();
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    let restored = actor.get_state_field("seen").unwrap();
+    assert_eq!(
+        crate::runtime::workflow::vm_value_to_string_in_actor(&restored, actor).as_deref(),
+        Some("replayed value"),
+        "journal replay must preserve persisted string payloads instead of converting them to nil"
+    );
+}
+
+#[test]
 fn test_local_state_is_not_persisted() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
