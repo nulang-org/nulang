@@ -1367,20 +1367,20 @@ pub(crate) struct BytecodeRuntimeCallbacks {
     actor_id: u64,
 }
 
-// SAFETY: `runtime` is a transient borrow of the executing `Runtime` that
-// is valid for the duration of the behavior invocation. The scheduler
-// guarantees that a `Runtime` (and thus each callback instance wrapping a
-// pointer to it) is only driven from one thread at a time, so no two
-// threads can alias the `&mut Runtime` produced by dereferencing `runtime`.
-unsafe impl Send for BytecodeRuntimeCallbacks {}
-// SAFETY: shared references only grant access through `Sync` if methods can
-// be called concurrently; all callback methods mutate through the raw
-// pointer and are only invoked while the owning thread is executing the
-// behavior, so cross-thread concurrent use cannot occur by construction.
-unsafe impl Sync for BytecodeRuntimeCallbacks {}
-
 impl BytecodeRuntimeCallbacks {
-    pub(crate) fn new(runtime: *mut Runtime, actor_id: u64) -> Self {
+    /// Construct callbacks around a scheduler-owned raw Runtime pointer.
+    ///
+    /// # Safety
+    /// `runtime` must be non-null and point to the live `Runtime` that owns
+    /// the VM using these callbacks. That Runtime must remain valid and
+    /// exclusively scheduler-owned for every callback invocation. This type
+    /// intentionally does not implement `Send` or `Sync`; moving/sharing it
+    /// across threads would violate that ownership contract.
+    pub(crate) unsafe fn from_raw(runtime: *mut Runtime, actor_id: u64) -> Self {
+        assert!(
+            !runtime.is_null(),
+            "BytecodeRuntimeCallbacks requires a non-null Runtime pointer"
+        );
         BytecodeRuntimeCallbacks { runtime, actor_id }
     }
 
@@ -2262,14 +2262,24 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
 /// while the runtime holds `&mut self`, so the pointer is valid and unique.
 #[derive(Debug)]
 pub(crate) struct BytecodeDistributedCallbacks {
-    pub(crate) runtime: *mut Runtime,
+    runtime: *mut Runtime,
 }
 
-// SAFETY: the VM only invokes these callbacks while the calling
-// `Runtime` method holds `&mut self`.  The raw pointer is therefore the
-// sole active borrow of the runtime.
-unsafe impl Send for BytecodeDistributedCallbacks {}
-unsafe impl Sync for BytecodeDistributedCallbacks {}
+impl BytecodeDistributedCallbacks {
+    /// Construct distributed callbacks around a scheduler-owned Runtime.
+    ///
+    /// # Safety
+    /// `runtime` must be non-null, live for every callback invocation, and
+    /// exclusively owned by the scheduler while installed in the VM. The
+    /// callback remains deliberately thread-confined (no `Send`/`Sync`).
+    pub(crate) unsafe fn from_raw(runtime: *mut Runtime) -> Self {
+        assert!(
+            !runtime.is_null(),
+            "BytecodeDistributedCallbacks requires a non-null Runtime pointer"
+        );
+        Self { runtime }
+    }
+}
 
 impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
     fn node_id(&self) -> u64 {
@@ -2891,10 +2901,16 @@ mod host_authority_tests {
     #[test]
     fn bytecode_top_level_zero_sentinel_is_actor_free_but_missing_real_actor_fails_closed() {
         let mut rt = Runtime::new();
-        let top_level = super::BytecodeRuntimeCallbacks::new(&mut rt as *mut Runtime, 0);
+        // SAFETY: the pointer is derived from live `rt` and the callback is used only in this scope.
+        let top_level = unsafe {
+            super::BytecodeRuntimeCallbacks::from_raw(&mut rt as *mut Runtime, 0)
+        };
         assert_eq!(top_level.authority_actor_id(), None);
 
-        let missing_actor = super::BytecodeRuntimeCallbacks::new(&mut rt as *mut Runtime, 999_999);
+        // SAFETY: same live, thread-confined Runtime as above.
+        let missing_actor = unsafe {
+            super::BytecodeRuntimeCallbacks::from_raw(&mut rt as *mut Runtime, 999_999)
+        };
         assert_eq!(missing_actor.authority_actor_id(), Some(999_999));
 
         let (constants, regs) = string_args(&["/tmp/sentinel.txt"]);
