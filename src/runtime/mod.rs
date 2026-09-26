@@ -1890,16 +1890,12 @@ impl Runtime {
             .map(|value| {
                 if let Some(id) = value.as_string_id() {
                     if let Some(source_actor_id) = source_actor_id {
-                        if let Some(text) =
-                            self.resolve_actor_module_string(source_actor_id, id)
-                        {
+                        if let Some(text) = self.resolve_actor_module_string(source_actor_id, id) {
                             return PersistedValue::String(text);
                         }
                     }
                     if source_actor_id != Some(target_actor_id) {
-                        if let Some(text) =
-                            self.resolve_actor_module_string(target_actor_id, id)
-                        {
+                        if let Some(text) = self.resolve_actor_module_string(target_actor_id, id) {
                             return PersistedValue::String(text);
                         }
                     }
@@ -2120,8 +2116,7 @@ impl Runtime {
             self.current_actor = Some(actor_id);
             if self.actor_is_persistent(actor_id) {
                 let seq = self.next_sequence(actor_id);
-                let payload =
-                    self.persist_journal_payload(actor_id, journal_source_actor, args);
+                let payload = self.persist_journal_payload(actor_id, journal_source_actor, args);
                 let _ = self.persistence.append_journal(
                     actor_id,
                     JournalEntry {
