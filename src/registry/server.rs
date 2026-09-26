@@ -373,6 +373,26 @@ mod tests {
         sort_versions(&mut versions);
         assert_eq!(versions, vec!["1.0.0", "latest", "v2"]);
     }
+
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_archive_extension_follows_content_type() {
+        let zstd = vec![("Content-Type".to_string(), "application/zstd".to_string())];
+        let gzip = vec![("content-type".to_string(), "application/gzip".to_string())];
+        let absent = Vec::new();
+
+        assert_eq!(archive_extension_for_headers(&zstd), ".tar.zst");
+        assert_eq!(archive_extension_for_headers(&gzip), ".tar.gz");
+        assert_eq!(archive_extension_for_headers(&absent), ".tar.gz");
+    }
+
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_archive_filename_parses_both_formats() {
+        assert_eq!(archive_version_from_filename("1.2.3.tar.zst"), Some("1.2.3"));
+        assert_eq!(archive_version_from_filename("1.2.3.tar.gz"), Some("1.2.3"));
+        assert_eq!(archive_version_from_filename("README.md"), None);
+    }
 }
 
 #[cfg(not(feature = "tcp"))]
