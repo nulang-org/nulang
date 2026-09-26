@@ -397,6 +397,7 @@ impl Drop for RegistryServer {
     }
 }
 
+#[cfg(feature = "tcp")]
 const PACKAGE_ARCHIVE_EXTENSIONS: [&str; 2] = [".tar.zst", ".tar.gz"];
 
 #[cfg(feature = "tcp")]
