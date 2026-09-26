@@ -710,11 +710,14 @@ pub fn render_route_handler(
 }
 
 fn invalid_ui_action_response(captured: &HttpRequestBindingInputs) -> Option<HttpResponse> {
-    captured.ui_message_error.as_ref().map(|error| HttpResponse {
-        status: 400,
-        headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
-        body: format!("Invalid UI action envelope: {error}").into_bytes(),
-    })
+    captured
+        .ui_message_error
+        .as_ref()
+        .map(|error| HttpResponse {
+            status: 400,
+            headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+            body: format!("Invalid UI action envelope: {error}").into_bytes(),
+        })
 }
 
 /// Dev server that dispatches registered `Web.route` handlers and falls back
@@ -927,39 +930,42 @@ impl WebDevServer {
                                         }
                                     });
                                     match rendered {
-                                    Ok(Some(html)) => HttpResponse {
-                                        status: 200,
-                                        headers: vec![(
-                                            "Content-Type".into(),
-                                            "text/html; charset=utf-8".into(),
-                                        )],
-                                        body: inject_client_runtime_script(&html).into_bytes(),
-                                    },
-                                    Ok(None) => HttpResponse {
-                                        status: 500,
-                                        headers: vec![("Content-Type".into(), "text/plain".into())],
-                                        body: b"Internal server error".to_vec(),
-                                    },
-                                    Err(DirectRequestRenderError::Decode(error)) => {
-                                        let problem = request_decode_problem_response(&error);
-                                        HttpResponse {
-                                            status: problem.status,
-                                            headers: problem.headers,
-                                            body: problem.body,
-                                        }
-                                    }
-                                    Err(DirectRequestRenderError::Execution(error)) => {
-                                        eprintln!("typed route dispatch error: {error}");
-                                        HttpResponse {
+                                        Ok(Some(html)) => HttpResponse {
+                                            status: 200,
+                                            headers: vec![(
+                                                "Content-Type".into(),
+                                                "text/html; charset=utf-8".into(),
+                                            )],
+                                            body: inject_client_runtime_script(&html).into_bytes(),
+                                        },
+                                        Ok(None) => HttpResponse {
                                             status: 500,
                                             headers: vec![(
                                                 "Content-Type".into(),
                                                 "text/plain".into(),
                                             )],
                                             body: b"Internal server error".to_vec(),
+                                        },
+                                        Err(DirectRequestRenderError::Decode(error)) => {
+                                            let problem = request_decode_problem_response(&error);
+                                            HttpResponse {
+                                                status: problem.status,
+                                                headers: problem.headers,
+                                                body: problem.body,
+                                            }
+                                        }
+                                        Err(DirectRequestRenderError::Execution(error)) => {
+                                            eprintln!("typed route dispatch error: {error}");
+                                            HttpResponse {
+                                                status: 500,
+                                                headers: vec![(
+                                                    "Content-Type".into(),
+                                                    "text/plain".into(),
+                                                )],
+                                                body: b"Internal server error".to_vec(),
+                                            }
                                         }
                                     }
-                                }
                                 }
                             } else {
                                 Self::serve_static(
