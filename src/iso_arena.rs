@@ -49,7 +49,7 @@
 //!   escape proof itself: a value that provably never leaves the activation
 //!   is indistinguishable from a message-scoped `iso` temporary for
 //!   reclamation purposes, regardless of its static capability.
-//! * **NaN-boxing:** arena objects are wrapped in `Value::ptr` exactly like
+//! * **Tagged values:** arena objects are wrapped in `Value::ptr` exactly like
 //!   heap objects; every arena object carries a fully initialised
 //!   [`OrcaHeader`] so `array_len` / type-tag inspection work unchanged.
 //! * **ORCA:** arena objects are *not* linked into the actor heap's live

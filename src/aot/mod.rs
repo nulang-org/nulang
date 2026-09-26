@@ -79,7 +79,7 @@ impl AotModule {
 
         let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
 
-        // Register NaN-tag-aware runtime helpers.
+        // Register tagged-word-aware runtime helpers.
         register_runtime_helpers(&mut jit_builder);
 
         let mut jit_module = JITModule::new(jit_builder);
