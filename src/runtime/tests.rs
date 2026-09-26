@@ -3451,9 +3451,21 @@ fn test_workflow_actor_step_event_and_checkpoint() {
     rt.send_message(actor_id, "next", &[]);
     run_ready_actor_turn(&mut rt, actor_id);
 
+    let journal = rt.persistence.read_journal(actor_id);
+    assert_eq!(journal.len(), 1, "the accepted command must be journaled");
+
     let events = rt.persistence.read_workflow_events(actor_id);
     assert_eq!(events.len(), 2);
-    assert!(matches!(&events[1], WorkflowEvent::StepCompleted { .. }));
+    assert!(matches!(
+        &events[1],
+        WorkflowEvent::StepCompleted {
+            activation: Some(WorkflowActivationId {
+                actor_id: terminal_actor,
+                command_sequence,
+            }),
+            ..
+        } if *terminal_actor == actor_id && *command_sequence == journal[0].sequence
+    ));
 
     let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
     assert_eq!(
