@@ -202,6 +202,11 @@ name = "nulang-savina"
 path = "src/bin/nulang_savina.rs"
 required-features = ["savina-bench"]
 
+[[bin]]
+name = "nulang-shard-bench"
+path = "src/bin/nulang_shard_bench.rs"
+required-features = ["savina-bench"]
+
 [profile.release]
 opt-level = 3
 lto = true
