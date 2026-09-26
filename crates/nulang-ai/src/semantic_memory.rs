@@ -28,6 +28,12 @@ pub struct SemanticMemory {
     pub documents: Vec<Document>,
     /// Dimensionality of the embedding vectors.
     pub dimensions: usize,
+    /// Cached document embeddings, aligned by index with `documents`.
+    ///
+    /// Older serialized memories omit this field; searches remain compatible
+    /// and the cache is rebuilt on the next mutation.
+    #[serde(default)]
+    pub embeddings: Vec<Vec<f32>>,
     /// Optional custom embedding function. Defaults to a deterministic hash-based
     /// embedding when `None`.
     #[serde(skip)]
@@ -48,6 +54,7 @@ impl SemanticMemory {
         Self {
             documents: Vec::new(),
             dimensions,
+            embeddings: Vec::new(),
             embedding_fn,
         }
     }
@@ -59,12 +66,17 @@ impl SemanticMemory {
         metadata: HashMap<String, String>,
     ) -> String {
         let content = content.into();
+        if self.embeddings.len() != self.documents.len() {
+            self.rebuild_embeddings();
+        }
+        let embedding = self.embed(&content);
         let id = deterministic_id(&content);
         self.documents.push(Document {
             id: id.clone(),
             content,
             metadata,
         });
+        self.embeddings.push(embedding);
         id
     }
 
@@ -80,9 +92,19 @@ impl SemanticMemory {
         let mut results: Vec<(&Document, f32)> = self
             .documents
             .iter()
-            .map(|doc| {
-                let doc_embedding = self.embed(&doc.content);
-                let score = cosine_similarity(&query_embedding, &doc_embedding);
+            .enumerate()
+            .map(|(index, doc)| {
+                let score = match self.embeddings.get(index) {
+                    Some(embedding) if embedding.len() == self.dimensions => {
+                        cosine_similarity(&query_embedding, embedding)
+                    }
+                    _ => {
+                        // Backward-compatible path for memories serialized
+                        // before embedding caching was introduced.
+                        let embedding = self.embed(&doc.content);
+                        cosine_similarity(&query_embedding, &embedding)
+                    }
+                };
                 (doc, score)
             })
             .collect();
@@ -98,6 +120,9 @@ impl SemanticMemory {
     pub fn delete(&mut self, id: &str) -> bool {
         if let Some(pos) = self.documents.iter().position(|doc| doc.id == id) {
             self.documents.remove(pos);
+            if pos < self.embeddings.len() {
+                self.embeddings.remove(pos);
+            }
             true
         } else {
             false
@@ -112,6 +137,18 @@ impl SemanticMemory {
     /// Return whether the memory contains no documents.
     pub fn is_empty(&self) -> bool {
         self.documents.is_empty()
+    }
+
+    /// Recompute cached embeddings for all documents.
+    ///
+    /// This is useful after loading an older serialized memory that predates
+    /// the embedding cache or after changing the embedding function.
+    pub fn rebuild_embeddings(&mut self) {
+        self.embeddings = self
+            .documents
+            .iter()
+            .map(|document| self.embed(&document.content))
+            .collect();
     }
 
     fn embed(&self, text: &str) -> Vec<f32> {
@@ -257,6 +294,34 @@ mod tests {
     }
 
     #[test]
+    fn test_semantic_memory_caches_document_embeddings() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static EMBED_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn counting_embed(input: &str) -> Vec<f32> {
+            EMBED_CALLS.fetch_add(1, Ordering::SeqCst);
+            let mut out = vec![0.0; 4];
+            for (i, byte) in input.bytes().enumerate() {
+                out[i % 4] += byte as f32;
+            }
+            l2_normalize(&mut out);
+            out
+        }
+
+        EMBED_CALLS.store(0, Ordering::SeqCst);
+        let mut memory = SemanticMemory::new(4, Some(counting_embed));
+        memory.store("cached document", HashMap::new());
+        assert_eq!(EMBED_CALLS.load(Ordering::SeqCst), 1);
+
+        let _ = memory.search("query", 1);
+        assert_eq!(
+            EMBED_CALLS.load(Ordering::SeqCst),
+            2,
+            "search should embed only the query, not every stored document"
+        );
+    }
+
+    #[test]
     fn test_semantic_memory_serialization_roundtrip() {
         let mut memory = SemanticMemory::new(32, None);
         let id1 = memory.store("alpha fact", HashMap::new());
@@ -269,6 +334,7 @@ mod tests {
         let restored: SemanticMemory = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored.len(), 2);
+        assert_eq!(restored.embeddings.len(), 2);
         assert_eq!(restored.documents[0].id, id1);
         assert_eq!(restored.documents[1].id, id2);
         assert_eq!(
