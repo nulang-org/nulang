@@ -89,6 +89,10 @@ jobs:
         working-directory: registry-worker
         run: npm ci --legacy-peer-deps
 
+      - name: Type-check registry worker
+        working-directory: registry-worker
+        run: npx tsc --noEmit
+
       - name: Test registry worker
         working-directory: registry-worker
         run: npm test
