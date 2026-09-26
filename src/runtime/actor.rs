@@ -292,7 +292,7 @@ pub struct Actor {
     /// The counter advances only after the corresponding durable custom event
     /// append succeeds. It intentionally remains on the resident actor across
     /// VM suspension; crash replay reconstructs an activation from ordinal 0.
-    pub next_workflow_replay_ordinal: u32,
+    pub next_workflow_operation_ordinal: u32,
     /// Sentinel heap object used by the cycle detector to represent this
     /// actor as a holder of foreign references.
     cycle_sentinel: Option<*mut OrcaHeader>,
@@ -439,7 +439,7 @@ impl Actor {
             max_reductions: 1000,
             sequence: 0,
             current_workflow_activation: None,
-            next_workflow_replay_ordinal: 0,
+            next_workflow_operation_ordinal: 0,
             cycle_sentinel: None,
             suspended_execution: None,
             waiting_signal: None,
