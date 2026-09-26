@@ -97,41 +97,48 @@ impl std::fmt::Debug for NativeLibrary {
 
 /// A native function callable through the FFI layer.
 ///
-/// The function pointer is stored as an opaque `*const c_void` so it can be
-/// transmuted to the correct `extern "C"` signature at call time.
+/// The registry stores an untyped C *function pointer*, not a raw data
+/// pointer. Function pointers are naturally `Send + Sync`, so thread safety
+/// follows from the representation instead of handwritten unsafe auto-trait
+/// impls. The concrete ABI is still selected only at the unsafe call boundary.
 #[derive(Debug, Clone)]
 pub struct NativeFunction {
-    pub ptr: *const c_void,
+    code: unsafe extern "C" fn(),
     pub signature: Signature,
     pub library: Option<String>,
     pub symbol: String,
 }
 
-// SAFETY: `*const c_void` is used as an opaque function pointer. The registry
-// guarantees that the pointed-to function outlives the registry entry, and all
-// access is serialized by the enclosing `Mutex`.
-unsafe impl Send for NativeFunction {}
-// SAFETY: function pointers are immutable once registered; shared access is
-// safe because `call_native` only reads from the pointer.
-unsafe impl Sync for NativeFunction {}
-
 impl NativeFunction {
-    /// Create a native function entry from a raw C function pointer.
+    /// Create a native function entry from a raw C function address.
     ///
     /// # Safety
-    /// `ptr` must point to a function whose ABI matches `signature`.
+    /// `ptr` must be non-null, remain callable for the lifetime of this
+    /// entry, and point to a function whose ABI matches `signature`.
     pub unsafe fn new(
         ptr: *const c_void,
         signature: Signature,
         library: Option<String>,
         symbol: String,
     ) -> Self {
+        assert!(!ptr.is_null(), "NativeFunction requires a non-null function pointer");
+        // SAFETY: guaranteed by this constructor's contract. Nulang's supported
+        // native FFI targets use the platform C ABI where a dynamic-loader
+        // symbol address can be represented as a C function pointer.
+        let code = unsafe {
+            std::mem::transmute::<*const c_void, unsafe extern "C" fn()>(ptr)
+        };
         Self {
-            ptr,
+            code,
             signature,
             library,
             symbol,
         }
+    }
+
+    /// Untyped callable used by the FFI marshaling layer.
+    pub(crate) fn code_ptr(&self) -> unsafe extern "C" fn() {
+        self.code
     }
 }
 
@@ -289,6 +296,14 @@ mod tests {
     use crate::ffi::marshal::{CType, Signature};
     use std::ffi::c_void;
 
+    extern "C" fn dummy_native() {}
+
+    #[test]
+    fn native_function_is_send_sync_without_manual_impls() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<NativeFunction>();
+    }
+
     #[test]
     fn test_ffi_registry_new() {
         let registry = FfiRegistry::new();
@@ -299,8 +314,8 @@ mod tests {
     #[test]
     fn test_registry_register_and_lookup() {
         let mut registry = FfiRegistry::new();
-        let dummy_ptr = std::ptr::null::<c_void>();
-        // SAFETY: null pointer is never called.
+        let dummy_ptr = dummy_native as *const c_void;
+        // SAFETY: dummy_native is a live C function; tests only exercise registry metadata.
         let func = unsafe {
             NativeFunction::new(
                 dummy_ptr,
@@ -318,8 +333,8 @@ mod tests {
     #[test]
     fn test_registry_list() {
         let mut registry = FfiRegistry::new();
-        let dummy_ptr = std::ptr::null::<c_void>();
-        // SAFETY: null pointers are never called.
+        let dummy_ptr = dummy_native as *const c_void;
+        // SAFETY: dummy_native is a live C function; tests only exercise registry metadata.
         let func1 = unsafe {
             NativeFunction::new(
                 dummy_ptr,
@@ -351,8 +366,8 @@ mod tests {
     #[test]
     fn test_registry_duplicate_name() {
         let mut registry = FfiRegistry::new();
-        let dummy_ptr = std::ptr::null::<c_void>();
-        // SAFETY: null pointers are never called.
+        let dummy_ptr = dummy_native as *const c_void;
+        // SAFETY: dummy_native is a live C function; tests only exercise registry metadata.
         let func1 = unsafe {
             NativeFunction::new(
                 dummy_ptr,
