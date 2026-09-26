@@ -3404,6 +3404,293 @@ fn test_receiver_hold_survives_sender_drop_until_release() {
 // v0.8 Workflow Runtime Tests
 // ========================================================================
 
+#[derive(Clone)]
+struct FailTerminalWorkflowStore {
+    inner: std::sync::Arc<std::sync::Mutex<MemoryStore>>,
+    fail_terminal: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FailTerminalWorkflowStore {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(MemoryStore::new())),
+            fail_terminal: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn fail_terminal_events(&self) {
+        self.fail_terminal
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl PersistenceStore for FailTerminalWorkflowStore {
+    fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> std::io::Result<()> {
+        self.inner.lock().unwrap().save_snapshot(snapshot)
+    }
+
+    fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        self.inner.lock().unwrap().load_snapshot(actor_id)
+    }
+
+    fn append_journal(&mut self, actor_id: u64, entry: JournalEntry) -> std::io::Result<()> {
+        self.inner.lock().unwrap().append_journal(actor_id, entry)
+    }
+
+    fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+        self.inner.lock().unwrap().read_journal(actor_id)
+    }
+
+    fn append_workflow_event(
+        &mut self,
+        actor_id: u64,
+        event: WorkflowEvent,
+    ) -> std::io::Result<()> {
+        if self.fail_terminal.load(std::sync::atomic::Ordering::SeqCst)
+            && matches!(
+                event,
+                WorkflowEvent::StepCompleted { .. } | WorkflowEvent::StepFailed { .. }
+            )
+        {
+            return Err(std::io::Error::other("injected terminal workflow event failure"));
+        }
+        self.inner
+            .lock()
+            .unwrap()
+            .append_workflow_event(actor_id, event)
+    }
+
+    fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+        self.inner.lock().unwrap().read_workflow_events(actor_id)
+    }
+
+    fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> std::io::Result<()> {
+        self.inner.lock().unwrap().append_event(actor_id, entry)
+    }
+
+    fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
+        self.inner.lock().unwrap().read_events(actor_id)
+    }
+
+    fn latest_sequence(&self, actor_id: u64) -> u64 {
+        self.inner.lock().unwrap().latest_sequence(actor_id)
+    }
+
+    fn clear(&mut self, actor_id: u64) -> std::io::Result<()> {
+        self.inner.lock().unwrap().clear(actor_id)
+    }
+}
+
+#[test]
+fn test_workflow_terminal_failure_keeps_last_safe_snapshot() {
+    let mut rt = Runtime::new();
+    let store = FailTerminalWorkflowStore::new();
+    let probe = store.clone();
+    rt.persistence = Box::new(store);
+
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "SafeSnapshotWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", |actor, _args| {
+            let current = actor
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int())
+                .unwrap();
+            actor.set_state_field("step_index", Value::int(current + 1));
+        });
+
+    let safe_snapshot = probe.load_snapshot(actor_id).unwrap();
+    assert_eq!(
+        safe_snapshot.state.get("step_index"),
+        Some(&PersistedValue::Int(0))
+    );
+
+    probe.fail_terminal_events();
+    rt.send_message(actor_id, "next", &[]);
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
+        Some(1),
+        "the in-memory handler ran before the injected terminal write failure"
+    );
+    assert_eq!(
+        probe.read_journal(actor_id).len(),
+        1,
+        "the accepted command remains durably journaled"
+    );
+    assert_eq!(
+        probe.read_workflow_events(actor_id).len(),
+        1,
+        "the terminal event must not appear when its durable append fails"
+    );
+
+    let recovered_snapshot = probe.load_snapshot(actor_id).unwrap();
+    assert_eq!(
+        recovered_snapshot.state.get("step_index"),
+        Some(&PersistedValue::Int(0)),
+        "a failed terminal transition must leave the last completed snapshot intact"
+    );
+}
+
+#[test]
+fn test_terminal_completion_helper_does_not_advance_state_when_marker_fails() {
+    let mut rt = Runtime::new();
+    let store = FailTerminalWorkflowStore::new();
+    let probe = store.clone();
+    rt.persistence = Box::new(store);
+
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "ResumeTerminalWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    probe.fail_terminal_events();
+    let committed = workflow::complete_workflow_step(
+        &mut rt,
+        actor_id,
+        Some(WorkflowActivationId::new(actor_id, 7)),
+        "resume",
+        true,
+    );
+
+    assert!(!committed, "terminal append failure must be observable");
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
+        Some(0),
+        "step progression must wait for the durable terminal marker"
+    );
+    assert_eq!(
+        probe.load_snapshot(actor_id).unwrap().state.get("step_index"),
+        Some(&PersistedValue::Int(0))
+    );
+}
+
+#[test]
+fn test_workflow_custom_event_does_not_checkpoint_partial_state() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "CustomEventSnapshotWorkflow",
+        Box::new(|| vec![("count".to_string(), Value::int(0))]),
+        models,
+    );
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .set_state_field("count", Value::int(7));
+    rt.emit_event(actor_id, "AuditRecorded", &[]);
+
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(
+        snapshot.state.get("count"),
+        Some(&PersistedValue::Int(0)),
+        "nonterminal custom events must not advance the completed-state snapshot"
+    );
+    assert!(matches!(
+        rt.persistence.read_workflow_events(actor_id).last(),
+        Some(WorkflowEvent::Custom { name, .. }) if name == "AuditRecorded"
+    ));
+}
+
+#[test]
+fn test_workflow_timer_events_do_not_checkpoint_partial_state() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "TimerSnapshotWorkflow",
+        Box::new(|| vec![("count".to_string(), Value::int(0))]),
+        models,
+    );
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .set_state_field("count", Value::int(7));
+    rt.append_timer_set(actor_id, "retry", 100).unwrap();
+    rt.append_timer_fired(actor_id, "retry").unwrap();
+
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(
+        snapshot.state.get("count"),
+        Some(&PersistedValue::Int(0)),
+        "timer journal entries must not snapshot an in-flight activation"
+    );
+}
+
+#[test]
+fn test_workflow_signal_event_does_not_checkpoint_partial_state() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "SignalSnapshotWorkflow",
+        Box::new(|| vec![("count".to_string(), Value::int(0))]),
+        models,
+    );
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .set_state_field("count", Value::int(7));
+    rt.append_signal_received(actor_id, "approved", Some("yes".into()))
+        .unwrap();
+
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(
+        snapshot.state.get("count"),
+        Some(&PersistedValue::Int(0)),
+        "signal receipt must not snapshot partial handler state"
+    );
+}
+
+#[test]
+fn test_workflow_compensation_event_does_not_checkpoint_partial_state() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "CompensationSnapshotWorkflow",
+        Box::new(|| vec![("count".to_string(), Value::int(0))]),
+        models,
+    );
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .set_state_field("count", Value::int(7));
+    rt.append_saga_compensated(actor_id, "charge").unwrap();
+
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(
+        snapshot.state.get("count"),
+        Some(&PersistedValue::Int(0)),
+        "compensation journal entries must not independently advance the snapshot"
+    );
+}
+
 #[test]
 fn test_workflow_actor_emits_started_event() {
     let mut rt = Runtime::new();

@@ -8,7 +8,9 @@
 use crate::bytecode::Constant;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
-use crate::runtime::persistence::{EventEntry, PersistedValue, WorkflowEvent};
+use crate::runtime::persistence::{
+    EventEntry, PersistedValue, WorkflowActivationId, WorkflowEvent,
+};
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
 use crate::vm::{Frame, Value, VM};
 
@@ -146,10 +148,11 @@ fn resolve_string_constant(rt: &Runtime, actor_id: u64, value: &Value) -> Option
         })
 }
 
-/// Emit a durable event for a workflow or event-sourced actor. For workflow
-/// actors this appends to the durable journal and forces a checkpoint. For
-/// event-sourced (non-workflow) actors the event is persisted to the event
-/// journal and a checkpoint is forced.
+/// Emit a durable event for a workflow or event-sourced actor.
+///
+/// Workflow events are journaled without advancing the completed-state
+/// snapshot. Until resumable continuations exist, only a terminal
+/// StepCompleted/StepFailed boundary may checkpoint in-flight workflow state.
 pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[Value]) {
     let is_workflow = actor_is_workflow(rt, actor_id);
     let seq = next_sequence(rt, actor_id);
@@ -232,7 +235,6 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 },
             );
         }
-        checkpoint_actor(rt, actor_id);
     }
 }
 
@@ -248,9 +250,7 @@ pub(crate) fn append_timer_set(
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
     rt.persistence
-        .append_timer_set(actor_id, seq, name.to_string(), duration_ms)?;
-    try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+        .append_timer_set(actor_id, seq, name.to_string(), duration_ms)
 }
 
 pub(crate) fn append_timer_fired(
@@ -260,9 +260,7 @@ pub(crate) fn append_timer_fired(
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
     rt.persistence
-        .append_timer_fired(actor_id, seq, name.to_string())?;
-    try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+        .append_timer_fired(actor_id, seq, name.to_string())
 }
 
 pub(crate) fn append_signal_received(
@@ -273,9 +271,7 @@ pub(crate) fn append_signal_received(
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
     rt.persistence
-        .append_signal_received(actor_id, seq, name.to_string(), payload)?;
-    try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+        .append_signal_received(actor_id, seq, name.to_string(), payload)
 }
 
 pub(crate) fn append_saga_compensated(
@@ -285,9 +281,52 @@ pub(crate) fn append_saga_compensated(
 ) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
     rt.persistence
-        .append_saga_compensated(actor_id, seq, step_name.to_string())?;
-    try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+        .append_saga_compensated(actor_id, seq, step_name.to_string())
+}
+
+/// Durably close a successful workflow activation before advancing its
+/// completed-state snapshot.
+///
+/// Returns false when the terminal event could not be persisted. In that case
+/// neither step progression nor snapshot advancement occurs, leaving recovery
+/// anchored at the previous safe boundary.
+pub(crate) fn complete_workflow_step(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<WorkflowActivationId>,
+    step_name: impl Into<String>,
+    advance_step_index: bool,
+) -> bool {
+    let sequence = next_sequence(rt, actor_id);
+    if let Err(error) = rt.persistence.append_workflow_event(
+        actor_id,
+        WorkflowEvent::StepCompleted {
+            sequence,
+            activation,
+            step_name: step_name.into(),
+        },
+    ) {
+        tracing::warn!(
+            actor_id,
+            %error,
+            "failed to persist terminal StepCompleted event"
+        );
+        return false;
+    }
+
+    if advance_step_index {
+        if let Some(actor) = rt.actors.get_mut(&actor_id) {
+            if let Some(index) = actor
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int())
+            {
+                actor.set_state_field("step_index", Value::int(index + 1));
+            }
+        }
+    }
+
+    checkpoint_actor(rt, actor_id);
+    true
 }
 
 // ---------------------------------------------------------------------------
