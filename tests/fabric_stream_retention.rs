@@ -129,6 +129,33 @@ fn retention_refuses_to_prune_past_a_named_consumer_cursor() {
 }
 
 #[test]
+fn retention_refuses_to_prune_an_unacknowledged_delivery_without_a_cursor() {
+    let root = test_dir("inflight");
+    let mut store = FileFabricStreamStore::open(&root).unwrap();
+    store.create_stream("events", one_record_segments()).unwrap();
+    store.append("events", &[1_u8; 32]).unwrap();
+    store.append("events", &[2_u8; 32]).unwrap();
+
+    let deliveries = store
+        .deliver_consumer_at(
+            "events",
+            "worker",
+            1,
+            Duration::from_secs(30),
+            UNIX_EPOCH + Duration::from_secs(100),
+        )
+        .unwrap();
+    assert_eq!(deliveries[0].record.sequence, 1);
+
+    let error = store.retain_from_sequence("events", 2).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("worker"));
+    assert_eq!(store.stream_info("events").unwrap().first_sequence, 1);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn new_consumers_start_immediately_before_the_retained_floor() {
     let root = test_dir("new-consumer");
     let mut store = FileFabricStreamStore::open(&root).unwrap();
