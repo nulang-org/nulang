@@ -12,18 +12,9 @@
 use crate::ast::{AstModule, Decl, Expr, Literal};
 use crate::effect_checker::EffectChecker;
 use crate::types::{Effect, EffectRow, Span};
+pub use nulang_ui_protocol::ActionPlacement;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-
-/// Compile-time placement decision for an action handler.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ActionPlacement {
-    /// The handler only touches browser-local signals/DOM; run it in the client.
-    Client,
-    /// The handler needs the server (DB, request, actor, network, etc.).
-    Server,
-}
 
 /// A node in the dependency graph.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -56,13 +47,133 @@ impl SignalGraph {
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
     }
+
+    /// Project the compiler-owned interaction graph into the renderer-neutral
+    /// nulang-ui/1 protocol. This is intentionally an interaction document,
+    /// not a second HTML tree: DOM/SwiftUI/Compose hosts can consume the same
+    /// signal/action identities without the web layer reparsing source.
+    pub fn to_ui_document(
+        &self,
+        document_id: impl Into<nulang_ui_protocol::DocumentId>,
+        revision: nulang_ui_protocol::Revision,
+    ) -> nulang_ui_protocol::UiDocument {
+        use nulang_ui_protocol::{ActionBinding, ActionId, NodeId, UiNode, WireValue};
+
+        let mut root = UiNode::new(NodeId::from("root"), "interaction_root");
+        let mut nodes = Vec::with_capacity(self.nodes.len() + 1);
+        let mut signal_index = 0usize;
+        let mut read_index = 0usize;
+        let mut action_index = 0usize;
+
+        for graph_node in &self.nodes {
+            let node = match graph_node {
+                GraphNode::Signal { name } => {
+                    let id = NodeId::new(format!("signal:{signal_index}:{name}"));
+                    signal_index += 1;
+                    let mut node = UiNode::new(id.clone(), "signal");
+                    node.properties
+                        .insert("name".to_string(), WireValue::from(name.clone()));
+                    node.properties.insert("value".to_string(), WireValue::Null);
+                    root.children.push(id);
+                    node
+                }
+                GraphNode::Read { signal, path } => {
+                    let id = NodeId::new(format!("read:{read_index}:{signal}"));
+                    read_index += 1;
+                    let mut node = UiNode::new(id.clone(), "signal_read");
+                    node.properties
+                        .insert("signal".to_string(), WireValue::from(signal.clone()));
+                    node.properties
+                        .insert("path".to_string(), WireValue::from(path.clone()));
+                    node.properties.insert("value".to_string(), WireValue::Null);
+                    root.children.push(id);
+                    node
+                }
+                GraphNode::Action {
+                    handler,
+                    path,
+                    placement,
+                } => {
+                    let id = NodeId::new(format!("action:{action_index}:{handler}"));
+                    action_index += 1;
+                    let mut node = UiNode::new(id.clone(), "action");
+                    node.properties
+                        .insert("handler".to_string(), WireValue::from(handler.clone()));
+                    node.properties
+                        .insert("path".to_string(), WireValue::from(path.clone()));
+                    node.actions.push(ActionBinding {
+                        event: "activate".to_string(),
+                        action_id: ActionId::new(handler.clone()),
+                        placement: *placement,
+                    });
+                    root.children.push(id);
+                    node
+                }
+            };
+            nodes.push(node);
+        }
+
+        nodes.push(root);
+        nulang_ui_protocol::UiDocument::new(document_id, revision, NodeId::from("root"), nodes)
+    }
+
+    /// Create a protocol patch for one signal update. The patch updates the
+    /// canonical signal node and every compiler-known read binding in one
+    /// ordered revision transition. Unknown signals return None.
+    pub fn signal_patch(
+        &self,
+        document_id: impl Into<nulang_ui_protocol::DocumentId>,
+        base_revision: nulang_ui_protocol::Revision,
+        revision: nulang_ui_protocol::Revision,
+        signal: &str,
+        value: nulang_ui_protocol::WireValue,
+    ) -> Option<nulang_ui_protocol::UiPatch> {
+        use nulang_ui_protocol::{NodeId, PatchOperation, UiPatch};
+
+        let mut operations = Vec::new();
+        let mut signal_index = 0usize;
+        let mut read_index = 0usize;
+        let mut found_signal = false;
+
+        for graph_node in &self.nodes {
+            match graph_node {
+                GraphNode::Signal { name } => {
+                    if name == signal {
+                        found_signal = true;
+                        operations.push(PatchOperation::SetProperty {
+                            node_id: NodeId::new(format!("signal:{signal_index}:{name}")),
+                            name: "value".to_string(),
+                            value: value.clone(),
+                        });
+                    }
+                    signal_index += 1;
+                }
+                GraphNode::Read {
+                    signal: read_signal,
+                    ..
+                } => {
+                    if read_signal == signal {
+                        operations.push(PatchOperation::SetProperty {
+                            node_id: NodeId::new(format!("read:{read_index}:{read_signal}")),
+                            name: "value".to_string(),
+                            value: value.clone(),
+                        });
+                    }
+                    read_index += 1;
+                }
+                GraphNode::Action { .. } => {}
+            }
+        }
+
+        found_signal.then(|| UiPatch::new(document_id, base_revision, revision, operations))
+    }
 }
 
 /// Analyze a module and build its signal graph.
 ///
 /// If an `EffectChecker` is supplied, action handlers are classified as
-/// `client` or `server` based on their effect row. Without it, every action
-/// defaults to `client`.
+/// `client` or `server` based on their effect row. Without a checker or a
+/// resolved effect row, placement fails closed to `server`.
 pub fn analyze_module(module: &AstModule, checker: Option<&EffectChecker>) -> SignalGraph {
     let mut graph = SignalGraph::default();
     let mut signals: HashSet<String> = HashSet::new();
@@ -306,33 +417,24 @@ fn scan_expr(
 
 fn classify_action(handler: &str, checker: Option<&EffectChecker>) -> ActionPlacement {
     let Some(checker) = checker else {
-        return ActionPlacement::Client;
+        return ActionPlacement::Server;
     };
     let Some(row) = checker.function_row(handler) else {
-        return ActionPlacement::Client;
+        return ActionPlacement::Server;
     };
-    let effects: Vec<_> = match row {
-        EffectRow::Closed(effs) | EffectRow::Open(effs, _) => effs.clone(),
-    };
-    let server_effects = [
-        Effect::Request,
-        Effect::Respond,
-        Effect::DB,
-        Effect::Spawn,
-        Effect::Send,
-        Effect::Receive,
-        Effect::Net,
-        Effect::Realtime,
-        Effect::Migrate,
-        Effect::Python,
-        Effect::Process,
-        Effect::System,
-        Effect::FFI,
-    ];
-    if effects.iter().any(|e| server_effects.contains(e)) {
-        ActionPlacement::Server
-    } else {
-        ActionPlacement::Client
+
+    // Fail closed: only a fully-known, browser-local effect row may execute
+    // client-side. Open rows and every other effect stay server-side so adding
+    // a new privileged effect cannot silently expand browser authority.
+    match row {
+        EffectRow::Closed(effects)
+            if effects
+                .iter()
+                .all(|effect| matches!(effect, Effect::Client)) =>
+        {
+            ActionPlacement::Client
+        }
+        EffectRow::Closed(_) | EffectRow::Open(_, _) => ActionPlacement::Server,
     }
 }
 
@@ -412,6 +514,9 @@ fn path_with_tag(path: &[String], tag: &str) -> String {
 /// client-side signal micro-runtime can hydrate the page. The tag is placed
 /// just before `</body>` when present, otherwise appended at the end.
 pub fn inject_client_runtime_script(html: &str) -> String {
+    if !html.contains("data-signal=") && !html.contains("data-action=") {
+        return html.to_string();
+    }
     let script = r#"<script src="/app.client.js"></script>"#;
     if let Some(pos) = html.rfind("</body>") {
         let mut out = String::with_capacity(html.len() + script.len() + 1);
@@ -674,15 +779,17 @@ fn data_attr(name: &str, value: &str, span: Span) -> Expr {
 }
 
 /// Generate the generic client-side micro-runtime that hydrates signals and
-/// actions from server-rendered HTML. The runtime reads `app.signals.json`
-/// to learn about declared signals and actions, then uses `data-signal` and
-/// `data-action` attributes on the DOM to bind live updates.
+/// actions from server-rendered HTML. Bindings are discovered once from
+/// `data-signal` and `data-action` attributes emitted by the compiler.
 pub fn generate_client_runtime() -> String {
     r#"(function () {
   const signals = {};
+  const signalBindings = Object.create(null);
 
   function refreshSignal(name) {
-    document.querySelectorAll('[data-signal="' + name + '"]').forEach(function (el) {
+    const bindings = signalBindings[name];
+    if (!bindings) return;
+    bindings.forEach(function (el) {
       el.textContent = signals[name];
     });
   }
@@ -695,10 +802,46 @@ pub fn generate_client_runtime() -> String {
     }
   }
 
+  function actionMessageId(prefix) {
+    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+      return prefix + ':' + globalThis.crypto.randomUUID();
+    }
+    return prefix + ':' + Date.now() + ':' + Math.random().toString(16).slice(2);
+  }
+
+  function wireFormPayload(body) {
+    const fields = {};
+    body.forEach(function (value, key) {
+      if (typeof value === 'string') {
+        fields[key] = { type: 'string', value: value };
+      }
+    });
+    return { type: 'object', value: fields };
+  }
+
+  function createActionMessage(handler, placement, body) {
+    const correlationId = actionMessageId('corr');
+    return {
+      type: 'invoke_action',
+      protocol: 'nulang-ui-msg/1',
+      request: {
+        document_id: 'app',
+        revision: '0',
+        action_id: handler,
+        placement: placement,
+        correlation_id: correlationId,
+        idempotency_key: actionMessageId('idem'),
+        payload: wireFormPayload(body)
+      }
+    };
+  }
+
   async function runServerAction(handler, el) {
     const form = el.closest('form');
     const body = form ? new FormData(form) : new FormData();
+    const message = createActionMessage(handler, 'server', body);
     body.append('__nulang_action', handler);
+    body.append('__nulang_ui_message', JSON.stringify(message));
     const response = await fetch(window.location.href, { method: 'POST', body: body });
     if (!response.ok) {
       throw new Error('server action failed: ' + response.status);
@@ -712,6 +855,10 @@ pub fn generate_client_runtime() -> String {
       if (!(name in signals)) {
         signals[name] = el.textContent;
       }
+      if (!signalBindings[name]) {
+        signalBindings[name] = [];
+      }
+      signalBindings[name].push(el);
     });
 
     document.querySelectorAll('[data-action]').forEach(function (el) {
@@ -834,7 +981,7 @@ fn button() -> Html {
         assert!(graph.nodes.contains(&GraphNode::Action {
             handler: "add".to_string(),
             path: "button".to_string(),
-            placement: ActionPlacement::Client,
+            placement: ActionPlacement::Server,
         }));
     }
 
@@ -946,23 +1093,32 @@ fn view() -> Html {
         assert!(js.contains("data-signal"), "data-signal selector not found");
         assert!(js.contains("data-action"), "data-action selector not found");
         assert!(
+            js.contains("signalBindings"),
+            "signal binding index not found"
+        );
+        assert!(
             js.contains("window.location.reload"),
             "server actions should reload the page after POST"
         );
     }
 
     #[test]
-    fn test_inject_client_script_before_body() {
+    fn test_static_html_does_not_inject_client_script() {
         let html = "<html><body><h1>Hi</h1></body></html>";
+        assert_eq!(inject_client_runtime_script(html), html);
+    }
+
+    #[test]
+    fn test_interactive_html_injects_client_script_before_body() {
+        let html = r#"<html><body><span data-signal="count">0</span></body></html>"#;
         let out = inject_client_runtime_script(html);
         assert!(out.contains(r#"<script src="/app.client.js"></script>"#));
-        assert!(out.contains("</body>"));
         assert!(out.find("<script").unwrap() < out.find("</body>").unwrap());
     }
 
     #[test]
-    fn test_inject_client_script_appends_when_no_body() {
-        let html = "<h1>Hi</h1>";
+    fn test_interactive_fragment_injects_client_script() {
+        let html = r#"<button data-action="save">Save</button>"#;
         let out = inject_client_runtime_script(html);
         assert!(out.ends_with(r#"<script src="/app.client.js"></script>"#));
     }
@@ -987,4 +1143,122 @@ fn card() -> Html {
             path: "div > span".to_string(),
         }));
     }
+
+    #[test]
+    fn test_signal_graph_projects_to_valid_ui_protocol_document() {
+        let module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("0")
+
+fn add() {}
+
+fn view() -> Html {
+    <div>
+        <span>{count}</span>
+        <button action={add}>Add</button>
+    </div>
+}
+"#,
+        );
+        let mut checker = crate::effect_checker::EffectChecker::new();
+        let _ = checker.check_module(&module.decls);
+        let graph = analyze_module(&module, Some(&checker));
+
+        let document = graph.to_ui_document("app", nulang_ui_protocol::Revision(1));
+        document
+            .validate()
+            .expect("interaction document must be valid");
+
+        assert_eq!(document.document_id.as_str(), "app");
+        assert_eq!(document.revision, nulang_ui_protocol::Revision(1));
+
+        let signal = document
+            .nodes
+            .iter()
+            .find(|node| node.kind == "signal")
+            .expect("signal node");
+        assert_eq!(
+            signal.properties.get("name"),
+            Some(&nulang_ui_protocol::WireValue::from("count"))
+        );
+
+        let action = document
+            .nodes
+            .iter()
+            .find(|node| node.kind == "action")
+            .expect("action node");
+        assert_eq!(action.actions.len(), 1);
+        assert_eq!(action.actions[0].action_id.as_str(), "add");
+        assert_eq!(action.actions[0].event, "activate");
+        assert_eq!(action.actions[0].placement, ActionPlacement::Client);
+    }
+
+    #[test]
+    fn test_signal_patch_updates_state_and_all_read_bindings() {
+        let module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+signal count: Html = text("0")
+
+fn view() -> Html {
+    <div><span>{count}</span><strong>{count}</strong></div>
+}
+"#,
+        );
+        let graph = analyze_module(&module, None);
+        let mut document = graph.to_ui_document("app", nulang_ui_protocol::Revision(4));
+
+        let patch = graph
+            .signal_patch(
+                "app",
+                nulang_ui_protocol::Revision(4),
+                nulang_ui_protocol::Revision(5),
+                "count",
+                nulang_ui_protocol::WireValue::from("1"),
+            )
+            .expect("known signal should produce a patch");
+
+        assert_eq!(patch.operations.len(), 3);
+        document.apply_patch(&patch).expect("patch should apply");
+
+        let updated: Vec<_> = document
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.properties.get("signal") == Some(&nulang_ui_protocol::WireValue::from("count"))
+                    || node.properties.get("name")
+                        == Some(&nulang_ui_protocol::WireValue::from("count"))
+            })
+            .collect();
+        assert_eq!(updated.len(), 3);
+        assert!(updated.iter().all(|node| {
+            node.properties.get("value") == Some(&nulang_ui_protocol::WireValue::from("1"))
+        }));
+
+        assert!(graph
+            .signal_patch(
+                "app",
+                nulang_ui_protocol::Revision(5),
+                nulang_ui_protocol::Revision(6),
+                "missing",
+                nulang_ui_protocol::WireValue::from("x"),
+            )
+            .is_none());
+    }
+    #[test]
+    fn test_client_runtime_emits_canonical_ui_action_message() {
+        let js = generate_client_runtime();
+        assert!(js.contains("__nulang_ui_message"));
+        assert!(js.contains("nulang-ui-msg/1"));
+        assert!(js.contains("invoke_action"));
+        assert!(js.contains("document_id"));
+        assert!(js.contains("idempotency_key"));
+        assert!(js.contains("__nulang_action"));
+    }
+
 }
