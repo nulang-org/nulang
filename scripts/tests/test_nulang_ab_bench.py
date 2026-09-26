@@ -14,6 +14,16 @@ nulang_ab_bench = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nulang_ab_bench)
 
 
+class CargoCommandTests(unittest.TestCase):
+    def test_benchmark_commands_compile_only_library_test_target(self):
+        for command in (
+            nulang_ab_bench.cargo_build_command([]),
+            nulang_ab_bench.cargo_command([]),
+        ):
+            self.assertIn("--lib", command)
+            self.assertLess(command.index("--lib"), command.index("benchmarks::bench_"))
+
+
 class CommandOutputTests(unittest.TestCase):
     def test_failed_command_preserves_captured_diagnostics_on_stderr(self):
         completed = subprocess.CompletedProcess(

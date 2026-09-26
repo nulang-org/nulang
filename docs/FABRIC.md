@@ -212,7 +212,7 @@ semantics that later cluster and stream layers can reuse.
 - [x] Bounded lagging committed-replica catch-up.
 - [x] Committed-index propagation to followers.
 - [x] Durable monotonic consumer cursors.
-- [ ] Consumer ACK/NACK and timed redelivery.
+- [x] Consumer ACK/NACK and timed redelivery.
 - [x] Replay by sequence and committed consumer cursor.
 - [ ] Seek by time.
 - [ ] Retention policies.

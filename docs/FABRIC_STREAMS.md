@@ -14,6 +14,7 @@ Each stream has:
 - `meta.json` — format version and segment-size configuration.
 - `<base-sequence>.seg` — ordered immutable-history segments.
 - `cursors.json` — atomically replaced consumer cursor state.
+- `deliveries.json` — durable per-consumer in-flight leases, ACK gaps, and delivery attempts.
 
 Records are assigned monotonically increasing 64-bit sequence numbers starting
 at 1. A record frame contains:
@@ -57,13 +58,19 @@ record larger than the target is allowed to occupy its own segment.
 
 ### Consumer cursors and replay
 
-A cursor is the last fully processed stream sequence for a named consumer.
-Cursor commits are monotonic and cannot advance beyond the current stream tail.
+A cursor is the last contiguous fully processed stream sequence for a named
+consumer. Cursor commits are monotonic and cannot advance beyond the current
+stream tail.
 
-`read_consumer(stream, consumer, limit)` replays from `cursor + 1`.
+`read_consumer(stream, consumer, limit)` remains the raw replay API from
+`cursor + 1`.
 
-This establishes the persistence primitive needed for later ACK/NACK semantics
-without pretending that ACK redelivery already exists.
+For acknowledged delivery, `deliver_consumer` creates durable per-record
+leases. An unacknowledged record is hidden until its ACK deadline expires; a
+NACK expires the lease immediately. Redelivery increments the attempt counter.
+ACKs may arrive out of order, but the durable cursor advances only across a
+contiguous acknowledged prefix, so ACKing sequence 5 cannot skip an unprocessed
+sequence 4. Delivery state survives process restart through `deliveries.json`.
 
 ## Runtime APIs
 
@@ -77,6 +84,20 @@ let sequence = runtime.fabric_stream_append("orders", payload)?;
 let records = runtime.fabric_stream_read("orders", 1, 100)?;
 runtime.fabric_stream_commit_cursor("orders", "billing", sequence)?;
 let pending = runtime.fabric_stream_read_consumer("orders", "billing", 100)?;
+
+let deliveries = runtime.fabric_stream_deliver_consumer(
+    "orders",
+    "billing-v2",
+    100,
+    std::time::Duration::from_secs(30),
+)?;
+if let Some(delivery) = deliveries.first() {
+    runtime.fabric_stream_ack_consumer(
+        "orders",
+        "billing-v2",
+        delivery.record.sequence,
+    )?;
+}
 ```
 
 Available APIs:
@@ -86,6 +107,9 @@ Available APIs:
 - `fabric_stream_append`
 - `fabric_stream_read`
 - `fabric_stream_read_consumer`
+- `fabric_stream_deliver_consumer`
+- `fabric_stream_ack_consumer`
+- `fabric_stream_nack_consumer`
 - `fabric_stream_commit_cursor`
 - `fabric_stream_cursor`
 - `fabric_stream_info`
@@ -97,14 +121,13 @@ must add:
 
 1. partition ownership and replica placement,
 2. replicated append / quorum policy,
-3. ACK/NACK and timed redelivery,
-4. retention by age/bytes/sequence,
-5. dead-letter streams,
-6. producer deduplication/idempotency keys,
-7. consumer groups and partition assignment,
-8. sequence/time seek indexes,
-9. typed language-level stream declarations,
-10. NATS JetStream compatibility only after native semantics stabilize.
+3. retention by age/bytes/sequence,
+4. dead-letter streams,
+5. producer deduplication/idempotency keys,
+6. consumer groups and partition assignment,
+7. sequence/time seek indexes,
+8. typed language-level stream declarations,
+9. NATS JetStream compatibility only after native semantics stabilize.
 
 The architectural boundary is intentional: the append log should remain usable
 for embedded/single-node Nulang even when cluster replication is disabled.
@@ -286,8 +309,9 @@ catch-up and failover protocol.
 - `fabric_stream_read_committed`
 
 This ACK layer concerns **replica durability**, not consumer delivery. Consumer
-ACK/NACK, timed redelivery, dead-letter streams, and consumer groups remain
-separate future work.
+ACK/NACK and timed redelivery are implemented separately through durable
+delivery leases. Dead-letter streams and durable consumer-group assignment
+remain future work.
 
 
 ## Durable replication intent and restart recovery
