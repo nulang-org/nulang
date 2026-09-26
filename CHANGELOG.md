@@ -1,5 +1,11 @@
 # Nulang Changelog
 
+### Representation-derived NativeFunction thread safety — 2026-09-26
+- **`NativeFunction` no longer manually implements `Send` or `Sync`.** It stores an untyped C function pointer instead of a raw `*const c_void`, so the global FFI registry's thread-safety follows from Rust's function-pointer auto-traits.
+- **Raw symbol addresses are validated once at construction.** Null addresses are rejected and the unsafe constructor converts a live dynamic-loader/test function address into the internal callable representation; ABI-specific casts remain in the already-unsafe marshaling call path.
+- **Tests and CI pin both sides of the contract.** A compile-time assertion requires `NativeFunction: Send + Sync`, while the repository verifier rejects handwritten auto-trait impls or a regression to raw data-pointer storage.
+
+
 ### Scheduler-local ORCA graph records — 2026-09-26
 - **ORCA graph pointer records no longer assert cross-thread auto-traits.** `ForeignEdge` drops handwritten `Send`/`Sync`, and `ForeignRefNode` drops handwritten `Send`; both remain owned by the single-threaded `CycleDetector`.
 - **The detector was already non-`Send`.** Its `Suspect` queue contains raw header pointers without auto-trait overrides, so the removed impls did not enable moving the detector and only widened the public pointer-bearing types.

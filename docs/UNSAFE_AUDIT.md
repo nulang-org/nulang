@@ -103,22 +103,25 @@ registered `Signature` — a wrong signature is instant UB at call time.
 stable; for FFI, this is inherent to dynamic loading — the library allowlist
 (`ffi/native.rs::is_lib_allowed`) is the real mitigation.
 
-### F6 — MEDIUM — `unsafe impl Send/Sync` on raw-pointer runtime types
-Two scheduler-local subsets are now resolved:
+### F6 — MEDIUM — unsafe auto-traits on raw-pointer runtime types
+Three previously handwritten auto-trait boundaries are now representation- or
+ownership-enforced:
 
-- `BytecodeRuntimeCallbacks` / `BytecodeDistributedCallbacks` no longer
-  override `Send` or `Sync`; raw Runtime-pointer construction is an explicit
-  unsafe `from_raw` boundary pinned by the repository verifier.
-- `ForeignEdge` / `ForeignRefNode` no longer override `Send`/`Sync`.
-  They are graph records owned by the single-threaded `CycleDetector`, which
-  is already non-`Send` because its `Suspect` queue carries raw pointers.
-  Repository verification rejects reintroducing those graph auto-traits.
+- `BytecodeRuntimeCallbacks` / `BytecodeDistributedCallbacks` are
+  scheduler-thread-confined and no longer override `Send`/`Sync`.
+- `ForeignEdge` / `ForeignRefNode` remain scheduler-local graph records and
+  no longer override `Send`/`Sync`.
+- `NativeFunction` stores an untyped `unsafe extern "C" fn()` callable rather
+  than `*const c_void`. C function pointers are naturally `Send + Sync`, so
+  the global `Mutex<FfiRegistry>` remains thread-safe without handwritten
+  unsafe auto-traits. The raw dynamic-loader address is validated non-null and
+  converted once at the unsafe constructor boundary; concrete ABI selection
+  still happens only inside `call_native`.
 
-Remaining sites are `src/ffi/native.rs` (`NativeFunction`) and
-`src/runtime/heap.rs` (`ActorHeap`). Those have materially different
-requirements: native function pointers may live in a shared registry, while
-`ActorHeap: Send` is intended to support actor migration between scheduler
-threads. They should be audited independently rather than removed mechanically.
+The remaining site is `src/runtime/heap.rs` (`ActorHeap: Send`). That case
+is intentionally different: actor-owned heaps are designed to move with actors
+between scheduler threads while remaining non-`Sync`. Do not remove that impl
+without first changing the actor migration/scheduler ownership model.
 
 ### F7 — LOW — heap serializer trusts recorded payload sizes
 `src/runtime/heap_serialize.rs:342`, `431`, `692`, `706`:

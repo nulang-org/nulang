@@ -267,6 +267,34 @@ def verify_files():
                 )
                 return False
 
+    # 11. NativeFunction must remain thread-safe without handwritten
+    # unsafe auto-trait assertions. Store an actual C function pointer rather
+    # than a raw data pointer so Send/Sync follow from Rust's function-pointer
+    # semantics while ABI-specific casts stay inside the unsafe call boundary.
+    native_path = "src/ffi/native.rs"
+    if not os.path.exists(native_path):
+        print(f"Error: {native_path} does not exist.")
+        return False
+    with open(native_path, "r", encoding="utf-8") as f:
+        native_content = f.read()
+
+    for auto_trait in ("Send", "Sync"):
+        forbidden = f"unsafe impl {auto_trait} for NativeFunction"
+        if forbidden in native_content:
+            print(
+                "Error: NativeFunction manually implements "
+                f"{auto_trait}; use an auto-trait-safe function-pointer "
+                "representation instead of overriding raw-pointer semantics."
+            )
+            return False
+
+    if "pub ptr: *const c_void" in native_content:
+        print(
+            "Error: NativeFunction stores a raw data pointer; keep the registry "
+            "thread-safe via an opaque C function pointer representation."
+        )
+        return False
+
     if not check_stdlib_manifest():
         return False
 
