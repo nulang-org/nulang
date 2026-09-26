@@ -591,9 +591,17 @@ impl Resolver {
             span: Span::default(),
         })?;
 
-        let cursor = std::io::Cursor::new(tarball);
-        let gz = flate2::read::GzDecoder::new(cursor);
-        let mut archive = tar::Archive::new(gz);
+        let tar_bytes = crate::package::archive::decode_archive(&tarball).map_err(|e| {
+            NuError::PackageError {
+                msg: format!(
+                    "cannot decode '{}-{}' registry archive from {}: {}",
+                    dep_name, best, registry_url, e
+                ),
+                span: Span::default(),
+            }
+        })?;
+        let cursor = std::io::Cursor::new(tar_bytes);
+        let mut archive = tar::Archive::new(cursor);
         archive.unpack(&dest).map_err(|e| NuError::PackageError {
             msg: format!("cannot extract '{}' to {}: {}", dep_name, dest.display(), e),
             span: Span::default(),

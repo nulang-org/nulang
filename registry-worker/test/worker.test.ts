@@ -107,4 +107,13 @@ describe('without QUOTA_HOOK_URL', () => {
     expect(res.status).toBe(201);
     expect(env.stored).toEqual(['foo/1.0.0.tar.gz']);
   });
+
+  it('stores zstd package archives under the canonical .tar.zst key', async () => {
+    const env = makeEnv();
+    const res = await publish(env, 'zstd-bytes', {
+      'Content-Type': 'application/zstd',
+    });
+    expect(res.status).toBe(201);
+    expect(env.stored).toEqual(['foo/1.0.0.tar.zst']);
+  });
 });

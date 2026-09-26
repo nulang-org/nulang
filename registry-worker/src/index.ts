@@ -1,5 +1,24 @@
 import { sortSemver } from './semver';
 
+const PACKAGE_EXTENSIONS = ['.tar.zst', '.tar.gz'] as const;
+
+function packageExtensionForRequest(request: Request): (typeof PACKAGE_EXTENSIONS)[number] {
+  return request.headers.get('Content-Type')?.split(';', 1)[0].trim().toLowerCase() ===
+    'application/zstd'
+    ? '.tar.zst'
+    : '.tar.gz';
+}
+
+function stripPackageExtension(filename: string): string | null {
+  for (const extension of PACKAGE_EXTENSIONS) {
+    if (filename.endsWith(extension)) {
+      return filename.slice(0, -extension.length);
+    }
+  }
+  return null;
+}
+
+
 export interface Env {
   BUCKET: R2Bucket;
   PUBLISH_TOKEN: string;
@@ -61,14 +80,15 @@ export default {
       do {
         const listed: R2Objects = await env.BUCKET.list({ cursor });
         for (const obj of listed.objects) {
-          // key format: "name/version.tar.gz"
+          // key format: "name/version.tar.{zst,gz}"
           const slash = obj.key.lastIndexOf('/');
-          if (slash <= 0 || !obj.key.endsWith('.tar.gz')) continue;
+          if (slash <= 0) continue;
           const name = obj.key.substring(0, slash);
-          const version = obj.key.substring(slash + 1).replace(/\.tar\.gz$/, '');
+          const version = stripPackageExtension(obj.key.substring(slash + 1));
+          if (!version) continue;
           const versions = packages.get(name);
           if (versions) {
-            versions.push(version);
+            if (!versions.includes(version)) versions.push(version);
           } else {
             packages.set(name, [version]);
           }
@@ -90,14 +110,16 @@ export default {
     if (matchVersion) {
       const name = matchVersion[1];
       const version = matchVersion[2];
-      const key = `${name}/${version}.tar.gz`;
-
       if (method === 'GET') {
-        const object = await env.BUCKET.get(key);
+        let object: R2ObjectBody | null = null;
+        for (const extension of PACKAGE_EXTENSIONS) {
+          object = await env.BUCKET.get(`${name}/${version}${extension}`);
+          if (object) break;
+        }
         if (!object) {
           return new Response('Not found', { status: 404 });
         }
-        
+
         const headers = new Headers();
         object.writeHttpMetadata(headers);
         headers.set('Content-Type', 'application/octet-stream');
@@ -123,10 +145,12 @@ export default {
           );
         }
 
-        // Check if version already exists
-        const existing = await env.BUCKET.head(key);
-        if (existing) {
-          return new Response('Conflict: Version already exists', { status: 409 });
+        // A package version is immutable regardless of archive compression.
+        for (const extension of PACKAGE_EXTENSIONS) {
+          const existing = await env.BUCKET.head(`${name}/${version}${extension}`);
+          if (existing) {
+            return new Response('Conflict: Version already exists', { status: 409 });
+          }
         }
 
         // Optional publish-quota hook (hosted deployments)
@@ -140,7 +164,14 @@ export default {
           return quotaRejection;
         }
         
-        await env.BUCKET.put(key, request.body);
+        const extension = packageExtensionForRequest(request);
+        const key = `${name}/${version}${extension}`;
+        await env.BUCKET.put(key, request.body, {
+          httpMetadata: {
+            contentType:
+              extension === '.tar.zst' ? 'application/zstd' : 'application/gzip',
+          },
+        });
         return new Response('Created', { status: 201 });
       }
     }
@@ -152,10 +183,13 @@ export default {
       const prefix = `${name}/`;
       
       const listed = await env.BUCKET.list({ prefix });
-      const versions = listed.objects.map(obj => {
-        // key format: "name/version.tar.gz" -> extract "version"
-        return obj.key.substring(prefix.length).replace('.tar.gz', '');
-      });
+      const versions = Array.from(
+        new Set(
+          listed.objects
+            .map(obj => stripPackageExtension(obj.key.substring(prefix.length)))
+            .filter((version): version is string => version !== null)
+        )
+      );
 
       if (versions.length === 0) {
         return new Response('Not found', { status: 404 });
