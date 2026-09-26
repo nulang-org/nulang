@@ -2,8 +2,9 @@
 //!
 //! This is the first stream-storage slice: an append-only segmented log with
 //! monotonic sequence numbers, per-record checksums, crash-tail repair,
-//! persisted consumer cursors, and replay. Replication, retention, consumer
-//! groups, and ACK/NACK redelivery build on this storage contract later.
+//! persisted consumer cursors, replay, and durable consumer delivery leases.
+//! Replication, retention, dead-lettering, and durable consumer-group
+//! assignment build on this storage contract.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
