@@ -432,6 +432,48 @@ mod tests {
 
     #[test]
     #[cfg(feature = "tcp")]
+    fn test_archive_upload_rejects_mime_magic_mismatch() {
+        let zstd = vec![("Content-Type".to_string(), "application/zstd".to_string())];
+        let gzip_bytes = [0x1f, 0x8b, 0x08, 0x00];
+
+        assert!(archive_extension_for_upload(&zstd, &gzip_bytes).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_archive_upload_rejects_unsupported_content_type() {
+        let unsupported = vec![(
+            "Content-Type".to_string(),
+            "application/octet-stream".to_string(),
+        )];
+        let gzip_bytes = [0x1f, 0x8b, 0x08, 0x00];
+
+        assert!(archive_extension_for_upload(&unsupported, &gzip_bytes).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_version_reservation_is_atomic() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nulang-registry-reservation-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = reserve_package_version(&dir, "1.0.0").unwrap();
+        let second = reserve_package_version(&dir, "1.0.0").unwrap_err();
+        assert_eq!(second.kind(), std::io::ErrorKind::AlreadyExists);
+
+        drop(first);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "tcp")]
     fn test_archive_filename_parses_both_formats() {
         assert_eq!(archive_version_from_filename("1.2.3.tar.zst"), Some("1.2.3"));
         assert_eq!(archive_version_from_filename("1.2.3.tar.gz"), Some("1.2.3"));
