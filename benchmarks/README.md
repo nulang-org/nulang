@@ -76,8 +76,13 @@ ranking; see the cross-runtime README for the full interpretation constraints.
 `scripts/nulang_ab_bench.py` compares the current checkout against an exact
 base ref on one host. Both variants are built before measurement, runs alternate
 base/candidate order to reduce thermal/load drift bias, and measured processes
-default to the same logical CPU. The report includes each workload's median
-throughput plus candidate-vs-base throughput, latency, and speedup deltas.
+default to the same logical CPU. The report retains each workload's aggregate
+median throughput for compatibility, but optimization evidence is also computed
+from **round-aligned base/candidate pairs**. It reports the median paired
+throughput/latency change, median speedup, and a deterministic percentile-
+bootstrap 95% interval for the paired speedup. Pairing reduces the effect of
+host-load and thermal drift that a ratio of two independent medians cannot
+cancel.
 
 The `Nulang actor A/B benchmarks` workflow uses the pull request's exact base
 SHA rather than a moving branch name. This makes stacked performance PRs
@@ -92,15 +97,20 @@ is needed.
 Nulang-only A/B probes include a mailbox-only one-value admission lower bound,
 a 0/1/4/5/16-value runtime enqueue sweep around the small-message inline
 boundary, a matched warmed-bytecode/JIT vs AOT actor-drain comparison over the
-same actor source, and first-run JIT-vs-interpreter crossover probes at 3k, 4k,
-5k, and 7.5k loop trips. The actor comparison warms bytecode past the tier-up
+same actor source, first-run JIT-vs-interpreter crossover probes at 3k, 4k,
+5k, and 7.5k loop trips, and two warmed 100k-iteration JIT execution controls:
+a non-reentrant arithmetic loop plus a call-heavy loop that re-enters the VM. The actor comparison warms bytecode past the tier-up
 threshold before timing and excludes enqueue time for both backends; it also
 emits a `[backend-bench]` AOT speedup line. The tiering probes preconstruct
 fresh VMs so their timed sections include interpreter execution and JIT
 compilation/native execution, but not source compilation or VM/module setup.
 The mailbox-vs-runtime pair is diagnostic: it isolates how much local-send cost
 lives above message construction and mailbox admission before routing or
-scheduler changes are attempted. The ordinary Nulang-only timings are emitted
+scheduler changes are attempted. The warmed JIT pair is likewise diagnostic:
+the arithmetic loop exercises the non-reentrant native transition path while
+the call-heavy loop is a negative control that still requires VM re-entry.
+Both assert interpreter parity and that at least one JIT region actually
+compiled before timing. The ordinary Nulang-only timings are emitted
 as `[ab-bench]` records and are never folded into the cross-language
 Rust/Go/Erlang comparison.
 
