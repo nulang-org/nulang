@@ -30,6 +30,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::dst::DeterministicRng;
 use crate::runtime::network::DeterministicNetworkTransport;
 use crate::runtime::{ActorAddress, NodeId, Runtime};
@@ -44,6 +46,54 @@ const ROUND_STEP: Duration = Duration::from_millis(100);
 /// behavior fail as `StepLimitExceeded` instead of hanging the harness.
 const STEPS_BUDGET: u64 = 100_000;
 
+/// A deterministic fault that can be injected at an exact simulation round.
+///
+/// Keeping faults as data rather than ad-hoc test control flow makes a failing
+/// run reproducible from a compact seed + fault script, mirroring the
+/// FoundationDB simulation approach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ClusterFault {
+    Partition { from: usize, to: usize },
+    Heal { node: usize },
+    Crash { node: usize },
+    Restart { node: usize },
+    ReorderAll { enabled: bool },
+}
+
+/// One fault scheduled for the beginning of a simulation round.
+///
+/// Round zero is the first call to `step_round`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ScheduledFault {
+    pub round: u64,
+    pub fault: ClusterFault,
+}
+
+/// Compact deterministic trace emitted by the cluster harness.
+///
+/// The trace intentionally records *decisions* rather than every packet so a
+/// failing run is cheap to persist while still capturing the seeded execution
+/// order and every injected fault.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ClusterTraceEvent {
+    FaultScheduled { round: u64, fault: ClusterFault },
+    FaultApplied { round: u64, fault: ClusterFault },
+    RoundOrder { round: u64, order: Vec<usize> },
+    NodeSkippedCrashed { round: u64, node: usize },
+    SchedulerStep {
+        round: u64,
+        node: usize,
+        step_limit_exceeded: bool,
+    },
+}
+
+/// Minimal artifact required to reproduce a deterministic cluster fault run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ClusterReplayPlan {
+    pub seed: u64,
+    pub faults: Vec<ScheduledFault>,
+}
+
 /// Deterministic multi-node cluster harness.
 pub(crate) struct DeterministicCluster {
     /// The real runtimes, one per simulated node (index-aligned with
@@ -51,6 +101,8 @@ pub(crate) struct DeterministicCluster {
     pub nodes: Vec<Runtime>,
     /// Node addresses; each node's id is derived from its address.
     pub addrs: Vec<SocketAddr>,
+    /// Original seed retained so a run can emit a complete replay artifact.
+    seed: u64,
     /// Master seeded RNG: drives per-round node order and hands each
     /// node's scheduler its selections from one shared stream.
     rng: DeterministicRng,
@@ -83,6 +135,10 @@ pub(crate) struct DeterministicCluster {
     /// How many times a node hit the per-round step budget
     /// (`STEPS_BUDGET`, i.e. `StepLimitExceeded`) — a livelock signal.
     pub limit_hits: u64,
+    /// Deterministic fault script, ordered by round then insertion order.
+    fault_script: Vec<ScheduledFault>,
+    /// Decision/fault trace for exact failure reproduction.
+    trace: Vec<ClusterTraceEvent>,
 }
 
 impl DeterministicCluster {
@@ -122,6 +178,7 @@ impl DeterministicCluster {
         DeterministicCluster {
             nodes,
             addrs: addrs.to_vec(),
+            seed,
             rng,
             partitions: vec![std::collections::HashSet::new(); addrs.len()],
             crashed: vec![false; addrs.len()],
@@ -129,6 +186,89 @@ impl DeterministicCluster {
             bus,
             round: 0,
             limit_hits: 0,
+            fault_script: Vec::new(),
+            trace: Vec::new(),
+        }
+    }
+
+    /// Schedule a deterministic fault for the beginning of `round`.
+    ///
+    /// Scheduling a fault in an already-completed round is rejected because it
+    /// would make replay semantics ambiguous.
+    pub fn schedule_fault(&mut self, round: u64, fault: ClusterFault) {
+        assert!(
+            round >= self.round,
+            "cannot schedule fault for completed round {round}; current round is {}",
+            self.round
+        );
+        self.trace.push(ClusterTraceEvent::FaultScheduled {
+            round,
+            fault: fault.clone(),
+        });
+        self.fault_script.push(ScheduledFault { round, fault });
+        self.fault_script.sort_by_key(|scheduled| scheduled.round);
+    }
+
+    /// Exact deterministic decision/fault trace for this run.
+    pub fn trace(&self) -> &[ClusterTraceEvent] {
+        &self.trace
+    }
+
+    /// Drop accumulated trace events without changing simulator state.
+    pub fn clear_trace(&mut self) {
+        self.trace.clear();
+    }
+
+    fn apply_scheduled_faults(&mut self) {
+        let round = self.round;
+        let split = self
+            .fault_script
+            .iter()
+            .take_while(|scheduled| scheduled.round == round)
+            .count();
+        if split == 0 {
+            return;
+        }
+        let due: Vec<ScheduledFault> = self.fault_script.drain(..split).collect();
+        for scheduled in due {
+            match scheduled.fault {
+                ClusterFault::Partition { from, to } => self.partition(from, to),
+                ClusterFault::Heal { node } => self.heal(node),
+                ClusterFault::Crash { node } => self.crash_node(node),
+                ClusterFault::Restart { node } => self.restart_node(node),
+                ClusterFault::ReorderAll { enabled } => self.set_reorder_all(enabled),
+            }
+        }
+    }
+
+    /// Build a fresh cluster from a persisted seed + fault script.
+    pub fn from_replay_plan(addrs: &[SocketAddr], plan: &ClusterReplayPlan) -> Self {
+        let mut cluster = Self::new(addrs, plan.seed);
+        for scheduled in &plan.faults {
+            cluster.schedule_fault(scheduled.round, scheduled.fault.clone());
+        }
+        cluster
+    }
+
+    /// Export the minimal artifact needed to replay this run.
+    ///
+    /// Scheduled faults are recovered from the immutable trace, so faults that
+    /// have already fired are still present after `fault_script` is drained.
+    pub fn replay_plan(&self) -> ClusterReplayPlan {
+        let faults = self
+            .trace
+            .iter()
+            .filter_map(|event| match event {
+                ClusterTraceEvent::FaultScheduled { round, fault } => Some(ScheduledFault {
+                    round: *round,
+                    fault: fault.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        ClusterReplayPlan {
+            seed: self.seed,
+            faults,
         }
     }
 
@@ -154,12 +294,20 @@ impl DeterministicCluster {
         let pid = self.id(to);
         self.partitions[from].insert(pid);
         self.apply_partitions();
+        self.trace.push(ClusterTraceEvent::FaultApplied {
+            round: self.round,
+            fault: ClusterFault::Partition { from, to },
+        });
     }
 
     /// Restore every outbound link of the node at `index`.
     pub fn heal(&mut self, index: usize) {
         self.partitions[index].clear();
         self.apply_partitions();
+        self.trace.push(ClusterTraceEvent::FaultApplied {
+            round: self.round,
+            fault: ClusterFault::Heal { node: index },
+        });
     }
 
     /// Hard-crash the node at `index`: it is removed from the pump and
@@ -178,6 +326,10 @@ impl DeterministicCluster {
             }
         }
         self.apply_partitions();
+        self.trace.push(ClusterTraceEvent::FaultApplied {
+            round: self.round,
+            fault: ClusterFault::Crash { node: index },
+        });
     }
 
     /// Restart the node at `index`: replace its Runtime with a fresh one
@@ -219,6 +371,10 @@ impl DeterministicCluster {
             peers.remove(&pid);
         }
         self.apply_partitions();
+        self.trace.push(ClusterTraceEvent::FaultApplied {
+            round: self.round,
+            fault: ClusterFault::Restart { node: index },
+        });
     }
 
     /// Push the harness-owned partition sets into the transports
@@ -247,6 +403,10 @@ impl DeterministicCluster {
                 transport.set_reorder(enabled);
             }
         }
+        self.trace.push(ClusterTraceEvent::FaultApplied {
+            round: self.round,
+            fault: ClusterFault::ReorderAll { enabled },
+        });
     }
 
     /// Run one round: advance every node's virtual clock by `ROUND_STEP`,
@@ -255,6 +415,7 @@ impl DeterministicCluster {
     /// its deterministic scheduler until its local actors Quiesce or the
     /// step budget is exhausted.
     pub fn step_round(&mut self) {
+        self.apply_scheduled_faults();
         let n = self.nodes.len();
         // Seeded Fisher-Yates over node indices: which node runs first in
         // this round is part of what the seed permutes.
@@ -263,11 +424,19 @@ impl DeterministicCluster {
             let j = (self.rng.next() as usize) % (n - i);
             order.swap(i, i + j);
         }
+        self.trace.push(ClusterTraceEvent::RoundOrder {
+            round: self.round,
+            order: order.clone(),
+        });
         for idx in order {
             if self.crashed[idx] {
                 // Hard-crashed: not pumped; peers' links to it are
                 // dropped, so the failure detector handles it in virtual
                 // time like a dead socket.
+                self.trace.push(ClusterTraceEvent::NodeSkippedCrashed {
+                    round: self.round,
+                    node: idx,
+                });
                 continue;
             }
             let rt = &mut self.nodes[idx];
@@ -280,12 +449,18 @@ impl DeterministicCluster {
             // embedder API; the harness models the embedder).
             rt.sync_crdts();
             let result = rt.run_scheduler_deterministic_with_rng(&mut self.rng, STEPS_BUDGET);
-            if matches!(
+            let step_limit_exceeded = matches!(
                 result,
                 crate::runtime::DeterministicRunResult::StepLimitExceeded { .. }
-            ) {
+            );
+            if step_limit_exceeded {
                 self.limit_hits += 1;
             }
+            self.trace.push(ClusterTraceEvent::SchedulerStep {
+                round: self.round,
+                node: idx,
+                step_limit_exceeded,
+            });
             // Deliver any packets still held by the reorder buffer (odd
             // tails are never stranded; no-op when reorder is off).
             if self.reorder {
@@ -1164,5 +1339,50 @@ mod tests {
             Some(other_node),
             "self-demote must forward sends to the directory's replacement node"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod foundationdb_trace_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    #[test]
+    fn scripted_faults_produce_identical_decision_traces_for_same_seed() {
+        let addrs = [addr(32101), addr(32102), addr(32103)];
+        let mut first = DeterministicCluster::new(&addrs, 0xF0_0D);
+        first.schedule_fault(1, ClusterFault::Partition { from: 0, to: 1 });
+        first.schedule_fault(2, ClusterFault::Heal { node: 0 });
+        first.schedule_fault(3, ClusterFault::ReorderAll { enabled: true });
+        first.run_rounds(4);
+
+        let encoded_plan = serde_json::to_vec(&first.replay_plan()).unwrap();
+        let plan: ClusterReplayPlan = serde_json::from_slice(&encoded_plan).unwrap();
+        let mut second = DeterministicCluster::from_replay_plan(&addrs, &plan);
+        second.run_rounds(4);
+
+        assert_eq!(first.trace(), second.trace());
+        assert!(first.trace().iter().any(|event| matches!(
+            event,
+            ClusterTraceEvent::FaultApplied {
+                round: 1,
+                fault: ClusterFault::Partition { from: 0, to: 1 }
+            }
+        )));
+        assert!(first.trace().iter().any(|event| matches!(
+            event,
+            ClusterTraceEvent::RoundOrder { round: 0, .. }
+        )));
+        let encoded = serde_json::to_vec(second.trace()).unwrap();
+        let decoded: Vec<ClusterTraceEvent> = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, second.trace());
+
+        first.clear_trace();
+        assert!(first.trace().is_empty());
     }
 }
