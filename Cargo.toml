@@ -193,6 +193,10 @@ name = "nulang"
 path = "src/main.rs"
 
 [[bin]]
+name = "nulang-semantic-abi"
+path = "src/bin/nulang_semantic_abi.rs"
+
+[[bin]]
 name = "nula_difffuzz"
 path = "src/bin/nula_difffuzz.rs"
 required-features = ["difffuzz"]
