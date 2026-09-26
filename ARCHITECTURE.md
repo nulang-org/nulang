@@ -176,8 +176,11 @@ Core surface forms (`src/ast.rs`, `src/parser.rs`):
   §6.3).
 
 There is no `switch` and no `case` keyword — `match` arms are introduced by
-`|`. Pattern matching is typed but **not** exhaustiveness-checked today: a
-non-exhaustive `match` compiles and may fail at runtime.
+`|`. Pattern matching is typed. The compiler performs conservative finite-domain
+coverage analysis for top-level declared variants and `Bool`, emitting `W0201`
+for provably missing cases and `W0202` for provably redundant arms. These are
+warnings by default; matches outside that proof domain, and warnings not promoted
+with `--deny-warnings`, retain the runtime non-exhaustive-match fallback.
 
 ### 2.2 HM Type Inference
 

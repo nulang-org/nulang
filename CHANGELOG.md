@@ -1,5 +1,11 @@
 # Nulang Changelog
 
+### Finite-domain pattern coverage diagnostics — 2026-09-26
+- **The typechecker now emits semantic coverage warnings for finite top-level matches.** `W0201` reports missing witnesses and `W0202` reports provably redundant arms for declared variants and `Bool`; guarded arms never count as exhaustive.
+- **Default runtime compatibility is preserved.** Coverage findings are warnings unless `--deny-warnings` is enabled, and unsupported pattern domains continue to use the runtime non-exhaustive fallback.
+- **CLI, LSP, tests, and public safety documentation now share the same boundary.** The docs no longer claim universal compile-time match or effect-handler exhaustiveness.
+
+
 ### Same-host A/B Cargo target isolation — 2026-09-25
 - **Base and candidate benchmark builds now use separate Cargo target directories.** The repository config points every checkout at one absolute target path; sharing it across the detached base worktree and candidate could reuse the base library artifact while compiling candidate integration tests, producing false build failures or invalid A/B binaries.
 - **The isolation applies to both prebuild and measured Cargo invocations.** Persistent per-variant target directories retain ordinary Cargo caching while preventing cross-variant artifact contamination.
