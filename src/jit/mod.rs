@@ -151,6 +151,9 @@ pub struct JitSession {
     /// Regions compiled through the type-directed (guard-stripped) path in
     /// `typed_compiler`, i.e. where inferred register types were available.
     typed_regions: FxHashSet<(usize, usize)>,
+    /// Register-prefix footprint for regions compiled through the tiered VM
+    /// path. Missing entries deliberately mean "materialize all 256".
+    register_spans: FxHashMap<(usize, usize), usize>,
     /// Backend-neutral region/safety/type analysis. Cranelift consumes the
     /// resulting plans but does not own the language-level planning rules.
     region_planner: RegionPlanner,
@@ -172,6 +175,7 @@ impl JitSession {
             compiled_count: 0,
             hot_counts: Vec::new(),
             typed_regions: FxHashSet::default(),
+            register_spans: FxHashMap::default(),
             region_planner: RegionPlanner::default(),
             tier2_counters: FxHashMap::default(),
             promotion_serial: 0,
@@ -862,6 +866,14 @@ impl crate::backends::JitBackend for JitSession {
         self.compiled_entry(module_idx, pc).map(|region| region.len)
     }
 
+    fn compiled_register_span(&self, module_idx: usize, pc: usize) -> usize {
+        self.register_spans
+            .get(&(module_idx, pc))
+            .copied()
+            .unwrap_or(256)
+            .min(256)
+    }
+
     fn compiled_count(&self) -> usize {
         self.compiled_count
     }
@@ -904,6 +916,8 @@ impl crate::backends::JitBackend for JitSession {
             }
             .is_some()
             {
+                self.register_spans
+                    .insert((module_idx, pc), plan.register_span.min(256));
                 return true;
             }
         }
