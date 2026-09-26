@@ -545,6 +545,30 @@ mod planner_tests {
     }
 
     #[test]
+    fn register_span_ignores_non_register_immediate_bytes() {
+        let instructions = vec![
+            Instruction::new3(OpCode::ConstU, 0xfe, 0xdc, 3),
+            Instruction::new3(OpCode::IAdd, 3, 4, 5),
+        ];
+
+        assert_eq!(register_span(&instructions, 0, instructions.len()), 6);
+    }
+
+    #[test]
+    fn register_span_uses_only_branch_condition_register() {
+        let instructions = vec![Instruction::new3(OpCode::JmpT, 7, 0xfe, 0xdc)];
+
+        assert_eq!(register_span(&instructions, 0, instructions.len()), 8);
+    }
+
+    #[test]
+    fn register_span_falls_back_to_full_frame_for_direct_calls() {
+        let instructions = vec![Instruction::new3(OpCode::Call, 0, 1, 3)];
+
+        assert_eq!(register_span(&instructions, 0, instructions.len()), 256);
+    }
+
+    #[test]
     fn test_region_planner_rejects_short_straight_line_region() {
         let mut module = CodeModule::new("planner_short");
         module.emit(Instruction::new1(OpCode::Const0, 0));
