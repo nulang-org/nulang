@@ -19,9 +19,7 @@ pub struct RegistryClient {
 
 #[cfg(feature = "ureq")]
 fn read_body_limited(reader: impl Read, max_len: usize) -> Result<Vec<u8>, String> {
-    let max_plus_one = u64::try_from(max_len)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
+    let max_plus_one = u64::try_from(max_len).unwrap_or(u64::MAX).saturating_add(1);
     let mut limited = reader.take(max_plus_one);
     let mut bytes = Vec::new();
     limited.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
@@ -182,7 +180,6 @@ impl RegistryClient {
         }
     }
 }
-
 
 #[cfg(all(test, feature = "ureq"))]
 mod tests {
