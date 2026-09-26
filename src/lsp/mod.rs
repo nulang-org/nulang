@@ -58,6 +58,93 @@ fn utf16_col_to_byte(line: &str, col: usize) -> usize {
     line.len()
 }
 
+/// Strict UTF-16 column conversion for document edits.
+///
+/// Unlike hover/completion lookups, edits must reject positions inside a
+/// surrogate pair or past the logical end of the line rather than clamping and
+/// potentially corrupting source text.
+fn utf16_col_to_byte_strict(line: &str, col: usize) -> Option<usize> {
+    let mut utf16 = 0usize;
+    for (byte_idx, ch) in line.char_indices() {
+        if utf16 == col {
+            return Some(byte_idx);
+        }
+        let next = utf16.checked_add(ch.len_utf16())?;
+        if col < next {
+            return None;
+        }
+        utf16 = next;
+    }
+    (utf16 == col).then_some(line.len())
+}
+
+/// Convert an LSP UTF-16 position into a UTF-8 byte offset in source.
+fn lsp_position_to_byte(source: &str, position: Position) -> Option<usize> {
+    let target_line = usize::try_from(position.line).ok()?;
+    let target_col = usize::try_from(position.character).ok()?;
+    let mut line_index = 0usize;
+    let mut line_start = 0usize;
+
+    for segment in source.split_inclusive('\n') {
+        if line_index == target_line {
+            let without_lf = segment.strip_suffix('\n').unwrap_or(segment);
+            let logical_line = without_lf.strip_suffix('\r').unwrap_or(without_lf);
+            let column = utf16_col_to_byte_strict(logical_line, target_col)?;
+            return line_start.checked_add(column);
+        }
+        line_start = line_start.checked_add(segment.len())?;
+        line_index = line_index.checked_add(1)?;
+    }
+
+    // split_inclusive has no final empty segment after a trailing newline.
+    if line_index == target_line && target_col == 0 {
+        Some(source.len())
+    } else {
+        None
+    }
+}
+
+/// Apply LSP content changes in the order supplied by the client.
+///
+/// Full-document changes replace the accumulated text. Ranged changes are
+/// resolved against the text produced by preceding changes, as required by the
+/// LSP synchronization contract.
+fn apply_content_changes(
+    source: &str,
+    changes: &[TextDocumentContentChangeEvent],
+) -> Result<String, String> {
+    let mut updated = source.to_owned();
+
+    for change in changes {
+        let Some(range) = change.range else {
+            updated = change.text.clone();
+            continue;
+        };
+
+        let start = lsp_position_to_byte(&updated, range.start).ok_or_else(|| {
+            format!(
+                "invalid didChange start position {}:{}",
+                range.start.line, range.start.character
+            )
+        })?;
+        let end = lsp_position_to_byte(&updated, range.end).ok_or_else(|| {
+            format!(
+                "invalid didChange end position {}:{}",
+                range.end.line, range.end.character
+            )
+        })?;
+        if start > end {
+            return Err(format!(
+                "invalid didChange range: start byte {start} exceeds end byte {end}"
+            ));
+        }
+
+        updated.replace_range(start..end, &change.text);
+    }
+
+    Ok(updated)
+}
+
 // ---------------------------------------------------------------------------
 // LSP Server
 // ---------------------------------------------------------------------------
@@ -264,7 +351,7 @@ impl LanguageServer for NulangLanguageServer {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::FULL),
+                        change: Some(TextDocumentSyncKind::INCREMENTAL),
                         will_save: None,
                         will_save_wait_until: None,
                         save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
@@ -328,12 +415,32 @@ impl LanguageServer for NulangLanguageServer {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.clone();
         let version = params.text_document.version;
-        let source = params
-            .content_changes
-            .into_iter()
-            .next()
-            .map(|c| c.text)
-            .unwrap_or_default();
+        let current_source = {
+            let docs = self.documents.lock().unwrap();
+            docs.get(&uri).map(|doc| doc.source.clone())
+        };
+        let Some(current_source) = current_source else {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("ignoring didChange for unopened document {uri}"),
+                )
+                .await;
+            return;
+        };
+
+        let source = match apply_content_changes(&current_source, &params.content_changes) {
+            Ok(source) => source,
+            Err(error) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("rejecting invalid didChange for {uri}: {error}"),
+                    )
+                    .await;
+                return;
+            }
+        };
 
         {
             let mut docs = self.documents.lock().unwrap();
@@ -346,6 +453,8 @@ impl LanguageServer for NulangLanguageServer {
                 doc.diagnostics_pending = true;
                 doc.inferred_decl_types = None;
                 doc.function_rows = None;
+            } else {
+                return;
             }
         }
 
