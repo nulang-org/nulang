@@ -1,0 +1,57 @@
+labels:
+  platform: linux/amd64
+  pool: bootstrap-ci
+
+when:
+  - event: push
+    branch: fix/p0-fail-closed-unknown-behavior-main
+
+steps:
+  - name: validate-and-land
+    image: rust:1.95-bookworm
+    commands:
+      - set -eux
+      - start_head="$(git rev-parse HEAD)"
+      - echo "validating P0 patch from $start_head"
+      - test -z "${CI_COMMIT_SHA:-}" || test "$start_head" = "$CI_COMMIT_SHA"
+      - apt-get update
+      - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-dev pkg-config
+      - rustup component add rustfmt
+      - python3 scripts/p0_apply_unknown_behavior_fix.py
+      - python3 scripts/p0_adjust_remote_fallback_test.py
+      - python3 scripts/p0_adjust_stress_tests.py
+      - python3 scripts/p0_harden_remote_behavior_resolution.py
+      - cargo fmt --all
+      - git diff --check
+      - test "$(git diff --name-only | sort)" = "$(printf '%s\n' src/runtime/distributed.rs src/runtime/mod.rs src/runtime/tests.rs src/stress_tests.rs | sort)"
+      - cargo test --no-default-features runtime::tests::p0_unknown_named_send_is_rejected -- --exact
+      - cargo test --no-default-features runtime::tests::p0_unknown_numeric_ask_is_rejected_without_running_behavior_zero -- --exact
+      - cargo test runtime::distributed::tests::test_remote_send_dispatches_named_behavior -- --exact
+      - cargo test --no-default-features runtime::tests::p0_cross_shard_named_send_resolves_on_owner_and_unknown_fails_closed -- --exact
+      - cargo test --no-default-features runtime::tests::test_send_carries_current_trace_span -- --exact
+      - cargo test --no-default-features runtime::tests::test_cross_actor_send_foreign_count_lifecycle -- --exact
+      - cargo test --no-default-features runtime::tests::test_distributed_remote_address_local_fallback -- --exact
+      - cargo test --no-default-features integration_tests::tests::test_flight_recorder_records_messages -- --exact
+      - cargo test --no-default-features
+      - cargo fmt --all -- --check
+      - git diff --check
+      - python3 scripts/p0_add_unknown_behavior_changelog.py
+      - git diff --check
+      - git fetch origin fix/p0-fail-closed-unknown-behavior-main
+      - remote_head="$(git rev-parse origin/fix/p0-fail-closed-unknown-behavior-main)"
+      - test "$remote_head" = "$start_head"
+      - rm scripts/p0_apply_unknown_behavior_fix.py
+      - rm scripts/p0_adjust_remote_fallback_test.py
+      - rm scripts/p0_adjust_stress_tests.py
+      - rm scripts/p0_harden_remote_behavior_resolution.py
+      - rm scripts/p0_add_unknown_behavior_changelog.py
+      - rm .github/workflows/p0-unknown-behavior-validate.yml
+      - rm .woodpecker/p0-unknown-behavior-land.yml
+      - rm .woodpecker/rust.yml
+      - git config user.name 'woodpecker-ci[bot]'
+      - git config user.email 'woodpecker-ci@users.noreply.github.com'
+      - git add -A
+      - git diff --cached --check
+      - test "$(git diff --cached --name-only | sort)" = "$(printf '%s\n' CHANGELOG.md src/runtime/distributed.rs src/runtime/mod.rs src/runtime/tests.rs src/stress_tests.rs .github/workflows/p0-unknown-behavior-validate.yml .woodpecker/p0-unknown-behavior-land.yml .woodpecker/rust.yml scripts/p0_add_unknown_behavior_changelog.py scripts/p0_adjust_remote_fallback_test.py scripts/p0_adjust_stress_tests.py scripts/p0_apply_unknown_behavior_fix.py scripts/p0_harden_remote_behavior_resolution.py | sort)"
+      - git commit -m 'fix(runtime): reject unknown actor behavior dispatch'
+      - git push origin HEAD:fix/p0-fail-closed-unknown-behavior-main
