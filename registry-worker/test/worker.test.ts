@@ -7,11 +7,11 @@ interface HookCall {
   size_bytes: number;
 }
 
-function chunkedBody(text: string): ReadableStream<Uint8Array> {
+function chunkedBody(bytes: Uint8Array): ReadableStream<Uint8Array> {
   // A stream body carries no Content-Length (chunked transfer encoding).
   return new ReadableStream({
     start(controller) {
-      controller.enqueue(new TextEncoder().encode(text));
+      controller.enqueue(bytes);
       controller.close();
     },
   });
@@ -122,7 +122,7 @@ describe('with QUOTA_HOOK_URL configured', () => {
 
   it('rejects chunked PUTs with 411 before the quota hook runs', async () => {
     const env = makeEnv({ QUOTA_HOOK_URL: hookUrl });
-    const res = await publish(env, chunkedBody('tarball-bytes'));
+    const res = await publish(env, chunkedBody(GZIP_BYTES));
     expect(res.status).toBe(411);
     expect(fetchMock).not.toHaveBeenCalled();
     expect(env.stored).toHaveLength(0);
@@ -131,8 +131,10 @@ describe('with QUOTA_HOOK_URL configured', () => {
   it('passes the real byte count to the quota hook and stores on approval', async () => {
     fetchMock.mockResolvedValue(new Response('ok', { status: 200 }));
     const env = makeEnv({ QUOTA_HOOK_URL: hookUrl });
-    const payload = 'tarball-bytes';
-    const res = await publish(env, payload, { 'Content-Length': String(payload.length) });
+    const payload = GZIP_BYTES;
+    const res = await publish(env, payload, {
+      'Content-Length': String(payload.byteLength),
+    });
     expect(res.status).toBe(201);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0];
@@ -140,7 +142,7 @@ describe('with QUOTA_HOOK_URL configured', () => {
     expect(JSON.parse(String(init?.body))).toEqual({
       name: 'foo',
       version: '1.0.0',
-      size_bytes: payload.length,
+      size_bytes: payload.byteLength,
     });
     expect(env.stored).toEqual(['foo/1.0.0.tar.gz']);
   });
@@ -148,7 +150,9 @@ describe('with QUOTA_HOOK_URL configured', () => {
   it('returns 402 with the hook message and does not store', async () => {
     fetchMock.mockResolvedValue(new Response('quota exceeded', { status: 402 }));
     const env = makeEnv({ QUOTA_HOOK_URL: hookUrl });
-    const res = await publish(env, 'tarball-bytes', { 'Content-Length': '13' });
+    const res = await publish(env, GZIP_BYTES, {
+      'Content-Length': String(GZIP_BYTES.byteLength),
+    });
     expect(res.status).toBe(402);
     expect(await res.text()).toBe('Payment Required: quota exceeded');
     expect(env.stored).toHaveLength(0);
@@ -158,7 +162,7 @@ describe('with QUOTA_HOOK_URL configured', () => {
 describe('without QUOTA_HOOK_URL', () => {
   it('accepts chunked PUTs when no quota hook is configured', async () => {
     const env = makeEnv();
-    const res = await publish(env, chunkedBody('tarball-bytes'));
+    const res = await publish(env, chunkedBody(GZIP_BYTES));
     expect(res.status).toBe(201);
     expect(env.stored).toEqual(['foo/1.0.0.tar.gz']);
   });
