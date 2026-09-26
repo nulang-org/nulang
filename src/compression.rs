@@ -38,6 +38,13 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+#[cfg(feature = "zstd-compression")]
+fn zstd_window_log_max(expected_len: usize) -> u32 {
+    let expected_len = u64::try_from(expected_len).unwrap_or(u64::MAX).max(1);
+    let ceil_log = u64::BITS - (expected_len - 1).leading_zeros();
+    ceil_log.clamp(10, 31)
+}
+
 fn encode_envelope(codec: BlobCodec, original_len: usize, payload: &[u8]) -> io::Result<Vec<u8>> {
     let original_len =
         u64::try_from(original_len).map_err(|_| invalid_data("runtime blob length exceeds u64"))?;
@@ -141,7 +148,10 @@ pub fn decode_blob_with_limit(encoded: &[u8], max_decoded_len: usize) -> io::Res
         value if value == BlobCodec::Zstd as u8 => {
             #[cfg(feature = "zstd-compression")]
             {
-                let decoder = zstd::stream::read::Decoder::new(Cursor::new(payload))
+                let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(payload))
+                    .map_err(|error| invalid_data(format!("invalid zstd runtime blob: {error}")))?;
+                decoder
+                    .window_log_max(zstd_window_log_max(expected_len))
                     .map_err(|error| invalid_data(format!("invalid zstd runtime blob: {error}")))?;
                 let mut limited = decoder.take(expected_len_u64.saturating_add(1));
                 let mut output = Vec::new();
