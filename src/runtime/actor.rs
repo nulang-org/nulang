@@ -281,6 +281,12 @@ pub struct Actor {
     turn_reductions: u32,     // Messages handled in the current scheduling turn
     pub max_reductions: u32,  // Max reductions per turn before yield (preemption)
     pub sequence: u64,        // Last persisted sequence number
+    /// Accepted workflow command currently executing on this actor.
+    ///
+    /// Set after the command is durably journaled and cleared when the direct
+    /// turn ends. If execution suspends, the identity is copied into
+    /// `SuspendedExecution` so later resumes close the same activation.
+    pub current_workflow_activation: Option<WorkflowActivationId>,
     /// Sentinel heap object used by the cycle detector to represent this
     /// actor as a holder of foreign references.
     cycle_sentinel: Option<*mut OrcaHeader>,
@@ -373,6 +379,8 @@ pub struct ReceiveWaitState {
 pub struct SuspendedExecution {
     pub vm_state: crate::vm::SuspendedVmState,
     pub behavior_idx: usize,
+    /// Stable identity of the accepted workflow command being resumed.
+    pub activation: Option<WorkflowActivationId>,
     pub step_name: String,
 }
 
@@ -424,6 +432,7 @@ impl Actor {
             turn_reductions: 0,
             max_reductions: 1000,
             sequence: 0,
+            current_workflow_activation: None,
             cycle_sentinel: None,
             suspended_execution: None,
             waiting_signal: None,
