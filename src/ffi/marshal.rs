@@ -208,7 +208,7 @@ fn ctype_to_libffi(ty: &CType) -> libffi::middle::Type {
 /// supported, not only the small fixed table used by the non-ffi fallback.
 ///
 /// # Safety
-/// `func.ptr` must point to a valid function whose ABI matches `func.signature`.
+/// `func` must contain a live function pointer whose ABI matches `func.signature`.
 pub unsafe fn call_native(func: &NativeFunction, args: &[Value]) -> Result<Value, String> {
     use libffi::middle::{arg, Cif, CodePtr, Type};
 
@@ -312,7 +312,7 @@ pub unsafe fn call_native(func: &NativeFunction, args: &[Value]) -> Result<Value
 
     let ret_type = ctype_to_libffi(&func.signature.ret);
     let cif = Cif::new(ffi_types, ret_type);
-    let code = CodePtr(func.ptr as *mut c_void);
+    let code = CodePtr(func.code_ptr() as *const () as *mut c_void);
 
     match func.signature.ret {
         CType::I64 => {
@@ -504,7 +504,7 @@ mod fixed_arity {
     /// Supports signatures with up to four parameters.
     ///
     /// # Safety
-    /// `func.ptr` must point to a valid function whose ABI matches `func.signature`.
+    /// `func` must contain a live function pointer whose ABI matches `func.signature`.
     pub unsafe fn call_native(func: &NativeFunction, args: &[Value]) -> Result<Value, String> {
         if func.signature.params.iter().any(|p| *p == CType::Value)
             || func.signature.ret == CType::Value
@@ -523,41 +523,41 @@ mod fixed_arity {
         let ret = func.signature.ret;
 
         match p.as_slice() {
-            [] => with_returns!(arity_0_arms!(func.ptr, ret)),
-            [CType::I64] => with_returns!(arity_1_arms!(func.ptr, args, ret, i64)),
-            [CType::F64] => with_returns!(arity_1_arms!(func.ptr, args, ret, f64)),
-            [CType::Bool] => with_returns!(arity_1_arms!(func.ptr, args, ret, bool)),
+            [] => with_returns!(arity_0_arms!(func.code_ptr(), ret)),
+            [CType::I64] => with_returns!(arity_1_arms!(func.code_ptr(), args, ret, i64)),
+            [CType::F64] => with_returns!(arity_1_arms!(func.code_ptr(), args, ret, f64)),
+            [CType::Bool] => with_returns!(arity_1_arms!(func.code_ptr(), args, ret, bool)),
             [CType::CStr] => {
-                with_returns!(arity_1_arms!(func.ptr, args, ret, *const std::ffi::c_char))
+                with_returns!(arity_1_arms!(func.code_ptr(), args, ret, *const std::ffi::c_char))
             }
             [CType::VoidPtr] => {
-                with_returns!(arity_1_arms!(func.ptr, args, ret, *mut std::ffi::c_void))
+                with_returns!(arity_1_arms!(func.code_ptr(), args, ret, *mut std::ffi::c_void))
             }
-            [CType::Unit] => with_returns!(arity_1_arms!(func.ptr, args, ret, ())),
-            [CType::I64, CType::I64] => with_returns!(arity_2_arms!(func.ptr, args, ret, i64, i64)),
-            [CType::I64, CType::F64] => with_returns!(arity_2_arms!(func.ptr, args, ret, i64, f64)),
+            [CType::Unit] => with_returns!(arity_1_arms!(func.code_ptr(), args, ret, ())),
+            [CType::I64, CType::I64] => with_returns!(arity_2_arms!(func.code_ptr(), args, ret, i64, i64)),
+            [CType::I64, CType::F64] => with_returns!(arity_2_arms!(func.code_ptr(), args, ret, i64, f64)),
             [CType::I64, CType::Bool] => {
-                with_returns!(arity_2_arms!(func.ptr, args, ret, i64, bool))
+                with_returns!(arity_2_arms!(func.code_ptr(), args, ret, i64, bool))
             }
-            [CType::F64, CType::I64] => with_returns!(arity_2_arms!(func.ptr, args, ret, f64, i64)),
-            [CType::F64, CType::F64] => with_returns!(arity_2_arms!(func.ptr, args, ret, f64, f64)),
+            [CType::F64, CType::I64] => with_returns!(arity_2_arms!(func.code_ptr(), args, ret, f64, i64)),
+            [CType::F64, CType::F64] => with_returns!(arity_2_arms!(func.code_ptr(), args, ret, f64, f64)),
             [CType::F64, CType::Bool] => {
-                with_returns!(arity_2_arms!(func.ptr, args, ret, f64, bool))
+                with_returns!(arity_2_arms!(func.code_ptr(), args, ret, f64, bool))
             }
             [CType::Bool, CType::I64] => {
-                with_returns!(arity_2_arms!(func.ptr, args, ret, bool, i64))
+                with_returns!(arity_2_arms!(func.code_ptr(), args, ret, bool, i64))
             }
             [CType::Bool, CType::F64] => {
-                with_returns!(arity_2_arms!(func.ptr, args, ret, bool, f64))
+                with_returns!(arity_2_arms!(func.code_ptr(), args, ret, bool, f64))
             }
             [CType::Bool, CType::Bool] => {
-                with_returns!(arity_2_arms!(func.ptr, args, ret, bool, bool))
+                with_returns!(arity_2_arms!(func.code_ptr(), args, ret, bool, bool))
             }
             [CType::I64, CType::I64, CType::I64] => {
-                with_returns!(arity_3_arms!(func.ptr, args, ret, i64, i64, i64))
+                with_returns!(arity_3_arms!(func.code_ptr(), args, ret, i64, i64, i64))
             }
             [CType::I64, CType::I64, CType::I64, CType::I64] => {
-                with_returns!(arity_4_arms!(func.ptr, args, ret, i64, i64, i64, i64))
+                with_returns!(arity_4_arms!(func.code_ptr(), args, ret, i64, i64, i64, i64))
             }
             _ => Err(format!(
                 "unsupported parameter count/types (max 4, no Value without ffi feature): {:?}",
@@ -602,12 +602,9 @@ mod tests {
     }
 
     fn make_func(ptr: *const c_void, signature: Signature) -> NativeFunction {
-        NativeFunction {
-            ptr,
-            signature,
-            library: None,
-            symbol: "test".to_string(),
-        }
+        // SAFETY: every caller supplies the address of a live test function
+        // whose C ABI matches the supplied signature.
+        unsafe { NativeFunction::new(ptr, signature, None, "test".to_string()) }
     }
 
     #[test]
