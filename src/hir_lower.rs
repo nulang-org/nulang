@@ -2725,6 +2725,7 @@ mod tests {
     fn test_lower_literal() {
         let ast = ast::AstModule {
             name: "test".to_string(),
+            exports: vec![],
             decls: vec![Decl::Function {
                 name: "__main".to_string(),
                 type_params: vec![],
@@ -2957,6 +2958,7 @@ mod tests {
         let sp = Span::default();
         let ast = ast::AstModule {
             name: "test".to_string(),
+            exports: vec![],
             decls: vec![Decl::StateMachine {
                 name: "TcpConnection".to_string(),
                 states: vec!["Closed".to_string(), "Connected".to_string()],

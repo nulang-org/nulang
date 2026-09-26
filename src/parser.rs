@@ -199,6 +199,7 @@ impl Parser {
     pub fn parse_module(&mut self) -> NuResult<AstModule> {
         self.diagnostics.clear();
         let mut decls = Vec::new();
+        let mut exports = Vec::new();
         let mut pending_lets: Vec<Decl> = Vec::new();
         let mut app_decls: Vec<ParsedApp> = Vec::new();
         self.skip_newlines();
@@ -216,8 +217,13 @@ impl Parser {
 
             // Try declaration first, then expression
             let decl_start = self.pos;
-            match self.parse_decl() {
-                Ok(mut decl) => {
+            match self.parse_decl_with_visibility() {
+                Ok((mut decl, is_public)) => {
+                    if is_public {
+                        if let Some(name) = decl.export_name() {
+                            exports.push(name.to_string());
+                        }
+                    }
                     // Collect LetBinding decls — they'll be wrapped into main's body.
                     if matches!(decl, Decl::LetBinding { .. }) {
                         pending_lets.push(decl);
@@ -489,6 +495,7 @@ impl Parser {
         let decls = Self::expand_contracts(Self::expand_derives(decls));
         Ok(AstModule {
             name: "main".to_string(),
+            exports,
             decls,
         })
     }
@@ -720,14 +727,14 @@ impl Parser {
 
     // === Declarations ===
 
-    fn parse_decl(&mut self) -> NuResult<Decl> {
+    fn parse_decl_with_visibility(&mut self) -> NuResult<(Decl, bool)> {
         self.local_type_params.clear();
         let _span = self.current_span();
         let annotations = self.parse_function_annotations()?;
         self.skip_newlines();
         let public = self.consume_if(&TokenKind::Pub);
         self.skip_newlines();
-        match self.peek_kind() {
+        let decl = match self.peek_kind() {
             TokenKind::Fn => self.parse_function(public, annotations),
             TokenKind::Actor
             | TokenKind::Persistent
@@ -776,19 +783,26 @@ impl Parser {
                 let name = self.expect_ident("module name")?;
                 self.expect(TokenKind::LBrace)?;
                 let mut decls = Vec::new();
+                let mut exports = Vec::new();
                 self.skip_newlines();
                 while !self.match_token(&TokenKind::RBrace) && !self.is_at_end() {
                     self.skip_newlines();
                     if self.match_token(&TokenKind::RBrace) {
                         break;
                     }
-                    decls.push(self.parse_decl()?);
+                    let (decl, is_public) = self.parse_decl_with_visibility()?;
+                    if is_public {
+                        if let Some(export_name) = decl.export_name() {
+                            exports.push(export_name.to_string());
+                        }
+                    }
+                    decls.push(decl);
                     self.skip_newlines();
                 }
                 self.expect(TokenKind::RBrace)?;
                 Ok(Decl::Module {
                     name,
-                    exports: vec![],
+                    exports,
                     decls,
                     span: self.current_span(),
                 })
@@ -806,7 +820,15 @@ impl Parser {
                 format!("Unexpected token in declaration: {}", other),
                 self.current_span(),
             )),
+        }?;
+
+        if public && decl.export_name().is_none() {
+            return Err(NuError::parse_error(
+                "`pub` requires a named declaration that can be exported".to_string(),
+                _span,
+            ));
         }
+        Ok((decl, public))
     }
 
     fn parse_function_annotations(&mut self) -> NuResult<Vec<FunctionAnnotation>> {
@@ -3661,7 +3683,18 @@ impl Parser {
             NuError::parse_error(format!("Invalid interpolation expression: {}", e), span)
         })?;
         let mut sub_parser = Parser::new(tokens);
-        sub_parser.parse_expr()
+        let expr = sub_parser.parse_expr()?;
+        sub_parser.skip_newlines_semicolons();
+        if !sub_parser.is_at_end() {
+            return Err(NuError::parse_error(
+                format!(
+                    "Invalid interpolation expression: unexpected trailing token {}",
+                    sub_parser.peek_kind()
+                ),
+                span,
+            ));
+        }
+        Ok(expr)
     }
 
     fn parse_let_rec_named(&mut self, name: String) -> NuResult<Expr> {
@@ -8954,5 +8987,36 @@ mod tests {
     fn test_parse_par_requires_brace() {
         let result = parse_expr("par");
         assert!(result.is_err(), "bare 'par' must be a parse error");
+    }
+    #[test]
+    fn test_interpolation_rejects_trailing_tokens() {
+        let tokens = crate::lexer::Lexer::new(r##"perform IO.print("#{1 2}")"##)
+            .lex()
+            .expect("source lexes");
+        let err = Parser::new(tokens).parse_module().unwrap_err();
+        assert!(format!("{}", err).contains("unexpected trailing token"));
+    }
+
+    #[test]
+    fn test_module_exports_capture_pub_actor_effect_and_class() {
+        let src = r#"
+pub actor Worker { behavior run() { unit } }
+pub effect Trace { write: String -> Unit }
+pub class Show[T] { fn show(self: T) -> String }
+actor Hidden { behavior run() { unit } }
+"#;
+        let tokens = Lexer::new(src).lex().unwrap();
+        let ast = Parser::new(tokens).parse_module().unwrap();
+        assert!(ast.exports.contains(&"Worker".to_string()));
+        assert!(ast.exports.contains(&"Trace".to_string()));
+        assert!(ast.exports.contains(&"Show".to_string()));
+        assert!(!ast.exports.contains(&"Hidden".to_string()));
+    }
+
+    #[test]
+    fn test_pub_rejected_for_anonymous_declaration() {
+        let tokens = Lexer::new("pub import stdlib::math").lex().unwrap();
+        let err = Parser::new(tokens).parse_module().unwrap_err();
+        assert!(format!("{}", err).contains("requires a named declaration"));
     }
 }
