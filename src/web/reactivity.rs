@@ -836,9 +836,20 @@ pub fn generate_client_runtime() -> String {
     };
   }
 
+  function formBody(form) {
+    const body = new URLSearchParams();
+    if (!form) return body;
+    new FormData(form).forEach(function (value, key) {
+      if (typeof value === 'string') {
+        body.append(key, value);
+      }
+    });
+    return body;
+  }
+
   async function runServerAction(handler, el) {
     const form = el.closest('form');
-    const body = form ? new FormData(form) : new FormData();
+    const body = formBody(form);
     const message = createActionMessage(handler, 'server', body);
     body.append('__nulang_action', handler);
     body.append('__nulang_ui_message', JSON.stringify(message));
@@ -1259,6 +1270,14 @@ fn view() -> Html {
         assert!(js.contains("document_id"));
         assert!(js.contains("idempotency_key"));
         assert!(js.contains("__nulang_action"));
+        assert!(
+            js.contains("new URLSearchParams()"),
+            "server actions must use the URL-encoded transport parsed by the runtime"
+        );
+        assert!(
+            js.contains("typeof value === 'string'"),
+            "only string form fields are currently part of the action wire payload"
+        );
     }
 
 }
