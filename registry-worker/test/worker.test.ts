@@ -172,6 +172,16 @@ describe('without QUOTA_HOOK_URL', () => {
     expect(env.stored).toEqual(['foo/1.0.0.tar.zst']);
   });
 
+  it('rejects a declared package body above the archive size limit', async () => {
+    const env = makeEnv();
+    const res = await publish(env, GZIP_BYTES, {
+      'Content-Type': 'application/gzip',
+      'Content-Length': String(64 * 1024 * 1024 + 1),
+    });
+    expect(res.status).toBe(413);
+    expect(env.stored).toHaveLength(0);
+  });
+
   it('rejects a content type that disagrees with archive magic', async () => {
     const env = makeEnv();
     const res = await publish(env, GZIP_BYTES, {
