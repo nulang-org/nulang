@@ -17,6 +17,7 @@ import re
 import shutil
 import statistics
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,12 +56,19 @@ def command_output(
     proc = subprocess.run(
         command,
         cwd=cwd,
-        check=True,
+        check=False,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         preexec_fn=preexec_fn,
     )
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stdout)
+        raise subprocess.CalledProcessError(
+            proc.returncode,
+            command,
+            output=proc.stdout,
+        )
     return proc.stdout
 
 
