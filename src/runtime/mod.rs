@@ -43,7 +43,8 @@ pub use distributed_context::{
     DistributedContext, FabricAdvertisement, FabricAdvertisementSnapshot, FabricPublishReport,
 };
 pub use fabric_stream::{
-    FabricStreamConfig, FabricStreamInfo, FabricStreamRecord, FileFabricStreamStore,
+    FabricConsumerDelivery, FabricStreamConfig, FabricStreamInfo, FabricStreamRecord,
+    FileFabricStreamStore,
 };
 pub use fabric_stream_cluster::{
     FabricStreamCatchUpReport, FabricStreamPlacement, FabricStreamRecoveryReport,
