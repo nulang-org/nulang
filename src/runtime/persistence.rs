@@ -450,7 +450,10 @@ impl DurableTransition {
             ));
         }
         for event in &self.workflow_events {
-            if let Some(activation) = event.activation_id() {
+            let activation = event
+                .activation_id()
+                .or_else(|| event.replay_id().map(|id| id.activation));
+            if let Some(activation) = activation {
                 if activation.actor_id != self.actor_id {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
