@@ -8,9 +8,7 @@
 use crate::bytecode::Constant;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
-use crate::runtime::persistence::{
-    EventEntry, PersistedValue, WorkflowEvent, WorkflowOperationId,
-};
+use crate::runtime::persistence::{EventEntry, PersistedValue, WorkflowEvent, WorkflowOperationId};
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
 use crate::vm::{Frame, Value, VM};
 
