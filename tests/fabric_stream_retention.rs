@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, UNIX_EPOCH};
 
 use nulang::runtime::{FabricStreamConfig, FileFabricStreamStore};
 
@@ -123,6 +124,36 @@ fn retention_refuses_to_prune_past_a_named_consumer_cursor() {
     store.commit_cursor("events", "billing", 2).unwrap();
     let report = store.retain_from_sequence("events", 3).unwrap();
     assert_eq!(report.effective_first_sequence, 3);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn new_consumers_start_immediately_before_the_retained_floor() {
+    let root = test_dir("new-consumer");
+    let mut store = FileFabricStreamStore::open(&root).unwrap();
+    store.create_stream("events", one_record_segments()).unwrap();
+    for byte in [1_u8, 2, 3] {
+        store.append("events", &[byte; 32]).unwrap();
+    }
+    store.retain_from_sequence("events", 3).unwrap();
+
+    assert_eq!(store.cursor("events", "fresh-worker").unwrap(), 2);
+    let deliveries = store
+        .deliver_consumer_at(
+            "events",
+            "fresh-worker",
+            1,
+            Duration::from_secs(30),
+            UNIX_EPOCH + Duration::from_secs(100),
+        )
+        .unwrap();
+    assert_eq!(deliveries[0].record.sequence, 3);
+
+    store
+        .ack_consumer("events", "fresh-worker", 3)
+        .unwrap();
+    assert_eq!(store.cursor("events", "fresh-worker").unwrap(), 3);
 
     let _ = fs::remove_dir_all(root);
 }
