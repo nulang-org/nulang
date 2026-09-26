@@ -39,8 +39,8 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 }
 
 fn encode_envelope(codec: BlobCodec, original_len: usize, payload: &[u8]) -> io::Result<Vec<u8>> {
-    let original_len = u64::try_from(original_len)
-        .map_err(|_| invalid_data("runtime blob length exceeds u64"))?;
+    let original_len =
+        u64::try_from(original_len).map_err(|_| invalid_data("runtime blob length exceeds u64"))?;
     let capacity = BLOB_HEADER_LEN
         .checked_add(payload.len())
         .ok_or_else(|| invalid_data("runtime blob envelope length overflow"))?;
@@ -160,11 +160,7 @@ pub fn decode_blob_with_limit(encoded: &[u8], max_decoded_len: usize) -> io::Res
                 ));
             }
         }
-        value => {
-            return Err(invalid_data(format!(
-                "unknown runtime blob codec {value}"
-            )))
-        }
+        value => return Err(invalid_data(format!("unknown runtime blob codec {value}"))),
     };
 
     if decoded.len() != expected_len {
