@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Fail-closed durable commit host ABI — 2026-09-26
+- **Standalone Wasmtime hosts now expose the internal atomic durability commit seam** `env.nulang_commit_transition(payload_ptr, payload_len) -> i64` in both normal and precompiled module paths.
+- **The host boundary fails closed.** It preserves the exact opaque request bytes, traps when no durable handler is configured or guest memory is invalid, and rejects serialized responses that exceed the existing 4 KiB result ring rather than truncating them.
+- This is a host ABI seam only: compiler emission and WASM workflow execution remain disabled until transition staging and replay semantics are wired end to end.
+
 ### Durable workflow activation identity on the host wire — 2026-09-26
 - **Terminal durable workflow records now preserve the accepted command activation identity across the host protocol.** `StepCompleted` and `StepFailed` carry optional `actor_id + command_sequence` fields encoded as strings so 64-bit identities survive JSON unchanged.
 - **Legacy wire records remain byte-shape compatible.** Missing activation decodes as `None` and is omitted again on serialization, so historical records and digests are not rewritten.
