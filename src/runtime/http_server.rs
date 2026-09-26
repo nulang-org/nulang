@@ -21,6 +21,7 @@ use crate::web::dispatch::{render_direct_request, DirectRequestRenderError};
 use crate::web::http_problem::request_decode_problem_response;
 use crate::web::http_request::HttpRequestBindingInputs;
 use crate::web::reactivity::inject_client_runtime_script;
+use crate::web::request_bindings::percent_decode_form;
 use crate::web::runtime_bindings::RuntimeWebRoute;
 
 /// HTTP method — must match the Nulang-level variant type.
@@ -503,42 +504,11 @@ pub fn parse_form_urlencoded(body: &[u8]) -> Vec<(String, String)> {
             continue;
         }
         let mut kv = part.splitn(2, '=');
-        let key = kv.next().unwrap_or("").to_string();
-        let value = kv.next().unwrap_or("").to_string();
-        pairs.push((percent_decode(&key), percent_decode(&value)));
+        let key = kv.next().unwrap_or("");
+        let value = kv.next().unwrap_or("");
+        pairs.push((percent_decode_form(key), percent_decode_form(value)));
     }
     pairs
-}
-
-fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h1), Some(h2)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
-                out.push(((h1 << 4) | h2) as char);
-                i += 3;
-                continue;
-            }
-        }
-        if bytes[i] == b'+' {
-            out.push(' ');
-        } else {
-            out.push(bytes[i] as char);
-        }
-        i += 1;
-    }
-    out
-}
-
-fn hex_value(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1154,11 +1124,13 @@ mod tests {
 
     #[test]
     fn test_parse_form_urlencoded() {
-        let pairs = parse_form_urlencoded(b"title=Buy+milk&id=1&foo=%26%3D");
-        assert_eq!(pairs.len(), 3);
+        let pairs =
+            parse_form_urlencoded(b"title=Buy+milk&id=1&foo=%26%3D&name=%C3%A9");
+        assert_eq!(pairs.len(), 4);
         assert!(pairs.contains(&("title".to_string(), "Buy milk".to_string())));
         assert!(pairs.contains(&("id".to_string(), "1".to_string())));
         assert!(pairs.contains(&("foo".to_string(), "&=".to_string())));
+        assert!(pairs.contains(&("name".to_string(), "é".to_string())));
     }
 
     #[test]
