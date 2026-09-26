@@ -1,4 +1,10 @@
 # Nulang Changelog
+
+### Workflow durability fail-closed boundary — 2026-09-25
+- **Durable workflow timers no longer become live after a failed persistence write.** `schedule_workflow_timer` now returns the storage error and arms the timer wheel only after `TimerSet` plus the current checkpoint succeed; VM timer effects turn that failure into an unhandled-effect error rather than continuing.
+- **Workflow signals no longer resume or enter in-memory signal state after a failed durable append/checkpoint.** `signal_workflow` now returns `io::Result` and mutates/resumes only after persistence succeeds.
+- **Timer expiry is fail-closed.** If `TimerFired` cannot be durably recorded, the runtime suppresses the corresponding actor message instead of executing an event that recovery cannot prove happened.
+- This deliberately preserves the legacy two-write event/checkpoint path until activation replay identity from #836 is implemented; it does not pretend intermediate workflow events are RFC 0022 atomic transitions yet.
 ### Actor A/B benchmark build diagnostics — 2026-09-25
 - **Failed base/candidate Cargo builds now preserve their captured compiler output in CI logs.** The same-host A/B harness re-emits combined stdout/stderr before raising, so build-stage failures no longer collapse into an opaque Python `CalledProcessError`; a focused Python regression test pins the behavior.
 
