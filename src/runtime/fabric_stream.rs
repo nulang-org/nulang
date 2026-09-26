@@ -690,6 +690,27 @@ impl FileFabricStreamStore {
             ));
         }
 
+        let deliveries = read_consumer_deliveries(&dir.join("deliveries.json"))?;
+        let default_cursor = current_first_sequence.saturating_sub(1);
+        for (consumer, state) in &deliveries.consumers {
+            if state.inflight.is_empty() && state.acked.is_empty() {
+                continue;
+            }
+            let cursor = cursors
+                .cursors
+                .get(consumer)
+                .copied()
+                .unwrap_or(default_cursor);
+            if cursor < required_cursor {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Fabric retention floor {effective_first_sequence} would overrun active consumer {consumer} at cursor {cursor}"
+                    ),
+                ));
+            }
+        }
+
         let mut deleted_segments = 0_usize;
         let mut deleted_records = 0_usize;
         let mut paths_to_delete = Vec::new();
