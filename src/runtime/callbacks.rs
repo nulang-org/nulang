@@ -2902,15 +2902,13 @@ mod host_authority_tests {
     fn bytecode_top_level_zero_sentinel_is_actor_free_but_missing_real_actor_fails_closed() {
         let mut rt = Runtime::new();
         // SAFETY: the pointer is derived from live `rt` and the callback is used only in this scope.
-        let top_level = unsafe {
-            super::BytecodeRuntimeCallbacks::from_raw(&mut rt as *mut Runtime, 0)
-        };
+        let top_level =
+            unsafe { super::BytecodeRuntimeCallbacks::from_raw(&mut rt as *mut Runtime, 0) };
         assert_eq!(top_level.authority_actor_id(), None);
 
         // SAFETY: same live, thread-confined Runtime as above.
-        let missing_actor = unsafe {
-            super::BytecodeRuntimeCallbacks::from_raw(&mut rt as *mut Runtime, 999_999)
-        };
+        let missing_actor =
+            unsafe { super::BytecodeRuntimeCallbacks::from_raw(&mut rt as *mut Runtime, 999_999) };
         assert_eq!(missing_actor.authority_actor_id(), Some(999_999));
 
         let (constants, regs) = string_args(&["/tmp/sentinel.txt"]);
