@@ -164,6 +164,7 @@ libffi = { version = "5", optional = true }
 # AI runtime crate (optional; enabled by the `ai-runtime` feature).
 nulang-ai = { path = "crates/nulang-ai", version = "0.1.0", optional = true }
 nulang-ai-local = { path = "crates/nulang-ai-local", version = "0.1.0", optional = true }
+nulang-durable-protocol = { path = "crates/nulang-durable-protocol", version = "0.1.0" }
 uuid = { version = "1", features = ["serde", "v4"], optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
 wasm-encoder = { version = "0.220", optional = true }
