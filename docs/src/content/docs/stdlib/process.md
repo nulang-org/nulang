@@ -16,6 +16,6 @@ The `Process` effect provides the following built-in operations, wired into the 
 
 | Operation | Signature | Description |
 |-----------|-----------|-------------|
-| `Process.run` | `run(cmd: String) -> String` | Execute a shell command via /bin/sh -c and return its stdout; returns nil on error or non-zero exit. |
+| `Process.run` | `run(cmd: String) -> String` | Trusted/standalone host primitive: execute a shell command via /bin/sh -c and return stdout; actor-backed runtimes do not dispatch it until an isolated process sandbox exists. |
 
 _Implementation site: Standalone VM_
