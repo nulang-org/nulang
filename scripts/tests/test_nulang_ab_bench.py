@@ -38,5 +38,22 @@ class CommandOutputTests(unittest.TestCase):
         )
 
 
+class CargoIsolationTests(unittest.TestCase):
+    def test_base_and_candidate_use_distinct_cargo_target_dirs(self):
+        base = nulang_ab_bench.cargo_environment("base")
+        candidate = nulang_ab_bench.cargo_environment("candidate")
+
+        self.assertIn("CARGO_TARGET_DIR", base)
+        self.assertIn("CARGO_TARGET_DIR", candidate)
+        self.assertNotEqual(base["CARGO_TARGET_DIR"], candidate["CARGO_TARGET_DIR"])
+
+    def test_variant_cargo_environment_preserves_process_environment(self):
+        with mock.patch.dict(nulang_ab_bench.os.environ, {"NULANG_AB_SENTINEL": "present"}):
+            env = nulang_ab_bench.cargo_environment("candidate")
+
+        self.assertEqual("present", env["NULANG_AB_SENTINEL"])
+
+
+
 if __name__ == "__main__":
     unittest.main()
