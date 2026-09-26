@@ -1,5 +1,9 @@
 # Nulang Changelog
 
+### Durable workflow activation identity on the host wire — 2026-09-26
+- **Terminal durable workflow records now preserve the accepted command activation identity across the host protocol.** `StepCompleted` and `StepFailed` carry optional `actor_id + command_sequence` fields encoded as strings so 64-bit identities survive JSON unchanged.
+- **Legacy wire records remain byte-shape compatible.** Missing activation decodes as `None` and is omitted again on serialization, so historical records and digests are not rewritten.
+
 ### Atomic durable transition host protocol — 2026-09-26
 - **The runtime-neutral RFC 0022 wire contract is now ported onto the current durability stack.** `nulang-durable-protocol` defines `nulang-durable-transition/v0alpha1`, opaque owner identity, fencing sequences, deterministic digests, workflow/timer/effect/outbox records, and fail-closed request validation without importing hosted Cloud policy.
 - **This supersedes the conflict-stale protocol branch rather than reviving its Cloud-control changes.** Transition staging can now target one portable Nulang-owned protocol while Nulang Cloud remains responsible for atomic host persistence.
