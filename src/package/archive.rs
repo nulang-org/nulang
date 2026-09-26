@@ -25,6 +25,11 @@ impl ArchiveCompression {
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
+pub const DEFAULT_MAX_PACKAGE_ARCHIVE_SIZE: usize = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_PACKAGE_TAR_SIZE: usize = 256 * 1024 * 1024;
+#[cfg(feature = "zstd-compression")]
+const DEFAULT_ZSTD_PACKAGE_WINDOW_LOG_MAX: u32 = 28;
+
 pub fn detect_archive_compression(bytes: &[u8]) -> Option<ArchiveCompression> {
     if bytes.starts_with(&GZIP_MAGIC) {
         Some(ArchiveCompression::Gzip)
@@ -36,6 +41,16 @@ pub fn detect_archive_compression(bytes: &[u8]) -> Option<ArchiveCompression> {
 }
 
 pub fn compress_tar(tar_bytes: &[u8], compression: ArchiveCompression) -> io::Result<Vec<u8>> {
+    compress_tar_with_limit(tar_bytes, compression, DEFAULT_MAX_PACKAGE_TAR_SIZE)
+}
+
+fn compress_tar_with_limit(
+    tar_bytes: &[u8],
+    compression: ArchiveCompression,
+    max_tar_bytes: usize,
+) -> io::Result<Vec<u8>> {
+    validate_tar_size(tar_bytes.len(), max_tar_bytes)?;
+
     match compression {
         ArchiveCompression::Gzip => {
             let mut output = Vec::new();
@@ -50,7 +65,10 @@ pub fn compress_tar(tar_bytes: &[u8], compression: ArchiveCompression) -> io::Re
         ArchiveCompression::Zstd => {
             #[cfg(feature = "zstd-compression")]
             {
-                zstd::stream::encode_all(Cursor::new(tar_bytes), crate::compression::DEFAULT_ZSTD_LEVEL)
+                zstd::stream::encode_all(
+                    Cursor::new(tar_bytes),
+                    crate::compression::DEFAULT_ZSTD_LEVEL,
+                )
             }
             #[cfg(not(feature = "zstd-compression"))]
             {
@@ -65,22 +83,48 @@ pub fn compress_tar(tar_bytes: &[u8], compression: ArchiveCompression) -> io::Re
 }
 
 pub fn decode_archive(archive_bytes: &[u8]) -> io::Result<Vec<u8>> {
+    if archive_bytes.len() > DEFAULT_MAX_PACKAGE_ARCHIVE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "package archive size {} exceeds limit {}",
+                archive_bytes.len(),
+                DEFAULT_MAX_PACKAGE_ARCHIVE_SIZE
+            ),
+        ));
+    }
+
+    decode_archive_with_limit(archive_bytes, DEFAULT_MAX_PACKAGE_TAR_SIZE)
+}
+
+pub fn decode_archive_with_limit(
+    archive_bytes: &[u8],
+    max_tar_bytes: usize,
+) -> io::Result<Vec<u8>> {
     match detect_archive_compression(archive_bytes) {
         Some(ArchiveCompression::Gzip) => {
-            let mut decoder = flate2::read::GzDecoder::new(Cursor::new(archive_bytes));
-            let mut output = Vec::new();
-            decoder.read_to_end(&mut output)?;
-            Ok(output)
+            let decoder = flate2::read::GzDecoder::new(Cursor::new(archive_bytes));
+            read_decoded_limited(decoder, max_tar_bytes, "gzip package archive")
         }
         Some(ArchiveCompression::Zstd) => {
             #[cfg(feature = "zstd-compression")]
             {
-                zstd::stream::decode_all(Cursor::new(archive_bytes)).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("invalid zstd package archive: {error}"),
-                    )
-                })
+                let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(archive_bytes))
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid zstd package archive: {error}"),
+                        )
+                    })?;
+                decoder
+                    .window_log_max(DEFAULT_ZSTD_PACKAGE_WINDOW_LOG_MAX)
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid zstd package archive: {error}"),
+                        )
+                    })?;
+                read_decoded_limited(decoder, max_tar_bytes, "zstd package archive")
             }
             #[cfg(not(feature = "zstd-compression"))]
             {
@@ -96,6 +140,36 @@ pub fn decode_archive(archive_bytes: &[u8]) -> io::Result<Vec<u8>> {
             "unknown package archive compression",
         )),
     }
+}
+
+fn validate_tar_size(decoded_len: usize, max_tar_bytes: usize) -> io::Result<()> {
+    if decoded_len > max_tar_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("package tar decoded length {decoded_len} exceeds limit {max_tar_bytes}"),
+        ));
+    }
+    Ok(())
+}
+
+fn read_decoded_limited(
+    reader: impl Read,
+    max_tar_bytes: usize,
+    label: &str,
+) -> io::Result<Vec<u8>> {
+    let max_plus_one = u64::try_from(max_tar_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut limited = reader.take(max_plus_one);
+    let mut output = Vec::new();
+    limited.read_to_end(&mut output)?;
+    if output.len() > max_tar_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} decoded size exceeds limit {max_tar_bytes}"),
+        ));
+    }
+    Ok(output)
 }
 
 #[cfg(test)]
