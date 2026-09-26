@@ -71,6 +71,31 @@ host-mode fork-join results must not be presented as a fair multicore
 comparison. These are language/runtime baselines, not a universal framework
 ranking; see the cross-runtime README for the full interpretation constraints.
 
+## Nulang shard scaling
+
+`nulang-shard-bench` measures best-case multicore runtime scaling independently
+from the cross-runtime Savina comparison. It keeps a fixed total number of
+messages across 1/2/4/8 shards, preloads same-shard actor work outside the
+timed section, constructs worker threads before timing, and releases all shard
+schedulers through a barrier. Results report throughput, ns/message, speedup
+against the 1-shard run, parallel efficiency, and the host's reported available
+parallelism.
+
+Run it on controlled hardware with:
+
+```bash
+cargo run --locked --profile savina --no-default-features \
+  --features savina-bench --bin nulang-shard-bench -- \
+  --shards 1,2,4,8 --messages 200000 --repeat 5 --format jsonl
+```
+
+This workload is deliberately **same-shard and independent**. It measures the
+runtime's parallel ceiling, not cross-shard messaging, contention, or network
+transport. The opt-in `Shard scaling benchmarks` workflow stores results as an
+artifact, but scaling ratios from shared CI hosts are diagnostic only. Publish
+multicore claims only from pinned/controlled hardware and report the host CPU
+topology alongside them.
+
 ## Same-runner Nulang A/B
 
 `scripts/nulang_ab_bench.py` compares the current checkout against an exact

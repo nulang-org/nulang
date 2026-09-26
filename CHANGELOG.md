@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Controlled runtime-shard scaling harness — 2026-09-26
+- **A dedicated shard-scaling runner measures fixed total actor-message work across 1/2/4/8 runtime shards**, excluding actor/message setup from timing and starting worker threads behind a barrier before measurement.
+- **Each run asserts that every preloaded message is processed exactly once** and reports throughput, ns/message, speedup, parallel efficiency, and host parallelism in human or JSONL form.
+- **The workload deliberately measures the best-case independent same-shard ceiling**, not cross-shard communication or contended fan-in, so transport changes remain blocked until this baseline exists.
+- **This replay preserves the original tested harness and includes the rustfmt output that was the only failing CI gate on #1067.**
+
 
 ### Same-host A/B Cargo target isolation — 2026-09-25
 - **Base and candidate benchmark builds now use separate Cargo target directories.** The repository config points every checkout at one absolute target path; sharing it across the detached base worktree and candidate could reuse the base library artifact while compiling candidate integration tests, producing false build failures or invalid A/B binaries.
