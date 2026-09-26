@@ -5294,7 +5294,14 @@ impl Runtime {
                 .collect();
             for entry in entries_to_replay {
                 let behavior_idx = entry.behavior_id as usize;
-                let payload: Vec<Value> = entry.payload.iter().map(|p| p.to_value()).collect();
+                let payload: Vec<Value> = {
+                    let actor = self.actors.get_mut(&actor_id)?;
+                    entry
+                        .payload
+                        .iter()
+                        .map(|value| value.to_value_on_heap(actor))
+                        .collect()
+                };
                 if self.has_native_handler(actor_id, behavior_idx) {
                     let _ = self.dispatch_native_handler(actor_id, behavior_idx, &payload);
                     if let Some(actor) = self.actors.get_mut(&actor_id) {
@@ -5491,7 +5498,22 @@ impl Runtime {
             let journal = self.persistence.read_journal(stable_actor_id);
             for entry in journal.iter().filter(|e| e.sequence > snap.sequence) {
                 let behavior_idx = entry.behavior_id as usize;
-                let payload: Vec<Value> = entry.payload.iter().map(|p| p.to_value()).collect();
+                let payload: Vec<Value> = {
+                    let actor = self.actors.get_mut(&stable_actor_id).ok_or_else(|| {
+                        NuError::RuntimeError {
+                            msg: format!(
+                                "virtual actor {} disappeared during journal replay",
+                                stable_actor_id
+                            ),
+                            span: Span::new(0, 0),
+                        }
+                    })?;
+                    entry
+                        .payload
+                        .iter()
+                        .map(|value| value.to_value_on_heap(actor))
+                        .collect()
+                };
                 if self.has_native_handler(stable_actor_id, behavior_idx) {
                     // Native handlers cannot be resolved until the actor is in
                     // `self.actors`, so we only support bytecode grains here.
