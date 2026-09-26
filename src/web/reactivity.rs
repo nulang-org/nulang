@@ -1279,4 +1279,55 @@ fn view() -> Html {
             "only string form fields are currently part of the action wire payload"
         );
     }
+    #[test]
+    fn test_action_graph_preserves_compiler_handler_params() {
+        let module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+fn save(title: String, count: Int, active: Bool) {}
+
+fn view() -> Html {
+    <button action={save}>Save</button>
+}
+"#,
+        );
+        let graph = analyze_module(&module, None);
+        let action = graph
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                GraphNode::Action {
+                    handler, params, ..
+                } if handler == "save" => Some(params),
+                _ => None,
+            })
+            .expect("save action");
+
+        assert_eq!(
+            action,
+            &vec![
+                crate::web::contracts::HandlerParamContract {
+                    name: "title".to_string(),
+                    ty: Some("String".to_string()),
+                    capability: None,
+                    request: None,
+                },
+                crate::web::contracts::HandlerParamContract {
+                    name: "count".to_string(),
+                    ty: Some("Int".to_string()),
+                    capability: None,
+                    request: None,
+                },
+                crate::web::contracts::HandlerParamContract {
+                    name: "active".to_string(),
+                    ty: Some("Bool".to_string()),
+                    capability: None,
+                    request: None,
+                },
+            ]
+        );
+    }
+
 }
