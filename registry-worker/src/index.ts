@@ -1,12 +1,90 @@
 import { sortSemver } from './semver';
 
 const PACKAGE_EXTENSIONS = ['.tar.zst', '.tar.gz'] as const;
+const MAX_PACKAGE_ARCHIVE_BYTES = 64 * 1024 * 1024;
+const VERSION_LOCK_SUFFIX = '.publish.lock';
 
-function packageExtensionForRequest(request: Request): (typeof PACKAGE_EXTENSIONS)[number] {
-  return request.headers.get('Content-Type')?.split(';', 1)[0].trim().toLowerCase() ===
-    'application/zstd'
-    ? '.tar.zst'
-    : '.tar.gz';
+type PackageCompression = 'gzip' | 'zstd';
+
+function packageCompressionForRequest(request: Request): PackageCompression | null {
+  const contentType = request.headers
+    .get('Content-Type')
+    ?.split(';', 1)[0]
+    .trim()
+    .toLowerCase();
+
+  if (contentType === undefined || contentType === 'application/gzip') {
+    return 'gzip';
+  }
+  if (contentType === 'application/zstd') {
+    return 'zstd';
+  }
+  return null;
+}
+
+function packageExtension(compression: PackageCompression): (typeof PACKAGE_EXTENSIONS)[number] {
+  return compression === 'zstd' ? '.tar.zst' : '.tar.gz';
+}
+
+function packageContentType(compression: PackageCompression): string {
+  return compression === 'zstd' ? 'application/zstd' : 'application/gzip';
+}
+
+function archiveMagicMatches(prefix: number[], compression: PackageCompression): boolean {
+  if (compression === 'gzip') {
+    return prefix.length >= 2 && prefix[0] === 0x1f && prefix[1] === 0x8b;
+  }
+  return (
+    prefix.length >= 4 &&
+    prefix[0] === 0x28 &&
+    prefix[1] === 0xb5 &&
+    prefix[2] === 0x2f &&
+    prefix[3] === 0xfd
+  );
+}
+
+function validatedArchiveStream(
+  body: ReadableStream<Uint8Array>,
+  compression: PackageCompression,
+  state: { failure: 'too-large' | 'magic' | null }
+): ReadableStream<Uint8Array> {
+  const requiredPrefix = compression === 'zstd' ? 4 : 2;
+  const prefix: number[] = [];
+  let seen = 0;
+  let validated = false;
+
+  return body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        seen += chunk.byteLength;
+        if (seen > MAX_PACKAGE_ARCHIVE_BYTES) {
+          state.failure = 'too-large';
+          throw new Error('package archive exceeds size limit');
+        }
+
+        if (!validated) {
+          for (let index = 0; index < chunk.length && prefix.length < requiredPrefix; index++) {
+            prefix.push(chunk[index]);
+          }
+          if (prefix.length >= requiredPrefix) {
+            if (!archiveMagicMatches(prefix, compression)) {
+              state.failure = 'magic';
+              throw new Error('package archive content type does not match payload');
+            }
+            validated = true;
+          }
+        }
+
+        controller.enqueue(chunk);
+      },
+      flush() {
+        if (!validated) {
+          state.failure = 'magic';
+          throw new Error('package archive is truncated or has invalid magic');
+        }
+      },
+    })
+  );
 }
 
 function stripPackageExtension(filename: string): string | null {
@@ -112,20 +190,29 @@ export default {
       const version = matchVersion[2];
       if (method === 'GET') {
         let object: R2ObjectBody | null = null;
+        let foundExtension: (typeof PACKAGE_EXTENSIONS)[number] | null = null;
         for (const extension of PACKAGE_EXTENSIONS) {
           object = await env.BUCKET.get(`${name}/${version}${extension}`);
-          if (object) break;
+          if (object) {
+            foundExtension = extension;
+            break;
+          }
         }
-        if (!object) {
+        if (!object || !foundExtension) {
           return new Response('Not found', { status: 404 });
         }
 
         const headers = new Headers();
         object.writeHttpMetadata(headers);
-        headers.set('Content-Type', 'application/octet-stream');
+        if (!headers.has('Content-Type')) {
+          headers.set(
+            'Content-Type',
+            foundExtension === '.tar.zst' ? 'application/zstd' : 'application/gzip'
+          );
+        }
 
         return new Response(object.body as ReadableStream, {
-          headers
+          headers,
         });
       }
 
@@ -135,17 +222,46 @@ export default {
           return new Response('Unauthorized', { status: 401 });
         }
 
-        // Quota hooks need a byte count, which chunked transfers (no
-        // Content-Length) cannot provide pre-flight. Reject them rather than
-        // reporting size_bytes: 0 and letting the quota check be bypassed.
-        if (env.QUOTA_HOOK_URL && !request.headers.has('Content-Length')) {
+        const contentLengthHeader = request.headers.get('Content-Length');
+        if (contentLengthHeader !== null) {
+          const declaredLength = Number(contentLengthHeader);
+          if (!Number.isSafeInteger(declaredLength) || declaredLength < 0) {
+            return new Response('Bad Request: invalid Content-Length', { status: 400 });
+          }
+          if (declaredLength > MAX_PACKAGE_ARCHIVE_BYTES) {
+            return new Response('Payload Too Large', { status: 413 });
+          }
+        }
+
+        if (env.QUOTA_HOOK_URL && contentLengthHeader === null) {
           return new Response(
             'Length Required: Content-Length header required when quota hook is enabled',
             { status: 411 }
           );
         }
 
-        // A package version is immutable regardless of archive compression.
+        const compression = packageCompressionForRequest(request);
+        if (!compression) {
+          return new Response('Unsupported package archive content type', { status: 415 });
+        }
+
+        const quotaRejection = await checkPublishQuota(
+          env,
+          name,
+          version,
+          Number(contentLengthHeader ?? 0)
+        );
+        if (quotaRejection) {
+          return quotaRejection;
+        }
+
+        const lockKey = `${name}/${version}${VERSION_LOCK_SUFFIX}`;
+        const onlyIf = new Headers({ 'If-None-Match': '*' });
+        const reservation = await env.BUCKET.put(lockKey, '', { onlyIf });
+        if (!reservation) {
+          return new Response('Conflict: Version already exists', { status: 409 });
+        }
+
         for (const extension of PACKAGE_EXTENSIONS) {
           const existing = await env.BUCKET.head(`${name}/${version}${extension}`);
           if (existing) {
@@ -153,25 +269,39 @@ export default {
           }
         }
 
-        // Optional publish-quota hook (hosted deployments)
-        const quotaRejection = await checkPublishQuota(
-          env,
-          name,
-          version,
-          Number(request.headers.get('Content-Length') ?? 0)
-        );
-        if (quotaRejection) {
-          return quotaRejection;
+        if (!request.body) {
+          await env.BUCKET.delete(lockKey);
+          return new Response('Unsupported package archive payload', { status: 415 });
         }
-        
-        const extension = packageExtensionForRequest(request);
+
+        const validation = { failure: null as 'too-large' | 'magic' | null };
+        const extension = packageExtension(compression);
         const key = `${name}/${version}${extension}`;
-        await env.BUCKET.put(key, request.body, {
-          httpMetadata: {
-            contentType:
-              extension === '.tar.zst' ? 'application/zstd' : 'application/gzip',
-          },
-        });
+        const body = validatedArchiveStream(request.body, compression, validation);
+
+        try {
+          const stored = await env.BUCKET.put(key, body, {
+            httpMetadata: {
+              contentType: packageContentType(compression),
+            },
+          });
+          if (!stored) {
+            await env.BUCKET.delete(lockKey);
+            return new Response('Internal Server Error', { status: 500 });
+          }
+        } catch {
+          await env.BUCKET.delete(lockKey);
+          if (validation.failure === 'too-large') {
+            return new Response('Payload Too Large', { status: 413 });
+          }
+          if (validation.failure === 'magic') {
+            return new Response('Package archive content type does not match payload', {
+              status: 415,
+            });
+          }
+          return new Response('Internal Server Error', { status: 500 });
+        }
+
         return new Response('Created', { status: 201 });
       }
     }
