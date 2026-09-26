@@ -225,10 +225,22 @@ def verify_files():
                 )
                 return False
 
-    if "pub(crate) unsafe fn from_raw(" not in callbacks_content:
+    required_constructors = (
+        "pub(crate) unsafe fn from_raw(runtime: *mut Runtime, actor_id: u64)",
+        "pub(crate) unsafe fn from_raw(runtime: *mut Runtime) -> Self",
+    )
+    for constructor in required_constructors:
+        if constructor not in callbacks_content:
+            print(
+                "Error: raw Runtime callback construction is not fully gated by "
+                f"unsafe from_raw constructors; missing: {constructor}"
+            )
+            return False
+
+    if "pub(crate) runtime: *mut Runtime" in callbacks_content:
         print(
-            "Error: raw Runtime callback construction is not marked unsafe; "
-            "the pointer validity/lifetime contract must be explicit at call sites."
+            "Error: distributed callback exposes its raw Runtime pointer crate-wide; "
+            "keep the field private so call sites must use unsafe from_raw."
         )
         return False
 
