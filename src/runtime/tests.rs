@@ -3439,24 +3439,24 @@ fn workflow_resume_context_preserves_next_replay_ordinal() {
     let activation = WorkflowActivationId::new(actor_id, 91);
     {
         let actor = rt.actors.get_mut(&actor_id).unwrap();
-        actor.next_workflow_replay_ordinal = 4;
+        actor.next_workflow_operation_ordinal = 4;
         actor.current_workflow_activation = None;
     }
 
-    super::workflow::restore_replay_context(&mut rt, actor_id, Some(activation));
+    super::workflow::resume_workflow_activation(&mut rt, actor_id, Some(activation));
 
     let actor = rt.actors.get(&actor_id).unwrap();
     assert_eq!(actor.current_workflow_activation, Some(activation));
-    assert_eq!(actor.next_workflow_replay_ordinal, 4);
+    assert_eq!(actor.next_workflow_operation_ordinal, 4);
 
-    super::workflow::clear_replay_context(&mut rt, actor_id);
+    super::workflow::clear_workflow_activation(&mut rt, actor_id);
     let actor = rt.actors.get(&actor_id).unwrap();
     assert_eq!(actor.current_workflow_activation, None);
-    assert_eq!(actor.next_workflow_replay_ordinal, 4);
+    assert_eq!(actor.next_workflow_operation_ordinal, 4);
 }
 
 #[test]
-fn workflow_custom_events_receive_activation_local_replay_ids() {
+fn workflow_custom_events_receive_activation_local_operations() {
     let mut rt = Runtime::new();
     let actor_id = rt.spawn_workflow_actor("ReplayWorkflow", Box::new(Vec::new), HashMap::new());
     let activation = WorkflowActivationId::new(actor_id, 77);
@@ -3468,21 +3468,21 @@ fn workflow_custom_events_receive_activation_local_replay_ids() {
     rt.emit_event(actor_id, "First", &[]);
     rt.emit_event(actor_id, "Second", &[]);
 
-    let replay_ids: Vec<_> = rt
+    let operations: Vec<_> = rt
         .persistence
         .read_workflow_events(actor_id)
         .into_iter()
         .filter_map(|event| match event {
-            WorkflowEvent::Custom { replay_id, .. } => replay_id,
+            WorkflowEvent::Custom { operation, .. } => operation,
             _ => None,
         })
         .collect();
 
     assert_eq!(
-        replay_ids,
+        operations,
         vec![
-            WorkflowReplayId::new(activation, 0),
-            WorkflowReplayId::new(activation, 1),
+            WorkflowOperationId::new(activation, 0),
+            WorkflowOperationId::new(activation, 1),
         ]
     );
 }
