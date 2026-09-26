@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Durable Fabric consumer ACK/NACK delivery — 2026-09-25
+- **Fabric Streams now persist per-consumer delivery leases and delivery attempts.** Unacknowledged records become eligible again after their ACK deadline, explicit NACK makes a lease immediately redeliverable, and restart preserves in-flight state.
+- **Out-of-order ACKs cannot skip durable work.** ACK gaps are persisted and the consumer cursor advances only across the longest contiguous acknowledged prefix; already-committed ACKs remain idempotent.
+- **The runtime exposes native delivery/ACK/NACK APIs without changing raw replay semantics.** Existing cursor/replay callers continue to work while consumers that need at-least-once delivery opt into leased delivery.
+
 ### Actor A/B benchmark build diagnostics — 2026-09-25
 - **Failed base/candidate Cargo builds now preserve their captured compiler output in CI logs.** The same-host A/B harness re-emits combined stdout/stderr before raising, so build-stage failures no longer collapse into an opaque Python `CalledProcessError`; a focused Python regression test pins the behavior.
 
