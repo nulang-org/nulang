@@ -352,9 +352,7 @@ pub(crate) fn query_workflow(rt: &mut Runtime, actor_id: u64, name: &str) -> Opt
         vm.set_actor_callbacks(Box::new(BytecodeRuntimeCallbacks::from_raw(
             self_ptr, actor_id,
         )));
-        vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks::from_raw(
-            self_ptr,
-        )));
+        vm.set_distributed_callbacks(Box::new(BytecodeDistributedCallbacks::from_raw(self_ptr)));
     }
     let mut frame = Frame::new(None, 0);
     frame.pc = offset;
