@@ -1716,6 +1716,16 @@ fn test_tier2_replaces_baseline_with_typed_code() {
         jit.is_typed_compiled(0, start),
         "promoted region should be recorded as type-directed"
     );
+    let stats = crate::backends::JitBackend::compile_stats(&jit);
+    assert_eq!(stats.fast_compiles, 1);
+    assert_eq!(stats.optimized_compiles, 1);
+    assert_eq!(stats.total_compiles(), 2);
+    assert_eq!(
+        stats.total_compile_ns(),
+        stats
+            .fast_compile_ns
+            .saturating_add(stats.optimized_compile_ns)
+    );
 }
 
 #[test]
