@@ -9,7 +9,7 @@ use crate::bytecode::Constant;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{
-    EventEntry, PersistedValue, WorkflowEvent, WorkflowReplayId,
+    EventEntry, PersistedValue, WorkflowEvent, WorkflowOperationId,
 };
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
 use crate::vm::{Frame, Value, VM};
@@ -29,7 +29,7 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn restore_replay_context(
+pub(crate) fn resume_workflow_activation(
     rt: &mut Runtime,
     actor_id: u64,
     activation: Option<crate::runtime::persistence::WorkflowActivationId>,
@@ -39,7 +39,7 @@ pub(crate) fn restore_replay_context(
     }
 }
 
-pub(crate) fn clear_replay_context(rt: &mut Runtime, actor_id: u64) {
+pub(crate) fn clear_workflow_activation(rt: &mut Runtime, actor_id: u64) {
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.current_workflow_activation = None;
     }
@@ -241,9 +241,9 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 .iter()
                 .map(|v| PersistedValue::from_value_resolved(v, module))
                 .collect();
-            let replay_id = rt.actors.get(&actor_id).and_then(|actor| {
+            let operation = rt.actors.get(&actor_id).and_then(|actor| {
                 actor.current_workflow_activation.map(|activation| {
-                    WorkflowReplayId::new(activation, actor.next_workflow_replay_ordinal)
+                    WorkflowOperationId::new(activation, actor.next_workflow_operation_ordinal)
                 })
             });
             let persisted = rt
@@ -252,16 +252,16 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                     actor_id,
                     WorkflowEvent::Custom {
                         sequence: seq,
-                        replay_id,
+                        operation,
                         name: event.to_string(),
                         args: payload,
                     },
                 )
                 .is_ok();
-            if persisted && replay_id.is_some() {
+            if persisted && operation.is_some() {
                 if let Some(actor) = rt.actors.get_mut(&actor_id) {
-                    actor.next_workflow_replay_ordinal = actor
-                        .next_workflow_replay_ordinal
+                    actor.next_workflow_operation_ordinal = actor
+                        .next_workflow_operation_ordinal
                         .checked_add(1)
                         .expect("workflow replay ordinal overflow");
                 }
