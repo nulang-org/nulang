@@ -1126,7 +1126,10 @@ impl FileFabricStreamStore {
         }
 
         let ack_wait_ms = u64::try_from(ack_wait.as_millis()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "Fabric ACK wait exceeds u64 milliseconds")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Fabric ACK wait exceeds u64 milliseconds",
+            )
         })?;
         if ack_wait_ms == 0 {
             return Err(io::Error::new(
@@ -1218,12 +1221,7 @@ impl FileFabricStreamStore {
     /// ACKs may arrive out of order, but the durable cursor only advances when
     /// every sequence from the current cursor through the ACKed sequence has
     /// been acknowledged.
-    pub fn ack_consumer(
-        &mut self,
-        name: &str,
-        consumer: &str,
-        sequence: u64,
-    ) -> io::Result<()> {
+    pub fn ack_consumer(&mut self, name: &str, consumer: &str, sequence: u64) -> io::Result<()> {
         validate_name("consumer", consumer)?;
         self.ensure_state(name)?;
         let cursor = self.cursor(name, consumer)?;
@@ -1287,12 +1285,7 @@ impl FileFabricStreamStore {
 
     /// NACK one in-flight delivery and make it immediately eligible for
     /// redelivery while preserving its attempt counter.
-    pub fn nack_consumer(
-        &mut self,
-        name: &str,
-        consumer: &str,
-        sequence: u64,
-    ) -> io::Result<()> {
+    pub fn nack_consumer(&mut self, name: &str, consumer: &str, sequence: u64) -> io::Result<()> {
         validate_name("consumer", consumer)?;
         self.ensure_state(name)?;
         if sequence <= self.cursor(name, consumer)? {
@@ -2057,8 +2050,7 @@ fn read_consumer_deliveries(path: &Path) -> io::Result<ConsumerDeliveryFile> {
         return Ok(ConsumerDeliveryFile::default());
     }
     let bytes = fs::read(path)?;
-    let deliveries: ConsumerDeliveryFile =
-        serde_json::from_slice(&bytes).map_err(json_error)?;
+    let deliveries: ConsumerDeliveryFile = serde_json::from_slice(&bytes).map_err(json_error)?;
     if deliveries.version != STREAM_FORMAT_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
