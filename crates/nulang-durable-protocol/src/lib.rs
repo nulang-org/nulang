@@ -12,6 +12,7 @@ use std::fmt;
 
 pub const DURABLE_TRANSITION_PROTOCOL_VERSION: &str = "nulang-durable-transition/v0alpha1";
 const DURABLE_TRANSITION_DIGEST_DOMAIN: &[u8] = b"nulang.durable-transition-protocol.v0alpha1\0";
+const DURABLE_COMPENSATION_ID_DOMAIN: &[u8] = b"nulang.durable-compensation.v1\0";
 
 mod u64_string {
     use serde::{Deserialize, Deserializer, Serializer};
