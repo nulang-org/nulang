@@ -4513,6 +4513,46 @@ mod lsp_tests {
         );
     }
 
+    /// LSP columns are UTF-16 code units, so a ranged edit after a non-BMP
+    /// character must not treat the column as a UTF-8 byte offset.
+    #[tokio::test]
+    async fn test_protocol_incremental_change_uses_utf16_columns() {
+        let (mut service, mut socket) = LspService::new(|client| NulangLanguageServer::new(client));
+        init(&mut service).await;
+        call(
+            &mut service,
+            did_open_req(DOC_URL, 1, "fn label() { \"😀x\" }"),
+        )
+        .await;
+        socket.next().await.expect("open diagnostics");
+
+        call(
+            &mut service,
+            Request::build("textDocument/didChange")
+                .params(serde_json::json!({
+                    "textDocument": { "uri": DOC_URL, "version": 2 },
+                    "contentChanges": [{
+                        "range": {
+                            "start": { "line": 0, "character": 16 },
+                            "end": { "line": 0, "character": 17 }
+                        },
+                        "rangeLength": 1,
+                        "text": "y"
+                    }]
+                }))
+                .finish(),
+        )
+        .await;
+
+        let msg = socket.next().await.expect("utf16 change diagnostics");
+        let params = msg.params().cloned().expect("params");
+        assert_eq!(
+            params["diagnostics"].as_array().map(|items| items.len()),
+            Some(0),
+            "UTF-16 ranged edit must keep the document valid: {params}"
+        );
+    }
+
     /// hover over a function declaration returns its signature text through
     /// the full JSON-RPC round-trip.
     #[tokio::test]
