@@ -202,6 +202,10 @@ impl WorkflowActivationId {
             command_sequence,
         }
     }
+
+    pub const fn operation(self, ordinal: u32) -> WorkflowOperationId {
+        WorkflowOperationId::new(self, ordinal)
+    }
 }
 
 /// Replay-stable identity of one deterministic workflow operation.
@@ -209,7 +213,18 @@ impl WorkflowActivationId {
 /// The ordinal is local to an accepted command activation. Re-executing the
 /// same activation must derive the same ordinal sequence so recovery can
 /// recognize already-committed operations instead of appending them twice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct WorkflowOperationId {
     pub activation: WorkflowActivationId,
     pub ordinal: u32,
@@ -221,6 +236,19 @@ impl WorkflowOperationId {
             activation,
             ordinal,
         }
+    }
+
+    pub fn durable_effect_id(self, effect_operation: &str) -> DurableEffectId {
+        let execution_key = format!(
+            "workflow-command:{}",
+            self.activation.command_sequence
+        );
+        DurableEffectId::derive(
+            self.activation.actor_id,
+            &execution_key,
+            self.ordinal,
+            effect_operation,
+        )
     }
 }
 
@@ -322,7 +350,7 @@ impl WorkflowEvent {
     ///
     /// Legacy records and event kinds without activation-local identity return
     /// `None`.
-    pub fn operation(&self) -> Option<WorkflowOperationId> {
+    pub fn operation_id(&self) -> Option<WorkflowOperationId> {
         match self {
             WorkflowEvent::Custom { operation, .. } => *operation,
             _ => None,
@@ -452,7 +480,7 @@ impl DurableTransition {
         for event in &self.workflow_events {
             let activation = event
                 .activation_id()
-                .or_else(|| event.operation().map(|id| id.activation));
+                .or_else(|| event.operation_id().map(|id| id.activation));
             if let Some(activation) = activation {
                 if activation.actor_id != self.actor_id {
                     return Err(io::Error::new(
