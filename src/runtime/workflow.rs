@@ -227,6 +227,7 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 actor_id,
                 WorkflowEvent::Custom {
                     sequence: seq,
+                    replay_id: None,
                     name: event.to_string(),
                     args: payload,
                 },
