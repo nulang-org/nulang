@@ -2606,53 +2606,62 @@ impl Runtime {
         args: &[Value],
         out_trace: Option<String>,
     ) -> MessageAdmission {
+        let sender = self.current_actor.unwrap_or(0);
         let msg = Message {
             behavior_id,
             payload: MessagePayload::from_slice(args),
-            sender: self.current_actor.unwrap_or(0),
+            sender,
             priority: MessagePriority::Normal,
             trace_id: out_trace.clone(),
         };
+
+        // Capture ready-queue and receive-wait decisions while we already hold
+        // the target actor lookup used for mailbox admission. Runtime shards
+        // are thread-confined, so no other thread can change run state or
+        // receive-wait state between this admission and the scheduler publish
+        // below. This avoids re-hashing the same actor id on every local send.
+        let mut enqueue_priority = None;
+        let mut wake_for_receive = false;
         let admission = if let Some(actor) = self.actors.get_mut(&target_id) {
             if actor.mailbox.push_local(msg).is_ok() {
                 // Record only messages that were actually admitted. The
                 // runtime-default recorder is disabled unless explicitly
                 // enabled, making this branch effectively free in production.
-                actor
-                    .flight_recorder
-                    .record(self.current_actor.unwrap_or(0), behavior_id, args);
+                actor.flight_recorder.record(sender, behavior_id, args);
                 // Activity resets the dehydration idle timer.
                 actor.idle_ms = 0;
+
+                if actor.run_state == ActorRunState::Idle {
+                    actor.run_state = ActorRunState::Queued;
+                    enqueue_priority = Some(actor.priority);
+                }
+                wake_for_receive = actor.suspended_execution.is_some()
+                    && actor.receive_wait.map(|w| !w.timed_out).unwrap_or(false);
+
                 MessageAdmission::Accepted
             } else {
-                // Mailbox is full (capacity > 0). Route to DLQ with a simple notification.
-                self.route_to_dlq(
-                    &Message {
-                        behavior_id,
-                        payload: MessagePayload::from_slice(args),
-                        sender: self.current_actor.unwrap_or(0),
-                        priority: MessagePriority::System,
-                        trace_id: out_trace.clone(),
-                    },
-                    "mailbox full",
-                );
                 MessageAdmission::Backpressured
             }
         } else {
-            self.route_to_dlq(
-                &Message {
-                    behavior_id,
-                    payload: MessagePayload::from_slice(args),
-                    sender: self.current_actor.unwrap_or(0),
-                    priority: MessagePriority::System,
-                    trace_id: out_trace.clone(),
-                },
-                "target actor not found",
-            );
             MessageAdmission::Rejected
         };
 
         if admission != MessageAdmission::Accepted {
+            let reason = match admission {
+                MessageAdmission::Backpressured => "mailbox full",
+                MessageAdmission::Rejected => "target actor not found",
+                MessageAdmission::Accepted => unreachable!(),
+            };
+            self.route_to_dlq(
+                &Message {
+                    behavior_id,
+                    payload: MessagePayload::from_slice(args),
+                    sender,
+                    priority: MessagePriority::System,
+                    trace_id: out_trace,
+                },
+                reason,
+            );
             return admission;
         }
 
@@ -2665,7 +2674,7 @@ impl Runtime {
                     // The true owner is recorded in the object's header: an
                     // actor forwarding a reference it received from a third
                     // actor must not be mistaken for the owner (that tripped
-                    // the ownership assert in `send_ref_to` and registered
+                    // the ownership assert in send_ref_to and registered
                     // the cycle-detector edge under the wrong actor).
                     // SAFETY: TAG_PTR values carry ActorHeap payload pointers
                     // with a uniform OrcaHeader layout; the sender holds a
@@ -2680,9 +2689,9 @@ impl Runtime {
                     } else {
                         // The owner has exited: its heap is retired (kept
                         // alive by the sender's hold), so the header is
-                        // still valid.  Bump the in-flight count directly
-                        // and queue the decrement op; `process_gc_ops`
-                        // applies it on the retired heap.
+                        // still valid. Bump the in-flight count directly
+                        // and queue the decrement op; process_gc_ops applies
+                        // it on the retired heap.
                         // SAFETY: as above; the single scheduler thread is
                         // the only mutator of any header.
                         unsafe { (*source_header).foreign_count += 1 };
@@ -2712,26 +2721,22 @@ impl Runtime {
                 }
             }
         }
-        self.enqueue_actor(target_id);
+
+        if let Some(priority) = enqueue_priority {
+            self.scheduler.enqueue_with_priority(target_id, priority);
+        }
+
         // Wake an actor suspended in a timed selective receive: resume it
         // so the VM re-executes the ReceiveWait scan. A match resolves the
         // wait; otherwise the behavior re-suspends on its original deadline.
         // (An already-fired timeout is resolved by the timer-fire path.)
-        let wake_for_receive = self
-            .actors
-            .get(&target_id)
-            .map(|a| {
-                a.suspended_execution.is_some()
-                    && a.receive_wait.map(|w| !w.timed_out).unwrap_or(false)
-            })
-            .unwrap_or(false);
         if wake_for_receive {
             if self.vm_execution_depth > 0 {
                 // A behavior is mid-flight on the shared runtime VM:
-                // resuming the target now would nest a second
-                // `vm.resume()` inside the running one and clobber the
-                // shared frames. Defer the wake; `vm_exec_end` drains it
-                // once the outermost VM call returns.
+                // resuming the target now would nest a second vm.resume()
+                // inside the running one and clobber the shared frames.
+                // Defer the wake; vm_exec_end drains it once the outermost
+                // VM call returns.
                 if !self.pending_receive_wakes.contains(&target_id) {
                     self.pending_receive_wakes.push(target_id);
                 }
