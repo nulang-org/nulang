@@ -1,5 +1,11 @@
 # Nulang Changelog
 
+### Universal UI protocol integration for Web actions — 2026-09-26
+- **Web reactivity now lowers into the renderer-neutral `nulang-ui/1` document/patch protocol.** Action placement uses the shared protocol type, unresolved placement fails closed to the server, static output avoids framework JavaScript, and signal updates use indexed bindings rather than repeated DOM scans.
+- **Server actions now carry validated `nulang-ui-msg/1` envelopes alongside the temporary legacy form field.** Malformed envelopes, client-placement requests, and envelope/legacy action identity mismatches fail closed before route dispatch.
+- **Direct runtime dispatch is compiler-gated.** Top-level zero-argument server actions can be resolved and invoked by compiler bytecode metadata; parameterized handlers explicitly require a future compiler-owned action binding plan instead of inferring argument types from form data.
+
+
 ### Same-host A/B Cargo target isolation — 2026-09-25
 - **Base and candidate benchmark builds now use separate Cargo target directories.** The repository config points every checkout at one absolute target path; sharing it across the detached base worktree and candidate could reuse the base library artifact while compiling candidate integration tests, producing false build failures or invalid A/B binaries.
 - **The isolation applies to both prebuild and measured Cargo invocations.** Persistent per-variant target directories retain ordinary Cargo caching while preventing cross-variant artifact contamination.
