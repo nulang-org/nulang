@@ -283,7 +283,7 @@ pub fn bind_path_arguments(
                 binding.source_name, binding.handler_param
             )
         })?;
-        let value = decode_path_constant(raw, binding.ty.as_deref()).map_err(|message| {
+        let value = decode_scalar_constant(raw, binding.ty.as_deref()).map_err(|message| {
             format!(
                 "path parameter '{}' for handler parameter '{}': {message}",
                 binding.source_name, binding.handler_param
@@ -366,7 +366,7 @@ pub fn render_bound_route_handler(
     Ok(vm.value_to_string(0, result))
 }
 
-fn decode_path_constant(raw: &str, ty: Option<&str>) -> Result<Constant, String> {
+pub(crate) fn decode_scalar_constant(raw: &str, ty: Option<&str>) -> Result<Constant, String> {
     match ty.map(str::trim) {
         Some("Int") => raw
             .parse::<i64>()
@@ -487,11 +487,11 @@ mod tests {
 
     #[test]
     fn non_finite_float_path_value_is_rejected() {
-        assert!(decode_path_constant("NaN", Some("Float")).is_err());
-        assert!(decode_path_constant("inf", Some("Float")).is_err());
-        assert!(decode_path_constant("-inf", Some("Float")).is_err());
+        assert!(decode_scalar_constant("NaN", Some("Float")).is_err());
+        assert!(decode_scalar_constant("inf", Some("Float")).is_err());
+        assert!(decode_scalar_constant("-inf", Some("Float")).is_err());
         assert_eq!(
-            decode_path_constant("1.5", Some("Float")).unwrap(),
+            decode_scalar_constant("1.5", Some("Float")).unwrap(),
             crate::bytecode::Constant::Float(1.5)
         );
     }
@@ -540,15 +540,15 @@ mod tests {
     #[test]
     fn decodes_supported_primitive_types() {
         assert_eq!(
-            decode_path_constant("7", Some("Int")).unwrap(),
+            decode_scalar_constant("7", Some("Int")).unwrap(),
             Constant::Int(7)
         );
         assert_eq!(
-            decode_path_constant("3.5", Some("Float")).unwrap(),
+            decode_scalar_constant("3.5", Some("Float")).unwrap(),
             Constant::Float(3.5)
         );
         assert_eq!(
-            decode_path_constant("true", Some("Bool")).unwrap(),
+            decode_scalar_constant("true", Some("Bool")).unwrap(),
             Constant::Bool(true)
         );
     }
@@ -556,17 +556,17 @@ mod tests {
     #[test]
     fn keeps_custom_identifier_types_string_backed() {
         assert_eq!(
-            decode_path_constant("usr_123", Some("UserId")).unwrap(),
+            decode_scalar_constant("usr_123", Some("UserId")).unwrap(),
             Constant::String("usr_123".to_string())
         );
     }
 
     #[test]
     fn reports_primitive_decode_failures() {
-        assert!(decode_path_constant("not-an-int", Some("Int"))
+        assert!(decode_scalar_constant("not-an-int", Some("Int"))
             .unwrap_err()
             .contains("expected Int"));
-        assert!(decode_path_constant("1", Some("Bool"))
+        assert!(decode_scalar_constant("1", Some("Bool"))
             .unwrap_err()
             .contains("expected Bool"));
     }
