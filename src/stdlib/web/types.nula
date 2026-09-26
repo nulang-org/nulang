@@ -1,10 +1,15 @@
 // Nulang web framework — semantic types.
 // Import: `import stdlib::web::types`
 //
-// These are compile-time distinctions only; at runtime they erase to their
-// underlying String representation. The typechecker enforces opacity so
-// user code cannot accidentally pass a raw String where escaped Html is
-// required.
+// Web semantic types erase to simple runtime representations. Most are
+// opaque distinctions enforced by the typechecker; Json[T] is a transparent
+// serialized-body marker whose T parameter carries response-schema metadata
+// for Web Contract IR, OpenAPI, deployment adapters, and Nulang Cloud.
+
+/// Serialized JSON response body. T documents the logical payload schema.
+/// The runtime representation is an already-serialized String; automatic
+/// serialization is intentionally a later layer rather than implicit magic.
+pub type alias Json[T] = String
 
 /// Escaped HTML document fragment. Distinct from String at compile time.
 opaque type Html = String

@@ -6,16 +6,16 @@
 
 use crate::web::bindings::{compile_route_bindings, RouteBindingContract, RouteBindingSource};
 use crate::web::contracts::{ContractCompilation, RouteContract, RouteParamContract};
+use crate::web::response::{response_contract, ResponseBodyKind, ResponseContract};
 use serde_json::{json, Map, Value};
 
 pub const OPENAPI_VERSION: &str = "3.1.0";
 
 /// Generate an OpenAPI 3.1 document from a validated Web Contract compilation.
 ///
-/// Response media types are intentionally not invented here. The current Web
-/// runtime still has HTML-oriented response behavior and the typed response
-/// algebra (`Json[T]`, `Html`, `Stream[T]`, etc.) has not landed yet. We retain
-/// the Nulang response/error type as extensions until that contract is explicit.
+/// Response media metadata is emitted only when Web Contract IR has an explicit
+/// semantic response type. Unknown/String responses retain the legacy
+/// extension-only representation rather than guessing a protocol contract.
 pub fn generate_openapi(contracts: &ContractCompilation, title: &str, version: &str) -> Value {
     let mut paths = Map::new();
 
@@ -76,6 +76,9 @@ fn operation_for(route: &RouteContract) -> Value {
             "x-nulang-response-type".to_string(),
             Value::String(response_type.clone()),
         );
+    }
+    if let Some(response) = response_contract(route.response_type.as_deref()) {
+        success.insert("content".to_string(), response_content(&response));
     }
 
     let mut responses = Map::new();
@@ -145,6 +148,24 @@ fn operation_for(route: &RouteContract) -> Value {
     }
 
     Value::Object(operation)
+}
+
+fn response_content(response: &ResponseContract) -> Value {
+    let schema = match response.kind {
+        ResponseBodyKind::Html => json!({ "type": "string" }),
+        ResponseBodyKind::Json => json_payload_schema(response.payload_type.as_deref()),
+    };
+    let mut content = Map::new();
+    content.insert(response.media_type.clone(), json!({ "schema": schema }));
+    Value::Object(content)
+}
+
+fn json_payload_schema(ty: Option<&str>) -> Value {
+    match ty.map(str::trim) {
+        Some("Int") | Some("Float") | Some("Bool") | Some("String") => schema_for_type(ty),
+        Some(other) => json!({ "x-nulang-type": other }),
+        None => json!({}),
+    }
 }
 
 fn path_parameter(param: &RouteParamContract) -> Value {
@@ -338,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn emits_contract_metadata_without_inventing_response_media_type() {
+    fn emits_contract_metadata_without_guessing_unknown_response_media_type() {
         let document = generate_openapi(
             &ContractCompilation {
                 routes: vec![route()],
