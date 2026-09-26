@@ -77,6 +77,9 @@ pub mod package;
 pub mod parallel_analysis;
 pub mod parallel_marker;
 pub mod parser;
+// Compiled and tested now; consumed by persistence backends in #290.
+#[allow(dead_code)]
+pub(crate) mod persistence_integrity;
 pub mod prelude_source;
 pub mod primitives;
 pub mod protocol;
