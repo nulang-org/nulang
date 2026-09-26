@@ -7,8 +7,37 @@
 use crate::web::request_bindings::{
     parse_cookie_header, parse_urlencoded, split_request_target, RequestBindingValues,
 };
-use nulang_ui_protocol::{decode_host_message, HostToRuntimeMessage};
+use nulang_ui_protocol::{decode_host_message, ActionPlacement, HostToRuntimeMessage};
 use std::collections::HashMap;
+
+/// Why a renderer-neutral action envelope was rejected at the HTTP boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiActionEnvelopeError {
+    Malformed,
+    ClientPlacement,
+    LegacyActionMismatch {
+        envelope_action: String,
+        legacy_action: String,
+    },
+}
+
+impl std::fmt::Display for UiActionEnvelopeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed => f.write_str("malformed or unsupported UI action envelope"),
+            Self::ClientPlacement => {
+                f.write_str("client-placement UI action cannot be invoked over server transport")
+            }
+            Self::LegacyActionMismatch {
+                envelope_action,
+                legacy_action,
+            } => write!(
+                f,
+                "UI action envelope names '{envelope_action}' but compatibility field names '{legacy_action}'"
+            ),
+        }
+    }
+}
 
 /// Owned HTTP request data derived once per matched route.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -21,6 +50,8 @@ pub struct HttpRequestBindingInputs {
     /// compatibility form submission. Invalid or unsupported envelopes are
     /// ignored rather than becoming runtime authority.
     pub ui_message: Option<HostToRuntimeMessage>,
+    /// Present when an envelope was supplied but failed authority checks.
+    pub ui_message_error: Option<UiActionEnvelopeError>,
 }
 
 impl HttpRequestBindingInputs {
@@ -47,10 +78,7 @@ impl HttpRequestBindingInputs {
         } else {
             HashMap::new()
         };
-        let ui_message = form
-            .get("__nulang_ui_message")
-            .and_then(|encoded| decode_host_message(encoded).ok())
-            .filter(|message| message.validate().is_ok());
+        let (ui_message, ui_message_error) = capture_ui_action_message(&form);
 
         Self {
             query,
@@ -58,6 +86,7 @@ impl HttpRequestBindingInputs {
             body: body_text,
             form,
             ui_message,
+            ui_message_error,
         }
     }
 
@@ -77,6 +106,41 @@ impl HttpRequestBindingInputs {
             form: &self.form,
         }
     }
+}
+
+
+fn capture_ui_action_message(
+    form: &HashMap<String, String>,
+) -> (Option<HostToRuntimeMessage>, Option<UiActionEnvelopeError>) {
+    let Some(encoded) = form.get("__nulang_ui_message") else {
+        return (None, None);
+    };
+
+    let Ok(message) = decode_host_message(encoded) else {
+        return (None, Some(UiActionEnvelopeError::Malformed));
+    };
+    if message.validate().is_err() {
+        return (None, Some(UiActionEnvelopeError::Malformed));
+    }
+
+    let HostToRuntimeMessage::InvokeAction { request, .. } = &message;
+    if request.placement != ActionPlacement::Server {
+        return (None, Some(UiActionEnvelopeError::ClientPlacement));
+    }
+
+    if let Some(legacy_action) = form.get("__nulang_action") {
+        if legacy_action != request.action_id.as_str() {
+            return (
+                None,
+                Some(UiActionEnvelopeError::LegacyActionMismatch {
+                    envelope_action: request.action_id.as_str().to_string(),
+                    legacy_action: legacy_action.clone(),
+                }),
+            );
+        }
+    }
+
+    (Some(message), None)
 }
 
 fn is_urlencoded_form(headers: &[(String, String)]) -> bool {
@@ -176,6 +240,7 @@ mod tests {
         let captured = HttpRequestBindingInputs::capture("/", &headers, body.as_bytes());
 
         assert_eq!(captured.ui_message, Some(message));
+        assert_eq!(captured.ui_message_error, None);
     }
 
     #[test]
@@ -190,6 +255,72 @@ mod tests {
             b"__nulang_ui_message=%7B%22type%22%3A%22invoke_action%22%7D",
         );
         assert!(captured.ui_message.is_none());
+        assert_eq!(
+            captured.ui_message_error,
+            Some(UiActionEnvelopeError::Malformed)
+        );
+    }
+
+    #[test]
+    fn rejects_ui_action_when_legacy_identity_disagrees() {
+        let message = nulang_ui_protocol::HostToRuntimeMessage::invoke_action(
+            nulang_ui_protocol::ActionRequest {
+                document_id: "app".into(),
+                revision: nulang_ui_protocol::Revision(1),
+                action_id: "safe_action".into(),
+                placement: nulang_ui_protocol::ActionPlacement::Server,
+                correlation_id: "corr-1".into(),
+                idempotency_key: "idem-1".into(),
+                payload: nulang_ui_protocol::WireValue::Null,
+            },
+        );
+        let encoded = nulang_ui_protocol::encode_host_message(&message).unwrap();
+        let body = format!(
+            "__nulang_action=different_action&__nulang_ui_message={}",
+            percent_encode_form_value(&encoded)
+        );
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let captured = HttpRequestBindingInputs::capture("/", &headers, body.as_bytes());
+
+        assert!(captured.ui_message.is_none());
+        assert_eq!(
+            captured.ui_message_error,
+            Some(UiActionEnvelopeError::LegacyActionMismatch {
+                envelope_action: "safe_action".to_string(),
+                legacy_action: "different_action".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_client_placement_over_server_transport() {
+        let message = nulang_ui_protocol::HostToRuntimeMessage::invoke_action(
+            nulang_ui_protocol::ActionRequest {
+                document_id: "app".into(),
+                revision: nulang_ui_protocol::Revision(1),
+                action_id: "local_only".into(),
+                placement: nulang_ui_protocol::ActionPlacement::Client,
+                correlation_id: "corr-1".into(),
+                idempotency_key: "idem-1".into(),
+                payload: nulang_ui_protocol::WireValue::Null,
+            },
+        );
+        let encoded = nulang_ui_protocol::encode_host_message(&message).unwrap();
+        let body = format!("__nulang_ui_message={}", percent_encode_form_value(&encoded));
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let captured = HttpRequestBindingInputs::capture("/", &headers, body.as_bytes());
+
+        assert!(captured.ui_message.is_none());
+        assert_eq!(
+            captured.ui_message_error,
+            Some(UiActionEnvelopeError::ClientPlacement)
+        );
     }
 
     fn percent_encode_form_value(value: &str) -> String {
