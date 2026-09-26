@@ -2,9 +2,10 @@
 //!
 //! This is the first stream-storage slice: an append-only segmented log with
 //! monotonic sequence numbers, per-record checksums, crash-tail repair,
-//! persisted consumer cursors, replay, and durable consumer delivery leases.
-//! Replication, retention, dead-lettering, and durable consumer-group
-//! assignment build on this storage contract.
+//! persisted consumer cursors, replay, durable consumer delivery leases, and
+//! crash-safe local sequence-floor retention. Replication-coordinated
+//! retention, dead-lettering, and durable consumer-group assignment build on
+//! this storage contract.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -90,6 +91,8 @@ pub struct FabricStreamInfo {
     /// `next_sequence`, the retained log is currently empty.
     pub first_sequence: u64,
     pub next_sequence: u64,
+    /// Highest sequence ever assigned in the local log. After pruning all
+    /// retained history this may be lower than `first_sequence`.
     pub last_sequence: Option<u64>,
     /// Highest sequence known committed by the stream's replication policy.
     /// Local/raw appends may exist beyond this boundary.
