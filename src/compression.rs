@@ -81,11 +81,7 @@ pub fn encode_blob(input: &[u8]) -> io::Result<Vec<u8>> {
 /// and emits a raw envelope. This keeps minimal builds free of the native zstd
 /// dependency while preserving the envelope contract.
 pub fn encode_blob_with_threshold(input: &[u8], threshold: usize) -> io::Result<Vec<u8>> {
-    encode_blob_with_threshold_and_limit(
-        input,
-        threshold,
-        DEFAULT_MAX_DECODED_BLOB_SIZE,
-    )
+    encode_blob_with_threshold_and_limit(input, threshold, DEFAULT_MAX_DECODED_BLOB_SIZE)
 }
 
 fn encode_blob_with_threshold_and_limit(
@@ -236,8 +232,8 @@ mod tests {
     #[test]
     fn encoder_rejects_payloads_above_default_decode_contract() {
         let input = b"abc";
-        let error = encode_blob_with_threshold_and_limit(input, usize::MAX, input.len() - 1)
-            .unwrap_err();
+        let error =
+            encode_blob_with_threshold_and_limit(input, usize::MAX, input.len() - 1).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("limit"));
