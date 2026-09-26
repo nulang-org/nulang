@@ -141,6 +141,37 @@ mod tests {
     }
 
     #[test]
+    fn gzip_decode_rejects_output_above_limit() {
+        let tar = vec![b'a'; 16 * 1024];
+        let archive = compress_tar(&tar, ArchiveCompression::Gzip).unwrap();
+        let error = decode_archive_with_limit(&archive, 1024).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("limit"));
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    #[test]
+    fn zstd_decode_rejects_output_above_limit() {
+        let tar = vec![b'a'; 64 * 1024];
+        let archive = compress_tar(&tar, ArchiveCompression::Zstd).unwrap();
+        let error = decode_archive_with_limit(&archive, 1024).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("limit"));
+    }
+
+    #[test]
+    fn archive_encoder_rejects_tar_above_decode_contract() {
+        let tar = b"abcd";
+        let error =
+            compress_tar_with_limit(tar, ArchiveCompression::Gzip, tar.len() - 1).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("limit"));
+    }
+
+    #[test]
     fn unknown_archive_fails_closed() {
         let error = decode_archive(b"not-an-archive").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
