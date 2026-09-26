@@ -5,9 +5,11 @@
 //! a top-level zero-argument function. Parameterized handlers must wait for a
 //! compiler-owned action binding plan rather than guessing from transport data.
 
-use crate::bytecode::CodeModule;
+use crate::bytecode::{CodeModule, Constant};
 use crate::vm::{Value, VM};
-use nulang_ui_protocol::{ActionPlacement, HostToRuntimeMessage};
+use crate::web::contracts::HandlerParamContract;
+use crate::web::runtime_bindings::decode_scalar_constant;
+use nulang_ui_protocol::{ActionPlacement, HostToRuntimeMessage, WireValue};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiActionDispatchError {
@@ -18,6 +20,7 @@ pub enum UiActionDispatchError {
         action_id: String,
         parameter_count: usize,
     },
+    InvalidPayload(String),
     Execution(String),
 }
 
@@ -36,6 +39,7 @@ impl std::fmt::Display for UiActionDispatchError {
                 f,
                 "UI action '{action_id}' has {parameter_count} parameter(s) and requires a compiler-owned binding plan"
             ),
+            Self::InvalidPayload(message) => write!(f, "invalid UI action payload: {message}"),
             Self::Execution(message) => write!(f, "UI action execution failed: {message}"),
         }
     }
@@ -90,6 +94,103 @@ pub fn resolve_zero_arg_action(
         action_id: action_id.to_string(),
         code_offset: info.code_offset,
     })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundActionArgument {
+    pub handler_index: usize,
+    pub value: Constant,
+}
+
+/// Bind a renderer-neutral action payload to compiler-owned handler slots.
+///
+/// Parameter names, order, and source types come from the compiler's existing
+/// `HandlerParamContract`. String payloads use the same primitive decoder as
+/// route bindings, while native hosts may send already-typed primitive
+/// `WireValue` values. Complex values remain rejected until their runtime ABI
+/// representation is compiler-defined.
+pub fn bind_action_payload(
+    params: &[HandlerParamContract],
+    message: &HostToRuntimeMessage,
+) -> Result<Vec<BoundActionArgument>, UiActionDispatchError> {
+    message
+        .validate()
+        .map_err(|error| UiActionDispatchError::InvalidEnvelope(error.to_string()))?;
+
+    let request = match message {
+        HostToRuntimeMessage::InvokeAction { request, .. } => request,
+    };
+    if request.placement != ActionPlacement::Server {
+        return Err(UiActionDispatchError::ClientPlacement);
+    }
+
+    if params.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let WireValue::Object(fields) = &request.payload else {
+        return Err(UiActionDispatchError::InvalidPayload(
+            "parameterized UI action payload must be an object".to_string(),
+        ));
+    };
+
+    params
+        .iter()
+        .enumerate()
+        .map(|(handler_index, param)| {
+            let value = fields.get(&param.name).ok_or_else(|| {
+                UiActionDispatchError::InvalidPayload(format!(
+                    "missing payload field '{}'",
+                    param.name
+                ))
+            })?;
+            let value = decode_action_constant(value, param.ty.as_deref()).map_err(|message| {
+                UiActionDispatchError::InvalidPayload(format!(
+                    "payload field '{}': {message}",
+                    param.name
+                ))
+            })?;
+            Ok(BoundActionArgument {
+                handler_index,
+                value,
+            })
+        })
+        .collect()
+}
+
+fn decode_action_constant(value: &WireValue, ty: Option<&str>) -> Result<Constant, String> {
+    match value {
+        WireValue::String(raw) => decode_scalar_constant(raw, ty),
+        WireValue::Bool(value) if matches!(ty.map(str::trim), None | Some("Bool")) => {
+            Ok(Constant::Bool(*value))
+        }
+        WireValue::I64(value) if matches!(ty.map(str::trim), None | Some("Int")) => {
+            Ok(Constant::Int(value.0))
+        }
+        WireValue::F64(value) if matches!(ty.map(str::trim), None | Some("Float")) => {
+            let value = value.to_f64();
+            value
+                .is_finite()
+                .then_some(Constant::Float(value))
+                .ok_or_else(|| "expected finite Float".to_string())
+        }
+        WireValue::Bool(_) => Err(format!(
+            "expected {}, got Bool",
+            ty.unwrap_or("string-compatible value")
+        )),
+        WireValue::I64(_) => Err(format!(
+            "expected {}, got Int",
+            ty.unwrap_or("string-compatible value")
+        )),
+        WireValue::F64(_) => Err(format!(
+            "expected {}, got Float",
+            ty.unwrap_or("string-compatible value")
+        )),
+        WireValue::Null => Err("null cannot bind a required handler parameter".to_string()),
+        WireValue::Bytes(_) | WireValue::Array(_) | WireValue::Object(_) => {
+            Err("complex payload values do not yet have a compiler-defined VM ABI".to_string())
+        }
+    }
 }
 
 pub fn invoke_zero_arg_action(
@@ -221,7 +322,10 @@ mod tests {
 
         assert_eq!(args.len(), 3);
         assert_eq!(args[0].handler_index, 0);
-        assert_eq!(args[0].value, crate::bytecode::Constant::String("Ship it".to_string()));
+        assert_eq!(
+            args[0].value,
+            crate::bytecode::Constant::String("Ship it".to_string())
+        );
         assert_eq!(args[1].handler_index, 1);
         assert_eq!(args[1].value, crate::bytecode::Constant::Int(42));
         assert_eq!(args[2].handler_index, 2);
@@ -230,7 +334,10 @@ mod tests {
 
     #[test]
     fn action_payload_missing_required_field_fails_closed() {
-        let params = vec![handler_param("title", "String"), handler_param("count", "Int")];
+        let params = vec![
+            handler_param("title", "String"),
+            handler_param("count", "Int"),
+        ];
         let mut fields = std::collections::BTreeMap::new();
         fields.insert(
             "title".to_string(),
@@ -270,5 +377,4 @@ mod tests {
             .to_string()
             .contains("parameterized UI action payload must be an object"));
     }
-
 }
