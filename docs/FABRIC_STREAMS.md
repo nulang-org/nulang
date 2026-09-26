@@ -13,7 +13,8 @@ Each stream has:
 
 - `meta.json` — format version and segment-size configuration.
 - `<base-sequence>.seg` — ordered immutable-history segments.
-- `cursors.json` — atomically replaced consumer cursor state.\n- `deliveries.json` — durable per-consumer in-flight leases, ACK gaps, and delivery attempts.
+- `cursors.json` — atomically replaced consumer cursor state.
+- `deliveries.json` — durable per-consumer in-flight leases, ACK gaps, and delivery attempts.
 - `retention.json` — durable oldest locally retained sequence.
 
 Records are assigned monotonically increasing 64-bit sequence numbers starting
@@ -72,7 +73,6 @@ ACKs may arrive out of order, but the durable cursor advances only across a
 contiguous acknowledged prefix, so ACKing sequence 5 cannot skip an unprocessed
 sequence 4. Delivery state survives process restart through `deliveries.json`.
 
-
 ### Local sequence retention
 
 `retain_from_sequence(stream, sequence)` advances the oldest locally retained
@@ -96,7 +96,6 @@ This first primitive is **local-only**. Streams with a durable replication polic
 are rejected because deleting leader history independently could strand a
 lagging follower that still needs catch-up. Age/byte policy automation and
 replica-coordinated retention remain follow-up work.
-
 
 ## Runtime APIs
 
