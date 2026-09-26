@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Round-paired performance A/B statistics — 2026-09-25
+- **Same-host A/B reports now compare base and candidate samples from the same measurement round before taking the median**, rather than relying only on a ratio of two independent medians. The existing alternating execution order is preserved, so pairing better cancels monotonic host-load and thermal drift.
+- **Performance reports now include a deterministic bootstrap 95% interval for median paired speedup** alongside paired throughput and latency deltas. The historical ratio-of-medians output remains for compatibility, while JSON report schema 2 records the paired result explicitly.
+- **Focused Python regressions pin sample alignment and operation-count invariants**, preventing a benchmark from silently producing a paired comparison across mismatched runs.
+
 ### Actor A/B benchmark build diagnostics — 2026-09-25
 - **Failed base/candidate Cargo builds now preserve their captured compiler output in CI logs.** The same-host A/B harness re-emits combined stdout/stderr before raising, so build-stage failures no longer collapse into an opaque Python `CalledProcessError`; a focused Python regression test pins the behavior.
 
