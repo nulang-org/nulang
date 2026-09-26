@@ -1066,7 +1066,12 @@ fn view() -> Html {
             handler: "submit".to_string(),
             path: "div > form".to_string(),
             placement: ActionPlacement::Server,
-            params: Vec::new(),
+            params: vec![crate::web::contracts::HandlerParamContract {
+                name: "id".to_string(),
+                ty: Some("RouteParam".to_string()),
+                capability: None,
+                request: None,
+            }],
         }));
     }
 
