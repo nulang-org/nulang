@@ -96,6 +96,13 @@ pub trait JitBackend {
     /// Number of bytecode instructions in the compiled region at `(module_idx, pc)`.
     fn compiled_region_len(&self, module_idx: usize, pc: usize) -> Option<usize>;
 
+    /// Smallest prefix of the 256-register frame that compiled code may
+    /// access. Backends that do not provide register-footprint metadata must
+    /// conservatively materialize the full frame.
+    fn compiled_register_span(&self, _module_idx: usize, _pc: usize) -> usize {
+        256
+    }
+
     /// Number of regions compiled (scalar path).
     fn compiled_count(&self) -> usize;
 
