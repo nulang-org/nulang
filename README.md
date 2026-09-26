@@ -47,6 +47,21 @@ distribution are integrated into that model.
 
 ## Installation
 
+### One-command installer (Linux / macOS)
+
+The installer detects the supported OS/architecture, downloads the matching
+latest release archive plus its published checksum, verifies SHA-256, and
+installs the executable to `~/.local/bin/nulang` by default:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nulang-org/nulang/main/install.sh | sh
+```
+
+Set `NULANG_INSTALL_DIR` to choose another user-writable directory. The
+installer does not use `sudo` and fails closed on unsupported release targets
+or checksum mismatch. Windows users should use the checksummed release archive
+below.
+
 ### Pre-built binaries
 Tagged releases publish checksummed archives from the release CI matrix:
 
