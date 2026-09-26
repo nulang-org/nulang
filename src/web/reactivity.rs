@@ -12,9 +12,10 @@
 use crate::ast::{AstModule, Decl, Expr, Literal};
 use crate::effect_checker::EffectChecker;
 use crate::types::{Effect, EffectRow, Span};
+use crate::web::contracts::HandlerParamContract;
 pub use nulang_ui_protocol::ActionPlacement;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// A node in the dependency graph.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -29,6 +30,8 @@ pub enum GraphNode {
         handler: String,
         path: String,
         placement: ActionPlacement,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        params: Vec<HandlerParamContract>,
     },
 }
 
@@ -93,6 +96,7 @@ impl SignalGraph {
                     handler,
                     path,
                     placement,
+                    ..
                 } => {
                     let id = NodeId::new(format!("action:{action_index}:{handler}"));
                     action_index += 1;
@@ -177,12 +181,32 @@ impl SignalGraph {
 pub fn analyze_module(module: &AstModule, checker: Option<&EffectChecker>) -> SignalGraph {
     let mut graph = SignalGraph::default();
     let mut signals: HashSet<String> = HashSet::new();
+    let mut handler_params: HashMap<String, Vec<HandlerParamContract>> = HashMap::new();
 
-    // Pass 1: collect declared signal names.
+    // Pass 1: collect declared signals and compiler-owned function parameter
+    // metadata. Action discovery below only records references to these
+    // declarations; it does not reconstruct types from rendered HTML.
     for decl in &module.decls {
-        if let Decl::Signal { name, .. } = decl {
-            signals.insert(name.clone());
-            graph.push(GraphNode::Signal { name: name.clone() });
+        match decl {
+            Decl::Signal { name, .. } => {
+                signals.insert(name.clone());
+                graph.push(GraphNode::Signal { name: name.clone() });
+            }
+            Decl::Function { name, params, .. } => {
+                handler_params.insert(
+                    name.clone(),
+                    params
+                        .iter()
+                        .map(|param| HandlerParamContract {
+                            name: param.name.clone(),
+                            ty: param.ty.as_ref().map(ToString::to_string),
+                            capability: param.cap.map(|capability| capability.to_string()),
+                            request: None,
+                        })
+                        .collect(),
+                );
+            }
+            _ => {}
         }
     }
 
@@ -190,6 +214,15 @@ pub fn analyze_module(module: &AstModule, checker: Option<&EffectChecker>) -> Si
     for decl in &module.decls {
         if let Decl::Function { body, .. } = decl {
             scan_expr(body, &mut Vec::new(), false, &signals, &mut graph, checker);
+        }
+    }
+
+    for node in &mut graph.nodes {
+        if let GraphNode::Action {
+            handler, params, ..
+        } = node
+        {
+            *params = handler_params.get(handler).cloned().unwrap_or_default();
         }
     }
 
@@ -219,6 +252,7 @@ fn scan_expr(
                             handler: handler.clone(),
                             path: path_with_tag(path, &tag),
                             placement: classify_action(&handler, checker),
+                            params: Vec::new(),
                         });
                     }
                 }
@@ -993,6 +1027,7 @@ fn button() -> Html {
             handler: "add".to_string(),
             path: "button".to_string(),
             placement: ActionPlacement::Server,
+            params: Vec::new(),
         }));
     }
 
@@ -1025,11 +1060,13 @@ fn view() -> Html {
             handler: "add".to_string(),
             path: "div > button".to_string(),
             placement: ActionPlacement::Client,
+            params: Vec::new(),
         }));
         assert!(graph.nodes.contains(&GraphNode::Action {
             handler: "submit".to_string(),
             path: "div > form".to_string(),
             placement: ActionPlacement::Server,
+            params: Vec::new(),
         }));
     }
 
@@ -1329,5 +1366,4 @@ fn view() -> Html {
             ]
         );
     }
-
 }
