@@ -49,7 +49,7 @@ function makeEnv(overrides: Partial<Env> = {}): Env & { stored: string[] } {
         onlyIf instanceof Headers ? onlyIf.get('If-None-Match') : undefined;
       if (ifNoneMatch === '*' && objects.has(key)) return null;
 
-      let bytes = new Uint8Array();
+      let bytes: Uint8Array = new Uint8Array();
       if (typeof value === 'string') {
         bytes = new TextEncoder().encode(value);
       } else if (value instanceof Uint8Array) {
