@@ -58,6 +58,93 @@ fn utf16_col_to_byte(line: &str, col: usize) -> usize {
     line.len()
 }
 
+/// Strict UTF-16 column conversion for document edits.
+///
+/// Unlike hover/completion lookups, edits must reject positions inside a
+/// surrogate pair or past the logical end of the line rather than clamping and
+/// potentially corrupting source text.
+fn utf16_col_to_byte_strict(line: &str, col: usize) -> Option<usize> {
+    let mut utf16 = 0usize;
+    for (byte_idx, ch) in line.char_indices() {
+        if utf16 == col {
+            return Some(byte_idx);
+        }
+        let next = utf16.checked_add(ch.len_utf16())?;
+        if col < next {
+            return None;
+        }
+        utf16 = next;
+    }
+    (utf16 == col).then_some(line.len())
+}
+
+/// Convert an LSP UTF-16 position into a UTF-8 byte offset in source.
+fn lsp_position_to_byte(source: &str, position: Position) -> Option<usize> {
+    let target_line = usize::try_from(position.line).ok()?;
+    let target_col = usize::try_from(position.character).ok()?;
+    let mut line_index = 0usize;
+    let mut line_start = 0usize;
+
+    for segment in source.split_inclusive('\n') {
+        if line_index == target_line {
+            let without_lf = segment.strip_suffix('\n').unwrap_or(segment);
+            let logical_line = without_lf.strip_suffix('\r').unwrap_or(without_lf);
+            let column = utf16_col_to_byte_strict(logical_line, target_col)?;
+            return line_start.checked_add(column);
+        }
+        line_start = line_start.checked_add(segment.len())?;
+        line_index = line_index.checked_add(1)?;
+    }
+
+    // split_inclusive has no final empty segment after a trailing newline.
+    if line_index == target_line && target_col == 0 {
+        Some(source.len())
+    } else {
+        None
+    }
+}
+
+/// Apply LSP content changes in the order supplied by the client.
+///
+/// Full-document changes replace the accumulated text. Ranged changes are
+/// resolved against the text produced by preceding changes, as required by the
+/// LSP synchronization contract.
+fn apply_content_changes(
+    source: &str,
+    changes: &[TextDocumentContentChangeEvent],
+) -> Result<String, String> {
+    let mut updated = source.to_owned();
+
+    for change in changes {
+        let Some(range) = change.range else {
+            updated = change.text.clone();
+            continue;
+        };
+
+        let start = lsp_position_to_byte(&updated, range.start).ok_or_else(|| {
+            format!(
+                "invalid didChange start position {}:{}",
+                range.start.line, range.start.character
+            )
+        })?;
+        let end = lsp_position_to_byte(&updated, range.end).ok_or_else(|| {
+            format!(
+                "invalid didChange end position {}:{}",
+                range.end.line, range.end.character
+            )
+        })?;
+        if start > end {
+            return Err(format!(
+                "invalid didChange range: start byte {start} exceeds end byte {end}"
+            ));
+        }
+
+        updated.replace_range(start..end, &change.text);
+    }
+
+    Ok(updated)
+}
+
 // ---------------------------------------------------------------------------
 // LSP Server
 // ---------------------------------------------------------------------------
@@ -264,7 +351,7 @@ impl LanguageServer for NulangLanguageServer {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::FULL),
+                        change: Some(TextDocumentSyncKind::INCREMENTAL),
                         will_save: None,
                         will_save_wait_until: None,
                         save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
@@ -328,12 +415,32 @@ impl LanguageServer for NulangLanguageServer {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.clone();
         let version = params.text_document.version;
-        let source = params
-            .content_changes
-            .into_iter()
-            .next()
-            .map(|c| c.text)
-            .unwrap_or_default();
+        let current_source = {
+            let docs = self.documents.lock().unwrap();
+            docs.get(&uri).map(|doc| doc.source.clone())
+        };
+        let Some(current_source) = current_source else {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("ignoring didChange for unopened document {uri}"),
+                )
+                .await;
+            return;
+        };
+
+        let source = match apply_content_changes(&current_source, &params.content_changes) {
+            Ok(source) => source,
+            Err(error) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("rejecting invalid didChange for {uri}: {error}"),
+                    )
+                    .await;
+                return;
+            }
+        };
 
         {
             let mut docs = self.documents.lock().unwrap();
@@ -346,6 +453,8 @@ impl LanguageServer for NulangLanguageServer {
                 doc.diagnostics_pending = true;
                 doc.inferred_decl_types = None;
                 doc.function_rows = None;
+            } else {
+                return;
             }
         }
 
@@ -3606,6 +3715,50 @@ pub async fn run_lsp_server() {
 mod lsp_tests {
     use super::*;
 
+    #[test]
+    fn test_apply_content_changes_applies_ranges_sequentially() {
+        let changes = vec![
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 0), Position::new(0, 1))),
+                range_length: Some(1),
+                text: "hello".to_string(),
+            },
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 5), Position::new(0, 6))),
+                range_length: Some(1),
+                text: "B".to_string(),
+            },
+        ];
+
+        assert_eq!(apply_content_changes("abc", &changes).unwrap(), "helloBc");
+    }
+
+    #[test]
+    fn test_apply_content_changes_rejects_mid_surrogate_position() {
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(0, 1), Position::new(0, 2))),
+            range_length: Some(1),
+            text: "x".to_string(),
+        }];
+
+        let error = apply_content_changes("😀", &changes).unwrap_err();
+        assert!(
+            error.contains("invalid didChange start position"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_apply_content_changes_handles_multiline_utf16_range() {
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(0, 1), Position::new(1, 1))),
+            range_length: None,
+            text: "-".to_string(),
+        }];
+
+        assert_eq!(apply_content_changes("a😀\nbc", &changes).unwrap(), "a-c");
+    }
+
     /// Function parameter without type annotation gets an inlay hint.
     #[test]
     fn test_type_inlay_for_fn_param() {
@@ -4381,6 +4534,11 @@ mod lsp_tests {
             serde_json::json!([".", ":"])
         );
         assert!(caps["capabilities"].get("inlayHintProvider").is_some());
+        assert_eq!(
+            caps["capabilities"]["textDocumentSync"]["change"],
+            serde_json::json!(2),
+            "server must advertise incremental document synchronization"
+        );
     }
 
     /// initialize -> didOpen(good doc) -> didOpen(broken doc): the server
@@ -4450,6 +4608,101 @@ mod lsp_tests {
         assert!(
             !params["diagnostics"].as_array().unwrap().is_empty(),
             "change to a broken doc must publish diagnostics, got {params}"
+        );
+    }
+
+    /// A ranged didChange edits the existing document instead of replacing
+    /// the entire source with the change fragment.
+    #[tokio::test]
+    async fn test_protocol_incremental_did_change_preserves_unchanged_text() {
+        let (mut service, mut socket) = LspService::new(|client| NulangLanguageServer::new(client));
+        init(&mut service).await;
+        call(
+            &mut service,
+            did_open_req(DOC_URL, 1, "fn add(x: Int, y: Int) { x + y }"),
+        )
+        .await;
+        socket.next().await.expect("open diagnostics");
+
+        call(
+            &mut service,
+            Request::build("textDocument/didChange")
+                .params(serde_json::json!({
+                    "textDocument": { "uri": DOC_URL, "version": 2 },
+                    "contentChanges": [{
+                        "range": {
+                            "start": { "line": 0, "character": 3 },
+                            "end": { "line": 0, "character": 6 }
+                        },
+                        "rangeLength": 3,
+                        "text": "sum"
+                    }]
+                }))
+                .finish(),
+        )
+        .await;
+
+        let msg = socket.next().await.expect("incremental change diagnostics");
+        assert_eq!(msg.method(), "textDocument/publishDiagnostics");
+        let params = msg.params().cloned().expect("params");
+        assert_eq!(
+            params["diagnostics"].as_array().map(|items| items.len()),
+            Some(0),
+            "renaming add to sum by range must keep the rest of the document intact: {params}"
+        );
+
+        let resp = call(&mut service, hover_req(DOC_URL, 0, 4))
+            .await
+            .expect("hover response");
+        let (_id, result) = resp.into_parts();
+        let hover = result.expect("hover must succeed after incremental edit");
+        let contents = hover["contents"]
+            .as_str()
+            .or_else(|| hover["contents"]["value"].as_str())
+            .unwrap_or("");
+        assert!(
+            contents.contains("sum"),
+            "hover must observe the incrementally edited function, got {hover}"
+        );
+    }
+
+    /// LSP columns are UTF-16 code units, so a ranged edit after a non-BMP
+    /// character must not treat the column as a UTF-8 byte offset.
+    #[tokio::test]
+    async fn test_protocol_incremental_change_uses_utf16_columns() {
+        let (mut service, mut socket) = LspService::new(|client| NulangLanguageServer::new(client));
+        init(&mut service).await;
+        call(
+            &mut service,
+            did_open_req(DOC_URL, 1, "fn label() { \"😀x\" }"),
+        )
+        .await;
+        socket.next().await.expect("open diagnostics");
+
+        call(
+            &mut service,
+            Request::build("textDocument/didChange")
+                .params(serde_json::json!({
+                    "textDocument": { "uri": DOC_URL, "version": 2 },
+                    "contentChanges": [{
+                        "range": {
+                            "start": { "line": 0, "character": 16 },
+                            "end": { "line": 0, "character": 17 }
+                        },
+                        "rangeLength": 1,
+                        "text": "y"
+                    }]
+                }))
+                .finish(),
+        )
+        .await;
+
+        let msg = socket.next().await.expect("utf16 change diagnostics");
+        let params = msg.params().cloned().expect("params");
+        assert_eq!(
+            params["diagnostics"].as_array().map(|items| items.len()),
+            Some(0),
+            "UTF-16 ranged edit must keep the document valid: {params}"
         );
     }
 
