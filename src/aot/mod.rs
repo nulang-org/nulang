@@ -1732,10 +1732,7 @@ impl crate::vm::ActorVmCallbacks for AotTopLevelCallbacks {
         // SAFETY: `self.runtime` is the live runtime pointer installed for
         // this AOT callback invocation; the callback is not retained afterward.
         let mut bc = unsafe {
-            crate::runtime::callbacks::BytecodeRuntimeCallbacks::from_raw(
-                self.runtime,
-                actor_id,
-            )
+            crate::runtime::callbacks::BytecodeRuntimeCallbacks::from_raw(self.runtime, actor_id)
         };
         bc.perform_builtin_effect_in_module(effect_name, op_name, module, regs)
     }
@@ -1750,10 +1747,7 @@ impl crate::vm::ActorVmCallbacks for AotTopLevelCallbacks {
         // SAFETY: `self.runtime` is the live runtime pointer installed for
         // this AOT callback invocation; the callback is not retained afterward.
         let mut bc = unsafe {
-            crate::runtime::callbacks::BytecodeRuntimeCallbacks::from_raw(
-                self.runtime,
-                actor_id,
-            )
+            crate::runtime::callbacks::BytecodeRuntimeCallbacks::from_raw(self.runtime, actor_id)
         };
         bc.perform_async(effect_op, constants, args)
     }
