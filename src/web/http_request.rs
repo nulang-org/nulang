@@ -108,7 +108,6 @@ impl HttpRequestBindingInputs {
     }
 }
 
-
 fn capture_ui_action_message(
     form: &HashMap<String, String>,
 ) -> (Option<HostToRuntimeMessage>, Option<UiActionEnvelopeError>) {
@@ -309,7 +308,10 @@ mod tests {
             },
         );
         let encoded = nulang_ui_protocol::encode_host_message(&message).unwrap();
-        let body = format!("__nulang_ui_message={}", percent_encode_form_value(&encoded));
+        let body = format!(
+            "__nulang_ui_message={}",
+            percent_encode_form_value(&encoded)
+        );
         let headers = vec![(
             "Content-Type".to_string(),
             "application/x-www-form-urlencoded".to_string(),
@@ -334,5 +336,4 @@ mod tests {
             })
             .collect()
     }
-
 }
