@@ -14,6 +14,7 @@ Each stream has:
 - `meta.json` — format version and segment-size configuration.
 - `<base-sequence>.seg` — ordered immutable-history segments.
 - `cursors.json` — atomically replaced consumer cursor state.\n- `deliveries.json` — durable per-consumer in-flight leases, ACK gaps, and delivery attempts.
+- `retention.json` — durable oldest locally retained sequence.
 
 Records are assigned monotonically increasing 64-bit sequence numbers starting
 at 1. A record frame contains:
@@ -71,6 +72,32 @@ ACKs may arrive out of order, but the durable cursor advances only across a
 contiguous acknowledged prefix, so ACKing sequence 5 cannot skip an unprocessed
 sequence 4. Delivery state survives process restart through `deliveries.json`.
 
+
+### Local sequence retention
+
+`retain_from_sequence(stream, sequence)` advances the oldest locally retained
+sequence and physically removes complete older segments.
+
+Retention is deliberately segment-granular. If the requested sequence is in the
+middle of a segment, Fabric rounds the effective floor **down** to that
+segment's base. It may therefore keep extra older records, but it never deletes
+the requested sequence or anything newer.
+
+The retention floor is persisted before old segment files are removed. Recovery
+ignores segments below the durable floor, so a crash during deletion can leave
+stale files consuming disk space but cannot make pruned history visible again.
+
+Named consumers are protected: retention refuses to advance past a consumer
+cursor or an active delivery lease. A consumer first created after pruning
+starts logically at `retained_floor - 1`, so its first delivery is the oldest
+record still retained.
+
+This first primitive is **local-only**. Streams with a durable replication policy
+are rejected because deleting leader history independently could strand a
+lagging follower that still needs catch-up. Age/byte policy automation and
+replica-coordinated retention remain follow-up work.
+
+
 ## Runtime APIs
 
 After opening storage:
@@ -106,6 +133,7 @@ Available APIs:
 - `fabric_stream_append`
 - `fabric_stream_read`
 - `fabric_stream_read_consumer`
+- `fabric_stream_retain_from_sequence`
 - `fabric_stream_deliver_consumer`
 - `fabric_stream_ack_consumer`
 - `fabric_stream_nack_consumer`
@@ -120,7 +148,7 @@ must add:
 
 1. partition ownership and replica placement,
 2. replicated append / quorum policy,
-3. retention by age/bytes/sequence,
+3. age/byte policy automation plus replica-coordinated retention,
 4. dead-letter streams,
 5. producer deduplication/idempotency keys,
 6. consumer groups and partition assignment,
