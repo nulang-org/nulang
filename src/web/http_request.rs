@@ -7,6 +7,7 @@
 use crate::web::request_bindings::{
     parse_cookie_header, parse_urlencoded, split_request_target, RequestBindingValues,
 };
+use nulang_ui_protocol::{decode_host_message, HostToRuntimeMessage};
 use std::collections::HashMap;
 
 /// Owned HTTP request data derived once per matched route.
@@ -16,6 +17,10 @@ pub struct HttpRequestBindingInputs {
     pub cookies: HashMap<String, String>,
     pub body: Option<String>,
     pub form: HashMap<String, String>,
+    /// Validated renderer-neutral UI/action message carried alongside a
+    /// compatibility form submission. Invalid or unsupported envelopes are
+    /// ignored rather than becoming runtime authority.
+    pub ui_message: Option<HostToRuntimeMessage>,
 }
 
 impl HttpRequestBindingInputs {
@@ -42,12 +47,17 @@ impl HttpRequestBindingInputs {
         } else {
             HashMap::new()
         };
+        let ui_message = form
+            .get("__nulang_ui_message")
+            .and_then(|encoded| decode_host_message(encoded).ok())
+            .filter(|message| message.validate().is_ok());
 
         Self {
             query,
             cookies,
             body: body_text,
             form,
+            ui_message,
         }
     }
 
@@ -141,4 +151,57 @@ mod tests {
         assert!(captured.body.is_none());
         assert!(captured.form.is_empty());
     }
+    #[test]
+    fn extracts_and_validates_ui_action_message_from_form() {
+        let message = nulang_ui_protocol::HostToRuntimeMessage::invoke_action(
+            nulang_ui_protocol::ActionRequest {
+                document_id: "app".into(),
+                revision: nulang_ui_protocol::Revision(7),
+                action_id: "save".into(),
+                placement: nulang_ui_protocol::ActionPlacement::Server,
+                correlation_id: "corr-1".into(),
+                idempotency_key: "idem-1".into(),
+                payload: nulang_ui_protocol::WireValue::Null,
+            },
+        );
+        let encoded = nulang_ui_protocol::encode_host_message(&message).unwrap();
+        let body = format!(
+            "__nulang_action=save&__nulang_ui_message={}",
+            percent_encode_form_value(&encoded)
+        );
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let captured = HttpRequestBindingInputs::capture("/", &headers, body.as_bytes());
+
+        assert_eq!(captured.ui_message, Some(message));
+    }
+
+    #[test]
+    fn invalid_ui_action_message_is_not_accepted() {
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )];
+        let captured = HttpRequestBindingInputs::capture(
+            "/",
+            &headers,
+            b"__nulang_ui_message=%7B%22type%22%3A%22invoke_action%22%7D",
+        );
+        assert!(captured.ui_message.is_none());
+    }
+
+    fn percent_encode_form_value(value: &str) -> String {
+        value
+            .bytes()
+            .map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (byte as char).to_string()
+                }
+                _ => format!("%{byte:02X}"),
+            })
+            .collect()
+    }
+
 }
