@@ -1241,6 +1241,7 @@ impl Runtime {
             return;
         }
 
+        workflow::restore_replay_context(self, actor_id, suspended.activation);
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -1309,6 +1310,7 @@ impl Runtime {
                     }
                 }
             }
+            workflow::clear_replay_context(&mut *self_ptr, actor_id);
             (*self_ptr).vm_exec_end();
         }
         self.requeue_if_mail_pending(actor_id);
@@ -1632,6 +1634,7 @@ impl Runtime {
 
         let behavior_idx = suspended.behavior_idx;
         let step_name = suspended.step_name;
+        workflow::restore_replay_context(self, actor_id, suspended.activation);
         let self_ptr: *mut Runtime = self;
         let result = unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -1731,6 +1734,7 @@ impl Runtime {
         // deferred wakes would clobber; the compensation arm runs nested
         // bytecode whose own begin/end must stay inside this window. Runs
         // on every path so wakes of other actors are not lost.
+        workflow::clear_replay_context(self, actor_id);
         self.vm_exec_end();
         // The suspension resolved (completed or failed): drain any mail
         // that queued up while the step was suspended.
@@ -4486,6 +4490,7 @@ impl Runtime {
             self.enqueue_actor(actor_id);
             return;
         }
+        workflow::restore_replay_context(self, actor_id, suspended.activation);
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -4553,6 +4558,7 @@ impl Runtime {
                     }
                 }
             }
+            workflow::clear_replay_context(&mut *self_ptr, actor_id);
             (*self_ptr).vm_exec_end();
         }
         // Re-enqueue so the scheduler can continue processing the actor.
@@ -4581,6 +4587,7 @@ impl Runtime {
             return;
         }
 
+        workflow::restore_replay_context(self, actor_id, suspended.activation);
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -4675,6 +4682,7 @@ impl Runtime {
             // on the shared VM, which would clobber the frames an
             // un-captured suspend still needs. Runs on every path, so
             // wakes of other actors are not lost when THIS one suspends.
+            workflow::clear_replay_context(&mut *self_ptr, actor_id);
             (*self_ptr).vm_exec_end();
         }
         // The suspension resolved (completed or failed): if messages queued
