@@ -193,7 +193,10 @@ mod tests {
     fn gzip_round_trip() {
         let tar = vec![b'a'; 16 * 1024];
         let archive = compress_tar(&tar, ArchiveCompression::Gzip).unwrap();
-        assert_eq!(detect_archive_compression(&archive), Some(ArchiveCompression::Gzip));
+        assert_eq!(
+            detect_archive_compression(&archive),
+            Some(ArchiveCompression::Gzip)
+        );
         assert_eq!(decode_archive(&archive).unwrap(), tar);
     }
 
@@ -202,7 +205,10 @@ mod tests {
     fn zstd_round_trip_is_smaller_for_repetitive_tar_bytes() {
         let tar = vec![b'a'; 64 * 1024];
         let archive = compress_tar(&tar, ArchiveCompression::Zstd).unwrap();
-        assert_eq!(detect_archive_compression(&archive), Some(ArchiveCompression::Zstd));
+        assert_eq!(
+            detect_archive_compression(&archive),
+            Some(ArchiveCompression::Zstd)
+        );
         assert!(archive.len() < tar.len() / 4);
         assert_eq!(decode_archive(&archive).unwrap(), tar);
     }
