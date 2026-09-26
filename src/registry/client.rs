@@ -30,24 +30,48 @@ impl RegistryClient {
         self.registry_url.trim_end_matches('/').to_string()
     }
 
-    /// Publish a tarball for `name@version`. Returns `Ok(())` on 201 Created;
-    /// a 409 Conflict (version already exists) or other failure is `Err`.
+    /// Publish a gzip tarball for `name@version`.
+    ///
+    /// Kept as the compatibility default for callers that do not negotiate an
+    /// archive format explicitly.
     pub fn publish(&self, name: &str, version: &str, tarball: &[u8]) -> Result<(), String> {
+        self.publish_archive(name, version, tarball, "application/gzip")
+    }
+
+    /// Publish an archive with an explicit media type.
+    ///
+    /// The registry uses the media type only to select its canonical storage
+    /// extension; package contents are still validated by consumers via magic
+    /// detection before extraction.
+    pub fn publish_archive(
+        &self,
+        name: &str,
+        version: &str,
+        archive: &[u8],
+        content_type: &str,
+    ) -> Result<(), String> {
         #[cfg(feature = "ureq")]
         {
             let url = format!("{}/api/v1/packages/{}/{}", self.base_url(), name, version);
-            let request = match &self.token {
-                Some(token) => ureq::put(&url).set("Authorization", &format!("Bearer {}", token)),
-                None => ureq::put(&url),
-            };
-            match request.send_bytes(tarball) {
+            let mut request = ureq::put(&url).set("Content-Type", content_type);
+            if let Some(token) = &self.token {
+                request = request.set("Authorization", &format!("Bearer {}", token));
+            }
+            match request.send_bytes(archive) {
                 Ok(_) => Ok(()),
                 Err(err) => Err(Self::describe_error(err)),
             }
         }
         #[cfg(not(feature = "ureq"))]
         {
-            let _ = (&self.registry_url, &self.token, name, version, tarball);
+            let _ = (
+                &self.registry_url,
+                &self.token,
+                name,
+                version,
+                archive,
+                content_type,
+            );
             Err("registry client disabled (feature 'ureq' not enabled)".to_string())
         }
     }
