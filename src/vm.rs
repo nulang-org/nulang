@@ -2512,6 +2512,86 @@ fn compute_jit_candidate_pcs(module: &CodeModule) -> Vec<bool> {
     candidates
 }
 
+#[cfg(feature = "native-codegen")]
+fn compute_jit_register_copy_lens(module: &CodeModule) -> Vec<u16> {
+    const FULL_REGISTER_FILE: u16 = 256;
+    const MIR_REGISTER_LIMIT: usize = 254; // r254 is reserved for direct-call staging.
+
+    let len = module.instructions.len();
+    let mut copy_lens = vec![FULL_REGISTER_FILE; len];
+    if len == 0 {
+        return copy_lens;
+    }
+
+    // Treat functions, behaviors, and the synthetic entry point as hard
+    // execution-region boundaries. Compiler-owned local-count metadata is
+    // valid only until the next boundary. Missing/zero metadata stays on the
+    // conservative full-register path.
+    let mut regions: Vec<(usize, Option<usize>)> = module
+        .function_table
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &start)| {
+            (start < len).then_some((
+                start,
+                module
+                    .function_local_counts
+                    .get(idx)
+                    .copied()
+                    .filter(|count| *count > 0),
+            ))
+        })
+        .collect();
+
+    regions.extend(
+        module
+            .behaviors
+            .iter()
+            .filter(|behavior| behavior.code_offset < len)
+            .map(|behavior| {
+                (
+                    behavior.code_offset,
+                    (behavior.local_count > 0).then_some(behavior.local_count),
+                )
+            }),
+    );
+
+    if let Some(entry) = module.entry_point.filter(|entry| *entry < len) {
+        regions.push((entry, None));
+    }
+
+    regions.sort_unstable_by_key(|(start, _)| *start);
+
+    // Duplicate starts indicate ambiguous/hand-built metadata. Fail closed for
+    // that region instead of trusting either local-count source.
+    let mut deduped: Vec<(usize, Option<usize>)> = Vec::with_capacity(regions.len());
+    for (start, count) in regions {
+        if let Some((last_start, last_count)) = deduped.last_mut() {
+            if *last_start == start {
+                *last_count = None;
+                continue;
+            }
+        }
+        deduped.push((start, count));
+    }
+
+    for idx in 0..deduped.len() {
+        let (start, count) = deduped[idx];
+        let end = deduped
+            .get(idx + 1)
+            .map(|(next, _)| *next)
+            .unwrap_or(len)
+            .min(len);
+        let Some(count) = count else {
+            continue;
+        };
+        let active = count.clamp(1, MIR_REGISTER_LIMIT) as u16;
+        copy_lens[start..end].fill(active);
+    }
+
+    copy_lens
+}
+
 /// Register-based bytecode virtual machine.
 ///
 /// Executes Nulang bytecode modules with:
@@ -2548,6 +2628,17 @@ pub struct VM {
     /// not add hotness probes.
     #[cfg(feature = "native-codegen")]
     jit_candidate_pcs: Vec<Vec<bool>>,
+    /// Per-module active-register prefix for JIT marshaling at each bytecode PC.
+    /// MIR-produced functions and behaviors use compiler-owned local counts;
+    /// ambiguous/legacy bytecode stays on the full 256-register path.
+    #[cfg(feature = "native-codegen")]
+    jit_register_copy_lens: Vec<Vec<u16>>,
+    /// Reusable JIT register scratch storage.
+    ///
+    /// The Box is temporarily moved out of the VM before native entry, so no
+    /// borrow or pointer into VM-owned storage survives a re-entrant callback.
+    #[cfg(feature = "native-codegen")]
+    jit_reg_scratch: Option<Box<[u64; 256]>>,
     /// Runtime error raised by a re-entrant JIT direct call (taken from the
     /// JIT pending-error thread-local in `try_jit_execute`; consumed by
     /// `step` so the error surfaces as a VM error). None when the last JIT
@@ -2746,6 +2837,10 @@ impl VM {
             jit_constants: Vec::new(),
             #[cfg(feature = "native-codegen")]
             jit_candidate_pcs: Vec::new(),
+            #[cfg(feature = "native-codegen")]
+            jit_register_copy_lens: Vec::new(),
+            #[cfg(feature = "native-codegen")]
+            jit_reg_scratch: None,
             jit_pending_error: None,
             node_id: 0,
             pending_migrations: Vec::new(),
@@ -3040,10 +3135,14 @@ impl VM {
         let bits = constants_to_jit_bits(&module.constants);
         #[cfg(feature = "native-codegen")]
         let jit_candidates = compute_jit_candidate_pcs(&module);
+        #[cfg(feature = "native-codegen")]
+        let jit_copy_lens = compute_jit_register_copy_lens(&module);
         self.modules.push(module);
         self.jit_constants.push(bits);
         #[cfg(feature = "native-codegen")]
         self.jit_candidate_pcs.push(jit_candidates);
+        #[cfg(feature = "native-codegen")]
+        self.jit_register_copy_lens.push(jit_copy_lens);
     }
 
     /// Number of hot regions compiled through the type-directed JIT path
@@ -3608,13 +3707,35 @@ impl VM {
             Vec::new()
         };
 
-        // Snapshot registers into stack-local storage. This deliberately keeps
-        // the current conservative 256-register ABI; register-copy reduction
-        // is a separate optimization and must not be entangled with this
-        // ownership fix.
-        let mut regs: [u64; 256] = [0; 256];
-        for (i, r) in self.frames[frame_idx].regs.iter().enumerate() {
-            regs[i] = r.to_bits();
+        // Marshal only the compiler-known active register prefix. Legacy or
+        // ambiguous bytecode retains the conservative 256-register path.
+        let copy_len = self
+            .jit_register_copy_lens
+            .get(module_idx)
+            .and_then(|row| row.get(pc))
+            .copied()
+            .map(usize::from)
+            .unwrap_or(256)
+            .min(256);
+
+        // Reuse one stable 2 KiB buffer without keeping it borrowed from the
+        // VM across native execution. Re-entrant helpers see the scratch slot
+        // as empty (and the JIT backend detached), preserving the ownership
+        // boundary established by the re-entrancy hardening work.
+        let mut regs = self
+            .jit_reg_scratch
+            .take()
+            .unwrap_or_else(|| Box::new([Value::nil().to_bits(); 256]));
+        for (dst, src) in regs[..copy_len]
+            .iter_mut()
+            .zip(self.frames[frame_idx].regs[..copy_len].iter())
+        {
+            *dst = src.to_bits();
+        }
+        // r254 is reserved for direct-call staging and can sit outside the
+        // ordinary MIR local prefix.
+        if copy_len <= 254 {
+            regs[254] = self.frames[frame_idx].regs[254].to_bits();
         }
 
         // No Rust borrow into module/backend/constant-cache storage survives
@@ -3628,7 +3749,7 @@ impl VM {
             crate::jit::runtime::set_jit_vm(self_ptr, module_idx);
         }
 
-        let action = jit.execute_compiled(module_idx, pc, &mut regs, &constants);
+        let action = jit.execute_compiled(module_idx, pc, regs.as_mut(), &constants);
 
         crate::jit::runtime::clear_jit_vm();
         crate::jit::runtime::clear_jit_callbacks();
@@ -3647,10 +3768,22 @@ impl VM {
         }
 
         if action != TieredAction::Interpret {
-            for (i, bits) in regs.iter().enumerate() {
-                self.frames[frame_idx].regs[i] = unsafe { Value::from_bits(*bits) };
+            for (dst, bits) in self.frames[frame_idx].regs[..copy_len]
+                .iter_mut()
+                .zip(regs[..copy_len].iter())
+            {
+                *dst = unsafe { Value::from_bits(*bits) };
             }
+            if copy_len <= 254 {
+                self.frames[frame_idx].regs[254] = unsafe { Value::from_bits(regs[254]) };
+            }
+        }
 
+        // Return the detached scratch allocation only after all reads from it
+        // are complete; no pointer into this Box is live after execute_compiled.
+        self.jit_reg_scratch = Some(regs);
+
+        if action != TieredAction::Interpret {
             // A re-entrant callee raised a runtime error. Surface it before
             // normal branch-exit or safepoint handling.
             if let Some(msg) = crate::jit::runtime::take_jit_pending_vm_error() {
@@ -6991,6 +7124,44 @@ mod vm_tests {
             err_msg.contains("resume called without a captured continuation"),
             "Error should mention missing continuation: {}",
             err_msg
+        );
+    }
+
+    #[cfg(feature = "native-codegen")]
+    #[test]
+    fn test_jit_register_copy_lens_use_compiler_metadata_and_boundaries() {
+        let mut module = CodeModule::new("jit_copy_lens");
+        for _ in 0..24 {
+            module.emit(Instruction::new0(OpCode::Nop));
+        }
+        module.function_table = vec![2, 10];
+        module.function_local_counts = vec![23, 0];
+        module.behaviors.push(crate::bytecode::BehaviorTableEntry {
+            name: "A.tick".to_string(),
+            param_count: 1,
+            code_offset: 14,
+            local_count: 31,
+            effect_mask: 0,
+            compensate_offset: None,
+            content_hash: None,
+            source_location: None,
+            parallel_branches: None,
+        });
+        module.entry_point = Some(20);
+
+        let lens = compute_jit_register_copy_lens(&module);
+        assert_eq!(lens[0], 256, "non-function code stays conservative");
+        assert_eq!(lens[2], 23);
+        assert_eq!(lens[9], 23);
+        assert_eq!(
+            lens[10], 256,
+            "zero/missing function metadata must not inherit the previous prefix"
+        );
+        assert_eq!(lens[14], 31, "behavior local-count metadata is usable");
+        assert_eq!(lens[19], 31);
+        assert_eq!(
+            lens[20], 256,
+            "synthetic entry-point code must not inherit behavior metadata"
         );
     }
 
