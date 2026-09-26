@@ -29,6 +29,22 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) fn restore_replay_context(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<crate::runtime::persistence::WorkflowActivationId>,
+) {
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.current_workflow_activation = activation;
+    }
+}
+
+pub(crate) fn clear_replay_context(rt: &mut Runtime, actor_id: u64) {
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.current_workflow_activation = None;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Checkpoint
 // ---------------------------------------------------------------------------
