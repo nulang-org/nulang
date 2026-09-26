@@ -125,11 +125,9 @@ pub struct ForeignEdge {
     pub ref_count: u32,
 }
 
-// SAFETY: ForeignEdge contains a raw pointer, but we only use it as an opaque
-// handle for HashMap keys. Equality and hashing are based on the pointer
-// address value, not the pointed-to data.
-unsafe impl Send for ForeignEdge {}
-unsafe impl Sync for ForeignEdge {}
+// Deliberately no Send/Sync impl: these edges are scheduler-local graph
+// records owned by CycleDetector. The raw pointer is compared/hashed as an
+// address here and must not acquire broader cross-thread guarantees.
 
 impl PartialEq for ForeignEdge {
     fn eq(&self, other: &Self) -> bool {
@@ -179,10 +177,9 @@ pub struct ForeignRefNode {
     pub visited_epoch: u64,
 }
 
-// SAFETY: ForeignRefNode stores a raw pointer, but the CycleDetector that
-// owns the node is !Sync (single-threaded), so there are no data races.
-// The pointer is only dereferenced after checking the object is alive.
-unsafe impl Send for ForeignRefNode {}
+// Deliberately no Send/Sync impl: CycleDetector owns these nodes on its
+// single scheduler/coordinator path. Pointer dereferences still require the
+// explicit liveness/provenance contract on the unsafe methods below.
 
 impl ForeignRefNode {
     /// Check whether the object this node represents is still alive.
