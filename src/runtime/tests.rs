@@ -6936,6 +6936,33 @@ fn test_object_ref_released_on_actor_exit() {
 }
 
 #[test]
+fn test_small_cross_shard_payload_stays_inline() {
+    let mut shards = Runtime::new_sharded(2);
+
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+
+    shards[0].send_message_by_id(target, 0, &[Value::int(42)]);
+    shards[1].drain_cross_shard_messages();
+
+    let received = shards[1]
+        .actors
+        .get_mut(&target)
+        .unwrap()
+        .mailbox
+        .pop()
+        .expect("cross-shard message should reach the target mailbox");
+
+    assert!(
+        received.payload.is_inline(),
+        "0-4 value cross-shard payloads should preserve inline storage"
+    );
+    assert_eq!(received.payload.as_slice(), &[Value::int(42)]);
+}
+
+#[test]
 fn test_object_ref_cross_shard_copies_bytes() {
     let mut shards = Runtime::new_sharded(2);
 
