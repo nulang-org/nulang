@@ -3751,7 +3751,7 @@ mod lsp_tests {
     #[test]
     fn test_apply_content_changes_handles_multiline_utf16_range() {
         let changes = vec![TextDocumentContentChangeEvent {
-            range: Some(Range::new(Position::new(0, 1), Position::new(1, 2))),
+            range: Some(Range::new(Position::new(0, 1), Position::new(1, 1))),
             range_length: None,
             text: "-".to_string(),
         }];
