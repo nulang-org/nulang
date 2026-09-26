@@ -198,6 +198,15 @@ pub struct DurableStateCheckpoint {
     pub fields: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableWorkflowActivation {
+    #[serde(with = "u64_string")]
+    pub actor_id: u64,
+    #[serde(with = "u64_string")]
+    pub command_sequence: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum DurableWorkflowEvent {
@@ -205,9 +214,13 @@ pub enum DurableWorkflowEvent {
         workflow_name: String,
     },
     StepCompleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activation: Option<DurableWorkflowActivation>,
         step_name: String,
     },
     StepFailed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activation: Option<DurableWorkflowActivation>,
         step_name: String,
         error: String,
     },
@@ -234,10 +247,12 @@ impl DurableWorkflowEvent {
     fn validate(&self) -> Result<(), DurableProtocolError> {
         let valid = match self {
             Self::WorkflowStarted { workflow_name } => !workflow_name.trim().is_empty(),
-            Self::StepCompleted { step_name } | Self::SagaCompensated { step_name } => {
+            Self::StepCompleted { step_name, .. } | Self::SagaCompensated { step_name } => {
                 !step_name.trim().is_empty()
             }
-            Self::StepFailed { step_name, error } => {
+            Self::StepFailed {
+                step_name, error, ..
+            } => {
                 !step_name.trim().is_empty() && !error.trim().is_empty()
             }
             Self::SignalAccepted { name, .. } | Self::Custom { name, .. } => {
@@ -760,6 +775,7 @@ mod tests {
                 ]),
             }),
             workflow_events: vec![DurableWorkflowEvent::StepCompleted {
+                activation: None,
                 step_name: "charge".into(),
             }],
             domain_events: vec![DurableDomainEvent {
@@ -883,6 +899,7 @@ mod tests {
         let first = DurableCommitRequest::new(transition()).unwrap();
         let mut changed = transition();
         changed.workflow_events = vec![DurableWorkflowEvent::StepFailed {
+            activation: None,
             step_name: "charge".into(),
             error: "declined".into(),
         }];
