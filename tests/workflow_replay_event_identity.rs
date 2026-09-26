@@ -1,26 +1,26 @@
-use nulang::runtime::{WorkflowActivationId, WorkflowEvent, WorkflowReplayId};
+use nulang::runtime::{WorkflowActivationId, WorkflowEvent, WorkflowOperationId};
 
 #[test]
-fn custom_workflow_event_exposes_activation_local_replay_identity() {
+fn custom_workflow_event_exposes_activation_local_operationentity() {
     let activation = WorkflowActivationId::new(42, 7);
-    let replay_id = WorkflowReplayId::new(activation, 3);
+    let operation = WorkflowOperationId::new(activation, 3);
     let event = WorkflowEvent::Custom {
         sequence: 11,
-        replay_id: Some(replay_id),
+        operation: Some(operation),
         name: "Charged".into(),
         args: vec![],
     };
 
-    assert_eq!(event.replay_id(), Some(replay_id));
-    assert_eq!(replay_id.activation, activation);
-    assert_eq!(replay_id.ordinal, 3);
+    assert_eq!(event.operation(), Some(operation));
+    assert_eq!(operation.activation, activation);
+    assert_eq!(operation.ordinal, 3);
 }
 
 #[test]
-fn legacy_custom_event_omits_absent_replay_identity() {
+fn legacy_custom_event_omits_absent_operationentity() {
     let event = WorkflowEvent::Custom {
         sequence: 11,
-        replay_id: None,
+        operation: None,
         name: "Legacy".into(),
         args: vec![],
     };
@@ -32,18 +32,18 @@ fn legacy_custom_event_omits_absent_replay_identity() {
         .expect("Custom content object");
 
     assert!(
-        !value.contains_key("replay_id"),
+        !value.contains_key("operation"),
         "legacy custom-event encoding must remain byte-compatible"
     );
 }
 
 #[test]
-fn replay_identity_changes_only_with_activation_or_ordinal() {
+fn operationentity_changes_only_with_activation_or_ordinal() {
     let activation = WorkflowActivationId::new(42, 7);
-    let first = WorkflowReplayId::new(activation, 0);
-    let retry = WorkflowReplayId::new(activation, 0);
-    let next = WorkflowReplayId::new(activation, 1);
-    let other_activation = WorkflowReplayId::new(WorkflowActivationId::new(42, 8), 0);
+    let first = WorkflowOperationId::new(activation, 0);
+    let retry = WorkflowOperationId::new(activation, 0);
+    let next = WorkflowOperationId::new(activation, 1);
+    let other_activation = WorkflowOperationId::new(WorkflowActivationId::new(42, 8), 0);
 
     assert_eq!(first, retry);
     assert_ne!(first, next);
