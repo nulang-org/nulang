@@ -13,7 +13,8 @@ Each stream has:
 
 - `meta.json` — format version and segment-size configuration.
 - `<base-sequence>.seg` — ordered immutable-history segments.
-- `cursors.json` — atomically replaced consumer cursor state.\n- `deliveries.json` — durable per-consumer in-flight leases, ACK gaps, and delivery attempts.
+- `cursors.json` — atomically replaced consumer cursor state.
+- `deliveries.json` — durable per-consumer in-flight leases, ACK gaps, and delivery attempts.
 
 Records are assigned monotonically increasing 64-bit sequence numbers starting
 at 1. A record frame contains:
