@@ -26,8 +26,8 @@ fn sequence_retention_prunes_segments_and_survives_restart() {
     {
         let mut store = FileFabricStreamStore::open(&root).unwrap();
         store
-        .create_stream("events", one_record_segments())
-        .unwrap();
+            .create_stream("events", one_record_segments())
+            .unwrap();
         for byte in [1_u8, 2, 3, 4] {
             store.append("events", &[byte; 32]).unwrap();
         }
@@ -197,8 +197,8 @@ fn retention_can_prune_all_history_without_reusing_sequence_numbers() {
     {
         let mut store = FileFabricStreamStore::open(&root).unwrap();
         store
-        .create_stream("events", one_record_segments())
-        .unwrap();
+            .create_stream("events", one_record_segments())
+            .unwrap();
         for byte in [1_u8, 2, 3] {
             store.append("events", &[byte; 32]).unwrap();
         }
