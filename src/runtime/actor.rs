@@ -685,6 +685,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wake_from_hibernation_accepts_legacy_unwrapped_nlcs_continuation() {
+        let mut vm = crate::vm::VM::new();
+        let continuation = crate::vm::Continuation {
+            frames: vec![crate::vm::Frame::new(None, 0)],
+            current_frame_idx: 0,
+            resume_pc: 0,
+            resume_dst: 0,
+            step_count: 0,
+            handler_stack_snapshot: Vec::new(),
+        };
+        let module_hash = [0u8; 32];
+        let legacy_bytes = crate::runtime::heap_serialize::serialize_continuation(
+            &continuation,
+            &[],
+            &vm,
+            &module_hash,
+        )
+        .unwrap();
+        assert!(legacy_bytes.starts_with(b"NLCS"));
+
+        let mut actor = Actor::new(1, "legacy", 0);
+        actor.hibernation_state = Some(HibernationState {
+            continuation_bytes: legacy_bytes,
+            module_hash,
+            hibernated_at_ms: 0,
+            state_fields: std::collections::HashMap::new(),
+        });
+
+        actor.wake_from_hibernation(&mut vm).unwrap();
+        assert!(!actor.is_hibernated());
+    }
+
+    #[test]
     fn test_actor_new() {
         let actor = Actor::new(1, "test", 0);
         assert_eq!(actor.id, 1);
