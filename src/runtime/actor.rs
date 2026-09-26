@@ -469,8 +469,10 @@ impl Actor {
             vm,
             module_hash,
         )?;
+        let stored_bytes = crate::compression::encode_blob(&bytes)
+            .map_err(|error| format!("failed to encode hibernation continuation: {error}"))?;
         self.hibernation_state = Some(HibernationState {
-            continuation_bytes: bytes.clone(),
+            continuation_bytes: stored_bytes.clone(),
             module_hash: *module_hash,
             hibernated_at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -478,7 +480,7 @@ impl Actor {
                 .as_millis() as u64,
             state_fields: self.state_data.clone(),
         });
-        Ok(bytes)
+        Ok(stored_bytes)
     }
 
     /// Wake this actor from hibernation: deserialize and restore VM state.
@@ -491,8 +493,11 @@ impl Actor {
         if hibernation.continuation_bytes.is_empty() {
             return Ok(());
         }
+        let continuation_bytes =
+            crate::compression::decode_blob_or_raw(&hibernation.continuation_bytes)
+                .map_err(|error| format!("failed to decode hibernation continuation: {error}"))?;
         let (cont, handlers) = crate::runtime::heap_serialize::deserialize_continuation(
-            &hibernation.continuation_bytes,
+            continuation_bytes.as_ref(),
             vm,
         )?;
         // Restore VM state
