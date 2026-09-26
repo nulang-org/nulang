@@ -189,7 +189,9 @@ fn default_event_value() -> PersistedValue {
 ///
 /// The command journal sequence is allocated before user code executes and
 /// remains stable across suspension, replay, and terminal workflow events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct WorkflowActivationId {
     pub actor_id: u64,
     pub command_sequence: u64,
@@ -201,6 +203,51 @@ impl WorkflowActivationId {
             actor_id,
             command_sequence,
         }
+    }
+
+    pub const fn operation(self, ordinal: u32) -> WorkflowOperationId {
+        WorkflowOperationId::new(self, ordinal)
+    }
+}
+
+/// Replay-stable identity of one deterministic workflow operation.
+///
+/// The ordinal is local to an accepted command activation. Re-executing the
+/// same activation must derive the same ordinal sequence so recovery can
+/// recognize already-committed operations instead of appending them twice.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct WorkflowOperationId {
+    pub activation: WorkflowActivationId,
+    pub ordinal: u32,
+}
+
+impl WorkflowOperationId {
+    pub const fn new(activation: WorkflowActivationId, ordinal: u32) -> Self {
+        Self {
+            activation,
+            ordinal,
+        }
+    }
+
+    pub fn durable_effect_id(self, effect_operation: &str) -> DurableEffectId {
+        let execution_key = format!("workflow-command:{}", self.activation.command_sequence);
+        DurableEffectId::derive(
+            self.activation.actor_id,
+            &execution_key,
+            self.ordinal,
+            effect_operation,
+        )
     }
 }
 
@@ -263,6 +310,9 @@ pub enum WorkflowEvent {
     /// Any other event emitted by a workflow handler.
     Custom {
         sequence: u64,
+        /// Replay-stable activation-local identity. Missing on legacy history.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation: Option<WorkflowOperationId>,
         name: String,
         args: Vec<PersistedValue>,
     },
@@ -291,6 +341,17 @@ impl WorkflowEvent {
         match self {
             WorkflowEvent::StepCompleted { activation, .. }
             | WorkflowEvent::StepFailed { activation, .. } => *activation,
+            _ => None,
+        }
+    }
+
+    /// Return the replay identity carried by a deterministic workflow event.
+    ///
+    /// Legacy records and event kinds without activation-local identity return
+    /// `None`.
+    pub fn operation_id(&self) -> Option<WorkflowOperationId> {
+        match self {
+            WorkflowEvent::Custom { operation, .. } => *operation,
             _ => None,
         }
     }
@@ -416,7 +477,10 @@ impl DurableTransition {
             ));
         }
         for event in &self.workflow_events {
-            if let Some(activation) = event.activation_id() {
+            let activation = event
+                .activation_id()
+                .or_else(|| event.operation_id().map(|id| id.activation));
+            if let Some(activation) = activation {
                 if activation.actor_id != self.actor_id {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -3936,6 +4000,7 @@ mod libsql_atomic_transition_tests {
                 },
                 WorkflowEvent::Custom {
                     sequence,
+                    operation: None,
                     name: "audit".to_string(),
                     args: vec![PersistedValue::Int(sequence as i64)],
                 },

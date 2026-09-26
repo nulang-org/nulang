@@ -3429,6 +3429,62 @@ fn test_workflow_actor_emits_started_event() {
 }
 
 #[test]
+fn workflow_resume_context_preserves_next_replay_ordinal() {
+    let mut rt = Runtime::new();
+    let actor_id =
+        rt.spawn_workflow_actor("ResumeReplayWorkflow", Box::new(Vec::new), HashMap::new());
+    let activation = WorkflowActivationId::new(actor_id, 91);
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.next_workflow_operation_ordinal = 4;
+        actor.current_workflow_activation = None;
+    }
+
+    super::workflow::resume_workflow_activation(&mut rt, actor_id, Some(activation));
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(actor.current_workflow_activation, Some(activation));
+    assert_eq!(actor.next_workflow_operation_ordinal, 4);
+
+    super::workflow::clear_workflow_activation(&mut rt, actor_id);
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(actor.current_workflow_activation, None);
+    assert_eq!(actor.next_workflow_operation_ordinal, 4);
+}
+
+#[test]
+fn workflow_custom_events_receive_activation_local_operations() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("ReplayWorkflow", Box::new(Vec::new), HashMap::new());
+    let activation = WorkflowActivationId::new(actor_id, 77);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(activation);
+
+    rt.emit_event(actor_id, "First", &[]);
+    rt.emit_event(actor_id, "Second", &[]);
+
+    let operations: Vec<_> = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::Custom { operation, .. } => operation,
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        operations,
+        vec![
+            WorkflowOperationId::new(activation, 0),
+            WorkflowOperationId::new(activation, 1),
+        ]
+    );
+}
+
+#[test]
 fn test_workflow_actor_step_event_and_checkpoint() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
