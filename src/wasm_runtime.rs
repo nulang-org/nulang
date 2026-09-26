@@ -1077,7 +1077,10 @@ fn error_message(e: NuError) -> String {
 
 fn map_wasmtime_err(e: impl std::fmt::Display) -> NuError {
     NuError::VMError {
-        msg: format!("wasmtime: {}", e),
+        // Alternate Display preserves anyhow/Wasmtime source chains, including
+        // fail-closed host-import causes that ordinary Display reduces to the
+        // guest backtrace.
+        msg: format!("wasmtime: {e:#}"),
         span: Span::default(),
     }
 }
