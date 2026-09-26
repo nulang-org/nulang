@@ -301,8 +301,12 @@ pub(crate) fn signal_workflow(
     actor_id: u64,
     name: &str,
     payload: Option<String>,
-) {
-    let _ = append_signal_received(rt, actor_id, name, payload.clone());
+) -> std::io::Result<()> {
+    // A signal must not become visible in memory or resume execution unless
+    // its durable journal write and checkpoint both succeeded. This remains
+    // the legacy two-write path until activation replay (#836) lets workflow
+    // events move safely onto RFC 0022's atomic transition tail.
+    append_signal_received(rt, actor_id, name, payload.clone())?;
 
     let should_resume = {
         if let Some(actor) = rt.actors.get_mut(&actor_id) {
@@ -320,6 +324,7 @@ pub(crate) fn signal_workflow(
     if should_resume {
         rt.resume_suspended_workflow_step(actor_id);
     }
+    Ok(())
 }
 
 /// Register a read-only query handler on a workflow actor.
@@ -364,11 +369,14 @@ pub(crate) fn schedule_workflow_timer(
     actor_id: u64,
     name: &str,
     duration_ms: u64,
-) {
+) -> std::io::Result<()> {
     if actor_is_workflow(rt, actor_id) {
-        let _ = append_timer_set(rt, actor_id, name, duration_ms);
+        // Never arm a live timer if its durable TimerSet/checkpoint failed.
+        // Recovery can only reason about timers that were durably recorded.
+        append_timer_set(rt, actor_id, name, duration_ms)?;
     }
     rt.rearm_timer(actor_id, name, duration_ms);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
