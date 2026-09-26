@@ -1130,8 +1130,7 @@ mod tests {
 
     #[test]
     fn test_parse_form_urlencoded() {
-        let pairs =
-            parse_form_urlencoded(b"title=Buy+milk&id=1&foo=%26%3D&name=%C3%A9");
+        let pairs = parse_form_urlencoded(b"title=Buy+milk&id=1&foo=%26%3D&name=%C3%A9");
         assert_eq!(pairs.len(), 4);
         assert!(pairs.contains(&("title".to_string(), "Buy milk".to_string())));
         assert!(pairs.contains(&("id".to_string(), "1".to_string())));
