@@ -40,7 +40,7 @@ language-version = "1.0.0-frozen"
 # window, but give it an explicit name so release/CI consumers can pin the
 # compatibility profile before the default is eventually minimized.
 default = ["full"]
-full = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
+full = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq", "zstd-compression"]
 # Cranelift-backed tiered JIT plus the current native/AOT backend.
 native-codegen = [
     "dep:cranelift",
@@ -86,6 +86,8 @@ cache-server = ["tcp", "dep:mio"]
 # package registry client, and `nula deploy`. Disable for a minimal build
 # without the `ureq` dependency.
 ureq = ["dep:ureq"]
+# Optional Zstandard compression for versioned runtime/checkpoint blobs.
+zstd-compression = ["dep:zstd"]
 # RocksDB persistence backend (production-grade LSM-tree storage).
 rocksdb = ["dep:rocksdb"]
 # PostgreSQL persistence backend (production-grade relational storage).
@@ -181,6 +183,7 @@ rand_core = { version = "0.6.4", features = ["getrandom"] }
 target-lexicon = { version = "0.13", optional = true }
 
 flate2 = "1"
+zstd = { version = "0.13.3", default-features = false, optional = true }
 tar = "0.4"
 
 [lib]
