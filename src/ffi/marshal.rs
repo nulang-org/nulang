@@ -528,19 +528,37 @@ mod fixed_arity {
             [CType::F64] => with_returns!(arity_1_arms!(func.code_ptr(), args, ret, f64)),
             [CType::Bool] => with_returns!(arity_1_arms!(func.code_ptr(), args, ret, bool)),
             [CType::CStr] => {
-                with_returns!(arity_1_arms!(func.code_ptr(), args, ret, *const std::ffi::c_char))
+                with_returns!(arity_1_arms!(
+                    func.code_ptr(),
+                    args,
+                    ret,
+                    *const std::ffi::c_char
+                ))
             }
             [CType::VoidPtr] => {
-                with_returns!(arity_1_arms!(func.code_ptr(), args, ret, *mut std::ffi::c_void))
+                with_returns!(arity_1_arms!(
+                    func.code_ptr(),
+                    args,
+                    ret,
+                    *mut std::ffi::c_void
+                ))
             }
             [CType::Unit] => with_returns!(arity_1_arms!(func.code_ptr(), args, ret, ())),
-            [CType::I64, CType::I64] => with_returns!(arity_2_arms!(func.code_ptr(), args, ret, i64, i64)),
-            [CType::I64, CType::F64] => with_returns!(arity_2_arms!(func.code_ptr(), args, ret, i64, f64)),
+            [CType::I64, CType::I64] => {
+                with_returns!(arity_2_arms!(func.code_ptr(), args, ret, i64, i64))
+            }
+            [CType::I64, CType::F64] => {
+                with_returns!(arity_2_arms!(func.code_ptr(), args, ret, i64, f64))
+            }
             [CType::I64, CType::Bool] => {
                 with_returns!(arity_2_arms!(func.code_ptr(), args, ret, i64, bool))
             }
-            [CType::F64, CType::I64] => with_returns!(arity_2_arms!(func.code_ptr(), args, ret, f64, i64)),
-            [CType::F64, CType::F64] => with_returns!(arity_2_arms!(func.code_ptr(), args, ret, f64, f64)),
+            [CType::F64, CType::I64] => {
+                with_returns!(arity_2_arms!(func.code_ptr(), args, ret, f64, i64))
+            }
+            [CType::F64, CType::F64] => {
+                with_returns!(arity_2_arms!(func.code_ptr(), args, ret, f64, f64))
+            }
             [CType::F64, CType::Bool] => {
                 with_returns!(arity_2_arms!(func.code_ptr(), args, ret, f64, bool))
             }
@@ -557,7 +575,15 @@ mod fixed_arity {
                 with_returns!(arity_3_arms!(func.code_ptr(), args, ret, i64, i64, i64))
             }
             [CType::I64, CType::I64, CType::I64, CType::I64] => {
-                with_returns!(arity_4_arms!(func.code_ptr(), args, ret, i64, i64, i64, i64))
+                with_returns!(arity_4_arms!(
+                    func.code_ptr(),
+                    args,
+                    ret,
+                    i64,
+                    i64,
+                    i64,
+                    i64
+                ))
             }
             _ => Err(format!(
                 "unsupported parameter count/types (max 4, no Value without ffi feature): {:?}",
