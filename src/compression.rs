@@ -26,6 +26,8 @@ pub const DEFAULT_COMPRESSION_THRESHOLD: usize = 4 * 1024;
 /// Default upper bound for a decoded runtime blob. Callers with a stricter
 /// domain-specific bound should use `decode_blob_with_limit`.
 pub const DEFAULT_MAX_DECODED_BLOB_SIZE: usize = 64 * 1024 * 1024;
+#[cfg(feature = "zstd-compression")]
+const DEFAULT_ZSTD_WINDOW_LOG_MAX: u32 = 26;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -36,13 +38,6 @@ pub enum BlobCodec {
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
-}
-
-#[cfg(feature = "zstd-compression")]
-fn zstd_window_log_max(expected_len: usize) -> u32 {
-    let expected_len = u64::try_from(expected_len).unwrap_or(u64::MAX).max(1);
-    let ceil_log = u64::BITS - (expected_len - 1).leading_zeros();
-    ceil_log.clamp(10, 31)
 }
 
 fn encode_envelope(codec: BlobCodec, original_len: usize, payload: &[u8]) -> io::Result<Vec<u8>> {
@@ -151,7 +146,7 @@ pub fn decode_blob_with_limit(encoded: &[u8], max_decoded_len: usize) -> io::Res
                 let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(payload))
                     .map_err(|error| invalid_data(format!("invalid zstd runtime blob: {error}")))?;
                 decoder
-                    .window_log_max(zstd_window_log_max(expected_len))
+                    .window_log_max(DEFAULT_ZSTD_WINDOW_LOG_MAX)
                     .map_err(|error| invalid_data(format!("invalid zstd runtime blob: {error}")))?;
                 let mut limited = decoder.take(expected_len_u64.saturating_add(1));
                 let mut output = Vec::new();
