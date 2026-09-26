@@ -1,5 +1,11 @@
 # Nulang Changelog
 
+### Scheduler-local ORCA graph records — 2026-09-26
+- **ORCA graph pointer records no longer assert cross-thread auto-traits.** `ForeignEdge` drops handwritten `Send`/`Sync`, and `ForeignRefNode` drops handwritten `Send`; both remain owned by the single-threaded `CycleDetector`.
+- **The detector was already non-`Send`.** Its `Suspect` queue contains raw header pointers without auto-trait overrides, so the removed impls did not enable moving the detector and only widened the public pointer-bearing types.
+- **CI pins the scheduler-local boundary.** The implementation verifier rejects future unsafe `Send`/`Sync` impls for those ORCA graph types.
+
+
 ### Thread-confined runtime callback bridges — 2026-09-26
 - **Runtime-owned VM callback bridges no longer override Rust's `Send`/`Sync` auto-traits.** `BytecodeRuntimeCallbacks` and `BytecodeDistributedCallbacks` keep their raw `Runtime` pointers scheduler-thread-confined instead of relying on handwritten unsafe cross-thread assertions.
 - **Raw callback construction is now an explicit unsafe boundary.** Both bridges use `unsafe fn from_raw` with non-null/live/exclusive-runtime contracts, and call sites document why the pointer is valid for the synchronous VM/native invocation.
