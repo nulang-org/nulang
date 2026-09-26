@@ -229,6 +229,16 @@ fn unsupported(message: impl Into<String>) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::runtime::{
+        ActorSnapshot, DurableOutboxMessage, JournalEntry, DURABLE_TRANSITION_VERSION,
+    };
+    use nulang_durable_protocol::{
+        DurableCommit as WireDurableCommit, DurableWorkflowActivation, DurableWorkflowEvent,
+    };
+    use serde_json::json;
+    use std::collections::HashMap;
+
 fn terminal_transition() -> DurableTransition {
     DurableTransition {
         version: DURABLE_TRANSITION_VERSION,
@@ -332,7 +342,7 @@ fn snapshot_metadata_without_wire_mapping_fails_closed() {
 #[test]
 fn unsupported_atomic_records_fail_closed_instead_of_being_omitted() {
     let mut transition = terminal_transition();
-    transition.outbox.push(super::DurableOutboxMessage {
+    transition.outbox.push(DurableOutboxMessage {
         destination_actor_id: 99,
         ordinal: 0,
         behavior_id: 5,
