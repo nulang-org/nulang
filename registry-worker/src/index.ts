@@ -110,14 +110,16 @@ export default {
     if (matchVersion) {
       const name = matchVersion[1];
       const version = matchVersion[2];
-      const key = `${name}/${version}.tar.gz`;
-
       if (method === 'GET') {
-        const object = await env.BUCKET.get(key);
+        let object: R2ObjectBody | null = null;
+        for (const extension of PACKAGE_EXTENSIONS) {
+          object = await env.BUCKET.get(`${name}/${version}${extension}`);
+          if (object) break;
+        }
         if (!object) {
           return new Response('Not found', { status: 404 });
         }
-        
+
         const headers = new Headers();
         object.writeHttpMetadata(headers);
         headers.set('Content-Type', 'application/octet-stream');
