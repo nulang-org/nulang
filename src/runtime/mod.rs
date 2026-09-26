@@ -3908,6 +3908,7 @@ impl Runtime {
                         workflow_activation = Some(WorkflowActivationId::new(actor_id, seq));
                         if let Some(actor) = self.actors.get_mut(&actor_id) {
                             actor.current_workflow_activation = workflow_activation;
+                            actor.next_workflow_replay_ordinal = 0;
                         }
                     }
                 }
@@ -3936,6 +3937,7 @@ impl Runtime {
                         workflow_activation = Some(WorkflowActivationId::new(actor_id, seq));
                         if let Some(actor) = self.actors.get_mut(&actor_id) {
                             actor.current_workflow_activation = workflow_activation;
+                            actor.next_workflow_replay_ordinal = 0;
                         }
                     }
                 }
