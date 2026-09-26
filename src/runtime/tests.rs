@@ -3429,6 +3429,42 @@ fn test_workflow_actor_emits_started_event() {
 }
 
 #[test]
+fn workflow_custom_events_receive_activation_local_replay_ids() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "ReplayWorkflow",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    let activation = WorkflowActivationId::new(actor_id, 77);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(activation);
+
+    rt.emit_event(actor_id, "First", &[]);
+    rt.emit_event(actor_id, "Second", &[]);
+
+    let replay_ids: Vec<_> = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::Custom { replay_id, .. } => replay_id,
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        replay_ids,
+        vec![
+            WorkflowReplayId::new(activation, 0),
+            WorkflowReplayId::new(activation, 1),
+        ]
+    );
+}
+
+#[test]
 fn test_workflow_actor_step_event_and_checkpoint() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
