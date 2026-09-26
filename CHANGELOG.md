@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Fail-closed durable commit host ABI — 2026-09-26
+- **Standalone Wasmtime hosts now expose the internal atomic durability commit seam** `env.nulang_commit_transition(payload_ptr, payload_len) -> i64` in both normal and precompiled module paths.
+- **The host boundary fails closed.** It preserves the exact opaque request bytes, traps when no durable handler is configured or guest memory is invalid, and rejects serialized responses that exceed the existing 4 KiB result ring rather than truncating them.
+- This is a host ABI seam only: compiler emission and WASM workflow execution remain disabled until transition staging and replay semantics are wired end to end.
+
 ### Atomic durable transition host protocol — 2026-09-26
 - **The runtime-neutral RFC 0022 wire contract is now ported onto the current durability stack.** `nulang-durable-protocol` defines `nulang-durable-transition/v0alpha1`, opaque owner identity, fencing sequences, deterministic digests, workflow/timer/effect/outbox records, and fail-closed request validation without importing hosted Cloud policy.
 - **This supersedes the conflict-stale protocol branch rather than reviving its Cloud-control changes.** Transition staging can now target one portable Nulang-owned protocol while Nulang Cloud remains responsible for atomic host persistence.
