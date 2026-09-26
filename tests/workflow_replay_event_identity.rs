@@ -1,7 +1,7 @@
 use nulang::runtime::{WorkflowActivationId, WorkflowEvent, WorkflowOperationId};
 
 #[test]
-fn custom_workflow_event_exposes_activation_local_operationentity() {
+fn custom_workflow_event_exposes_activation_local_operation_identity() {
     let activation = WorkflowActivationId::new(42, 7);
     let operation = WorkflowOperationId::new(activation, 3);
     let event = WorkflowEvent::Custom {
@@ -11,13 +11,26 @@ fn custom_workflow_event_exposes_activation_local_operationentity() {
         args: vec![],
     };
 
-    assert_eq!(event.operation(), Some(operation));
+    assert_eq!(event.operation_id(), Some(operation));
     assert_eq!(operation.activation, activation);
     assert_eq!(operation.ordinal, 3);
 }
 
 #[test]
-fn legacy_custom_event_omits_absent_operationentity() {
+fn workflow_operation_identity_derives_stable_durable_effect_ids() {
+    let activation = WorkflowActivationId::new(42, 7);
+    let operation = activation.operation(3);
+
+    let first = operation.durable_effect_id("Provider.ask");
+    let replay = activation.operation(3).durable_effect_id("Provider.ask");
+    let next = activation.operation(4).durable_effect_id("Provider.ask");
+
+    assert_eq!(first, replay);
+    assert_ne!(first, next);
+}
+
+#[test]
+fn legacy_custom_event_omits_absent_operation_identity() {
     let event = WorkflowEvent::Custom {
         sequence: 11,
         operation: None,
@@ -38,7 +51,7 @@ fn legacy_custom_event_omits_absent_operationentity() {
 }
 
 #[test]
-fn operationentity_changes_only_with_activation_or_ordinal() {
+fn operation_identity_changes_only_with_activation_or_ordinal() {
     let activation = WorkflowActivationId::new(42, 7);
     let first = WorkflowOperationId::new(activation, 0);
     let retry = WorkflowOperationId::new(activation, 0);
