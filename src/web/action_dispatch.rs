@@ -184,4 +184,91 @@ mod tests {
 
         assert!(value.is_unit());
     }
+    fn handler_param(name: &str, ty: &str) -> crate::web::contracts::HandlerParamContract {
+        crate::web::contracts::HandlerParamContract {
+            name: name.to_string(),
+            ty: Some(ty.to_string()),
+            capability: None,
+            request: None,
+        }
+    }
+
+    #[test]
+    fn binds_action_payload_by_compiler_parameter_order() {
+        let params = vec![
+            handler_param("title", "String"),
+            handler_param("count", "Int"),
+            handler_param("active", "Bool"),
+        ];
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("active".to_string(), WireValue::Bool(true));
+        fields.insert("count".to_string(), WireValue::String("42".to_string()));
+        fields.insert(
+            "title".to_string(),
+            WireValue::String("Ship it".to_string()),
+        );
+        let message = HostToRuntimeMessage::invoke_action(ActionRequest {
+            document_id: DocumentId::from("app"),
+            revision: Revision(1),
+            action_id: "save".into(),
+            placement: ActionPlacement::Server,
+            correlation_id: CorrelationId::from("corr-1"),
+            idempotency_key: IdempotencyKey::from("idem-1"),
+            payload: WireValue::Object(fields),
+        });
+
+        let args = bind_action_payload(&params, &message).expect("typed payload should bind");
+
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0].handler_index, 0);
+        assert_eq!(args[0].value, crate::bytecode::Constant::String("Ship it".to_string()));
+        assert_eq!(args[1].handler_index, 1);
+        assert_eq!(args[1].value, crate::bytecode::Constant::Int(42));
+        assert_eq!(args[2].handler_index, 2);
+        assert_eq!(args[2].value, crate::bytecode::Constant::Bool(true));
+    }
+
+    #[test]
+    fn action_payload_missing_required_field_fails_closed() {
+        let params = vec![handler_param("title", "String"), handler_param("count", "Int")];
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            "title".to_string(),
+            WireValue::String("Only title".to_string()),
+        );
+        let message = HostToRuntimeMessage::invoke_action(ActionRequest {
+            document_id: DocumentId::from("app"),
+            revision: Revision(1),
+            action_id: "save".into(),
+            placement: ActionPlacement::Server,
+            correlation_id: CorrelationId::from("corr-1"),
+            idempotency_key: IdempotencyKey::from("idem-1"),
+            payload: WireValue::Object(fields),
+        });
+
+        let error =
+            bind_action_payload(&params, &message).expect_err("missing count must fail closed");
+        assert!(error.to_string().contains("missing payload field 'count'"));
+    }
+
+    #[test]
+    fn action_payload_must_be_an_object_for_parameterized_handlers() {
+        let params = vec![handler_param("title", "String")];
+        let message = HostToRuntimeMessage::invoke_action(ActionRequest {
+            document_id: DocumentId::from("app"),
+            revision: Revision(1),
+            action_id: "save".into(),
+            placement: ActionPlacement::Server,
+            correlation_id: CorrelationId::from("corr-1"),
+            idempotency_key: IdempotencyKey::from("idem-1"),
+            payload: WireValue::String("not-an-object".to_string()),
+        });
+
+        let error =
+            bind_action_payload(&params, &message).expect_err("non-object payload must fail");
+        assert!(error
+            .to_string()
+            .contains("parameterized UI action payload must be an object"));
+    }
+
 }
