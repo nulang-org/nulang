@@ -214,13 +214,21 @@ mod tests {
 
     fn module_with_action(name: &str, params: Vec<usize>) -> CodeModule {
         let mut module = CodeModule::new("actions");
-        let offset = module.emit(Instruction::new0(OpCode::Ret));
+        let offset = module.instructions.len();
+        let unit_index = module.add_constant(Constant::Unit);
+        module.emit(Instruction::new3(
+            OpCode::ConstU,
+            ((unit_index >> 8) & 0xFF) as u8,
+            (unit_index & 0xFF) as u8,
+            0,
+        ));
+        module.emit(Instruction::new1(OpCode::RetVal, 0));
         module.function_table.push(offset);
         module.function_local_counts.push(params.len());
         module.debug_functions.push(DebugFunctionInfo {
             name: name.to_string(),
             code_offset: offset,
-            code_len: 1,
+            code_len: 2,
             params,
             locals: Vec::new(),
         });
