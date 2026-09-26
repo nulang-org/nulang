@@ -29,10 +29,30 @@
 //! operations for tag extraction, the representation is fully deterministic
 //! across all targets: native, WASM, and any future backend.
 //!
-//! Floats are stored as their raw IEEE-754 bit pattern. Any bit pattern whose
-//! upper 16 bits do not match a known type tag is interpreted as a float
-//! (the current tag set occupies the quiet-NaN range 0x7FF6–0x7FFE, so no
-//! valid non-NaN float will collide).
+//! Finite floats and infinities retain their raw IEEE-754 bit pattern. NaNs
+//! are canonicalized to `CANONICAL_NAN_BITS`. Arbitrary NaN payloads are not
+//! accepted as floats because the runtime tags occupy reserved patterns in the
+//! IEEE-754 quiet-NaN range (currently 0x7FF5–0x7FFE).
+// ---------------------------------------------------------------------------
+// Stable ABI contract
+// ---------------------------------------------------------------------------
+
+/// Version of the public tagged-value ABI shared by Nulang runtimes and hosts.
+///
+/// Increment this only for an intentionally incompatible change to the semantic
+/// value contract. Physical transports may add their own envelope versions,
+/// but a host claiming this ABI must preserve these tags and payload rules.
+pub const VALUE_ABI_VERSION: u32 = 1;
+
+/// Stable identifier for the public tagged-value ABI.
+pub const VALUE_ABI_ID: &str = "nulang.value/i64-tagged-v1";
+
+/// Number of high bits reserved for the type tag.
+pub const VALUE_ABI_TAG_BITS: u32 = 16;
+
+/// Number of low bits available to tagged payloads.
+pub const VALUE_ABI_PAYLOAD_BITS: u32 = 48;
+
 // ---------------------------------------------------------------------------
 // Masks
 // ---------------------------------------------------------------------------
@@ -228,7 +248,7 @@ const MANTISSA_MASK: u64 = 0x000F_FFFF_FFFF_FFFF;
 /// reserved `CANONICAL_NAN_BITS` pattern, which `float_bits()` substitutes for
 /// any NaN result so that float NaNs survive in the boxed representation.
 ///
-/// All tagged values (0x7FF6–0x7FFE) occupy the quiet-NaN range, so this
+/// All tagged values (0x7FF5–0x7FFE) occupy the quiet-NaN range, so this
 /// integer bitmask test is equivalent to `!f64::from_bits(raw).is_nan()` (plus
 /// the canonical-NaN exception) but avoids the FPU domain-crossing penalty of
 /// `vmovq` + `ucomisd`.
@@ -248,6 +268,14 @@ pub fn is_float_raw(raw: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_value_abi_contract_descriptor() {
+        assert_eq!(VALUE_ABI_VERSION, 1);
+        assert_eq!(VALUE_ABI_ID, "nulang.value/i64-tagged-v1");
+        assert_eq!(VALUE_ABI_TAG_BITS + VALUE_ABI_PAYLOAD_BITS, 64);
+        assert_eq!(TAG_SHIFT, VALUE_ABI_PAYLOAD_BITS);
+    }
 
     #[test]
     fn test_tags_are_unique() {
