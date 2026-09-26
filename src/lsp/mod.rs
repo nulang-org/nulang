@@ -4381,6 +4381,11 @@ mod lsp_tests {
             serde_json::json!([".", ":"])
         );
         assert!(caps["capabilities"].get("inlayHintProvider").is_some());
+        assert_eq!(
+            caps["capabilities"]["textDocumentSync"]["change"],
+            serde_json::json!(2),
+            "server must advertise incremental document synchronization"
+        );
     }
 
     /// initialize -> didOpen(good doc) -> didOpen(broken doc): the server
@@ -4450,6 +4455,61 @@ mod lsp_tests {
         assert!(
             !params["diagnostics"].as_array().unwrap().is_empty(),
             "change to a broken doc must publish diagnostics, got {params}"
+        );
+    }
+
+    /// A ranged didChange edits the existing document instead of replacing
+    /// the entire source with the change fragment.
+    #[tokio::test]
+    async fn test_protocol_incremental_did_change_preserves_unchanged_text() {
+        let (mut service, mut socket) = LspService::new(|client| NulangLanguageServer::new(client));
+        init(&mut service).await;
+        call(
+            &mut service,
+            did_open_req(DOC_URL, 1, "fn add(x: Int, y: Int) { x + y }"),
+        )
+        .await;
+        socket.next().await.expect("open diagnostics");
+
+        call(
+            &mut service,
+            Request::build("textDocument/didChange")
+                .params(serde_json::json!({
+                    "textDocument": { "uri": DOC_URL, "version": 2 },
+                    "contentChanges": [{
+                        "range": {
+                            "start": { "line": 0, "character": 3 },
+                            "end": { "line": 0, "character": 6 }
+                        },
+                        "rangeLength": 3,
+                        "text": "sum"
+                    }]
+                }))
+                .finish(),
+        )
+        .await;
+
+        let msg = socket.next().await.expect("incremental change diagnostics");
+        assert_eq!(msg.method(), "textDocument/publishDiagnostics");
+        let params = msg.params().cloned().expect("params");
+        assert_eq!(
+            params["diagnostics"].as_array().map(|items| items.len()),
+            Some(0),
+            "renaming add to sum by range must keep the rest of the document intact: {params}"
+        );
+
+        let resp = call(&mut service, hover_req(DOC_URL, 0, 4))
+            .await
+            .expect("hover response");
+        let (_id, result) = resp.into_parts();
+        let hover = result.expect("hover must succeed after incremental edit");
+        let contents = hover["contents"]
+            .as_str()
+            .or_else(|| hover["contents"]["value"].as_str())
+            .unwrap_or("");
+        assert!(
+            contents.contains("sum"),
+            "hover must observe the incrementally edited function, got {hover}"
         );
     }
 
