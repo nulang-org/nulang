@@ -35,11 +35,31 @@ AB_RECORD_RE = re.compile(
 )
 
 
+CARGO_TARGET_ROOT = Path(tempfile.gettempdir()) / "nulang-ab-cargo-target"
+
+
+def cargo_environment(variant: str) -> dict[str, str]:
+    """Return an environment with build artifacts isolated per A/B variant.
+
+    The repository-level Cargo config uses one absolute target directory.
+    Sharing that directory between the detached base worktree and candidate
+    checkout can make Cargo reuse the base library artifact while compiling
+    candidate integration tests. Keep dependency/build caches persistent across
+    harness runs, but never share one target directory across the two variants.
+    """
+    if variant not in {"base", "candidate"}:
+        raise ValueError(f"unknown A/B variant: {variant}")
+    env = os.environ.copy()
+    env["CARGO_TARGET_DIR"] = str(CARGO_TARGET_ROOT / variant)
+    return env
+
+
 def command_output(
     command: list[str],
     *,
     cwd: Path,
     cpu_affinity: set[int] | None = None,
+    env: dict[str, str] | None = None,
 ) -> str:
     preexec_fn = None
     if cpu_affinity is not None:
@@ -61,6 +81,7 @@ def command_output(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         preexec_fn=preexec_fn,
+        env=env,
     )
     if proc.returncode != 0:
         sys.stderr.write(proc.stdout)
@@ -289,10 +310,23 @@ def main() -> int:
                     "record format; merge/rebase the benchmark foundation first"
                 )
 
+        environments = {
+            "base": cargo_environment("base"),
+            "candidate": cargo_environment("candidate"),
+        }
+
         print(f"[build] base={args.base_ref}", flush=True)
-        command_output(cargo_build_command(extra_args), cwd=base)
+        command_output(
+            cargo_build_command(extra_args),
+            cwd=base,
+            env=environments["base"],
+        )
         print("[build] candidate=HEAD", flush=True)
-        command_output(cargo_build_command(extra_args), cwd=ROOT)
+        command_output(
+            cargo_build_command(extra_args),
+            cwd=ROOT,
+            env=environments["candidate"],
+        )
 
         samples: dict[str, dict[str, list[dict[str, int]]]] = {
             variant: {name: [] for name in BENCHMARKS}
@@ -318,6 +352,7 @@ def main() -> int:
                     cargo_command(extra_args),
                     cwd=roots[variant],
                     cpu_affinity=affinity,
+                    env=environments[variant],
                 )
                 records = parse_records(output)
                 if measured:
