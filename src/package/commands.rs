@@ -581,7 +581,7 @@ import stdlib::web::types
 import stdlib::web::host
 import stdlib::json
 
-fn get_todos() -> [JsonValue] {
+fn get_todos() {
     let raw = kv_get("todos")
     if raw == "" then { [] }
     else {

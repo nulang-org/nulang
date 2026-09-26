@@ -183,11 +183,42 @@ jobs:
       - name: Smoke test (eval)
         run: ./target/release/nulang --eval 'perform IO.print("hello")'
 
-      - name: Scaffold test package
-        run: ./target/release/nulang nula new test-pkg
+      - name: Scaffold test package through public shortcut
+        run: ./target/release/nulang new test-pkg
 
       - name: Run nula test
         run: cd test-pkg && ../target/release/nulang nula test
+
+      - name: Smoke test public new -> dev path
+        run: |
+          ./target/release/nulang new test-web --template web
+          cd test-web
+
+          ../target/release/nulang dev --port 18787 > ../nulang-dev.log 2>&1 &
+          dev_pid=$!
+          trap 'kill "$dev_pid" 2>/dev/null || true' EXIT
+
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:18787/ > ../nulang-dev.html; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "$dev_pid" 2>/dev/null; then
+              echo "nulang dev exited before becoming ready"
+              cat ../nulang-dev.log
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "nulang dev did not become ready"
+            cat ../nulang-dev.log
+            exit 1
+          fi
+
+          grep -q "Nulang Todo" ../nulang-dev.html
 
       - name: Verify documentation examples
         run: NULANG_BIN=./target/release/nulang bash scripts/verify_doc_examples.sh
