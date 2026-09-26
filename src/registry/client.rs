@@ -17,6 +17,23 @@ pub struct RegistryClient {
     token: Option<String>,
 }
 
+#[cfg(feature = "ureq")]
+fn read_body_limited(reader: impl Read, max_len: usize) -> Result<Vec<u8>, String> {
+    let max_plus_one = u64::try_from(max_len)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut limited = reader.take(max_plus_one);
+    let mut bytes = Vec::new();
+    limited.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.len() > max_len {
+        return Err(format!(
+            "package archive size {} exceeds limit {max_len}",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
 impl RegistryClient {
     pub fn new(registry_url: String, token: Option<String>) -> Self {
         RegistryClient {
@@ -83,12 +100,21 @@ impl RegistryClient {
             let url = format!("{}/api/v1/packages/{}/{}", self.base_url(), name, version);
             match ureq::get(&url).call() {
                 Ok(response) => {
-                    let mut bytes = Vec::new();
-                    response
-                        .into_reader()
-                        .read_to_end(&mut bytes)
-                        .map_err(|e| e.to_string())?;
-                    Ok(bytes)
+                    if let Some(content_length) = response.header("Content-Length") {
+                        let declared = content_length.parse::<usize>().map_err(|_| {
+                            "invalid Content-Length from package registry".to_string()
+                        })?;
+                        if declared > crate::package::archive::DEFAULT_MAX_PACKAGE_ARCHIVE_SIZE {
+                            return Err(format!(
+                                "package archive size {declared} exceeds limit {}",
+                                crate::package::archive::DEFAULT_MAX_PACKAGE_ARCHIVE_SIZE
+                            ));
+                        }
+                    }
+                    read_body_limited(
+                        response.into_reader(),
+                        crate::package::archive::DEFAULT_MAX_PACKAGE_ARCHIVE_SIZE,
+                    )
                 }
                 Err(err) => Err(Self::describe_error(err)),
             }
