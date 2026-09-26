@@ -16,6 +16,7 @@
 //! - `env.memory` — linear memory
 //! - `env.nulang_alloc(i32) -> i32` — bump allocator in WASM memory
 //! - `env.nulang_dispatch(i32,i32,i32,i32)` — effect dispatch (stub)
+//! - `env.nulang_commit_transition(i32,i32) -> i64` — fail-closed atomic durability ABI
 //! - `env.log(i32,i32) -> i64` — log to stderr
 //! - `env.io_print(i32,i32) -> i64` — print to stdout
 //! - `env.io_read() -> i64` — read stdin (stub: returns nil)
@@ -65,6 +66,13 @@ struct HostState {
     /// tests to verify the compiler's marshaling. Cleared by
     /// [`WasmRuntime::take_last_dispatch`].
     last_dispatch: std::sync::Arc<parking_lot::Mutex<Option<(Vec<u8>, Vec<u8>)>>>,
+    /// Injectable atomic durable-transition response for the standalone
+    /// Wasmtime host. `None` means no durable commit handler is registered and
+    /// the guest call traps. This mirrors Nulang Cloud's fail-closed host ABI.
+    durable_commit_result: std::sync::Arc<parking_lot::Mutex<Option<Vec<u8>>>>,
+    /// Exact request bytes from the last `nulang_commit_transition` call,
+    /// recorded for host-ABI contract tests.
+    last_durable_commit: std::sync::Arc<parking_lot::Mutex<Option<Vec<u8>>>>,
 }
 
 impl Default for HostState {
@@ -75,6 +83,8 @@ impl Default for HostState {
             input: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             dispatch_result: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             last_dispatch: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            durable_commit_result: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            last_durable_commit: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 }
@@ -123,6 +133,13 @@ impl WasmRuntime {
             .map_err(map_wasmtime_err)?;
         linker
             .func_wrap("env", "nulang_dispatch_args", host_dispatch_args)
+            .map_err(map_wasmtime_err)?;
+        linker
+            .func_wrap(
+                "env",
+                "nulang_commit_transition",
+                host_commit_transition,
+            )
             .map_err(map_wasmtime_err)?;
         linker
             .func_wrap("env", "log", host_log)
@@ -234,6 +251,21 @@ impl WasmRuntime {
     /// clearing it. Returns `None` if dispatch was never called.
     pub fn take_last_dispatch(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
         self.store.data().last_dispatch.clone().lock().take()
+    }
+
+    /// Install a standalone-host durable commit result for ABI tests.
+    ///
+    /// Production Cloud hosts bind this import to a real persistence backend.
+    /// Leaving this unset deliberately means there is no durable handler and
+    /// `nulang_commit_transition` fails closed.
+    pub fn set_durable_commit_result(&mut self, result: Option<Vec<u8>>) {
+        let arc = self.store.data().durable_commit_result.clone();
+        *arc.lock() = result;
+    }
+
+    /// Take the exact payload bytes from the last durable commit request.
+    pub fn take_last_durable_commit(&mut self) -> Option<Vec<u8>> {
+        self.store.data().last_durable_commit.clone().lock().take()
     }
 
     pub fn run(&mut self) -> NuResult<crate::vm::Value> {
@@ -846,6 +878,81 @@ fn host_dispatch(mut caller: Caller<'_, HostState>, a: i32, b: i32, c: i32, d: i
     write_len as i64
 }
 
+/// `env.nulang_commit_transition(payload_ptr: i32, payload_len: i32) -> i64`
+///
+/// Internal atomic-durability host ABI. The guest passes one serialized Nulang
+/// transition request. On success the host writes the serialized commit response
+/// to the existing 4 KiB result ring and returns its byte length.
+///
+/// This path intentionally differs from ordinary effect dispatch: missing
+/// handler state, invalid guest memory, and oversized responses all trap. A
+/// durability boundary must never silently degrade to a nil/no-op result.
+fn host_commit_transition(
+    mut caller: Caller<'_, HostState>,
+    payload_ptr: i32,
+    payload_len: i32,
+) -> Result<i64, Error> {
+    let result = caller
+        .data()
+        .durable_commit_result
+        .lock()
+        .clone()
+        .ok_or_else(|| {
+            Error::msg(
+                "nulang_commit_transition called but no durable commit handler registered",
+            )
+        })?;
+
+    let payload = {
+        if payload_ptr < 0 || payload_len < 0 {
+            return Err(Error::msg(format!(
+                "nulang_commit_transition payload out of bounds (off={payload_ptr}, len={payload_len})"
+            )));
+        }
+        let mem = get_memory(&mut caller)?;
+        let data = mem.data(&caller);
+        let start = payload_ptr as usize;
+        let len = payload_len as usize;
+        let end = start.checked_add(len).ok_or_else(|| {
+            Error::msg(format!(
+                "nulang_commit_transition payload out of bounds (off={payload_ptr}, len={payload_len})"
+            ))
+        })?;
+        data.get(start..end)
+            .ok_or_else(|| {
+                Error::msg(format!(
+                    "nulang_commit_transition payload out of bounds (off={payload_ptr}, len={payload_len})"
+                ))
+            })?
+            .to_vec()
+    };
+    *caller.data().last_durable_commit.lock() = Some(payload);
+
+    const RESULT_RING_SIZE: usize = 0x1000;
+    if result.len() > RESULT_RING_SIZE {
+        return Err(Error::msg(format!(
+            "nulang_commit_transition result too large: {} > {}",
+            result.len(),
+            RESULT_RING_SIZE
+        )));
+    }
+
+    if !result.is_empty() {
+        let base = crate::mir_wasm::RING_BUFFER_BASE as usize;
+        let mem = get_memory(&mut caller)?;
+        let data = mem.data_mut(&mut caller);
+        let end = base.checked_add(result.len()).ok_or_else(|| {
+            Error::msg("nulang_commit_transition result ring overflow")
+        })?;
+        let target = data.get_mut(base..end).ok_or_else(|| {
+            Error::msg("nulang_commit_transition result ring out of bounds")
+        })?;
+        target.copy_from_slice(&result);
+    }
+
+    Ok(result.len() as i64)
+}
+
 /// Decode one tagged Nulang value (as produced by the WASM backend) into a
 /// plain JSON value. `TAG_STRING` payload is an offset into `data` addressing
 /// NUL-terminated UTF-8; out-of-bounds or unterminated → null. Untransferable
@@ -1034,6 +1141,13 @@ pub fn load_precompiled(cwasm_bytes: &[u8]) -> NuResult<WasmRuntime> {
         .func_wrap("env", "nulang_dispatch_args", host_dispatch_args)
         .map_err(map_wasmtime_err)?;
     linker
+        .func_wrap(
+            "env",
+            "nulang_commit_transition",
+            host_commit_transition,
+        )
+        .map_err(map_wasmtime_err)?;
+    linker
         .func_wrap("env", "log", host_log)
         .map_err(map_wasmtime_err)?;
     linker
@@ -1045,6 +1159,7 @@ pub fn load_precompiled(cwasm_bytes: &[u8]) -> NuResult<WasmRuntime> {
 
     let mem_type = MemoryType::new(1, None);
     let memory = Memory::new(&mut store, mem_type).map_err(map_wasmtime_err)?;
+    store.data_mut().memory = Some(memory);
     linker
         .define(&mut store, "env", "memory", memory)
         .map_err(map_wasmtime_err)?;
@@ -1143,6 +1258,148 @@ mod tests {
         let engine = Engine::new(&config).unwrap();
         let result = Module::new(&engine, &[] as &[u8]);
         assert!(result.is_err(), "empty bytes should fail to parse");
+    }
+
+    #[test]
+    fn test_durable_commit_host_abi_round_trips_request_and_result() {
+        const REQUEST: &str = r#"{"protocol":"nulang-durable-transition/v0alpha1","sequence":"1"}"#;
+        let wasm = format!(
+            r#"(module
+                (import "env" "memory" (memory 1))
+                (import "env" "nulang_commit_transition"
+                    (func $commit (param i32 i32) (result i64)))
+                (data (i32.const 8192) "{request}")
+                (func $start (result i64)
+                    i32.const 8192
+                    i32.const {request_len}
+                    call $commit
+                    drop
+                    i64.const 0x7ffb000000000000
+                    i32.const 4096
+                    i64.load8_u
+                    i64.or)
+                (export "nulang_init" (func $start))
+            )"#,
+            request = REQUEST.replace('"', r#"\""#),
+            request_len = REQUEST.len(),
+        );
+
+        let mut runtime = WasmRuntime::new(wasm.as_bytes(), None).unwrap();
+        runtime.set_durable_commit_result(Some(vec![42]));
+        let result = runtime.run().unwrap();
+
+        assert_eq!(result.as_int(), Some(42));
+        assert_eq!(
+            runtime.take_last_durable_commit(),
+            Some(REQUEST.as_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn test_durable_commit_host_abi_fails_closed_without_handler() {
+        let wasm = br#"(module
+            (import "env" "memory" (memory 1))
+            (import "env" "nulang_commit_transition"
+                (func $commit (param i32 i32) (result i64)))
+            (data (i32.const 8192) "{}")
+            (func $start (result i64)
+                i32.const 8192
+                i32.const 2
+                call $commit
+                drop
+                i64.const 0x7ff8000000000000)
+            (export "nulang_init" (func $start))
+        )"#;
+
+        let mut runtime = WasmRuntime::new(wasm, None).unwrap();
+        let error = runtime
+            .run()
+            .expect_err("durable commit must fail closed without a registered handler");
+        assert!(
+            error.to_string().contains("no durable commit handler"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_precompiled_durable_commit_host_abi_uses_host_memory() {
+        let wasm = br#"(module
+            (import "env" "memory" (memory 1))
+            (import "env" "nulang_commit_transition"
+                (func $commit (param i32 i32) (result i64)))
+            (data (i32.const 8192) "{}")
+            (func $start (result i64)
+                i32.const 8192
+                i32.const 2
+                call $commit
+                drop
+                i64.const 0x7ff8000000000000)
+            (export "nulang_init" (func $start))
+        )"#;
+
+        let engine = Engine::new(&default_wasm_config()).unwrap();
+        let cwasm = engine.precompile_module(wasm).unwrap();
+        let mut runtime = load_precompiled(&cwasm).unwrap();
+        runtime.set_durable_commit_result(Some(vec![1]));
+        runtime.run().unwrap();
+
+        assert_eq!(
+            runtime.take_last_durable_commit(),
+            Some(b"{}".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_durable_commit_host_abi_rejects_oversized_result() {
+        let wasm = br#"(module
+            (import "env" "memory" (memory 1))
+            (import "env" "nulang_commit_transition"
+                (func $commit (param i32 i32) (result i64)))
+            (data (i32.const 8192) "{}")
+            (func $start (result i64)
+                i32.const 8192
+                i32.const 2
+                call $commit
+                drop
+                i64.const 0x7ff8000000000000)
+            (export "nulang_init" (func $start))
+        )"#;
+
+        let mut runtime = WasmRuntime::new(wasm, None).unwrap();
+        runtime.set_durable_commit_result(Some(vec![0; 0x1001]));
+        let error = runtime
+            .run()
+            .expect_err("durable commit must trap instead of truncating its result");
+        assert!(
+            error.to_string().contains("result too large"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_durable_commit_host_abi_rejects_out_of_bounds_payload() {
+        let wasm = br#"(module
+            (import "env" "memory" (memory 1))
+            (import "env" "nulang_commit_transition"
+                (func $commit (param i32 i32) (result i64)))
+            (func $start (result i64)
+                i32.const 65530
+                i32.const 32
+                call $commit
+                drop
+                i64.const 0x7ff8000000000000)
+            (export "nulang_init" (func $start))
+        )"#;
+
+        let mut runtime = WasmRuntime::new(wasm, None).unwrap();
+        runtime.set_durable_commit_result(Some(vec![1]));
+        let error = runtime
+            .run()
+            .expect_err("durable commit must trap on invalid guest memory");
+        assert!(
+            error.to_string().contains("payload out of bounds"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
