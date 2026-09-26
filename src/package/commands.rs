@@ -2203,6 +2203,13 @@ fn cmd_deploy(
     let name = manifest.package.name.clone();
     let version = manifest.package.version.clone();
 
+    // Managed package deployment is intentionally fail-closed until Nulang Cloud's
+    // dedicated versioned package-ingress contract is live. The historical client
+    // sends a gzip package archive, while the legacy /api/v1/deploy surface accepts
+    // JSON source/WASM requests; sending the archive there can never be a trustworthy
+    // deployment path. Keep --dry-run useful for inspecting the local envelope.
+    ensure_managed_package_deploy_available(dry_run)?;
+
     // Build the web output so dist/ contains the IR and static assets.
     cmd_build_web()?;
 
@@ -2399,6 +2406,26 @@ fn cmd_deploy(
 
     println!("Deployed! -> {} ({})", deploy.url, deploy.status);
     Ok(())
+}
+
+#[cfg(feature = "ureq")]
+fn ensure_managed_package_deploy_available(dry_run: bool) -> NuResult<()> {
+    if dry_run {
+        return Ok(());
+    }
+
+    Err(NuError::PackageError {
+        msg: concat!(
+            "Managed Nulang Cloud package deployment is temporarily unavailable while ",
+            "the canonical versioned package-ingress contract is being qualified. ",
+            "The legacy /api/v1/deploy endpoint accepts JSON and is incompatible with ",
+            "the package archive produced by this command. Use `nulang nula deploy ",
+            "--dry-run` to inspect the package locally; Cloud cutover is tracked by ",
+            "Nulang Cloud issue #471."
+        )
+        .to_string(),
+        span: Span::default(),
+    })
 }
 
 /// `nula deploy` — disabled without the `ureq` feature.
@@ -2990,9 +3017,9 @@ mod tests {
     }
     #[cfg(feature = "ureq")]
     #[test]
-    fn test_cmd_deploy_missing_token() {
+    fn test_cmd_deploy_fails_closed_before_token_validation() {
         let dir =
-            std::env::temp_dir().join(format!("nulang_deploy_token_test_{}", std::process::id()));
+            std::env::temp_dir().join(format!("nulang_deploy_gate_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _guard = ChangeDir::new(&dir);
@@ -3006,11 +3033,14 @@ mod tests {
             crate::web::adapters::AdapterKind::NulangCloud,
             false,
         );
-        assert!(result.is_err(), "deploy without token should fail");
+        assert!(result.is_err(), "managed deploy must fail while ingress is unqualified");
         if let Err(NuError::PackageError { msg, .. }) = result {
             assert!(
-                msg.contains("NULANG_CLOUD_TOKEN") || msg.contains("--token"),
-                "error should mention token: {}",
+                msg.contains("temporarily unavailable")
+                    && msg.contains("/api/v1/deploy")
+                    && msg.contains("--dry-run")
+                    && msg.contains("#471"),
+                "error should explain the qualification gate before auth validation: {}",
                 msg
             );
         }
@@ -3137,6 +3167,20 @@ app "counter" {
         assert!(ir.contains("routes"), "IR should contain routes");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "ureq")]
+    #[test]
+    fn test_managed_package_deploy_fails_closed_until_package_ingress_cutover() {
+        assert!(ensure_managed_package_deploy_available(true).is_ok());
+
+        let err = ensure_managed_package_deploy_available(false)
+            .expect_err("real managed deploy must fail closed before package-ingress cutover");
+        let msg = err.to_string();
+        assert!(msg.contains("temporarily unavailable"));
+        assert!(msg.contains("/api/v1/deploy"));
+        assert!(msg.contains("--dry-run"));
+        assert!(msg.contains("#471"));
     }
 
     #[test]
