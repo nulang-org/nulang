@@ -32,7 +32,7 @@ use std::time::Duration;
 /// ```text
 /// <data-dir>/
 ///   <name>/
-///     <version>.tar.gz
+///     <version>.tar.gz | <version>.tar.zst
 /// ```
 ///
 /// The listener handle lives behind a `Mutex` so that `start(&self)` and
@@ -218,7 +218,7 @@ impl RegistryServer {
                     Self::write_response(stream, 401, "text/plain", b"Unauthorized");
                     return;
                 }
-                Self::handle_put(stream, data_dir, name, version, body);
+                Self::handle_put(stream, data_dir, name, version, headers, body);
             }
             ("GET", Some(version)) => Self::handle_get_tarball(stream, data_dir, name, version),
             ("GET", None) => Self::handle_list_versions(stream, data_dir, name),
@@ -226,33 +226,53 @@ impl RegistryServer {
         }
     }
 
-    /// PUT /api/v1/packages/<name>/<version> — store a tarball.
-    fn handle_put(stream: &mut TcpStream, data_dir: &Path, name: &str, version: &str, body: &[u8]) {
+    /// PUT /api/v1/packages/<name>/<version> — store an immutable package archive.
+    fn handle_put(
+        stream: &mut TcpStream,
+        data_dir: &Path,
+        name: &str,
+        version: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) {
         let dir = data_dir.join(name);
-        let file = dir.join(format!("{}.tar.gz", version));
-        if file.exists() {
+        if PACKAGE_ARCHIVE_EXTENSIONS
+            .iter()
+            .any(|extension| dir.join(format!("{version}{extension}")).exists())
+        {
             Self::write_response(stream, 409, "text/plain", b"Version already exists");
             return;
         }
-        if let Err(_) = std::fs::create_dir_all(&dir) {
+        if std::fs::create_dir_all(&dir).is_err() {
             Self::write_response(stream, 500, "text/plain", b"Internal server error");
             return;
         }
+
+        let extension = archive_extension_for_headers(headers);
+        let file = dir.join(format!("{version}{extension}"));
         match std::fs::write(&file, body) {
             Ok(()) => Self::write_response(stream, 201, "text/plain", b"Created"),
             Err(_) => Self::write_response(stream, 500, "text/plain", b"Internal server error"),
         }
     }
 
-    /// GET /api/v1/packages/<name>/<version> — return the stored tarball.
+    /// GET /api/v1/packages/<name>/<version> — return zstd when present,
+    /// otherwise fall back to the historical gzip archive.
     fn handle_get_tarball(stream: &mut TcpStream, data_dir: &Path, name: &str, version: &str) {
-        let file = data_dir.join(name).join(format!("{}.tar.gz", version));
-        match std::fs::read(&file) {
-            Ok(bytes) => {
-                Self::write_response(stream, 200, "application/octet-stream", &bytes);
+        let dir = data_dir.join(name);
+        for extension in PACKAGE_ARCHIVE_EXTENSIONS {
+            let file = dir.join(format!("{version}{extension}"));
+            if let Ok(bytes) = std::fs::read(&file) {
+                let content_type = if extension == ".tar.zst" {
+                    "application/zstd"
+                } else {
+                    "application/gzip"
+                };
+                Self::write_response(stream, 200, content_type, &bytes);
+                return;
             }
-            Err(_) => Self::write_response(stream, 404, "text/plain", b"Not found"),
         }
+        Self::write_response(stream, 404, "text/plain", b"Not found");
     }
 
     /// GET /api/v1/packages/<name> — list published versions as JSON.
@@ -266,12 +286,13 @@ impl RegistryServer {
             }
         };
         let mut versions: Vec<String> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-            .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|f| f.ends_with(".tar.gz"))
-            .map(|f| f.trim_end_matches(".tar.gz").to_string())
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().map(|kind| kind.is_file()).unwrap_or(false))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter_map(|filename| archive_version_from_filename(&filename).map(str::to_owned))
             .collect();
+        versions.sort();
+        versions.dedup();
         sort_versions(&mut versions);
         let payload = serde_json::json!({ "name": name, "versions": versions });
         let body = payload.to_string();
@@ -309,6 +330,29 @@ impl Drop for RegistryServer {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+const PACKAGE_ARCHIVE_EXTENSIONS: [&str; 2] = [".tar.zst", ".tar.gz"];
+
+#[cfg(feature = "tcp")]
+fn archive_extension_for_headers(headers: &[(String, String)]) -> &'static str {
+    let content_type = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.split(';').next().unwrap_or(value).trim().to_ascii_lowercase());
+
+    if content_type.as_deref() == Some("application/zstd") {
+        ".tar.zst"
+    } else {
+        ".tar.gz"
+    }
+}
+
+#[cfg(feature = "tcp")]
+fn archive_version_from_filename(filename: &str) -> Option<&str> {
+    PACKAGE_ARCHIVE_EXTENSIONS
+        .iter()
+        .find_map(|extension| filename.strip_suffix(extension))
 }
 
 /// Validate a package name/version path segment: rejects empty segments,
