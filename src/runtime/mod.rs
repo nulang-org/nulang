@@ -30,6 +30,7 @@ pub use heap_serialize::*;
 mod cluster;
 mod distributed;
 mod distributed_context;
+pub(crate) mod durable_wire;
 mod fabric_stream;
 mod fabric_stream_cluster;
 mod fabric_stream_epoch;
