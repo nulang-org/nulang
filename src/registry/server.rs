@@ -158,13 +158,31 @@ impl RegistryServer {
         };
 
         // Read the remainder of the body according to Content-Length.
-        let content_length: usize = headers
+        let content_length_header = headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-            .and_then(|(_, v)| v.parse().ok())
-            .unwrap_or(0);
+            .map(|(_, v)| v.as_str());
+        if method == "PUT" && content_length_header.is_none() {
+            Self::write_response(&mut stream, 411, "text/plain", b"Length required");
+            return;
+        }
+        let content_length = match content_length_header {
+            Some(value) => match value.parse::<usize>() {
+                Ok(value) => value,
+                Err(_) => {
+                    Self::write_response(&mut stream, 400, "text/plain", b"Bad request");
+                    return;
+                }
+            },
+            None => 0,
+        };
+        if content_length > Self::MAX_BODY_SIZE {
+            Self::write_response(&mut stream, 413, "text/plain", b"Payload too large");
+            return;
+        }
+
         let mut body = head[body_offset..].to_vec();
-        while body.len() < content_length.min(Self::MAX_BODY_SIZE) {
+        while body.len() < content_length {
             let mut chunk = [0u8; 4096];
             match stream.read(&mut chunk) {
                 Ok(0) => break,
@@ -172,10 +190,11 @@ impl RegistryServer {
                 Err(_) => break,
             }
         }
-        if content_length > Self::MAX_BODY_SIZE {
-            Self::write_response(&mut stream, 413, "text/plain", b"Payload too large");
+        if body.len() < content_length {
+            Self::write_response(&mut stream, 400, "text/plain", b"Truncated request body");
             return;
         }
+        body.truncate(content_length);
 
         Self::dispatch(
             &mut stream,
@@ -235,24 +254,65 @@ impl RegistryServer {
         headers: &[(String, String)],
         body: &[u8],
     ) {
+        let extension = match archive_extension_for_upload(headers, body) {
+            Ok(extension) => extension,
+            Err(message) => {
+                Self::write_response(stream, 415, "text/plain", message.as_bytes());
+                return;
+            }
+        };
+
         let dir = data_dir.join(name);
-        if PACKAGE_ARCHIVE_EXTENSIONS
-            .iter()
-            .any(|extension| dir.join(format!("{version}{extension}")).exists())
-        {
-            Self::write_response(stream, 409, "text/plain", b"Version already exists");
-            return;
-        }
         if std::fs::create_dir_all(&dir).is_err() {
             Self::write_response(stream, 500, "text/plain", b"Internal server error");
             return;
         }
 
-        let extension = archive_extension_for_headers(headers);
+        let reservation = match reserve_package_version(&dir, version) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Self::write_response(stream, 409, "text/plain", b"Version already exists");
+                return;
+            }
+            Err(_) => {
+                Self::write_response(stream, 500, "text/plain", b"Internal server error");
+                return;
+            }
+        };
+
+        if PACKAGE_ARCHIVE_EXTENSIONS
+            .iter()
+            .any(|archive_extension| {
+                dir.join(format!("{version}{archive_extension}")).exists()
+            })
+        {
+            drop(reservation);
+            Self::write_response(stream, 409, "text/plain", b"Version already exists");
+            return;
+        }
+
         let file = dir.join(format!("{version}{extension}"));
-        match std::fs::write(&file, body) {
-            Ok(()) => Self::write_response(stream, 201, "text/plain", b"Created"),
-            Err(_) => Self::write_response(stream, 500, "text/plain", b"Internal server error"),
+        let write_result = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file)
+            .and_then(|mut output| output.write_all(body));
+
+        match write_result {
+            Ok(()) => {
+                drop(reservation);
+                Self::write_response(stream, 201, "text/plain", b"Created");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                drop(reservation);
+                Self::write_response(stream, 409, "text/plain", b"Version already exists");
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&file);
+                let _ = std::fs::remove_file(version_lock_path(&dir, version));
+                drop(reservation);
+                Self::write_response(stream, 500, "text/plain", b"Internal server error");
+            }
         }
     }
 
@@ -308,7 +368,9 @@ impl RegistryServer {
             404 => "Not Found",
             405 => "Method Not Allowed",
             409 => "Conflict",
+            411 => "Length Required",
             413 => "Payload Too Large",
+            415 => "Unsupported Media Type",
             500 => "Internal Server Error",
             _ => "Unknown",
         };
@@ -335,17 +397,52 @@ impl Drop for RegistryServer {
 const PACKAGE_ARCHIVE_EXTENSIONS: [&str; 2] = [".tar.zst", ".tar.gz"];
 
 #[cfg(feature = "tcp")]
-fn archive_extension_for_headers(headers: &[(String, String)]) -> &'static str {
+fn archive_extension_for_upload(
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<&'static str, &'static str> {
+    use crate::package::archive::{detect_archive_compression, ArchiveCompression};
+
     let content_type = headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-        .map(|(_, value)| value.split(';').next().unwrap_or(value).trim().to_ascii_lowercase());
+        .map(|(_, value)| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or(value)
+                .trim()
+                .to_ascii_lowercase()
+        });
 
-    if content_type.as_deref() == Some("application/zstd") {
-        ".tar.zst"
-    } else {
-        ".tar.gz"
+    let expected = match content_type.as_deref() {
+        None | Some("application/gzip") => ArchiveCompression::Gzip,
+        Some("application/zstd") => ArchiveCompression::Zstd,
+        Some(_) => return Err("Unsupported package archive content type"),
+    };
+
+    let actual = detect_archive_compression(body).ok_or("Unknown package archive compression")?;
+    if actual != expected {
+        return Err("Package archive content type does not match payload");
     }
+
+    Ok(expected.extension())
+}
+
+#[cfg(feature = "tcp")]
+const PACKAGE_VERSION_LOCK_SUFFIX: &str = ".publish.lock";
+
+#[cfg(feature = "tcp")]
+fn version_lock_path(dir: &Path, version: &str) -> PathBuf {
+    dir.join(format!("{version}{PACKAGE_VERSION_LOCK_SUFFIX}"))
+}
+
+#[cfg(feature = "tcp")]
+fn reserve_package_version(dir: &Path, version: &str) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(version_lock_path(dir, version))
 }
 
 #[cfg(feature = "tcp")]
@@ -425,9 +522,18 @@ mod tests {
         let gzip = vec![("content-type".to_string(), "application/gzip".to_string())];
         let absent = Vec::new();
 
-        assert_eq!(archive_extension_for_headers(&zstd), ".tar.zst");
-        assert_eq!(archive_extension_for_headers(&gzip), ".tar.gz");
-        assert_eq!(archive_extension_for_headers(&absent), ".tar.gz");
+        assert_eq!(
+            archive_extension_for_upload(&zstd, &[0x28, 0xb5, 0x2f, 0xfd]).unwrap(),
+            ".tar.zst"
+        );
+        assert_eq!(
+            archive_extension_for_upload(&gzip, &[0x1f, 0x8b]).unwrap(),
+            ".tar.gz"
+        );
+        assert_eq!(
+            archive_extension_for_upload(&absent, &[0x1f, 0x8b]).unwrap(),
+            ".tar.gz"
+        );
     }
 
     #[test]
