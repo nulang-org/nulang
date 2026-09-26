@@ -282,9 +282,7 @@ impl RegistryServer {
 
         if PACKAGE_ARCHIVE_EXTENSIONS
             .iter()
-            .any(|archive_extension| {
-                dir.join(format!("{version}{archive_extension}")).exists()
-            })
+            .any(|archive_extension| dir.join(format!("{version}{archive_extension}")).exists())
         {
             drop(reservation);
             Self::write_response(stream, 409, "text/plain", b"Version already exists");
@@ -347,7 +345,12 @@ impl RegistryServer {
         };
         let mut versions: Vec<String> = entries
             .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_type().map(|kind| kind.is_file()).unwrap_or(false))
+            .filter(|entry| {
+                entry
+                    .file_type()
+                    .map(|kind| kind.is_file())
+                    .unwrap_or(false)
+            })
             .filter_map(|entry| entry.file_name().into_string().ok())
             .filter_map(|filename| archive_version_from_filename(&filename).map(str::to_owned))
             .collect();
@@ -581,7 +584,10 @@ mod tests {
     #[test]
     #[cfg(feature = "tcp")]
     fn test_archive_filename_parses_both_formats() {
-        assert_eq!(archive_version_from_filename("1.2.3.tar.zst"), Some("1.2.3"));
+        assert_eq!(
+            archive_version_from_filename("1.2.3.tar.zst"),
+            Some("1.2.3")
+        );
         assert_eq!(archive_version_from_filename("1.2.3.tar.gz"), Some("1.2.3"));
         assert_eq!(archive_version_from_filename("README.md"), None);
     }
