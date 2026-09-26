@@ -156,3 +156,17 @@ impl RegistryClient {
         }
     }
 }
+
+
+#[cfg(all(test, feature = "ureq"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_download_reader_rejects_oversize_body() {
+        let input = std::io::Cursor::new(vec![b'x'; 17]);
+        let error = read_body_limited(input, 16).unwrap_err();
+
+        assert!(error.contains("limit"));
+    }
+}
