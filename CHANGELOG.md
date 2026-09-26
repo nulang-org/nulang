@@ -1,5 +1,11 @@
 # Nulang Changelog
 
+### Thread-confined runtime callback bridges — 2026-09-26
+- **Runtime-owned VM callback bridges no longer override Rust's `Send`/`Sync` auto-traits.** `BytecodeRuntimeCallbacks` and `BytecodeDistributedCallbacks` keep their raw `Runtime` pointers scheduler-thread-confined instead of relying on handwritten unsafe cross-thread assertions.
+- **Raw callback construction is now an explicit unsafe boundary.** Both bridges use `unsafe fn from_raw` with non-null/live/exclusive-runtime contracts, and call sites document why the pointer is valid for the synchronous VM/native invocation.
+- **The implementation verifier pins the invariant.** CI rejects reintroduced unsafe `Send`/`Sync` impls for these callback types.
+
+
 ### Same-host A/B Cargo target isolation — 2026-09-25
 - **Base and candidate benchmark builds now use separate Cargo target directories.** The repository config points every checkout at one absolute target path; sharing it across the detached base worktree and candidate could reuse the base library artifact while compiling candidate integration tests, producing false build failures or invalid A/B binaries.
 - **The isolation applies to both prebuild and measured Cargo invocations.** Persistent per-variant target directories retain ordinary Cargo caching while preventing cross-variant artifact contamination.
