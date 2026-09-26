@@ -17,6 +17,21 @@ pub struct RegistryClient {
     token: Option<String>,
 }
 
+#[cfg(feature = "ureq")]
+fn read_body_limited(reader: impl Read, max_len: usize) -> Result<Vec<u8>, String> {
+    let max_plus_one = u64::try_from(max_len).unwrap_or(u64::MAX).saturating_add(1);
+    let mut limited = reader.take(max_plus_one);
+    let mut bytes = Vec::new();
+    limited.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.len() > max_len {
+        return Err(format!(
+            "package archive size {} exceeds limit {max_len}",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
 impl RegistryClient {
     pub fn new(registry_url: String, token: Option<String>) -> Self {
         RegistryClient {
@@ -30,24 +45,48 @@ impl RegistryClient {
         self.registry_url.trim_end_matches('/').to_string()
     }
 
-    /// Publish a tarball for `name@version`. Returns `Ok(())` on 201 Created;
-    /// a 409 Conflict (version already exists) or other failure is `Err`.
+    /// Publish a gzip tarball for `name@version`.
+    ///
+    /// Kept as the compatibility default for callers that do not negotiate an
+    /// archive format explicitly.
     pub fn publish(&self, name: &str, version: &str, tarball: &[u8]) -> Result<(), String> {
+        self.publish_archive(name, version, tarball, "application/gzip")
+    }
+
+    /// Publish an archive with an explicit media type.
+    ///
+    /// The registry uses the media type only to select its canonical storage
+    /// extension; package contents are still validated by consumers via magic
+    /// detection before extraction.
+    pub fn publish_archive(
+        &self,
+        name: &str,
+        version: &str,
+        archive: &[u8],
+        content_type: &str,
+    ) -> Result<(), String> {
         #[cfg(feature = "ureq")]
         {
             let url = format!("{}/api/v1/packages/{}/{}", self.base_url(), name, version);
-            let request = match &self.token {
-                Some(token) => ureq::put(&url).set("Authorization", &format!("Bearer {}", token)),
-                None => ureq::put(&url),
-            };
-            match request.send_bytes(tarball) {
+            let mut request = ureq::put(&url).set("Content-Type", content_type);
+            if let Some(token) = &self.token {
+                request = request.set("Authorization", &format!("Bearer {}", token));
+            }
+            match request.send_bytes(archive) {
                 Ok(_) => Ok(()),
                 Err(err) => Err(Self::describe_error(err)),
             }
         }
         #[cfg(not(feature = "ureq"))]
         {
-            let _ = (&self.registry_url, &self.token, name, version, tarball);
+            let _ = (
+                &self.registry_url,
+                &self.token,
+                name,
+                version,
+                archive,
+                content_type,
+            );
             Err("registry client disabled (feature 'ureq' not enabled)".to_string())
         }
     }
@@ -59,12 +98,21 @@ impl RegistryClient {
             let url = format!("{}/api/v1/packages/{}/{}", self.base_url(), name, version);
             match ureq::get(&url).call() {
                 Ok(response) => {
-                    let mut bytes = Vec::new();
-                    response
-                        .into_reader()
-                        .read_to_end(&mut bytes)
-                        .map_err(|e| e.to_string())?;
-                    Ok(bytes)
+                    if let Some(content_length) = response.header("Content-Length") {
+                        let declared = content_length.parse::<usize>().map_err(|_| {
+                            "invalid Content-Length from package registry".to_string()
+                        })?;
+                        if declared > crate::package::archive::DEFAULT_MAX_PACKAGE_ARCHIVE_SIZE {
+                            return Err(format!(
+                                "package archive size {declared} exceeds limit {}",
+                                crate::package::archive::DEFAULT_MAX_PACKAGE_ARCHIVE_SIZE
+                            ));
+                        }
+                    }
+                    read_body_limited(
+                        response.into_reader(),
+                        crate::package::archive::DEFAULT_MAX_PACKAGE_ARCHIVE_SIZE,
+                    )
                 }
                 Err(err) => Err(Self::describe_error(err)),
             }
@@ -130,5 +178,18 @@ impl RegistryClient {
             }
             other => other.to_string(),
         }
+    }
+}
+
+#[cfg(all(test, feature = "ureq"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_download_reader_rejects_oversize_body() {
+        let input = std::io::Cursor::new(vec![b'x'; 17]);
+        let error = read_body_limited(input, 16).unwrap_err();
+
+        assert!(error.contains("limit"));
     }
 }

@@ -204,6 +204,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
         Some("publish") => {
             let mut registry_url: Option<String> = None;
             let mut token: Option<String> = None;
+            let mut zstd = false;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -215,6 +216,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
                         i += 1;
                         if i < args.len() { token = Some(args[i].clone()); }
                     }
+                    "--zstd" => zstd = true,
                     other => {
                         return Err(NuError::PackageError {
                             msg: format!("unknown flag '{}' for nula publish", other),
@@ -224,7 +226,7 @@ pub fn run(args: &[String]) -> NuResult<()> {
                 }
                 i += 1;
             }
-            cmd_publish(registry_url, token)
+            cmd_publish(registry_url, token, zstd)
         }
 
         Some("deploy") => {
@@ -297,6 +299,7 @@ fn print_usage() {
     println!("  add   <name>  Add a dependency to Nulang.toml");
     println!("  remove <name> Remove a dependency from Nulang.toml");
     println!("  publish       Publish the package to a registry");
+    println!("                --zstd           Use a .tar.zst archive (gzip remains default)");
     println!("                --registry <url>  Registry URL (or set in Nulang.toml)");
     println!("                --token <token>   Auth token (or set NULA_TOKEN)");
     println!("  deploy        Build and deploy the package to Nulang Cloud");
@@ -2077,9 +2080,13 @@ fn cmd_doc(open: bool) -> NuResult<()> {
 
 /// Recursively remove .nbc files under `dir`.
 
-/// `nula publish [--registry <url>] [--token <token>]` — package and upload
-/// the current package to a registry.
-fn cmd_publish(registry_url: Option<String>, token: Option<String>) -> NuResult<()> {
+/// `nula publish [--registry <url>] [--token <token>] [--zstd]` — package and upload
+/// the current package to a registry. Gzip remains the compatibility default.
+fn cmd_publish(
+    registry_url: Option<String>,
+    token: Option<String>,
+    use_zstd: bool,
+) -> NuResult<()> {
     let root = package_root()?;
     let manifest_path = root.join(MANIFEST_FILE);
     if !manifest_path.exists() {
@@ -2112,20 +2119,19 @@ fn cmd_publish(registry_url: Option<String>, token: Option<String>) -> NuResult<
             span: Span::default(),
         })?;
 
-    // Build tarball of the package (Nulang.toml + src/ tree).
-    let mut tarball = Vec::new();
+    // Build a canonical uncompressed tar first, then apply the selected
+    // transport compression. Keeping tar construction separate makes install
+    // format detection independent of registry filenames.
+    let mut tar_bytes = Vec::new();
     {
-        let gz = flate2::write::GzEncoder::new(&mut tarball, flate2::Compression::default());
-        let mut ar = tar::Builder::new(gz);
+        let mut ar = tar::Builder::new(&mut tar_bytes);
 
-        // Add Nulang.toml
         ar.append_path_with_name(&manifest_path, "Nulang.toml")
             .map_err(|e| NuError::PackageError {
                 msg: format!("cannot package {}: {}", MANIFEST_FILE, e),
                 span: Span::default(),
             })?;
 
-        // Add src/ tree
         let src_dir = root.join("src");
         if src_dir.is_dir() {
             add_dir_to_tar(&mut ar, &src_dir, "src").map_err(|e| NuError::PackageError {
@@ -2134,7 +2140,6 @@ fn cmd_publish(registry_url: Option<String>, token: Option<String>) -> NuResult<
             })?;
         }
 
-        // Add tests/ if present
         let tests_dir = root.join("tests");
         if tests_dir.is_dir() {
             add_dir_to_tar(&mut ar, &tests_dir, "tests").map_err(|e| NuError::PackageError {
@@ -2143,23 +2148,37 @@ fn cmd_publish(registry_url: Option<String>, token: Option<String>) -> NuResult<
             })?;
         }
 
-        let gz = ar.into_inner().map_err(|e| NuError::PackageError {
-            msg: format!("cannot finish tarball: {}", e),
-            span: Span::default(),
-        })?;
-        gz.finish().map_err(|e| NuError::PackageError {
-            msg: format!("cannot compress tarball: {}", e),
+        ar.finish().map_err(|e| NuError::PackageError {
+            msg: format!("cannot finish package tar: {}", e),
             span: Span::default(),
         })?;
     }
 
+    let compression = if use_zstd {
+        crate::package::archive::ArchiveCompression::Zstd
+    } else {
+        crate::package::archive::ArchiveCompression::Gzip
+    };
+    let archive = crate::package::archive::compress_tar(&tar_bytes, compression).map_err(|e| {
+        NuError::PackageError {
+            msg: format!("cannot compress package archive: {}", e),
+            span: Span::default(),
+        }
+    })?;
+
     let name = &manifest.package.name;
     let version = &manifest.package.version;
-    eprintln!("Publishing {}-{} to {} ...", name, version, registry_url);
+    eprintln!(
+        "Publishing {}-{} to {} as {} ...",
+        name,
+        version,
+        registry_url,
+        compression.extension()
+    );
 
     let client = RegistryClient::new(registry_url, Some(token));
     client
-        .publish(name, version, &tarball)
+        .publish_archive(name, version, &archive, compression.content_type())
         .map_err(|e| NuError::PackageError {
             msg: format!("publish failed: {}", e),
             span: Span::default(),

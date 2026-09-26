@@ -10,6 +10,7 @@
 //! live in [`commands`] and are dispatched from `main.rs` when the first
 //! argument is `nula`.
 
+pub mod archive;
 pub mod commands;
 pub mod identity;
 mod identity_verify;
