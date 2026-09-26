@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Backend-neutral JIT compile telemetry — 2026-09-26
+- **JIT backends now expose aggregate Fast and Optimized compilation counts and compiler-only wall time through `JitCompileStats`.** The counters exclude interpreter warm-up and generated-code execution so tiering decisions can separate compile cost from runtime payoff.
+- **`VM::jit_compile_stats` exposes the telemetry without leaking Cranelift-specific APIs**, and the tier-promotion regression requires one Fast plus one Optimized compile across the tested promotion.
+- **A dedicated `nulang-jit-bench` runner reports interpreter-checked first-run/warm execution together with compiler-only deltas** for numeric, call-heavy, and branch-heavy workloads in human or JSONL form.
+- **This implementation targets the current split JIT prepare/execute backend contract directly**, rather than inheriting the stale direct-frame optimization stack.
+
 ### Warm JIT transition A/B controls — 2026-09-25
 - **The same-host A/B harness now includes warmed 100k-iteration JIT execution probes for a non-reentrant arithmetic loop and a call-heavy re-entrant control.** Both compile once before timing, assert interpreter-equivalent results, and require a real JIT region so register-transition optimizations can be measured on their actual hot path instead of inferred from unrelated actor enqueue benchmarks.
 - **The benchmark helper now shares frontend-to-bytecode compilation across JIT A/B probes,** keeping the crossover and warmed-execution fixtures on one compilation path without changing timed work.
