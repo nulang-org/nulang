@@ -304,7 +304,7 @@ pub fn parse_urlencoded(input: &[u8]) -> HashMap<String, String> {
             continue;
         }
         let (key, value) = part.split_once('=').unwrap_or((part, ""));
-        out.insert(percent_decode(key), percent_decode(value));
+        out.insert(percent_decode_form(key), percent_decode_form(value));
     }
     out
 }
@@ -319,11 +319,11 @@ pub fn parse_cookie_header(header: &str) -> HashMap<String, String> {
         .collect()
 }
 
-fn percent_decode(input: &str) -> String {
+pub(crate) fn percent_decode_form(input: &str) -> String {
     percent_decode_impl(input, true)
 }
 
-/// Path-segment decoding: identical to [`percent_decode`] except `+` is a
+/// Path-segment decoding: identical to [`percent_decode_form`] except `+` is a
 /// literal plus, not a space (RFC 3986; `+`-means-space is a query/form
 /// convention only).
 pub(crate) fn percent_decode_path(input: &str) -> String {
