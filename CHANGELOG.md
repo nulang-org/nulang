@@ -1,4 +1,11 @@
 # Nulang Changelog
+
+### Machine-readable value-layout semantic ABI — 2026-09-25
+- **Nulang now exports the canonical value-layout contract as deterministic machine-readable JSON.** `semantic_abi::value_layout_manifest()` derives its bit widths from `u64::BITS` and `TAG_SHIFT`, and the `nulang-semantic-abi` CLI emits the manifest for downstream compatibility checks.
+- **The manifest separates its JSON schema version from the frozen runtime `VALUE_LAYOUT_VERSION`.** Consumers can detect a representation change independently from an additive manifest-schema evolution.
+- **64-bit masks, tags, and canonical NaN bits are encoded as fixed-width hexadecimal strings.** This preserves exact bit patterns for JSON consumers such as JavaScript that cannot represent arbitrary `u64` integers exactly.
+- **The first ABI slice covers the full Core value layout, including `TAG_OBJECT`, and indexes existing versioned runtime contracts.** Authority, WIT world metadata, and typed-program semantic-schema export remain follow-up work under #1046.
+
 ### Actor A/B benchmark build diagnostics — 2026-09-25
 - **Failed base/candidate Cargo builds now preserve their captured compiler output in CI logs.** The same-host A/B harness re-emits combined stdout/stderr before raising, so build-stage failures no longer collapse into an opaque Python `CalledProcessError`; a focused Python regression test pins the behavior.
 
