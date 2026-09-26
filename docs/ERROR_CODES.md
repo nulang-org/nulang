@@ -108,8 +108,12 @@ by `render_warning`/`format_warning` (src/diagnostic.rs) with a
 |---------|-------------------------------------------|--------------------------|
 | `W0101` | Deprecated `catch` expression (all forms) | `match` on `Ok`/`Error`, `?` under `T ! E` (RFC 0015) |
 | `W0102` | Deprecated `fail` expression              | `return Error(...)` under `T ! E` (RFC 0015) |
+| `W0201` | Provably non-exhaustive finite-domain `match` | Add arms for the reported missing witnesses |
+| `W0202` | Provably redundant/unreachable finite-domain match arm | Remove, move, or refine the reported arm(s) |
 
-`W0201`/`W0202` are conservative semantic warnings: currently the analyzer proves coverage only for top-level declared variants and `Bool`, and guarded arms never count toward exhaustiveness. `--deny-warnings` enables strict enforcement without changing default runtime semantics.\n\nSee `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
+`W0201`/`W0202` are conservative semantic warnings: currently the analyzer proves coverage only for top-level declared variants and `Bool`, and guarded arms never count toward exhaustiveness. `--deny-warnings` enables strict enforcement without changing default runtime semantics.
+
+See `docs/MIGRATION_RFC_0015.md` for the `catch`/`fail` migration guide.
 
 ## Output modes
 
