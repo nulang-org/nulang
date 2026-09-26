@@ -74,10 +74,21 @@ pub struct FabricConsumerDelivery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricStreamRetentionReport {
+    pub requested_first_sequence: u64,
+    pub effective_first_sequence: u64,
+    pub deleted_segments: usize,
+    pub deleted_records: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FabricStreamInfo {
     pub name: String,
     pub segment_max_bytes: u64,
     pub segment_count: usize,
+    /// Oldest sequence still retained locally. When this equals
+    /// `next_sequence`, the retained log is currently empty.
+    pub first_sequence: u64,
     pub next_sequence: u64,
     pub last_sequence: Option<u64>,
     /// Highest sequence known committed by the stream's replication policy.
@@ -95,6 +106,12 @@ struct StreamMetadata {
 struct CursorFile {
     version: u16,
     cursors: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RetentionFile {
+    version: u16,
+    first_sequence: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,6 +262,15 @@ impl Default for CursorFile {
     }
 }
 
+impl Default for RetentionFile {
+    fn default() -> Self {
+        Self {
+            version: STREAM_FORMAT_VERSION,
+            first_sequence: 1,
+        }
+    }
+}
+
 impl Default for ConsumerDeliveryFile {
     fn default() -> Self {
         Self {
@@ -257,6 +283,7 @@ impl Default for ConsumerDeliveryFile {
 #[derive(Debug, Clone)]
 struct StreamState {
     config: FabricStreamConfig,
+    first_sequence: u64,
     next_sequence: u64,
     current_segment_base: u64,
     current_segment_len: u64,
@@ -311,6 +338,7 @@ impl FileFabricStreamStore {
             name.to_string(),
             StreamState {
                 config,
+                first_sequence: 1,
                 next_sequence: 1,
                 current_segment_base: 1,
                 current_segment_len: 0,
@@ -345,13 +373,17 @@ impl FileFabricStreamStore {
             .states
             .get(name)
             .expect("stream state must exist after ensure_state");
-        let segment_count = list_segments(&self.stream_dir(name))?.len();
+        let segment_count = list_segments(&self.stream_dir(name))?
+            .into_iter()
+            .filter(|(base, _)| *base >= state.first_sequence)
+            .count();
         let committed_sequence =
             read_commit(&self.stream_dir(name).join("commit.json"))?.committed_sequence;
         Ok(FabricStreamInfo {
             name: name.to_string(),
             segment_max_bytes: state.config.segment_max_bytes,
             segment_count,
+            first_sequence: state.first_sequence,
             next_sequence: state.next_sequence,
             last_sequence: state.next_sequence.checked_sub(1).filter(|&seq| seq > 0),
             committed_sequence,
@@ -381,11 +413,21 @@ impl FileFabricStreamStore {
         payload: &[u8],
     ) -> io::Result<bool> {
         self.ensure_state(name)?;
-        let next_sequence = self
+        let state = self
             .states
             .get(name)
-            .expect("stream state must exist after ensure_state")
-            .next_sequence;
+            .expect("stream state must exist after ensure_state");
+        let first_sequence = state.first_sequence;
+        let next_sequence = state.next_sequence;
+
+        if sequence < first_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Fabric replica sequence {sequence} is below retained floor {first_sequence}"
+                ),
+            ));
+        }
 
         if sequence < next_sequence {
             let existing = self.read_from(name, sequence, 1)?;
@@ -515,8 +557,18 @@ impl FileFabricStreamStore {
             return Ok(Vec::new());
         }
 
+        let first_sequence = self
+            .states
+            .get(name)
+            .expect("stream state must exist after ensure_state")
+            .first_sequence;
+        let start_sequence = start_sequence.max(first_sequence);
+
         let mut result = Vec::with_capacity(limit.min(256));
         for (base, path) in list_segments(&self.stream_dir(name))? {
+            if base < first_sequence {
+                continue;
+            }
             let records = decode_segment(&path, base, false)?;
             for record in records {
                 if record.sequence < start_sequence {
@@ -1689,10 +1741,15 @@ fn recover_stream(dir: &Path) -> io::Result<StreamState> {
         ));
     }
     let config = metadata.config.validate()?;
+    let retention = read_retention(&dir.join("retention.json"))?;
+    let first_sequence = retention.first_sequence;
 
-    let segments = list_segments(dir)?;
-    let mut expected_sequence = 1_u64;
-    let mut current_segment_base = 1_u64;
+    let segments: Vec<_> = list_segments(dir)?
+        .into_iter()
+        .filter(|(base, _)| *base >= first_sequence)
+        .collect();
+    let mut expected_sequence = first_sequence;
+    let mut current_segment_base = first_sequence;
     let mut current_segment_len = 0_u64;
 
     for (index, (base, path)) in segments.iter().enumerate() {
@@ -1719,6 +1776,7 @@ fn recover_stream(dir: &Path) -> io::Result<StreamState> {
 
     Ok(StreamState {
         config,
+        first_sequence,
         next_sequence: expected_sequence,
         current_segment_base,
         current_segment_len,
@@ -2013,6 +2071,21 @@ fn read_replication(path: &Path) -> io::Result<ReplicationFile> {
         ));
     }
     Ok(replication)
+}
+
+fn read_retention(path: &Path) -> io::Result<RetentionFile> {
+    if !path.exists() {
+        return Ok(RetentionFile::default());
+    }
+    let bytes = fs::read(path)?;
+    let retention: RetentionFile = serde_json::from_slice(&bytes).map_err(json_error)?;
+    if retention.version != STREAM_FORMAT_VERSION || retention.first_sequence == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid durable Fabric retention state",
+        ));
+    }
+    Ok(retention)
 }
 
 fn read_commit(path: &Path) -> io::Result<CommitFile> {
