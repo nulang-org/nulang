@@ -121,13 +121,14 @@ impl NativeFunction {
         library: Option<String>,
         symbol: String,
     ) -> Self {
-        assert!(!ptr.is_null(), "NativeFunction requires a non-null function pointer");
+        assert!(
+            !ptr.is_null(),
+            "NativeFunction requires a non-null function pointer"
+        );
         // SAFETY: guaranteed by this constructor's contract. Nulang's supported
         // native FFI targets use the platform C ABI where a dynamic-loader
         // symbol address can be represented as a C function pointer.
-        let code = unsafe {
-            std::mem::transmute::<*const c_void, unsafe extern "C" fn()>(ptr)
-        };
+        let code = unsafe { std::mem::transmute::<*const c_void, unsafe extern "C" fn()>(ptr) };
         Self {
             code,
             signature,
