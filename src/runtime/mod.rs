@@ -237,6 +237,69 @@ fn actor_exit_reason(value: Option<&Value>, constants: &[crate::bytecode::Consta
 // Cross-shard message type for multi-threaded scheduler
 // ---------------------------------------------------------------------------
 
+/// RAII ownership for ObjectRefs while a cross-shard envelope is in flight.
+///
+/// The source acquires these refs before publishing the message. On successful
+/// destination mailbox admission they are transferred into the receiving
+/// actor's lifetime hold set. Any send, resolution, hydration, or admission
+/// failure drops the lease and rolls the temporary refs back automatically.
+#[derive(Debug)]
+struct ObjectRefLease {
+    store: ObjectStore,
+    ids: Vec<ObjectId>,
+}
+
+impl ObjectRefLease {
+    fn acquire(store: &ObjectStore, payload: &[Value]) -> Option<Self> {
+        let mut seen = HashSet::new();
+        let mut ids = Vec::new();
+
+        for id in payload.iter().filter_map(|value| value.as_object_id()) {
+            if !seen.insert(id) {
+                continue;
+            }
+            if !store.clone_ref(id) {
+                for acquired in ids.drain(..) {
+                    store.drop_ref(acquired);
+                }
+                return None;
+            }
+            ids.push(id);
+        }
+
+        Some(Self {
+            store: store.clone(),
+            ids,
+        })
+    }
+
+    fn transfer_to_actor(mut self, actor: &mut Actor) {
+        if self.ids.is_empty() {
+            return;
+        }
+
+        if actor.held_object_store.is_none() {
+            actor.held_object_store = Some(self.store.clone());
+        }
+
+        for id in self.ids.drain(..) {
+            if !actor.held_objects.insert(id) {
+                // The actor already owns a lifetime hold for this ObjectId.
+                // Drop the redundant in-flight reference.
+                self.store.drop_ref(id);
+            }
+        }
+    }
+}
+
+impl Drop for ObjectRefLease {
+    fn drop(&mut self) {
+        for id in self.ids.drain(..) {
+            self.store.drop_ref(id);
+        }
+    }
+}
+
 /// A message routed between Runtime shards in a multi-threaded deployment.
 ///
 /// Each shard owns a disjoint subset of actors (by `actor_id % shard_count`).
@@ -255,6 +318,7 @@ enum CrossShardMsg {
         sender: u64,
         trace_id: Option<String>,
         grain_id: Option<GrainId>,
+        object_holds: ObjectRefLease,
     },
     /// Name-based delivery to an actor owned by another shard. The owning
     /// shard resolves the name against the target actor's behavior table;
@@ -265,6 +329,7 @@ enum CrossShardMsg {
         payload: Vec<Value>,
         sender: u64,
         trace_id: Option<String>,
+        object_holds: ObjectRefLease,
     },
     /// Enqueue an actor on the target shard (wake from idle/waiting).
     EnqueueActor {
@@ -1329,6 +1394,7 @@ impl Runtime {
         sender: u64,
         trace_id: Option<String>,
         grain_id: Option<GrainId>,
+        object_holds: ObjectRefLease,
     ) {
         // If the target is a known grain identity but not currently resident,
         // hydrate it before delivering the message. The `grain_id` carried on
@@ -1358,11 +1424,9 @@ impl Runtime {
             }
         }
 
-        let admitted_payload = MessagePayload::from_vec(payload);
-        let hold_payload = admitted_payload.clone();
         let msg = Message {
             behavior_id,
-            payload: admitted_payload,
+            payload: MessagePayload::from_vec(payload),
             sender,
             priority: MessagePriority::Normal,
             trace_id: trace_id.clone(),
@@ -1396,7 +1460,9 @@ impl Runtime {
             );
         }
         if admitted {
-            self.hold_object_refs(target_id, &hold_payload);
+            if let Some(actor) = self.actors.get_mut(&target_id) {
+                object_holds.transfer_to_actor(actor);
+            }
             self.enqueue_actor(target_id);
         }
         // Wake an actor suspended in a timed selective receive (same as
@@ -1441,6 +1507,7 @@ impl Runtime {
                     sender,
                     trace_id,
                     grain_id,
+                    object_holds,
                 } => {
                     self.deliver_cross_shard_message(
                         target_id,
@@ -1449,6 +1516,7 @@ impl Runtime {
                         sender,
                         trace_id,
                         grain_id,
+                        object_holds,
                     );
                 }
                 CrossShardMsg::DeliverNamedMessage {
@@ -1457,6 +1525,7 @@ impl Runtime {
                     payload,
                     sender,
                     trace_id,
+                    object_holds,
                 } => {
                     let Some(behavior_id) =
                         self.behavior_id_for_delivery(target_id, &behavior_name)
@@ -1474,6 +1543,7 @@ impl Runtime {
                         sender,
                         trace_id,
                         None,
+                        object_holds,
                     );
                 }
                 CrossShardMsg::EnqueueActor {
@@ -2109,6 +2179,13 @@ impl Runtime {
                 return MessageAdmission::Rejected;
             }
         }
+        let Some(object_holds) = ObjectRefLease::acquire(&self.object_store, &args) else {
+            warn!(
+                "nulang-shard: rejecting cross-shard message to actor {}: object ref not found",
+                target_id
+            );
+            return MessageAdmission::Rejected;
+        };
         let tx = self.cross_shard_tx.as_ref().unwrap();
         let result = tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessage {
             target_id,
@@ -2117,6 +2194,7 @@ impl Runtime {
             sender: self.current_actor.unwrap_or(0),
             trace_id: out_trace,
             grain_id,
+            object_holds,
         });
 
         match result {
@@ -2162,6 +2240,13 @@ impl Runtime {
             }
         }
 
+        let Some(object_holds) = ObjectRefLease::acquire(&self.object_store, &args) else {
+            warn!(
+                "nulang-shard: rejecting named cross-shard message to actor {}: object ref not found",
+                target_id
+            );
+            return MessageAdmission::Rejected;
+        };
         let tx = self.cross_shard_tx.as_ref().unwrap();
         let result = tx[target_shard as usize].try_send(CrossShardMsg::DeliverNamedMessage {
             target_id,
@@ -2169,6 +2254,7 @@ impl Runtime {
             payload: args,
             sender: self.current_actor.unwrap_or(0),
             trace_id: out_trace,
+            object_holds,
         });
 
         match result {
@@ -3309,7 +3395,9 @@ impl Runtime {
     /// keeping the stable identity mapping in `grain_actor_ids`/`actor_grain_id`.
     /// The `grain_residents` entry is removed so that the next send re-hydrates
     /// the grain from its snapshot (or fresh type metadata). Pinned grains and
-    /// grains with non-empty mailboxes are never evicted.
+    /// grains with non-empty mailboxes or live ObjectStore holds are never
+    /// evicted. ObjectRef durability across dehydration is intentionally
+    /// deferred until snapshots can preserve/reacquire those references.
     ///
     /// Returns the number of actors evicted.
     pub fn evict_hibernated_grains(&mut self, max_evict: Option<usize>) -> usize {
@@ -3318,7 +3406,11 @@ impl Runtime {
             .iter()
             .filter_map(|(&actor_id, grain_id)| {
                 let actor = self.actors.get(&actor_id)?;
-                if actor.is_hibernated() && !actor.pinned && actor.mailbox.is_empty() {
+                if actor.is_hibernated()
+                    && !actor.pinned
+                    && actor.mailbox.is_empty()
+                    && actor.held_objects.is_empty()
+                {
                     Some((actor_id, grain_id.clone()))
                 } else {
                     None
@@ -3430,8 +3522,21 @@ impl Runtime {
                 continue;
             }
             if self.object_store.clone_ref(id) {
-                if let Some(receiver) = self.actors.get_mut(&receiver_id) {
-                    receiver.held_objects.insert(id);
+                let store = self.object_store.clone();
+                let retained = self
+                    .actors
+                    .get_mut(&receiver_id)
+                    .map(|receiver| {
+                        if receiver.held_objects.insert(id) {
+                            receiver.held_object_store.get_or_insert(store);
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !retained {
+                    self.object_store.drop_ref(id);
                 }
             }
         }
