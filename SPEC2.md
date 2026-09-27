@@ -1834,8 +1834,12 @@ Named functions may recurse by referring to their own name. Functions may be pre
 fn hash_slot(key: Int) -> Int {
   key % 16384
 }
+```
 
-// Agent-tool annotation (§11.4)
+Agent-tool annotations (§11.4) are separate from the allocation contract:
+
+```nulang
+// fragment
 @tool(description: "Search the knowledge base")
 fn search(query: String) -> String {
   ...
