@@ -358,10 +358,7 @@ impl MirCodegen {
             let details = violations
                 .iter()
                 .map(|violation| {
-                    format!(
-                        "@noalloc fn '{}': {}",
-                        violation.function, violation.reason
-                    )
+                    format!("@noalloc fn '{}': {}", violation.function, violation.reason)
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
