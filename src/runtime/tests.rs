@@ -6923,6 +6923,108 @@ fn test_frozen_graph_store_preserves_shared_substructure() {
 }
 
 #[test]
+fn test_freeze_actor_value_preserves_heap_dag_aliases() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+
+    let shared = rt
+        .actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .allocate_string("shared");
+
+    let array_ptr = rt
+        .actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .heap
+        .alloc(2 * std::mem::size_of::<Value>(), TypeTag::Array)
+        .unwrap();
+    unsafe {
+        let slots = array_ptr as *mut Value;
+        slots.write(shared);
+        slots.add(1).write(shared);
+    }
+    let array = unsafe { Value::ptr(array_ptr) };
+
+    let graph = rt.freeze_actor_value(actor_id, array).unwrap();
+    let encoded = graph.encode().unwrap();
+    let view = FrozenGraphView::new(&encoded).unwrap();
+
+    let FrozenNodeView::Array(children) = view.node(view.root()).unwrap() else {
+        panic!("root should be a frozen array");
+    };
+    let children = children.collect::<Vec<_>>();
+    assert_eq!(children.len(), 2);
+    assert_eq!(
+        children[0], children[1],
+        "the same heap pointer must remain one shared frozen node"
+    );
+    assert!(matches!(
+        view.node(children[0]).unwrap(),
+        FrozenNodeView::String("shared")
+    ));
+}
+
+#[test]
+fn test_freeze_actor_value_rejects_cycles() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+
+    let array_ptr = rt
+        .actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .heap
+        .alloc(std::mem::size_of::<Value>(), TypeTag::Array)
+        .unwrap();
+    let array = unsafe { Value::ptr(array_ptr) };
+    unsafe {
+        (array_ptr as *mut Value).write(array);
+    }
+
+    assert!(matches!(
+        rt.freeze_actor_value(actor_id, array),
+        Err(FreezeValueError::CycleDetected)
+    ));
+}
+
+#[test]
+fn test_freeze_actor_value_rejects_foreign_heap_pointer() {
+    let mut rt = Runtime::new();
+    let owner = rt.spawn_actor(Box::new(|| vec![]));
+    let other = rt.spawn_actor(Box::new(|| vec![]));
+    let foreign = rt.actors.get_mut(&owner).unwrap().allocate_string("owned");
+
+    assert!(matches!(
+        rt.freeze_actor_value(other, foreign),
+        Err(FreezeValueError::PointerOutsideActorHeap)
+    ));
+}
+
+#[test]
+fn test_freeze_actor_value_rejects_runtime_identity_values() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+    let object_id = rt.object_store.put(vec![1, 2, 3].into_boxed_slice());
+
+    assert!(matches!(
+        rt.freeze_actor_value(actor_id, Value::actor_ref(42)),
+        Err(FreezeValueError::UnsupportedRuntimeValue("actor reference"))
+    ));
+    assert!(matches!(
+        rt.freeze_actor_value(actor_id, Value::closure(7)),
+        Err(FreezeValueError::UnsupportedRuntimeValue("closure"))
+    ));
+    assert!(matches!(
+        rt.freeze_actor_value(actor_id, Value::object(object_id)),
+        Err(FreezeValueError::UnsupportedRuntimeValue(
+            "object reference"
+        ))
+    ));
+}
+
+#[test]
 fn test_object_ref_send_same_shard_records_hold() {
     let mut rt = Runtime::new();
     let receiver = rt.spawn_actor(Box::new(|| vec![]));
