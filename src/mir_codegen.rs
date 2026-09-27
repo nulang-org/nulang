@@ -3656,9 +3656,8 @@ extern "__nulang_registered__" {
 
 fn main() -> Int { 0 }
 "#;
-        compile_source(source).expect(
-            "opaque scalar newtypes should lower through the underlying primitive FFI ABI",
-        );
+        compile_source(source)
+            .expect("opaque scalar newtypes should lower through the underlying primitive FFI ABI");
     }
 
     #[test]
