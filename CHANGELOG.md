@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Runtime behavior ownership enforcement — 2026-09-27
+- **Bytecode behavior names and numeric IDs are now scoped to the target actor schema.** Foreign-schema IDs are rejected before local or cross-shard mailbox publication, workflow-local IDs translate through their own `ActorMeta.behavior_indices`, and virtual actor instances resolve only their declared grain schema.
+- **Anonymous low-level runtime actors keep their compatibility path.** Inert numeric behavior id 0 remains admissible only when the actor has no declared native or bytecode behavior surface.
+
 ### Runtime actor schema identity — 2026-09-27
 - **Actors spawned from compiler-produced module metadata retain their canonical `ActorMeta.name`.** Plain bytecode actors no longer discard their owning schema in favor of only `actor_<id>`; manually spawned/native actors keep their synthetic instance names. This is the prerequisite for target-schema behavior ownership checks.
 
