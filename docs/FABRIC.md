@@ -113,12 +113,33 @@ runtimes, publishes from one node, then verifies that the message arrives at the
 remote actor through the existing distributed actor transport.
 
 The Fabric control plane is explicit and runtime-owned. It uses small in-process
-channels only for subscription lifecycle metadata. There is no process-global
-subscription registry, so separate Runtime groups and deterministic tests remain
-isolated.
+channels only for subscription and service-directory lifecycle metadata. There
+is no process-global registry, so separate Runtime groups and deterministic
+tests remain isolated.
 
-This layer has deliberately **no durability guarantee yet**. It defines routing
-semantics that later cluster and stream layers can reuse.
+Fabric now also contains the typed foundation for service discovery. A
+`ServiceAdvertisement` binds a service endpoint to its owning node,
+deployment, replica, and allocation fencing epoch, plus protocol and health.
+Local endpoint/health changes share Fabric's process-wide generation counter and
+replicate across runtime shards. Complete remote service snapshots use the same
+generation-replacement rule as subscription snapshots: stale generations are
+ignored, partial snapshots are rejected by the exporter, and confirmed
+node-loss cleanup removes both endpoints and remembered generation.
+
+Service routing is intentionally weaker than allocation ownership. Only
+`Serving` endpoints resolve, and remote resolution additionally requires the
+node to be healthy in cluster membership. Service health can therefore remove a
+destination from routing, but it cannot create ownership, change an allocation
+epoch, or authorize failover.
+
+The current service-directory slice exposes manual complete snapshot
+export/replacement APIs. Carrying those snapshots automatically in the existing
+NUL0 gossip envelope is the next integration slice; until then it does not claim
+automatic cross-node service convergence.
+
+This layer has deliberately **no durability guarantee yet** for ephemeral topic
+or service metadata. It defines routing semantics that durable Cloud ownership
+and Fabric streams can reuse.
 
 ## Design constraints
 
@@ -187,6 +208,9 @@ semantics that later cluster and stream layers can reuse.
   locality.
 - [ ] Propagate cross-shard/remote load summaries.
 - [x] Deterministic partition/reorder coverage for automatic gossip.
+- [x] Typed generation-fenced service-directory registry with health-aware
+  resolution and manual complete snapshot exchange.
+- [ ] Carry complete service-directory snapshots automatically in NUL0 gossip.
 
 ### Phase 3 — durable streams
 
