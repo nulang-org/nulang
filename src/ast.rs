@@ -778,7 +778,7 @@ pub enum Decl {
         items: Vec<String>,
         span: Span,
     },
-    /// Foreign function interface block: extern "lib" { fn f(x: T) -> R }
+    /// Foreign function interface block: unsafe extern "lib" { fn f(x: T) -> R }
     Extern {
         library: String,
         funcs: Vec<ExternFunc>,
