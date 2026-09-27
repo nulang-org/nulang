@@ -29,6 +29,33 @@ fn register_for_recovery(rt: &mut Runtime, actor_id: u64, module: nulang::byteco
 }
 
 #[test]
+fn none_schema_name_preserves_legacy_serialized_shape() {
+    let snapshot = ActorSnapshot {
+        actor_id: 6,
+        ..ActorSnapshot::default()
+    };
+    let json = serde_json::to_value(&snapshot).expect("serialize snapshot");
+    assert!(
+        json.get("schema_name").is_none(),
+        "None schema identity must be omitted so legacy transition digests remain stable"
+    );
+}
+
+#[test]
+fn canonical_schema_name_is_serialized_when_present() {
+    let snapshot = ActorSnapshot {
+        actor_id: 6,
+        schema_name: Some("Counter".to_string()),
+        ..ActorSnapshot::default()
+    };
+    let json = serde_json::to_value(&snapshot).expect("serialize snapshot");
+    assert_eq!(
+        json.get("schema_name").and_then(|value| value.as_str()),
+        Some("Counter")
+    );
+}
+
+#[test]
 fn legacy_snapshot_json_without_schema_name_remains_readable() {
     let snapshot: ActorSnapshot = serde_json::from_str(
         r#"{
