@@ -3135,6 +3135,7 @@ mod json_file_store_tests {
                     waiting_signal: None,
                     crdt_snapshot: None,
                     crdt_field_map: None,
+                    schema_name: None,
                     authority_tokens: Default::default(),
                 })
                 .unwrap();
@@ -3420,6 +3421,7 @@ mod rocksdb_store_tests {
                     waiting_signal: None,
                     crdt_snapshot: None,
                     crdt_field_map: None,
+                    schema_name: None,
                     authority_tokens: Default::default(),
                 })
                 .unwrap();
