@@ -2255,9 +2255,15 @@ so *every* field silently reverted to the `Local` default the moment
 an actor recovered once -- a second crash would have dropped `durable`
 fields from the snapshot entirely, and `event_sourced` fields would
 have stopped accumulating altogether (the "+1 per emit" bump above
-iterates `state_models` to find which fields to bump). Fixed by
-restoring `state_models` from the recovery module's `actor_metadata`
-in the same place `bytecode_module`/`bytecode_offsets` are restored.
+iterates `state_models` to find which fields to bump). Recovery now
+restores declared models from the recovery module's `actor_metadata`
+and also reconstructs missing runtime-created models from existing
+durable records without changing the snapshot format: snapshot state
+implies Durable unless its CRDT field/id/type metadata identifies a
+specific CRDT model, while event-journal field names imply EventSourced.
+This preserves persistence semantics across repeated recovery even when
+the actor was created through the runtime API rather than a source-level
+actor declaration.
 
 ## 9.7 Deterministic Replay
 
