@@ -217,5 +217,3 @@ pub fn validate_noalloc_contracts(
         Err(violations)
     }
 }
-
-
