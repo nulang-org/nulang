@@ -7079,12 +7079,19 @@ fn test_object_ref_cross_shard_in_flight_hold_survives_creator_drop() {
 
 #[test]
 fn test_named_cross_shard_rejection_releases_in_flight_object_hold() {
+    fn known_behavior(_actor: &mut Actor, _args: &[Value]) {}
+
     let mut shards = Runtime::new_sharded(2);
 
     let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
     while target % 2 != 1 {
         target = shards[1].spawn_actor(Box::new(|| vec![]));
     }
+    shards[1]
+        .actors
+        .get_mut(&target)
+        .unwrap()
+        .register_behavior("known", known_behavior);
 
     let obj_id = shards[0]
         .object_store
@@ -7107,8 +7114,10 @@ fn test_named_cross_shard_rejection_releases_in_flight_object_hold() {
 #[test]
 fn test_disconnected_cross_shard_send_rolls_back_object_hold() {
     let mut shards = Runtime::new_sharded(2);
-    let target = shards[1].spawn_actor(Box::new(|| vec![]));
-    assert_eq!(target % 2, 1);
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
 
     let survivor_store = shards[0].object_store.clone();
     let obj_id = survivor_store.put(vec![1, 1, 2, 3, 5].into_boxed_slice());
