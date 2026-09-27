@@ -6893,6 +6893,36 @@ fn test_object_store_put_get() {
 }
 
 #[test]
+fn test_frozen_graph_store_preserves_shared_substructure() {
+    let rt = Runtime::new();
+    let graph = FrozenGraph::new(
+        vec![
+            FrozenNode::String("shared".to_string()),
+            FrozenNode::Array(vec![0, 0]),
+            FrozenNode::Record(vec![("payload".to_string(), 1)]),
+        ],
+        2,
+    )
+    .unwrap();
+
+    let id = rt.object_store.put_frozen(&graph).unwrap();
+    let entry = rt.object_store.get(id).unwrap();
+    let view = entry.frozen_view().unwrap();
+
+    assert_eq!(view.root(), 2);
+    let FrozenNodeView::Record(mut fields) = view.node(view.root()).unwrap() else {
+        panic!("root should be a record");
+    };
+    let (name, array_id) = fields.next().unwrap();
+    assert_eq!(name, "payload");
+
+    let FrozenNodeView::Array(children) = view.node(array_id).unwrap() else {
+        panic!("payload should be an array");
+    };
+    assert_eq!(children.collect::<Vec<_>>(), vec![0, 0]);
+}
+
+#[test]
 fn test_object_ref_send_same_shard_records_hold() {
     let mut rt = Runtime::new();
     let receiver = rt.spawn_actor(Box::new(|| vec![]));

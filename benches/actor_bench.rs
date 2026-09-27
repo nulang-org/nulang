@@ -5,7 +5,9 @@
 //! accordingly so their timings are not misread as message throughput.
 
 use criterion::{black_box, criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
-use nulang::runtime::{Mailbox, Message, MessagePayload, MessagePriority, Runtime};
+use nulang::runtime::{
+    FrozenGraph, FrozenNode, Mailbox, Message, MessagePayload, MessagePriority, Runtime,
+};
 use nulang::vm::Value;
 
 const MESSAGE_BATCH: usize = 100;
@@ -195,6 +197,55 @@ fn selective_receive_mailbox(depth: usize, hit_behavior: u16) -> Mailbox {
     mailbox
 }
 
+fn frozen_fanout_fixture(payload_bytes: usize, fanout: usize) -> (Runtime, Vec<u64>, Value) {
+    let mut rt = Runtime::new();
+    let mut receivers = Vec::with_capacity(fanout);
+    for _ in 0..fanout {
+        receivers.push(rt.spawn_actor(Box::new(|| vec![])));
+    }
+    // Remove spawn-time ready tokens from the measured path.
+    rt.run_scheduler();
+
+    let graph = FrozenGraph::new(vec![FrozenNode::Bytes(vec![7u8; payload_bytes])], 0)
+        .expect("valid frozen benchmark graph");
+    let object_id = rt
+        .object_store
+        .put_frozen(&graph)
+        .expect("frozen benchmark object");
+    (rt, receivers, Value::object(object_id))
+}
+
+/// Frozen-object fan-out should scale with receiver count, not payload bytes:
+/// each local send carries one ObjectId and takes one receiver hold over the
+/// node-shared immutable allocation.
+fn bench_frozen_object_fanout(c: &mut Criterion) {
+    let mut group = c.benchmark_group("actor/frozen_object_fanout");
+
+    for payload_bytes in [1usize << 10, 64usize << 10, 1usize << 20] {
+        for fanout in [1usize, 16, 256] {
+            group.throughput(Throughput::Elements(fanout as u64));
+            group.bench_with_input(
+                BenchmarkId::new(format!("{payload_bytes}_bytes"), fanout),
+                &(payload_bytes, fanout),
+                |b, &(payload_bytes, fanout)| {
+                    b.iter_batched(
+                        || frozen_fanout_fixture(payload_bytes, fanout),
+                        |(mut rt, receivers, object)| {
+                            for actor_id in receivers {
+                                rt.send_message_by_id(actor_id, 0, &[object]);
+                            }
+                            black_box(rt);
+                        },
+                        BatchSize::SmallInput,
+                    )
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
 fn bench_selective_receive(c: &mut Criterion) {
     const HIT: u16 = 60_000;
 
@@ -265,5 +316,6 @@ criterion_group!(
     bench_spawn_send_receive,
     bench_message_enqueue,
     bench_message_drain,
+    bench_frozen_object_fanout,
     bench_selective_receive
 );
