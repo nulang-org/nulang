@@ -1332,6 +1332,17 @@ impl Eq Int {
     }
 
     #[test]
+    fn test_fmt_preserves_opaque_type_contract() {
+        let src = "opaque type UserId = Int\n";
+        let out = format_source(src).expect("opaque type formats");
+        assert_eq!(
+            out, src,
+            "formatter must not erase opaque nominal semantics"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
     fn test_fmt_extern() {
         let src = r#"extern "libm.so.6" {
     fn sqrt(x: Float) -> Float
