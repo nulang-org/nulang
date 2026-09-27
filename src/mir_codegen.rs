@@ -354,7 +354,7 @@ impl MirCodegen {
         // Validate source-level @noalloc against optimized emitted bytecode.
         // The cost model also follows statically resolved direct calls
         // transitively and fails closed for unresolved/closure calls.
-        if let Err(violations) = crate::cost_model::validate_noalloc_contracts(mir, &self.module) {
+        if let Err(violations) = crate::noalloc::validate_noalloc_contracts(mir, &self.module) {
             let details = violations
                 .iter()
                 .map(|violation| {
