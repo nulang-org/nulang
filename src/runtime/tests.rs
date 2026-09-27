@@ -7042,7 +7042,6 @@ fn test_object_ref_cross_shard_reuses_node_shared_storage() {
     assert_eq!(target_entry.as_bytes(), &[11, 22, 33]);
 }
 
-
 #[test]
 fn test_object_ref_cross_shard_in_flight_hold_survives_creator_drop() {
     let mut shards = Runtime::new_sharded(2);
