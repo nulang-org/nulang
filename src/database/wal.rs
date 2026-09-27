@@ -428,7 +428,6 @@ impl FileWal {
         }
         Ok(())
     }
-
 }
 
 fn encode_frame_header(payload_len: u32) -> [u8; WAL_FRAME_HEADER_BYTES] {
@@ -462,8 +461,7 @@ fn decode_frame_header(
         return Err(WalError::HeaderChecksumMismatch { offset });
     }
 
-    let payload_len =
-        u32::from_le_bytes([header[6], header[7], header[8], header[9]]) as usize;
+    let payload_len = u32::from_le_bytes([header[6], header[7], header[8], header[9]]) as usize;
     if payload_len > MAX_WAL_RECORD_BYTES {
         return Err(WalError::RecordTooLarge {
             offset,
@@ -628,14 +626,20 @@ impl fmt::Display for WalError {
             Self::Io { message, .. } => write!(f, "WAL I/O error: {message}"),
             Self::InvalidHeader => f.write_str("invalid NuDB WAL header"),
             Self::InvalidFrameHeader { offset, reason } => {
-                write!(f, "invalid WAL frame header at byte offset {offset}: {reason}")
+                write!(
+                    f,
+                    "invalid WAL frame header at byte offset {offset}: {reason}"
+                )
             }
             Self::UnsupportedFrameVersion { offset, version } => write!(
                 f,
                 "unsupported WAL frame version {version} at byte offset {offset}"
             ),
             Self::HeaderChecksumMismatch { offset } => {
-                write!(f, "WAL frame header checksum mismatch at byte offset {offset}")
+                write!(
+                    f,
+                    "WAL frame header checksum mismatch at byte offset {offset}"
+                )
             }
             Self::UnsupportedRecordVersion { offset, version } => write!(
                 f,
@@ -831,7 +835,10 @@ mod hardening_tests {
             wal.append_write(&write(0, b"k")),
             Err(WalError::Io { .. })
         ));
-        assert_eq!(wal.append_write(&write(0, b"retry")).unwrap_err(), WalError::Poisoned);
+        assert_eq!(
+            wal.append_write(&write(0, b"retry")).unwrap_err(),
+            WalError::Poisoned
+        );
 
         drop(wal);
 
