@@ -8214,10 +8214,11 @@ mod tests {
 
     #[test]
     fn test_noalloc_rejects_non_function_declaration() {
-        let err = parse("@noalloc\ntype Id = Int")
-            .expect_err("@noalloc must only annotate functions");
+        let err =
+            parse("@noalloc\ntype Id = Int").expect_err("@noalloc must only annotate functions");
         assert!(
-            err.to_string().contains("@noalloc may only annotate a function"),
+            err.to_string()
+                .contains("@noalloc may only annotate a function"),
             "unexpected diagnostic: {err}"
         );
     }
