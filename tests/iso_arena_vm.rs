@@ -104,6 +104,44 @@ fn local_array_module(escapes: bool) -> CodeModule {
     module
 }
 
+
+fn local_fixed_composite_module(opcode: OpCode) -> CodeModule {
+    let mut module = CodeModule::new("iso-arena-fixed-composite-routing");
+    module.emit(Instruction::new2(opcode, 2, 2));
+    module.emit(Instruction::new1(OpCode::Drop, 2));
+    module.emit(Instruction::new0(OpCode::Halt));
+    module.entry_point = Some(0);
+    module
+}
+
+#[test]
+fn qualifying_record_allocation_uses_iso_arena() {
+    let (mut vm, stats) = with_iso_arena_vm();
+    vm.set_actor_callbacks(Box::new(TrackingCallbacks::new(stats.clone())));
+    vm.load_module(local_fixed_composite_module(OpCode::RecMk));
+
+    vm.run().expect("VM run should succeed");
+
+    let stats = stats.borrow();
+    assert_eq!(stats.arena_allocs, 1);
+    assert_eq!(stats.heap_allocs, 0);
+    assert_eq!(stats.arena_resets, 1);
+}
+
+#[test]
+fn qualifying_tuple_allocation_uses_iso_arena() {
+    let (mut vm, stats) = with_iso_arena_vm();
+    vm.set_actor_callbacks(Box::new(TrackingCallbacks::new(stats.clone())));
+    vm.load_module(local_fixed_composite_module(OpCode::TupleMk));
+
+    vm.run().expect("VM run should succeed");
+
+    let stats = stats.borrow();
+    assert_eq!(stats.arena_allocs, 1);
+    assert_eq!(stats.heap_allocs, 0);
+    assert_eq!(stats.arena_resets, 1);
+}
+
 #[test]
 fn qualifying_allocation_uses_iso_arena_and_resets_at_completion() {
     let (mut vm, stats) = with_iso_arena_vm();
