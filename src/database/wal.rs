@@ -29,6 +29,7 @@ const WAL_FRAME_PREFIX_BYTES: usize = 4 + 2 + 4;
 const WAL_FRAME_HEADER_BYTES: usize = WAL_FRAME_PREFIX_BYTES + 32;
 const MAX_WAL_RECORD_BYTES: usize = 64 * 1024 * 1024;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppendFailPoint {
     AfterHeader,
@@ -148,7 +149,10 @@ pub struct FileWal {
 impl FileWal {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent)?;
         }
 
@@ -385,12 +389,19 @@ impl FileWal {
         self.poisoned = true;
 
         self.file.write_all(&header)?;
+        #[cfg(test)]
         self.maybe_fail_append_for_test(AppendFailPoint::AfterHeader)?;
+
         self.file.write_all(&payload)?;
+        #[cfg(test)]
         self.maybe_fail_append_for_test(AppendFailPoint::AfterPayload)?;
+
         self.file.write_all(checksum.as_bytes())?;
+        #[cfg(test)]
         self.maybe_fail_append_for_test(AppendFailPoint::AfterChecksum)?;
+
         self.file.sync_data()?;
+        #[cfg(test)]
         self.maybe_fail_append_for_test(AppendFailPoint::AfterSync)?;
 
         let end = self.file.stream_position()?;
@@ -418,10 +429,6 @@ impl FileWal {
         Ok(())
     }
 
-    #[cfg(not(test))]
-    fn maybe_fail_append_for_test(&mut self, _point: AppendFailPoint) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 fn encode_frame_header(payload_len: u32) -> [u8; WAL_FRAME_HEADER_BYTES] {
