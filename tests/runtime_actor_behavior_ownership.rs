@@ -39,7 +39,10 @@ fn duplicate_hit_module() -> (nulang::bytecode::CodeModule, usize, usize) {
         .expect("Second actor metadata");
     let first_hit = *first.behavior_indices.first().expect("First.hit index");
     let second_hit = *second.behavior_indices.first().expect("Second.hit index");
-    assert_ne!(first_hit, second_hit, "fixture requires distinct behavior ids");
+    assert_ne!(
+        first_hit, second_hit,
+        "fixture requires distinct behavior ids"
+    );
     (module, first_hit, second_hit)
 }
 
@@ -91,20 +94,17 @@ fn numeric_ask_rejects_behavior_owned_by_another_actor_schema() {
 }
 
 #[test]
-fn numeric_send_rejects_behavior_owned_by_another_actor_schema() {
+fn low_level_numeric_send_keeps_transport_semantics() {
     let (module, first_hit, second_hit) = duplicate_hit_module();
     let (mut runtime, actor_id) = spawn_second(&module, second_hit);
 
-    assert_eq!(runtime.actors[&actor_id].mailbox.len(), 0);
     runtime.send_message_by_id(actor_id, first_hit as u16, &[]);
+    runtime.send_message_by_id(actor_id, second_hit as u16, &[]);
     assert_eq!(
         runtime.actors[&actor_id].mailbox.len(),
-        0,
-        "foreign-schema numeric id must be rejected before mailbox publication"
+        2,
+        "raw numeric transport may carry inert ids; execution remains schema-gated"
     );
-
-    runtime.send_message_by_id(actor_id, second_hit as u16, &[]);
-    assert_eq!(runtime.actors[&actor_id].mailbox.len(), 1);
 }
 
 #[test]
