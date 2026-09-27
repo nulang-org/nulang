@@ -138,7 +138,7 @@ bool nulang_free_string(NulangRuntime *runtime, const char *ptr);
 /**
  * Register a native C function so it can be called from Nulang.
  *
- * Use `"__nulang_registered__"` as the library name in the Nulang `extern`
+ * Use `"__nulang_registered__"` as the library name in the Nulang `unsafe extern`
  * block when the function was registered this way. Returns 0 on success,
  * -1 on error.
  */
