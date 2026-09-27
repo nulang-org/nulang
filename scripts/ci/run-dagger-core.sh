@@ -13,4 +13,4 @@ if [[ ! -x "$DAGGER_BIN" ]]; then
 fi
 
 cd "$ROOT"
-exec "$DAGGER_BIN" --progress=plain < ci/dagger/core.dag
+exec "$DAGGER_BIN" --progress=plain ci/dagger/core.dag
