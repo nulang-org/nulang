@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Pointer-free frozen term graphs — 2026-09-27
+- **The runtime now has a versioned, pointer-free frozen term graph format for immutable shared data.** Scalars, strings, bytes, arrays, tuples, records, maps, and variants are encoded using node IDs rather than process pointers, preserving shared substructure while remaining safe to move through the existing object transport.
+- **Frozen graph decoding is fail-closed and zero-copy after storage.** Bounds, tags, UTF-8, offsets, child references, and resource limits are validated before exposing borrowed graph views; automatic heap-value promotion remains intentionally disabled pending fan-out and payload-size measurements.
+
 ### Node-shared immutable object store — 2026-09-27
 - **Immutable object-store payloads are now shared across runtime shards without copying their bytes.** `TAG_OBJECT` handles keep a single node-local allocation while actor-lifetime holds protect queued and delivered messages; duplicate deliveries no longer over-increment object references.
 - **Cross-node object transport remains explicit and compatible.** Remote sends still serialize object bytes and intern a fresh local object on the receiving node, while actor heaps and ORCA ownership remain shard-confined.

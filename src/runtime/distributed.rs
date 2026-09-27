@@ -2648,6 +2648,56 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
+    fn frozen_graph_survives_existing_object_wire_transport() {
+        use crate::runtime::{FrozenGraph, FrozenNode, FrozenNodeView};
+
+        let source = Runtime::new();
+        let graph = FrozenGraph::new(
+            vec![
+                FrozenNode::String("config".to_string()),
+                FrozenNode::Int(42),
+                FrozenNode::Record(vec![("name".to_string(), 0), ("version".to_string(), 1)]),
+            ],
+            2,
+        )
+        .unwrap();
+        let source_id = source.object_store.put_frozen(&graph).unwrap();
+
+        let (mut payload, object_table) =
+            resolve_wire_objects(&source, &[Value::object(source_id)]).unwrap();
+        assert_eq!(payload[0].as_object_id(), Some(0));
+
+        let mut target = Runtime::new();
+        assert!(intern_wire_objects(
+            &mut target,
+            &mut payload,
+            &object_table
+        ));
+
+        let target_id = payload[0].as_object_id().unwrap();
+        assert_ne!(
+            target_id, 0,
+            "wire-table index must be rewritten to a local ObjectId"
+        );
+        let target_entry = target.object_store.get(target_id).unwrap();
+        let view = target_entry.frozen_view().unwrap();
+        assert_eq!(view.root(), 2);
+
+        let FrozenNodeView::Record(fields) = view.node(2).unwrap() else {
+            panic!("root should remain a frozen record");
+        };
+        assert_eq!(
+            fields.collect::<Vec<_>>(),
+            vec![("name", 0), ("version", 1)]
+        );
+        assert!(matches!(
+            view.node(0).unwrap(),
+            FrozenNodeView::String("config")
+        ));
+        assert!(matches!(view.node(1).unwrap(), FrozenNodeView::Int(42)));
+    }
+
+    #[test]
     fn test_resolve_verified_behavior_rejects_mismatched_hot_reload_hash() {
         use crate::bytecode::{BehaviorTableEntry, CodeModule};
 
