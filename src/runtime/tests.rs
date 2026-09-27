@@ -7615,7 +7615,6 @@ fn p0_cross_shard_named_send_resolves_only_on_owner() {
     );
 }
 
-
 #[test]
 fn test_primitive_local_message_scans_object_refs_once_at_admission() {
     let mut rt = Runtime::new();
