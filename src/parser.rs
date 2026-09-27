@@ -781,10 +781,14 @@ impl Parser {
                 }
                 self.parse_extern(public)
             }
-            TokenKind::Extern => Err(NuError::parse_error(
-                "Native ABI declarations require explicit acknowledgement: use `unsafe extern`",
-                self.current_span(),
-            )),
+            TokenKind::Extern => {
+                let span = self.current_span();
+                self.advance(); // consume so parse_module preserves this declaration error
+                Err(NuError::parse_error(
+                    "Native ABI declarations require explicit acknowledgement: use `unsafe extern`",
+                    span,
+                ))
+            }
             TokenKind::Import => self.parse_import(),
             TokenKind::Module => {
                 self.advance(); // consume 'module'
