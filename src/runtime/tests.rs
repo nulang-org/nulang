@@ -2045,6 +2045,7 @@ fn test_memory_store_latest_sequence() {
         waiting_signal: None,
         crdt_snapshot: None,
         crdt_field_map: None,
+        schema_name: None,
         authority_tokens: Default::default(),
     };
     store.save_snapshot(snapshot).unwrap();
@@ -2074,6 +2075,7 @@ fn test_libsql_store_save_load_snapshot() {
         waiting_signal: None,
         crdt_snapshot: None,
         crdt_field_map: None,
+        schema_name: None,
         authority_tokens: Default::default(),
     };
     store.save_snapshot(snapshot).unwrap();
@@ -2128,6 +2130,7 @@ fn test_libsql_store_latest_sequence() {
             waiting_signal: None,
             crdt_snapshot: None,
             crdt_field_map: None,
+            schema_name: None,
             authority_tokens: Default::default(),
         })
         .unwrap();
@@ -2156,6 +2159,7 @@ fn test_libsql_store_clear() {
             waiting_signal: None,
             crdt_snapshot: None,
             crdt_field_map: None,
+            schema_name: None,
             authority_tokens: Default::default(),
         })
         .unwrap();
@@ -2192,6 +2196,7 @@ fn test_libsql_store_persists_to_disk() {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -2232,6 +2237,7 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
             waiting_signal: None,
             crdt_snapshot: Some(vec![(7, 1, vec![1, 2, 3]), (8, 2, vec![])]),
             crdt_field_map: None,
+            schema_name: None,
             authority_tokens: Default::default(),
         })
         .unwrap();
@@ -2251,6 +2257,7 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
             waiting_signal: None,
             crdt_snapshot: None,
             crdt_field_map: None,
+            schema_name: None,
             authority_tokens: Default::default(),
         })
         .unwrap();
@@ -2294,6 +2301,7 @@ fn test_libsql_store_migrates_old_schema_crdt_column() {
                 waiting_signal: None,
                 crdt_snapshot: Some(vec![(7, 1, vec![1, 2, 3])]),
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
