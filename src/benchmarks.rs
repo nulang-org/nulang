@@ -159,6 +159,49 @@ fn bench_ab_enqueue_payload_sweep() {
     }
 }
 
+/// Scheduler + runtime dispatch floor for already-admitted local messages.
+///
+/// Enqueue is outside the timed region and the native behavior does no user
+/// work. Comparing this with the mailbox-only/enqueue probes and the matched
+/// bytecode/AOT actor drains localizes the remaining per-message cost inside
+/// scheduler dequeue, `step_actor`, runtime bookkeeping, and native dispatch.
+#[test]
+fn bench_ab_native_noop_actor_drain() {
+    const N: usize = 200_000;
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(Vec::new));
+    rt.actors
+        .get_mut(&actor_id)
+        .expect("spawned actor")
+        .register_behavior("handle", ab_noop_handler);
+
+    // Clear spawn-time ready ownership before preparing the measured backlog.
+    rt.run_scheduler();
+    let reductions_before = rt
+        .actors
+        .get(&actor_id)
+        .expect("actor still live")
+        .reduction_count;
+
+    for _ in 0..N {
+        rt.send_message_by_id(actor_id, 0, &[]);
+    }
+
+    let start = Instant::now();
+    rt.run_scheduler();
+    let elapsed = start.elapsed();
+
+    let actor = rt.actors.get(&actor_id).expect("actor still live");
+    assert!(actor.mailbox.is_empty(), "native drain must empty the mailbox");
+    assert_eq!(
+        actor.reduction_count - reductions_before,
+        N as u32,
+        "native drain must dispatch every admitted message"
+    );
+    report_ab("native_noop_actor_drain", N as u64, elapsed);
+}
+
 /// Host-wide ideal shard-scaling probe over a fixed amount of local actor work.
 ///
 /// The ordinary A/B harness pins child processes to one logical CPU; this probe
