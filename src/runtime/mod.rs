@@ -12,6 +12,7 @@ use tracing::warn;
 
 mod actor;
 mod behavior_ownership;
+mod schema_identity;
 mod blocking_executor;
 pub mod cache;
 pub mod cache_cluster;
@@ -486,6 +487,10 @@ pub struct Runtime {
     // compensation_offsets).
     pub(crate) recovery_modules:
         HashMap<u64, (crate::bytecode::CodeModule, Vec<usize>, Vec<Option<usize>>)>,
+    /// Canonical ActorMeta.name retained after actor reaping so migration
+    /// forwarding and recovery can translate runtime-local behavior ids
+    /// without guessing schema ownership.
+    pub(crate) recovery_schema_names: HashMap<u64, String>,
     /// Content-addressed bytecode cache for fetch-on-demand.
     /// When a node receives a message for an unknown content hash, it can
     /// request the bytecode from the sender and cache it here keyed by hash.
@@ -677,6 +682,7 @@ impl Runtime {
             draining_receive_wakes: false,
             idle_callback: None,
             recovery_modules: HashMap::new(),
+            recovery_schema_names: HashMap::new(),
             #[cfg(feature = "ai-runtime")]
             ai: AiRuntimeRegistry::new(),
             #[cfg(feature = "ai-runtime")]
@@ -1805,10 +1811,39 @@ impl Runtime {
             }
         }
         let module = actor.bytecode_module.as_ref()?;
-        module
-            .behaviors
-            .get(behavior_id as usize)
-            .map(|b| b.name.clone())
+        if module.actor_metadata.is_empty() {
+            return module
+                .behaviors
+                .get(behavior_id as usize)
+                .map(|behavior| behavior.name.clone());
+        }
+        behavior_ownership::behavior_name_for_runtime_id(
+            module,
+            &actor.name,
+            behavior_id as usize,
+        )
+        .map(str::to_owned)
+    }
+
+    /// Resolve a runtime-visible behavior id for an actor that is no longer
+    /// resident but still has retained recovery metadata.
+    fn recovery_behavior_wire_name_for(&self, actor_id: u64, behavior_id: u16) -> Option<String> {
+        let (module, _, _) = self.recovery_modules.get(&actor_id)?;
+        if let Some(schema_name) = self.recovery_schema_names.get(&actor_id) {
+            return behavior_ownership::behavior_name_for_runtime_id(
+                module,
+                schema_name,
+                behavior_id as usize,
+            )
+            .map(str::to_owned);
+        }
+        if module.actor_metadata.is_empty() {
+            return module
+                .behaviors
+                .get(behavior_id as usize)
+                .map(|behavior| behavior.name.clone());
+        }
+        None
     }
 
     /// Synchronously run a single behavior on an actor and return its result.
@@ -2516,17 +2551,15 @@ impl Runtime {
         // Forwarding for migrated actors: if this actor has been relocated
         // to another node, route the message there instead of bouncing it.
         if let Some(&(target_node, _migrated_at)) = self.migrated_actors.get(&target_id) {
-            // Look up the behavior name from the recovery module.
-            let behavior_name = self
-                .recovery_modules
-                .get(&target_id)
-                .and_then(|(module, _, _)| {
-                    module
-                        .behaviors
-                        .get(behavior_id as usize)
-                        .map(|b| b.name.clone())
-                })
-                .unwrap_or_else(|| format!("behavior_{}", behavior_id));
+            let Some(behavior_name) =
+                self.recovery_behavior_wire_name_for(target_id, behavior_id)
+            else {
+                warn!(
+                    "nulang-net: refusing migrated forwarding for actor {} behavior {}: missing canonical schema ownership",
+                    target_id, behavior_id
+                );
+                return;
+            };
             let target = ActorAddress::remote(target_node, target_id);
             self.send_distributed(target, &behavior_name, args);
             return;
@@ -3290,7 +3323,7 @@ impl Runtime {
     /// updating the actor's own sequence/dirty tracking.
     fn build_actor_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
         let mut state = std::collections::HashMap::new();
-        let (waiting_signal, authority_tokens) = {
+        let (waiting_signal, schema_name, authority_tokens) = {
             let actor = self.actors.get(&actor_id)?;
             for (name, value) in &actor.state_data {
                 let model = actor
@@ -3334,7 +3367,20 @@ impl Runtime {
                     return None;
                 }
             };
-            (actor.waiting_signal.clone(), authority_tokens)
+            (
+                actor.waiting_signal.clone(),
+                actor
+                    .bytecode_module
+                    .as_ref()
+                    .and_then(|module| {
+                        schema_identity::canonical_schema_name_for_runtime_actor(
+                            module,
+                            &actor.name,
+                        )
+                    })
+                    .map(str::to_owned),
+                authority_tokens,
+            )
         };
         let sequence = self.next_sequence(actor_id);
         let crdt_snapshot = self.crdt_manager.as_ref().map(|m| {
@@ -3357,6 +3403,7 @@ impl Runtime {
             waiting_signal,
             crdt_snapshot,
             crdt_field_map,
+            schema_name,
             authority_tokens,
         })
     }
