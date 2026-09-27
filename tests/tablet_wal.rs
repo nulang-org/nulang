@@ -200,3 +200,71 @@ fn wal_replay_revalidates_mutations_against_the_recovery_range() {
 
     let _ = fs::remove_file(path);
 }
+
+
+#[test]
+fn wal_rejects_ownership_epoch_regression_on_append() {
+    let path = temp_wal("epoch_regression");
+    let _ = fs::remove_file(&path);
+
+    let mut wal = FileWal::open(&path).unwrap();
+    wal.append_write(&write(0, b"k1", b"v1")).unwrap();
+
+    let stale_descriptor = TabletDescriptor::new(
+        TabletId::new(31).unwrap(),
+        KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+        3,
+    )
+    .unwrap();
+    let stale_write = TabletWrite::prepare(
+        &stale_descriptor,
+        3,
+        1,
+        1,
+        vec![TabletMutation::Put {
+            key: b"k2".to_vec(),
+            value: b"stale".to_vec(),
+        }],
+    )
+    .unwrap();
+
+    assert_eq!(
+        wal.append_write(&stale_write).unwrap_err(),
+        WalError::StaleOwnershipEpoch {
+            durable: 4,
+            presented: 3,
+        }
+    );
+    assert_eq!(wal.last_sequence(), 1);
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn wal_recovery_rejects_a_descriptor_older_than_durable_ownership() {
+    let path = temp_wal("stale_recovery_epoch");
+    let _ = fs::remove_file(&path);
+
+    {
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append_write(&write(0, b"k", b"value")).unwrap();
+    }
+
+    let stale_descriptor = TabletDescriptor::new(
+        TabletId::new(31).unwrap(),
+        KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+        3,
+    )
+    .unwrap();
+
+    let wal = FileWal::open(&path).unwrap();
+    assert_eq!(
+        wal.recover_memory_tablet(stale_descriptor).unwrap_err(),
+        WalError::StaleOwnershipEpoch {
+            durable: 4,
+            presented: 3,
+        }
+    );
+
+    let _ = fs::remove_file(path);
+}
