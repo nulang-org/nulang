@@ -71,17 +71,19 @@ fn wal_rejects_sequence_gaps_before_writing() {
     wal.append_write(&write(0, b"k1", b"v1")).unwrap();
 
     let error = wal
-        .append_write(&TabletWrite::prepare(
-            &descriptor(),
-            4,
-            2,
-            2,
-            vec![TabletMutation::Put {
-                key: b"k3".to_vec(),
-                value: b"v3".to_vec(),
-            }],
+        .append_write(
+            &TabletWrite::prepare(
+                &descriptor(),
+                4,
+                2,
+                2,
+                vec![TabletMutation::Put {
+                    key: b"k3".to_vec(),
+                    value: b"v3".to_vec(),
+                }],
+            )
+            .unwrap(),
         )
-        .unwrap())
         .unwrap_err();
 
     assert_eq!(
