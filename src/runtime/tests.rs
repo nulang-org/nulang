@@ -7126,6 +7126,49 @@ fn test_disconnected_cross_shard_send_rolls_back_object_hold() {
 }
 
 #[test]
+fn test_cross_shard_mailbox_rejection_releases_in_flight_object_hold() {
+    let mut shards = Runtime::new_sharded(2);
+
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+
+    shards[1].actors.get_mut(&target).unwrap().mailbox = Mailbox::new(1);
+    let filler = Message {
+        behavior_id: 0,
+        payload: MessagePayload::from_slice(&[]),
+        sender: 0,
+        priority: MessagePriority::Normal,
+        trace_id: None,
+    };
+    shards[1]
+        .actors
+        .get_mut(&target)
+        .unwrap()
+        .mailbox
+        .push_local(filler)
+        .unwrap();
+
+    let obj_id = shards[0]
+        .object_store
+        .put(vec![34, 55, 89].into_boxed_slice());
+    shards[0].send_message_by_id(target, 0, &[Value::object(obj_id)]);
+    shards[0].object_store.drop_ref(obj_id);
+    assert!(
+        shards[0].object_store.get(obj_id).is_some(),
+        "the in-flight envelope must retain the object before destination admission"
+    );
+
+    shards[1].drain_cross_shard_messages();
+
+    assert!(
+        shards[0].object_store.get(obj_id).is_none(),
+        "mailbox rejection must release the in-flight ObjectRef lease"
+    );
+}
+
+#[test]
 fn test_dropping_one_shard_releases_actor_object_holds() {
     let mut shards = Runtime::new_sharded(2);
     let survivor_store = shards[0].object_store.clone();
