@@ -135,7 +135,11 @@ fn wal_fails_closed_on_checksum_corruption() {
     }
 
     {
-        let mut file = fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         file.seek(SeekFrom::Start(12)).unwrap();
         file.write_all(&[0xff]).unwrap();
         file.sync_all().unwrap();
