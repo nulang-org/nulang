@@ -22,6 +22,45 @@ fn declare_test_behavior(rt: &mut Runtime, actor_id: u64, name: &str) {
 }
 
 #[test]
+fn test_actor_module_hash_uses_exact_runtime_schema() {
+    let mut module = CodeModule::new("multi-schema-hash");
+    for (name, hash) in [("First", [1u8; 32]), ("Second", [2u8; 32])] {
+        module.add_actor_meta(ActorMeta {
+            name: name.to_string(),
+            persistent: false,
+            state_models: vec![],
+            state_defaults: vec![],
+            behavior_indices: vec![],
+            type_hash: Some(hash),
+            version: 1,
+            migrations: String::new(),
+            is_workflow: false,
+            is_agent: false,
+            is_organization: false,
+            is_virtual: false,
+            tools: vec![],
+            semantic_memory_dimensions: None,
+            procedural_memory_namespace: None,
+            backend: crate::ast::ActorBackendKind::Native,
+            fallback_config: String::new(),
+            retry_config: String::new(),
+        });
+    }
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(Vec::new));
+    let actor = rt.actors.get_mut(&actor_id).expect("actor");
+    actor.name = "Second".to_string();
+    actor.bytecode_module = Some(module);
+
+    assert_eq!(
+        rt.actor_module_hash(actor_id),
+        [2u8; 32],
+        "module/hash identity must come from Second, not the first ActorMeta"
+    );
+}
+
+#[test]
 fn test_authority_snapshot_round_trip_recovery() {
     let mut rt = Runtime::new();
     let actor_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
