@@ -148,7 +148,7 @@ pub struct TabletSplitPlan {
 }
 
 /// One mutation staged for a tablet commit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TabletMutation {
     Put { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
