@@ -3262,29 +3262,7 @@ impl Runtime {
                     .copied()
                     .unwrap_or(StateModel::Local);
                 if model == StateModel::Durable || model.is_crdt() {
-                    let persisted = if name == "semantic_memory" || name == "procedural_memory" {
-                        #[cfg(feature = "ai-runtime")]
-                        {
-                            self.vm_value_to_string_in_actor(value, actor)
-                                .map(PersistedValue::String)
-                                .unwrap_or_else(|| {
-                                    PersistedValue::from_value_resolved(
-                                        value,
-                                        actor.bytecode_module.as_ref(),
-                                    )
-                                })
-                        }
-                        #[cfg(not(feature = "ai-runtime"))]
-                        {
-                            PersistedValue::from_value_resolved(
-                                value,
-                                actor.bytecode_module.as_ref(),
-                            )
-                        }
-                    } else {
-                        PersistedValue::from_value_resolved(value, actor.bytecode_module.as_ref())
-                    };
-                    state.insert(name.clone(), persisted);
+                    state.insert(name.clone(), actor.persist_value(value));
                 }
             }
             let authority_tokens = match actor.authority_manifest() {
@@ -5070,8 +5048,13 @@ impl Runtime {
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
-        actor.waiting_signal = snapshot.waiting_signal;
+        actor.waiting_signal = snapshot.waiting_signal.clone();
         actor.install_authority_manifest(&authority_manifest);
+        let recovery_module = self
+            .recovery_modules
+            .get(&actor_id)
+            .map(|(module, _, _)| module);
+        Self::restore_state_models_from_snapshot(&mut actor, recovery_module, &snapshot);
         // Restore CRDT state if present in the snapshot.
         if let Some(crdt_snap) = &snapshot.crdt_snapshot {
             if let Some(manager) = &mut self.crdt_manager {
@@ -5137,6 +5120,12 @@ impl Runtime {
         let events = self.persistence.read_events(actor_id);
         if !events.is_empty() {
             for entry in &events {
+                actor
+                    .state_models
+                    .entry(entry.field_name.clone())
+                    .or_insert(StateModel::EventSourced);
+            }
+            for entry in &events {
                 let v = entry.value.to_value_on_heap(&mut actor);
                 actor.set_state_field(&entry.field_name, v);
                 let current_seq = actor
@@ -5182,23 +5171,6 @@ impl Runtime {
             actor.bytecode_module = Some(module.clone());
             actor.bytecode_offsets = offsets.clone();
             actor.compensation_offsets = comp_offsets.clone();
-            // Restore per-field state-model tracking (Local/Durable/
-            // EventSourced/Crdt), lost when `Actor::new` built a bare
-            // actor above. Without this, `checkpoint_actor`'s
-            // Durable/Crdt snapshot filter and `emit_event`'s
-            // EventSourced "+1" bump both silently fall back to
-            // treating every field as `Local` (via their
-            // `unwrap_or(StateModel::Local)`), breaking persistence for
-            // any field mutated after this recovery: a second crash
-            // would drop Durable fields from the snapshot entirely, and
-            // EventSourced fields would stop accumulating via emitted
-            // events.
-            actor.state_models = module
-                .actor_metadata
-                .iter()
-                .flat_map(|m| &m.state_models)
-                .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
-                .collect();
         }
         if is_workflow {
             self.actors.insert(actor_id, actor);
@@ -5294,7 +5266,14 @@ impl Runtime {
                 .collect();
             for entry in entries_to_replay {
                 let behavior_idx = entry.behavior_id as usize;
-                let payload: Vec<Value> = entry.payload.iter().map(|p| p.to_value()).collect();
+                let payload: Vec<Value> = {
+                    let actor = self.actors.get_mut(&actor_id)?;
+                    entry
+                        .payload
+                        .iter()
+                        .map(|value| value.to_value_on_heap(actor))
+                        .collect()
+                };
                 if self.has_native_handler(actor_id, behavior_idx) {
                     let _ = self.dispatch_native_handler(actor_id, behavior_idx, &payload);
                     if let Some(actor) = self.actors.get_mut(&actor_id) {
@@ -5321,6 +5300,47 @@ impl Runtime {
     /// Restores persistent flags, state models, durable fields, and default
     /// values.  Does NOT register the recovery module, restore CRDT state,
     /// insert into `self.actors`, or enqueue - callers do those.
+    fn restore_state_models_from_snapshot(
+        actor: &mut Actor,
+        module: Option<&crate::bytecode::CodeModule>,
+        snapshot: &ActorSnapshot,
+    ) {
+        actor.state_models = module
+            .into_iter()
+            .flat_map(|module| module.actor_metadata.iter())
+            .flat_map(|meta| &meta.state_models)
+            .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
+            .collect();
+
+        // Snapshot state contains only Durable or CRDT fields. Recover any
+        // runtime-created models absent from module metadata from that existing
+        // representation, avoiding a snapshot-format or transition-digest
+        // change. CRDT identity/type is already carried by the snapshot.
+        for name in snapshot.state.keys() {
+            if actor.state_models.contains_key(name) {
+                continue;
+            }
+
+            let crdt_model = snapshot
+                .crdt_field_map
+                .as_ref()
+                .and_then(|field_map| field_map.get(name))
+                .and_then(|crdt_id| {
+                    snapshot.crdt_snapshot.as_ref().and_then(|entries| {
+                        entries
+                            .iter()
+                            .find(|(id, _, _)| id == crdt_id)
+                            .and_then(|(_, ty, _)| crate::ast::CrdtType::from_u8(*ty))
+                    })
+                })
+                .map(StateModel::Crdt);
+
+            actor
+                .state_models
+                .insert(name.clone(), crdt_model.unwrap_or(StateModel::Durable));
+        }
+    }
+
     fn restore_actor_from_snapshot(
         actor_id: u64,
         module: &crate::bytecode::CodeModule,
@@ -5368,13 +5388,7 @@ impl Runtime {
         actor.bytecode_offsets = offsets;
         actor.compensation_offsets = compensation_offsets;
 
-        // Restore per-field state-model tracking.
-        actor.state_models = module
-            .actor_metadata
-            .iter()
-            .flat_map(|m| &m.state_models)
-            .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
-            .collect();
+        Self::restore_state_models_from_snapshot(&mut actor, Some(module), snapshot);
 
         // Restore durable state fields from the snapshot.
         for (name, value) in &snapshot.state {
@@ -5491,7 +5505,22 @@ impl Runtime {
             let journal = self.persistence.read_journal(stable_actor_id);
             for entry in journal.iter().filter(|e| e.sequence > snap.sequence) {
                 let behavior_idx = entry.behavior_id as usize;
-                let payload: Vec<Value> = entry.payload.iter().map(|p| p.to_value()).collect();
+                let payload: Vec<Value> = {
+                    let actor = self.actors.get_mut(&stable_actor_id).ok_or_else(|| {
+                        NuError::RuntimeError {
+                            msg: format!(
+                                "virtual actor {} disappeared during journal replay",
+                                stable_actor_id
+                            ),
+                            span: Span::new(0, 0),
+                        }
+                    })?;
+                    entry
+                        .payload
+                        .iter()
+                        .map(|value| value.to_value_on_heap(actor))
+                        .collect()
+                };
                 if self.has_native_handler(stable_actor_id, behavior_idx) {
                     // Native handlers cannot be resolved until the actor is in
                     // `self.actors`, so we only support bytecode grains here.
