@@ -632,6 +632,55 @@ impl Actor {
         self.turn_reductions += count;
     }
 
+    /// Convert one actor-owned runtime value into its durable representation.
+    ///
+    /// Constant-pool strings resolve through the actor module. Heap-backed
+    /// strings are accepted only when the pointer exactly matches a live
+    /// allocation tagged `TypeTag::String`; arbitrary pointers fail closed
+    /// through `from_value_resolved` instead of being interpreted as C strings.
+    pub(crate) fn persist_value(&self, value: &Value) -> PersistedValue {
+        if let Some(ptr) = value.as_ptr() {
+            if ptr.is_null() {
+                return PersistedValue::Nil;
+            }
+
+            let mut resolved = None;
+            self.heap.iter_live_objects(|header, payload, _| {
+                if resolved.is_some() || payload != ptr {
+                    return;
+                }
+
+                // SAFETY: iter_live_objects yields headers for live allocations
+                // in this actor heap. Equality with ptr proves exact allocation
+                // provenance before metadata or payload bytes are inspected.
+                let header = unsafe { &*header };
+                if header.type_tag != TypeTag::String || header.payload_size == 0 {
+                    return;
+                }
+
+                // SAFETY: payload_size is the requested size of this live
+                // allocation, so the slice stays within the object. Runtime
+                // strings are UTF-8 bytes followed by a trailing NUL.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(payload as *const u8, header.payload_size)
+                };
+                let Some(nul) = bytes.iter().position(|byte| *byte == 0) else {
+                    return;
+                };
+                let Ok(text) = std::str::from_utf8(&bytes[..nul]) else {
+                    return;
+                };
+                resolved = Some(PersistedValue::String(text.to_owned()));
+            });
+
+            return resolved.unwrap_or_else(|| {
+                PersistedValue::from_value_resolved(value, self.bytecode_module.as_ref())
+            });
+        }
+
+        PersistedValue::from_value_resolved(value, self.bytecode_module.as_ref())
+    }
+
     /// Allocate a null-terminated string on the actor heap and return a pointer
     /// value. Returns nil if allocation fails.
     pub fn allocate_string(&mut self, s: &str) -> Value {
