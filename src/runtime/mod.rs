@@ -5613,12 +5613,12 @@ impl Runtime {
                 stable_actor_id,
                 &grain_type.module,
                 snap,
-                false,
-                false,
+                Some(&grain_id.grain_type),
+                Some(grain_id.actor_name()),
             )
             .map_err(|err| NuError::RuntimeError {
                 msg: format!(
-                    "invalid authority snapshot for virtual actor {}: {}",
+                    "invalid durable snapshot for virtual actor {}: {}",
                     grain_id.actor_name(),
                     err
                 ),
@@ -5635,13 +5635,13 @@ impl Runtime {
                 .iter()
                 .map(|(name, model)| (name.clone(), *model))
                 .collect();
-            // Fill declared initial values.
-            for (name, c) in grain_type
-                .module
-                .actor_metadata
-                .iter()
-                .flat_map(|m| &m.state_defaults)
-            {
+            // Fill declared initial values only from the requested grain schema.
+            let grain_meta = behavior_ownership::actor_meta_for_schema(
+                &grain_type.module,
+                &grain_id.grain_type,
+            )
+            .expect("registered grain type must retain its ActorMeta");
+            for (name, c) in &grain_meta.state_defaults {
                 let v = match c {
                     crate::bytecode::Constant::String(s) => actor.allocate_string(&s),
                     other => crate::vm::constant_to_value(&other),
@@ -5651,7 +5651,9 @@ impl Runtime {
             actor
         };
 
-        // Track the grain identity.
+        // Track canonical schema and grain identity.
+        self.recovery_schema_names
+            .insert(stable_actor_id, grain_id.grain_type.clone());
         self.actors.insert(stable_actor_id, actor);
         self.grain_residents
             .insert(grain_id.clone(), stable_actor_id);
@@ -5729,52 +5731,50 @@ impl Runtime {
             }
         };
 
-        let is_workflow = module.actor_metadata.iter().any(|m| m.is_workflow);
-        let is_agent = module.actor_metadata.iter().any(|m| m.is_agent);
+        let schema_meta = if module.actor_metadata.is_empty() && snapshot.schema_name.is_none() {
+            None
+        } else {
+            match schema_identity::resolve_snapshot_actor_meta(
+                &module,
+                snapshot.schema_name.as_deref(),
+            ) {
+                Ok(meta) => Some(meta.clone()),
+                Err(err) => {
+                    warn!(
+                        "nulang-migrate: invalid schema identity for actor {}: {}",
+                        actor_id, err
+                    );
+                    return false;
+                }
+            }
+        };
+        let is_workflow = schema_meta
+            .as_ref()
+            .is_some_and(|meta| meta.is_workflow);
 
         let actor = match Self::restore_actor_from_snapshot(
             actor_id,
             &module,
             &snapshot,
-            is_workflow,
-            is_agent,
+            None,
+            None,
         ) {
             Ok(actor) => actor,
             Err(err) => {
                 warn!(
-                    "nulang-migrate: invalid authority manifest for actor {}: {}",
+                    "nulang-migrate: invalid durable snapshot for actor {}: {}",
                     actor_id, err
                 );
                 return false;
             }
         };
 
-        // Register the recovery module.
-        let offsets: Vec<usize> = module
-            .behaviors
-            .iter()
-            .map(|b| b.code_offset as usize)
-            .collect();
-        // Filter compensation_offsets to this actor's own behaviors using
-        // behavior_indices from the first workflow ActorMeta (a migrated
-        // actor module carries its own metadata).
-        let compensation_offsets: Vec<Option<usize>> = module
-            .actor_metadata
-            .iter()
-            .find(|m| m.is_workflow)
-            .map(|meta| {
-                meta.behavior_indices
-                    .iter()
-                    .map(|&i| module.behaviors[i].compensate_offset.map(|o| o as usize))
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                module
-                    .behaviors
-                    .iter()
-                    .map(|b| b.compensate_offset.map(|o| o as usize))
-                    .collect()
-            });
+        let offsets = actor.bytecode_offsets.clone();
+        let compensation_offsets = actor.compensation_offsets.clone();
+        if let Some(schema_meta) = &schema_meta {
+            self.recovery_schema_names
+                .insert(actor_id, schema_meta.name.clone());
+        }
         self.recovery_modules
             .insert(actor_id, (module, offsets, compensation_offsets));
 
@@ -5801,10 +5801,10 @@ impl Runtime {
             }
         }
 
+        self.actors.insert(actor_id, actor);
         if is_workflow {
             self.layout_workflow_behavior_table(actor_id);
         }
-        self.actors.insert(actor_id, actor);
         if let Some(ref mut mgr) = self.crdt_manager {
             if let Some(actor) = self.actors.get(&actor_id) {
                 mgr.register_actor_fields(actor_id, actor);
