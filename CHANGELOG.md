@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Durable journal string replay — 2026-09-26
+- **Persistent actor and virtual-actor journal replay now materializes persisted string payloads on the recovering actor heap.** Previously `PersistedValue::String` passed through the context-free `to_value()` conversion and became `nil`, so post-snapshot commands could replay with different arguments than were durably recorded.
+- **Recovered heap strings remain durable across later checkpoints and a second restart.** Snapshot serialization now recognizes exact live actor-heap allocations tagged `TypeTag::String`, while arbitrary pointers still fail closed instead of being interpreted as strings.
+- **Runtime-created persistence models survive ordinary recovery without changing the snapshot format.** Module metadata remains authoritative when present; fields already present in a snapshot recover missing Durable/CRDT classifications from existing snapshot metadata, and event-journal fields recover missing EventSourced classification. This closes the second-crash data-loss gap for persistent actors whose models were supplied at runtime rather than encoded in actor metadata.
+- **Focused regressions pin both stages of the failure.** The suite proves journal replay preserves the string, the post-replay checkpoint stores it semantically, and a second recovery observes the same value.
+
 ### Warm JIT transition A/B controls — 2026-09-25
 - **The same-host A/B harness now includes warmed 100k-iteration JIT execution probes for a non-reentrant arithmetic loop and a call-heavy re-entrant control.** Both compile once before timing, assert interpreter-equivalent results, and require a real JIT region so register-transition optimizations can be measured on their actual hot path instead of inferred from unrelated actor enqueue benchmarks.
 - **The benchmark helper now shares frontend-to-bytecode compilation across JIT A/B probes,** keeping the crossover and warmed-execution fixtures on one compilation path without changing timed work.
