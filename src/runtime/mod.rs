@@ -1848,6 +1848,32 @@ impl Runtime {
             .map(|behavior| behavior.name.clone())
     }
 
+    /// Resolve a runtime-visible behavior id for an actor that is no longer
+    /// resident but still has retained recovery metadata. Workflow ids are
+    /// actor-local, so schema ownership is required to translate them to the
+    /// module-global wire name.
+    fn recovery_behavior_wire_name_for(&self, actor_id: u64, behavior_id: u16) -> Option<String> {
+        let (module, _, _) = self.recovery_modules.get(&actor_id)?;
+        if let Some(schema_name) = self.recovery_schema_names.get(&actor_id) {
+            return behavior_ownership::behavior_name_for_runtime_id(
+                module,
+                schema_name,
+                behavior_id as usize,
+            )
+            .map(str::to_owned);
+        }
+
+        // Narrow compatibility for historical synthetic modules with no
+        // ActorMeta. Their runtime ids are module-global and unambiguous.
+        if module.actor_metadata.is_empty() {
+            return module
+                .behaviors
+                .get(behavior_id as usize)
+                .map(|behavior| behavior.name.clone());
+        }
+        None
+    }
+
     /// Resolve a pointer-tagged value only when it is the exact payload
     /// address of a live ActorHeap string allocation. This deliberately does
     /// not call `CStr::from_ptr` on arbitrary TAG_PTR values: safe code can
@@ -2686,17 +2712,15 @@ impl Runtime {
         // Forwarding for migrated actors: if this actor has been relocated
         // to another node, route the message there instead of bouncing it.
         if let Some(&(target_node, _migrated_at)) = self.migrated_actors.get(&target_id) {
-            // Look up the behavior name from the recovery module.
-            let behavior_name = self
-                .recovery_modules
-                .get(&target_id)
-                .and_then(|(module, _, _)| {
-                    module
-                        .behaviors
-                        .get(behavior_id as usize)
-                        .map(|b| b.name.clone())
-                })
-                .unwrap_or_else(|| format!("behavior_{}", behavior_id));
+            let Some(behavior_name) =
+                self.recovery_behavior_wire_name_for(target_id, behavior_id)
+            else {
+                warn!(
+                    "nulang-net: refusing migrated forwarding for actor {} behavior {}: missing canonical schema ownership",
+                    target_id, behavior_id
+                );
+                return;
+            };
             let target = ActorAddress::remote(target_node, target_id);
             self.send_distributed(target, &behavior_name, args);
             return;
