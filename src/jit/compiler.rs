@@ -756,7 +756,7 @@ pub fn compile_bytecode_region(
                     &helpers,
                     regs_ptr,
                     slots,
-                    HeapTypeTag::Array,
+                    TypeTag::Array,
                     pc,
                     instr.op2 as usize,
                 );
@@ -771,7 +771,7 @@ pub fn compile_bytecode_region(
                     &helpers,
                     regs_ptr,
                     slots,
-                    HeapTypeTag::Record,
+                    TypeTag::Record,
                     pc,
                     instr.op2 as usize,
                 );
@@ -786,7 +786,7 @@ pub fn compile_bytecode_region(
                     &helpers,
                     regs_ptr,
                     slots,
-                    HeapTypeTag::Tuple,
+                    TypeTag::Tuple,
                     pc,
                     instr.op2 as usize,
                 );
@@ -1050,7 +1050,7 @@ fn emit_composite_alloc(
     helpers: &HashMap<RuntimeHelper, FuncRef>,
     regs_ptr: Value,
     tagged_slot_count: Value,
-    type_tag: HeapTypeTag,
+    type_tag: TypeTag,
     pc: usize,
     dst: usize,
 ) {
