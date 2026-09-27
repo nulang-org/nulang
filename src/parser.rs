@@ -8192,8 +8192,14 @@ mod tests {
         let ast = parse(r#"unsafe extern "libm.so.6" { fn sqrt(x: Float) -> Float }"#)
             .expect("unsafe extern should parse");
         assert_eq!(ast.decls.len(), 1);
-        assert!(matches!(&ast.decls[0], Decl::Extern { library, funcs, .. }
-            if library == "libm.so.6" && funcs.len() == 1 && funcs[0].name == "sqrt"));
+        match &ast.decls[0] {
+            Decl::Extern { library, funcs, .. } => {
+                assert_eq!(library, "libm.so.6");
+                assert_eq!(funcs.len(), 1);
+                assert_eq!(funcs[0].name, "sqrt");
+            }
+            _ => panic!("Expected extern declaration"),
+        }
     }
 
     #[test]
