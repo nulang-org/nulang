@@ -636,6 +636,23 @@ mod tests {
         assert_eq!(f64_to_value(2.5).as_float(), Some(2.5));
     }
 
+    #[cfg(not(feature = "ffi"))]
+    #[test]
+    fn test_fixed_arity_bool_abi_is_one_byte_u8() {
+        use super::fixed_arity::CTypeArg;
+
+        assert_eq!(std::mem::size_of::<<u8 as CTypeArg>::Abi>(), 1);
+        assert_eq!(
+            <u8 as CTypeArg>::from_value(Value::bool(true)).expect("encode bool"),
+            1
+        );
+        assert_eq!(
+            <u8 as CTypeArg>::to_value(2).as_bool(),
+            Some(true),
+            "foreign nonzero bool bytes normalize to Nulang true"
+        );
+    }
+
     #[test]
     fn test_marshal_bool_roundtrip() {
         let v = Value::bool(true);
