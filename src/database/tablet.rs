@@ -296,12 +296,9 @@ impl MemoryTablet {
         )
     }
 
-    /// Atomically apply one prevalidated write to the in-memory MVCC state.
-    ///
-    /// All ownership, predecessor, and key-range checks happen before the
-    /// first row version is appended, so a rejected batch leaves the tablet
-    /// unchanged.
-    pub fn commit(&mut self, write: TabletWrite) -> Result<u64, TabletError> {
+    /// Validate a prepared write against the tablet's current ownership and
+    /// committed tail without mutating state.
+    pub(crate) fn validate_write(&self, write: &TabletWrite) -> Result<(), TabletError> {
         if write.tablet_id != self.descriptor.id {
             return Err(TabletError::WrongTablet {
                 expected: self.descriptor.id,
@@ -345,8 +342,19 @@ impl MemoryTablet {
             });
         }
 
-        self.apply_mutations(write.sequence, write.mutations);
-        Ok(write.sequence)
+        Ok(())
+    }
+
+    /// Atomically apply one prevalidated write to the in-memory MVCC state.
+    ///
+    /// All ownership, predecessor, and key-range checks happen before the
+    /// first row version is appended, so a rejected batch leaves the tablet
+    /// unchanged.
+    pub fn commit(&mut self, write: TabletWrite) -> Result<u64, TabletError> {
+        self.validate_write(&write)?;
+        let sequence = write.sequence;
+        self.apply_mutations(sequence, write.mutations);
+        Ok(sequence)
     }
 
     /// Replay one already checksummed/validated WAL record into MVCC state.
