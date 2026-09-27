@@ -775,14 +775,14 @@ impl Parser {
                 self.skip_newlines();
                 if !matches!(self.peek_kind(), TokenKind::Extern) {
                     return Err(NuError::parse_error(
-                        "Expected \`extern\` after \`unsafe\`",
+                        "Expected `extern` after `unsafe`",
                         unsafe_span,
                     ));
                 }
                 self.parse_extern(public)
             }
             TokenKind::Extern => Err(NuError::parse_error(
-                "Native ABI declarations require explicit acknowledgement: use \`unsafe extern\`",
+                "Native ABI declarations require explicit acknowledgement: use `unsafe extern`",
                 self.current_span(),
             )),
             TokenKind::Import => self.parse_import(),
