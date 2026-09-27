@@ -769,7 +769,22 @@ impl Parser {
             }
             TokenKind::Handler => self.parse_named_handler(),
             TokenKind::Effect => self.parse_effect_decl(),
-            TokenKind::Extern => self.parse_extern(public),
+            TokenKind::Unsafe => {
+                let unsafe_span = self.current_span();
+                self.advance(); // consume 'unsafe'
+                self.skip_newlines();
+                if !matches!(self.peek_kind(), TokenKind::Extern) {
+                    return Err(NuError::parse_error(
+                        "Expected \`extern\` after \`unsafe\`",
+                        unsafe_span,
+                    ));
+                }
+                self.parse_extern(public)
+            }
+            TokenKind::Extern => Err(NuError::parse_error(
+                "Native ABI declarations require explicit acknowledgement: use \`unsafe extern\`",
+                self.current_span(),
+            )),
             TokenKind::Import => self.parse_import(),
             TokenKind::Module => {
                 self.advance(); // consume 'module'
@@ -8182,7 +8197,7 @@ mod tests {
 
     #[test]
     fn test_bare_extern_requires_unsafe_acknowledgement() {
-        let err = parse(r#"extern \"libm.so.6\" { fn sqrt(x: Float) -> Float }"#)
+        let err = parse(r#"unsafe extern \"libm.so.6\" { fn sqrt(x: Float) -> Float }"#)
             .expect_err("bare extern must require an explicit unsafe acknowledgement");
         assert!(
             err.to_string().contains("unsafe extern"),
@@ -8192,7 +8207,7 @@ mod tests {
 
     #[test]
     fn test_parse_extern_block() {
-        let ast = parse(r#"extern "libm.so.6" { fn sqrt(x: Float) -> Float fn pow(x: Float, y: Float) -> Float }"#).unwrap();
+        let ast = parse(r#"unsafe extern "libm.so.6" { fn sqrt(x: Float) -> Float fn pow(x: Float, y: Float) -> Float }"#).unwrap();
         assert_eq!(ast.decls.len(), 1);
         match &ast.decls[0] {
             Decl::Extern { library, funcs, .. } => {
@@ -8217,7 +8232,7 @@ mod tests {
 
     #[test]
     fn test_parse_extern_empty_block() {
-        let ast = parse(r#"extern "empty" {}"#).unwrap();
+        let ast = parse(r#"unsafe extern "empty" {}"#).unwrap();
         match &ast.decls[0] {
             Decl::Extern { library, funcs, .. } => {
                 assert_eq!(library, "empty");
@@ -8229,7 +8244,7 @@ mod tests {
 
     #[test]
     fn test_parse_extern_missing_param_type_errors() {
-        let result = parse(r#"extern "lib" { fn f(x) -> Int }"#);
+        let result = parse(r#"unsafe extern "lib" { fn f(x) -> Int }"#);
         assert!(
             result.is_err(),
             "Expected parse error for missing parameter type in extern"
@@ -8238,7 +8253,7 @@ mod tests {
 
     #[test]
     fn test_parse_extern_default_library() {
-        let ast = parse(r#"extern { fn identity(x: Int) -> Int }"#).unwrap();
+        let ast = parse(r#"unsafe extern { fn identity(x: Int) -> Int }"#).unwrap();
         assert_eq!(ast.decls.len(), 1);
         match &ast.decls[0] {
             Decl::Extern { library, funcs, .. } => {
@@ -8252,7 +8267,7 @@ mod tests {
 
     #[test]
     fn test_parse_extern_missing_arrow_errors() {
-        let result = parse(r#"extern { fn f(x: Int) { } }"#);
+        let result = parse(r#"unsafe extern { fn f(x: Int) { } }"#);
         assert!(
             result.is_err(),
             "Expected parse error for missing `->` in extern function"
@@ -8261,7 +8276,7 @@ mod tests {
 
     #[test]
     fn test_parse_extern_unsupported_type_errors() {
-        let result = parse(r#"extern { fn f(x: Int) -> [Int] }"#);
+        let result = parse(r#"unsafe extern { fn f(x: Int) -> [Int] }"#);
         assert!(
             result.is_err(),
             "Expected parse error for unsupported FFI return type"
