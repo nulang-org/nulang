@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 
 use crate::authority::AuthorityManifest;
-use crate::authority_runtime::RuntimeAuthorityError;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::{Actor, ActorBackend, BehaviorEntry};
 use crate::runtime::persistence::{ActorSnapshot, PersistedValue, StateModel, WorkflowEvent};
