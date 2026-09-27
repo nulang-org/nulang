@@ -1,4 +1,8 @@
 # Nulang Changelog
+### NuDB single-node tablet and WAL foundation — 2026-09-27
+- **NuDB now has an experimental single-node range-tablet kernel with ownership-epoch and predecessor-sequence fencing, MVCC snapshot reads, tombstones, deterministic split plans, and WAL-before-visibility commits.** Database hot loops remain ordinary local computation; actors are reserved for future tablet ownership, placement, migration, and distributed coordination.
+- **The prototype WAL fails closed on corrupt framing and payloads and requires recovery after ambiguous append failures.** `NUDBWAL2` protects record metadata and payload bytes independently, truncates only genuinely incomplete crash tails, poisons a live WAL handle after post-emission I/O failure, and fsyncs new WAL directory entries on Unix.
+
 ### Warm JIT transition A/B controls — 2026-09-25
 - **The same-host A/B harness now includes warmed 100k-iteration JIT execution probes for a non-reentrant arithmetic loop and a call-heavy re-entrant control.** Both compile once before timing, assert interpreter-equivalent results, and require a real JIT region so register-transition optimizations can be measured on their actual hot path instead of inferred from unrelated actor enqueue benchmarks.
 - **The benchmark helper now shares frontend-to-bytecode compilation across JIT A/B probes,** keeping the crossover and warmed-execution fixtures on one compilation path without changing timed work.
