@@ -8188,7 +8188,7 @@ mod tests {
 
     #[test]
     fn test_unsafe_extern_block_is_accepted() {
-        let ast = parse(r#"unsafe extern \"libm.so.6\" { fn sqrt(x: Float) -> Float }"#)
+        let ast = parse(r#"unsafe extern "libm.so.6" { fn sqrt(x: Float) -> Float }"#)
             .expect("unsafe extern should parse");
         assert_eq!(ast.decls.len(), 1);
         assert!(matches!(&ast.decls[0], Decl::Extern { library, funcs, .. }
@@ -8197,7 +8197,7 @@ mod tests {
 
     #[test]
     fn test_bare_extern_requires_unsafe_acknowledgement() {
-        let err = parse(r#"unsafe extern \"libm.so.6\" { fn sqrt(x: Float) -> Float }"#)
+        let err = parse(r#"extern "libm.so.6" { fn sqrt(x: Float) -> Float }"#)
             .expect_err("bare extern must require an explicit unsafe acknowledgement");
         assert!(
             err.to_string().contains("unsafe extern"),
