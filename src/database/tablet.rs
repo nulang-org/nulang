@@ -345,25 +345,66 @@ impl MemoryTablet {
             });
         }
 
-        for mutation in write.mutations {
+        self.apply_mutations(write.sequence, write.mutations);
+        Ok(write.sequence)
+    }
+
+    /// Replay one already checksummed/validated WAL record into MVCC state.
+    ///
+    /// WAL replay intentionally does not re-check historical ownership epochs:
+    /// an older owner epoch is valid history. It does re-check sequence order
+    /// and current tablet range before mutating state.
+    pub(crate) fn replay_committed(
+        &mut self,
+        sequence: u64,
+        expected_previous_sequence: u64,
+        mutations: Vec<TabletMutation>,
+    ) -> Result<(), TabletError> {
+        if expected_previous_sequence != self.current_sequence {
+            return Err(TabletError::SequenceMismatch {
+                committed: self.current_sequence,
+                expected_previous: expected_previous_sequence,
+            });
+        }
+        let expected_sequence = self
+            .current_sequence
+            .checked_add(1)
+            .ok_or(TabletError::SequenceOverflow)?;
+        if sequence != expected_sequence {
+            return Err(TabletError::RecoveredSequenceMismatch {
+                expected: expected_sequence,
+                presented: sequence,
+            });
+        }
+        if mutations
+            .iter()
+            .any(|mutation| !self.descriptor.range.contains(mutation.key()))
+        {
+            return Err(TabletError::KeyOutsideTabletRange);
+        }
+
+        self.apply_mutations(sequence, mutations);
+        Ok(())
+    }
+
+    fn apply_mutations(&mut self, sequence: u64, mutations: Vec<TabletMutation>) {
+        for mutation in mutations {
             match mutation {
                 TabletMutation::Put { key, value } => {
                     self.rows.entry(key).or_default().push(VersionedValue {
-                        sequence: write.sequence,
+                        sequence,
                         value: Some(value),
                     });
                 }
                 TabletMutation::Delete { key } => {
                     self.rows.entry(key).or_default().push(VersionedValue {
-                        sequence: write.sequence,
+                        sequence,
                         value: None,
                     });
                 }
             }
         }
-
-        self.current_sequence = write.sequence;
-        Ok(write.sequence)
+        self.current_sequence = sequence;
     }
 
     /// Read one key at an already committed snapshot sequence.
@@ -423,6 +464,10 @@ pub enum TabletError {
         expected_previous: u64,
     },
     SequenceOverflow,
+    RecoveredSequenceMismatch {
+        expected: u64,
+        presented: u64,
+    },
     SnapshotAhead {
         committed: u64,
         requested: u64,
@@ -469,6 +514,13 @@ impl fmt::Display for TabletError {
                 "tablet predecessor {expected_previous} does not match committed sequence {committed}"
             ),
             Self::SequenceOverflow => f.write_str("tablet sequence overflow"),
+            Self::RecoveredSequenceMismatch {
+                expected,
+                presented,
+            } => write!(
+                f,
+                "recovered tablet sequence {presented} does not match expected sequence {expected}"
+            ),
             Self::SnapshotAhead {
                 committed,
                 requested,
