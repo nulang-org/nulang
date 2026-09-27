@@ -145,10 +145,12 @@ fn direct_noalloc_reason(
 /// contract is present, so ordinary compilation pays no duplicate-codegen
 /// cost.
 ///
-/// The bytecode proof is intentionally the single source of truth for the
-/// language-level contract. Backend-specific code generators may lower the
-/// accepted operations differently, but they must not silently weaken what
-/// `@noalloc` means.
+/// The proof combines resolved MIR type evidence with the bytecode emitted
+/// from that MIR. MIR is required for operations such as `+`, whose `IAdd`
+/// runtime fallback may concatenate strings when operand types remain
+/// unresolved; bytecode remains authoritative for concrete runtime
+/// boundaries. Backend-specific code generators must not silently weaken
+/// what `@noalloc` means.
 pub fn prove_noalloc_contracts(mir: &crate::mir::Module) -> crate::types::NuResult<()> {
     if !mir
         .functions
