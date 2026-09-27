@@ -385,13 +385,13 @@ mod fixed_arity {
             f64_to_value(self)
         }
     }
-    impl CTypeArg for bool {
-        type Abi = bool;
+    impl CTypeArg for u8 {
+        type Abi = u8;
         fn from_value(v: Value) -> Result<Self, String> {
-            value_to_bool(&v)
+            value_to_bool(&v).map(u8::from)
         }
         fn to_value(self) -> Value {
-            bool_to_value(self)
+            bool_to_value(self != 0)
         }
     }
     impl CTypeArg for *const c_char {
@@ -425,7 +425,7 @@ mod fixed_arity {
 
     macro_rules! with_returns {
         ($macro:ident!($($args:tt)*)) => {
-            $macro!($($args)*, [(I64, i64); (F64, f64); (Bool, bool); (CStr, *const std::ffi::c_char); (VoidPtr, *mut std::ffi::c_void); (Unit, ())])
+            $macro!($($args)*, [(I64, i64); (F64, f64); (Bool, u8); (CStr, *const std::ffi::c_char); (VoidPtr, *mut std::ffi::c_void); (Unit, ())])
         };
     }
 
@@ -526,7 +526,7 @@ mod fixed_arity {
             [] => with_returns!(arity_0_arms!(func.ptr, ret)),
             [CType::I64] => with_returns!(arity_1_arms!(func.ptr, args, ret, i64)),
             [CType::F64] => with_returns!(arity_1_arms!(func.ptr, args, ret, f64)),
-            [CType::Bool] => with_returns!(arity_1_arms!(func.ptr, args, ret, bool)),
+            [CType::Bool] => with_returns!(arity_1_arms!(func.ptr, args, ret, u8)),
             [CType::CStr] => {
                 with_returns!(arity_1_arms!(func.ptr, args, ret, *const std::ffi::c_char))
             }
@@ -537,21 +537,21 @@ mod fixed_arity {
             [CType::I64, CType::I64] => with_returns!(arity_2_arms!(func.ptr, args, ret, i64, i64)),
             [CType::I64, CType::F64] => with_returns!(arity_2_arms!(func.ptr, args, ret, i64, f64)),
             [CType::I64, CType::Bool] => {
-                with_returns!(arity_2_arms!(func.ptr, args, ret, i64, bool))
+                with_returns!(arity_2_arms!(func.ptr, args, ret, i64, u8))
             }
             [CType::F64, CType::I64] => with_returns!(arity_2_arms!(func.ptr, args, ret, f64, i64)),
             [CType::F64, CType::F64] => with_returns!(arity_2_arms!(func.ptr, args, ret, f64, f64)),
             [CType::F64, CType::Bool] => {
-                with_returns!(arity_2_arms!(func.ptr, args, ret, f64, bool))
+                with_returns!(arity_2_arms!(func.ptr, args, ret, f64, u8))
             }
             [CType::Bool, CType::I64] => {
-                with_returns!(arity_2_arms!(func.ptr, args, ret, bool, i64))
+                with_returns!(arity_2_arms!(func.ptr, args, ret, u8, i64))
             }
             [CType::Bool, CType::F64] => {
-                with_returns!(arity_2_arms!(func.ptr, args, ret, bool, f64))
+                with_returns!(arity_2_arms!(func.ptr, args, ret, u8, f64))
             }
             [CType::Bool, CType::Bool] => {
-                with_returns!(arity_2_arms!(func.ptr, args, ret, bool, bool))
+                with_returns!(arity_2_arms!(func.ptr, args, ret, u8, u8))
             }
             [CType::I64, CType::I64, CType::I64] => {
                 with_returns!(arity_3_arms!(func.ptr, args, ret, i64, i64, i64))
