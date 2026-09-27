@@ -33,6 +33,11 @@ AB_RECORD_RE = re.compile(
     r"\[ab-bench\]\s+benchmark=(?P<benchmark>[a-z0-9_-]+)\s+"
     r"operations=(?P<messages>\d+)\s+elapsed_ns=(?P<elapsed_ns>\d+)"
 )
+SCALE_RECORD_RE = re.compile(
+    r"\[scale-bench\]\s+benchmark=(?P<benchmark>[a-z0-9_-]+)\s+"
+    r"shards=(?P<shards>\d+)\s+operations=(?P<operations>\d+)\s+"
+    r"elapsed_ns=(?P<elapsed_ns>\d+)"
+)
 
 
 CARGO_TARGET_ROOT = Path(tempfile.gettempdir()) / "nulang-ab-cargo-target"
@@ -122,6 +127,20 @@ def parse_records(output: str) -> dict[str, dict[str, int]]:
         )
     return rows
 
+
+def parse_scaling_records(output: str) -> dict[str, dict[str, int]]:
+    rows: dict[str, dict[str, int]] = {}
+    for match in SCALE_RECORD_RE.finditer(output):
+        key = f"{match.group('benchmark')}/shards_{match.group('shards')}"
+        rows[key] = {
+            "operations": int(match.group("operations")),
+            "elapsed_ns": int(match.group("elapsed_ns")),
+        }
+    if not rows:
+        raise RuntimeError("Nulang scaling benchmark output contained no scale records\n" + output)
+    return rows
+
+
 def measurement_affinity(cpu_mode: str) -> set[int] | None:
     if cpu_mode == "host":
         return None
@@ -146,6 +165,25 @@ def cargo_command(extra_args: list[str]) -> list[str]:
         "--nocapture",
         "--test-threads=1",
     ]
+
+
+def scaling_command(extra_args: list[str]) -> list[str]:
+    return [
+        "cargo",
+        "test",
+        "--release",
+        *extra_args,
+        "benchmarks::bench_ab_shard_scaling",
+        "--",
+        "--nocapture",
+        "--test-threads=1",
+    ]
+
+
+def scaling_environment(variant: str) -> dict[str, str]:
+    env = cargo_environment(variant)
+    env["NULANG_BENCH_SHARD_SCALING"] = "1"
+    return env
 
 
 def cargo_build_command(extra_args: list[str]) -> list[str]:
@@ -364,6 +402,54 @@ def main() -> int:
         print_table(summary, compare)
         print_candidate_only(summary)
 
+        scaling_samples: dict[str, dict[str, list[dict[str, int]]]] = {
+            "base": {},
+            "candidate": {},
+        }
+        scaling_supported = {
+            variant: "bench_ab_shard_scaling"
+            in (root / "src" / "benchmarks.rs").read_text(errors="replace")
+            for variant, root in roots.items()
+        }
+        scaling_rounds = args.warmup + args.runs
+        for round_idx in range(scaling_rounds):
+            measured = round_idx >= args.warmup
+            phase = "scale-sample" if measured else "scale-warmup"
+            index = round_idx - args.warmup + 1 if measured else round_idx + 1
+            order = (
+                ("base", "candidate")
+                if round_idx % 2 == 0
+                else ("candidate", "base")
+            )
+            for variant in order:
+                if not scaling_supported[variant]:
+                    continue
+                print(f"[{phase} {index}] {variant}", flush=True)
+                output = command_output(
+                    scaling_command(extra_args),
+                    cwd=roots[variant],
+                    cpu_affinity=None,
+                    env=scaling_environment(variant),
+                )
+                records = parse_scaling_records(output)
+                if measured:
+                    for name, row in records.items():
+                        scaling_samples[variant].setdefault(name, []).append(
+                            {
+                                "messages": row["operations"],
+                                "elapsed_ns": row["elapsed_ns"],
+                            }
+                        )
+
+        scaling_summary = summarize(scaling_samples)
+        scaling_compare = comparisons(scaling_summary)
+        if scaling_summary["base"] or scaling_summary["candidate"]:
+            print()
+            print("host-wide shard scaling diagnostics (no CPU affinity)")
+            print("====================================================")
+            print_table(scaling_summary, scaling_compare)
+            print_candidate_only(scaling_summary)
+
         allowed = (
             sorted(os.sched_getaffinity(0))
             if hasattr(os, "sched_getaffinity")
@@ -406,6 +492,13 @@ def main() -> int:
             "samples": samples,
             "summary": summary,
             "comparison": compare,
+            "scaling_methodology": (
+                "same-host host-wide local actor-drain scaling; no CPU affinity; "
+                "fixed total work across shard counts"
+            ),
+            "scaling_samples": scaling_samples,
+            "scaling_summary": scaling_summary,
+            "scaling_comparison": scaling_compare,
         }
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)

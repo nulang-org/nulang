@@ -54,6 +54,39 @@ class CargoIsolationTests(unittest.TestCase):
         self.assertEqual("present", env["NULANG_AB_SENTINEL"])
 
 
+class ScalingHarnessTests(unittest.TestCase):
+    def test_parse_scaling_records_keeps_each_shard_count_distinct(self):
+        output = """
+[scale-bench] benchmark=actor_drain shards=1 operations=200000 elapsed_ns=1000000
+[scale-bench] benchmark=actor_drain shards=2 operations=200000 elapsed_ns=600000
+[scale-bench] benchmark=actor_drain shards=4 operations=200000 elapsed_ns=350000
+"""
+
+        rows = nulang_ab_bench.parse_scaling_records(output)
+
+        self.assertEqual(
+            {"operations": 200000, "elapsed_ns": 600000},
+            rows["actor_drain/shards_2"],
+        )
+        self.assertEqual(
+            {"operations": 200000, "elapsed_ns": 350000},
+            rows["actor_drain/shards_4"],
+        )
+
+    def test_scaling_command_targets_only_opt_in_scaling_probe(self):
+        command = nulang_ab_bench.scaling_command(
+            ["--no-default-features", "--features", "native-codegen"]
+        )
+
+        self.assertIn("benchmarks::bench_ab_shard_scaling", command)
+        self.assertNotIn("benchmarks::bench_", command)
+
+    def test_scaling_environment_enables_probe_without_losing_variant_isolation(self):
+        env = nulang_ab_bench.scaling_environment("candidate")
+
+        self.assertEqual("1", env["NULANG_BENCH_SHARD_SCALING"])
+        self.assertIn("CARGO_TARGET_DIR", env)
+
 
 if __name__ == "__main__":
     unittest.main()
