@@ -3,9 +3,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nulang::database::tablet::{
-    KeyRange, TabletDescriptor, TabletId, TabletMutation, TabletWrite,
-};
+use nulang::database::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation, TabletWrite};
 use nulang::database::wal::{FileWal, WalError};
 
 static NEXT_TEST_WAL: AtomicU64 = AtomicU64::new(1);
