@@ -256,3 +256,25 @@ pub fn validate_noalloc_contracts(
         Err(violations)
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_allocation_opcodes_are_never_noalloc_safe() {
+        assert_eq!(
+            noalloc_forbidden_opcode(OpCode::SCmpEq),
+            Some("string comparison may allocate while the VM materializes owned strings")
+        );
+        assert_eq!(
+            noalloc_forbidden_opcode(OpCode::Panic),
+            Some("panic/error formatting may allocate")
+        );
+        assert_eq!(
+            noalloc_forbidden_opcode(OpCode::SConcat),
+            Some("string materialization")
+        );
+    }
+}
