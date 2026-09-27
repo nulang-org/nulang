@@ -730,7 +730,7 @@ impl Parser {
         let mut pos = self.pos + 1;
         while pos < self.tokens.len()
             && matches!(
-                self.tokens[pos].kind,
+                &self.tokens[pos].kind,
                 TokenKind::Newline | TokenKind::DocComment(_)
             )
         {
