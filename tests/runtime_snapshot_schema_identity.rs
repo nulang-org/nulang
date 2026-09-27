@@ -235,3 +235,114 @@ fn grain_hydration_rejects_different_valid_module_schema() {
         .expect_err("Counter must reject an Other snapshot");
     assert!(error.to_string().contains("does not match expected schema"));
 }
+
+
+#[test]
+fn recovery_rejects_journal_behavior_owned_by_other_schema() {
+    use nulang::runtime::JournalEntry;
+
+    let module = compile(
+        r#"
+        persistent actor First {
+            behavior hit() { nil }
+        }
+        persistent actor Second {
+            behavior hit() { nil }
+        }
+        "#,
+    );
+    let first_behavior = module
+        .actor_metadata
+        .iter()
+        .find(|meta| meta.name == "First")
+        .expect("First metadata")
+        .behavior_indices[0];
+    let actor_id = 7006;
+    let mut rt = Runtime::new();
+    register_for_recovery(&mut rt, actor_id, module);
+    rt.persistence
+        .save_snapshot(ActorSnapshot {
+            actor_id,
+            sequence: 0,
+            schema_name: Some("Second".to_string()),
+            ..ActorSnapshot::default()
+        })
+        .expect("snapshot");
+    rt.persistence
+        .append_journal(
+            actor_id,
+            JournalEntry {
+                sequence: 1,
+                behavior_id: u16::try_from(first_behavior).expect("behavior id"),
+                payload: vec![],
+            },
+        )
+        .expect("journal");
+
+    assert_eq!(
+        rt.recover_actor(actor_id),
+        None,
+        "recovery must reject durable history owned by another actor schema"
+    );
+    assert!(
+        !rt.actors.contains_key(&actor_id),
+        "invalid journal ownership must fail before actor publication"
+    );
+}
+
+#[test]
+fn migrated_workflow_recovery_keeps_actor_local_behavior_layout() {
+    let module = compile(
+        r#"
+        actor Prefix {
+            behavior ping() { nil }
+        }
+
+        workflow Flow {
+            step first { nil }
+            step second { nil }
+        }
+        "#,
+    );
+    let flow = module
+        .actor_metadata
+        .iter()
+        .find(|meta| meta.name == "Flow")
+        .expect("Flow metadata");
+    let flow_behavior_count = flow.behavior_indices.len();
+    assert!(
+        flow.behavior_indices[0] > 0,
+        "Prefix must occupy an earlier module-global behavior slot"
+    );
+
+    let actor_id = 7007;
+    let snapshot = ActorSnapshot {
+        actor_id,
+        schema_name: Some("Flow".to_string()),
+        ..ActorSnapshot::default()
+    };
+    let nbc = module.to_nbc(None).expect("nbc");
+    let json = serde_json::to_vec(&snapshot).expect("snapshot json");
+
+    let mut rt = Runtime::new();
+    assert!(rt.receive_migrated_actor(actor_id, nbc, json));
+    assert_eq!(
+        rt.actors[&actor_id].bytecode_offsets.len(),
+        flow_behavior_count,
+        "migrated workflow must start with actor-local offsets"
+    );
+
+    rt.persistence
+        .save_snapshot(snapshot)
+        .expect("persist snapshot for crash recovery");
+    rt.actors.remove(&actor_id);
+
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+    assert_eq!(
+        rt.actors[&actor_id].bytecode_offsets.len(),
+        flow_behavior_count,
+        "recovery after migration must retain actor-local workflow offsets"
+    );
+    assert_eq!(rt.behavior_id_for(actor_id, "first"), Some(0));
+    assert_eq!(rt.behavior_id_for(actor_id, "second"), Some(1));
+}
