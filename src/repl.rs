@@ -86,6 +86,7 @@ impl ReplHelper {
                 "pub",
                 "type",
                 "alias",
+                "unsafe",
                 "extern",
                 "iso",
                 "trn",
