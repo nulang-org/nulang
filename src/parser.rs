@@ -4588,6 +4588,7 @@ impl Parser {
             TokenKind::Database,
             TokenKind::Type,
             TokenKind::Effect,
+            TokenKind::Unsafe,
             TokenKind::Extern,
             TokenKind::Import,
             TokenKind::Module,
