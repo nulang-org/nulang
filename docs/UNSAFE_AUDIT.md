@@ -99,9 +99,16 @@ bounded helper during the rewrite.
 The trait-object layout transmute is not guaranteed by the language (works on
 all Tier-1 targets; documented at the site). The FFI transmutes trust the
 registered `Signature` — a wrong signature is instant UB at call time.
-**Recommended fix:** keep, but consider `std::ptr::metadata` APIs once
-stable; for FFI, this is inherent to dynamic loading — the library allowlist
-(`ffi/native.rs::is_lib_allowed`) is the real mitigation.
+**Status:** PARTIALLY CLOSED (2026-09-27) — Nulang source now requires
+`unsafe extern` for native ABI declarations. This makes the signature/layout
+proof obligation explicit at the declaration site while preserving the existing
+`FFI` effect and runtime library/symbol authority checks. Because source-level
+FFI currently accepts only `Int`, `Float`, `Bool`, `String`, and `Unit` rather
+than raw pointer types, the declaration is the narrow unsafe boundary; ordinary
+calls do not gain a separate unchecked execution mode.
+**Remaining:** keep the transmute-based dynamic-call bridge, but consider
+`std::ptr::metadata` APIs once stable; the library allowlist and exact
+library/symbol authority remain runtime mitigations.
 
 ### F6 — MEDIUM — `unsafe impl Send/Sync` on raw-pointer callback/graph types
 `src/runtime/callbacks.rs:807-808` (`BytecodeRuntimeCallbacks`, wraps
