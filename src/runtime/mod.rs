@@ -5546,12 +5546,14 @@ impl Runtime {
     /// insert into `self.actors`, or enqueue - callers do those.
     fn restore_state_models_from_snapshot(
         actor: &mut Actor,
-        module: Option<&crate::bytecode::CodeModule>,
+        selected_meta: Option<&crate::bytecode::ActorMeta>,
         snapshot: &ActorSnapshot,
     ) {
-        actor.state_models = module
+        // Declared state models come only from the actor schema selected for
+        // this durable identity. Never flatten metadata from sibling actor
+        // schemas in the same module.
+        actor.state_models = selected_meta
             .into_iter()
-            .flat_map(|module| module.actor_metadata.iter())
             .flat_map(|meta| &meta.state_models)
             .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
             .collect();
