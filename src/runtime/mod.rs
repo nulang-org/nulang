@@ -1425,26 +1425,6 @@ impl Runtime {
             }
         }
 
-        if self.actors.contains_key(&target_id)
-            && !self.actor_accepts_numeric_delivery(target_id, behavior_id)
-        {
-            warn!(
-                "nulang-runtime: rejecting cross-shard message to actor {}: behavior id {} is not owned by target schema",
-                target_id, behavior_id
-            );
-            self.route_to_dlq(
-                &Message {
-                    behavior_id,
-                    payload: MessagePayload::from_slice(&[]),
-                    sender,
-                    priority: MessagePriority::System,
-                    trace_id: trace_id.clone(),
-                },
-                "behavior id not owned by target actor schema (cross-shard)",
-            );
-            return;
-        }
-
         let msg = Message {
             behavior_id,
             payload: MessagePayload::from_vec(payload),
@@ -2085,54 +2065,18 @@ impl Runtime {
         }
     }
 
-    /// Return whether `behavior_id` names a real executable handler owned by
-    /// `target_id`. Metadata-free synthetic modules retain their historical
-    /// global behavior table; compiler-produced actor modules prove ownership
-    /// through the target actor's canonical schema identity.
+    /// Return whether `behavior_id` names a real native or executable
+    /// bytecode handler on `target_id`. Bytecode execution is schema-scoped
+    /// by `has_bytecode_handler`; numeric mailbox transport itself remains a
+    /// low-level primitive and may carry inert/unknown ids.
     fn actor_has_behavior_id(&self, target_id: u64, behavior_id: u16) -> bool {
         let behavior_idx = behavior_id as usize;
-        let Some(actor) = self.actors.get(&target_id) else {
-            return false;
-        };
-        if actor
-            .behavior_table
-            .get(behavior_idx)
-            .is_some_and(|entry| !entry.name.is_empty())
-        {
-            return true;
-        }
-
-        let Some(module) = actor.bytecode_module.as_ref() else {
-            return false;
-        };
-        if module.actor_metadata.is_empty() {
-            return self.has_bytecode_handler(target_id, behavior_idx);
-        }
-
-        behavior_ownership::module_behavior_index_for_actor(module, &actor.name, behavior_idx)
-            .is_some()
-            && self.has_bytecode_handler(target_id, behavior_idx)
-    }
-
-    /// Numeric mailbox admission is intentionally compatible with anonymous
-    /// low-level actors: inert behavior id 0 remains usable when an actor has no
-    /// declared native or bytecode behavior. Typed/module actors are strict.
-    fn actor_accepts_numeric_delivery(&self, target_id: u64, behavior_id: u16) -> bool {
-        if self.actor_has_behavior_id(target_id, behavior_id) {
-            return true;
-        }
-        let Some(actor) = self.actors.get(&target_id) else {
-            return false;
-        };
-        let has_named_native = actor
-            .behavior_table
-            .iter()
-            .any(|entry| !entry.name.is_empty());
-        let has_named_bytecode = actor
-            .bytecode_module
-            .as_ref()
-            .is_some_and(|module| module.behaviors.iter().any(|entry| !entry.name.is_empty()));
-        behavior_id == 0 && !has_named_native && !has_named_bytecode
+        let has_native = self
+            .actors
+            .get(&target_id)
+            .and_then(|actor| actor.behavior_table.get(behavior_idx))
+            .is_some_and(|entry| !entry.name.is_empty());
+        has_native || self.has_bytecode_handler(target_id, behavior_idx)
     }
 
     pub fn behavior_id_for(&self, target_id: u64, behavior: &str) -> Option<u16> {
@@ -2621,26 +2565,6 @@ impl Runtime {
         args: &[Value],
         out_trace: Option<String>,
     ) -> MessageAdmission {
-        if self.actors.contains_key(&target_id)
-            && !self.actor_accepts_numeric_delivery(target_id, behavior_id)
-        {
-            warn!(
-                "nulang-runtime: rejecting local message to actor {}: behavior id {} is not owned by target schema",
-                target_id, behavior_id
-            );
-            self.route_to_dlq(
-                &Message {
-                    behavior_id,
-                    payload: MessagePayload::from_slice(args),
-                    sender: self.current_actor.unwrap_or(0),
-                    priority: MessagePriority::System,
-                    trace_id: out_trace.clone(),
-                },
-                "behavior id not owned by target actor schema",
-            );
-            return MessageAdmission::Rejected;
-        }
-
         let msg = Message {
             behavior_id,
             payload: MessagePayload::from_slice(args),
@@ -4352,10 +4276,29 @@ impl Runtime {
     }
 
     fn has_bytecode_handler(&self, actor_id: u64, behavior_idx: usize) -> bool {
-        self.actors
-            .get(&actor_id)
-            .map(|a| a.bytecode_module.is_some() && behavior_idx < a.bytecode_offsets.len())
-            .unwrap_or(false)
+        let Some(actor) = self.actors.get(&actor_id) else {
+            return false;
+        };
+        let Some(module) = actor.bytecode_module.as_ref() else {
+            return false;
+        };
+        if behavior_idx >= actor.bytecode_offsets.len() {
+            return false;
+        }
+        if module.actor_metadata.is_empty() {
+            return true;
+        }
+        if behavior_ownership::module_behavior_index_for_actor(module, &actor.name, behavior_idx)
+            .is_some()
+        {
+            return true;
+        }
+
+        // Recovery predates durable schema identity in this stack layer and
+        // rebuilds ordinary actors with synthetic actor_<id> names. Preserve
+        // that legacy execution path here; the immediately-following durable
+        // schema PR binds recovery to ActorMeta.name and removes the ambiguity.
+        actor.name.starts_with("actor_")
     }
 
     fn next_sequence(&self, actor_id: u64) -> u64 {
