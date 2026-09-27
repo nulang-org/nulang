@@ -73,6 +73,29 @@ The bytecode VM is designed for compact code and fast dispatch:
 - **Reference capabilities**: `iso` and `val` references are sendable without deep copies; the type system guarantees no aliasing at compile time.
 - **Cross-node**: String content travels by value on the wire and is re-interned at the destination. Heap pointers, closures, and actor refs are rejected at send time.
 
+## Allocation transparency
+
+Nulang can inspect structural allocation costs in compiled bytecode without profiling a live workload:
+
+```bash
+nulang costs app.nula
+nulang costs app.nula --json
+nulang costs app.nula --deny-allocations
+```
+
+The report counts allocation **sites**, not dynamic frequency. It separates heap-object allocation, string materialization, and heap sites that the existing escape analysis proves eligible for the activation-local iso arena. An arena-eligible site is cheaper to reclaim, but it is still an allocation.
+
+For hot-path APIs that must remain allocation-free, the Experimental `@noalloc` contract makes that requirement compiler-checked:
+
+```nulang
+@noalloc
+fn hash_slot(key: Int) -> Int {
+  key % 16384
+}
+```
+
+The compiler checks optimized emitted bytecode and follows statically resolved direct calls transitively. Indirect calls fail closed because their targets cannot be proven allocation-free. Runtime-integrated operations that may allocate—such as effect/suspension boundaries, FFI/Python, actor/distributed operations, I/O, capture storage, spills, heap objects, and string materialization—also reject the contract.
+
 ## Benchmark methodology
 
 The repository includes Criterion benchmarks that separate interpreter, warm-JIT, actor/runtime, cache, and supported AOT paths. Run the benchmark harness with:
