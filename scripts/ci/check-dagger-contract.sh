@@ -31,6 +31,8 @@ for script in scripts/ci/buildkite-rust-static.sh scripts/ci/buildkite-rust-test
 done
 
 require_literal "$runner" 'DAGGER_VERSION="1.0.0-beta.14"'
+require_literal "$runner" '--no-mod'
+require_literal "$dagger" 'directory "." --gitignore=true'
 require_literal "$smoke" 'event: manual'
 require_literal "$smoke" 'branch: main'
 require_literal "$smoke" 'NULANG_VERIFICATION_LANE == "dagger-smoke"'
