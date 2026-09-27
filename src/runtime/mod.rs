@@ -13,7 +13,6 @@ use tracing::warn;
 mod actor;
 mod behavior_ownership;
 mod blocking_executor;
-mod schema_identity;
 pub mod cache;
 pub mod cache_cluster;
 pub mod cache_dispatch;
@@ -28,6 +27,7 @@ pub mod heap;
 pub(crate) mod heap_serialize;
 mod mailbox;
 mod scheduler;
+mod schema_identity;
 pub use heap_serialize::*;
 mod cluster;
 mod distributed;
@@ -2712,8 +2712,7 @@ impl Runtime {
         // Forwarding for migrated actors: if this actor has been relocated
         // to another node, route the message there instead of bouncing it.
         if let Some(&(target_node, _migrated_at)) = self.migrated_actors.get(&target_id) {
-            let Some(behavior_name) =
-                self.recovery_behavior_wire_name_for(target_id, behavior_id)
+            let Some(behavior_name) = self.recovery_behavior_wire_name_for(target_id, behavior_id)
             else {
                 warn!(
                     "nulang-net: refusing migrated forwarding for actor {} behavior {}: missing canonical schema ownership",
@@ -5833,11 +5832,9 @@ impl Runtime {
                 .collect();
             // Fill declared initial values only from the requested grain
             // schema, never from sibling actor declarations in the module.
-            let grain_meta = behavior_ownership::actor_meta_for_schema(
-                &grain_type.module,
-                &grain_id.grain_type,
-            )
-            .expect("registered grain type must retain its ActorMeta");
+            let grain_meta =
+                behavior_ownership::actor_meta_for_schema(&grain_type.module, &grain_id.grain_type)
+                    .expect("registered grain type must retain its ActorMeta");
             for (name, constant) in &grain_meta.state_defaults {
                 let value = match constant {
                     crate::bytecode::Constant::String(text) => actor.allocate_string(text),
@@ -5960,9 +5957,7 @@ impl Runtime {
                 }
             }
         };
-        let is_workflow = schema_meta
-            .as_ref()
-            .is_some_and(|meta| meta.is_workflow);
+        let is_workflow = schema_meta.as_ref().is_some_and(|meta| meta.is_workflow);
 
         let actor =
             match Self::restore_actor_from_snapshot(actor_id, &module, &snapshot, None, None) {
