@@ -3791,7 +3791,7 @@ fn main() -> Int { positive(1) }
         let source = r#"
 @noalloc
 fn countdown(n: Int) -> Int {
-    if n == 0 { 0 } else { countdown(n - 1) }
+    if n == 0 then 0 else countdown(n - 1)
 }
 
 fn main() -> Int { countdown(4) }
