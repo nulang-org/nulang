@@ -60,8 +60,7 @@ impl ActorVmCallbacks for TrackingCallbacks {
         unsafe {
             let header = &*ActorHeap::header_of(ptr);
             (header.type_tag == TypeTag::Array).then(|| {
-                header.size.saturating_sub(ActorHeap::HEADER_SIZE)
-                    / std::mem::size_of::<Value>()
+                header.size.saturating_sub(ActorHeap::HEADER_SIZE) / std::mem::size_of::<Value>()
             })
         }
     }
@@ -114,9 +113,18 @@ fn qualifying_allocation_uses_iso_arena_and_resets_at_completion() {
     vm.run().expect("VM run should succeed");
 
     let stats = stats.borrow();
-    assert_eq!(stats.arena_allocs, 1, "qualifying allocation must use arena");
-    assert_eq!(stats.heap_allocs, 0, "qualifying allocation must bypass heap");
-    assert_eq!(stats.arena_resets, 1, "completed activation must reset arena");
+    assert_eq!(
+        stats.arena_allocs, 1,
+        "qualifying allocation must use arena"
+    );
+    assert_eq!(
+        stats.heap_allocs, 0,
+        "qualifying allocation must bypass heap"
+    );
+    assert_eq!(
+        stats.arena_resets, 1,
+        "completed activation must reset arena"
+    );
 }
 
 #[test]
@@ -128,7 +136,16 @@ fn escaping_allocation_stays_on_heap() {
     vm.run().expect("VM run should succeed");
 
     let stats = stats.borrow();
-    assert_eq!(stats.arena_allocs, 0, "escaping allocation must not use arena");
-    assert_eq!(stats.heap_allocs, 1, "escaping allocation must remain heap-backed");
-    assert_eq!(stats.arena_resets, 1, "completed activation still resets arena");
+    assert_eq!(
+        stats.arena_allocs, 0,
+        "escaping allocation must not use arena"
+    );
+    assert_eq!(
+        stats.heap_allocs, 1,
+        "escaping allocation must remain heap-backed"
+    );
+    assert_eq!(
+        stats.arena_resets, 1,
+        "completed activation still resets arena"
+    );
 }
