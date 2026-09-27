@@ -257,6 +257,7 @@ impl WasmBackend {
     // ── Compile ───────────────────────────────────────────────────
 
     pub fn compile(&mut self, mir: &mir::Module, _module_name: &str) -> NuResult<Vec<u8>> {
+        crate::cost_model::prove_noalloc_contracts(mir)?;
         if mir.actor_metadata.iter().any(|meta| meta.is_workflow) {
             return Err(crate::types::NuError::VMError {
                 msg: "WASM backend does not yet support durable workflow semantics; use the bytecode/native runtime until workflow journaling, suspension, recovery, and compensation are implemented for WASM".into(),
