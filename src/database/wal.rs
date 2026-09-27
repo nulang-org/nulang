@@ -20,8 +20,20 @@ use std::path::{Path, PathBuf};
 use super::tablet::{MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite};
 
 const WAL_MAGIC: &[u8; 8] = b"NUDBWAL1";
+const WAL_FRAME_MAGIC: &[u8; 4] = b"NREC";
+const WAL_FRAME_VERSION: u16 = 1;
 const WAL_RECORD_VERSION: u16 = 1;
+const WAL_FRAME_PREFIX_BYTES: usize = 4 + 2 + 4;
+const WAL_FRAME_HEADER_BYTES: usize = WAL_FRAME_PREFIX_BYTES + 32;
 const MAX_WAL_RECORD_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppendFailPoint {
+    AfterHeader,
+    AfterPayload,
+    AfterChecksum,
+    AfterSync,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct DiskWalRecord {
@@ -126,6 +138,9 @@ pub struct FileWal {
     record_end_offsets: Vec<u64>,
     tablet_id: Option<TabletId>,
     latest_ownership_epoch: Option<u64>,
+    poisoned: bool,
+    #[cfg(test)]
+    append_failpoint: Option<AppendFailPoint>,
 }
 
 impl FileWal {
@@ -163,23 +178,17 @@ impl FileWal {
 
         loop {
             let record_start = file.stream_position()?;
-            let mut length_bytes = [0_u8; 4];
-            let length_read = read_up_to(&mut file, &mut length_bytes)?;
-            if length_read == 0 {
+            let mut header = [0_u8; WAL_FRAME_HEADER_BYTES];
+            let header_read = read_up_to(&mut file, &mut header)?;
+            if header_read == 0 {
                 break;
             }
-            if length_read != length_bytes.len() {
+            if header_read != header.len() {
                 truncate_crash_tail(&mut file, record_start)?;
                 break;
             }
 
-            let payload_len = u32::from_le_bytes(length_bytes) as usize;
-            if payload_len > MAX_WAL_RECORD_BYTES {
-                return Err(WalError::RecordTooLarge {
-                    offset: record_start,
-                    length: payload_len,
-                });
-            }
+            let payload_len = decode_frame_header(&header, record_start)?;
 
             let mut payload = vec![0_u8; payload_len];
             if read_up_to(&mut file, &mut payload)? != payload_len {
@@ -230,6 +239,9 @@ impl FileWal {
             record_end_offsets,
             tablet_id,
             latest_ownership_epoch,
+            poisoned: false,
+            #[cfg(test)]
+            append_failpoint: None,
         })
     }
 
@@ -299,6 +311,10 @@ impl FileWal {
     /// have been written and `sync_data` succeeds. If an I/O failure leaves a
     /// partial physical append, reopening the WAL truncates that crash tail.
     pub fn append_write(&mut self, write: &TabletWrite) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(WalError::Poisoned);
+        }
+
         let record = WalRecord::from_write(write);
         let last_sequence = self.last_sequence();
 
@@ -353,20 +369,96 @@ impl FileWal {
             length: payload.len(),
         })?;
         let checksum = blake3::hash(&payload);
+        let header = encode_frame_header(payload_len);
 
+        // Seeking does not mutate the file. Once the first frame byte may have
+        // been emitted, every early return leaves this handle poisoned. The
+        // only safe way to continue is to reopen, which validates/truncates the
+        // physical tail before accepting another append.
         self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&payload_len.to_le_bytes())?;
+        self.poisoned = true;
+
+        self.file.write_all(&header)?;
+        self.maybe_fail_append_for_test(AppendFailPoint::AfterHeader)?;
         self.file.write_all(&payload)?;
+        self.maybe_fail_append_for_test(AppendFailPoint::AfterPayload)?;
         self.file.write_all(checksum.as_bytes())?;
+        self.maybe_fail_append_for_test(AppendFailPoint::AfterChecksum)?;
         self.file.sync_data()?;
+        self.maybe_fail_append_for_test(AppendFailPoint::AfterSync)?;
 
         let end = self.file.stream_position()?;
         self.tablet_id = Some(record.tablet_id);
         self.latest_ownership_epoch = Some(record.ownership_epoch);
         self.records.push(record);
         self.record_end_offsets.push(end);
+        self.poisoned = false;
         Ok(())
     }
+
+    #[cfg(test)]
+    fn set_append_failpoint_for_test(&mut self, point: AppendFailPoint) {
+        self.append_failpoint = Some(point);
+    }
+
+    #[cfg(test)]
+    fn maybe_fail_append_for_test(&mut self, point: AppendFailPoint) -> io::Result<()> {
+        if self.append_failpoint == Some(point) {
+            self.append_failpoint = None;
+            return Err(io::Error::other(format!(
+                "injected NuDB WAL append failure at {point:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn maybe_fail_append_for_test(&mut self, _point: AppendFailPoint) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_frame_header(payload_len: u32) -> [u8; WAL_FRAME_HEADER_BYTES] {
+    let mut header = [0_u8; WAL_FRAME_HEADER_BYTES];
+    header[..4].copy_from_slice(WAL_FRAME_MAGIC);
+    header[4..6].copy_from_slice(&WAL_FRAME_VERSION.to_le_bytes());
+    header[6..10].copy_from_slice(&payload_len.to_le_bytes());
+    let checksum = blake3::hash(&header[..WAL_FRAME_PREFIX_BYTES]);
+    header[WAL_FRAME_PREFIX_BYTES..].copy_from_slice(checksum.as_bytes());
+    header
+}
+
+fn decode_frame_header(
+    header: &[u8; WAL_FRAME_HEADER_BYTES],
+    offset: u64,
+) -> Result<usize, WalError> {
+    if &header[..4] != WAL_FRAME_MAGIC {
+        return Err(WalError::InvalidFrameHeader {
+            offset,
+            reason: "record magic mismatch".to_string(),
+        });
+    }
+
+    let version = u16::from_le_bytes([header[4], header[5]]);
+    if version != WAL_FRAME_VERSION {
+        return Err(WalError::UnsupportedFrameVersion { offset, version });
+    }
+
+    let expected_checksum = blake3::hash(&header[..WAL_FRAME_PREFIX_BYTES]);
+    if &header[WAL_FRAME_PREFIX_BYTES..] != expected_checksum.as_bytes() {
+        return Err(WalError::HeaderChecksumMismatch { offset });
+    }
+
+    let payload_len =
+        u32::from_le_bytes([header[6], header[7], header[8], header[9]]) as usize;
+    if payload_len > MAX_WAL_RECORD_BYTES {
+        return Err(WalError::RecordTooLarge {
+            offset,
+            length: payload_len,
+        });
+    }
+
+    Ok(payload_len)
 }
 
 fn validate_record_chain(
@@ -443,6 +535,17 @@ pub enum WalError {
         message: String,
     },
     InvalidHeader,
+    InvalidFrameHeader {
+        offset: u64,
+        reason: String,
+    },
+    UnsupportedFrameVersion {
+        offset: u64,
+        version: u16,
+    },
+    HeaderChecksumMismatch {
+        offset: u64,
+    },
     UnsupportedRecordVersion {
         offset: u64,
         version: u16,
@@ -478,6 +581,7 @@ pub enum WalError {
     Serialization {
         message: String,
     },
+    Poisoned,
 }
 
 impl From<io::Error> for WalError {
@@ -494,6 +598,16 @@ impl fmt::Display for WalError {
         match self {
             Self::Io { message, .. } => write!(f, "WAL I/O error: {message}"),
             Self::InvalidHeader => f.write_str("invalid NuDB WAL header"),
+            Self::InvalidFrameHeader { offset, reason } => {
+                write!(f, "invalid WAL frame header at byte offset {offset}: {reason}")
+            }
+            Self::UnsupportedFrameVersion { offset, version } => write!(
+                f,
+                "unsupported WAL frame version {version} at byte offset {offset}"
+            ),
+            Self::HeaderChecksumMismatch { offset } => {
+                write!(f, "WAL frame header checksum mismatch at byte offset {offset}")
+            }
             Self::UnsupportedRecordVersion { offset, version } => write!(
                 f,
                 "unsupported WAL record version {version} at byte offset {offset}"
@@ -535,6 +649,9 @@ impl fmt::Display for WalError {
             Self::Serialization { message } => {
                 write!(f, "WAL serialization error: {message}")
             }
+            Self::Poisoned => f.write_str(
+                "NuDB WAL handle is poisoned after an ambiguous append; reopen before retrying",
+            ),
         }
     }
 }
