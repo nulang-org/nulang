@@ -1,5 +1,5 @@
 # Portable Dagger Core representation of Nulang's repository-owned CI contract.
-source=$(host | directory ".")
+source=$(host | directory "." --gitignore=true)
 
 container |
   from "rust:1.95-bookworm" |
