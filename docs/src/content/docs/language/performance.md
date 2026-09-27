@@ -94,7 +94,7 @@ fn hash_slot(key: Int) -> Int {
 }
 ```
 
-The compiler checks optimized emitted bytecode and follows statically resolved direct calls transitively. Indirect calls fail closed because their targets cannot be proven allocation-free. Runtime-integrated operations that may allocate—such as effect/suspension boundaries, FFI/Python, actor/distributed operations, I/O, capture storage, spills, heap objects, and string materialization—also reject the contract.
+The compiler combines resolved MIR type evidence with optimized emitted bytecode and follows statically resolved direct calls transitively. This rejects operations such as unresolved `+` that can fall back to allocating string concatenation at runtime while still allowing proven `Int`/`Float` arithmetic. Indirect calls fail closed because their targets cannot be proven allocation-free. Runtime-integrated operations that may allocate—such as effect/suspension boundaries, FFI/Python, actor/distributed operations, I/O, capture storage, spills, heap objects, and string materialization—also reject the contract.
 
 ## Benchmark methodology
 
