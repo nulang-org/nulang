@@ -33,7 +33,9 @@ done
 require_literal "$runner" 'DAGGER_VERSION="1.0.0-beta.14"'
 require_literal "$smoke" 'event: manual'
 require_literal "$smoke" 'branch: main'
+require_literal "$smoke" 'NULANG_VERIFICATION_LANE == "dagger-smoke"'
 require_literal "$smoke" 'privileged: true'
+require_literal "$woodpecker" 'NULANG_VERIFICATION_LANE == "ci" || NULANG_VERIFICATION_LANE == "all"'
 require_literal "$smoke" 'podman/podman.sock:/var/run/docker.sock'
 require_literal "$smoke" 'bash scripts/ci/run-dagger-core.sh'
 
