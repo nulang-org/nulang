@@ -146,3 +146,52 @@ fn wal_fails_closed_on_checksum_corruption() {
 
     let _ = fs::remove_file(path);
 }
+
+
+#[test]
+fn wal_replay_reconstructs_mvcc_snapshots_after_restart() {
+    let path = temp_wal("replay");
+    let _ = fs::remove_file(&path);
+
+    {
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append_write(&write(0, b"k", b"v1")).unwrap();
+        wal.append_write(&write(1, b"k", b"v2")).unwrap();
+    }
+
+    let wal = FileWal::open(&path).unwrap();
+    let tablet = wal.recover_memory_tablet(descriptor()).unwrap();
+
+    assert_eq!(tablet.current_sequence(), 2);
+    assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
+    assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn wal_replay_revalidates_mutations_against_the_recovery_range() {
+    let path = temp_wal("replay_range");
+    let _ = fs::remove_file(&path);
+
+    {
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append_write(&write(0, b"y", b"value")).unwrap();
+    }
+
+    let narrow = TabletDescriptor::new(
+        TabletId::new(31).unwrap(),
+        KeyRange::new(b"a".to_vec(), Some(b"m".to_vec())).unwrap(),
+        4,
+    )
+    .unwrap();
+
+    let wal = FileWal::open(&path).unwrap();
+    let error = wal.recover_memory_tablet(narrow).unwrap_err();
+    assert!(matches!(
+        error,
+        WalError::ReplayRejected { sequence: 1, .. }
+    ));
+
+    let _ = fs::remove_file(path);
+}
