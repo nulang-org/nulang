@@ -5264,6 +5264,34 @@ impl Runtime {
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
+
+        let selected_meta = if let Some((module, _, _)) = self.recovery_modules.get(&actor_id) {
+            if module.actor_metadata.is_empty() && snapshot.schema_name.is_none() {
+                // Historical synthetic bytecode modules predate ActorMeta.
+                None
+            } else {
+                match schema_identity::resolve_snapshot_actor_meta(
+                    module,
+                    snapshot.schema_name.as_deref(),
+                ) {
+                    Ok(meta) => Some(meta.clone()),
+                    Err(err) => {
+                        warn!(
+                            "nulang-recover: refusing actor {} with invalid schema identity: {}",
+                            actor_id, err
+                        );
+                        return None;
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        let recovery_schema_name = selected_meta
+            .as_ref()
+            .map(|meta| meta.name.clone())
+            .or_else(|| snapshot.schema_name.clone());
+
         let authority_manifest =
             match crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens) {
                 Ok(manifest) => manifest,
@@ -5276,29 +5304,61 @@ impl Runtime {
                 }
             };
         let workflow_events = self.persistence.read_workflow_events(actor_id);
-        let is_workflow = self
-            .recovery_modules
-            .get(&actor_id)
-            .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_workflow))
+        let is_workflow = selected_meta
+            .as_ref()
+            .map(|meta| meta.is_workflow)
             .unwrap_or(!workflow_events.is_empty());
-        let is_agent = self
-            .recovery_modules
-            .get(&actor_id)
-            .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_agent))
+        let is_agent = selected_meta
+            .as_ref()
+            .map(|meta| meta.is_agent)
             .unwrap_or(false);
 
-        let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
+        // Validate ordinary message history before publishing the actor. An
+        // in-range module-global id owned by a sibling schema is not a valid
+        // command for this durable identity.
+        let journal_to_replay: Vec<JournalEntry> = if is_workflow {
+            Vec::new()
+        } else {
+            self.persistence
+                .read_journal(actor_id)
+                .into_iter()
+                .filter(|entry| entry.sequence > snapshot.sequence)
+                .collect()
+        };
+        if let (Some(meta), Some((module, _, _))) =
+            (selected_meta.as_ref(), self.recovery_modules.get(&actor_id))
+        {
+            for entry in &journal_to_replay {
+                if behavior_ownership::module_behavior_index_for_runtime_id(
+                    module,
+                    &meta.name,
+                    entry.behavior_id as usize,
+                )
+                .is_none()
+                {
+                    warn!(
+                        "nulang-recover: refusing actor {}: journal behavior id {} is not owned by schema '{}'",
+                        actor_id, entry.behavior_id, meta.name
+                    );
+                    return None;
+                }
+            }
+        }
+
+        let mut actor = Actor::new(
+            actor_id,
+            recovery_schema_name
+                .clone()
+                .unwrap_or_else(|| format!("actor_{}", actor_id)),
+            0,
+        );
         actor.persistent = true;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
         actor.waiting_signal = snapshot.waiting_signal.clone();
         actor.install_authority_manifest(&authority_manifest);
-        let recovery_module = self
-            .recovery_modules
-            .get(&actor_id)
-            .map(|(module, _, _)| module);
-        Self::restore_state_models_from_snapshot(&mut actor, recovery_module, &snapshot);
+        Self::restore_state_models_from_snapshot(&mut actor, selected_meta.as_ref(), &snapshot);
         // Restore CRDT state if present in the snapshot.
         if let Some(crdt_snap) = &snapshot.crdt_snapshot {
             if let Some(manager) = &mut self.crdt_manager {
