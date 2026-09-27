@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Opaque scalar FFI transparency — 2026-09-27
+- **Opaque nominal wrappers over supported FFI primitives now preserve their nominal type inside Nulang while lowering through the underlying C ABI representation.** `opaque type UserId = Int` can therefore appear in native FFI signatures without weakening type distinction elsewhere.
+- **The boundary remains deliberately narrow:** opaque records, arrays, functions, references, and actor types are still rejected; ordinary Nulang records do not gain an implied C layout.
+- **The formatter now preserves `opaque type` declarations** instead of rewriting them as transparent `type` declarations.
+
 ### Node-shared immutable object store — 2026-09-27
 - **Immutable object-store payloads are now shared across runtime shards without copying their bytes.** `TAG_OBJECT` handles keep a single node-local allocation while actor-lifetime holds protect queued and delivered messages; duplicate deliveries no longer over-increment object references.
 - **Cross-node object transport remains explicit and compatible.** Remote sends still serialize object bytes and intern a fresh local object on the receiving node, while actor heaps and ORCA ownership remain shard-confined.
