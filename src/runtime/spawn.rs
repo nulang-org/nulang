@@ -103,16 +103,7 @@ pub(crate) fn spawn_actor_with_id(
     persistent: bool,
     workflow: Option<&str>,
 ) -> u64 {
-    match try_spawn_actor_with_id(
-        rt,
-        id,
-        init,
-        state_models,
-        persistent,
-        workflow,
-        None,
-        None,
-    ) {
+    match try_spawn_actor_with_id(rt, id, init, state_models, persistent, workflow, None, None) {
         Ok(id) => id,
         Err(error) => {
             tracing::warn!(actor_id = id, %error, "actor spawn failed before publication");
@@ -615,8 +606,7 @@ mod authority_tests {
         typechecker.check_module(&ast).expect("typecheck");
         let hir = crate::hir_lower::lower_module(&ast, &typechecker.inferred_decl_types);
         let mut mir = crate::mir_lower::lower_module(&hir).expect("MIR lowering");
-        crate::mir_codegen::compile_mir(&mut mir, "spawn-schema-preflight")
-            .expect("codegen")
+        crate::mir_codegen::compile_mir(&mut mir, "spawn-schema-preflight").expect("codegen")
     }
 
     #[derive(Clone)]
