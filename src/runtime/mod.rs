@@ -3238,8 +3238,10 @@ impl Runtime {
     fn actor_module_hash(&self, actor_id: u64) -> [u8; 32] {
         self.actors
             .get(&actor_id)
-            .and_then(|a| a.bytecode_module.as_ref())
-            .and_then(|m| m.actor_metadata.iter().find_map(|m| m.type_hash))
+            .and_then(|actor| {
+                let module = actor.bytecode_module.as_ref()?;
+                behavior_ownership::actor_meta_for_runtime_name(module, &actor.name)?.type_hash
+            })
             .unwrap_or([0u8; 32])
     }
 
