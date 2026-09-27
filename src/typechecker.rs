@@ -5457,6 +5457,40 @@ mod tests {
     }
 
     #[test]
+    fn test_ffi_accepts_opaque_scalar_newtype() {
+        let result = check_src(
+            r#"
+opaque type UserId = Int
+extern "__nulang_registered__" {
+    fn echo_id(x: UserId) -> UserId
+}
+"#,
+        );
+        assert!(
+            result.is_ok(),
+            "scalar opaque newtypes erase to their underlying FFI representation: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_ffi_rejects_opaque_non_scalar_newtype() {
+        let result = check_src(
+            r#"
+opaque type Header = { tag: Int }
+extern "__nulang_registered__" {
+    fn echo_header(x: Header) -> Header
+}
+"#,
+        );
+        let err = result.expect_err("opaque records must not become C-layout structs implicitly");
+        assert!(
+            err.to_string().contains("Unsupported FFI type"),
+            "unexpected opaque-record diagnostic: {err}"
+        );
+    }
+
+    #[test]
     fn test_apply_subst_to_ctx_updates_bindings() {
         let v = TypeVar(9001);
         let ctx = ctx_with("x", Type::Var(v));
