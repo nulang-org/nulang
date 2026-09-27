@@ -149,7 +149,7 @@ pub struct ActorSnapshot {
     /// Canonical declared actor schema represented by this snapshot. Legacy
     /// snapshots omit it and are accepted only when the loaded module has one
     /// unambiguous actor schema.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_name: Option<String>,
     /// Canonical external-authority tokens held by the actor at the time
     /// of the snapshot. Missing on pre-authority snapshots means empty
