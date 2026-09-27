@@ -7,6 +7,7 @@ labels:
 when:
   - event: manual
     branch: main
+    evaluate: 'NULANG_VERIFICATION_LANE == "dagger-smoke"'
 
 steps:
   - name: dagger-core-smoke
