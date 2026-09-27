@@ -7042,6 +7042,149 @@ fn test_object_ref_cross_shard_reuses_node_shared_storage() {
     assert_eq!(target_entry.as_bytes(), &[11, 22, 33]);
 }
 
+
+#[test]
+fn test_object_ref_cross_shard_in_flight_hold_survives_creator_drop() {
+    let mut shards = Runtime::new_sharded(2);
+
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+
+    let obj_id = shards[0]
+        .object_store
+        .put(vec![21, 34, 55].into_boxed_slice());
+
+    shards[0].send_message_by_id(target, 0, &[Value::object(obj_id)]);
+
+    // A successful cross-shard admission must own an in-flight reference.
+    shards[0].object_store.drop_ref(obj_id);
+    assert!(
+        shards[0].object_store.get(obj_id).is_some(),
+        "the channel envelope must retain ObjectRefs until destination admission"
+    );
+
+    shards[1].drain_cross_shard_messages();
+    assert!(
+        shards[1].object_store.get(obj_id).is_some(),
+        "destination admission must transfer the in-flight reference to the actor"
+    );
+
+    shards[1].exit_actor(target, ExitReason::Normal);
+    assert!(
+        shards[0].object_store.get(obj_id).is_none(),
+        "the final actor-lifetime hold must release on exit"
+    );
+}
+
+#[test]
+fn test_named_cross_shard_rejection_releases_in_flight_object_hold() {
+    let mut shards = Runtime::new_sharded(2);
+
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+
+    let obj_id = shards[0]
+        .object_store
+        .put(vec![8, 13, 21].into_boxed_slice());
+
+    shards[0].send_message(target, "does_not_exist", &[Value::object(obj_id)]);
+    shards[0].object_store.drop_ref(obj_id);
+    assert!(
+        shards[0].object_store.get(obj_id).is_some(),
+        "named cross-shard messages must retain ObjectRefs while queued"
+    );
+
+    shards[1].drain_cross_shard_messages();
+    assert!(
+        shards[0].object_store.get(obj_id).is_none(),
+        "unknown destination behavior must release the in-flight ObjectRef"
+    );
+}
+
+#[test]
+fn test_disconnected_cross_shard_send_rolls_back_object_hold() {
+    let mut shards = Runtime::new_sharded(2);
+    let target = shards[1].spawn_actor(Box::new(|| vec![]));
+    assert_eq!(target % 2, 1);
+
+    let survivor_store = shards[0].object_store.clone();
+    let obj_id = survivor_store.put(vec![1, 1, 2, 3, 5].into_boxed_slice());
+    drop(shards.pop().unwrap());
+
+    shards[0].send_message_by_id(target, 0, &[Value::object(obj_id)]);
+
+    assert_eq!(
+        survivor_store.get(obj_id).unwrap().ref_count(),
+        1,
+        "failed channel admission must roll back any temporary ObjectRef hold"
+    );
+    survivor_store.drop_ref(obj_id);
+    assert!(survivor_store.get(obj_id).is_none());
+}
+
+#[test]
+fn test_dropping_one_shard_releases_actor_object_holds() {
+    let mut shards = Runtime::new_sharded(2);
+    let survivor_store = shards[0].object_store.clone();
+
+    let mut receiver = shards[1].spawn_actor(Box::new(|| vec![]));
+    while receiver % 2 != 1 {
+        receiver = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+
+    let obj_id = survivor_store.put(vec![89, 144].into_boxed_slice());
+    shards[1].send_message_by_id(receiver, 0, &[Value::object(obj_id)]);
+    survivor_store.drop_ref(obj_id);
+    assert!(survivor_store.get(obj_id).is_some());
+
+    drop(shards.pop().unwrap());
+
+    assert!(
+        survivor_store.get(obj_id).is_none(),
+        "dropping a shard must release manual ObjectStore holds owned by its actors"
+    );
+}
+
+#[test]
+fn test_hibernated_grain_with_object_holds_is_not_evicted() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+    let grain_id = GrainId::new("ObjectHoldingGrain", "one");
+
+    rt.actor_grain_id.insert(actor_id, grain_id.clone());
+    rt.grain_residents.insert(grain_id.clone(), actor_id);
+
+    let obj_id = rt.object_store.put(vec![2, 3, 5, 7].into_boxed_slice());
+    rt.send_message_by_id(actor_id, 0, &[Value::object(obj_id)]);
+    let _ = rt.actors.get_mut(&actor_id).unwrap().mailbox.pop();
+    rt.object_store.drop_ref(obj_id);
+
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.hibernation_state = Some(HibernationState {
+            continuation_bytes: Vec::new(),
+            module_hash: [0; 32],
+            hibernated_at_ms: 0,
+            state_fields: HashMap::new(),
+        });
+    }
+
+    assert_eq!(
+        rt.evict_hibernated_grains(None),
+        0,
+        "grains with live ObjectRefs must remain resident until durable ObjectRef semantics exist"
+    );
+    assert!(rt.actors.contains_key(&actor_id));
+    assert!(rt.object_store.get(obj_id).is_some());
+
+    rt.exit_actor(actor_id, ExitReason::Normal);
+    assert!(rt.object_store.get(obj_id).is_none());
+}
+
 // ========================================================================
 // Built-in Grain effects
 // ========================================================================
