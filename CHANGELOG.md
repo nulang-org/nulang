@@ -1,5 +1,10 @@
 # Nulang Changelog
 
+### Shard scaling and JIT transition benchmark foundation — 2026-09-26
+- **The same-host performance harness now measures host-wide 1/2/4/8-shard actor-drain scaling separately from the single-CPU A/B suite.** The scaling probe keeps total work fixed at 200,000 local messages, runs without CPU affinity, preserves the actor-id ownership invariant, and emits dedicated `[scale-bench]` records into a separate JSON section.
+- **A tiny warmed-JIT loop now provides a transition-sensitive control against the pure interpreter.** The loop minimizes useful work per hot-region entry so changes to native-transition overhead, including the current conservative register-file snapshot, are visible without claiming to isolate one implementation detail.
+- **Interpretation remains deliberately narrow.** The shard probe excludes cross-shard routing and message production, so it is an ideal local-shard parallelism ceiling rather than an end-to-end multicore actor result.
+
 ### Same-host A/B Cargo target isolation — 2026-09-25
 - **Base and candidate benchmark builds now use separate Cargo target directories.** The repository config points every checkout at one absolute target path; sharing it across the detached base worktree and candidate could reuse the base library artifact while compiling candidate integration tests, producing false build failures or invalid A/B binaries.
 - **The isolation applies to both prebuild and measured Cargo invocations.** Persistent per-variant target directories retain ordinary Cargo caching while preventing cross-variant artifact contamination.
