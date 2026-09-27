@@ -193,7 +193,10 @@ fn bench_ab_native_noop_actor_drain() {
     let elapsed = start.elapsed();
 
     let actor = rt.actors.get(&actor_id).expect("actor still live");
-    assert!(actor.mailbox.is_empty(), "native drain must empty the mailbox");
+    assert!(
+        actor.mailbox.is_empty(),
+        "native drain must empty the mailbox"
+    );
     assert_eq!(
         actor.reduction_count - reductions_before,
         N as u32,
