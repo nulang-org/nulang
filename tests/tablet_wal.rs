@@ -201,7 +201,6 @@ fn wal_replay_revalidates_mutations_against_the_recovery_range() {
     let _ = fs::remove_file(path);
 }
 
-
 #[test]
 fn wal_rejects_ownership_epoch_regression_on_append() {
     let path = temp_wal("epoch_regression");
