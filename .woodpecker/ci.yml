@@ -17,7 +17,6 @@ variables:
     volumes:
       - cargo-registry:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git
-      - nulang-target:/woodpecker/src/target
     environment:
       CARGO_TERM_COLOR: "always"
       CARGO_INCREMENTAL: "0"
