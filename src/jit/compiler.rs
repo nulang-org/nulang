@@ -144,7 +144,7 @@ pub(crate) fn make_void_reg4_sig<M: Module>(module: &M) -> Signature {
 pub(crate) fn make_alloc_obj_at_sig<M: Module>(module: &M) -> Signature {
     let mut sig = module.make_signature();
     sig.params.push(AbiParam::new(types::I64)); // tagged slot count
-    sig.params.push(AbiParam::new(types::I32)); // HeapTypeTag discriminant
+    sig.params.push(AbiParam::new(types::I32)); // TypeTag discriminant
     sig.params.push(AbiParam::new(types::I64)); // absolute bytecode pc
     sig.returns.push(AbiParam::new(types::I64)); // tagged pointer / nil
     sig
