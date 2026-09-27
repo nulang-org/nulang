@@ -5452,58 +5452,93 @@ impl Runtime {
         actor_id: u64,
         module: &crate::bytecode::CodeModule,
         snapshot: &ActorSnapshot,
-        is_workflow: bool,
-        is_agent: bool,
-    ) -> Result<Actor, crate::authority_runtime::RuntimeAuthorityError> {
-        let authority_manifest =
-            crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens)?;
-        let offsets: Vec<usize> = crate::runtime::spawn::bytecode_offsets_for(module, is_workflow);
-        let compensation_offsets: Vec<Option<usize>> = if is_workflow {
-            module
-                .actor_metadata
+        expected_schema_name: Option<&str>,
+        runtime_name: Option<String>,
+    ) -> Result<Actor, String> {
+        if module.actor_metadata.is_empty()
+            && snapshot.schema_name.is_none()
+            && expected_schema_name.is_none()
+        {
+            let authority_manifest =
+                crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens)
+                    .map_err(|err| err.to_string())?;
+            let mut actor = Actor::new(
+                actor_id,
+                runtime_name.unwrap_or_else(|| format!("actor_{}", actor_id)),
+                0,
+            );
+            actor.persistent = true;
+            actor.sequence = snapshot.sequence;
+            actor.waiting_signal = snapshot.waiting_signal.clone();
+            actor.install_authority_manifest(&authority_manifest);
+            actor.bytecode_module = Some(module.clone());
+            actor.bytecode_offsets = module
+                .behaviors
                 .iter()
-                .find(|m| m.is_workflow)
-                .map(|meta| {
-                    meta.behavior_indices
-                        .iter()
-                        .map(|&i| module.behaviors[i].compensate_offset.map(|o| o as usize))
-                        .collect()
-                })
-                .unwrap_or_else(|| {
-                    module
-                        .behaviors
-                        .iter()
-                        .map(|b| b.compensate_offset.map(|o| o as usize))
-                        .collect()
-                })
+                .map(|behavior| behavior.code_offset as usize)
+                .collect();
+            actor.compensation_offsets = module
+                .behaviors
+                .iter()
+                .map(|behavior| behavior.compensate_offset)
+                .collect();
+            for (name, value) in &snapshot.state {
+                let value = value.to_value_on_heap(&mut actor);
+                actor.set_state_field(name, value);
+            }
+            return Ok(actor);
+        }
+
+        let meta = match expected_schema_name {
+            Some(expected) => schema_identity::resolve_expected_snapshot_actor_meta(
+                module,
+                snapshot.schema_name.as_deref(),
+                expected,
+            ),
+            None => schema_identity::resolve_snapshot_actor_meta(
+                module,
+                snapshot.schema_name.as_deref(),
+            ),
+        }
+        .map_err(|err| err.to_string())?;
+        let role = meta.role().map_err(|err| err.to_string())?;
+        let authority_manifest =
+            crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens)
+                .map_err(|err| err.to_string())?;
+        let offsets = crate::runtime::spawn::bytecode_offsets_for_role(module, role);
+        let compensation_offsets: Vec<Option<usize>> = if meta.is_workflow {
+            meta.behavior_indices
+                .iter()
+                .map(|&i| module.behaviors[i].compensate_offset)
+                .collect()
         } else {
             module
                 .behaviors
                 .iter()
-                .map(|b| b.compensate_offset.map(|o| o as usize))
+                .map(|behavior| behavior.compensate_offset)
                 .collect()
         };
 
-        let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
+        let mut actor = Actor::new(
+            actor_id,
+            runtime_name.unwrap_or_else(|| meta.name.clone()),
+            0,
+        );
         actor.persistent = true;
-        actor.is_workflow = is_workflow;
-        actor.is_agent = is_agent;
+        actor.is_workflow = meta.is_workflow;
+        actor.is_agent = meta.is_agent;
         actor.sequence = snapshot.sequence;
         actor.waiting_signal = snapshot.waiting_signal.clone();
         actor.install_authority_manifest(&authority_manifest);
         actor.bytecode_module = Some(module.clone());
         actor.bytecode_offsets = offsets;
         actor.compensation_offsets = compensation_offsets;
-
-        // Restore per-field state-model tracking.
-        actor.state_models = module
-            .actor_metadata
+        actor.state_models = meta
+            .state_models
             .iter()
-            .flat_map(|m| &m.state_models)
             .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
             .collect();
 
-        // Restore durable state fields from the snapshot.
         for (name, value) in &snapshot.state {
             if name == "semantic_memory" || name == "procedural_memory" {
                 if let PersistedValue::String(json) = value {
@@ -5512,20 +5547,31 @@ impl Runtime {
                     continue;
                 }
             }
-            let v = value.to_value_on_heap(&mut actor);
-            actor.set_state_field(name, v);
+            let value = value.to_value_on_heap(&mut actor);
+            actor.set_state_field(name, value);
         }
 
-        // Fill in declared initial values for fields not touched above.
-        for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
+        for (name, constant) in &meta.state_defaults {
             if actor.get_state_field(name).is_some() {
                 continue;
             }
-            let v = match c {
-                crate::bytecode::Constant::String(s) => actor.allocate_string(s),
+            let value = match constant {
+                crate::bytecode::Constant::String(value) => actor.allocate_string(value),
                 other => crate::vm::constant_to_value(other),
             };
-            actor.set_state_field(name, v);
+            actor.set_state_field(name, value);
+        }
+
+        if meta.is_agent {
+            for (name, constant) in &meta.state_defaults {
+                if let crate::bytecode::Constant::String(json) = constant {
+                    if name == "retry_config" {
+                        actor.retry_config = serde_json::from_str(json).ok();
+                    } else if name == "fallback_config" {
+                        actor.fallback_config = serde_json::from_str(json).unwrap_or_default();
+                    }
+                }
+            }
         }
 
         Ok(actor)
