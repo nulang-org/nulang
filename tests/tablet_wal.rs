@@ -140,7 +140,9 @@ fn wal_fails_closed_on_checksum_corruption() {
             .write(true)
             .open(&path)
             .unwrap();
-        file.seek(SeekFrom::Start(12)).unwrap();
+        // Skip file magic (8) and the checksummed fixed-size frame header
+        // (record magic 4 + frame version 2 + payload length 4 + header hash 32).
+        file.seek(SeekFrom::Start(50)).unwrap();
         file.write_all(&[0xff]).unwrap();
         file.sync_all().unwrap();
     }
