@@ -80,6 +80,16 @@ pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::
             .map(|((_, name), id)| (name.clone(), id.0))
             .collect()
     });
+    let schema_name = actor
+        .bytecode_module
+        .as_ref()
+        .and_then(|module| {
+            crate::runtime::schema_identity::canonical_schema_name_for_runtime_actor(
+                module,
+                &actor.name,
+            )
+        })
+        .map(str::to_owned);
     let snapshot = crate::runtime::persistence::ActorSnapshot {
         actor_id,
         sequence: seq,
@@ -87,6 +97,7 @@ pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::
         waiting_signal: actor.waiting_signal.clone(),
         crdt_snapshot,
         crdt_field_map,
+        schema_name,
         authority_tokens,
     };
     // The local persistence store is authoritative. Publish a shadow replica
