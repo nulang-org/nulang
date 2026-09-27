@@ -18,6 +18,7 @@
 //! Actor heaps and ORCA remain shard-confined. Shared objects are immutable and
 //! never contain actor-heap pointers.
 
+use super::frozen_term::{FrozenGraph, FrozenGraphView, FrozenTermError};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -47,6 +48,14 @@ impl ObjectEntry {
 
     pub fn ref_count(&self) -> usize {
         self.ref_count.load(Ordering::Acquire)
+    }
+
+    /// Interpret this object's bytes as a validated frozen term graph.
+    ///
+    /// The returned view borrows the immutable object-store allocation and
+    /// performs no graph materialization or pointer reconstruction.
+    pub fn frozen_view(&self) -> Result<FrozenGraphView<'_>, FrozenTermError> {
+        FrozenGraphView::new(self.as_bytes())
     }
 }
 
@@ -98,6 +107,12 @@ impl ObjectStore {
             .expect("object-store write lock poisoned")
             .insert(id, entry);
         id
+    }
+
+    /// Encode and store a pointer-free frozen graph. Refcount starts at 1.
+    pub fn put_frozen(&self, graph: &FrozenGraph) -> Result<ObjectId, FrozenTermError> {
+        let bytes = graph.encode()?;
+        Ok(self.put(bytes.into_boxed_slice()))
     }
 
     /// Return a shared immutable entry by id.
