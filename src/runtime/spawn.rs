@@ -377,6 +377,11 @@ fn try_spawn_from_module(
         actor.bytecode_offsets = offsets.clone();
         actor.compensation_offsets = compensation_offsets.clone();
         if let Some(meta) = meta {
+            // Preserve the compiler-owned schema identity that owns this
+            // actor's behavior table. Plain module actors previously kept only
+            // actor_<id>, which made runtime ownership checks guess globally.
+            // Manual/native actors still retain their synthetic instance name.
+            actor.name = meta.name.clone();
             if matches!(role, ActorRole::Agent) {
                 // Legacy storage flag retained until the serialized role enum
                 // replaces the compatibility booleans.
