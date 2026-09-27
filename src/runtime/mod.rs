@@ -5809,12 +5809,12 @@ impl Runtime {
                 stable_actor_id,
                 &grain_type.module,
                 snap,
-                false,
-                false,
+                Some(&grain_id.grain_type),
+                Some(grain_id.actor_name()),
             )
             .map_err(|err| NuError::RuntimeError {
                 msg: format!(
-                    "invalid authority snapshot for virtual actor {}: {}",
+                    "invalid durable snapshot for virtual actor {}: {}",
                     grain_id.actor_name(),
                     err
                 ),
@@ -5831,23 +5831,26 @@ impl Runtime {
                 .iter()
                 .map(|(name, model)| (name.clone(), *model))
                 .collect();
-            // Fill declared initial values.
-            for (name, c) in grain_type
-                .module
-                .actor_metadata
-                .iter()
-                .flat_map(|m| &m.state_defaults)
-            {
-                let v = match c {
-                    crate::bytecode::Constant::String(s) => actor.allocate_string(&s),
-                    other => crate::vm::constant_to_value(&other),
+            // Fill declared initial values only from the requested grain
+            // schema, never from sibling actor declarations in the module.
+            let grain_meta = behavior_ownership::actor_meta_for_schema(
+                &grain_type.module,
+                &grain_id.grain_type,
+            )
+            .expect("registered grain type must retain its ActorMeta");
+            for (name, constant) in &grain_meta.state_defaults {
+                let value = match constant {
+                    crate::bytecode::Constant::String(text) => actor.allocate_string(text),
+                    other => crate::vm::constant_to_value(other),
                 };
-                actor.set_state_field(name, v);
+                actor.set_state_field(name, value);
             }
             actor
         };
 
-        // Track the grain identity.
+        // Track canonical schema and grain identity.
+        self.recovery_schema_names
+            .insert(stable_actor_id, grain_id.grain_type.clone());
         self.actors.insert(stable_actor_id, actor);
         self.grain_residents
             .insert(grain_id.clone(), stable_actor_id);
