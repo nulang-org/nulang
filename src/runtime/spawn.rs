@@ -50,10 +50,11 @@ pub(crate) fn try_spawn_actor_with_models(
         persistent,
         workflow,
         initial_authority,
+        None,
     )
 }
 
-/// Load and validate legacy restart snapshot authority before actor initialization.
+/// Load and validate restart snapshot authority and schema before actor initialization.
 ///
 /// A malformed persisted manifest aborts activation before the init closure,
 /// CRDT registration, actor insertion, or scheduler enqueue. Pre-authority
@@ -62,12 +63,32 @@ pub(crate) fn try_spawn_actor_with_models(
 fn preflight_persistent_snapshot(
     rt: &Runtime,
     actor_id: u64,
-) -> Result<Option<(ActorSnapshot, AuthorityManifest)>, RuntimeAuthorityError> {
+    expected_schema: Option<(&crate::bytecode::CodeModule, &str)>,
+) -> Result<Option<(ActorSnapshot, AuthorityManifest)>, String> {
     let Some(snapshot) = rt.persistence.load_snapshot(actor_id) else {
         return Ok(None);
     };
     let manifest =
-        AuthorityManifest::from_tokens(snapshot.authority_tokens.iter().map(String::as_str))?;
+        AuthorityManifest::from_tokens(snapshot.authority_tokens.iter().map(String::as_str))
+            .map_err(|error| error.to_string())?;
+
+    if let Some((module, expected_schema_name)) = expected_schema {
+        super::schema_identity::resolve_expected_snapshot_actor_meta(
+            module,
+            snapshot.schema_name.as_deref(),
+            expected_schema_name,
+        )
+        .map_err(|error| error.to_string())?;
+    } else if let Some(schema_name) = snapshot
+        .schema_name
+        .as_deref()
+        .filter(|schema_name| !schema_name.is_empty())
+    {
+        return Err(format!(
+            "persisted actor schema '{schema_name}' cannot be activated without compiler-owned schema context"
+        ));
+    }
+
     Ok(Some((snapshot, manifest)))
 }
 
@@ -82,7 +103,16 @@ pub(crate) fn spawn_actor_with_id(
     persistent: bool,
     workflow: Option<&str>,
 ) -> u64 {
-    match try_spawn_actor_with_id(rt, id, init, state_models, persistent, workflow, None) {
+    match try_spawn_actor_with_id(
+        rt,
+        id,
+        init,
+        state_models,
+        persistent,
+        workflow,
+        None,
+        None,
+    ) {
         Ok(id) => id,
         Err(error) => {
             tracing::warn!(actor_id = id, %error, "actor spawn failed before publication");
@@ -99,15 +129,16 @@ fn try_spawn_actor_with_id(
     persistent: bool,
     workflow: Option<&str>,
     initial_authority: Option<&AuthorityManifest>,
+    expected_schema: Option<(&crate::bytecode::CodeModule, &str)>,
 ) -> std::io::Result<u64> {
     let restart_snapshot = if persistent && workflow.is_none() {
-        match preflight_persistent_snapshot(rt, id) {
+        match preflight_persistent_snapshot(rt, id, expected_schema) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 tracing::warn!(
                     actor_id = id,
                     %error,
-                    "refusing to activate persistent actor with invalid authority snapshot"
+                    "refusing to activate persistent actor with invalid durable snapshot"
                 );
                 return Ok(id);
             }
@@ -328,8 +359,9 @@ fn try_spawn_from_module(
             .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
             .collect();
         let defaults = meta.state_defaults.clone();
-        try_spawn_actor_with_models(
+        try_spawn_actor_with_id(
             rt,
+            fresh_actor_id(),
             Box::new(move || {
                 let mut fields: Vec<(String, Value)> = defaults
                     .iter()
@@ -346,17 +378,24 @@ fn try_spawn_from_module(
                 None
             },
             initial_authority,
+            Some((module, meta.name.as_str())),
         )?
     } else {
-        try_spawn_actor_with_models(
+        try_spawn_actor_with_id(
             rt,
+            fresh_actor_id(),
             Box::new(move || init),
             HashMap::new(),
             false,
             None,
             initial_authority,
+            None,
         )?
     };
+    if !rt.actors.contains_key(&id) {
+        return Ok(Value::nil());
+    }
+
     let offsets: Vec<usize> = bytecode_offsets_for_role(module, role);
     // compensation_offsets filtered to this actor's own behaviors so
     // step-local indices in run_saga_compensation match.
@@ -543,6 +582,14 @@ pub(crate) fn register_recovery_module(
     offsets: Vec<usize>,
     compensation_offsets: Vec<Option<usize>>,
 ) {
+    if let Some(actor) = rt.actors.get(&actor_id) {
+        if let Some(schema_name) =
+            super::schema_identity::canonical_schema_name_for_runtime_actor(&module, &actor.name)
+        {
+            rt.recovery_schema_names
+                .insert(actor_id, schema_name.to_string());
+        }
+    }
     rt.recovery_modules
         .insert(actor_id, (module, offsets, compensation_offsets));
 }
