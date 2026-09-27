@@ -1369,9 +1369,21 @@ pub fn process_network_packets(
                                         );
                                         continue;
                                     }
+                                    let Some(object_holds) =
+                                        ObjectRefLease::acquire(&runtime.object_store, &payload_vec)
+                                    else {
+                                        notify_delivery_failed(
+                                            runtime,
+                                            msg.sender,
+                                            "object ref missing on retry",
+                                        );
+                                        continue;
+                                    };
                                     msg.payload = MessagePayload::from_vec(payload_vec);
                                     if let Some(actor) = runtime.actors.get_mut(&target_actor) {
-                                        let _ = actor.mailbox.push(msg);
+                                        if actor.mailbox.push(msg).is_ok() {
+                                            object_holds.transfer_to_actor(actor);
+                                        }
                                         runtime.enqueue_actor(target_actor);
                                     } else {
                                         notify_delivery_failed(
@@ -2289,9 +2301,21 @@ pub fn process_network_packets(
                         );
                         continue;
                     }
+                    let Some(object_holds) =
+                        ObjectRefLease::acquire(&runtime.object_store, &payload_vec)
+                    else {
+                        notify_delivery_failed(
+                            runtime,
+                            msg.sender,
+                            "object ref missing on receiver",
+                        );
+                        continue;
+                    };
                     msg.payload = MessagePayload::from_vec(payload_vec);
                     if let Some(actor) = runtime.actors.get_mut(&target_actor) {
-                        let _ = actor.mailbox.push(msg);
+                        if actor.mailbox.push(msg).is_ok() {
+                            object_holds.transfer_to_actor(actor);
+                        }
                         runtime.enqueue_actor(target_actor);
                     } else {
                         notify_delivery_failed(runtime, msg.sender, "target actor not found");
