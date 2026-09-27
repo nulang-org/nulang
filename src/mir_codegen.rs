@@ -3759,7 +3759,9 @@ fn same(a: String, b: String) -> Bool { a == b }
 fn main() -> Int { 0 }
 "#;
         let err = compile_source(source)
-            .expect_err("@noalloc must reject SCmpEq while VM comparison materializes owned strings")
+            .expect_err(
+                "@noalloc must reject SCmpEq while VM comparison materializes owned strings",
+            )
             .to_string();
         assert!(
             err.contains("string comparison may allocate"),
