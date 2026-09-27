@@ -1,6 +1,6 @@
 # Nulang Changelog
 ### Explicit unsafe FFI declaration boundary — 2026-09-27
-- **Native ABI declarations now require `unsafe extern`.** The keyword acknowledges that the declared symbol signature is a programmer-supplied proof obligation that the compiler cannot verify against a dynamically loaded C library. Bare `extern` is rejected with a targeted diagnostic.
+- **Native ABI declarations now require `unsafe extern`.** The contextual `unsafe` marker acknowledges that the declared symbol signature is a programmer-supplied proof obligation that the compiler cannot verify against a dynamically loaded C library. Bare `extern` is rejected with a targeted diagnostic, while `unsafe` remains usable as an ordinary identifier elsewhere.
 - **The existing FFI semantics are unchanged after parsing.** `Decl::Extern`, the `FFI` effect row, deployment resource gating, exact actor authority checks, HIR/MIR lowering, bytecode, and runtime dispatch remain the same; the new boundary adds no second execution path.
 - **The formatter canonicalizes FFI declarations to `unsafe extern`,** and parser/FFI/migration regressions plus examples/docs use the explicit boundary.
 
