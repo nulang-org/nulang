@@ -54,16 +54,7 @@ pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::
             .copied()
             .unwrap_or(StateModel::Local);
         if model == StateModel::Durable || model.is_crdt() {
-            let persisted = if name == "semantic_memory" || name == "procedural_memory" {
-                vm_value_to_string_in_actor(value, actor)
-                    .map(PersistedValue::String)
-                    .unwrap_or_else(|| {
-                        PersistedValue::from_value_resolved(value, actor.bytecode_module.as_ref())
-                    })
-            } else {
-                PersistedValue::from_value_resolved(value, actor.bytecode_module.as_ref())
-            };
-            state.insert(name.clone(), persisted);
+            state.insert(name.clone(), actor.persist_value(value));
         }
     }
     let authority_tokens = actor
