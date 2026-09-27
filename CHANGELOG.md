@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Runtime actor schema identity — 2026-09-27
+- **Actors spawned from compiler-produced module metadata retain their canonical `ActorMeta.name`.** Plain bytecode actors no longer discard their owning schema in favor of only `actor_<id>`; manually spawned/native actors keep their synthetic instance names. This is the prerequisite for target-schema behavior ownership checks.
+
 ### Node-shared immutable object store — 2026-09-27
 - **Immutable object-store payloads are now shared across runtime shards without copying their bytes.** `TAG_OBJECT` handles keep a single node-local allocation while actor-lifetime holds protect queued and delivered messages; duplicate deliveries no longer over-increment object references.
 - **Cross-node object transport remains explicit and compatible.** Remote sends still serialize object bytes and intern a fresh local object on the receiving node, while actor heaps and ORCA ownership remain shard-confined.
