@@ -125,13 +125,14 @@ fn p0_migrated_workflow_local_behavior_id_uses_retained_schema() {
         }
     "#;
     let tokens = crate::lexer::Lexer::new(source).lex().expect("lex");
-    let ast = crate::parser::Parser::new(tokens).parse_module().expect("parse");
+    let ast = crate::parser::Parser::new(tokens)
+        .parse_module()
+        .expect("parse");
     let mut typechecker = crate::typechecker::TypeChecker::new();
     typechecker.check_module(&ast).expect("typecheck");
     let hir = crate::hir_lower::lower_module(&ast, &typechecker.inferred_decl_types);
     let mut mir = crate::mir_lower::lower_module(&hir).expect("MIR lowering");
-    let module = crate::mir_codegen::compile_mir(&mut mir, "workflow-forwarding")
-        .expect("codegen");
+    let module = crate::mir_codegen::compile_mir(&mut mir, "workflow-forwarding").expect("codegen");
 
     let flow = module
         .actor_metadata
