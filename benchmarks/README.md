@@ -91,7 +91,9 @@ is needed.
 
 Nulang-only A/B probes include a mailbox-only one-value admission lower bound,
 a 0/1/4/5/16-value runtime enqueue sweep around the small-message inline
-boundary, a matched warmed-bytecode/JIT vs AOT actor-drain comparison over the
+boundary, an already-admitted native no-op actor drain that isolates the
+scheduler/runtime dispatch floor, a matched warmed-bytecode/JIT vs AOT
+actor-drain comparison over the
 same actor source, first-run JIT-vs-interpreter crossover probes at 3k, 4k, 5k,
 and 7.5k loop trips, and a tiny warmed-JIT loop paired with an interpreter
 control. The tiny-loop pair deliberately minimizes useful work per hot-region
