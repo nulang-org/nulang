@@ -879,6 +879,9 @@ pub(crate) fn nulang_type_to_ffi_type(ty: &crate::types::Type) -> Option<crate::
             crate::types::PrimitiveType::Unit => Some(FfiType::Unit),
             _ => None,
         },
+        // Opaque newtypes erase to the underlying runtime value. Recurse so
+        // only wrappers over already-supported FFI primitives are accepted.
+        Type::Nominal { underlying, .. } => nulang_type_to_ffi_type(underlying),
         _ => None,
     }
 }
