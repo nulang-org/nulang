@@ -3964,7 +3964,8 @@ impl TypeChecker {
     // -----------------------------------------------------------------------
 
     /// Validate that a type is usable as an FFI parameter/return type in the MVP.
-    /// Only primitive Int, Float, Bool, String, and Unit are supported.
+    /// Int, Float, Bool, String, Unit, and opaque nominal wrappers over those
+    /// same primitives are supported. Opaque non-scalar shapes remain rejected.
     fn validate_ffi_type(&self, ty: &Type, span: Span) -> NuResult<()> {
         match ty {
             Type::Primitive(PrimitiveType::Int)
