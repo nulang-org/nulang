@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Node-shared immutable object store — 2026-09-27
+- **Immutable object-store payloads are now shared across runtime shards without copying their bytes.** `TAG_OBJECT` handles keep a single node-local allocation while actor-lifetime holds protect queued and delivered messages; duplicate deliveries no longer over-increment object references.
+- **Cross-node object transport remains explicit and compatible.** Remote sends still serialize object bytes and intern a fresh local object on the receiving node, while actor heaps and ORCA ownership remain shard-confined.
+
 ### Allocation transparency and transitive `@noalloc` — 2026-09-27
 - **Experimental function-level `@noalloc` is preserved from AST through HIR/MIR and verified using resolved MIR type evidence plus optimized emitted bytecode.** Statically resolved direct callees are checked transitively; indirect/closure calls and missing proof metadata fail closed. Heap/string materialization, copying, capturing closure storage, effect/suspension boundaries, FFI/Python, actor/distributed operations, I/O, and register spills reject the contract when they cannot be proven allocation-free.
 - **Native AOT, WASM, and WasmFX reuse the same canonical bytecode proof** before backend-specific lowering, so selecting another backend cannot silently weaken `@noalloc`.

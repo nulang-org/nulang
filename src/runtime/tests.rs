@@ -1798,7 +1798,6 @@ fn test_trap_exit_converts_to_message() {
         "exit signal should become message"
     );
 }
-
 // ========================================================================
 // VM Opcode Tests
 // ========================================================================
@@ -2697,8 +2696,7 @@ fn test_closure_capture_retains_heap_object_across_drop() {
 
 /// Same regression as `test_closure_capture_retains_heap_object_across_drop`,
 /// but for `ArrStore`: storing a heap pointer into an array slot must retain
-/// it too, or a later `Drop` of the value's original binding would free it
-/// out from under the array — a latent use-after-free CapStore was already
+/// it too, or a later `Drop` of the value's original binding would free it/// out from under the array — a latent use-after-free CapStore was already
 /// protected against but ArrStore wasn't.
 #[test]
 fn test_array_store_retains_heap_object_across_drop() {
@@ -5397,8 +5395,7 @@ fn test_three_node_cluster_static_quorum_downs_minority() {
 /// `handle_node_failed`, which (a) invalidates A's `RemoteActorCache`
 /// entry for B's actor and (b) delivers `DOWN`-with-`noconnection`
 /// (payload code 6) to the local watcher. The cross-node registration
-/// is set up on the registry directly because the D8 *send* side
-/// (`perform Actor.monitor` reaching a remote target) is not yet wired —
+/// is set up on the registry directly because the D8 *send* side/// (`perform Actor.monitor` reaching a remote target) is not yet wired —
 /// the receive side (`Packet::Monitor` → `remote_monitors.register`) is
 /// exercised by the packet round-trip test; this test drives the
 /// failure→DOWN half of the chain.
@@ -6888,7 +6885,7 @@ fn test_dst_gc_during_send_seed_sweep() {
 
 #[test]
 fn test_object_store_put_get() {
-    let mut rt = Runtime::new();
+    let rt = Runtime::new();
     let bytes: Box<[u8]> = vec![1, 2, 3, 4, 5].into_boxed_slice();
     let id = rt.object_store.put(bytes);
     let entry = rt.object_store.get(id).unwrap();
@@ -6915,6 +6912,51 @@ fn test_object_ref_send_same_shard_records_hold() {
 }
 
 #[test]
+fn test_object_ref_mailbox_admission_holds_object_before_receive() {
+    let mut rt = Runtime::new();
+    let receiver = rt.spawn_actor(Box::new(|| vec![]));
+    let obj_id = rt.object_store.put(vec![4, 5, 6].into_boxed_slice());
+
+    rt.send_message_by_id(receiver, 0, &[Value::object(obj_id)]);
+
+    // The creator can release immediately after send; the receiver mailbox
+    // admission must already own a hold even though the actor has not run.
+    rt.object_store.drop_ref(obj_id);
+    assert!(
+        rt.object_store.get(obj_id).is_some(),
+        "mailbox admission must keep the shared object alive before receive"
+    );
+
+    rt.exit_actor(receiver, ExitReason::Normal);
+    assert!(rt.object_store.get(obj_id).is_none());
+}
+
+#[test]
+fn test_object_ref_duplicate_deliveries_take_one_actor_hold() {
+    let mut rt = Runtime::new();
+    let receiver = rt.spawn_actor(Box::new(|| vec![]));
+    let obj_id = rt.object_store.put(vec![1, 2, 3].into_boxed_slice());
+
+    rt.send_message_by_id(receiver, 0, &[Value::object(obj_id)]);
+    run_ready_actor_turn(&mut rt, receiver);
+    rt.send_message_by_id(receiver, 0, &[Value::object(obj_id)]);
+    run_ready_actor_turn(&mut rt, receiver);
+
+    assert_eq!(
+        rt.object_store.get(obj_id).unwrap().ref_count(),
+        2,
+        "creator plus one receiver actor hold should remain regardless of duplicate deliveries"
+    );
+
+    rt.object_store.drop_ref(obj_id);
+    rt.exit_actor(receiver, ExitReason::Normal);
+    assert!(
+        rt.object_store.get(obj_id).is_none(),
+        "the actor single hold should release the object exactly once on exit"
+    );
+}
+
+#[test]
 fn test_object_ref_released_on_actor_exit() {
     let mut rt = Runtime::new();
     let receiver = rt.spawn_actor(Box::new(|| vec![]));
@@ -6936,7 +6978,7 @@ fn test_object_ref_released_on_actor_exit() {
 }
 
 #[test]
-fn test_object_ref_cross_shard_copies_bytes() {
+fn test_object_ref_cross_shard_reuses_node_shared_storage() {
     let mut shards = Runtime::new_sharded(2);
 
     // Spawn actors until we have one on each shard with opposite parity.
@@ -6957,9 +6999,17 @@ fn test_object_ref_cross_shard_copies_bytes() {
     assert_eq!(source_shard, 0);
     assert_eq!(target_shard, 1);
 
-    // Put object in the source shard's store and send from a to b.
+    assert!(
+        shards[source_shard]
+            .object_store
+            .shares_storage_with(&shards[target_shard].object_store),
+        "runtime shards should share one node-local object store"
+    );
+
+    // Put object once and send only its ObjectId across the shard channel.
     let bytes: Box<[u8]> = vec![11, 22, 33].into_boxed_slice();
     let obj_id = shards[source_shard].object_store.put(bytes);
+    let source_entry = shards[source_shard].object_store.get(obj_id).unwrap();
     shards[source_shard].current_actor = Some(a);
     shards[source_shard].send_message_by_id(b, 0, &[Value::object(obj_id)]);
 
@@ -6971,8 +7021,6 @@ fn test_object_ref_cross_shard_copies_bytes() {
         1
     );
 
-    // The received object id is local to the target store (ids are per-store
-    // and may coincide by chance, so verify via bytes, not id equality).
     let received_msg = shards[target_shard]
         .actors
         .get_mut(&b)
@@ -6980,15 +7028,212 @@ fn test_object_ref_cross_shard_copies_bytes() {
         .mailbox
         .pop()
         .unwrap();
-    let local_id = received_msg.payload[0].as_object_id().unwrap();
+    let received_id = received_msg.payload[0].as_object_id().unwrap();
     assert_eq!(
-        shards[target_shard]
-            .object_store
-            .get(local_id)
-            .unwrap()
-            .as_bytes(),
-        &[11, 22, 33]
+        received_id, obj_id,
+        "cross-shard send must preserve ObjectId"
     );
+
+    let target_entry = shards[target_shard].object_store.get(received_id).unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&source_entry, &target_entry),
+        "cross-shard send should reference the same immutable allocation"
+    );
+    assert_eq!(target_entry.as_bytes(), &[11, 22, 33]);
+}
+
+#[test]
+fn test_object_ref_cross_shard_in_flight_hold_survives_creator_drop() {
+    let mut shards = Runtime::new_sharded(2);
+
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+
+    let obj_id = shards[0]
+        .object_store
+        .put(vec![21, 34, 55].into_boxed_slice());
+
+    shards[0].send_message_by_id(target, 0, &[Value::object(obj_id)]);
+
+    // A successful cross-shard admission must own an in-flight reference.
+    shards[0].object_store.drop_ref(obj_id);
+    assert!(
+        shards[0].object_store.get(obj_id).is_some(),
+        "the channel envelope must retain ObjectRefs until destination admission"
+    );
+
+    shards[1].drain_cross_shard_messages();
+    assert!(
+        shards[1].object_store.get(obj_id).is_some(),
+        "destination admission must transfer the in-flight reference to the actor"
+    );
+
+    shards[1].exit_actor(target, ExitReason::Normal);
+    assert!(
+        shards[0].object_store.get(obj_id).is_none(),
+        "the final actor-lifetime hold must release on exit"
+    );
+}
+
+#[test]
+fn test_named_cross_shard_rejection_releases_in_flight_object_hold() {
+    fn known_behavior(_actor: &mut Actor, _args: &[Value]) {}
+
+    let mut shards = Runtime::new_sharded(2);
+
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+    shards[1]
+        .actors
+        .get_mut(&target)
+        .unwrap()
+        .register_behavior("known", known_behavior);
+
+    let obj_id = shards[0]
+        .object_store
+        .put(vec![8, 13, 21].into_boxed_slice());
+
+    shards[0].send_message(target, "does_not_exist", &[Value::object(obj_id)]);
+    shards[0].object_store.drop_ref(obj_id);
+    assert!(
+        shards[0].object_store.get(obj_id).is_some(),
+        "named cross-shard messages must retain ObjectRefs while queued"
+    );
+
+    shards[1].drain_cross_shard_messages();
+    assert!(
+        shards[0].object_store.get(obj_id).is_none(),
+        "unknown destination behavior must release the in-flight ObjectRef"
+    );
+}
+
+#[test]
+fn test_disconnected_cross_shard_send_rolls_back_object_hold() {
+    let mut shards = Runtime::new_sharded(2);
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+
+    let survivor_store = shards[0].object_store.clone();
+    let obj_id = survivor_store.put(vec![1, 1, 2, 3, 5].into_boxed_slice());
+    drop(shards.pop().unwrap());
+
+    shards[0].send_message_by_id(target, 0, &[Value::object(obj_id)]);
+
+    assert_eq!(
+        survivor_store.get(obj_id).unwrap().ref_count(),
+        1,
+        "failed channel admission must roll back any temporary ObjectRef hold"
+    );
+    survivor_store.drop_ref(obj_id);
+    assert!(survivor_store.get(obj_id).is_none());
+}
+
+#[test]
+fn test_cross_shard_mailbox_rejection_releases_in_flight_object_hold() {
+    let mut shards = Runtime::new_sharded(2);
+
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+
+    shards[1].actors.get_mut(&target).unwrap().mailbox = Mailbox::new(1);
+    let filler = Message {
+        behavior_id: 0,
+        payload: MessagePayload::from_slice(&[]),
+        sender: 0,
+        priority: MessagePriority::Normal,
+        trace_id: None,
+    };
+    shards[1]
+        .actors
+        .get_mut(&target)
+        .unwrap()
+        .mailbox
+        .push_local(filler)
+        .unwrap();
+
+    let obj_id = shards[0]
+        .object_store
+        .put(vec![34, 55, 89].into_boxed_slice());
+    shards[0].send_message_by_id(target, 0, &[Value::object(obj_id)]);
+    shards[0].object_store.drop_ref(obj_id);
+    assert!(
+        shards[0].object_store.get(obj_id).is_some(),
+        "the in-flight envelope must retain the object before destination admission"
+    );
+
+    shards[1].drain_cross_shard_messages();
+
+    assert!(
+        shards[0].object_store.get(obj_id).is_none(),
+        "mailbox rejection must release the in-flight ObjectRef lease"
+    );
+}
+
+#[test]
+fn test_dropping_one_shard_releases_actor_object_holds() {
+    let mut shards = Runtime::new_sharded(2);
+    let survivor_store = shards[0].object_store.clone();
+
+    let mut receiver = shards[1].spawn_actor(Box::new(|| vec![]));
+    while receiver % 2 != 1 {
+        receiver = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+
+    let obj_id = survivor_store.put(vec![89, 144].into_boxed_slice());
+    shards[1].send_message_by_id(receiver, 0, &[Value::object(obj_id)]);
+    survivor_store.drop_ref(obj_id);
+    assert!(survivor_store.get(obj_id).is_some());
+
+    drop(shards.pop().unwrap());
+
+    assert!(
+        survivor_store.get(obj_id).is_none(),
+        "dropping a shard must release manual ObjectStore holds owned by its actors"
+    );
+}
+
+#[test]
+fn test_hibernated_grain_with_object_holds_is_not_evicted() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+    let grain_id = GrainId::new("ObjectHoldingGrain", "one");
+
+    rt.actor_grain_id.insert(actor_id, grain_id.clone());
+    rt.grain_residents.insert(grain_id.clone(), actor_id);
+
+    let obj_id = rt.object_store.put(vec![2, 3, 5, 7].into_boxed_slice());
+    rt.send_message_by_id(actor_id, 0, &[Value::object(obj_id)]);
+    let _ = rt.actors.get_mut(&actor_id).unwrap().mailbox.pop();
+    rt.object_store.drop_ref(obj_id);
+
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.hibernation_state = Some(HibernationState {
+            continuation_bytes: Vec::new(),
+            module_hash: [0; 32],
+            hibernated_at_ms: 0,
+            state_fields: HashMap::new(),
+        });
+    }
+
+    assert_eq!(
+        rt.evict_hibernated_grains(None),
+        0,
+        "grains with live ObjectRefs must remain resident until durable ObjectRef semantics exist"
+    );
+    assert!(rt.actors.contains_key(&actor_id));
+    assert!(rt.object_store.get(obj_id).is_some());
+
+    rt.exit_actor(actor_id, ExitReason::Normal);
+    assert!(rt.object_store.get(obj_id).is_none());
 }
 
 // ========================================================================
