@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Allocation transparency and transitive `@noalloc` — 2026-09-27
+- **Experimental function-level `@noalloc` is preserved from AST through HIR/MIR and verified against optimized emitted bytecode.** Statically resolved direct callees are checked transitively; indirect/closure calls and missing proof metadata fail closed. Heap/string materialization, copying, capturing closure storage, effect/suspension boundaries, FFI/Python, actor/distributed operations, I/O, and register spills reject the contract when they cannot be proven allocation-free.
+- **Native AOT, WASM, and WasmFX reuse the same canonical bytecode proof** before backend-specific lowering, so selecting another backend cannot silently weaken `@noalloc`.
+- **`nulang costs <FILE>` exposes static mechanical-cost reports** in human-readable or `--json` form, with `--deny-allocations` available as a CI gate. Reports distinguish activation-local iso-arena-eligible heap sites from general actor-heap/ORCA sites, while both continue to count as allocations.
+
 ### Warm JIT transition A/B controls — 2026-09-25
 - **The same-host A/B harness now includes warmed 100k-iteration JIT execution probes for a non-reentrant arithmetic loop and a call-heavy re-entrant control.** Both compile once before timing, assert interpreter-equivalent results, and require a real JIT region so register-transition optimizations can be measured on their actual hot path instead of inferred from unrelated actor enqueue benchmarks.
 - **The benchmark helper now shares frontend-to-bytecode compilation across JIT A/B probes,** keeping the crossover and warmed-execution fixtures on one compilation path without changing timed work.
