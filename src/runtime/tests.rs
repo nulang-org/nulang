@@ -1798,7 +1798,6 @@ fn test_trap_exit_converts_to_message() {
         "exit signal should become message"
     );
 }
-
 // ========================================================================
 // VM Opcode Tests
 // ========================================================================
@@ -2697,8 +2696,7 @@ fn test_closure_capture_retains_heap_object_across_drop() {
 
 /// Same regression as `test_closure_capture_retains_heap_object_across_drop`,
 /// but for `ArrStore`: storing a heap pointer into an array slot must retain
-/// it too, or a later `Drop` of the value's original binding would free it
-/// out from under the array — a latent use-after-free CapStore was already
+/// it too, or a later `Drop` of the value's original binding would free it/// out from under the array — a latent use-after-free CapStore was already
 /// protected against but ArrStore wasn't.
 #[test]
 fn test_array_store_retains_heap_object_across_drop() {
@@ -5397,8 +5395,7 @@ fn test_three_node_cluster_static_quorum_downs_minority() {
 /// `handle_node_failed`, which (a) invalidates A's `RemoteActorCache`
 /// entry for B's actor and (b) delivers `DOWN`-with-`noconnection`
 /// (payload code 6) to the local watcher. The cross-node registration
-/// is set up on the registry directly because the D8 *send* side
-/// (`perform Actor.monitor` reaching a remote target) is not yet wired —
+/// is set up on the registry directly because the D8 *send* side/// (`perform Actor.monitor` reaching a remote target) is not yet wired —
 /// the receive side (`Packet::Monitor` → `remote_monitors.register`) is
 /// exercised by the packet round-trip test; this test drives the
 /// failure→DOWN half of the chain.
@@ -6888,7 +6885,7 @@ fn test_dst_gc_during_send_seed_sweep() {
 
 #[test]
 fn test_object_store_put_get() {
-    let mut rt = Runtime::new();
+    let rt = Runtime::new();
     let bytes: Box<[u8]> = vec![1, 2, 3, 4, 5].into_boxed_slice();
     let id = rt.object_store.put(bytes);
     let entry = rt.object_store.get(id).unwrap();
@@ -6915,6 +6912,51 @@ fn test_object_ref_send_same_shard_records_hold() {
 }
 
 #[test]
+fn test_object_ref_mailbox_admission_holds_object_before_receive() {
+    let mut rt = Runtime::new();
+    let receiver = rt.spawn_actor(Box::new(|| vec![]));
+    let obj_id = rt.object_store.put(vec![4, 5, 6].into_boxed_slice());
+
+    rt.send_message_by_id(receiver, 0, &[Value::object(obj_id)]);
+
+    // The creator can release immediately after send; the receiver mailbox
+    // admission must already own a hold even though the actor has not run.
+    rt.object_store.drop_ref(obj_id);
+    assert!(
+        rt.object_store.get(obj_id).is_some(),
+        "mailbox admission must keep the shared object alive before receive"
+    );
+
+    rt.exit_actor(receiver, ExitReason::Normal);
+    assert!(rt.object_store.get(obj_id).is_none());
+}
+
+#[test]
+fn test_object_ref_duplicate_deliveries_take_one_actor_hold() {
+    let mut rt = Runtime::new();
+    let receiver = rt.spawn_actor(Box::new(|| vec![]));
+    let obj_id = rt.object_store.put(vec![1, 2, 3].into_boxed_slice());
+
+    rt.send_message_by_id(receiver, 0, &[Value::object(obj_id)]);
+    run_ready_actor_turn(&mut rt, receiver);
+    rt.send_message_by_id(receiver, 0, &[Value::object(obj_id)]);
+    run_ready_actor_turn(&mut rt, receiver);
+
+    assert_eq!(
+        rt.object_store.get(obj_id).unwrap().ref_count(),
+        2,
+        "creator plus one receiver actor hold should remain regardless of duplicate deliveries"
+    );
+
+    rt.object_store.drop_ref(obj_id);
+    rt.exit_actor(receiver, ExitReason::Normal);
+    assert!(
+        rt.object_store.get(obj_id).is_none(),
+        "the actor single hold should release the object exactly once on exit"
+    );
+}
+
+#[test]
 fn test_object_ref_released_on_actor_exit() {
     let mut rt = Runtime::new();
     let receiver = rt.spawn_actor(Box::new(|| vec![]));
@@ -6936,7 +6978,7 @@ fn test_object_ref_released_on_actor_exit() {
 }
 
 #[test]
-fn test_object_ref_cross_shard_copies_bytes() {
+fn test_object_ref_cross_shard_reuses_node_shared_storage() {
     let mut shards = Runtime::new_sharded(2);
 
     // Spawn actors until we have one on each shard with opposite parity.
@@ -6957,9 +6999,17 @@ fn test_object_ref_cross_shard_copies_bytes() {
     assert_eq!(source_shard, 0);
     assert_eq!(target_shard, 1);
 
-    // Put object in the source shard's store and send from a to b.
+    assert!(
+        shards[source_shard]
+            .object_store
+            .shares_storage_with(&shards[target_shard].object_store),
+        "runtime shards should share one node-local object store"
+    );
+
+    // Put object once and send only its ObjectId across the shard channel.
     let bytes: Box<[u8]> = vec![11, 22, 33].into_boxed_slice();
     let obj_id = shards[source_shard].object_store.put(bytes);
+    let source_entry = shards[source_shard].object_store.get(obj_id).unwrap();
     shards[source_shard].current_actor = Some(a);
     shards[source_shard].send_message_by_id(b, 0, &[Value::object(obj_id)]);
 
@@ -6971,8 +7021,6 @@ fn test_object_ref_cross_shard_copies_bytes() {
         1
     );
 
-    // The received object id is local to the target store (ids are per-store
-    // and may coincide by chance, so verify via bytes, not id equality).
     let received_msg = shards[target_shard]
         .actors
         .get_mut(&b)
@@ -6980,15 +7028,18 @@ fn test_object_ref_cross_shard_copies_bytes() {
         .mailbox
         .pop()
         .unwrap();
-    let local_id = received_msg.payload[0].as_object_id().unwrap();
+    let received_id = received_msg.payload[0].as_object_id().unwrap();
     assert_eq!(
-        shards[target_shard]
-            .object_store
-            .get(local_id)
-            .unwrap()
-            .as_bytes(),
-        &[11, 22, 33]
+        received_id, obj_id,
+        "cross-shard send must preserve ObjectId"
     );
+
+    let target_entry = shards[target_shard].object_store.get(received_id).unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&source_entry, &target_entry),
+        "cross-shard send should reference the same immutable allocation"
+    );
+    assert_eq!(target_entry.as_bytes(), &[11, 22, 33]);
 }
 
 // ========================================================================

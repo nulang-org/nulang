@@ -240,10 +240,9 @@ fn actor_exit_reason(value: Option<&Value>, constants: &[crate::bytecode::Consta
 /// A message routed between Runtime shards in a multi-threaded deployment.
 ///
 /// Each shard owns a disjoint subset of actors (by `actor_id % shard_count`).
-/// Cross-shard messages carry only value-type payloads (ints, strings, bools,
-/// unit, nil) - heap pointers are stripped before sending, matching the
-/// network wire-protocol restriction. This keeps ORCA reference counting
-/// local to each shard.
+/// Cross-shard messages carry shard-safe values, including `TAG_OBJECT`
+/// handles backed by the node-shared immutable ObjectStore. Actor-heap pointers,
+/// actor refs, and closures remain forbidden, keeping ORCA ownership shard-local.
 #[derive(Debug)]
 enum CrossShardMsg {
     /// Deliver a message to an actor on the target shard.  For grain targets
@@ -264,27 +263,6 @@ enum CrossShardMsg {
         target_id: u64,
         behavior_name: String,
         payload: Vec<Value>,
-        sender: u64,
-        trace_id: Option<String>,
-    },
-    /// Deliver a message whose payload contains object-store refs.  The bytes
-    /// are copied because each shard owns a separate `ObjectStore`.
-    DeliverMessageWithObjects {
-        target_id: u64,
-        behavior_id: u16,
-        payload: Vec<Value>,
-        /// Object ids referenced in `payload` and their byte contents.
-        objects: Vec<(crate::runtime::object_store::ObjectId, Vec<u8>)>,
-        sender: u64,
-        trace_id: Option<String>,
-        grain_id: Option<GrainId>,
-    },
-    /// Name-based delivery with copied object-store refs.
-    DeliverNamedMessageWithObjects {
-        target_id: u64,
-        behavior_name: String,
-        payload: Vec<Value>,
-        objects: Vec<(crate::runtime::object_store::ObjectId, Vec<u8>)>,
         sender: u64,
         trace_id: Option<String>,
     },
@@ -694,8 +672,10 @@ impl Runtime {
         shard_count: u16,
         cross_shard_tx: Vec<mpsc::SyncSender<CrossShardMsg>>,
         cross_shard_rx: mpsc::Receiver<CrossShardMsg>,
+        object_store: ObjectStore,
     ) -> Self {
         let mut rt = Runtime::new();
+        rt.object_store = object_store;
         rt.shard_idx = shard_idx;
         rt.shard_count = shard_count;
         rt.cross_shard_tx = Some(cross_shard_tx);
@@ -730,6 +710,7 @@ impl Runtime {
         let senders: Vec<mpsc::SyncSender<CrossShardMsg>> =
             channels.iter().map(|(tx, _)| tx.clone()).collect();
 
+        let object_store = ObjectStore::new();
         let mut shards = Vec::with_capacity(num_shards);
         for (i, (_tx, rx)) in channels.into_iter().enumerate() {
             shards.push(Runtime::new_shard(
@@ -737,6 +718,7 @@ impl Runtime {
                 num_shards as u16,
                 senders.clone(),
                 rx,
+                object_store.clone(),
             ));
         }
         shards
@@ -1336,9 +1318,9 @@ impl Runtime {
 
     // -- Cross-shard message handling --
 
-    /// Deliver a message that arrived from another shard.  No ORCA
-    /// reference-counting is performed because cross-shard payloads are
-    /// restricted to value types (ints, strings, bools, unit, nil).
+    /// Deliver a message that arrived from another shard. Actor-heap ORCA
+    /// references remain forbidden across this boundary; immutable `TAG_OBJECT`
+    /// handles are retained through the node-shared object store on mailbox admission.
     fn deliver_cross_shard_message(
         &mut self,
         target_id: u64,
@@ -1376,15 +1358,20 @@ impl Runtime {
             }
         }
 
+        let admitted_payload = MessagePayload::from_vec(payload);
+        let hold_payload = admitted_payload.clone();
         let msg = Message {
             behavior_id,
-            payload: MessagePayload::from_vec(payload),
+            payload: admitted_payload,
             sender,
             priority: MessagePriority::Normal,
             trace_id: trace_id.clone(),
         };
+        let mut admitted = false;
         if let Some(actor) = self.actors.get_mut(&target_id) {
-            if let Err(_dropped) = actor.mailbox.push_local(msg) {
+            if actor.mailbox.push_local(msg).is_ok() {
+                admitted = true;
+            } else {
                 self.route_to_dlq(
                     &Message {
                         behavior_id,
@@ -1408,7 +1395,10 @@ impl Runtime {
                 "target actor not found (cross-shard)",
             );
         }
-        self.enqueue_actor(target_id);
+        if admitted {
+            self.hold_object_refs(target_id, &hold_payload);
+            self.enqueue_actor(target_id);
+        }
         // Wake an actor suspended in a timed selective receive (same as
         // local path, but without the deferred-wake machinery since
         // cross-shard messages arrive between steps, never mid-VM-exec).
@@ -1477,85 +1467,6 @@ impl Runtime {
                         );
                         continue;
                     };
-                    self.deliver_cross_shard_message(
-                        target_id,
-                        behavior_id,
-                        payload,
-                        sender,
-                        trace_id,
-                        None,
-                    );
-                }
-                CrossShardMsg::DeliverMessageWithObjects {
-                    target_id,
-                    behavior_id,
-                    mut payload,
-                    objects,
-                    sender,
-                    trace_id,
-                    grain_id,
-                } => {
-                    // Insert each object into the local store and rewrite the
-                    // payload so that object ids refer to local entries.
-                    let mut id_map: std::collections::HashMap<
-                        crate::runtime::object_store::ObjectId,
-                        crate::runtime::object_store::ObjectId,
-                    > = std::collections::HashMap::with_capacity(objects.len());
-                    for (original_id, bytes) in objects {
-                        let local_id = self.object_store.put(bytes.into_boxed_slice());
-                        id_map.insert(original_id, local_id);
-                    }
-                    for value in &mut payload {
-                        if let Some(id) = value.as_object_id() {
-                            if let Some(&local_id) = id_map.get(&id) {
-                                *value = Value::object(local_id);
-                            }
-                        }
-                    }
-                    self.deliver_cross_shard_message(
-                        target_id,
-                        behavior_id,
-                        payload,
-                        sender,
-                        trace_id,
-                        grain_id,
-                    );
-                }
-                CrossShardMsg::DeliverNamedMessageWithObjects {
-                    target_id,
-                    behavior_name,
-                    mut payload,
-                    objects,
-                    sender,
-                    trace_id,
-                } => {
-                    // Resolve the behavior before hydrating transferred objects.
-                    // Invalid named delivery must not allocate orphaned object-store
-                    // entries on the destination shard.
-                    let Some(behavior_id) =
-                        self.behavior_id_for_delivery(target_id, &behavior_name)
-                    else {
-                        warn!(
-                            "nulang-shard: rejecting named object message to actor {}: unknown behavior '{}'",
-                            target_id, behavior_name
-                        );
-                        continue;
-                    };
-                    let mut id_map: std::collections::HashMap<
-                        crate::runtime::object_store::ObjectId,
-                        crate::runtime::object_store::ObjectId,
-                    > = std::collections::HashMap::with_capacity(objects.len());
-                    for (original_id, bytes) in objects {
-                        let local_id = self.object_store.put(bytes.into_boxed_slice());
-                        id_map.insert(original_id, local_id);
-                    }
-                    for value in &mut payload {
-                        if let Some(id) = value.as_object_id() {
-                            if let Some(&local_id) = id_map.get(&id) {
-                                *value = Value::object(local_id);
-                            }
-                        }
-                    }
                     self.deliver_cross_shard_message(
                         target_id,
                         behavior_id,
@@ -1886,7 +1797,6 @@ impl Runtime {
             self.current_actor = None;
             return Ok(result);
         }
-
         // Intercept procedural-memory behaviors generated by compile_agent.
         #[cfg(feature = "ai-runtime")]
         if self.actor_is_agent(actor_id) && self.is_procedural_memory_behavior(&behavior_name) {
@@ -2176,9 +2086,10 @@ impl Runtime {
     }
 
     /// Send a message to an actor owned by another shard. Validates that the
-    /// payload contains only value types (object-store refs are copied to the
-    /// target shard's store). Returns the admission outcome so callers can
-    /// distinguish bounded-channel backpressure from invalid payload rejection.
+    /// payload contains only shard-safe values. Object-store refs remain stable
+    /// because every shard in this Runtime set shares one node-local store.
+    /// Returns the admission outcome so callers can distinguish bounded-channel
+    /// backpressure from invalid payload rejection.
     fn send_cross_shard_message(
         &mut self,
         target_id: u64,
@@ -2199,34 +2110,14 @@ impl Runtime {
             }
         }
         let tx = self.cross_shard_tx.as_ref().unwrap();
-        let object_refs: Vec<crate::runtime::object_store::ObjectId> =
-            args.iter().filter_map(|v| v.as_object_id()).collect();
-        let result = if object_refs.is_empty() {
-            tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessage {
-                target_id,
-                behavior_id,
-                payload: args,
-                sender: self.current_actor.unwrap_or(0),
-                trace_id: out_trace,
-                grain_id,
-            })
-        } else {
-            let mut objects = Vec::with_capacity(object_refs.len());
-            for id in object_refs {
-                if let Some(entry) = self.object_store.get(id) {
-                    objects.push((id, entry.as_bytes().to_vec()));
-                }
-            }
-            tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessageWithObjects {
-                target_id,
-                behavior_id,
-                payload: args,
-                objects,
-                sender: self.current_actor.unwrap_or(0),
-                trace_id: out_trace,
-                grain_id,
-            })
-        };
+        let result = tx[target_shard as usize].try_send(CrossShardMsg::DeliverMessage {
+            target_id,
+            behavior_id,
+            payload: args,
+            sender: self.current_actor.unwrap_or(0),
+            trace_id: out_trace,
+            grain_id,
+        });
 
         match result {
             Ok(()) => MessageAdmission::Accepted,
@@ -2272,32 +2163,13 @@ impl Runtime {
         }
 
         let tx = self.cross_shard_tx.as_ref().unwrap();
-        let object_refs: Vec<crate::runtime::object_store::ObjectId> =
-            args.iter().filter_map(|v| v.as_object_id()).collect();
-        let result = if object_refs.is_empty() {
-            tx[target_shard as usize].try_send(CrossShardMsg::DeliverNamedMessage {
-                target_id,
-                behavior_name: behavior_name.to_string(),
-                payload: args,
-                sender: self.current_actor.unwrap_or(0),
-                trace_id: out_trace,
-            })
-        } else {
-            let mut objects = Vec::with_capacity(object_refs.len());
-            for id in object_refs {
-                if let Some(entry) = self.object_store.get(id) {
-                    objects.push((id, entry.as_bytes().to_vec()));
-                }
-            }
-            tx[target_shard as usize].try_send(CrossShardMsg::DeliverNamedMessageWithObjects {
-                target_id,
-                behavior_name: behavior_name.to_string(),
-                payload: args,
-                objects,
-                sender: self.current_actor.unwrap_or(0),
-                trace_id: out_trace,
-            })
-        };
+        let result = tx[target_shard as usize].try_send(CrossShardMsg::DeliverNamedMessage {
+            target_id,
+            behavior_name: behavior_name.to_string(),
+            payload: args,
+            sender: self.current_actor.unwrap_or(0),
+            trace_id: out_trace,
+        });
 
         match result {
             Ok(()) => MessageAdmission::Accepted,
@@ -2655,6 +2527,8 @@ impl Runtime {
         if admission != MessageAdmission::Accepted {
             return admission;
         }
+
+        self.hold_object_refs(target_id, args);
 
         for arg in args {
             if let Some(ptr) = arg.as_ptr() {
@@ -3502,14 +3376,14 @@ impl Runtime {
     /// its local references or exits first.  Holds are recorded on the
     /// receiver's `OrcaGc` and released by [`release_held_foreign_refs`].
     fn hold_payload_refs(&mut self, receiver_id: u64, payload: &[Value]) {
+        // Object refs are acquired at mailbox admission so the backing bytes
+        // remain alive while a message waits to be processed. Keep this call
+        // as a fallback for direct/internal delivery paths; actor-level set
+        // semantics make repeated acquisition a no-op.
+        self.hold_object_refs(receiver_id, payload);
+
         for value in payload {
-            if let Some(id) = value.as_object_id() {
-                // Object-store ref: increment the node-local refcount and
-                // record the hold on the receiving actor.
-                self.object_store.clone_ref(id);
-                if let Some(receiver) = self.actors.get_mut(&receiver_id) {
-                    receiver.held_objects.insert(id);
-                }
+            if value.is_object() {
                 continue;
             }
             let Some(ptr) = value.as_ptr() else { continue };
@@ -3534,6 +3408,31 @@ impl Runtime {
             }
             if let Some(receiver) = self.actors.get_mut(&receiver_id) {
                 receiver.orca_gc.record_held_ref(owner_id, header);
+            }
+        }
+    }
+
+    /// Acquire actor-lifetime holds for immutable object-store references.
+    ///
+    /// Holds are taken at mailbox admission, not receive time, so a sender may
+    /// release its creator reference immediately after a successful send.
+    /// Duplicate ObjectIds are held only once per actor.
+    fn hold_object_refs(&mut self, receiver_id: u64, payload: &[Value]) {
+        for value in payload {
+            let Some(id) = value.as_object_id() else {
+                continue;
+            };
+            let already_held = self
+                .actors
+                .get(&receiver_id)
+                .is_some_and(|receiver| receiver.held_objects.contains(&id));
+            if already_held {
+                continue;
+            }
+            if self.object_store.clone_ref(id) {
+                if let Some(receiver) = self.actors.get_mut(&receiver_id) {
+                    receiver.held_objects.insert(id);
+                }
             }
         }
     }
@@ -3697,7 +3596,6 @@ impl Runtime {
             };
             self.current_trace = Some(trace_ctx);
             let _span_guard = trace_ctx.enter_dispatch_span(actor_id, behavior_idx);
-
             // Intercept semantic-memory behaviors generated by compile_agent.
             // They are bytecode behaviors but are implemented directly by the
             // runtime against the durable `semantic_memory` state field.
