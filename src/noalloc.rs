@@ -18,6 +18,8 @@ fn noalloc_forbidden_opcode(opcode: OpCode) -> Option<&'static str> {
     match opcode {
         Alloc | ArrAlloc | TupleMk | RecMk | RecCopy => Some("heap object allocation"),
         FToS | SConcat => Some("string materialization"),
+        SCmpEq => Some("string comparison may allocate while the VM materializes owned strings"),
+        Panic => Some("panic/error formatting may allocate"),
         // Copy is specified as a deep/capability-aware copy even though parts
         // of the current VM path are conservative/reserved. A no-allocation
         // contract must remain valid when that opcode gains its full semantics.
@@ -80,7 +82,44 @@ fn function_bytecode_range(module: &CodeModule, function_index: usize) -> Option
     Some((start, info.code_len))
 }
 
-fn direct_noalloc_reason(module: &CodeModule, function_index: usize) -> Option<String> {
+fn is_proven_numeric_type(ty: &crate::types::Type) -> bool {
+    *ty == crate::types::Type::int() || *ty == crate::types::Type::float()
+}
+
+fn mir_hidden_allocation_reason(func: &crate::mir::Function) -> Option<String> {
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            let crate::mir::Stmt::Assign { op, .. } = stmt else {
+                continue;
+            };
+            if let crate::mir::RValue::Binary(crate::ast::BinOp::Add, left, right) = op {
+                let left_ty = func.locals.get(left.0 as usize).map(|local| &local.ty);
+                let right_ty = func.locals.get(right.0 as usize).map(|local| &local.ty);
+                if !matches!(
+                    (left_ty, right_ty),
+                    (Some(left_ty), Some(right_ty))
+                        if is_proven_numeric_type(left_ty) && is_proven_numeric_type(right_ty)
+                ) {
+                    return Some(
+                        "dynamic addition may allocate a string because operand types are not proven numeric"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    None
+}
+
+fn direct_noalloc_reason(
+    func: &crate::mir::Function,
+    module: &CodeModule,
+    function_index: usize,
+) -> Option<String> {
+    if let Some(reason) = mir_hidden_allocation_reason(func) {
+        return Some(reason);
+    }
+
     let Some((start, len)) = function_bytecode_range(module, function_index) else {
         return Some(format!(
             "missing bytecode range metadata for function-table index {}",
@@ -147,7 +186,7 @@ pub fn validate_noalloc_contracts(
     let mut calls = vec![Vec::<usize>::new(); n];
 
     for (idx, func) in mir.functions.iter().enumerate() {
-        direct_reason[idx] = direct_noalloc_reason(module, idx);
+        direct_reason[idx] = direct_noalloc_reason(func, module, idx);
         let (targets, has_indirect) = direct_calls(func);
         calls[idx] = targets;
         if has_indirect && direct_reason[idx].is_none() {
