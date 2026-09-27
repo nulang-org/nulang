@@ -39,6 +39,9 @@ pub enum HelperSig {
     /// `(regs_ptr, func_idx, argc, dst)` returns a nonzero status when the
     /// non-suspending callee raised a runtime error.
     DirectCall,
+    /// `(i64, i32, i64) -> i64` — allocation at an exact bytecode PC.
+    /// Arguments are tagged slot-count Value, heap type tag, and absolute PC.
+    AllocObjAt,
 }
 
 // ---------------------------------------------------------------------------
@@ -96,7 +99,7 @@ macro_rules! define_helpers {
             module: &mut M,
             builder: &mut FunctionBuilder,
         ) -> Result<HashMap<RuntimeHelper, FuncRef>, super::compiler::CompileError> {
-            use super::compiler::{make_bin_sig, make_direct_call_sig, make_unary_sig, make_void_reg3_sig, make_void_reg4_sig};
+            use super::compiler::{make_alloc_obj_at_sig, make_bin_sig, make_direct_call_sig, make_unary_sig, make_void_reg3_sig, make_void_reg4_sig};
             let mut helpers = HashMap::new();
 
             $(
@@ -106,6 +109,7 @@ macro_rules! define_helpers {
                     HelperSig::Reg3 => make_void_reg3_sig(module),
                     HelperSig::Reg4 => make_void_reg4_sig(module),
                     HelperSig::DirectCall => make_direct_call_sig(module),
+                    HelperSig::AllocObjAt => make_alloc_obj_at_sig(module),
                 };
                 let name = stringify!($c_name);
                 let func_id = module
@@ -173,6 +177,7 @@ define_helpers! {
     StrEq    => nulang_str_eq,      Bin,
     StrConcat => nulang_str_concat,  Bin,
     AllocObj => nulang_alloc_obj,   Bin,  // actually (i64,i32)->i64 but builder only needs ptr
+    AllocObjAt => nulang_jit_alloc_obj_at, AllocObjAt,
     ObjGet   => nulang_obj_get,     Bin,
     ObjSet   => nulang_obj_set,     Reg4, // actually (i64,i64,i64)->void
     ObjLen   => nulang_obj_len,     Unary,
