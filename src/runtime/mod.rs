@@ -11,6 +11,7 @@ use std::time::Instant;
 use tracing::warn;
 
 mod actor;
+mod behavior_ownership;
 mod blocking_executor;
 pub mod cache;
 pub mod cache_cluster;
@@ -1424,6 +1425,26 @@ impl Runtime {
             }
         }
 
+        if self.actors.contains_key(&target_id)
+            && !self.actor_accepts_numeric_delivery(target_id, behavior_id)
+        {
+            warn!(
+                "nulang-runtime: rejecting cross-shard message to actor {}: behavior id {} is not owned by target schema",
+                target_id, behavior_id
+            );
+            self.route_to_dlq(
+                &Message {
+                    behavior_id,
+                    payload: MessagePayload::from_slice(&[]),
+                    sender,
+                    priority: MessagePriority::System,
+                    trace_id: trace_id.clone(),
+                },
+                "behavior id not owned by target actor schema (cross-shard)",
+            );
+            return;
+        }
+
         let msg = Message {
             behavior_id,
             payload: MessagePayload::from_vec(payload),
@@ -2064,46 +2085,83 @@ impl Runtime {
         }
     }
 
-    /// Return whether `behavior_id` names a real native or bytecode handler on
-    /// `target_id`. Behavior id 0 is valid only when the target actually
-    /// declares handler 0; invalid ids are never aliases for it.
+    /// Return whether `behavior_id` names a real executable handler owned by
+    /// `target_id`. Metadata-free synthetic modules retain their historical
+    /// global behavior table; compiler-produced actor modules prove ownership
+    /// through the target actor's canonical schema identity.
     fn actor_has_behavior_id(&self, target_id: u64, behavior_id: u16) -> bool {
         let behavior_idx = behavior_id as usize;
-        let has_native = self
-            .actors
-            .get(&target_id)
-            .and_then(|actor| actor.behavior_table.get(behavior_idx))
-            .is_some_and(|entry| !entry.name.is_empty());
-        has_native || self.has_bytecode_handler(target_id, behavior_idx)
+        let Some(actor) = self.actors.get(&target_id) else {
+            return false;
+        };
+        if actor
+            .behavior_table
+            .get(behavior_idx)
+            .is_some_and(|entry| !entry.name.is_empty())
+        {
+            return true;
+        }
+
+        let Some(module) = actor.bytecode_module.as_ref() else {
+            return false;
+        };
+        if module.actor_metadata.is_empty() {
+            return self.has_bytecode_handler(target_id, behavior_idx);
+        }
+
+        behavior_ownership::module_behavior_index_for_actor(module, &actor.name, behavior_idx)
+            .is_some()
+            && self.has_bytecode_handler(target_id, behavior_idx)
+    }
+
+    /// Numeric mailbox admission is intentionally compatible with anonymous
+    /// low-level actors: inert behavior id 0 remains usable when an actor has no
+    /// declared native or bytecode behavior. Typed/module actors are strict.
+    fn actor_accepts_numeric_delivery(&self, target_id: u64, behavior_id: u16) -> bool {
+        if self.actor_has_behavior_id(target_id, behavior_id) {
+            return true;
+        }
+        let Some(actor) = self.actors.get(&target_id) else {
+            return false;
+        };
+        let has_named_native = actor
+            .behavior_table
+            .iter()
+            .any(|entry| !entry.name.is_empty());
+        let has_named_bytecode = actor
+            .bytecode_module
+            .as_ref()
+            .is_some_and(|module| module.behaviors.iter().any(|entry| !entry.name.is_empty()));
+        behavior_id == 0 && !has_named_native && !has_named_bytecode
     }
 
     pub fn behavior_id_for(&self, target_id: u64, behavior: &str) -> Option<u16> {
         let actor = self.actors.get(&target_id)?;
-        // Allocation-free match: `entry.name == behavior`, or
-        // `entry.name` ends with `.<behavior>` (qualified name).
         let matches = |name: &str| {
             name == behavior
                 || name
                     .strip_suffix(behavior)
                     .is_some_and(|prefix| prefix.ends_with('.'))
         };
-        // Search the per-actor behavior table first (native handlers).
         if let Some(idx) = actor
             .behavior_table
             .iter()
             .position(|entry| matches(&entry.name))
         {
-            return Some(idx as u16);
+            return u16::try_from(idx).ok();
         }
-        // Fall back to the module-level behavior table (bytecode handlers).
-        // Returns the GLOBAL index into module.behaviors, which matches
-        // what bytecode_offsets expects.
+
         let module = actor.bytecode_module.as_ref()?;
-        module
-            .behaviors
-            .iter()
-            .position(|b| matches(&b.name))
-            .map(|idx| idx as u16)
+        if module.actor_metadata.is_empty() {
+            return module
+                .behaviors
+                .iter()
+                .position(|entry| matches(&entry.name))
+                .and_then(|idx| u16::try_from(idx).ok());
+        }
+
+        behavior_ownership::runtime_behavior_id_for_actor_name(module, &actor.name, behavior)
+            .and_then(|idx| u16::try_from(idx).ok())
     }
 
     /// Resolve a public name-based delivery without reintroducing the old
@@ -2146,13 +2204,12 @@ impl Runtime {
     /// target actor has been hydrated on the local shard.
     fn resolve_grain_behavior_id(&self, grain_id: &GrainId, behavior_name: &str) -> Option<u16> {
         let grain_type = self.grain_registry.get(&grain_id.grain_type)?;
-        let suffix = format!(".{}", behavior_name);
-        grain_type
-            .module
-            .behaviors
-            .iter()
-            .position(|b| b.name == behavior_name || b.name.ends_with(&suffix))
-            .map(|idx| idx as u16)
+        behavior_ownership::runtime_behavior_id_for_name(
+            &grain_type.module,
+            &grain_id.grain_type,
+            behavior_name,
+        )
+        .and_then(|idx| u16::try_from(idx).ok())
     }
 
     /// Send a message to an actor owned by another shard. Validates that the
@@ -2564,6 +2621,26 @@ impl Runtime {
         args: &[Value],
         out_trace: Option<String>,
     ) -> MessageAdmission {
+        if self.actors.contains_key(&target_id)
+            && !self.actor_accepts_numeric_delivery(target_id, behavior_id)
+        {
+            warn!(
+                "nulang-runtime: rejecting local message to actor {}: behavior id {} is not owned by target schema",
+                target_id, behavior_id
+            );
+            self.route_to_dlq(
+                &Message {
+                    behavior_id,
+                    payload: MessagePayload::from_slice(args),
+                    sender: self.current_actor.unwrap_or(0),
+                    priority: MessagePriority::System,
+                    trace_id: out_trace.clone(),
+                },
+                "behavior id not owned by target actor schema",
+            );
+            return MessageAdmission::Rejected;
+        }
+
         let msg = Message {
             behavior_id,
             payload: MessagePayload::from_slice(args),
