@@ -7,7 +7,7 @@ Language support for [Nulang](https://github.com/nulang-org/nulang) in Visual St
 - **Syntax highlighting** for `.nula` files via a TextMate grammar
   (`source.nulang`, maintained in
   [nulang-org/nulang-syntax](https://github.com/nulang-org/nulang-syntax)):
-  - Keywords: `fn`, `let`, `const`, `type`, `alias`, `effect`, `actor`, `behavior`, `state`, `spawn`, `send`, `receive`, `handle`, `perform`, `resume`, `match`, `case`, `if`/`else`, `for`, `while`, `loop`, `return`, `import`, `pub`, `extern`, and more
+  - Keywords: `fn`, `let`, `const`, `type`, `alias`, `effect`, `actor`, `behavior`, `state`, `spawn`, `send`, `receive`, `handle`, `perform`, `resume`, `match`, `case`, `if`/`else`, `for`, `while`, `loop`, `return`, `import`, `pub`, `unsafe`, `extern`, and more
   - Reference capabilities: `iso`, `trn`, `ref`, `val`, `box`, `tag`, `lineariso` (including `@cap` annotations)
   - Primitive and standard types, effect names (`IO`, `Http`, `Json`, `LLM`, ...), user-defined types
   - Strings with escape sequences, character literals, comments (`//` and `/* */`), numbers (int, float, hex, binary, octal), and operators (`->`, `=>`, `|>`, `!`, `<-`, `..`, ...)
