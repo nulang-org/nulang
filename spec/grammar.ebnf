@@ -15,6 +15,9 @@
 > Python interop, WIT) is **out of scope** for this grammar and is not part of
 > the frozen or stable language.
 >
+> `unsafe` is a contextual marker for the Experimental `unsafe extern` form;
+> it is not globally reserved and may still be used as an identifier elsewhere.
+>
 > EBNF conventions: `{ X }` = zero or more; `[ X ]` = optional; `X | Y` =
 > alternation; `"tok"` = literal terminal; `(* comment *)`. Newlines and
 > semicolons are equivalent statement separators (`SEP`).
@@ -35,7 +38,7 @@ Reserved keywords (not usable as identifiers): `fn`, `let`, `if`, `else`,
 `match`, `return`, `type`, `alias`, `enum`, `struct`, `effect`, `handle`,
 `perform`, `actor`, `behavior`, `spawn`, `send`, `receive`, `val`, `iso`,
 `trn`, `box`, `tag`, `lineariso`, `true`, `false`, `nil`, `unit`, `pub`,
-`unsafe`, `extern`, `where`, `priv`, `loop`, `node`, `monitor`, `link`, `exit`,
+`extern`, `where`, `priv`, `loop`, `node`, `monitor`, `link`, `exit`,
 `await`, `subworkflow`, `case`, `do`.
 
 ## 2. Core productions (Frozen — RFC 0002)
