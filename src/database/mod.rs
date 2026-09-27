@@ -5,3 +5,4 @@
 //! inner storage and query loops remain ordinary local computation.
 
 pub mod tablet;
+pub mod wal;
