@@ -3472,12 +3472,6 @@ impl Runtime {
     /// its local references or exits first.  Holds are recorded on the
     /// receiver's `OrcaGc` and released by [`release_held_foreign_refs`].
     fn hold_payload_refs(&mut self, receiver_id: u64, payload: &[Value]) {
-        // Object refs are acquired at mailbox admission so the backing bytes
-        // remain alive while a message waits to be processed. Keep this call
-        // as a fallback for direct/internal delivery paths; actor-level set
-        // semantics make repeated acquisition a no-op.
-        self.hold_object_refs(receiver_id, payload);
-
         for value in payload {
             if value.is_object() {
                 continue;
