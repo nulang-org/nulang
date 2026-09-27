@@ -80,13 +80,8 @@ impl ActorVmCallbacks for TrackingCallbacks {
 }
 
 fn with_iso_arena_vm() -> (VM, Rc<RefCell<AllocStats>>) {
-    let previous = std::env::var_os("NULANG_ISO_ARENA");
-    std::env::set_var("NULANG_ISO_ARENA", "1");
-    let vm = VM::new_without_jit();
-    match previous {
-        Some(value) => std::env::set_var("NULANG_ISO_ARENA", value),
-        None => std::env::remove_var("NULANG_ISO_ARENA"),
-    }
+    let mut vm = VM::new_without_jit();
+    vm.set_iso_arena_enabled(true);
     let stats = Rc::new(RefCell::new(AllocStats::default()));
     (vm, stats)
 }
