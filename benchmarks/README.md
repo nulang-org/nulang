@@ -92,10 +92,14 @@ is needed.
 Nulang-only A/B probes include a mailbox-only one-value admission lower bound,
 a 0/1/4/5/16-value runtime enqueue sweep around the small-message inline
 boundary, a matched warmed-bytecode/JIT vs AOT actor-drain comparison over the
-same actor source, and first-run JIT-vs-interpreter crossover probes at 3k, 4k,
-5k, and 7.5k loop trips. The actor comparison warms bytecode past the tier-up
-threshold before timing and excludes enqueue time for both backends; it also
-emits a `[backend-bench]` AOT speedup line. The tiering probes preconstruct
+same actor source, first-run JIT-vs-interpreter crossover probes at 3k, 4k, 5k,
+and 7.5k loop trips, and a tiny warmed-JIT loop paired with an interpreter
+control. The tiny-loop pair deliberately minimizes useful work per hot-region
+entry so changes to native-transition overhead (including the current
+conservative register-file snapshot) become visible without pretending to
+measure that copy in isolation. The actor comparison warms bytecode past the
+tier-up threshold before timing and excludes enqueue time for both backends; it
+also emits a `[backend-bench]` AOT speedup line. The tiering probes preconstruct
 fresh VMs so their timed sections include interpreter execution and JIT
 compilation/native execution, but not source compilation or VM/module setup.
 The mailbox-vs-runtime pair is diagnostic: it isolates how much local-send cost
@@ -103,6 +107,16 @@ lives above message construction and mailbox admission before routing or
 scheduler changes are attempted. The ordinary Nulang-only timings are emitted
 as `[ab-bench]` records and are never folded into the cross-language
 Rust/Go/Erlang comparison.
+
+The same workflow also runs an **unpinned host-wide shard-scaling diagnostic**
+separately from the single-CPU A/B measurements. It holds total work fixed at
+200,000 already-admitted local actor messages and drains equal shares on
+1/2/4/8 independent runtime shards. Records use `[scale-bench]`. This is an
+ideal local-shard parallelism ceiling: it intentionally excludes cross-shard
+routing, message production, and network traffic. Do not present it as
+end-to-end multicore actor scaling. The JSON report records these samples in a
+separate `scaling_*` section so they cannot be mixed accidentally with the
+single-CPU A/B results.
 
 ## Interpretation rules
 
