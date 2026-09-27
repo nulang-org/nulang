@@ -5399,17 +5399,13 @@ impl Runtime {
         }
         // Parse cached retry/fallback configs from restored state for agents.
         if is_agent {
-            if let Some(module) = actor
-                .bytecode_module
-                .as_ref()
-                .or_else(|| self.recovery_modules.get(&actor_id).map(|(m, _, _)| m))
-            {
-                for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
-                    if let crate::bytecode::Constant::String(json) = c {
+            if let Some(meta) = selected_meta.as_ref() {
+                for (name, constant) in &meta.state_defaults {
+                    if let crate::bytecode::Constant::String(json) = constant {
                         if name == "retry_config" {
-                            actor.retry_config = serde_json::from_str(&json).ok();
+                            actor.retry_config = serde_json::from_str(json).ok();
                         } else if name == "fallback_config" {
-                            actor.fallback_config = serde_json::from_str(&json).unwrap_or_default();
+                            actor.fallback_config = serde_json::from_str(json).unwrap_or_default();
                         }
                     }
                 }
@@ -5458,16 +5454,16 @@ impl Runtime {
         // persisted events legitimately has no value yet either, but
         // that's a separate, pre-existing question this fix doesn't
         // change.
-        if let Some(module) = self.recovery_modules.get(&actor_id).map(|(m, _, _)| m) {
-            for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
+        if let Some(meta) = selected_meta.as_ref() {
+            for (name, constant) in &meta.state_defaults {
                 if actor.get_state_field(name).is_some() {
                     continue;
                 }
-                let v = match c {
-                    crate::bytecode::Constant::String(s) => actor.allocate_string(s),
+                let value = match constant {
+                    crate::bytecode::Constant::String(text) => actor.allocate_string(text),
                     other => crate::vm::constant_to_value(other),
                 };
-                actor.set_state_field(name, v);
+                actor.set_state_field(name, value);
             }
         }
         // Restore bytecode metadata registered for recovery.
@@ -5476,11 +5472,12 @@ impl Runtime {
             actor.bytecode_offsets = offsets.clone();
             actor.compensation_offsets = comp_offsets.clone();
         }
+        if let Some(schema_name) = recovery_schema_name {
+            self.recovery_schema_names.insert(actor_id, schema_name);
+        }
+        self.actors.insert(actor_id, actor);
         if is_workflow {
-            self.actors.insert(actor_id, actor);
             self.layout_workflow_behavior_table(actor_id);
-        } else {
-            self.actors.insert(actor_id, actor);
         }
         // Ensure CRDT-backed fields are registered (or re-registered after
         // recovery). `register_actor_fields` is idempotent, so declared fields
@@ -5561,14 +5558,10 @@ impl Runtime {
                 }
             }
         } else {
-            // Replay journal entries that arrived after the snapshot.
-            let journal = self.persistence.read_journal(actor_id);
-            let entries_to_replay: Vec<_> = journal
-                .iter()
-                .filter(|e| e.sequence > snapshot.sequence)
-                .cloned()
-                .collect();
-            for entry in entries_to_replay {
+            // Replay entries that were schema-validated before actor
+            // publication. Payload materialization remains actor-heap aware so
+            // persisted strings retain their semantic value.
+            for entry in journal_to_replay {
                 let behavior_idx = entry.behavior_id as usize;
                 let payload: Vec<Value> = {
                     let actor = self.actors.get_mut(&actor_id)?;
