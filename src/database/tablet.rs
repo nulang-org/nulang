@@ -4,6 +4,7 @@
 //! invariants a future NuDB storage engine can enforce before mapping accepted
 //! writes onto WAL/MVCC/Raft machinery.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// Stable identifier for one logical tablet.
@@ -243,6 +244,156 @@ impl TabletWrite {
     }
 }
 
+/// One committed value version in the in-memory MVCC prototype.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VersionedValue {
+    sequence: u64,
+    value: Option<Vec<u8>>,
+}
+
+/// Minimal single-node MVCC tablet used to prove transaction semantics before
+/// introducing WAL and replication.
+///
+/// The structure is deliberately ordinary local computation rather than an
+/// actor-per-key design. A future tablet actor can own this state while reads,
+/// version lookup, and mutation application stay in the local hot path.
+#[derive(Debug, Clone)]
+pub struct MemoryTablet {
+    descriptor: TabletDescriptor,
+    current_sequence: u64,
+    rows: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
+}
+
+impl MemoryTablet {
+    pub fn new(descriptor: TabletDescriptor) -> Self {
+        Self {
+            descriptor,
+            current_sequence: 0,
+            rows: BTreeMap::new(),
+        }
+    }
+
+    pub fn descriptor(&self) -> &TabletDescriptor {
+        &self.descriptor
+    }
+
+    pub fn current_sequence(&self) -> u64 {
+        self.current_sequence
+    }
+
+    pub fn prepare_write(
+        &self,
+        presented_epoch: u64,
+        expected_previous_sequence: u64,
+        mutations: Vec<TabletMutation>,
+    ) -> Result<TabletWrite, TabletError> {
+        TabletWrite::prepare(
+            &self.descriptor,
+            presented_epoch,
+            expected_previous_sequence,
+            self.current_sequence,
+            mutations,
+        )
+    }
+
+    /// Atomically apply one prevalidated write to the in-memory MVCC state.
+    ///
+    /// All ownership, predecessor, and key-range checks happen before the
+    /// first row version is appended, so a rejected batch leaves the tablet
+    /// unchanged.
+    pub fn commit(&mut self, write: TabletWrite) -> Result<u64, TabletError> {
+        if write.tablet_id != self.descriptor.id {
+            return Err(TabletError::WrongTablet {
+                expected: self.descriptor.id,
+                presented: write.tablet_id,
+            });
+        }
+        if write.ownership_epoch < self.descriptor.ownership_epoch {
+            return Err(TabletError::StaleEpoch {
+                current: self.descriptor.ownership_epoch,
+                presented: write.ownership_epoch,
+            });
+        }
+        if write.ownership_epoch > self.descriptor.ownership_epoch {
+            return Err(TabletError::UnknownEpoch {
+                current: self.descriptor.ownership_epoch,
+                presented: write.ownership_epoch,
+            });
+        }
+        if write.expected_previous_sequence != self.current_sequence {
+            return Err(TabletError::SequenceMismatch {
+                committed: self.current_sequence,
+                expected_previous: write.expected_previous_sequence,
+            });
+        }
+        if write
+            .mutations
+            .iter()
+            .any(|mutation| !self.descriptor.range.contains(mutation.key()))
+        {
+            return Err(TabletError::KeyOutsideTabletRange);
+        }
+
+        let next_sequence = self
+            .current_sequence
+            .checked_add(1)
+            .ok_or(TabletError::SequenceOverflow)?;
+        if write.sequence != next_sequence {
+            return Err(TabletError::SequenceMismatch {
+                committed: self.current_sequence,
+                expected_previous: write.expected_previous_sequence,
+            });
+        }
+
+        for mutation in write.mutations {
+            match mutation {
+                TabletMutation::Put { key, value } => {
+                    self.rows.entry(key).or_default().push(VersionedValue {
+                        sequence: write.sequence,
+                        value: Some(value),
+                    });
+                }
+                TabletMutation::Delete { key } => {
+                    self.rows.entry(key).or_default().push(VersionedValue {
+                        sequence: write.sequence,
+                        value: None,
+                    });
+                }
+            }
+        }
+
+        self.current_sequence = write.sequence;
+        Ok(write.sequence)
+    }
+
+    /// Read one key at an already committed snapshot sequence.
+    pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
+        if snapshot > self.current_sequence {
+            return Err(TabletError::SnapshotAhead {
+                committed: self.current_sequence,
+                requested: snapshot,
+            });
+        }
+        if !self.descriptor.range.contains(key) {
+            return Err(TabletError::KeyOutsideTabletRange);
+        }
+
+        Ok(self.rows.get(key).and_then(|versions| {
+            versions
+                .iter()
+                .rev()
+                .find(|version| version.sequence <= snapshot)
+                .and_then(|version| version.value.as_deref())
+        }))
+    }
+
+    /// Read the newest committed value. Out-of-range keys route as absent;
+    /// callers that need a routing error can use `read_at`.
+    pub fn read_latest(&self, key: &[u8]) -> Option<&[u8]> {
+        self.read_at(key, self.current_sequence).ok().flatten()
+    }
+}
+
 /// Invariant failures detected before a tablet operation reaches storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TabletError {
@@ -250,6 +401,10 @@ pub enum TabletError {
     InvalidKeyRange,
     InvalidOwnershipEpoch,
     SplitKeyOutsideInterior,
+    WrongTablet {
+        expected: TabletId,
+        presented: TabletId,
+    },
     DuplicateChildTablet,
     EpochNotAdvanced {
         current: u64,
@@ -268,6 +423,10 @@ pub enum TabletError {
         expected_previous: u64,
     },
     SequenceOverflow,
+    SnapshotAhead {
+        committed: u64,
+        requested: u64,
+    },
     KeyOutsideTabletRange,
 }
 
@@ -280,6 +439,15 @@ impl fmt::Display for TabletError {
             Self::SplitKeyOutsideInterior => {
                 f.write_str("tablet split key must be strictly inside the source range")
             }
+            Self::WrongTablet {
+                expected,
+                presented,
+            } => write!(
+                f,
+                "tablet write targets tablet {}; expected {}",
+                presented.get(),
+                expected.get()
+            ),
             Self::DuplicateChildTablet => f.write_str("tablet split children must have distinct ids"),
             Self::EpochNotAdvanced { current, proposed } => write!(
                 f,
@@ -301,6 +469,13 @@ impl fmt::Display for TabletError {
                 "tablet predecessor {expected_previous} does not match committed sequence {committed}"
             ),
             Self::SequenceOverflow => f.write_str("tablet sequence overflow"),
+            Self::SnapshotAhead {
+                committed,
+                requested,
+            } => write!(
+                f,
+                "snapshot {requested} is ahead of committed tablet sequence {committed}"
+            ),
             Self::KeyOutsideTabletRange => {
                 f.write_str("tablet mutation key falls outside the owned key range")
             }
