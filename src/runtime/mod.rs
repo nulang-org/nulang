@@ -5103,6 +5103,13 @@ impl Runtime {
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
+        if snapshot.schema_name.is_some() && !self.recovery_modules.contains_key(&actor_id) {
+            warn!(
+                "nulang-recover: refusing actor {}: persisted schema identity has no registered compiler module",
+                actor_id
+            );
+            return None;
+        }
         let selected_meta = if let Some((module, _, _)) = self.recovery_modules.get(&actor_id) {
             if module.actor_metadata.is_empty() && snapshot.schema_name.is_none() {
                 None
