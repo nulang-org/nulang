@@ -209,17 +209,21 @@ fn bench_ab_shard_scaling() {
         }
 
         // Spawn worker threads before timing, then release all shard schedulers
-        // through one barrier so thread-creation cost is not mistaken for
-        // runtime scaling overhead.
+        // through one barrier and stop the clock at a second barrier. Thread
+        // creation and join teardown therefore cannot masquerade as scaling
+        // overhead.
         let start_gate = std::sync::Arc::new(std::sync::Barrier::new(shard_count + 1));
+        let finish_gate = std::sync::Arc::new(std::sync::Barrier::new(shard_count + 1));
         let (shards, elapsed) = std::thread::scope(|scope| {
             let handles: Vec<_> = shards
                 .into_iter()
                 .map(|mut shard| {
                     let start_gate = start_gate.clone();
+                    let finish_gate = finish_gate.clone();
                     scope.spawn(move || {
                         start_gate.wait();
                         shard.run_scheduler();
+                        finish_gate.wait();
                         shard
                     })
                 })
@@ -227,11 +231,13 @@ fn bench_ab_shard_scaling() {
 
             let start = Instant::now();
             start_gate.wait();
+            finish_gate.wait();
+            let elapsed = start.elapsed();
             let shards = handles
                 .into_iter()
                 .map(|handle| handle.join().expect("shard benchmark worker panicked"))
                 .collect::<Vec<_>>();
-            (shards, start.elapsed())
+            (shards, elapsed)
         });
 
         let processed: u64 = shards
@@ -240,8 +246,7 @@ fn bench_ab_shard_scaling() {
             .map(|actor| actor.reduction_count as u64)
             .sum();
         assert_eq!(
-            processed,
-            TOTAL_MESSAGES as u64,
+            processed, TOTAL_MESSAGES as u64,
             "shard scaling probe must process every admitted message"
         );
 
@@ -262,9 +267,7 @@ fn bench_ab_jit_transition_floor() {
     // loop iteration is two increments, so the result is sensitive to the
     // current native-transition machinery (including the conservative register
     // snapshot) without pretending to isolate one memcpy in artificial code.
-    let source = format!(
-        "var x = 0; var i = 0; while i < {TRIPS} {{ x = x + 1; i = i + 1; }}; x"
-    );
+    let source = format!("var x = 0; var i = 0; while i < {TRIPS} {{ x = x + 1; i = i + 1; }}; x");
     let tokens = Lexer::new(&source).lex().expect("bench: lex failed");
     let ast = Parser::new(tokens)
         .parse_module()
