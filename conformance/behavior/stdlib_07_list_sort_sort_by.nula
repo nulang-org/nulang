@@ -3,6 +3,12 @@
 import stdlib::list
 
 fn main() {
+    let show = fn(opt: Option[Int]) {
+        match opt {
+            Some(x) => perform Int.to_string(x),
+            None => "None",
+        }
+    }
     let s = sort([3, 1, 4, 1, 5])
     perform IO.print("sort_len=" + perform Int.to_string(length(s)))
     perform IO.print("sort0=" + perform Int.to_string(s[0]))
@@ -16,13 +22,15 @@ fn main() {
     perform IO.print("sort_by0=" + perform Int.to_string(d[0]))
     perform IO.print("sort_by2=" + perform Int.to_string(d[2]))
     let lt = fn(a, b) { a < b }
-    perform IO.print("min_by=" + perform Int.to_string(min_by(lt, [5, 2, 9])))
-    perform IO.print("max_by=" + perform Int.to_string(max_by(lt, [5, 2, 9])))
+    perform IO.print("min_by=" + show(min_by(lt, [5, 2, 9])))
+    perform IO.print("max_by=" + show(max_by(lt, [5, 2, 9])))
     let by_abs = fn(a, b) {
         let abs_a = if a < 0 then 0 - a else a;
         let abs_b = if b < 0 then 0 - b else b;
         abs_a < abs_b
     }
-    perform IO.print("min_by_abs=" + perform Int.to_string(min_by(by_abs, [5, -2, 3, -10])))
-    perform IO.print("max_by_abs=" + perform Int.to_string(max_by(by_abs, [5, -2, 3, -10])))
+    perform IO.print("min_by_abs=" + show(min_by(by_abs, [5, -2, 3, -10])))
+    perform IO.print("max_by_abs=" + show(max_by(by_abs, [5, -2, 3, -10])))
+    perform IO.print("min_by_empty=" + show(min_by(lt, [])))
+    perform IO.print("max_by_empty=" + show(max_by(lt, [])))
 }

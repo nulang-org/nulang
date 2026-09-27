@@ -31,6 +31,10 @@ pub enum RuntimeAuthorityError {
     /// The manifest is structurally valid but does not contain the exact grant
     /// required for the requested external action or delegation.
     Denied(AuthorityGrant),
+    /// Durable actor creation could not commit its required initial journal or
+    /// snapshot. This remains distinct from an authority denial so callers can
+    /// report infrastructure failure without misclassifying it as policy.
+    Persistence { operation: String, message: String },
 }
 
 impl fmt::Display for RuntimeAuthorityError {
@@ -45,6 +49,12 @@ impl fmt::Display for RuntimeAuthorityError {
             RuntimeAuthorityError::Denied(grant) => {
                 write!(f, "capability denied: {grant}")
             }
+            RuntimeAuthorityError::Persistence { operation, message } => {
+                write!(
+                    f,
+                    "durable spawn persistence failed during {operation}: {message}"
+                )
+            }
         }
     }
 }
@@ -54,7 +64,8 @@ impl Error for RuntimeAuthorityError {
         match self {
             RuntimeAuthorityError::InvalidManifest(err) => Some(err),
             RuntimeAuthorityError::AmbiguousSpawnMetadata { .. }
-            | RuntimeAuthorityError::Denied(_) => None,
+            | RuntimeAuthorityError::Denied(_)
+            | RuntimeAuthorityError::Persistence { .. } => None,
         }
     }
 }

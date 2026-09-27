@@ -2,7 +2,7 @@
 //!
 //! This module defines the small, backend-neutral vocabulary that host
 //! integrations should authorize before touching the filesystem, environment,
-//! secret store, or network. It intentionally does not perform I/O itself.
+//! secret store, process executor, or network. It intentionally does not perform I/O itself.
 //! The VM/runtime dispatch sites still need to call these helpers before the
 //! corresponding external effect becomes security-enforced end to end.
 
@@ -21,6 +21,7 @@ pub enum HostAuthorityRequest {
     FsWrite { path: String },
     EnvRead { name: String },
     SecretRead { name: String },
+    ProcessRun { command: String },
 }
 
 impl HostAuthorityRequest {
@@ -47,6 +48,12 @@ impl HostAuthorityRequest {
         Self::SecretRead { name: name.into() }
     }
 
+    pub fn process_run(command: impl Into<String>) -> Self {
+        Self::ProcessRun {
+            command: command.into(),
+        }
+    }
+
     /// Convert the host operation into the exact external authority grant it
     /// requires.
     ///
@@ -64,6 +71,9 @@ impl HostAuthorityRequest {
             Self::FsWrite { path } => AuthorityGrant::FsWrite { path: path.clone() },
             Self::EnvRead { name } => AuthorityGrant::EnvRead { name: name.clone() },
             Self::SecretRead { name } => AuthorityGrant::SecretRead { name: name.clone() },
+            Self::ProcessRun { command } => AuthorityGrant::ProcessRun {
+                command: command.clone(),
+            },
         }
     }
 }
@@ -97,6 +107,10 @@ impl Actor {
     pub fn require_secret_read(&self, name: &str) -> Result<(), RuntimeAuthorityError> {
         self.require_host_authority(&HostAuthorityRequest::secret_read(name))
     }
+
+    pub fn require_process_run(&self, command: &str) -> Result<(), RuntimeAuthorityError> {
+        self.require_host_authority(&HostAuthorityRequest::process_run(command))
+    }
 }
 
 #[cfg(test)]
@@ -124,6 +138,12 @@ mod tests {
             AuthorityGrant::NetTcpOut {
                 host: "api.stripe.com".into(),
                 port: 443,
+            }
+        );
+        assert_eq!(
+            HostAuthorityRequest::process_run("printf hello").required_grant(),
+            AuthorityGrant::ProcessRun {
+                command: "printf hello".into(),
             }
         );
     }
@@ -154,6 +174,16 @@ mod tests {
         assert!(actor.require_secret_read("STRIPE_KEY").is_ok());
         assert!(matches!(
             actor.require_secret_read("API_URL"),
+            Err(RuntimeAuthorityError::Denied(_))
+        ));
+    }
+
+    #[test]
+    fn process_authority_is_exact_command_only() {
+        let actor = actor_with(&["Process::Run(printf hello)"]);
+        assert!(actor.require_process_run("printf hello").is_ok());
+        assert!(matches!(
+            actor.require_process_run("printf goodbye"),
             Err(RuntimeAuthorityError::Denied(_))
         ));
     }

@@ -1,17 +1,26 @@
 # Nulang Architecture Reference
 
-**Document Version:** 1.1
-**Date:** July 2026
+**Document Version:** 1.2
+**Date:** September 2026
 **Audience:** Core implementers, runtime engineers, language designers
 **Companion Documents:** design notes in `docs/archive/` (AI SDK, workflow SDK, cloud, package manager)
 
-> **Implementation status (v1.1):** Sections 2 and 6 (Language and AI Runtime)
-> have been re-verified against the current source tree and describe the
-> system as implemented. Sections 3–5 and the derived material in Sections
-> 7–10 still describe the *target* architecture; where the implementation
-> already diverges in a verified way, §1 carries the corrections. Treat
-> uncaveated numbers and diagrams in Sections 3–5 as design goals, not
-> as-built fact.
+> **Implementation status (v1.2):** This document mixes an as-built reference
+> with longer-term architecture. The compiler/backend description and the
+> correction list in §1 are maintained against current `main`; substantial
+> parts of Sections 3–5 and derived diagrams in Sections 7–10 still describe
+> target architecture. Treat uncaveated topology, protocol, capacity, and
+> performance numbers outside explicitly marked "current" sections as design
+> goals rather than shipped behavior. For a concise current-main matrix, see
+> `docs/IMPLEMENTATION_STATUS.md`.
+>
+> **Semantic-model correction (September 2026):** RFC 0024 supersedes the
+> earlier language-wide "everything is an actor" framing. The five layers below
+> remain an implementation/component map. They are not the language ontology:
+> local computation, scoped tasks, and actors are distinct execution domains,
+> while durability and identity are orthogonal properties. Current workflow
+> lowering may still use actors as a host without making actor identity part of
+> workflow semantics.
 
 ---
 
@@ -33,7 +42,11 @@
 
 ## 1. System Overview
 
-Nulang is organized into five strictly layered subsystems. Each layer communicates only with adjacent layers. This constraint ensures independent testability, replaceability, and evolution.
+The current Nulang implementation is organized into five layered subsystems. This
+diagram describes component ownership and dependency direction, not a requirement
+that every computation semantically pass through the actor abstraction. Each layer
+communicates only with adjacent layers where the current architecture enforces that
+boundary, supporting independent testability, replaceability, and evolution.
 
 ```
 +==========================================================================+
@@ -73,32 +86,43 @@ Nulang is organized into five strictly layered subsystems. Each layer communicat
 - Data passes across boundaries as plain structs; no shared mutable state
 - Each layer can be tested with mocked adjacent layers
 
-**Implementation note (updated July 2026):** the compiler targets a
+**Implementation note (updated September 2026):** the compiler targets a
 register-VM bytecode by default. A WASM backend (`--backend wasm | wasm-run | wasm-aot`)
 exists behind the `wasm-backend` feature flag (src/mir_wasm.rs, src/wasm_runtime.rs).
 A native/AOT backend (`--backend native`) compiles via Cranelift ahead-of-time.
 Other verified divergences from the target design of Layers 2–4, to keep in
 mind while reading §3–§5:
 
-- **Mailboxes are unbounded**, backed by `crossbeam::queue::SegQueue`
-  (`src/runtime/mailbox.rs`); push always succeeds — there is no 10,000-slot
-  ring buffer, no overflow policy, and no transport-level backpressure.
-  Messages carry a `MessagePriority` (`System`/`Normal`/`Bulk`) field, but the
-  queue itself is a single FIFO.
+- **Spawned actors currently default to unbounded mailboxes**, but the mailbox
+  implementation is no longer an unbounded single FIFO. `Mailbox` has separate
+  System and Normal/Bulk concurrent lanes, a scheduler-local lane, transactional
+  selective-receive staging, and an optional capacity limit. Bounded normal/bulk
+  pushes fail with explicit backpressure while System messages bypass the limit.
+  Cross-shard transport is separately bounded by 1024-entry `sync_channel`s.
 - **Actor identity is a bare `u64`** from a global atomic counter
   (`fresh_actor_id`, `src/runtime/mod.rs`); `spawn` is explicit — there is no
   Orleans-style string identity, no activation-on-first-message, and no
   consistent-hash placement yet.
-- **The reduction budget is 1000** per scheduling round (`next_reductions` in
-  `src/runtime/mod.rs`), enforced by a synchronous single-threaded
-  `step_actor` loop — not 2000 WASM-asyncify reductions.
-- **Persistence** ships three `PersistenceStore` backends — `MemoryStore`,
-  `JsonFileStore`, `LibsqlStore` (`src/runtime/persistence.rs`) — not
-  PostgreSQL or S3.
-- **The NUL0 transport** is a hand-rolled, length-prefixed TCP protocol whose
-  fixed header is 13 bytes (4-byte `NUL0` magic, 1-byte packet type, 8-byte
-  sequence); the version/flags/MAC fields, TLS, QUIC, and Poly1305 drawn in
-  §5.5 do not exist in `src/runtime/network.rs`.
+- **Scheduling is single-owner per shard, not single-threaded process-wide.**
+  `run_scheduler()` cooperatively executes one shard on one OS thread with a
+  1000-step/message turn budget and a small same-actor micro-batch. With
+  `NULANG_SHARDS>1`, `main.rs` runs multiple `Runtime` shards concurrently
+  on scoped OS threads. The live per-shard dequeue path uses scheduler worker
+  slot 0; Chase-Lev peer stealing is implemented for generic multi-worker callers
+  but is not active inside the current live shard loop.
+- **Persistence** is abstracted by `PersistenceStore`. Current `main` ships
+  `MemoryStore`, `JsonFileStore`, and `LibsqlStore`; optional
+  `rocksdb` and `postgres` features add `RocksDbStore` and
+  `PostgresStore`. Atomic durable-transition support is capability-specific:
+  unsupported stores fail closed rather than emulating an atomic commit with
+  sequential writes.
+- **The NUL0 transport** is a hand-rolled, length-prefixed TCP protocol. Each
+  connection begins with a frozen 16-byte versioned handshake
+  (`NUL0` magic + `u32` wire version + `u64` node id); each framed packet
+  then carries the 13-byte NUL0/type/sequence envelope after its 4-byte length
+  prefix. The TCP path supports mutual TLS through rustls, with an explicit
+  insecure plaintext mode for development/testing. QUIC and the older
+  Poly1305-style target design in §5.5 are not implemented.
 
 ---
 
@@ -492,78 +516,55 @@ WASM instances are shared across actors of the same type via copy-on-write. The 
 - No central coordinator needed for placement decisions
 - Hot actors can be manually migrated via the management API
 
-### 3.2 Scheduler: Work-Stealing M:N with Reduction Counting
+### 3.2 Scheduler: Sharded Cooperative Execution with Reduction Counting
 
-The scheduler maps M actors onto N OS threads. It is the execution heart of the runtime.
+The production CLI currently scales actor execution by running multiple independent
+`Runtime` shards in parallel, rather than by sharing one mutable actor table across
+many worker threads.
 
-**Architecture:**
-
-```
-+------------------------------------------------------------------------+
-|                          OS Thread Pool (N threads)                     |
-|  Typically N = number of CPU cores                                     |
-+------------------------------------------------------------------------+
-|                                                                         |
-|  +----------+  +----------+  +----------+         +----------+         |
-|  | Sched 0  |  | Sched 1  |  | Sched 2  |  ...    | Sched N-1|         |
-|  |          |  |          |  |          |         |          |         |
-|  | Run Queue|  | Run Queue|  | Run Queue|         | Run Queue|         |
-|  | [A1, A3] |  | [A7]     |  | [A2, A5] |         | [A4, A6] |         |
-|  |          |  |          |  |          |         |          |         |
-|  | LIFO for |  | LIFO for |  | LIFO for |         | LIFO for |         |
-|  | spawns   |  | spawns   |  | spawns   |         | spawns   |         |
-|  | FIFO for |  | FIFO for |  | FIFO for |         | FIFO for |         |
-|  | messages |  | messages |  | messages |         | messages |         |
-|  +----------+  +----------+  +----------+         +----------+         |
-|       |             |             |                      |              |
-|       | steal <-----+----- steal +----- steal -----------+              |
-|       |    (when empty, steal half from random neighbor)                |
-+------------------------------------------------------------------------+
-```
-
-**Per-scheduler data structures:**
-
-| Structure | Purpose | Access Pattern |
-|-----------|---------|----------------|
-| Local run queue | Ready actors | LIFO (spawns) + FIFO (messages), producer-consumer |
-| Steal deque | Work available for other schedulers | Lock-free Chase-Lev deque |
-| Current actor | Actor currently executing | Single owner |
-| Reduction counter | Remaining reductions for current actor | Decremented per operation |
-
-**Reduction counting:** Each actor is assigned a reduction budget (default: 2000 reductions) when scheduled. One reduction ≈ one WASM instruction or one host function call. When the counter reaches zero:
-1. The actor yields (WASM execution paused via asyncify)
-2. Actor returns to the run queue
-3. Scheduler picks the next actor
-
-Reduction counting serves two purposes: fairness (no actor monopolizes a thread) and checkpointing (yield points are natural checkpoint boundaries).
-
-**Work-stealing algorithm** (Chase-Lev, lock-free):
+**As-built execution model:**
 
 ```
-When scheduler S has no work:
-  1. Pick a random victim scheduler V
-  2. Attempt to steal half of V's deque (from the bottom)
-  3. If steal succeeds: process stolen work
-  4. If steal fails: try another victim (up to 3 attempts)
-  5. If all fail: park the OS thread (futex wait)
-  6. Wake when new work arrives (futex wake)
+process
+  |
+  +-- shard 0 / OS thread 0 --> Runtime 0 --> Scheduler::dequeue(slot 0) --> actors id % N == 0
+  |
+  +-- shard 1 / OS thread 1 --> Runtime 1 --> Scheduler::dequeue(slot 0) --> actors id % N == 1
+  |
+  +-- ...
+  |
+  +-- shard N-1 / OS thread N-1
+
+cross-shard delivery: bounded mpsc::sync_channel(1024)
+optional Linux affinity: NULANG_PIN_CORES=1
+shard count: NULANG_SHARDS (default 1)
 ```
 
-**Message processing loop:**
+Each actor remains single-threaded because exactly one shard owns it. Cross-shard
+messages carry value-style payloads rather than sharing actor-heap pointers, which
+keeps ORCA reference ownership local to the shard.
 
-```
-for each scheduled actor:
-  1. Dequeue next message from actor's mailbox
-  2. If mailbox empty: deactivate actor (if idle timeout exceeded)
-  3. Load reduction counter (default 2000)
-  4. Enter WASM sandbox, call behavior handler with message
-  5. Handler runs until completion OR reduction counter hits 0
-  6. If counter hit 0: save WASM stack (asyncify), requeue actor
-  7. If handler completed: check for outgoing messages, deliver them
-  8. If persistent actor: trigger checkpoint (async, non-blocking)
-  9. If more messages in mailbox: requeue actor
-  10. If mailbox empty: mark idle, start idle timer
-```
+`Scheduler` itself retains Chase-Lev worker deques and a generic
+`Scheduler::next_task` peer-stealing path. The live `Runtime::run_scheduler`
+path deliberately uses worker slot 0, so there is currently **one scheduler worker
+per shard**. Do not describe the live runtime as multiple stealing workers over one
+shared `Runtime` actor table.
+
+**Live scheduling policy:**
+
+- strict actor priority: High > Normal > Low;
+- cooperative turns with a 1000 reduction/message budget;
+- up to 16 same-actor messages may be micro-batched for cache locality while the
+  actor remains runnable and under its turn budget;
+- yielded/runnable actors are re-enqueued, preserving actor isolation;
+- timer and suspended-LLM completions are pumped by the owning shard loop;
+- cross-shard inboxes are drained before local dequeue so remote work becomes
+  ordinary local actor work.
+
+This model gives real multicore execution when multiple shards are configured while
+avoiding a `Send + Sync` shared mutable `Runtime`. A future multi-worker-per-shard
+runtime can reuse the existing work-stealing primitives, but it must preserve the
+single-owner actor/VM/GC invariants before the live path switches to them.
 
 ### 3.3 Mailbox Design: Bounded MPSC with Backpressure
 

@@ -2,6 +2,20 @@
 
 import stdlib::list
 
+fn option_int_eq(opt: Option[Int], expected: Int) -> Bool {
+  match opt {
+    Some(x) => x == expected,
+    None => false,
+  }
+}
+
+fn option_int_is_none(opt: Option[Int]) -> Bool {
+  match opt {
+    Some(_) => false,
+    None => true,
+  }
+}
+
 // ── length ───────────────────────────────────────────────────────────────────
 fn test_length() {
   perform Test.assert_eq(length([]), 0, "length empty")
@@ -25,11 +39,11 @@ fn test_contains() {
 
 // ── index_of ─────────────────────────────────────────────────────────────────
 fn test_index_of() {
-  perform Test.assert_eq(index_of(2, [1, 2, 3]), 1, "index_of middle")
-  perform Test.assert_eq(index_of(1, [1, 2, 3]), 0, "index_of first")
-  perform Test.assert_eq(index_of(3, [1, 2, 3]), 2, "index_of last")
-  perform Test.assert_eq(index_of(99, [1, 2, 3]), -1, "index_of not found")
-  perform Test.assert_eq(index_of(1, []), -1, "index_of empty")
+  perform Test.assert(option_int_eq(index_of(2, [1, 2, 3]), 1), "index_of middle")
+  perform Test.assert(option_int_eq(index_of(1, [1, 2, 3]), 0), "index_of first")
+  perform Test.assert(option_int_eq(index_of(3, [1, 2, 3]), 2), "index_of last")
+  perform Test.assert(option_int_is_none(index_of(99, [1, 2, 3])), "index_of not found")
+  perform Test.assert(option_int_is_none(index_of(1, [])), "index_of empty")
 }
 
 // ── any ──────────────────────────────────────────────────────────────────────
@@ -51,8 +65,8 @@ fn test_all() {
 // ── find ─────────────────────────────────────────────────────────────────────
 fn test_find() {
   let is_even = fn(x) { x - (x / 2) * 2 == 0 }
-  perform Test.assert_eq(find(is_even, [1, 2, 3]), 2, "find even")
-  perform Test.assert_eq(find(is_even, [1, 3, 5]), -1, "find not found")
+  perform Test.assert(option_int_eq(find(is_even, [1, 2, 3]), 2), "find even")
+  perform Test.assert(option_int_is_none(find(is_even, [1, 3, 5])), "find not found")
 }
 
 // ── fold ─────────────────────────────────────────────────────────────────────
@@ -65,16 +79,18 @@ fn test_fold() {
 
 // ── max_of ───────────────────────────────────────────────────────────────────
 fn test_max_of() {
-  perform Test.assert_eq(max_of([1, 5, 3, 9, 2]), 9, "max_of middle")
-  perform Test.assert_eq(max_of([-5, -1, -3]), -1, "max_of negative")
-  perform Test.assert_eq(max_of([42]), 42, "max_of single")
+  perform Test.assert(option_int_eq(max_of([1, 5, 3, 9, 2]), 9), "max_of middle")
+  perform Test.assert(option_int_eq(max_of([-5, -1, -3]), -1), "max_of negative")
+  perform Test.assert(option_int_eq(max_of([42]), 42), "max_of single")
+  perform Test.assert(option_int_is_none(max_of([])), "max_of empty")
 }
 
 // ── min_of ───────────────────────────────────────────────────────────────────
 fn test_min_of() {
-  perform Test.assert_eq(min_of([1, 5, 3, 0, 2]), 0, "min_of middle")
-  perform Test.assert_eq(min_of([-5, -1, -3]), -5, "min_of negative")
-  perform Test.assert_eq(min_of([42]), 42, "min_of single")
+  perform Test.assert(option_int_eq(min_of([1, 5, 3, 0, 2]), 0), "min_of middle")
+  perform Test.assert(option_int_eq(min_of([-5, -1, -3]), -5), "min_of negative")
+  perform Test.assert(option_int_eq(min_of([42]), 42), "min_of single")
+  perform Test.assert(option_int_is_none(min_of([])), "min_of empty")
 }
 
 // ── map ──────────────────────────────────────────────────────────────────────
@@ -103,7 +119,7 @@ fn test_reverse() {
   let result = reverse([1, 2, 3])
   perform Test.assert_eq(length(result), 3, "reverse len")
   perform Test.assert_eq(sum(result), 6, "reverse sum")
-  perform Test.assert_eq(index_of(3, result), 0, "reverse first is 3")
+  perform Test.assert(option_int_eq(index_of(3, result), 0), "reverse first is 3")
   perform Test.assert_eq(length(reverse([])), 0, "reverse empty")
 }
 
@@ -142,7 +158,7 @@ fn test_sort() {
   perform Test.assert_eq(length(result), 8, "sort len")
   perform Test.assert_eq(sum(result), 31, "sort sum preserved")
   // Check sorted: index_of each in order
-  perform Test.assert_eq(index_of(1, result), 0, "sort first is 1")
+  perform Test.assert(option_int_eq(index_of(1, result), 0), "sort first is 1")
   let empty = sort([])
   perform Test.assert_eq(length(empty), 0, "sort empty")
   let single = sort([42])
@@ -156,7 +172,7 @@ fn test_sort_by() {
   let result = sort_by(descending, [3, 1, 4, 1, 5])
   perform Test.assert_eq(length(result), 5, "sort_by len")
   perform Test.assert_eq(sum(result), 14, "sort_by sum preserved")
-  perform Test.assert_eq(index_of(5, result), 0, "sort_by first is 5")
+  perform Test.assert(option_int_eq(index_of(5, result), 0), "sort_by first is 5")
   let empty = sort_by(descending, [])
   perform Test.assert_eq(length(empty), 0, "sort_by empty")
 }
@@ -168,7 +184,8 @@ fn test_min_by() {
     let abs_b = if b < 0 then 0 - b else b;
     abs_a < abs_b
   }
-  perform Test.assert_eq(min_by(by_abs, [5, -2, 3, -10]), -2, "min_by abs")
+  perform Test.assert(option_int_eq(min_by(by_abs, [5, -2, 3, -10]), -2), "min_by abs")
+  perform Test.assert(option_int_is_none(min_by(by_abs, [])), "min_by empty")
 }
 
 // ── max_by ───────────────────────────────────────────────────────────────────
@@ -178,7 +195,8 @@ fn test_max_by() {
     let abs_b = if b < 0 then 0 - b else b;
     abs_a < abs_b
   }
-  perform Test.assert_eq(max_by(by_abs, [5, -2, 3, -10]), -10, "max_by abs")
+  perform Test.assert(option_int_eq(max_by(by_abs, [5, -2, 3, -10]), -10), "max_by abs")
+  perform Test.assert(option_int_is_none(max_by(by_abs, [])), "max_by empty")
 }
 
 // ── append ───────────────────────────────────────────────────────────────────
@@ -186,7 +204,7 @@ fn test_append() {
   let result = append([1, 2, 3], [4, 5])
   perform Test.assert_eq(length(result), 5, "append len")
   perform Test.assert_eq(sum(result), 15, "append sum")
-  perform Test.assert_eq(index_of(4, result), 3, "append index of first from ys")
+  perform Test.assert(option_int_eq(index_of(4, result), 3), "append index of first from ys")
   let empty_l = append([], [1, 2])
   perform Test.assert_eq(length(empty_l), 2, "append empty xs")
   let empty_r = append([1, 2], [])

@@ -1,5 +1,5 @@
 //! VM throughput benchmarks: arithmetic, function calls, closures, dispatch,
-//! record/array access.
+//! record/array access, and direct effect dispatch.
 
 use criterion::{black_box, criterion_group, BatchSize, Criterion};
 use nulang::bytecode::CodeModule;
@@ -123,6 +123,72 @@ fn bench_array_indexing(c: &mut Criterion) {
     });
 }
 
+/// Baseline the `Perform` hot path before module-load name caching.
+/// The performed operation is stable for every loop iteration, so repeated
+/// parsing/allocation of `Float.sqrt` is pure dispatch overhead.
+fn bench_perform_float_sqrt(c: &mut Criterion) {
+    let source = "var sum = 0.0; var x = 1.0; var i = 0; while i < 1000 { sum = sum + perform Float.sqrt(x); x = x + 1.0; i = i + 1; }; sum";
+    let module = compile(source);
+    c.bench_function("vm/perform/float_sqrt", |b| {
+        b.iter_batched(
+            || fresh_vm(&module),
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+}
+
+fn bench_perform_int_to_float(c: &mut Criterion) {
+    let source = "var sum = 0.0; var i = 0; while i < 1000 { sum = sum + perform Int.to_float(i); i = i + 1; }; sum";
+    let module = compile(source);
+    c.bench_function("vm/perform/int_to_float", |b| {
+        b.iter_batched(
+            || fresh_vm(&module),
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+}
+
+fn bench_perform_array_length(c: &mut Criterion) {
+    let source = "let xs = [1, 2, 3, 4, 5, 6, 7, 8]; var sum = 0; var i = 0; while i < 1000 { sum = sum + perform Array.length(xs); i = i + 1; }; sum";
+    let module = compile(source);
+    c.bench_function("vm/perform/array_length", |b| {
+        b.iter_batched(
+            || fresh_vm(&module),
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+}
+
+fn bench_perform_string_length(c: &mut Criterion) {
+    let source = "let s = \"perform-direct-baseline\"; var sum = 0; var i = 0; while i < 1000 { sum = sum + perform String.length(s); i = i + 1; }; sum";
+    let module = compile(source);
+    c.bench_function("vm/perform/string_length", |b| {
+        b.iter_batched(
+            || fresh_vm(&module),
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+}
+
+/// Control benchmark for the statically resolved handler path. The compiler
+/// lowers this known handler to PerformDirect, so it is intentionally kept
+/// separate from the generic Perform cache measurements above.
+fn bench_perform_direct_custom_handler(c: &mut Criterion) {
+    let source = "let result = handle { var sum = 0; var i = 0; while i < 500 { sum = sum + perform Counter.ask(); i = i + 1; }; sum } { | Counter.ask() resume => 1 }; result";
+    let module = compile(source);
+    c.bench_function("vm/perform_direct/custom_handler", |b| {
+        b.iter_batched(
+            || fresh_vm(&module),
+            |mut vm| black_box(vm.run().unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+}
+
 criterion_group!(
     benches,
     bench_int_arithmetic,
@@ -131,4 +197,9 @@ criterion_group!(
     bench_closure_capture,
     bench_record_access,
     bench_array_indexing,
+    bench_perform_float_sqrt,
+    bench_perform_int_to_float,
+    bench_perform_array_length,
+    bench_perform_string_length,
+    bench_perform_direct_custom_handler,
 );

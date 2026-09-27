@@ -1,1 +1,1 @@
-{"exit_code":0,"stdout":"fold_sum=10\nfold_init10=16\nfold_empty=0\nfold_sub=-7\nmax=9\nmax_neg=-1\nmin=0\nmin_neg=-5","stderr":""}
+{"exit_code":0,"stdout":"fold_sum=10\nfold_init10=16\nfold_empty=0\nfold_sub=-7\nmax=9\nmax_neg=-1\nmin=0\nmin_neg=-5\nmax_empty=None\nmin_empty=None","stderr":""}

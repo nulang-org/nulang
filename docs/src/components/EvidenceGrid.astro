@@ -1,0 +1,129 @@
+---
+const evidence = [
+  {
+    eyebrow: 'Run it',
+    title: 'Browser playground',
+    body: 'Real compiler frontend + CoreVM in WebAssembly.',
+    href: '/playground/',
+    cta: 'Open playground',
+    external: false,
+  },
+  {
+    eyebrow: 'Verify it',
+    title: 'Conformance suite',
+    body: 'Executable behavior cases for language and runtime semantics.',
+    href: 'https://github.com/nulang-org/nulang/tree/main/conformance',
+    cta: 'Browse tests',
+    external: true,
+  },
+  {
+    eyebrow: 'Measure it',
+    title: 'Benchmark history',
+    body: 'Regression-gated Criterion results retained per main-branch commit.',
+    href: 'https://github.com/nulang-org/nulang/tree/main/benchmarks',
+    cta: 'Inspect data',
+    external: true,
+  },
+];
+---
+
+<div class="evidence-strip" role="list" aria-label="Ways to verify Nulang">
+  {evidence.map((item) => (
+    <a
+      class="evidence-item"
+      href={item.href}
+      role="listitem"
+      target={item.external ? '_blank' : undefined}
+      rel={item.external ? 'noopener noreferrer' : undefined}
+    >
+      <span class="evidence-eyebrow">{item.eyebrow}</span>
+      <strong>{item.title}</strong>
+      <p>{item.body}</p>
+      <span class="evidence-cta">
+        {item.cta}
+        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M5 12h14" />
+          <path d="m12 5 7 7-7 7" />
+        </svg>
+      </span>
+    </a>
+  ))}
+</div>
+
+<style>
+  .evidence-strip {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border-top: 1px solid var(--nu-border);
+    border-bottom: 1px solid var(--nu-border);
+  }
+
+  .evidence-item {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    padding: 1.5rem;
+    color: var(--nu-text);
+    text-decoration: none;
+  }
+
+  .evidence-item + .evidence-item {
+    border-left: 1px solid var(--nu-border);
+  }
+
+  .evidence-item:hover {
+    background: color-mix(in srgb, var(--nu-blue) 4%, transparent);
+    text-decoration: none;
+  }
+
+  .evidence-eyebrow {
+    color: var(--nu-blue);
+    font-size: 0.68rem;
+    font-weight: 750;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .evidence-item strong {
+    margin-top: 0.45rem;
+    font-size: 1rem;
+  }
+
+  .evidence-item p {
+    margin: 0.45rem 0 0;
+    color: var(--nu-text-secondary);
+    font-size: 0.86rem;
+    line-height: 1.55;
+  }
+
+  .evidence-cta {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin-top: 1rem;
+    color: var(--nu-accent-high);
+    font-size: 0.8rem;
+    font-weight: 700;
+  }
+
+  .evidence-cta svg {
+    width: 0.9rem;
+    height: 0.9rem;
+    transition: transform 0.18s ease;
+  }
+
+  .evidence-item:hover .evidence-cta svg {
+    transform: translateX(3px);
+  }
+
+  @media (max-width: 46rem) {
+    .evidence-strip {
+      grid-template-columns: 1fr;
+    }
+
+    .evidence-item + .evidence-item {
+      border-left: 0;
+      border-top: 1px solid var(--nu-border);
+    }
+  }
+</style>

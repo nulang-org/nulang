@@ -17,11 +17,66 @@ env:
 
 jobs:
   # -----------------------------------------------------------------------
+  # Documentation site + zero-install browser playground
+  # -----------------------------------------------------------------------
+  docs-site:
+    name: Docs site & browser playground
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Install Rust for browser playground
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.95.0'
+          targets: wasm32-unknown-unknown
+
+      - name: Cache playground build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build browser playground
+        run: playground/web/build.sh
+
+      - name: Smoke test browser playground
+        run: node playground/web/test/smoke.mjs
+
+      - name: Install docs dependencies
+        run: |
+          cd docs
+          pnpm install --frozen-lockfile
+
+      - name: Type-check Astro site
+        run: |
+          cd docs
+          pnpm run check
+
+      - name: Build Astro site
+        run: |
+          cd docs
+          pnpm run build
+
+      - name: Verify playground is in site output
+        run: |
+          test -s docs/dist/playground/index.html
+          test -s docs/dist/playground/playground.js
+          test -s docs/dist/playground/style.css
+          test -s docs/dist/playground/nulang_playground.wasm
+
+  # -----------------------------------------------------------------------
   # Primary build & test (default features)
   # -----------------------------------------------------------------------
   test:
     name: Build & Test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
@@ -32,25 +87,27 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --all-targets
+        run: cargo build --locked --all-targets
 
       - name: Test
-        run: |
-          # The five-node split-brain cluster test is known to be timing-
-          # sensitive on GitHub Actions shared runners. Retry the whole suite
-          # once on failure so a single flaky run does not block merges.
-          cargo test || (echo "Retrying test suite after flaky failure..." && cargo test)
+        # Cluster partition/healing coverage uses the virtual-clock harness;
+        # fail on the first suite failure so CI never masks a real regression.
+        run: cargo test --locked
 
       - name: Install cargo-llvm-cov
+        if: env.CODECOV_TOKEN != ''
         run: cargo install cargo-llvm-cov --locked
 
       - name: Generate coverage report
-        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+        if: env.CODECOV_TOKEN != ''
+        run: cargo llvm-cov --locked --all-features --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
         if: env.CODECOV_TOKEN != ''
@@ -59,7 +116,10 @@ jobs:
           files: lcov.info
 
       - name: Gate (forbidden patterns + zero warnings)
-        run: python3 scripts/verify_implementation.py
+        # Build & Test above already ran the full default-feature test suite,
+        # and llvm-cov reran tests with all features. Keep the verifier's
+        # static-invariant and zero-warning checks, but avoid a third test run.
+        run: python3 scripts/verify_implementation.py --skip-tests
 
   # -----------------------------------------------------------------------
   # Release build — catches optimization-only errors
@@ -67,6 +127,7 @@ jobs:
   release:
     name: Release Build
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
@@ -75,15 +136,17 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Test (release)
-        run: cargo test --release
+        run: cargo test --locked --release
 
 
   # -----------------------------------------------------------------------
@@ -92,6 +155,7 @@ jobs:
   nula-test:
     name: Nula Package Test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: release
     env:
       # The repo sets `target-dir = "/tmp/cargo-target"` in `.cargo/config.toml`,
@@ -107,12 +171,14 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
       - name: Build nulang (release)
-        run: cargo build --release --bin nulang
+        run: cargo build --locked --release --bin nulang
 
       - name: Smoke test (eval)
         run: ./target/release/nulang --eval 'perform IO.print("hello")'
@@ -131,11 +197,14 @@ jobs:
   minimal-build:
     name: Build without optional features
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -143,13 +212,19 @@ jobs:
       # No python3-dev installed here on purpose: this job proves the
       # no-default-features build has zero PyO3/SQLite/LSP dependencies.
       - name: Build
-        run: cargo build --all-targets --no-default-features
+        run: cargo build --locked --all-targets --no-default-features
 
       - name: Test
-        run: cargo test --no-default-features
+        run: cargo test --locked --no-default-features
 
       - name: Check zero warnings
-        run: cargo check --tests --no-default-features
+        run: cargo check --locked --tests --no-default-features
+
+      - name: Smoke test standalone Savina runner
+        run: |
+          output="$(cargo run --locked --no-default-features --features savina-bench --bin nulang-savina -- --benchmark ping_pong --format jsonl)"
+          echo "$output"
+          echo "$output" | grep -F '"benchmark":"ping_pong"'
 
   # -----------------------------------------------------------------------
   # WASM backend
@@ -157,30 +232,7 @@ jobs:
   wasm-backend:
     name: Build & Test (wasm-backend feature)
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3-dev
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build
-        run: cargo build --all-targets --features wasm-backend
-
-      - name: Test
-        run: cargo test --features wasm-backend
-
-  # -----------------------------------------------------------------------
-  # Lint — format, clippy, audit, docs, all-features check
-  # -----------------------------------------------------------------------
-  lint:
-    name: Format, Clippy & Audit
-    runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
@@ -190,6 +242,34 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --locked --all-targets --features wasm-backend
+
+      - name: Test
+        run: cargo test --locked --features wasm-backend
+
+  # -----------------------------------------------------------------------
+  # Lint — format, clippy, audit, docs, all-features check
+  # -----------------------------------------------------------------------
+  lint:
+    name: Format, Clippy & Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
           components: rustfmt, clippy
 
       - name: Cache cargo
@@ -201,19 +281,19 @@ jobs:
 
       # Clippy with default features — correctness lints are blocking.
       - name: Clippy (default features)
-        run: cargo clippy --all-targets -- -D clippy::correctness
+        run: cargo clippy --locked --all-targets -- -D clippy::correctness
 
       # Clippy with all features — catches wasm-backend code paths.
       - name: Clippy (all features)
-        run: cargo clippy --all-targets --all-features -- -D clippy::correctness
+        run: cargo clippy --locked --all-targets --all-features -- -D clippy::correctness
 
       # Clippy with no default features — catches minimal-build code paths.
       - name: Clippy (no default features)
-        run: cargo clippy --all-targets --no-default-features -- -D clippy::correctness
+        run: cargo clippy --locked --all-targets --no-default-features -- -D clippy::correctness
 
       # Zero compiler warnings on the main build path.
       - name: Check zero warnings (tests)
-        run: cargo check --tests
+        run: cargo check --locked --tests
 
       # Security audit of dependency tree.
       - name: Audit (cargo-audit)
@@ -221,17 +301,22 @@ jobs:
           cargo install cargo-audit --locked
           cargo audit
 
+      # Named batteries-included compatibility profile. Run it with
+      # defaults disabled so CI proves the aggregate is self-contained.
+      - name: Check explicit full profile
+        run: cargo check --locked --all-targets --no-default-features --features full
+
       # All-features compilation check.
       - name: Check all features
-        run: cargo check --all-features
+        run: cargo check --locked --all-features
 
       # Documentation builds without errors.
       - name: Check docs
-        run: cargo doc --no-deps
+        run: cargo doc --locked --no-deps
 
       # Documentation warnings are non-blocking but visible.
       - name: Doc warnings (info only)
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps 2>&1 || true
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps 2>&1 || true
 
   # -----------------------------------------------------------------------
   # Lean formalization — verifies the formal specs compile
@@ -239,6 +324,7 @@ jobs:
   lean:
     name: Lean Formalization
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
@@ -278,7 +364,7 @@ jobs:
   # run-to-run noise, so a naive fixed threshold would fail PRs for
   # noise, not real regressions). Runs on push to main only (not every
   # PR) since a full criterion run of every group is slow; results are
-  # committed back so PERFORMANCE_ANALYSIS.md can cite real numbers
+  # persisted on a dedicated automation branch so regression history is retained
   # instead of estimates. The gate needs >= 3 prior commits' worth of
   # history for a given benchmark before it will fail anything, so
   # early runs (and brand-new benchmarks) are informational only until
@@ -287,53 +373,115 @@ jobs:
   bench:
     name: Benchmarks (regression-gated)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write  # Persist rolling benchmark history after regression checks pass
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
       - uses: actions/checkout@v7
+        with:
+          # History JSON filenames are the producing main-branch commit SHA.
+          # Full history lets the regression checker order those samples by
+          # Git commit time instead of unreliable filesystem mtimes.
+          fetch-depth: 0
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y python3-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
       - name: Run benchmarks
-        run: cargo bench --bench bench_main
+        run: cargo bench --locked --bench bench_main
+
+      - name: Run Savina actor benchmarks
+        run: |
+          cargo run --locked \
+            --profile savina \
+            --no-default-features \
+            --features savina-bench \
+            --bin nulang-savina \
+            -- --format jsonl --repeat 5 | tee "benchmarks/savina-${{ github.sha }}.jsonl"
 
       - name: Collect results
         run: |
           python3 scripts/collect_bench_results.py \
-            --out "benchmarks/$(git rev-parse --short HEAD).json"
+            --out "benchmarks/${{ github.sha }}.json"
+
+      # Keep generated history off protected main. Pull prior JSON from the
+      # dedicated history branch so regression checks retain their rolling
+      # baseline without mutating the branch being validated.
+      - name: Load benchmark history
+        env:
+          BENCH_HISTORY_BRANCH: automation/benchmark-history
+        run: |
+          git fetch origin "${BENCH_HISTORY_BRANCH}" || true
+          if git rev-parse --verify "origin/${BENCH_HISTORY_BRANCH}" >/dev/null 2>&1; then
+            git ls-tree -r --name-only "origin/${BENCH_HISTORY_BRANCH}" benchmarks |
+              while read -r path; do
+                case "${path}" in
+                  *.json)
+                    if [ ! -e "${path}" ]; then
+                      mkdir -p "$(dirname "${path}")"
+                      git show "origin/${BENCH_HISTORY_BRANCH}:${path}" > "${path}"
+                    fi
+                    ;;
+                esac
+              done
+          fi
 
       - name: Check for regressions
         id: regression_check
         continue-on-error: true
         run: |
           python3 scripts/check_bench_regression.py \
-            --latest "benchmarks/$(git rev-parse --short HEAD).json" \
+            --latest "benchmarks/${{ github.sha }}.json" \
+            --history-dir benchmarks
+
+      # Shared GitHub runners occasionally produce an isolated wall-clock
+      # outlier even after the MAD-based noise filter. Confirm a detected
+      # regression with one independent Criterion measurement in the same job.
+      # The collector overwrites this commit's JSON, so history records the
+      # confirmation sample rather than the noisy first pass.
+      - name: Confirm detected regressions
+        id: regression_confirmation
+        if: steps.regression_check.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          echo "First benchmark sample exceeded its historical threshold; re-measuring once."
+          cargo bench --locked --bench bench_main
+          python3 scripts/collect_bench_results.py \
+            --out "benchmarks/${{ github.sha }}.json"
+          python3 scripts/check_bench_regression.py \
+            --latest "benchmarks/${{ github.sha }}.json" \
             --history-dir benchmarks
 
       - name: Upload results as build artifact
         uses: actions/upload-artifact@v7
         with:
           name: bench-results-${{ github.sha }}
-          path: benchmarks/*.json
+          path: |
+            benchmarks/${{ github.sha }}.json
+            benchmarks/savina-${{ github.sha }}.jsonl
           retention-days: 90
 
-      - name: Commit results to benchmarks/
+      - name: Persist benchmark history
+        env:
+          BENCH_HISTORY_BRANCH: automation/benchmark-history
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "benchmarks/$(git rev-parse --short HEAD).json"
-          git diff --staged --quiet || git commit -m "bench: record results for $(git rev-parse --short HEAD) [skip ci]"
-          git push
+          git add benchmarks/*.json
+          git diff --staged --quiet || git commit -m "bench: record results for ${{ github.sha }} [skip ci]"
+          git push --force-with-lease origin "HEAD:refs/heads/${BENCH_HISTORY_BRANCH}"
 
-      # Separate from the check step itself so the commit above always
-      # happens (preserving complete rolling-window history) even when
-      # this commit's numbers regressed.
-      - name: Fail the job if a regression was found
-        if: steps.regression_check.outcome == 'failure'
+      # Preserve the confirmed sample before failing. A one-off first-pass
+      # outlier no longer blocks main; a reproduced regression still does.
+      - name: Fail the job if a regression was confirmed
+        if: steps.regression_check.outcome == 'failure' && steps.regression_confirmation.outcome == 'failure'
         run: exit 1

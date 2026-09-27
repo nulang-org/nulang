@@ -1,8 +1,19 @@
 ---
 title: Performance
-description: Nulang's performance architecture — JIT compilation, native AOT, WASM backend, SIMD, and zero-copy execution.
+description: Nulang's execution architecture — semantic-reference bytecode, Cranelift JIT tiering, portable WASM, secondary native AOT, SIMD, memory layout, and benchmark methodology.
 ---
 import JitDemo from '../../../components/animations/JitDemo.astro';
+
+## Backend contract
+
+Nulang deliberately separates **semantic correctness** from execution optimizations:
+
+- **Bytecode VM** — the semantic reference implementation. Full-language behavior is judged against this path.
+- **Cranelift JIT** — an optimization layer for hot bytecode regions. A JIT speedup is valid only when it preserves bytecode semantics.
+- **WASM** — the canonical portable/cloud execution target. The backend is still experimental and does not yet implement every runtime surface.
+- **Native AOT** — a secondary backend for supported programs and differential/conformance testing. It must not be treated as full-language parity until the relevant semantics are proven.
+
+This ordering matters when reading performance results: faster execution on a restricted backend is not evidence that the same speedup applies to arbitrary Nulang programs.
 
 ## JIT Tiering
 
@@ -17,16 +28,16 @@ Nulang's bytecode VM uses hot-counter tiering to compile frequently-executed cod
 
 Warm-up behavior: the first 1,000 iterations of a hot loop run in the interpreter. Once the threshold is crossed, the compiled region replaces interpretation for subsequent iterations.
 
-## Native AOT
+## Secondary native AOT
 
-The `--backend native` flag compiles Nulang directly to native code:
+The `--backend native` path lowers supported MIR through Cranelift to native code:
 
 - **Pipeline**: Source → AST → HIR → MIR → Cranelift CLIF → native object code.
-- **Unboxed operations**: Compile-time type metadata (`src/type_metadata.rs`) enables unboxed integer and float arithmetic — no NaN-tagging overhead in compiled code.
-- **Zero VM overhead**: AOT-compiled functions run natively without interpreter dispatch or frame management.
+- **Typed lowering**: Compile-time type metadata can remove tagged-value checks for supported integer and float operations.
+- **No interpreter dispatch for compiled functions**: supported code executes as native machine code rather than through the bytecode dispatch loop.
 
-:::caution[Limitation]
-`--backend native` compiles a **pure-functional subset only** — no effects, no actors, and no FFI (the compiler errors name the unsupported construct). Use the default bytecode backend for full-language programs.
+:::caution[Semantic scope]
+Native AOT is **not** the semantic reference implementation. Some effects, continuation/resume forms, actors, FFI, and other runtime-integrated constructs remain restricted or backend-specific. Unsupported constructs must fail deterministically rather than silently changing behavior. Use bytecode when you need the broadest language/runtime coverage.
 :::
 
 ## WASM Backend
@@ -38,8 +49,8 @@ The WASM backend (`--backend wasm`, requires `--features wasm-backend`) compiles
 - **AOT compilation**: `wasmtime compile` produces `.cwasm` files for instant startup — no JIT warm-up on the client side.
 - **SIMD lowering**: MIR array operations lower to WASM SIMD instructions via raw byte emission.
 
-:::caution[Limitation]
-The WASM backend supports **IO.print/read only** — no user-defined effect handlers and no actor mailbox. (The experimental `wasmfx-backend` feature adds WasmFX stack-switching for suspending effects such as `LLM.ask`, `Signal.wait`, and `ReceiveWait`.)
+:::caution[Semantic scope]
+The plain WASM backend is still a restricted profile for runtime-integrated effects and actor behavior. The experimental `wasmfx-backend` adds stack-switching lowering for supported suspending effects, but user-defined handler/resume semantics and host-side continuation integration are not yet complete. Treat both WASM paths as experimental until conformance coverage proves parity for the workload you need.
 :::
 
 ## Register VM
@@ -62,16 +73,30 @@ The bytecode VM is designed for compact code and fast dispatch:
 - **Reference capabilities**: `iso` and `val` references are sendable without deep copies; the type system guarantees no aliasing at compile time.
 - **Cross-node**: String content travels by value on the wire and is re-interned at the destination. Heap pointers, closures, and actor refs are rejected at send time.
 
+## Benchmark methodology
+
+The repository includes Criterion benchmarks that separate interpreter, warm-JIT, actor/runtime, cache, and supported AOT paths. Run the benchmark harness with:
+
+```bash
+cargo bench --bench bench_main
+```
+
+For any published number, record the commit SHA, CPU/OS, Rust toolchain, enabled Cargo features, workload, input size, and whether the measurement is cold interpreter, warm JIT, WASM, or native AOT. Do not compare a warmed or restricted backend against a cold/full-language path without labeling that difference.
+
+Performance claims should also preserve semantic confidence: differential fuzzing and conformance tests are the guardrail for accepting backend optimizations.
+
 ## Comparisons
+
+The tables below compare **execution architecture and language/runtime features**, not universal benchmark winners. Actual throughput and latency depend on workload, warm-up, backend support, allocation behavior, and hardware.
 
 ### vs Erlang/BEAM
 
 | | Nulang | Erlang/BEAM |
 |---|---|---|
-| **Compilation** | JIT + native AOT | BEAM JIT (as of OTP 24) |
+| **Compilation** | Bytecode + tiered Cranelift JIT; secondary native AOT | BEAM bytecode + JIT (OTP 24+) |
 | **GC** | Per-actor ORCA, no global pause | Per-process, generational |
 | **Type system** | Static, HM-inferred | Dynamic |
-| **Native code** | AOT via `--backend native` | HiPE (deprecated) |
+| **Native code** | Restricted Cranelift AOT path | JIT-generated native code; HiPE is deprecated |
 
 ### vs Rust
 
@@ -79,23 +104,22 @@ The bytecode VM is designed for compact code and fast dispatch:
 |---|---|---|
 | **Distribution** | Built-in clustering, CRDTs | Manual (gRPC, custom protocols) |
 | **Supervision** | OTP-style supervision trees | Manual error handling |
-| **Performance** | Cranelift (same backend as Rust via `cranelift-codegen`) | LLVM (via rustc) |
+| **Performance toolchain** | Bytecode + Cranelift JIT/AOT | rustc normally uses LLVM; alternative codegen backends also exist |
 | **Memory safety** | Capabilities (compile-time) | Ownership + borrowing (compile-time) |
 
 ### vs Go
 
 | | Nulang | Go |
 |---|---|---|
-| **Execution** | Register VM + JIT + AOT | Goroutine scheduler + GC |
+| **Execution** | Register VM + tiered JIT; secondary AOT | Native code + goroutine scheduler + GC |
 | **Concurrency** | Actors with supervision | Goroutines + channels |
-| **Messaging** | Zero-copy handles (within node) | Channel copy |
+| **Messaging** | Actor messages; some immutable/interned data can be shared within a node, while cross-node payloads serialize | Channels share/copy values according to Go value/reference semantics |
 | **Effect tracking** | Compile-time effect rows | No effect system |
 
 ### vs Python
 
 | | Nulang | Python |
 |---|---|---|
-| **Execution** | Compiled (VM + JIT + AOT) | Interpreted (CPython) |
+| **Execution** | Bytecode VM + tiered JIT; optional WASM/AOT paths | CPython bytecode interpreter with version-dependent specialization/JIT work |
 | **Types** | Static, full HM inference | Dynamic, optional type hints |
 | **Concurrency** | Actor model, no GIL | GIL (CPython), asyncio |
-| **Startup** | Sub-millisecond (AOT) | ~100 ms (CPython import) |

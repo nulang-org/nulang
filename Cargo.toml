@@ -36,7 +36,11 @@ autobenches = false
 language-version = "1.0.0-frozen"
 
 [features]
-default = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
+# Keep the historical batteries-included default during the stabilization
+# window, but give it an explicit name so release/CI consumers can pin the
+# compatibility profile before the default is eventually minimized.
+default = ["full"]
+full = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
 # Cranelift-backed tiered JIT plus the current native/AOT backend.
 native-codegen = [
     "dep:cranelift",
@@ -50,6 +54,8 @@ native-codegen = [
 # Marker profile for embedded mobile runtimes. Intentionally empty: the
 # bytecode interpreter and pre-registered host callbacks need no JIT.
 mobile-runtime = []
+# Enables the standalone Savina-style actor benchmark runner without pulling optional subsystems.
+savina-bench = []
 python = ["dep:pyo3"]
 sqlite = ["dep:libsql"]
 lsp = ["dep:tower-lsp", "dep:tokio", "dep:futures", "dep:tower-service"]
@@ -72,6 +78,10 @@ ffi = ["dep:libloading", "dep:libffi"]
 # (their entry points return errors) while keeping the wire protocol, packet
 # types, and the in-memory deterministic transport.
 tcp = []
+# Dedicated RESP cache reactor. Kept separate from the existing std-only TCP
+# surfaces so embedders do not pay for an OS readiness reactor unless they
+# actually serve the cache protocol.
+cache-server = ["tcp", "dep:mio"]
 # Synchronous HTTP client for `Http.get`/`Http.post` builtin effects, the
 # package registry client, and `nula deploy`. Disable for a minimal build
 # without the `ureq` dependency.
@@ -88,6 +98,7 @@ difffuzz = ["native-codegen"]
 mimalloc = "0.1"
 crossbeam = "0.8"
 parking_lot = "0.12"
+mio = { version = "1.2", features = ["os-poll", "net"], optional = true }
 # OS primitives (core affinity for thread-per-core pinning, unix-only)
 libc = "0.2"
 httparse = "1"
@@ -186,10 +197,23 @@ name = "nula_difffuzz"
 path = "src/bin/nula_difffuzz.rs"
 required-features = ["difffuzz"]
 
+[[bin]]
+name = "nulang-savina"
+path = "src/bin/nulang_savina.rs"
+required-features = ["savina-bench"]
+
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
+
+# Fast optimized profile for standalone Savina actor benchmarks. Keep this separate
+# from [profile.bench] so Criterion history remains comparable.
+[profile.savina]
+inherits = "release"
+lto = false
+codegen-units = 8
+debug = false
 
 [profile.dev]
 opt-level = 0

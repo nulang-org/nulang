@@ -1895,6 +1895,120 @@ pub fn compile_boxing_wrapper(
     Ok(())
 }
 
+/// Generate the stable runtime-facing entry wrapper for an actor behavior.
+///
+/// Internal behavior functions keep their ordinary optimized signature
+/// (`fn(u64, ...) -> u64`). The scheduler calls only this wrapper, whose ABI
+/// is fixed to `NativeActorEntry`: a single `*mut NativeActorContext`
+/// parameter and a `NativeActorStatus` discriminant return value.
+pub fn compile_actor_entry_wrapper(
+    aot: &mut AotContext,
+    param_count: usize,
+    wrapper_fid: cranelift_module::FuncId,
+    behavior_fid: cranelift_module::FuncId,
+) -> AotResult<()> {
+    let module: &mut JITModule = aot.module;
+    let codegen_ctx: &mut codegen::Context = &mut aot.codegen_ctx;
+    let builder_ctx: &mut FunctionBuilderContext = aot.builder_context;
+    let pointer_type = module.isa().pointer_type();
+
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(pointer_type));
+    sig.returns.push(AbiParam::new(types::I32));
+    codegen_ctx.func.signature = sig;
+
+    let mut builder = FunctionBuilder::new(&mut codegen_ctx.func, builder_ctx);
+    let entry = builder.create_block();
+    let arity_check = builder.create_block();
+    let invoke = builder.create_block();
+    let bad_abi = builder.create_block();
+    let bad_arity = builder.create_block();
+
+    builder.switch_to_block(entry);
+    builder.append_block_params_for_function_params(entry);
+    let ctx_ptr = builder.block_params(entry)[0];
+    let flags = MemFlags::trusted();
+
+    let abi_offset =
+        std::mem::offset_of!(crate::native_abi::NativeActorContext, abi_version) as i32;
+    let abi_version = builder.ins().load(types::I32, flags, ctx_ptr, abi_offset);
+    let expected_abi = builder.ins().iconst(
+        types::I32,
+        crate::native_abi::NATIVE_ACTOR_ABI_VERSION as i64,
+    );
+    let abi_ok = builder.ins().icmp(IntCC::Equal, abi_version, expected_abi);
+    builder.ins().brif(abi_ok, arity_check, &[], bad_abi, &[]);
+
+    builder.switch_to_block(arity_check);
+    let payload_len_offset =
+        std::mem::offset_of!(crate::native_abi::NativeActorContext, payload_len) as i32;
+    let payload_len = builder
+        .ins()
+        .load(types::I64, flags, ctx_ptr, payload_len_offset);
+    let expected_len = builder.ins().iconst(types::I64, param_count as i64);
+    let arity_ok = builder.ins().icmp(IntCC::Equal, payload_len, expected_len);
+    builder.ins().brif(arity_ok, invoke, &[], bad_arity, &[]);
+
+    builder.switch_to_block(invoke);
+    let payload_ptr_offset =
+        std::mem::offset_of!(crate::native_abi::NativeActorContext, payload_ptr) as i32;
+    let payload_ptr = builder
+        .ins()
+        .load(pointer_type, flags, ctx_ptr, payload_ptr_offset);
+    let mut args = Vec::with_capacity(param_count);
+    for idx in 0..param_count {
+        args.push(
+            builder
+                .ins()
+                .load(types::I64, flags, payload_ptr, (idx * 8) as i32),
+        );
+    }
+
+    let behavior_ref = module.declare_func_in_func(behavior_fid, builder.func);
+    let call = builder.ins().call(behavior_ref, &args);
+    let result = builder.inst_results(call)[0];
+    let result_offset = std::mem::offset_of!(crate::native_abi::NativeActorContext, result) as i32;
+    builder.ins().store(flags, result, ctx_ptr, result_offset);
+    let completed = builder.ins().iconst(
+        types::I32,
+        crate::native_abi::NativeActorStatus::Completed as i64,
+    );
+    builder.ins().return_(&[completed]);
+
+    builder.switch_to_block(bad_abi);
+    builder.set_cold_block(bad_abi);
+    let status = builder.ins().iconst(
+        types::I32,
+        crate::native_abi::NativeActorStatus::AbiMismatch as i64,
+    );
+    builder.ins().return_(&[status]);
+
+    builder.switch_to_block(bad_arity);
+    builder.set_cold_block(bad_arity);
+    let status = builder.ins().iconst(
+        types::I32,
+        crate::native_abi::NativeActorStatus::BadArity as i64,
+    );
+    builder.ins().return_(&[status]);
+
+    builder.seal_all_blocks();
+    builder.finalize();
+
+    if std::env::var("NULANG_DUMP_CLIF").is_ok() {
+        eprintln!(
+            "=== CLIF for native actor entry wrapper ({}) ===",
+            param_count
+        );
+        eprintln!("{}", codegen_ctx.func.display());
+    }
+
+    module
+        .define_function(wrapper_fid, codegen_ctx)
+        .map_err(|e| AotCompileError::Cranelift(e.to_string()))?;
+    module.clear_context(codegen_ctx);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Statement compilation
 // ---------------------------------------------------------------------------
@@ -2144,10 +2258,11 @@ fn compile_stmt(
             local_vals.insert(reg, val);
             Ok(())
         }
-        mir::Stmt::EnterHandle { .. } | mir::Stmt::PopHandler => {
-            // Handler tables and the handler stack are a runtime (VM)
-            // concept — at the AOT level these are no-ops.  The handler
-            // body is compiled inline as ordinary blocks.
+        mir::Stmt::EnterHandle { .. }
+        | mir::Stmt::PopHandler
+        | mir::Stmt::ParallelMarker { .. } => {
+            // Handler tables and parallel-region markers are compile-time /
+            // VM metadata at this backend boundary and emit no native code.
             Ok(())
         }
         mir::Stmt::StoreFieldNamed { obj, field, src } => {
@@ -3631,11 +3746,26 @@ mod tests {
         let ptr = aot
             .fn_ptr_for_behavior("Doubler.double")
             .expect("behavior 'double' should be compiled");
-        // Boxed calling convention: extern "C" fn(u64) -> u64.
-        let f: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(ptr) };
-        let result = f(crate::vm::Value::int(21).as_raw());
-        let got = unsafe { crate::vm::Value::from_bits(result) }.as_int();
+        let payload = [crate::vm::Value::int(21).as_raw()];
+        let mut ctx = crate::native_abi::NativeActorContext::new(0, &payload);
+        let entry: crate::native_abi::NativeActorEntry = unsafe { std::mem::transmute(ptr) };
+        let status = unsafe { entry(&mut ctx) };
+        assert_eq!(
+            crate::native_abi::NativeActorStatus::from_raw(status),
+            Some(crate::native_abi::NativeActorStatus::Completed)
+        );
+        let got = unsafe { crate::vm::Value::from_bits(ctx.result) }.as_int();
         assert_eq!(got, Some(42));
+
+        // The wrapper rejects malformed deliveries before calling the
+        // arity-specific internal function, avoiding an ABI mismatch/UB.
+        let empty: [u64; 0] = [];
+        let mut bad_ctx = crate::native_abi::NativeActorContext::new(0, &empty);
+        let status = unsafe { entry(&mut bad_ctx) };
+        assert_eq!(
+            crate::native_abi::NativeActorStatus::from_raw(status),
+            Some(crate::native_abi::NativeActorStatus::BadArity)
+        );
     }
 
     #[test]
@@ -3893,11 +4023,11 @@ mod tests {
 
     #[test]
     fn test_aot_runtime_native_dispatch() {
-        // Phase 3: the real actor `Runtime` dispatches a spawned actor's
-        // behavior through AOT native code. A `Counter` actor spawned from a
-        // CodeModule whose AotModule is registered must run `Add` natively
-        // (handler = aot_behavior_adapter, target armed) and mutate state
-        // through `AotRuntimeCallbacks` routing to the Runtime.
+        // The real actor Runtime dispatches a spawned actor's behavior
+        // directly through the stable AOT actor-entry ABI. The behavior table
+        // keeps the compatibility adapter for standalone/legacy callers, but
+        // Runtime dispatch uses the per-behavior AOT target directly and
+        // mutates state through AotRuntimeCallbacks.
         use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
         use crate::lexer::Lexer;
         use crate::parser::Parser;
@@ -3936,8 +4066,8 @@ mod tests {
             .as_actor_id()
             .expect("spawn should return an actor ref");
 
-        // The Add behavior must dispatch through the AOT adapter with an armed
-        // target (proving native wiring, not bytecode).
+        // The behavior table retains the compatibility adapter while the
+        // runtime-owned AOT target proves native wiring is available.
         {
             let actor = rt.actors.get(&id).expect("spawned actor");
             assert_eq!(actor.behavior_table.len(), 2, "both behaviors registered");
@@ -3946,7 +4076,7 @@ mod tests {
                     == crate::aot::aot_behavior_adapter
                         as fn(&mut crate::runtime::Actor, &[crate::vm::Value])
                         as usize,
-                "Add should dispatch through the AOT adapter"
+                "Add should retain the AOT compatibility adapter"
             );
             assert!(
                 actor.aot_targets[0].is_some(),
@@ -3968,6 +4098,23 @@ mod tests {
             total,
             Some(5),
             "AOT-native Add should mutate state through the Runtime"
+        );
+
+        // Queue one native message, then issue a synchronous native ask.
+        // ask_actor_sync first flushes the mailbox, so this exercises both
+        // non-scheduler runtime entry points without arming AOT_DISPATCH.
+        rt.send_message_by_id(id, 0, &[crate::vm::Value::int(2)]);
+        rt.ask_actor_sync(id, 0, &[crate::vm::Value::int(3)])
+            .expect("direct AOT sync dispatch should succeed");
+        let total = rt
+            .actors
+            .get(&id)
+            .and_then(|a| a.get_state_field("total"))
+            .and_then(|v| v.as_int());
+        assert_eq!(
+            total,
+            Some(10),
+            "queued flush plus sync AOT dispatch must both use the direct native path"
         );
     }
 

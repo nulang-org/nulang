@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import re
 import sys
@@ -75,6 +76,25 @@ def check_warnings():
         and check_warnings_for(["--no-default-features"], "(--no-default-features)")
         and check_warnings_for(["--all-features"], "(--all-features)")
     )
+
+def check_stdlib_manifest():
+    """Fail when canonical stdlib metadata or generated mirrors drift."""
+    print("Checking canonical stdlib manifest and generated artifacts...")
+    res = subprocess.run(
+        [sys.executable, "scripts/generate_stdlib.py", "--check"],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        print("Error: stdlib manifest validation failed.")
+        if res.stdout:
+            print(res.stdout)
+        if res.stderr:
+            print(res.stderr)
+        return False
+    print(res.stdout.strip())
+    return True
+
 
 def verify_files():
     # 1. (compiler.rs has been removed; MIR pipeline is now exclusive.)
@@ -181,8 +201,27 @@ def verify_files():
         print("Error: Cycle detector intra-node restriction is not wired in Runtime.")
         return False
 
+    if not check_stdlib_manifest():
+        return False
+
     print("Success: All files passed implementation checks!")
     return True
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Verify Nulang implementation invariants and executable checks."
+    )
+    parser.add_argument(
+        "--skip-tests",
+        action="store_true",
+        help=(
+            "Skip the duplicate cargo build/test phase. Intended for CI jobs "
+            "that already ran the full test suite; static invariants and "
+            "zero-warning checks still run."
+        ),
+    )
+    return parser.parse_args()
 
 
 def run_tests():
@@ -237,7 +276,8 @@ def run_tests():
 
 
 if __name__ == "__main__":
-    if verify_files() and check_warnings() and run_tests():
-        sys.exit(0)
-    else:
-        sys.exit(1)
+    args = parse_args()
+    ok = verify_files() and check_warnings()
+    if ok and not args.skip_tests:
+        ok = run_tests()
+    sys.exit(0 if ok else 1)

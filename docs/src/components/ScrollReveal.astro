@@ -9,8 +9,8 @@
       '.durable-row',
       '.benefit-callout',
       '.feature-card',
-      '.pillar-card',
-      '.support-card',
+      '.architecture-map',
+      '.evidence-item',
       '.metric',
       '.hero h1',
       '.hero .tagline',
@@ -32,7 +32,7 @@
 
       // Cards get a subtle scale fade; everything else slides up
       let revealClass = 'reveal';
-      if (el.classList.contains('feature-card') || el.classList.contains('pillar-card') || el.classList.contains('support-card')) {
+      if (el.classList.contains('feature-card') || el.classList.contains('architecture-map')) {
         revealClass = 'reveal-scale';
       } else if (el.matches('.hero h1, .hero .tagline, .hero .actions')) {
         revealClass = 'reveal-scale';

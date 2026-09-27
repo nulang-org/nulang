@@ -1,0 +1,52 @@
+env:
+  CARGO_TERM_COLOR: "always"
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+steps:
+  - label: ":rust: Static validation"
+    key: "rust-static"
+    agents:
+      queue: "nulang-cloud"
+    timeout_in_minutes: 60
+    command: "bash scripts/ci/buildkite-rust-static.sh"
+    plugins:
+      - docker#v5.14.0:
+          image: "rust:1.95-bookworm"
+          workdir: "/work/nulang"
+          entrypoint: ""
+          shell:
+            - "/bin/bash"
+            - "-e"
+            - "-u"
+            - "-o"
+            - "pipefail"
+            - "-c"
+          always-pull: true
+          mount-checkout: true
+          propagate-environment: true
+          chown: true
+
+  - label: ":test_tube: Runtime + workspace tests"
+    key: "rust-tests"
+    agents:
+      queue: "nulang-cloud"
+    depends_on: "rust-static"
+    timeout_in_minutes: 120
+    command: "bash scripts/ci/buildkite-rust-tests.sh"
+    plugins:
+      - docker#v5.14.0:
+          image: "rust:1.95-bookworm"
+          workdir: "/work/nulang"
+          entrypoint: ""
+          shell:
+            - "/bin/bash"
+            - "-e"
+            - "-u"
+            - "-o"
+            - "pipefail"
+            - "-c"
+          always-pull: true
+          mount-checkout: true
+          propagate-environment: true
+          chown: true

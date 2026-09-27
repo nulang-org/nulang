@@ -1,13 +1,15 @@
-# RFC 0020: Native Representation Views
+# RFC 0026: Native Representation Views
 
 - **Status:** Draft
 - **Tier:** Experimental
 - **Author:** David Porkka (AI-assisted)
 - **Created:** 2026-09-17
+- **Updated:** 2026-09-27
 - **Resolved:** TBD
 - **Language-version at effect:** N/A until accepted
 - **Supersedes:** none
 - **Superseded by:** none
+- **Related:** RFC 0001 (format stability), RFC 0021 (compatibility before freeze)
 
 ## Summary
 
@@ -18,6 +20,10 @@ and native/AOT boundaries. Alignment controls follow as a constrained
 extension. Packed records, endian-qualified scalar storage, and
 structure-of-arrays (SoA) are deliberately deferred until the base
 representation contract is proven across all backends.
+
+This RFC is complementary to scalar opaque-newtype ABI transparency:
+`opaque type UserId = Int` may reuse the existing scalar FFI representation,
+but aggregate record layout remains a separate explicit boundary concern.
 
 The load-bearing rule is:
 
@@ -175,34 +181,85 @@ layout engine.
 
 ### 5. C-view field types
 
-Phase 1 allows only fields with a defined C ABI projection.
+Phase 1 is deliberately scalar-only. A `repr(c)` record field must have one
+of the existing, concrete Nulang native-FFI projections below:
 
-At minimum the implementation must explicitly enumerate supported scalar
-projections. Unsupported fields produce a named diagnostic rather than being
-boxed implicitly.
+| Nulang field type | C-view ABI slot | Default libffi type | Size/alignment rule |
+|---|---|---|---|
+| `Int` | signed 64-bit slot | `i64` | 8-byte width; target ABI i64 alignment |
+| `Float` | C `double` | `f64` | 8-byte width; target ABI f64 alignment |
+| `Bool` | one-byte 0/1 value | `u8` | 1 byte / 1 byte |
+| opaque wrapper over one of the above | same as underlying type | same as underlying type | same as underlying type |
 
-Examples that should initially be rejected inside a `repr(c)` record unless a
-separate ABI rule exists:
+This table is the target Phase-1 aggregate ABI and is derived from the existing
+`FfiType -> CType -> libffi::middle::Type` path. Two existing scalar-FFI
+details must be repaired before this table is treated as a stable aggregate
+contract:
 
+1. **Int range checking.** Nulang's tagged runtime stores a signed 48-bit
+   integer payload even though its foreign call slot is `i64`. Copy-in is
+   lossless for every valid Nulang Int. Copy-out from C must reject values
+   outside `[-2^47, 2^47 - 1]`; masking/truncation is forbidden.
+2. **Bool ABI normalization.** The libffi path currently uses an unsigned
+   one-byte value, while the no-`ffi` fixed-arity fallback is expressed with
+   Rust `bool`. Phase 1 requires one canonical one-byte 0/1 foreign contract
+   across both paths before aggregate layout is enabled.
+
+Although scalar FFI calls already support `String` and `Unit`, they are not
+Phase-1 aggregate fields:
+
+- `String` maps to a C pointer and therefore needs an explicit ownership and
+  lifetime rule when embedded inside a returned or mutable struct;
+- `Unit` has no portable non-zero C field representation and C does not
+  provide a standard zero-sized data member.
+
+The following also remain rejected inside a Phase-1 `repr(c)` record:
+
+- nested records and arrays;
 - actors and actor references;
 - closures/functions;
 - arbitrary variants;
 - GC-managed references whose lifetime cannot cross the boundary safely;
-- open/generic record fields without a concrete monomorphized layout.
+- open/generic record fields without a concrete monomorphized layout;
+- raw pointers until Nulang exposes a source-level pointer type with explicit
+  unsafe/provenance rules.
 
-This keeps `repr(c)` an ABI contract, not a request for "best effort"
-marshalling.
+A later RFC or accepted extension may recursively admit nested C-view records,
+strings, or pointers after their ownership and marshalling contracts are
+specified. Phase 1 must never box or pointer-lower an unsupported field
+implicitly.
 
 ### 6. FFI integration
 
 The first consumer is `src/ffi/marshal.rs`.
 
-A `repr(c)` record passed across an `extern` boundary is marshalled into an
-ABI buffer described by `RecordLayout`. The buffer is separate from the
-actor heap object. Copy-in/copy-out semantics are explicit, which prevents a C
-callee from receiving a pointer into movable/managed Nulang storage.
+A `repr(c)` record passed across an `extern` boundary is materialized into
+a temporary ABI buffer described by `RecordLayout`. The logical Nulang
+record remains an ordinary managed record; the native buffer is a projection,
+not an alias of actor-heap storage.
 
-The VM's `Value` representation does not change.
+For Phase 1, the boundary semantics are:
+
+1. **argument:** copy each supported scalar field from the logical record into
+   the ABI buffer at the canonical offset;
+2. **native call:** libffi receives the aggregate using the canonical field
+   sequence/layout;
+3. **return:** validate every foreign scalar (including the signed 48-bit
+   Nulang Int range), then copy the returned C aggregate into a fresh logical
+   Nulang record field-by-field;
+4. **no borrowed aggregate pointers:** C never receives a pointer into the
+   actor heap, and Nulang never retains a pointer into the temporary ABI
+   buffer after the call.
+
+Mutation through `T*` is intentionally out of scope because Nulang currently
+has no source-level raw-pointer FFI type. When pointer syntax is eventually
+added, in/out/inout ownership must be specified separately rather than
+smuggled into by-value `repr(c)`.
+
+The VM's `Value` representation does not change. The FFI metadata/runtime
+will need a versioned aggregate signature representation; it must consume the
+same `RecordLayout` produced by `src/layout.rs`, not independently
+recompute offsets.
 
 ### 7. AOT integration
 
@@ -321,8 +378,9 @@ kind    0       8     8
 length  8       8     8
 ```
 
-The exact scalar sizes above depend on the eventual C ABI mapping; the example
-is illustrative, not normative.
+The offsets shown are illustrative for a target where i64 has 8-byte
+alignment. The Phase-1 scalar widths are normative; target-specific alignment
+and resulting padding come from the canonical `TargetLayout`.
 
 Machine-readable JSON should be available for bindgen/header-generation tools.
 
@@ -368,10 +426,17 @@ Rejected for Phase 1. Physical layout should not participate in HM unification
 or infect every structural record expression. Declaration metadata provides a
 clean boundary.
 
-### Reuse `opaque type` for ABI wrappers
+### Use only `opaque type` for ABI representation
 
-Rejected. Opaque nominal identity and physical representation solve different
-problems. A type may need either, both, or neither.
+Rejected for aggregates, but useful and complementary for scalars.
+
+Opaque nominal identity and aggregate physical representation solve different
+problems. Scalar opaque newtypes may intentionally reuse their underlying
+primitive FFI ABI (for example `opaque type UserId = Int` uses the same
+foreign integer slot) while remaining nominally distinct in Nulang. That does
+not define field offsets, padding, aggregate calling convention, alignment, or
+ownership for records. A type may therefore need nominal identity, a
+representation view, both, or neither.
 
 ### Let each backend define its own offsets
 
@@ -386,15 +451,18 @@ the riskiest ones.
 
 ## Open Questions
 
-1. Which fixed-width scalar types should be introduced or exposed for C ABI
-   records? Current `Int` semantics alone may be too host-dependent for a
-   serious ABI contract.
+1. Should Nulang later expose fixed-width source aliases/types such as
+   `I8/I16/I32/I64` and unsigned counterparts for richer C APIs? Phase 1
+   does not depend on that decision because its scalar slots are explicitly
+   fixed above.
 2. Should `repr(c)` generic records be rejected until monomorphization, or
    permitted only after all type parameters are concrete?
 3. Should header generation live in the compiler (`nulang header`) or a
    separate package built on the layout JSON API?
 4. Should alignment metadata be accepted in the same language version as
    `repr(c)` or one version later?
+5. After Phase 1, should nested `repr(c)` records be the next aggregate
+   extension, or should pointer/ownership semantics land first?
 
 These questions affect ergonomics and rollout, not the central
 semantic/physical separation.

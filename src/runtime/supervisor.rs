@@ -430,7 +430,7 @@ impl Supervisor {
             runtime.supervisors.insert(new_id, new_sup);
         }
 
-        runtime.scheduler.enqueue(new_id);
+        runtime.enqueue_actor(new_id);
         Some(new_id)
     }
 

@@ -7,6 +7,7 @@
 // replacing those values with mathematical constants would change test semantics.
 #![cfg_attr(test, allow(clippy::approx_constant))]
 
+mod actor_protocol;
 pub mod agent;
 #[cfg(feature = "native-codegen")]
 pub mod aot;
@@ -17,6 +18,7 @@ pub mod authority_host;
 mod authority_runtime;
 pub use authority_runtime::RuntimeAuthorityError;
 pub mod backends;
+pub mod behavior_manifest;
 #[cfg(test)]
 pub mod benchmarks;
 pub mod bytecode;
@@ -26,6 +28,8 @@ pub mod cir;
 pub mod cir_analysis;
 #[cfg(feature = "wasmfx-backend")]
 pub mod cir_lower;
+pub mod compat;
+pub mod compiler_identity;
 pub mod content_identity;
 pub mod core_vm;
 #[cfg(feature = "native-codegen")]
@@ -38,6 +42,7 @@ pub mod docgen;
 pub mod dst;
 pub mod durable_effect;
 pub mod durable_effect_persistence;
+pub mod durable_effect_runtime;
 pub mod effect_checker;
 pub mod ffi;
 pub mod fmt;
@@ -46,6 +51,7 @@ pub mod format;
 pub mod fuzz;
 pub mod hir;
 pub mod hir_lower;
+pub mod host_effect_abi;
 pub mod integration_tests;
 pub mod iso_arena;
 #[cfg(feature = "native-codegen")]
@@ -54,6 +60,7 @@ pub mod json_diagnostics;
 pub mod lexer;
 #[cfg(feature = "lsp")]
 pub mod lsp;
+pub mod migration_purity;
 pub mod mir;
 pub mod mir_codegen;
 pub mod mir_inline;
@@ -62,9 +69,13 @@ pub mod mir_lower;
 pub mod mir_wasm;
 #[cfg(feature = "wasm-backend")]
 pub mod mir_wasm_simd;
+#[cfg(feature = "native-codegen")]
+pub mod native_abi;
 #[cfg(feature = "otel")]
 pub mod observability;
 pub mod package;
+pub mod parallel_analysis;
+pub mod parallel_marker;
 pub mod parser;
 pub mod prelude_source;
 pub mod primitives;
@@ -76,6 +87,8 @@ pub mod registry;
 pub mod repl;
 pub mod resolver;
 pub mod runtime;
+pub mod semantic_identity;
+pub mod semantic_schema;
 pub mod stdlib;
 #[cfg(test)]
 pub mod stress_tests;

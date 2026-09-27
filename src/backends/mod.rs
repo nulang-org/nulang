@@ -117,8 +117,29 @@ pub trait JitBackend {
         false
     }
 
-    /// Execute one tiered step: if the region at `pc` is compiled, run it;
-    /// if hot, compile then run; otherwise record and return `Interpret`.
+    /// Prepare a probed tiered step without executing native code.
+    ///
+    /// The caller first invokes `probe_and_maybe_hot`. Implementations may
+    /// compile or promote the region here while a normal shared CodeModule
+    /// borrow is available. Returning true guarantees that
+    /// `execute_compiled` can run immediately without borrowing the module.
+    fn prepare_tiered_step(&mut self, module_idx: usize, pc: usize, module: &CodeModule) -> bool;
+
+    /// Execute a region prepared by `prepare_tiered_step`.
+    ///
+    /// Deliberately receives no CodeModule reference: the VM can detach the JIT
+    /// backend and module-derived constant cache before native entry, ensuring
+    /// re-entrant runtime helpers do not overlap Rust borrows into VM storage.
+    fn execute_compiled(
+        &mut self,
+        module_idx: usize,
+        pc: usize,
+        regs: &mut [u64; 256],
+        constants: &[u64],
+    ) -> TieredAction;
+
+    /// Convenience wrapper for callers that do not need re-entrant VM safety.
+    /// The VM itself uses the split probe/prepare/execute protocol.
     fn tiered_execute_step_typed(
         &mut self,
         module_idx: usize,
@@ -126,7 +147,14 @@ pub trait JitBackend {
         module: &CodeModule,
         regs: &mut [u64; 256],
         constants: &[u64],
-    ) -> TieredAction;
+    ) -> TieredAction {
+        if !self.probe_and_maybe_hot(module_idx, pc)
+            || !self.prepare_tiered_step(module_idx, pc, module)
+        {
+            return TieredAction::Interpret;
+        }
+        self.execute_compiled(module_idx, pc, regs, constants)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -459,9 +487,26 @@ pub trait CryptoProvider: Send + Sync {
 /// this with a JavaScript engine, a WASM component model host, or whatever
 /// foreign runtime exists in 2125.
 pub trait ForeignInterop: Send {
-    /// Call a named foreign function with the given arguments.
-    /// Returns the marshalled result on success, or an error string.
+    /// Call a named foreign function with the given VM values.
+    ///
+    /// This compatibility path executes on the caller thread and therefore
+    /// must not be used by scheduler-isolated worker execution.
     fn call(&mut self, module: &str, function: &str, args: &[Value]) -> Result<Value, String>;
+
+    /// Execute a fully-owned foreign call.
+    ///
+    /// The default fails closed so existing/custom backends do not silently
+    /// claim worker-thread safety. Backends may opt in once they can consume
+    /// `OwnedForeignValue` without touching VM or actor state.
+    fn call_owned(
+        &mut self,
+        request: &crate::runtime::ForeignCallRequest,
+    ) -> crate::runtime::ForeignCallResult {
+        Err(format!(
+            "foreign backend does not support owned off-thread calls: {}.{}",
+            request.module, request.function
+        ))
+    }
 
     /// Import a foreign module, making its exports available via `call`.
     /// Returns an error string if the module cannot be loaded.
@@ -513,6 +558,24 @@ impl ForeignInterop for DefaultForeignInterop {
             .collect();
         let result_id = self.bridge.call(func_id, py_args?)?;
         crate::python::python_object_id_to_value(result_id)
+    }
+
+    fn call_owned(
+        &mut self,
+        request: &crate::runtime::ForeignCallRequest,
+    ) -> crate::runtime::ForeignCallResult {
+        let module_id = *self
+            .modules
+            .get(&request.module)
+            .ok_or_else(|| format!("module '{}' not imported", request.module))?;
+        let func_id = self.bridge.get_attr(module_id, &request.function)?;
+        let py_args: Result<Vec<_>, String> = request
+            .args
+            .iter()
+            .map(crate::python::owned_foreign_to_python_object_id)
+            .collect();
+        let result_id = self.bridge.call(func_id, py_args?)?;
+        crate::python::python_object_id_to_owned_foreign(result_id)
     }
 }
 
@@ -667,6 +730,23 @@ mod tests {
         let pk: [u8; 32] = verifying_key.to_bytes();
         assert!(cp.verify(&pk, msg, &sig));
         assert!(!cp.verify(&pk, b"wrong message", &sig));
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn test_foreign_interop_owned_python_roundtrip() {
+        let _ = pyo3::Python::attach(|_py| ());
+
+        let mut fi = DefaultForeignInterop::new().expect("failed to create DefaultForeignInterop");
+        fi.import("math").expect("failed to import math");
+
+        let request = crate::runtime::ForeignCallRequest::new(
+            "math",
+            "sqrt",
+            vec![crate::runtime::OwnedForeignValue::Float(81.0)],
+        );
+        let result = fi.call_owned(&request).expect("owned Python call failed");
+        assert_eq!(result, crate::runtime::OwnedForeignValue::Float(9.0));
     }
 
     #[cfg(feature = "python")]

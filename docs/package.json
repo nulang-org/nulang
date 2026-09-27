@@ -8,10 +8,11 @@
     "dev": "astro dev",
     "start": "astro dev",
     "build": "astro build",
-    "prebuild": "pnpm run generate-og",
+    "prebuild": "pnpm run sync-playground && pnpm run generate-og",
     "generate-og": "node scripts/generate-og-image.mjs",
     "preview": "astro preview",
-    "check": "astro check"
+    "check": "astro check",
+    "sync-playground": "node scripts/sync-playground.mjs"
   },
   "dependencies": {
     "@astrojs/sitemap": "^3.7.4",

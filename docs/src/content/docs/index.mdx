@@ -1,82 +1,38 @@
 ---
 title: Nulang
-description: A distributed, actor-based programming language with algebraic effects and row-polymorphic types.
+description: An actor-based programming language with static types, algebraic effects, supervision, and durable state for resilient software.
 template: splash
 hero:
-  title: Build software that <span class="hero-emphasis">doesn't crash.</span>
-  tagline: Nulang is a distributed, actor-based programming language for durable applications with built-in AI primitives. Ship fault-tolerant systems with less infrastructure plumbing.
+  title: Build software that <span class="hero-emphasis">survives failure.</span>
+  tagline: Nulang is an alpha actor-based language with Hindley-Milner inference, algebraic effects, capability types, supervision, and persistent actors in one runtime.
   actions:
-    - text: Get Started
-      link: /getting-started/installation/
+    - text: Try Nulang
+      link: /playground/
       icon: right-arrow
       variant: primary
-    - text: Read the Quick Start
-      link: /getting-started/quick-start/
+    - text: Read the Docs
+      link: /getting-started/installation/
       icon: right-arrow
       variant: secondary
 ---
 
-import SupervisionTree from '../../components/animations/SupervisionTree.astro';
-import DistributionDemo from '../../components/animations/DistributionDemo.astro';
-import AIPipeline from '../../components/animations/AIPipeline.astro';
-import GcDemo from '../../components/animations/GcDemo.astro';
+import ArchitectureMap from '../../components/ArchitectureMap.astro';
 import ScrollReveal from '../../components/ScrollReveal.astro';
 import FeatureGrid from '../../components/FeatureGrid.astro';
 import Steps from '../../components/Steps.astro';
 import TerminalCard from '../../components/TerminalCard.astro';
 import MetricsBand from '../../components/MetricsBand.astro';
+import EvidenceGrid from '../../components/EvidenceGrid.astro';
+import ResourceRail from '../../components/ResourceRail.astro';
 
-<MetricsBand>
-  <GcDemo />
-</MetricsBand>
+<MetricsBand />
 
-<div class="nu-section">
+<div class="nu-section architecture-section">
   <div class="nu-container">
-    <div class="nu-section-header">
-      <h2>Everything you need to ship</h2>
-      <p class="nu-section-subhead">A complete language for distributed systems, not a piecemeal collection of tools.</p>
-    </div>
-
-    <div class="pillars-grid">
-      <div class="pillar-card">
-        <div class="feature-icon-chip">
-          <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon">
-            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
-          </svg>
-        </div>
-        <h3>Durable actors</h3>
-        <p>Failures are isolated and restarted automatically. Supervision trees, durable workflows, and saga compensation keep your program running through crashes and restarts.</p>
-        <div class="pillar-demo">
-          <SupervisionTree />
-        </div>
-      </div>
-      <div class="pillar-card">
-        <div class="feature-icon-chip">
-          <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon">
-            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
-          </svg>
-        </div>
-        <h3>Built-in AI primitives</h3>
-        <p>Perform LLM calls as algebraic effects, wire up agent pipelines, debates, and supervisor teams with episodic, semantic, and procedural memory.</p>
-        <div class="pillar-demo">
-          <AIPipeline />
-        </div>
-      </div>
-      <div class="pillar-card">
-        <div class="feature-icon-chip">
-          <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon">
-            <circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/>
-          </svg>
-        </div>
-        <h3>Location-transparent distribution</h3>
-        <p>Move a service from one node to many without rewriting code. Actors communicate through messages, with automatic clustering and CRDT state replication.</p>
-        <div class="pillar-demo">
-          <DistributionDemo />
-        </div>
-      </div>
-    </div>
+    <ArchitectureMap />
   </div>
 </div>
+
 
 <div class="nu-section" style="padding-top: 0;">
   <div class="nu-container">
@@ -93,40 +49,36 @@ import MetricsBand from '../../components/MetricsBand.astro';
   <div class="nu-container">
     <div class="durable-row">
       <div class="benefit-text">
-        <h2>Durable when you ask for it</h2>
-        <p>Ordinary actors are fast and in-memory. Mark an actor <code>persistent</code> — as in <code>persistent actor Counter</code> — and every external operation (messages, effects, timers) is journaled as part of its execution log. If a persistent actor crashes mid-flight, it replays from the last checkpoint and picks up exactly where it left off.</p>
+        <h2>Persistence without bolting on an ORM</h2>
+        <p>Ordinary actors are in-memory. Mark an actor <code>persistent</code> and declare durable or event-sourced state to opt into checkpointing and journaling. The CLI can reopen a durable store and hydrate persistent actors across process restarts. Nulang is still alpha, so validate recovery semantics for your workload before production use.</p>
         <ul class="durable-checklist">
           <li>
             <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-            Journaling and checkpointing for persistent actors
+            Explicit local, durable, event-sourced, and CRDT state models
           </li>
           <li>
             <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-            Saga compensation for safe rollbacks
+            File-backed durable storage by default for programs that declare durable state
           </li>
           <li>
             <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-            Persistent actors survive crashes and restarts
+            Recovery and supervisor hydration are covered by runtime tests
           </li>
           <li>
             <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-            Human approval workflows that wait for days if needed
+            Pluggable JSON, RocksDB, and Postgres store URIs where the corresponding features are enabled
           </li>
         </ul>
       </div>
       <div class="benefit-demo">
-        <TerminalCard title="nulang nula deploy" code={`$ nulang nula build-wasm
+        <TerminalCard title="durable execution" code={`# Durable programs use .nulang/store/ by default
+$ nulang counter.nula
 
-Building counter (WASM AOT)...
-  Compiling src/main.nula to WASM...
-WASM AOT build succeeded.
+# Or choose a store explicitly
+$ nulang --store json:.nulang/store counter.nula
 
-$ nulang nula deploy --wasm
-
-Compiling counter to .nbc...
-Compiling counter to .wasm + .cwasm...
-Deploying counter to https://deploy.nulang.cloud ...
-Deployed! -> https://counter-7f3a9c.nulang.cloud (healthy)`} />
+# Environment-based configuration is also supported
+$ NULANG_STORE_PATH=.nulang/store nulang counter.nula`} />
       </div>
     </div>
   </div>
@@ -135,8 +87,8 @@ Deployed! -> https://counter-7f3a9c.nulang.cloud (healthy)`} />
 <div class="nu-section">
   <div class="nu-container">
     <div class="nu-section-header">
-      <h2>Language Features</h2>
-      <p class="nu-section-subhead">Explore the core capabilities that make Nulang different.</p>
+      <h2>Language + runtime capabilities</h2>
+      <p class="nu-section-subhead">Each capability is labeled by maturity so you can distinguish stable language surfaces from experimental runtime features.</p>
     </div>
 
     <FeatureGrid />
@@ -145,60 +97,33 @@ Deployed! -> https://counter-7f3a9c.nulang.cloud (healthy)`} />
 
 <div class="nu-section" style="padding-top: 0;">
   <div class="nu-container">
-    <h2>Learn & Contribute</h2>
-    <p>Nulang.org is the home for the <strong>language</strong> — documentation, tutorials, and the open-source community. When you’re ready to deploy actors to production, head to Nulang Cloud.</p>
-
-    <div class="learn-grid">
-      <a href="/getting-started/installation/" class="learn-card">
-        <h3>Read the docs</h3>
-        <p>Installation, syntax, types, and the standard library.</p>
-      </a>
-      <a href="/tutorial/" class="learn-card">
-        <h3>Follow the tutorial</h3>
-        <p>Build your first actor-based program step by step.</p>
-      </a>
-      <a href="https://github.com/nulang-org/nulang" class="learn-card" target="_blank" rel="noopener noreferrer">
-        <h3>Contribute on GitHub</h3>
-        <p>Issues, discussions, and pull requests welcome.</p>
-      </a>
-      <a href="https://www.nulang.cloud" class="learn-card learn-card-accent" target="_blank" rel="noopener noreferrer">
-        <h3>Deploy on Nulang Cloud</h3>
-        <p>Durable actors, AI gateway, and global edge deployment.</p>
-      </a>
+    <div class="nu-section-header">
+      <h2>Don’t take the homepage on faith</h2>
+      <p class="nu-section-subhead">Run the compiler, inspect executable conformance cases, and look at regression-gated benchmark data. Nulang’s strongest claims should be independently checkable.</p>
     </div>
+
+    <EvidenceGrid />
   </div>
 </div>
 
-<div class="nu-section support-section" style="padding-bottom: 0;">
+<div class="nu-section" style="padding-top: 0;">
   <div class="nu-container">
     <div class="nu-section-header">
-      <h2>Support Nulang</h2>
-      <p class="nu-section-subhead">The language is free and open source. Help us keep building the future of durable software.</p>
+      <h2>Keep going</h2>
+      <p class="nu-section-subhead">Read the language docs, follow the tutorial, inspect the implementation, or explore the managed platform.</p>
     </div>
-    <div class="support-grid support-grid-single">
-      <a href="https://buy.stripe.com/cNidR932O6du6nK6eX1RC02" class="support-card support-card-accent" target="_blank" rel="noopener noreferrer">
-        <div class="support-icon">
-          <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/>
-          </svg>
-        </div>
-        <h3>Sponsor development</h3>
-        <p>Back the project financially and get priority support, roadmap input, and recognition.</p>
-      </a>
-    </div>
+    <ResourceRail />
   </div>
 </div>
 
 <div class="cta-panel bottom-cta">
-  <h2 class="cta-panel-title">Ready to ship?</h2>
+  <h2 class="cta-panel-title">Ready to try Nulang?</h2>
   <div class="cta-panel-copy">
-    Nulang is open source under the Apache 2.0 license. Get started, contribute on GitHub, or support its ongoing development.
+    Nulang is alpha software and open source under the Apache 2.0 license. Build it from source, run the examples, and pressure-test the ideas.
   </div>
   <div class="cta-panel-actions">
-    <a href="/getting-started/installation/" class="cta-btn cta-btn-primary">Get Started</a>
-    <a href="https://github.com/nulang-org/nulang" class="cta-btn cta-btn-ghost" target="_blank" rel="noopener noreferrer">
-      Contribute on GitHub
-    </a>
+    <a href="/playground/" class="cta-btn cta-btn-primary">Try Nulang in your browser</a>
+    <a href="/getting-started/installation/" class="cta-btn cta-btn-ghost">Read the Docs</a>
   </div>
 </div>
 

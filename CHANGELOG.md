@@ -1,4 +1,57 @@
 # Nulang Changelog
+### Node-shared immutable object store — 2026-09-27
+- **Immutable object-store payloads are now shared across runtime shards without copying their bytes.** `TAG_OBJECT` handles keep a single node-local allocation while actor-lifetime holds protect queued and delivered messages; duplicate deliveries no longer over-increment object references.
+- **Cross-node object transport remains explicit and compatible.** Remote sends still serialize object bytes and intern a fresh local object on the receiving node, while actor heaps and ORCA ownership remain shard-confined.
+
+### Warm JIT transition A/B controls — 2026-09-25
+- **The same-host A/B harness now includes warmed 100k-iteration JIT execution probes for a non-reentrant arithmetic loop and a call-heavy re-entrant control.** Both compile once before timing, assert interpreter-equivalent results, and require a real JIT region so register-transition optimizations can be measured on their actual hot path instead of inferred from unrelated actor enqueue benchmarks.
+- **The benchmark helper now shares frontend-to-bytecode compilation across JIT A/B probes,** keeping the crossover and warmed-execution fixtures on one compilation path without changing timed work.
+
+### Round-paired performance A/B statistics — 2026-09-25
+- **Same-host A/B reports now compare base and candidate samples from the same measurement round before taking the median**, rather than relying only on a ratio of two independent medians. The existing alternating execution order is preserved, so pairing better cancels monotonic host-load and thermal drift.
+- **Performance reports now include a deterministic bootstrap 95% interval for median paired speedup** alongside paired throughput and latency deltas. The historical ratio-of-medians output remains for compatibility, while JSON report schema 2 records the paired result explicitly.
+- **Focused Python regressions pin sample alignment and operation-count invariants**, preventing a benchmark from silently producing a paired comparison across mismatched runs.
+
+
+### Same-host A/B Cargo target isolation — 2026-09-25
+- **Base and candidate benchmark builds now use separate Cargo target directories.** The repository config points every checkout at one absolute target path; sharing it across the detached base worktree and candidate could reuse the base library artifact while compiling candidate integration tests, producing false build failures or invalid A/B binaries.
+- **The isolation applies to both prebuild and measured Cargo invocations.** Persistent per-variant target directories retain ordinary Cargo caching while preventing cross-variant artifact contamination.
+### Actor A/B benchmark build diagnostics — 2026-09-25
+- **Failed base/candidate Cargo builds now preserve their captured compiler output in CI logs.** The same-host A/B harness re-emits combined stdout/stderr before raising, so build-stage failures no longer collapse into an opaque Python `CalledProcessError`; a focused Python regression test pins the behavior.
+
+### Runtime hot-path benchmark decomposition — 2026-09-25
+- **The same-host A/B harness now reports a mailbox-only one-value admission lower bound alongside the full runtime enqueue sweep.** This exposes the cost above message construction/mailbox admission before actor-routing or scheduler changes are justified.
+- **The actor A/B harness now measures AOT against warmed bytecode/JIT on the exact same 50k-message actor drain.** Bytecode is warmed past tier-up, enqueue time is excluded for both paths, and the harness prints the direct AOT speedup while retaining the existing AOT history record.
+- **PR A/B runs now sample the first-run JIT profitability crossover at 3k, 4k, 5k, and 7.5k loop trips against interpreter-only execution.** Fresh VMs are prepared outside timing, so the result isolates execution plus JIT compile/native cost and can drive the tier threshold without relying on shared-runner cross-commit history.
+- **GC benchmarks now include real cross-actor ORCA pointer-send bookkeeping.** The new `gc/orca_foreign_ref_send/256` fixture uses live actor-heap pointers and measures message admission, foreign-count bumps, coordinator submission, cycle-detector edge registration, and ready-state publication with semantic assertions.
+- **The benchmark contract now distinguishes primitive actor/GC cadence from foreign-reference ORCA work.** Existing history keeps its name while new measurements state exactly which runtime layers are timed.
+
+### Benchmark signal and scheduler dispatch accounting — 2026-09-25
+- **The ORCA benchmark now measures admitted actor traffic instead of rejected sends.** Benchmark actors register the measured `handle` behavior and assert that all 380 intended messages reached mailboxes before scheduler/GC processing begins.
+- **JIT tiering profitability now samples the 2k–10k crossover densely.** New 3k, 4k, 5k, and 7.5k trip points make future threshold changes evidence-based, and the call-heavy benchmark documentation now reflects the shipped direct-call helper path.
+- **Debug/source line metadata no longer creates JIT hotness probe sites.** Function/behavior entries, branch targets/fallthroughs, and post-boundary PCs remain candidates, while debugger line mappings stay independent; a regression test pins the separation so breakpoint fidelity does not tax cold straight-line execution.
+- **Scheduler total-task telemetry is derived from local/global/stolen source counters at snapshot time.** The public metric is unchanged while successful dispatch avoids one redundant atomic read-modify-write; a regression test pins the source-sum invariant.
+- **Benchmark guidance now treats shared-runner history as a regression signal, not optimization evidence.** Same-runner base/candidate A/B remains the primary before/after measurement for performance PRs.
+
+### Hosted control-plane ownership boundary — 2026-09-25
+- **Hosted placement and reconciliation policy is no longer owned by the Nulang language/runtime workspace.** `crates/nulang-cloud-control` is frozen as a migration surface and excluded from ordinary workspace builds; Nulang Cloud's `nlc-placement` remains the authoritative hosted control plane.
+- **The boundary is explicit:** Nulang owns portable computation semantics and cloud-neutral contracts, while provider, region/cell, tenancy, billing, and deployment policy belong to Nulang Cloud.
+
+### WASM type-directed float arithmetic parity — 2026-09-25
+- **WASM now preserves the bytecode backend's F* arithmetic choice.** Statically-float MIR arithmetic normalizes tagged runtime fallback values to the same defaults used by `FAdd/FSub/FMul/FDiv/FMod/FPow` before invoking the existing host arithmetic ABI.
+- **No Cloud host ABI change is required.** Float normalization is emitted into guest WASM, preserving the existing import set and function indices.
+- **The nightly zero-division regression is pinned.** `-(0.1 + 1.0 / 0.0)` remains `-0.1`: `FDiv` yields nil, `FAdd` treats nil as `0.0`, then `FNeg` negates the float.
+
+### Fail-closed WASM workflow admission — 2026-09-25
+- **The canonical WASM backend now rejects workflow declarations until durable workflow semantics are implemented there.** Previously simple workflows could compile to WASM even though the backend did not provide the bytecode runtime's durable step journal, signal suspension/resume, crash recovery, or saga compensation; only individual unsupported operations such as `Signal.wait` failed loudly.
+- **This is an integrity gate, not a workflow deprecation.** Bytecode/native workflows remain available while WASM parity is implemented, and Cloud admission can no longer mistake partial actor emulation for durable workflow execution.
+
+### Native JIT codegen backend boundary — 2026-09-24
+- **`JitSession` no longer owns Cranelift modules or reusable Cranelift contexts.** `src/jit/native_codegen.rs` introduces `NativeCodegenBackend`, `NativeCompileRequest`, and specialization requests for scalar, typed, and SIMD lowering.
+- **`CraneliftCodegen` now exclusively owns both compiler tiers.** Fast code still uses `opt_level=none` + single-pass register allocation, optimized code still uses `opt_level=speed` + backtracking, but tier/cache orchestration only sees native entry pointers and compile success/failure.
+- **Existing typed/SIMD white-box compiler tests now reach Cranelift state through the codegen component.** A backend-boundary regression compiles equivalent scalar requests through both fast and optimized policies.
+
+
 
 > This changelog is organized by **stability tier** (see `GOVERNANCE.md` §2),
 > not by release. The tier determines what may change and how. The crate
@@ -7,7 +60,15 @@
 > `LANGUAGE_VERSION` in `src/format/constants.rs`) is what this changelog
 > tracks — it moves only on RFC-ratified change.
 
-**Language version:** `1.0.0-frozen` (since 2026-07-19; RFCs 0001, 0002).
+**Published v1 artifact language metadata:** `1.0.0-frozen` (since
+2026-07-19; RFCs 0001, 0002). This historical identifier remains readable and
+is not rewritten.
+
+**Current compatibility policy:** RFC 0021 (accepted 2026-09-21) reclassifies
+pre-adoption Nulang Core source semantics as Stable until an evidence-bearing
+external-adoption freeze RFC is accepted. Published format/protocol/ABI
+versions remain archival compatibility obligations; future representations may
+evolve only behind explicit version boundaries and readers/migrations.
 
 ---
 
@@ -32,18 +93,539 @@ version + migration.*
   - `FormatError` enum: `Truncated`, `BadMagic`, `UnsupportedVersion`,
     `IncompatibleLanguage`, `LengthMismatch`, `UnknownOpcode`, `BodyDecode`,
     `BadConstant`.
-- **RFC 0002 — Frozen Core.** Defined Nulang Core, the minimal frozen subset:
-  `fn`/`let`/`if`/`match`/closures, `Int`/`Bool`/`String`/`Unit`/`Nil`/
-  `Vec`/`Map`/tuples/records/`enum`, HM inference over this subset, `IO.print`
-  and `IO.read` only, `val` capability only. Every Core program valid today is
-  valid in every future version.
+- **RFC 0002 — historical Frozen Core definition.** Defined the original Core
+  subset. RFC 0021 (accepted 2026-09-21) supersedes the *permanent
+  source-semantic freeze* portion of RFC 0002: Core remains the portability
+  kernel but is Stable until the external-adoption freeze gate is met.
+  Historical artifacts emitted under the old metadata remain compatibility
+  obligations.
 - Stability contract published as `SPEC2.md` §"Format Stability" and
   `GOVERNANCE.md`.
 
 ## Stable tier
 
+### Backend-neutral JIT region planning — 2026-09-24
+- **Native compilation eligibility is now separated from Cranelift code generation.** `src/jit/region_planner.rs` owns region boundaries, non-suspending direct-call folding, recursion safety, cached per-module analyses, and type metadata production.
+- **`JitSession` now consumes a `RegionPlan` for initial compilation and Tier-2 replacement instead of recomputing language/runtime safety rules itself.** This creates a reusable planning boundary for MIR, a custom baseline emitter, or another future native backend without duplicating call/effect/recursion semantics.
+- **Planner regressions cover typed arithmetic regions and short straight-line rejection.** Existing direct-call, recursion, suspension, typed-JIT, and SIMD tests continue to exercise the extracted analysis helpers.
+
+
+### JIT tier replacement and compile-time observability — 2026-09-24
+- **Tier-2 promotion now replaces the installed machine-code entry instead of returning the already-cached lower-tier function.** Compiled regions carry an explicit `Baseline` / `Typed` / `Simd` tier plus a `Fast` / `Optimized` codegen policy, and promotion uses fresh Cranelift symbols while preserving the same cache slot.
+- **First-tier native code now uses a low-latency Cranelift module with `opt_level=none` and `regalloc_algorithm=single_pass`; hot replacement uses a separate `opt_level=speed` + backtracking-register-allocation module.** Baseline code can retain folded direct calls while being recompiled at the optimized level; typed code preserves type-directed guard stripping across promotion and can subsequently promote to SIMD when the loop analyzer accepts it.
+- **Each installed compiled region records compiler wall time in nanoseconds.** Regression coverage pins pointer replacement, optimization-level transition, SIMD promotion, per-session counters, and stable compiled-region cardinality across replacement.
+
+
+### CI playground dependency and formatting repair — 2026-09-24
+- **Browser-playground compilation now includes the shared content-identity module and its pure-Rust `hex` dependency** (`crates/nulang-playground`), matching `semantic_identity.rs`'s current dependency graph. Runtime worker-pool files were also normalized to the repository's rustfmt output so the format gate reflects semantics rather than stale layout.
+
+
+### Complete Python marshal extraction typing — 2026-09-24
+- **Owned Python→Nulang foreign-value conversion now uses explicit PyO3 extraction targets for Int, Float, and String** (`src/python/marshal.rs`), completing the Bool fix from #930. This prevents Rust/CodeQL builds from failing generic `extract` inference one branch at a time without changing conversion semantics.
+
+
+### Python bool marshal type inference — 2026-09-24
+- **Default-feature builds now make PyO3 boolean extraction explicit with `extract::<bool>()`**, avoiding a compiler inference failure in the Python marshal path without changing conversion semantics.
+
+### Consuming local-send ownership proof — 2026-09-24
+- **MIR now identifies fresh, single-definition heap-owning values whose sole use is a same-node actor send**, establishing a conservative proof surface for a later ORCA ownership handoff.
+- The analysis is intentionally metadata-only in this slice: it changes no bytecode, mailbox representation, reference count, or runtime behavior. Parameters, captures, handler bindings, multi-use values, and remote sends remain ineligible.
+
+### Durable external-effect crash-window release gate — 2026-09-23
+- **The deterministic crash-window matrix now exercises the real `DurableEffectCoordinator` over `MemoryStore` using compiler-owned semantic effect-site IDs**, covering intent-only recovery, provider-commit/receipt-loss deduplication, completed-receipt replay, request/specification drift, stale-owner completion fencing, explicit at-least-once duplication, and backend-defined delegation.
+- **The public durability guarantee boundary is documented explicitly** (`docs/DURABILITY_GUARANTEES.md`): Nulang does not claim arbitrary exactly-once external execution; effectively-once behavior requires a real provider/backend deduplication contract and the same stable operation identity across recovery.
+- **`scripts/test-durability-guarantees.sh` is now a focused minimal-feature release gate** spanning semantic-site artifact propagation, persistence recovery, the crash matrix, and lower-level durable-effect unit contracts.
+
+### Durable external-effect recovery coordinator — 2026-09-23
+- **Atomic durable-effect records are now recoverable through the storage-neutral `PersistenceStore` contract.** Memory and libSQL backends can load the newest record for a stable `DurableEffectId`; backends without recovery support fail with `Unsupported` instead of pretending the effect never ran.
+- **`DurableEffectCoordinator` connects the existing semantic effect state machine to atomic `DurableTransition` commits.** A new effect persists `Prepared` before external dispatch, recovery validates both request digest and full effect specification, terminal results persist as `Completed`, and completed results replay without redispatch.
+- **Activation fencing and sequence CAS remain authoritative at the persistence boundary.** The coordinator supplies the current activation epoch but does not invent replay identity; callers must provide a semantic, replay-stable `DurableEffectSpec`.
+- Focused store/coordinator tests pin request drift, specification drift, monotonic completion, stale-activation rejection, newest-record lookup, and fail-closed unsupported-backend behavior.
+
+### Semantic effect-site artifact metadata — 2026-09-23
+- **Bytecode artifacts now carry an additive `effect_sites` metadata sidecar** mapping the exact `Perform` / `PerformDirect` / `PerformAsync` instruction PC to the compiler-owned semantic effect-site digest and qualified operation. Opcode bytes and NBC format version remain unchanged.
+- **MIR codegen captures semantic sites before optimization and consumes them while emitting effects.** If optimization ever removes or reorders observable effect operations, codegen fails instead of silently attaching an incorrect durable identity.
+- Effect metadata is attached after argument staging, so the recorded PC points at the effect opcode itself rather than preceding spill/move instructions.
+- NBC round-trip tests pin metadata preservation, legacy artifacts without the field default to an empty sidecar, and formatting-only source changes preserve the semantic site digest.
+- NBC encode/decode now rejects unsorted, duplicate, out-of-range, or non-effect effect-site PCs so binary-search lookup cannot silently accept malformed durability metadata.
+
+### Type-preserving async effect completions — 2026-09-23
+- **`PerformAsyncResult` now has an additive `ReadyValue(Value)` completion path** so asynchronous host effects can resume with integers, floats, booleans, actor-safe opaque handles, or other already-materialized VM values without coercing them through strings.
+- **The interpreter stores `ReadyValue` directly and the native JIT/AOT helper returns its raw value bits**, while the existing `Ready(Option<String>)` and `Pending` contracts remain unchanged. A VM regression pins non-string result preservation.
+
+### Stateful blocking foreign executor — 2026-09-23
+- **Foreign backends can now be owned behind a dedicated bounded worker and invoked with fully-owned request envelopes** (`src/runtime/foreign_executor.rs`), keeping blocking backend execution off cooperative actor scheduler threads while preserving mutable interpreter/module state across calls.
+- **The scheduler-facing path remains non-blocking and never acquires the backend mutex**; one worker per backend instance serializes access deliberately. This slice still does not change VM suspension/resumption or route source-level Python/FFI effects through the executor.
+
+### Owned Python foreign execution — 2026-09-23
+- **The Python foreign backend now opts into the worker-safe `ForeignInterop::call_owned` contract**, consuming only owned semantic values and opaque registry handles while preserving the existing synchronous VM-`Value` compatibility path.
+- **Owned Python arguments/results convert through the registry without VM, actor-heap, or module string-pool access**; unsupported custom backends continue to fail closed unless they explicitly implement the owned-call contract.
+
+### Owned foreign-call worker boundary — 2026-09-23
+- **Foreign calls can now be marshalled into worker-safe owned envelopes before leaving the actor scheduler thread** (`src/runtime/foreign_call.rs`). Primitive values cross by semantic value, strings cross by resolved UTF-8 content, and supported backend objects cross only as opaque backend-tagged ids.
+- **Actor references, heap pointers, closures, unresolved string ids, and other runtime-local VM representations fail closed** instead of crossing worker threads. The request/result types are statically asserted `Send + 'static`; this slice does not yet execute a backend or suspend/resume actors.
+
+### Standalone Savina actor benchmark runner — 2026-09-23
+- **Savina-style actor workloads now have a dedicated minimal benchmark path** (`src/bin/nulang_savina.rs`, `benchmarks/SAVINA.md`). Counting, ping-pong, thread-ring, fork-join, and Skynet can run with `--no-default-features` under the non-LTO `savina` profile and emit stable JSONL records for repeated measurements. CI smoke-tests the runner and archives five-repetition output on main benchmark runs. The existing Criterion profile and historical regression baselines are unchanged.
+
+### Compiler-owned semantic effect-site identity — 2026-09-23
+- **MIR can now derive backend-independent `EffectSiteId` values for every `Perform` / `PerformAsync` site.** Identity is domain-separated by module, owner kind, fully qualified function/behavior name, effect operation, and same-operation ordinal; source spans, compiler-generated local/block IDs, and bytecode PCs are deliberately excluded.
+- **Durable invocation identity can compose semantic site identity with durable execution identity.** `DurableEffectId::derive_from_site` combines actor identity, a replay-stable execution key, the compiler-owned site ID, and a dynamic occurrence index so repeated execution of one site inside a loop remains distinguishable while retries remain stable.
+- Regression tests pin formatting/source-line stability, unrelated-definition stability, actor-qualified behavior identity, same-operation site ordinals, dynamic occurrence separation, and hex round-tripping.
+- This changes no source syntax or bytecode format. Preserving the site ID through backend artifacts is the next integration step before receipt-backing `Provider.ask` / `Inference.ask`.
+
+### Indexed selective receive — 2026-09-23
+- **Selective receive now lazily indexes staged mailbox lanes by behavior id**, avoiding repeated O(mailbox depth × arm count) scans while preserving system → local → normal precedence, FIFO candidate choice, first-arm semantics, and transactional guard retry/reset behavior.
+- Criterion coverage now measures mailbox depth, arm count, and repeated guard rejection; focused regressions pin index rebuilds after commit, new arrivals, duplicate arms, and cursor rewind on receive reset.
+
+### Bounded blocking host executor — 2026-09-23
+- **The actor runtime now exposes a fixed-size bounded executor for host work that must not run on cooperative scheduler threads** (`src/runtime/blocking_executor.rs`), with non-blocking admission, explicit queue-full/closed results, stable job ids, and bounded completion delivery.
+- **Worker jobs must own `Send + 'static` data and panics are isolated into typed completions**; shutdown drops the completion receiver before joining workers so blocked completion delivery cannot deadlock runtime teardown. The executor is generic infrastructure only in this slice and does not yet reroute Python/FFI/filesystem effects.
+
+### Runtime test feature-gating cleanup — 2026-09-23
+- **The runtime test-only `Arc` import is gated behind the `tcp` feature that uses it**, keeping default builds warning-clean after the actor benchmark repair landed separately in #889.
+
+### Same-host actor optimization A/B gate — 2026-09-23
+- **Performance pull requests can now compare the candidate to their exact base SHA on the same runner and logical CPU** (`scripts/nulang_ab_bench.py`, `.github/workflows/nulang-ab-bench.yml`). Build work is excluded from timing, execution order alternates by round, and the JSON artifact records raw samples, medians, throughput/latency deltas, toolchains, and CPU affinity.
+- **Stacked performance work is measured incrementally by construction**, and Nulang-only probes cover the small-message payload boundary plus AOT actor dispatch without contaminating the cross-language baseline.
+
+### Reproducible cross-runtime actor baselines — 2026-09-23
+- **Matched Savina-style counting, ping-pong, thread-ring, and fork-join fixtures now cover Nulang, Rust standard-library channels, Go channels/goroutines, and Erlang/BEAM processes** (`benchmarks/cross_runtime/`, `scripts/cross_runtime_bench.py`). The runner records exact timing samples, medians, toolchain/git/CPU metadata, and emits one JSON artifact.
+- **Comparative runs default to one enforced logical CPU across every runtime process and child scheduler/thread**, matching the current single-shard Nulang harness's compute budget. Unconstrained host mode is explicitly diagnostic until a separate sharded Nulang fixture exists, so multicore fork-join results are not misrepresented as equivalent comparisons.
+- **Benchmark-related pull requests run the cross-runtime harness automatically**, while manual workflow dispatch remains available for longer controlled runs.
+
+### Inline small actor message payloads — 2026-09-23
+- **Actor messages with 0–4 values now store their NaN-boxed payload directly in the message envelope** (`src/runtime/mailbox.rs`) instead of allocating a `Vec` plus `Arc`; larger payloads retain shared `Arc<Vec<Value>>` storage.
+- **Local runtime sends, AOT sends, supervision/system messages, cross-shard delivery, and decoded network delivery all use the small-message representation.**
+- **Selective receive keeps its transactional `Arc<Vec<Value>>` callback ABI** by materializing an inline candidate only when selected and retaining the same Arc through commit.
+- **The existing `actor/message_enqueue/by_id_100` benchmark keeps its name for rolling-history continuity**, while a new 5-argument shared-payload benchmark provides the allocation-backed comparison.
+
+### Deduplicated actor ready queue and adaptive turns — 2026-09-23
+- **Actor scheduling now has explicit shard-owned `Idle → Queued → Running` ownership** (`src/runtime/actor.rs`, `src/runtime/mod.rs`), so bursts of sends append mailbox work without injecting duplicate ready tokens. Production, cross-shard delivery, timer wakeups, supervisor restarts, and internal manual pumps use the same claim/finish transition helpers.
+- **Mailbox turns adapt to runnable-peer pressure**: contended actors keep the existing 16-message quantum, while an effectively solo actor may drain up to 256 messages before returning to the scheduler; peer pressure is rechecked every 16 messages and the actor reduction budget remains the hard preemption ceiling.
+- **GC/CRDT/dehydration cadence is charged by messages actually processed rather than actor-turn count**, preventing larger solo batches from stretching maintenance intervals.
+- **Actor benchmarks retain the existing named-send history and add a numeric behavior-id enqueue signal**, making scheduler/mailbox changes visible without conflating them with behavior-name resolution.
+
+### Actor density and mailbox hot-path allocation — 2026-09-23
+- **Idle actors no longer materialize their 16 KiB ORCA bump block at spawn** (`src/runtime/heap.rs`). The configured first-block capacity is preserved, but allocation is deferred until the first small-object heap allocation; LOS-only actors also remain bump-block-free.
+- **Mailbox logical-count atomics use relaxed ordering** (`src/runtime/mailbox.rs`) because Crossbeam `SegQueue` owns message publication/synchronization; the atomic counter remains capacity/accounting state and its modification order still prevents bounded producers from over-reserving.
+- **Criterion now tracks `actor/spawn_idle/1000`** so actor-density allocation changes have a direct throughput regression signal.
+
+### Actor runtime hot-path overhead reduction — 2026-09-23
+- **Per-actor flight recording is now opt-in for runtime-created actors** (`src/runtime/actor.rs`, `src/runtime/mod.rs`). `NULANG_FLIGHT_RECORDER=1` enables the existing recorder; disabled actors reserve no recorder ring storage and skip payload-summary formatting. Explicit `FlightRecorder::new(...)` callers retain enabled behavior, and accepted messages are recorded only after mailbox admission succeeds.
+- **Bytecode actor turns now reuse the cached VM module index without deep-cloning `CodeModule` on every dispatch** (`src/runtime/mod.rs`). The clone/load cost is paid only when an actor first installs its module into the runtime VM; subsequent turns execute directly against `bytecode_module_idx`. Bytecode format and execution semantics are unchanged.
+
+### RFC 0008 migration compatibility substrate — 2026-09-23
+- **Entity migration graphs are now validated before lowering** (`src/typechecker.rs`). Schema versions must be positive; migration steps must advance exactly one version, cannot duplicate an origin or target beyond the current schema, and must form a complete 1→current chain. Invalid skipped-version and downgrade conformance cases now fail compilation instead of silently running.
+- **Migration compatibility metadata now survives HIR→MIR lowering** (`src/mir_lower.rs`, `src/bytecode.rs`) instead of being replaced with an empty `ActorMeta.migrations` payload.
+- **Typed actor semantic identity now includes entity schema version and canonical migration topology/event surface** (`src/semantic_schema.rs`), so schema-evolution declarations participate in compatibility identity. Runtime execution of migration bodies and persisted snapshot/history schema-version fencing remain follow-up work; this entry does not claim RFC 0008 replay migration is complete.
+
+### Direct runtime AOT actor dispatch — 2026-09-23
+- **Runtime-owned AOT behaviors now call the stable native actor-entry ABI directly** (`src/runtime/mod.rs`, `src/aot/mod.rs`) instead of arming `AOT_DISPATCH`, invoking the generic behavior-table adapter, then reading the target back from thread-local state.
+- **Common native actor payloads no longer allocate a temporary raw-word Vec**: 0–4 boxed values are packed into fixed stack storage before entering the ABI; larger arities retain the allocation-backed fallback.
+- **Synchronous ask, mailbox-flush, scheduler, and recovery native-handler entry points share one dispatch boundary**, preventing runtime-owned AOT calls from depending on a separately armed TLS target.
+- **Criterion now tracks one-argument and five-argument direct actor-entry dispatch separately** so the stack-packed common path and allocation-backed fallback remain measurable.
+
+### Stable native actor entry ABI — 2026-09-23
+- **AOT actor dispatch now crosses one versioned C-ABI boundary** (`src/native_abi.rs`, `src/aot/codegen.rs`, `src/aot/mod.rs`). Generated Cranelift wrappers validate ABI version and payload arity, load boxed arguments, and call the behavior's optimized internal native function. The runtime no longer selects an arity-specific Rust function type from message length.
+- **Native actor entry status reserves explicit scheduler outcomes** (`Completed`, `Waiting`, `Yielded`, `Suspended`, `Faulted`) so continuation-aware preemption can be added without changing the runtime-facing calling convention. Mid-function AOT yielding is intentionally not enabled until continuation state can be preserved.
+
+### Re-entrant JIT ownership boundary — 2026-09-23
+- **JIT preparation and native execution are now distinct backend phases** (`src/backends/mod.rs`, `src/jit/mod.rs`), so compilation and Tier-2 promotion finish before native code may call back into the interpreter.
+- **`VM::try_jit_execute` detaches the mutable JIT backend and raw-bit constant cache before native entry** (`src/vm.rs`). Re-entrant direct calls therefore see no VM-owned JIT backend to alias and execute nested frames in the interpreter.
+- **JIT helpers no longer keep a borrowed constant-pool slice in thread-local state**; interned strings resolve through the active VM pointer plus an explicit module index (`src/jit/runtime.rs`).
+- **Debug assertions pin the re-entry invariant**: direct calls require both the backend to be detached and the active module's JIT constant cache slot to be empty.
+
+### Backend differential oracle hardening — 2026-09-22
+- **WASM differential execution now fails closed after artifact emission** (`src/fuzz.rs`, `src/difffuzz.rs`). Restricted-profile rejection remains an expected compile-time skip, but malformed/invalid emitted WASM, instantiation failures, or a missing required `nulang_init` export are backend correctness failures. Differential campaigns now record WASM agreement coverage, and the `wasm-backend` test lane requires positive WASM participation so a silently-disabled backend cannot leave CI green.
+
+### RFC 0008 migration purity enforcement — 2026-09-22
+- **Entity migration bodies now fail compilation when they contain nondeterministic or externally visible operations** (`src/migration_purity.rs`, `src/effect_checker.rs`). The public effect-checking pipeline rejects direct or transitively hidden `perform`, spawn/send/ask/receive, actor migration, grain lookup, continuation resume, defer/errdefer, and extern/FFI calls; locally handling an effect does not launder it. Pure helpers and replay-stream `emit` remain allowed, and the existing conformance proof-of-gap now expects compilation failure.
+
+### Last-use MIR ownership transfer — 2026-09-22
+- **Single-definition heap-owning locals can now transfer ownership through their sole `Load` use** (`src/mir_codegen.rs`). The compiler proves the source has exactly one MIR definition and exactly one use, copies the value to the destination, then clears the dead source to `nil` without decrementing ORCA. Ownership proofs propagate through chains of such moves, allowing the final owner to be reclaimed at its true last use while ordinary multi-use copies retain the previous conservative behavior.
+
+### Temporary concatenated-string reclamation — 2026-09-22
+- **Non-folded string concatenations now participate in MIR ownership-based reclamation** (`src/mir_codegen.rs`). Because `SConcat` creates a fresh actor-heap string, the liveness planner can release its sole local ORCA reference immediately after the last safe use instead of retaining the temporary until actor teardown. Runtime semantics and the existing ORCA/store-barrier protocol are unchanged.
+
+### Typed JIT native SSA across arithmetic, loops, and simple CFGs — 2026-09-22
+- **The typed Cranelift JIT now keeps proven Int/Float values in native SSA form across arithmetic chains, simple loop backedges, and conservative forward-branch joins** (`src/jit/typed_compiler.rs`). It preserves Nulang's 48-bit integer wrap, nullable division/modulo behavior, NaN canonicalization, and runtime-helper fallbacks while avoiding repeated tag/unbox/register-file round trips. Per-block forward must-type analysis makes type facts CFG-derived rather than bytecode-emission-order-dependent. The implementation is the current-main replay of the independently tested #738→#768→#770→#771→#773→#774 stack.
+
+### Candidate-only JIT hotness probing — 2026-09-22
+- **Cold interpreted execution now probes JIT hotness only at candidate compiled-region entries** (`src/vm.rs`). The VM precomputes per-module candidates for execution/function/behavior entries, source-statement starts, branch targets/fallthroughs, and successors of compilation boundaries, avoiding JIT backend dispatch and hot-counter mutation at ordinary straight-line bytecode PCs without changing language semantics.
+
+### Canonical compiler semantic identity — 2026-09-21
+- **Compiler-owned `SemanticId` now derives from canonical backend-independent MIR plus typed actor-state schemas** (Experimental, `src/semantic_identity.rs`, `src/semantic_schema.rs`, `src/compiler_identity.rs`). The encoding alpha-normalizes compiler-generated IDs, excludes presentation/debug metadata and backend selection, includes executable/effect/authority/durable semantics, and folds dependency semantic identities deterministically. `ArtifactIdentityManifest` assembly now has a typed-program entry point that keeps exact `SourceId`, semantic identity, and backend-specific `ArtifactId` distinct without changing frozen NBC v1.
+
+### Production host-authority boundary — 2026-09-20
+- **Test effect handlers no longer exist in production runtime builds** (`src/runtime/mod.rs`, `src/runtime/callbacks.rs`). Mock effect interception is now `#[cfg(test)]` and crate-private, so actor-backed host effects in production cannot take the test-handler path before external-authority enforcement.
+- **Actor-backed `Process.run` remains non-dispatched until a real process sandbox exists** (`src/runtime/callbacks.rs`, `src/stdlib.rs`). A regression test proves that even an actor holding an exact `Process::Run(...)` grant cannot turn that grant into host shell execution; docs now mark the existing `/bin/sh -c` implementation as trusted/standalone-only.
+
+### Typed process host authority — 2026-09-20
+- **`Process.run` uses a first-class typed host authority grant** (`src/authority.rs`, `src/authority_host.rs`, `src/runtime/callbacks.rs`). Actor-backed process execution now resolves to `AuthorityGrant::ProcessRun { command }` rather than the generic extension-authority fallback. The canonical `Process::Run(command)` token remains byte-for-byte compatible, grants remain exact-command only, and missing or empty command authority fails closed.
+
+
 *Breaking changes require an accepted RFC and a deprecation cycle of at least
 two major versions.*
+
+### Actor-capable `.nbc` execution — 2026-09-22
+- **Precompiled actor/workflow artifacts execute through the real Runtime**
+  instead of standalone VM actor callbacks. Serialized modules carrying actor
+  metadata now use the same spawn/send/state/scheduler path as source
+  execution, while pure modules retain the lower-overhead standalone VM path.
+  Regression coverage verifies message delivery after NBC round-trip and
+  durable-store selection for persistent actors.
+
+### Actor protocol rolling-upgrade compatibility — 2026-09-20
+- **Directional structural compatibility** (Experimental, `src/protocol.rs`).
+  A receiver may serve an older required protocol when it preserves every
+  required compiler-owned behavior contract exactly; additive receiver
+  behaviors are allowed. Parameter, return, effect, or capability changes are
+  incompatible. V1 deliberately avoids implicit variance/default-field rules.
+
+### Actor protocol schema registry — 2026-09-20
+- **Trusted canonical schema registry** (Experimental, `src/protocol.rs`).
+  `ProtocolRegistry` maps `ProtocolId` values to compiler-derived schemas so
+  different digests can be compared using directional rolling-upgrade rules.
+  Exact digest equality needs no lookup; different/unknown digests fail closed.
+  Structurally identical source renames register idempotently because display
+  names are intentionally excluded from protocol identity.
+
+### Actor protocol pre-mailbox admission — 2026-09-20
+- **Fail-closed protocol admission policy** (Experimental, `src/protocol.rs`).
+  `admit_protocol` is a side-effect-free decision point intended to run before
+  mailbox publication. `StrictCompatible` is the default: exact ids pass
+  directly, proven additive receiver upgrades pass through the trusted schema
+  registry, and incompatible/unknown/missing typed identities are rejected.
+  `LegacyCompatible` is explicit migration mode and relaxes only a missing
+  incoming required protocol identity; typed mismatches remain fail-closed.
+
+### NUL0 required actor-protocol identity tail — 2026-09-20
+- **Additive typed delivery metadata** (Experimental, `src/runtime/network.rs`,
+  `src/runtime/distributed.rs`). Actor messages may carry the sender/client's
+  required `ProtocolId` in a self-identifying `PRT0` trailing extension.
+  Existing untyped send paths emit the historical NUL0-v1 payload unchanged;
+  current readers accept messages without the tail and ignore unrelated future
+  trailing extensions. The receiver's installed protocol remains local runtime
+  metadata and is deliberately not trusted from the wire.
+
+### JIT compiled-region dense slots — 2026-09-20
+- **Dense compiled-region lookup** (Experimental, `src/jit/mod.rs`).
+  JIT-compiled region pointers are now stored in per-module dense PC-indexed
+  slots instead of an `FxHashMap<(module_idx, pc), ...>`. The interpreter's
+  per-step compiled-region probe therefore uses bounds checks plus an
+  `Option` load rather than hashing every still-interpreted instruction after
+  the first region tiers up. Compiled-region count, module/PC isolation, and
+  replacement semantics are covered by regression tests; tier thresholds and
+  JIT ABI are unchanged.
+
+### Typed actor protocol checking — 2026-09-20
+- **Static protocol validation for known actor references** (Experimental,
+  `src/actor_protocol.rs`, RFC 0023). Actor `send`/`ask` calls whose receiver
+  resolves statically to an actor declaration now reject unknown behaviors and
+  wrong arity, constrain behavior arguments through the existing HM checker,
+  and propagate conservatively known `ask` return types. Dynamic/opaque actor
+  references retain the previous compatibility behavior. The implementation is
+  a compiler pre-pass integrated directly into `TypeChecker::check_module`; it
+  does not alter runtime dispatch, persistence, or wire formats.
+- **Structural `ActorRef[P]` protocols** (Experimental). Public/generic actor
+  APIs can require a behavior record such as
+  `ActorRef[{ get: () -> Int, add: Int -> Unit }]`. Concrete actors advertise
+  declared behavior signatures through the existing `Type::Actor.behavior`
+  slot; concrete-to-`ActorRef` unification permits extra concrete behaviors
+  while requiring every requested behavior/signature. Calls through
+  `ActorRef[P]` are checked directly from `P`. The type is compile-time-only
+  and does not change runtime actor representation or stable formats.
+- **Directional ActorRef attenuation** (Experimental). Already-abstract
+  `ActorRef<P>` values may flow to narrower `ActorRef<Q>` requirements when
+  every required behavior/signature is present. Widening to claim missing
+  behaviors is rejected. The check is applied at value-to-expected-type
+  boundaries without making general HM unification asymmetric.
+- **Compiler-owned protocol fingerprints** (Experimental, `src/protocol.rs`).
+  `ProtocolSchema::from_actor_type` derives structural protocol identity from
+  the typechecker's canonical actor behavior record. Full behavior signatures
+  include parameter packs, return types, effects, and capabilities; unresolved
+  or open contracts fail closed. Protocol type hashes now use the canonical
+  content encoding rather than information-erasing NTIR.
+
+### Compiler-owned host effect ABI — 2026-09-20
+- **Built-in host effects now lower through a versioned compiler-owned contract**
+  (Experimental, `src/host_effect_abi.rs`, `spec/host-effects/v0alpha1.json`,
+  `src/mir_wasm.rs`). The compiler defines canonical operation identity,
+  deterministic request shape, response projection, minimum checked authority,
+  and replay classification for platform-provided effects. WASM lowering emits
+  canonical versioned host-operation identifiers for known operations instead
+  of requiring the host to reconstruct Nulang semantics from dotted source
+  spellings such as `Storage.write`. Unknown/custom effects retain the legacy
+  compatibility path while the experimental ABI rolls out.
+
+### Actor dispatch soundness — 2026-09-20
+- **Fail-closed behavior-name resolution** (Stable runtime correction). Actors
+  with a declared native or bytecode behavior surface reject unknown names
+  across local, cross-shard, and remote delivery; an unknown name can never
+  alias a real behavior id 0 handler. Metadata-free low-level actors created
+  directly through `Runtime::spawn_actor` retain raw mailbox admission through
+  inert id 0 for Rust-embedder/runtime compatibility; by definition those
+  actors have no handler at id 0, so this compatibility path cannot execute
+  user code. Name resolution remains on the owning runtime/shard, fetched or
+  hot-reloaded code must still declare the requested behavior, invalid
+  synchronous numeric asks fail explicitly, and a genuinely declared behavior
+  id 0 remains valid.
+
+### RESP-compatible cache kernel — 2026-09-19
+- **Packed shard-local cache substrate and borrowed RESP parser** (Experimental,
+  `src/runtime/cache.rs`, `src/runtime/resp.rs`). Cache entries bypass actor
+  mailboxes, the VM heap, and ORCA: small values inline, larger keys/values use
+  reusable size-class arena blocks, the index is contiguous open addressing,
+  TTL references are generation-fenced, and routing preserves Redis Cluster's
+  16,384 logical slots and hash tags. RESP2 command frames are parsed into
+  borrowed slices without allocating an argument vector. Criterion coverage
+  tracks local GET/SET churn, arena reuse, and slot hashing.
+- **Initial RESP command execution layer** (Experimental,
+  `src/runtime/resp_cache.rs`). PING/GET/SET/DEL/EXISTS/INCR/EXPIRE/TTL/MGET/MSET
+  execute directly against the shard-local cache. SET supports EX/PX, INCR
+  preserves TTL while promoting numeric byte strings to the packed integer
+  representation, and multi-key operations reject CROSSSLOT before mutation.
+- **Epoch-fenced Redis-slot placement table** (Experimental,
+  `src/runtime/cache_routing.rs`). All 16,384 logical slots resolve by direct
+  indexed lookup to a physical node/shard owner. Placement changes validate the
+  complete range batch before mutation and reject stale epochs or overlapping
+  assignments, keeping topology coordination off the GET/SET hot path.
+- **Cache-specific local/remote dispatch boundary** (Experimental,
+  `src/runtime/cache_dispatch.rs`). Same-shard commands execute directly on
+  the owning `CacheStore`; other local shards use bounded request/reply queues
+  with explicit backpressure, while remote ownership produces a transport
+  handoff tagged with slot and placement epoch. RESP frames are copied only
+  when crossing a shard or node boundary.
+- **Ordered RESP connection pipeline** (Experimental,
+  `src/runtime/cache_pipeline.rs`). Cross-shard and remote completions may
+  arrive out of order, but responses are buffered behind a bounded
+  per-connection sequencer and emitted only as the longest contiguous completed
+  prefix. Direct responses stay immediate when no earlier async request is
+  pending; pipeline saturation is explicit backpressure.
+- **RESP pipeline retained-byte high-water mark** (Experimental,
+  `src/runtime/cache_pipeline.rs`). Deferred direct and completed local/remote
+  responses now contribute to a per-connection byte budget in addition to the
+  pending-entry limit. Crossing the byte high-water mark backpressures further
+  submissions/completions until ordered draining releases retained bytes.
+- **Redis Cluster MOVED redirect mode** (Experimental,
+  `src/runtime/cache_cluster.rs`, `src/runtime/cache_dispatch.rs`). Physical
+  cache owners can advertise preformatted RESP endpoints. Redirect mode sends
+  `MOVED` immediately for keyed commands received by a non-owning shard or
+  node, while transparent mode retains internal queue/transport routing.
+  Missing endpoint metadata fails closed rather than silently proxying.
+- **Redis Cluster topology discovery and compact default placement**
+  (Experimental, `src/runtime/cache_cluster.rs`,
+  `src/runtime/cache_routing.rs`). `CLUSTER KEYSLOT`, `CLUSTER SHARDS`,
+  and legacy `CLUSTER SLOTS` are served from the routing snapshot without
+  entering CacheStore. Default local ownership now uses balanced contiguous
+  slot ranges instead of modulo striping, keeping discovery payloads compact
+  while CRC16 preserves expected key balance.
+- **Dedicated per-shard RESP reactor** (Experimental, optional
+  `cache-server` feature, `src/runtime/cache_server.rs`). Mio readiness
+  polling keeps each physical shard's listener, connections, CacheStore,
+  expiration work, and RESP pipelines on one thread, independent of the actor
+  scheduler. Redirect mode is required so normal client traffic reaches the
+  owning shard directly. Cross-shard inbox activity and shutdown wake blocked
+  reactors through Mio Waker, while bounded connection/input/output/pipeline
+  limits provide explicit resource backpressure.
+
+### Progressive capability diagnostics — 2026-09-19
+- **Actor-send capability errors now explain the isolation rule and the safe repair** (`src/effect_checker.rs`, `src/types.rs`). Local `ref`/`trn`/`box` send failures state why actor-local aliasing or borrowing cannot cross an actor boundary; remote-send failures explain the serialization boundary and point users toward `val`, `tag`, or serializable `linear` data. `iso` use-after-move guidance now correctly tells callers to stop using the moved binding or create an immutable snapshot before transfer instead of suggesting a misleading pre-move `consume`.
+
+### C embedding handle and function dispatch correctness — 2026-09-18
+- **Public module handles now resolve through the runtime handle table before
+  accessing deduplicated compiled modules** (`src/ffi/c_api.rs`). Repeated
+  compilation of identical source can therefore use fresh public handles
+  consistently for execution, named calls, module string interning, and
+  returned-string stabilization.
+- **Named C API function calls now execute from the function's actual bytecode
+  offset instead of its function-table slot** (`src/bytecode.rs`,
+  `src/ffi/c_api.rs`). Non-first top-level functions no longer risk starting
+  execution at an unrelated bytecode PC.
+### Fabric confirmed-removal automatic failover — 2026-09-18
+- **Automatic ownership transition after confirmed leader removal**
+  (Experimental, `src/runtime/fabric_stream_epoch.rs`,
+  `src/runtime/distribution.rs`). Confirmed removed nodes are queued until
+  Runtime regains cluster/transport ownership, then durable stream policies are
+  scanned. A stream transitions automatically only when surviving old replicas
+  still satisfy the old majority, reduced placement contains exactly those old
+  survivors, and the local node is the deterministic candidate. Insufficient
+  quorum or placement requiring a new replica fails closed. Candidate prepare
+  traffic retries on the logical clock at 500ms/1s/2s/... up to 30s so
+  staggered removal confirmation cannot strand an otherwise safe transition.
+  Deterministic tests cover positive-goodbye automatic RF3->RF2 failover and
+  delayed peer removal followed by retry.
+
+### Fabric stable installed placement — 2026-09-18
+- **Durable policy is authoritative after stream bootstrap** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`). Established stream append, retry,
+  crash recovery, application ACK validation, committed catch-up, replica
+  application and commit propagation now derive leader/replica/fingerprint
+  state from the installed `replication_policy.json` rather than recomputing
+  rendezvous over the entire current cluster. Unrelated node joins and rejoins
+  therefore cannot implicitly rebalance a live stream or invalidate current
+  quorum traffic; membership still controls reachability and explicit epoch
+  transitions remain the only ownership-change path. Epoch-1 follower bootstrap
+  continues to use current rendezvous when no local policy exists, leaving a
+  documented first-contact race for a future explicit policy-bootstrap message.
+
+### Fabric automatic failover reconciliation — 2026-09-18
+- **Bounded push/pull repair during confirmed-removal failover** (Experimental,
+  `src/runtime/fabric_stream_epoch.rs`). The automatic failover logical-clock
+  scheduler now inspects durable transition votes before retrying prepare: it
+  pushes a proposal-scoped suffix to lagging proposed replicas, pulls from an
+  ahead survivor when the deterministic candidate is behind, and starts a
+  strictly higher term after a pull changes the proposal-bound candidate tail.
+  Each retry performs at most one 256-record reconciliation action and retains
+  the existing 500ms -> 1s -> 2s exponential backoff capped at 30s.
+  Deterministic coverage verifies both candidate-ahead and candidate-behind
+  failover complete without manual repair API calls.
+
+### Fabric epoch candidate reconciliation — 2026-09-18
+- **Proposal-scoped pull from an ahead surviving replica** (Experimental,
+  `src/runtime/fabric_stream_epoch.rs`, `src/runtime/distributed.rs`).
+  A prospective leader that is behind another proposed survivor can now request
+  a bounded exact durable suffix under the active proposal. The source validates
+  old policy, proposed placement, requester identity and promise fencing; the
+  candidate validates the recorded rejected-vote tail and exact next sequence
+  before appending. Because pulling changes the proposal-bound candidate tail,
+  the old proposal is never finalized: the caller starts a strictly higher
+  election term whose hash binds the reconciled tail. Deterministic coverage
+  exercises installed epoch 1 -> rejected term 2 -> pull sequence 2 -> successful
+  term 3 RF=2 transition.
+
+### Fabric epoch voter repair — 2026-09-18
+- **Proposal-scoped repair for lagging transition voters** (Experimental,
+  `src/runtime/fabric_stream_epoch.rs`, `src/runtime/distributed.rs`).
+  A prospective leader can now send a bounded exact suffix to a rejected
+  new-policy voter whose durable tail is behind the proposal tail, without
+  reopening normal traffic from the fenced old epoch. Repair batches validate
+  the active proposal and old durable policy, are idempotent across duplicate
+  delivery, append only the missing exact-sequence suffix, and immediately
+  re-evaluate/send the voter's proposal vote. Multi-round repair advances via
+  updated rejected-tail votes. Replicas ahead of the candidate are reported but
+  left untouched pending a separate pull/reconciliation protocol.
+
+### Fabric quorum-backed epoch transition — 2026-09-18
+- **Durable prepare/vote/commit ownership transition** (Experimental,
+  `src/runtime/fabric_stream_epoch.rs`, `src/runtime/fabric_stream.rs`,
+  `src/runtime/distributed.rs`). Existing replicas can now move a stream from
+  epoch N to N+1 after an old-policy majority fsyncs a single-proposal promise.
+  A higher promise immediately fences normal traffic from the old epoch.
+  Affirmative voters must hold the candidate's exact durable tail, every new
+  replica must be an affirmative old-policy voter, and finalization promotes
+  that majority-shared tail to the new committed boundary. Finalized transition
+  state is restart-resumable, old pending tickets are retired, and prepare,
+  vote, and commit messages reuse reserved NUL0-v1 ActorMessage behaviors.
+  Higher election terms may supersede an abandoned lower proposal without
+  requiring the old durable policy to advance first, preventing a stale vote
+  from permanently wedging the stream. The first version supports
+  shrink/leadership transition within the old replica set (for example RF3 ->
+  RF2 after confirmed loss); adding a replacement replica and automatic
+  failover remain follow-up work.
+
+### Fabric stream epoch fencing — 2026-09-18
+- **Durable replication policy + epoch-1 fencing** (Experimental,
+  `src/runtime/fabric_stream.rs`, `src/runtime/fabric_stream_cluster.rs`,
+  `src/runtime/distributed.rs`). Replicated streams now atomically persist
+  leader, ordered replica set, replication factor, membership fingerprint and a
+  non-zero epoch before the first replicated append. Pending intents, replica
+  appends, application ACK/NACKs, quorum tickets and commit updates carry the
+  epoch and must match both current deterministic placement and durable policy.
+  Existing durable history without policy fails closed instead of inferring
+  ownership from current membership. Additive wire fields default to epoch 1
+  for compatibility with the preceding experimental stack; epoch 0 is rejected.
+  No epoch transition or automatic failover is enabled yet.
+
+### Fabric automatic quorum retry — 2026-09-18
+- **Logical-clock pending replication retry** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`, `src/runtime/distribution.rs`).
+  Pending uncommitted stream sequences now retry from the runtime network loop
+  after 500 ms, then with exponential 1s/2s/4s backoff capped at 30 seconds.
+  Scheduling uses `Runtime::now()`, preserving virtual-clock determinism in
+  DST. Retries reuse exact-sequence idempotent replica application and never
+  count transport dispatch as quorum durability. Commit removes the associated
+  retry schedule immediately; recovered durable intents install an immediate
+  schedule after ticket reconstruction. Majority-committed lagging-replica
+  repair remains separately bounded by the catch-up API.
+
+### Fabric committed-replica catch-up — 2026-09-18
+- **Durable follower progress + committed-prefix repair** (Experimental,
+  `src/runtime/fabric_stream.rs`, `src/runtime/fabric_stream_cluster.rs`,
+  `src/runtime/distributed.rs`). Leaders now persist each follower's highest
+  application-ACKed sequence, can replay a bounded set of missing
+  quorum-committed records to a lagging replica, and propagate committed
+  visibility through a reserved NUL0-v1-compatible system ActorMessage.
+  Commit updates are sent only when durable ACK progress proves the follower
+  already stores the committed prefix; followers validate current placement
+  and local tail before advancing their own durable commit boundary. This
+  repairs replicas after partitions without introducing automatic leader
+  failover.
+
+### Fabric stream crash recovery — 2026-09-18
+- **Durable replication intent + explicit retry** (Experimental,
+  `src/runtime/fabric_stream.rs`, `src/runtime/fabric_stream_cluster.rs`).
+  Leaders now fsync a versioned replication intent before appending an
+  uncommitted replicated sequence. Restart recovery reconciles intent with the
+  committed boundary and exact local log, removes stale committed intents and
+  orphan pre-append reservations, reconstructs pending quorum tickets with the
+  leader self-ACK only, and fails closed if current placement differs from the
+  persisted leader/fingerprint/replica set. Explicit retry redispatches exact
+  pending sequences idempotently; an ACK arriving immediately after restart can
+  trigger ticket reconstruction automatically. Commit cleanup persists the
+  committed boundary before deleting intent, so crash ordering cannot promote
+  local durability to quorum durability.
+
+### Fabric stream quorum commit — 2026-09-17
+- **Application-level replica ACK/NACK and quorum visibility** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`, `src/runtime/distributed.rs`,
+  `src/runtime/fabric_stream.rs`). Replicated appends now create leader-local
+  pending tickets, count the leader's fsynced append as the first ACK, and
+  require a majority of the configured replica set before advancing a durable
+  contiguous commit index. Followers send a reserved application ACK/NACK only
+  after exact-sequence durable application; transport ACKs are never counted as
+  quorum durability. The committed boundary is persisted atomically and powers
+  committed-only reads, while raw local reads may expose uncommitted tails.
+  Duplicate ACKs are idempotent and pending ACKs are fenced to the current
+  membership fingerprint. Pending tickets remain volatile across restart;
+  uncommitted durable tails stay uncommitted until future retry/catch-up work.
+
+### Fabric stream replica transport — 2026-09-17
+- **NUL0-v1-compatible Fabric stream replication transport** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`, `src/runtime/distributed.rs`).
+  Leader-produced replica envelopes can now be dispatched through the existing
+  `Packet::ActorMessage` shape using reserved system actor 0 plus an internal
+  behavior name; no packet discriminant or wire-version change is required.
+  Receivers verify transport sender identity, envelope leader, placement, and
+  exact-sequence durable application before accepting data. Duplicate network
+  retry remains idempotent. Dispatch reporting distinguishes reachable sends
+  from unavailable replicas. Transport ACKs are explicitly not treated as
+  replica fsync/quorum ACKs; application-level quorum commit remains follow-up.
+
+### Fabric stream replica placement — 2026-09-17
+- **Deterministic Fabric stream ownership** (Experimental,
+  `src/runtime/fabric_stream_cluster.rs`, `src/runtime/fabric_stream.rs`).
+  Adds rendezvous-hash replica placement over the stable known-membership set,
+  exact-sequence idempotent replica application, leader-produced replica
+  envelopes, and stale-membership/leader/configuration rejection. Failed and
+  suspicious nodes remain in placement until confirmed removed so transient
+  partitions cannot silently elect a second writer. The current physical store
+  remains partition 0 only; remote transport, quorum ACKs, automatic failover,
+  and physical multi-partition logs remain follow-up work.
+
+### Fabric durable stream storage — 2026-09-17
+- **File-backed Fabric stream log** (Experimental, `src/runtime/fabric_stream.rs`).
+  Adds a dedicated append-only segmented log for Fabric Streams rather than
+  overloading actor journals. Records receive monotonic sequence numbers and a
+  BLAKE3 integrity checksum; successful appends flush and `sync_data` before
+  acknowledgement. Stream recovery verifies segment continuity/checksums and
+  truncates only an incomplete final frame after a torn write. Persisted
+  consumer cursors are monotonic, atomically replaced, and support replay from
+  the first uncommitted sequence. New Runtime APIs open/create streams,
+  append/read records, inspect stream metadata, and commit/read consumer
+  cursors. Distributed replication, retention, ACK/NACK redelivery, DLQs, and
+  deduplication remain follow-up work.
 
 ### Runtime backend parity — 2026-09-17
 - **WASM guest-heap negation error parity** (`src/wasm_runtime.rs`,
@@ -1199,3 +1781,56 @@ in this version; they are recorded here to establish their tier.
 No stability promise. The 0.x series is the alpha development track. Language
 version 1.0.0-frozen is the first version with a published stability contract;
 everything before it is implicitly Experimental.
+
+## Experimental tier
+
+### Cloud control-plane placement foundation — 2026-09-24
+- **Nulang Cloud now has an isolated deterministic control-plane planner** (`crates/nulang-cloud-control`) that turns deployment intent plus node/allocation snapshots into a pure `PlacementPlan` without mutating runtimes or provisioning infrastructure.
+- **Placement separates hard feasibility from soft ranking.** Node state, architecture, region/zone, trust tier, required labels/capabilities, resource availability, and per-node replica limits reject candidates before region-locality, failure-domain spread, node spread, and headroom scoring.
+- **Per-replica allocation epochs provide a fencing contract for later durable commit/execution.** Matching allocations are retained, lower-epoch duplicates are superseded, stale revisions and invalid placements are replaced with `max(epoch)+1`, and scale-down work is explicit.
+- **Blocked placement is explainable rather than opaque.** Partial plans identify unscheduled replicas, per-node rejection details, and aggregate rejection counts suitable for a future `nula cloud explain` surface. The existing `nulang-capacity` crate remains the separate provider-capacity/lease layer.
+- **Cloud placement plans now have a storage-neutral atomic commit boundary and durable execution outbox.** `ControlStore::commit_plan` validates current allocation epochs before making replacements visible, exact retries are idempotent, stale concurrent plans fail closed, and Start/Stop commands are committed with allocation ownership rather than reconstructed after a crash.
+- **The control plane now includes an idempotent reconciliation turn and concrete recovery backends.** `MemoryControlStore` supports deterministic tests; `JsonFileControlStore` persists whole-state transitions with temp-file + fsync + rename discipline for single-process controllers and recovery tests. `reconcile_once` persists evaluation intent before planning and returns an already-committed durable plan on retry instead of replanning against changed cluster state.
+- **Placement failover now requires a real fencing event rather than liveness suspicion.** Existing allocations on `Suspect`, `Unreachable`, or temporarily absent nodes are retained fail-closed; replacement epochs are created only after explicit `Removed` membership (or intentional `Draining`). This aligns Cloud placement with the runtime's confirmed-removal rule and prevents partition-induced dual ownership.
+- **The Cloud control store now has an optional PostgreSQL multi-controller backend.** `PostgresControlStore` uses one versioned state row per scheduling scope and `SELECT ... FOR UPDATE` inside a database transaction, so competing controller processes serialize epoch validation and atomically commit plans, allocation ownership, and execution-outbox changes. The first implementation intentionally favors a low-migration single-document schema; normalization is deferred until measured contention justifies it.
+
+### RFC 0020 Behavior Manifest durability admission subset — 2026-09-23
+- **Package builds now emit `<package>.behavior.json` beside `.nbc` artifacts** (`src/behavior_manifest.rs`, `src/main.rs`, `src/package/commands.rs`). The experimental `nulang.behavior/v0alpha1` sidecar binds package/language metadata to compiler artifact identity and exposes durable actor persistence class, schema version, canonical state-schema semantic identity, and migration topology.
+- **Manifest parsing fails closed** on unknown schema versions/artifact kinds, malformed content identities or digests, duplicate actors, invalid/incomplete migration chains, and artifact identity tampering. The sidecar includes a BLAKE3 digest of the exact emitted `.nbc` bytes and can verify the executable/manifest pairing; canonical ordering gives deterministic JSON and a separate domain-separated manifest digest.
+- **Deployment upgrade preflight rejects structural durable-state hazards**: removing a durable owner, dropping or changing its persistence model, schema downgrades, same-version schema drift, rewriting previously declared migration topology, package identity mismatch, or a missing version-by-version migration path. Migration body identity is explicitly `topology-only` in v0alpha1; successful preflight is not represented as proof that runtime migration execution is complete.
+- **`nula deploy` bundles the behavior sidecar automatically**, giving Nulang Cloud a machine-readable compatibility contract without depending on compiler HIR/MIR internals.
+
+### Temporal compatibility boundary — 2026-09-23
+- **Temporal compatibility now has an explicit adapter boundary** (Experimental, RFC 0025, `src/compat/temporal.rs`). Concrete Temporal workflow/run identity and workflow-task identity derive replay-stable Nulang `DurableEffectId` values for activities without introducing Temporal types into the runtime, persistence backends, compiler, or language syntax.
+- **Temporal activity preparation reuses Nulang's durable-effect contract.** Activities default to at-least-once recovery; deduplicated delivery is explicit, and the durable request digest binds activity id/type, task queue, and payload so divergent replay fails closed. Timer and signal translation reuse the existing atomic durable-transition workflow-event path.
+- **The compatibility adapter now includes a transport-neutral workflow-task core.** A supported Temporal history subset is projected with strict event-order/reference validation, then ordered Temporal commands are planned against the same Nulang durable primitives. This core is shared by future standalone worker transports and Nulang Cloud rather than reimplemented in each integration.
+- **Managed adapters negotiate Temporal compatibility contract version 1.** The adapter version is independent from Temporal's API version and Nulang artifact versions so runtime/gateway semantic skew can fail before processing durable work.
+
+### Production readiness hardening — 2026-09-23
+- **Benchmark validation no longer writes generated history to protected `main`.** CI restores rolling benchmark JSON from `automation/benchmark-history`, uploads only the current result artifact, and persists generated history to that dedicated branch.
+- **Primary Rust build/test/check/bench commands and tagged release builds now resolve the checked-in dependency graph with `--locked`.** Tagged releases also fail preflight when the Git tag, `Cargo.toml` version, and CLI `VERSION` disagree.
+- **Release supply-chain permissions are narrower.** Matrix build jobs use read-only repository access; only the publishing job retains `contents: write`. Checksum generation works with GNU `sha256sum` or macOS `shasum -a 256`.
+- **Security disclosure policy is explicit.** `SECURITY.md` documents private reporting, high-risk compiler/runtime surfaces, and that `.cargo/audit.toml` suppressions are accepted risks rather than an advisory-free claim.
+- **Release/readiness documentation now matches the implementation.** The release matrix is Linux x86_64/aarch64, macOS aarch64, and Windows x86_64; stale CRDT-recovery, historical test-count, and launch-status claims were corrected.
+
+### Atomic durable-transition storage contract — 2026-09-22
+- **Persistence backends now have a fail-closed atomic transition API** (Experimental, RFC 0022, `src/runtime/persistence.rs`). `DurableTransition` binds actor identity, activation epoch, sequence predecessor, command, snapshot, workflow/domain events, durable-effect records, and outbox messages to one canonical BLAKE3 digest. Unsupported backends return `Unsupported` rather than emulating atomicity with sequential writes. `MemoryStore` implements sequence/epoch fencing, idempotent exact retries, conflicting-retry rejection, and migration from existing legacy history.
+- **libSQL/SQLite commits durable transitions in one database transaction.** Additive transition/tail/event/effect/outbox tables preserve legacy readability while allowing multiple workflow/domain records at one logical sequence. The committed tail is compare-and-set under an IMMEDIATE transaction, so stale activations and sequence gaps fail before becoming visible. Rollback, stale-epoch, exact-retry, and legacy-history migration tests pin the no-sequential-fallback contract.
+
+### Allocation-free protocol actor-ref decoding — 2026-09-21
+- **ProtocolId wire decode no longer hex-allocates.** The fixed 32-byte protocol digest is reconstructed directly with `ProtocolId::from_bytes` instead of expanding to a 64-character hex `String` and reparsing it. Wire bytes and compatibility semantics are unchanged.
+
+### Single-pass LSP diagnostics parsing — 2026-09-21
+- **LSP diagnostics reuse their parsed AST.** Document open and debounced changes now populate `DocumentState.ast` from the frontend pass that already produced diagnostics, removing a guaranteed second lex+parse of the same source while preserving diagnostics and editor semantics.
+
+### Canonical stdlib module manifest — 2026-09-21
+- **Stdlib module metadata is now generated from one manifest.** `spec/stdlib/v0alpha1.json` owns module names, imports, source paths, stability tiers, descriptions, and declared official package mirrors. `scripts/generate_stdlib.py` materializes Rust descriptors and the docs module index from that file.
+- **Official package mirrors fail closed on drift.** The `json` seed package is generated from `src/stdlib/json.nula` with only its package-specific import preamble substituted; `scripts/verify_implementation.py` runs the generator in `--check` mode so stale package copies or generated metadata fail CI.
+- **Built-in effects remain executable registry data.** `src/stdlib.rs` still owns the compiler/runtime built-in operation registry used by effect docs; module metadata is no longer duplicated in its comments. This intentionally separates executable effect semantics from higher-level Nulang-authored module metadata while exposing both through `nulang::stdlib`.
+
+
+## Experimental tier
+
+### Standard-library Option lookup contracts — 2026-09-21
+- **Collection absence is explicit.** Experimental `stdlib::map.get`, `stdlib::list.index_of`, and `stdlib::list.find` now return `Option` instead of sentinel `-1` values. `max_of`, `min_of`, `min_by`, and `max_by` now return `None` for empty inputs. Conformance fixtures and stdlib tests pin the new contracts. This is source-breaking for Experimental stdlib callers that compared missing results with integer sentinels.
+
