@@ -13,9 +13,7 @@
 use std::fmt;
 use std::path::Path;
 
-use super::tablet::{
-    MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite,
-};
+use super::tablet::{MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite};
 use super::wal::{FileWal, WalError};
 
 #[derive(Debug)]
@@ -49,11 +47,8 @@ impl WalBackedTablet {
         expected_previous_sequence: u64,
         mutations: Vec<TabletMutation>,
     ) -> Result<TabletWrite, TabletError> {
-        self.tablet.prepare_write(
-            presented_epoch,
-            expected_previous_sequence,
-            mutations,
-        )
+        self.tablet
+            .prepare_write(presented_epoch, expected_previous_sequence, mutations)
     }
 
     /// Durably commit one write before making it visible to readers.
@@ -63,11 +58,7 @@ impl WalBackedTablet {
         Ok(self.tablet.publish_validated(write))
     }
 
-    pub fn read_at(
-        &self,
-        key: &[u8],
-        snapshot: u64,
-    ) -> Result<Option<&[u8]>, TabletError> {
+    pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
         self.tablet.read_at(key, snapshot)
     }
 
