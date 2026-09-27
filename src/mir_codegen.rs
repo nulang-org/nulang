@@ -3734,6 +3734,70 @@ fn main() -> Int { 0 }
     }
 
     #[test]
+    fn test_noalloc_rejects_polymorphic_addition_that_may_concatenate_strings() {
+        let source = r#"
+@noalloc
+fn add(a, b) { a + b }
+
+fn main() -> Int { add(20, 22) }
+"#;
+        let err = compile_source(source)
+            .expect_err("@noalloc must reject IAdd when operand types are not proven numeric")
+            .to_string();
+        assert!(
+            err.contains("dynamic addition may allocate a string"),
+            "unexpected polymorphic-add diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn test_noalloc_rejects_string_equality_until_vm_comparison_is_borrowed() {
+        let source = r#"
+@noalloc
+fn same(a: String, b: String) -> Bool { a == b }
+
+fn main() -> Int { 0 }
+"#;
+        let err = compile_source(source)
+            .expect_err("@noalloc must reject SCmpEq while VM comparison materializes owned strings")
+            .to_string();
+        assert!(
+            err.contains("string comparison may allocate"),
+            "unexpected string-equality diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn test_noalloc_rejects_contract_panic_path() {
+        let source = r#"
+@noalloc
+fn positive(x: Int) -> Int requires x > 0 { x }
+
+fn main() -> Int { positive(1) }
+"#;
+        let err = compile_source(source)
+            .expect_err("@noalloc must reject runtime panic formatting")
+            .to_string();
+        assert!(
+            err.contains("panic/error formatting may allocate"),
+            "unexpected panic diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn test_noalloc_allows_pure_direct_recursion() {
+        let source = r#"
+@noalloc
+fn countdown(n: Int) -> Int {
+    if n == 0 { 0 } else { countdown(n - 1) }
+}
+
+fn main() -> Int { countdown(4) }
+"#;
+        compile_source(source).expect("pure direct recursion should satisfy @noalloc");
+    }
+
+    #[test]
     fn test_fold_const_add() {
         // `1 + 2` folds to a single constant; no IAdd survives.
         let value = run_source("1 + 2").unwrap();
