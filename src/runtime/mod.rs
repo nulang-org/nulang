@@ -2104,8 +2104,30 @@ impl Runtime {
                 .and_then(|idx| u16::try_from(idx).ok());
         }
 
-        behavior_ownership::runtime_behavior_id_for_actor_name(module, &actor.name, behavior)
-            .and_then(|idx| u16::try_from(idx).ok())
+        if let Some(idx) =
+            behavior_ownership::runtime_behavior_id_for_actor_name(module, &actor.name, behavior)
+        {
+            return u16::try_from(idx).ok();
+        }
+
+        // Transitional compatibility for durable actors recovered before this
+        // stack preserves ActorMeta.name. Never choose the first suffix:
+        // a synthetic actor_<id> may resolve a short name only when it is
+        // globally unique in the module. #1119 removes this fallback by
+        // restoring the canonical persisted schema identity.
+        if actor.name.starts_with("actor_") {
+            let mut candidates = module
+                .behaviors
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| matches(&entry.name))
+                .map(|(idx, _)| idx);
+            let idx = candidates.next()?;
+            if candidates.next().is_none() {
+                return u16::try_from(idx).ok();
+            }
+        }
+        None
     }
 
     /// Resolve a public name-based delivery without reintroducing the old
