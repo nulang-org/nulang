@@ -2,6 +2,7 @@
 
 ### Shard scaling and JIT transition benchmark foundation — 2026-09-26
 - **The same-host performance harness now measures host-wide 1/2/4/8-shard actor-drain scaling separately from the single-CPU A/B suite.** The scaling probe keeps total work fixed at 200,000 local messages, runs without CPU affinity, preserves the actor-id ownership invariant, and emits dedicated `[scale-bench]` records into a separate JSON section.
+- **A native no-op actor drain now isolates the scheduler/runtime dispatch floor.** Messages are admitted before timing and the handler performs no user work, so the result can be compared directly with mailbox admission, full runtime enqueue, warmed bytecode/JIT drain, and AOT drain.
 - **A tiny warmed-JIT loop now provides a transition-sensitive control against the pure interpreter.** The loop minimizes useful work per hot-region entry so changes to native-transition overhead, including the current conservative register-file snapshot, are visible without claiming to isolate one implementation detail.
 - **Interpretation remains deliberately narrow.** The shard probe excludes cross-shard routing and message production, so it is an ideal local-shard parallelism ceiling rather than an end-to-end multicore actor result.
 
