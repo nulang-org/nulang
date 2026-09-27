@@ -11,6 +11,7 @@ use std::time::Instant;
 use tracing::warn;
 
 mod actor;
+mod behavior_ownership;
 mod blocking_executor;
 pub mod cache;
 pub mod cache_cluster;
@@ -26,6 +27,7 @@ pub mod heap;
 pub(crate) mod heap_serialize;
 mod mailbox;
 mod scheduler;
+mod schema_identity;
 pub use heap_serialize::*;
 mod cluster;
 mod distributed;
@@ -442,6 +444,10 @@ pub struct Runtime {
     // compensation_offsets).
     pub(crate) recovery_modules:
         HashMap<u64, (crate::bytecode::CodeModule, Vec<usize>, Vec<Option<usize>>)>,
+    /// Canonical ActorMeta.name retained after actor reaping so recovery,
+    /// migration forwarding, and durable replay never guess schema ownership
+    /// from a module-global behavior index.
+    pub(crate) recovery_schema_names: HashMap<u64, String>,
     /// Content-addressed bytecode cache for fetch-on-demand.
     /// When a node receives a message for an unknown content hash, it can
     /// request the bytecode from the sender and cache it here keyed by hash.
@@ -633,6 +639,7 @@ impl Runtime {
             draining_receive_wakes: false,
             idle_callback: None,
             recovery_modules: HashMap::new(),
+            recovery_schema_names: HashMap::new(),
             #[cfg(feature = "ai-runtime")]
             ai: AiRuntimeRegistry::new(),
             #[cfg(feature = "ai-runtime")]
@@ -1376,6 +1383,26 @@ impl Runtime {
             }
         }
 
+        if self.actors.contains_key(&target_id)
+            && !self.actor_accepts_numeric_delivery(target_id, behavior_id)
+        {
+            warn!(
+                "nulang-runtime: rejecting cross-shard message to actor {}: behavior id {} is not owned by target schema",
+                target_id, behavior_id
+            );
+            self.route_to_dlq(
+                &Message {
+                    behavior_id,
+                    payload: MessagePayload::from_slice(&[]),
+                    sender,
+                    priority: MessagePriority::System,
+                    trace_id: trace_id.clone(),
+                },
+                "behavior id not owned by target actor schema (cross-shard)",
+            );
+            return;
+        }
+
         let msg = Message {
             behavior_id,
             payload: MessagePayload::from_vec(payload),
@@ -1803,10 +1830,48 @@ impl Runtime {
             }
         }
         let module = actor.bytecode_module.as_ref()?;
+        // Historical/synthetic bytecode modules may have no ActorMeta at all.
+        // Preserve their global behavior table semantics; real actor modules
+        // must prove ownership through the runtime actor's canonical schema.
+        let module_idx = if module.actor_metadata.is_empty() {
+            behavior_id as usize
+        } else {
+            behavior_ownership::module_behavior_index_for_actor(
+                module,
+                &actor.name,
+                behavior_id as usize,
+            )?
+        };
         module
             .behaviors
-            .get(behavior_id as usize)
-            .map(|b| b.name.clone())
+            .get(module_idx)
+            .map(|behavior| behavior.name.clone())
+    }
+
+    /// Resolve a runtime-visible behavior id for an actor that is no longer
+    /// resident but still has retained recovery metadata. Workflow ids are
+    /// actor-local, so schema ownership is required to translate them to the
+    /// module-global wire name.
+    fn recovery_behavior_wire_name_for(&self, actor_id: u64, behavior_id: u16) -> Option<String> {
+        let (module, _, _) = self.recovery_modules.get(&actor_id)?;
+        if let Some(schema_name) = self.recovery_schema_names.get(&actor_id) {
+            return behavior_ownership::behavior_name_for_runtime_id(
+                module,
+                schema_name,
+                behavior_id as usize,
+            )
+            .map(str::to_owned);
+        }
+
+        // Narrow compatibility for historical synthetic modules with no
+        // ActorMeta. Their runtime ids are module-global and unambiguous.
+        if module.actor_metadata.is_empty() {
+            return module
+                .behaviors
+                .get(behavior_id as usize)
+                .map(|behavior| behavior.name.clone());
+        }
+        None
     }
 
     /// Resolve a pointer-tagged value only when it is the exact payload
@@ -2193,46 +2258,84 @@ impl Runtime {
         }
     }
 
-    /// Return whether `behavior_id` names a real native or bytecode handler on
-    /// `target_id`. Behavior id 0 is valid only when the target actually
-    /// declares handler 0; invalid ids are never aliases for it.
+    /// Return whether `behavior_id` names a real executable handler owned by
+    /// `target_id`. Real actor modules prove ownership through ActorMeta;
+    /// historical synthetic modules without ActorMeta retain their legacy
+    /// module-global behavior ids.
     fn actor_has_behavior_id(&self, target_id: u64, behavior_id: u16) -> bool {
         let behavior_idx = behavior_id as usize;
-        let has_native = self
-            .actors
-            .get(&target_id)
-            .and_then(|actor| actor.behavior_table.get(behavior_idx))
-            .is_some_and(|entry| !entry.name.is_empty());
-        has_native || self.has_bytecode_handler(target_id, behavior_idx)
+        let Some(actor) = self.actors.get(&target_id) else {
+            return false;
+        };
+        if actor
+            .behavior_table
+            .get(behavior_idx)
+            .is_some_and(|entry| !entry.name.is_empty())
+        {
+            return true;
+        }
+
+        let Some(module) = actor.bytecode_module.as_ref() else {
+            return false;
+        };
+        if module.actor_metadata.is_empty() {
+            return self.has_bytecode_handler(target_id, behavior_idx);
+        }
+
+        behavior_ownership::module_behavior_index_for_actor(module, &actor.name, behavior_idx)
+            .is_some()
+            && self.has_bytecode_handler(target_id, behavior_idx)
+    }
+
+    /// Numeric mailbox admission is slightly broader than executable handler
+    /// ownership for the intentionally untyped raw-actor primitive. Raw actors
+    /// with no declared handlers may still receive inert behavior id 0, while
+    /// every typed/native/bytecode actor remains fail-closed.
+    fn actor_accepts_numeric_delivery(&self, target_id: u64, behavior_id: u16) -> bool {
+        if self.actor_has_behavior_id(target_id, behavior_id) {
+            return true;
+        }
+        let Some(actor) = self.actors.get(&target_id) else {
+            return false;
+        };
+        let has_named_native = actor
+            .behavior_table
+            .iter()
+            .any(|entry| !entry.name.is_empty());
+        let has_named_bytecode = actor
+            .bytecode_module
+            .as_ref()
+            .is_some_and(|module| module.behaviors.iter().any(|entry| !entry.name.is_empty()));
+        behavior_id == 0 && !has_named_native && !has_named_bytecode
     }
 
     pub fn behavior_id_for(&self, target_id: u64, behavior: &str) -> Option<u16> {
         let actor = self.actors.get(&target_id)?;
-        // Allocation-free match: `entry.name == behavior`, or
-        // `entry.name` ends with `.<behavior>` (qualified name).
         let matches = |name: &str| {
             name == behavior
                 || name
                     .strip_suffix(behavior)
                     .is_some_and(|prefix| prefix.ends_with('.'))
         };
-        // Search the per-actor behavior table first (native handlers).
         if let Some(idx) = actor
             .behavior_table
             .iter()
             .position(|entry| matches(&entry.name))
         {
-            return Some(idx as u16);
+            return u16::try_from(idx).ok();
         }
-        // Fall back to the module-level behavior table (bytecode handlers).
-        // Returns the GLOBAL index into module.behaviors, which matches
-        // what bytecode_offsets expects.
+
         let module = actor.bytecode_module.as_ref()?;
-        module
-            .behaviors
-            .iter()
-            .position(|b| matches(&b.name))
-            .map(|idx| idx as u16)
+        if module.actor_metadata.is_empty() {
+            return module
+                .behaviors
+                .iter()
+                .position(|entry| matches(&entry.name))
+                .and_then(|idx| u16::try_from(idx).ok());
+        }
+
+        behavior_ownership::runtime_behavior_id_for_actor_name(module, &actor.name, behavior)
+            .and_then(|idx| u16::try_from(idx).ok())
     }
 
     /// Resolve a public name-based delivery without reintroducing the old
@@ -2275,13 +2378,12 @@ impl Runtime {
     /// target actor has been hydrated on the local shard.
     fn resolve_grain_behavior_id(&self, grain_id: &GrainId, behavior_name: &str) -> Option<u16> {
         let grain_type = self.grain_registry.get(&grain_id.grain_type)?;
-        let suffix = format!(".{}", behavior_name);
-        grain_type
-            .module
-            .behaviors
-            .iter()
-            .position(|b| b.name == behavior_name || b.name.ends_with(&suffix))
-            .map(|idx| idx as u16)
+        behavior_ownership::runtime_behavior_id_for_name(
+            &grain_type.module,
+            &grain_id.grain_type,
+            behavior_name,
+        )
+        .and_then(|idx| u16::try_from(idx).ok())
     }
 
     /// Send a message to an actor owned by another shard. Validates that the
@@ -2610,17 +2712,14 @@ impl Runtime {
         // Forwarding for migrated actors: if this actor has been relocated
         // to another node, route the message there instead of bouncing it.
         if let Some(&(target_node, _migrated_at)) = self.migrated_actors.get(&target_id) {
-            // Look up the behavior name from the recovery module.
-            let behavior_name = self
-                .recovery_modules
-                .get(&target_id)
-                .and_then(|(module, _, _)| {
-                    module
-                        .behaviors
-                        .get(behavior_id as usize)
-                        .map(|b| b.name.clone())
-                })
-                .unwrap_or_else(|| format!("behavior_{}", behavior_id));
+            let Some(behavior_name) = self.recovery_behavior_wire_name_for(target_id, behavior_id)
+            else {
+                warn!(
+                    "nulang-net: refusing migrated forwarding for actor {} behavior {}: missing canonical schema ownership",
+                    target_id, behavior_id
+                );
+                return;
+            };
             let target = ActorAddress::remote(target_node, target_id);
             self.send_distributed(target, &behavior_name, args);
             return;
@@ -2715,6 +2814,26 @@ impl Runtime {
         args: &[Value],
         out_trace: Option<String>,
     ) -> MessageAdmission {
+        if self.actors.contains_key(&target_id)
+            && !self.actor_accepts_numeric_delivery(target_id, behavior_id)
+        {
+            warn!(
+                "nulang-runtime: rejecting local message to actor {}: behavior id {} is not owned by target schema",
+                target_id, behavior_id
+            );
+            self.route_to_dlq(
+                &Message {
+                    behavior_id,
+                    payload: MessagePayload::from_slice(args),
+                    sender: self.current_actor.unwrap_or(0),
+                    priority: MessagePriority::System,
+                    trace_id: out_trace.clone(),
+                },
+                "behavior id not owned by target actor schema",
+            );
+            return MessageAdmission::Rejected;
+        }
+
         let msg = Message {
             behavior_id,
             payload: MessagePayload::from_slice(args),
@@ -3353,8 +3472,10 @@ impl Runtime {
     fn actor_module_hash(&self, actor_id: u64) -> [u8; 32] {
         self.actors
             .get(&actor_id)
-            .and_then(|a| a.bytecode_module.as_ref())
-            .and_then(|m| m.actor_metadata.iter().find_map(|m| m.type_hash))
+            .and_then(|actor| {
+                let module = actor.bytecode_module.as_ref()?;
+                behavior_ownership::actor_meta_for_runtime_name(module, &actor.name)?.type_hash
+            })
             .unwrap_or([0u8; 32])
     }
 
@@ -3362,7 +3483,7 @@ impl Runtime {
     /// updating the actor's own sequence/dirty tracking.
     fn build_actor_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
         let mut state = std::collections::HashMap::new();
-        let (waiting_signal, authority_tokens) = {
+        let (waiting_signal, schema_name, authority_tokens) = {
             let actor = self.actors.get(&actor_id)?;
             for (name, value) in &actor.state_data {
                 let model = actor
@@ -3384,7 +3505,14 @@ impl Runtime {
                     return None;
                 }
             };
-            (actor.waiting_signal.clone(), authority_tokens)
+            let schema_name = actor
+                .bytecode_module
+                .as_ref()
+                .and_then(|module| {
+                    schema_identity::canonical_schema_name_for_runtime_actor(module, &actor.name)
+                })
+                .map(str::to_owned);
+            (actor.waiting_signal.clone(), schema_name, authority_tokens)
         };
         let sequence = self.next_sequence(actor_id);
         let crdt_snapshot = self.crdt_manager.as_ref().map(|m| {
@@ -3407,6 +3535,7 @@ impl Runtime {
             waiting_signal,
             crdt_snapshot,
             crdt_field_map,
+            schema_name,
             authority_tokens,
         })
     }
@@ -5134,6 +5263,34 @@ impl Runtime {
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
+
+        let selected_meta = if let Some((module, _, _)) = self.recovery_modules.get(&actor_id) {
+            if module.actor_metadata.is_empty() && snapshot.schema_name.is_none() {
+                // Historical synthetic bytecode modules predate ActorMeta.
+                None
+            } else {
+                match schema_identity::resolve_snapshot_actor_meta(
+                    module,
+                    snapshot.schema_name.as_deref(),
+                ) {
+                    Ok(meta) => Some(meta.clone()),
+                    Err(err) => {
+                        warn!(
+                            "nulang-recover: refusing actor {} with invalid schema identity: {}",
+                            actor_id, err
+                        );
+                        return None;
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        let recovery_schema_name = selected_meta
+            .as_ref()
+            .map(|meta| meta.name.clone())
+            .or_else(|| snapshot.schema_name.clone());
+
         let authority_manifest =
             match crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens) {
                 Ok(manifest) => manifest,
@@ -5146,29 +5303,61 @@ impl Runtime {
                 }
             };
         let workflow_events = self.persistence.read_workflow_events(actor_id);
-        let is_workflow = self
-            .recovery_modules
-            .get(&actor_id)
-            .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_workflow))
+        let is_workflow = selected_meta
+            .as_ref()
+            .map(|meta| meta.is_workflow)
             .unwrap_or(!workflow_events.is_empty());
-        let is_agent = self
-            .recovery_modules
-            .get(&actor_id)
-            .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_agent))
+        let is_agent = selected_meta
+            .as_ref()
+            .map(|meta| meta.is_agent)
             .unwrap_or(false);
 
-        let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
+        // Validate ordinary message history before publishing the actor. An
+        // in-range module-global id owned by a sibling schema is not a valid
+        // command for this durable identity.
+        let journal_to_replay: Vec<JournalEntry> = if is_workflow {
+            Vec::new()
+        } else {
+            self.persistence
+                .read_journal(actor_id)
+                .into_iter()
+                .filter(|entry| entry.sequence > snapshot.sequence)
+                .collect()
+        };
+        if let (Some(meta), Some((module, _, _))) =
+            (selected_meta.as_ref(), self.recovery_modules.get(&actor_id))
+        {
+            for entry in &journal_to_replay {
+                if behavior_ownership::module_behavior_index_for_runtime_id(
+                    module,
+                    &meta.name,
+                    entry.behavior_id as usize,
+                )
+                .is_none()
+                {
+                    warn!(
+                        "nulang-recover: refusing actor {}: journal behavior id {} is not owned by schema '{}'",
+                        actor_id, entry.behavior_id, meta.name
+                    );
+                    return None;
+                }
+            }
+        }
+
+        let mut actor = Actor::new(
+            actor_id,
+            recovery_schema_name
+                .clone()
+                .unwrap_or_else(|| format!("actor_{}", actor_id)),
+            0,
+        );
         actor.persistent = true;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
         actor.waiting_signal = snapshot.waiting_signal.clone();
         actor.install_authority_manifest(&authority_manifest);
-        let recovery_module = self
-            .recovery_modules
-            .get(&actor_id)
-            .map(|(module, _, _)| module);
-        Self::restore_state_models_from_snapshot(&mut actor, recovery_module, &snapshot);
+        Self::restore_state_models_from_snapshot(&mut actor, selected_meta.as_ref(), &snapshot);
         // Restore CRDT state if present in the snapshot.
         if let Some(crdt_snap) = &snapshot.crdt_snapshot {
             if let Some(manager) = &mut self.crdt_manager {
@@ -5209,17 +5398,13 @@ impl Runtime {
         }
         // Parse cached retry/fallback configs from restored state for agents.
         if is_agent {
-            if let Some(module) = actor
-                .bytecode_module
-                .as_ref()
-                .or_else(|| self.recovery_modules.get(&actor_id).map(|(m, _, _)| m))
-            {
-                for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
-                    if let crate::bytecode::Constant::String(json) = c {
+            if let Some(meta) = selected_meta.as_ref() {
+                for (name, constant) in &meta.state_defaults {
+                    if let crate::bytecode::Constant::String(json) = constant {
                         if name == "retry_config" {
-                            actor.retry_config = serde_json::from_str(&json).ok();
+                            actor.retry_config = serde_json::from_str(json).ok();
                         } else if name == "fallback_config" {
-                            actor.fallback_config = serde_json::from_str(&json).unwrap_or_default();
+                            actor.fallback_config = serde_json::from_str(json).unwrap_or_default();
                         }
                     }
                 }
@@ -5268,16 +5453,16 @@ impl Runtime {
         // persisted events legitimately has no value yet either, but
         // that's a separate, pre-existing question this fix doesn't
         // change.
-        if let Some(module) = self.recovery_modules.get(&actor_id).map(|(m, _, _)| m) {
-            for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
+        if let Some(meta) = selected_meta.as_ref() {
+            for (name, constant) in &meta.state_defaults {
                 if actor.get_state_field(name).is_some() {
                     continue;
                 }
-                let v = match c {
-                    crate::bytecode::Constant::String(s) => actor.allocate_string(s),
+                let value = match constant {
+                    crate::bytecode::Constant::String(text) => actor.allocate_string(text),
                     other => crate::vm::constant_to_value(other),
                 };
-                actor.set_state_field(name, v);
+                actor.set_state_field(name, value);
             }
         }
         // Restore bytecode metadata registered for recovery.
@@ -5286,11 +5471,12 @@ impl Runtime {
             actor.bytecode_offsets = offsets.clone();
             actor.compensation_offsets = comp_offsets.clone();
         }
+        if let Some(schema_name) = recovery_schema_name {
+            self.recovery_schema_names.insert(actor_id, schema_name);
+        }
+        self.actors.insert(actor_id, actor);
         if is_workflow {
-            self.actors.insert(actor_id, actor);
             self.layout_workflow_behavior_table(actor_id);
-        } else {
-            self.actors.insert(actor_id, actor);
         }
         // Ensure CRDT-backed fields are registered (or re-registered after
         // recovery). `register_actor_fields` is idempotent, so declared fields
@@ -5371,14 +5557,10 @@ impl Runtime {
                 }
             }
         } else {
-            // Replay journal entries that arrived after the snapshot.
-            let journal = self.persistence.read_journal(actor_id);
-            let entries_to_replay: Vec<_> = journal
-                .iter()
-                .filter(|e| e.sequence > snapshot.sequence)
-                .cloned()
-                .collect();
-            for entry in entries_to_replay {
+            // Replay entries that were schema-validated before actor
+            // publication. Payload materialization remains actor-heap aware so
+            // persisted strings retain their semantic value.
+            for entry in journal_to_replay {
                 let behavior_idx = entry.behavior_id as usize;
                 let payload: Vec<Value> = {
                     let actor = self.actors.get_mut(&actor_id)?;
@@ -5416,12 +5598,14 @@ impl Runtime {
     /// insert into `self.actors`, or enqueue - callers do those.
     fn restore_state_models_from_snapshot(
         actor: &mut Actor,
-        module: Option<&crate::bytecode::CodeModule>,
+        selected_meta: Option<&crate::bytecode::ActorMeta>,
         snapshot: &ActorSnapshot,
     ) {
-        actor.state_models = module
+        // Declared state models come only from the actor schema selected for
+        // this durable identity. Never flatten metadata from sibling actor
+        // schemas in the same module.
+        actor.state_models = selected_meta
             .into_iter()
-            .flat_map(|module| module.actor_metadata.iter())
             .flat_map(|meta| &meta.state_models)
             .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
             .collect();
@@ -5459,42 +5643,88 @@ impl Runtime {
         actor_id: u64,
         module: &crate::bytecode::CodeModule,
         snapshot: &ActorSnapshot,
-        is_workflow: bool,
-        is_agent: bool,
-    ) -> Result<Actor, crate::authority_runtime::RuntimeAuthorityError> {
+        expected_schema_name: Option<&str>,
+        runtime_name: Option<String>,
+    ) -> Result<Actor, String> {
         let authority_manifest =
-            crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens)?;
-        let offsets: Vec<usize> = crate::runtime::spawn::bytecode_offsets_for(module, is_workflow);
-        let compensation_offsets: Vec<Option<usize>> = if is_workflow {
-            module
-                .actor_metadata
+            crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens)
+                .map_err(|error| error.to_string())?;
+
+        // Historical synthetic modules can have bytecode but no ActorMeta.
+        // Keep that narrow compatibility path while real actor modules require
+        // an exact durable schema identity.
+        if module.actor_metadata.is_empty()
+            && snapshot.schema_name.is_none()
+            && expected_schema_name.is_none()
+        {
+            let mut actor = Actor::new(
+                actor_id,
+                runtime_name.unwrap_or_else(|| format!("actor_{}", actor_id)),
+                0,
+            );
+            actor.persistent = true;
+            actor.sequence = snapshot.sequence;
+            actor.waiting_signal = snapshot.waiting_signal.clone();
+            actor.install_authority_manifest(&authority_manifest);
+            actor.bytecode_module = Some(module.clone());
+            actor.bytecode_offsets = module
+                .behaviors
                 .iter()
-                .find(|m| m.is_workflow)
-                .map(|meta| {
-                    meta.behavior_indices
-                        .iter()
-                        .map(|&i| module.behaviors[i].compensate_offset.map(|o| o as usize))
-                        .collect()
+                .map(|behavior| behavior.code_offset)
+                .collect();
+            actor.compensation_offsets = module
+                .behaviors
+                .iter()
+                .map(|behavior| behavior.compensate_offset.map(|offset| offset as usize))
+                .collect();
+            Self::restore_state_models_from_snapshot(&mut actor, None, snapshot);
+            for (name, value) in &snapshot.state {
+                let value = value.to_value_on_heap(&mut actor);
+                actor.set_state_field(name, value);
+            }
+            return Ok(actor);
+        }
+
+        let meta = match expected_schema_name {
+            Some(expected) => schema_identity::resolve_expected_snapshot_actor_meta(
+                module,
+                snapshot.schema_name.as_deref(),
+                expected,
+            ),
+            None => schema_identity::resolve_snapshot_actor_meta(
+                module,
+                snapshot.schema_name.as_deref(),
+            ),
+        }
+        .map_err(|error| error.to_string())?;
+        let role = meta.role().map_err(|error| error.to_string())?;
+
+        let offsets = crate::runtime::spawn::bytecode_offsets_for_role(module, role);
+        let compensation_offsets: Vec<Option<usize>> = if meta.is_workflow {
+            meta.behavior_indices
+                .iter()
+                .map(|&idx| {
+                    module.behaviors[idx]
+                        .compensate_offset
+                        .map(|offset| offset as usize)
                 })
-                .unwrap_or_else(|| {
-                    module
-                        .behaviors
-                        .iter()
-                        .map(|b| b.compensate_offset.map(|o| o as usize))
-                        .collect()
-                })
+                .collect()
         } else {
             module
                 .behaviors
                 .iter()
-                .map(|b| b.compensate_offset.map(|o| o as usize))
+                .map(|behavior| behavior.compensate_offset.map(|offset| offset as usize))
                 .collect()
         };
 
-        let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
+        let mut actor = Actor::new(
+            actor_id,
+            runtime_name.unwrap_or_else(|| meta.name.clone()),
+            0,
+        );
         actor.persistent = true;
-        actor.is_workflow = is_workflow;
-        actor.is_agent = is_agent;
+        actor.is_workflow = meta.is_workflow;
+        actor.is_agent = meta.is_agent;
         actor.sequence = snapshot.sequence;
         actor.waiting_signal = snapshot.waiting_signal.clone();
         actor.install_authority_manifest(&authority_manifest);
@@ -5502,9 +5732,8 @@ impl Runtime {
         actor.bytecode_offsets = offsets;
         actor.compensation_offsets = compensation_offsets;
 
-        Self::restore_state_models_from_snapshot(&mut actor, Some(module), snapshot);
+        Self::restore_state_models_from_snapshot(&mut actor, Some(meta), snapshot);
 
-        // Restore durable state fields from the snapshot.
         for (name, value) in &snapshot.state {
             if name == "semantic_memory" || name == "procedural_memory" {
                 if let PersistedValue::String(json) = value {
@@ -5513,20 +5742,31 @@ impl Runtime {
                     continue;
                 }
             }
-            let v = value.to_value_on_heap(&mut actor);
-            actor.set_state_field(name, v);
+            let value = value.to_value_on_heap(&mut actor);
+            actor.set_state_field(name, value);
         }
 
-        // Fill in declared initial values for fields not touched above.
-        for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
+        for (name, constant) in &meta.state_defaults {
             if actor.get_state_field(name).is_some() {
                 continue;
             }
-            let v = match c {
-                crate::bytecode::Constant::String(s) => actor.allocate_string(s),
+            let value = match constant {
+                crate::bytecode::Constant::String(text) => actor.allocate_string(text),
                 other => crate::vm::constant_to_value(other),
             };
-            actor.set_state_field(name, v);
+            actor.set_state_field(name, value);
+        }
+
+        if meta.is_agent {
+            for (name, constant) in &meta.state_defaults {
+                if let crate::bytecode::Constant::String(json) = constant {
+                    if name == "retry_config" {
+                        actor.retry_config = serde_json::from_str(json).ok();
+                    } else if name == "fallback_config" {
+                        actor.fallback_config = serde_json::from_str(json).unwrap_or_default();
+                    }
+                }
+            }
         }
 
         Ok(actor)
@@ -5568,12 +5808,12 @@ impl Runtime {
                 stable_actor_id,
                 &grain_type.module,
                 snap,
-                false,
-                false,
+                Some(&grain_id.grain_type),
+                Some(grain_id.actor_name()),
             )
             .map_err(|err| NuError::RuntimeError {
                 msg: format!(
-                    "invalid authority snapshot for virtual actor {}: {}",
+                    "invalid durable snapshot for virtual actor {}: {}",
                     grain_id.actor_name(),
                     err
                 ),
@@ -5590,23 +5830,24 @@ impl Runtime {
                 .iter()
                 .map(|(name, model)| (name.clone(), *model))
                 .collect();
-            // Fill declared initial values.
-            for (name, c) in grain_type
-                .module
-                .actor_metadata
-                .iter()
-                .flat_map(|m| &m.state_defaults)
-            {
-                let v = match c {
-                    crate::bytecode::Constant::String(s) => actor.allocate_string(&s),
-                    other => crate::vm::constant_to_value(&other),
+            // Fill declared initial values only from the requested grain
+            // schema, never from sibling actor declarations in the module.
+            let grain_meta =
+                behavior_ownership::actor_meta_for_schema(&grain_type.module, &grain_id.grain_type)
+                    .expect("registered grain type must retain its ActorMeta");
+            for (name, constant) in &grain_meta.state_defaults {
+                let value = match constant {
+                    crate::bytecode::Constant::String(text) => actor.allocate_string(text),
+                    other => crate::vm::constant_to_value(other),
                 };
-                actor.set_state_field(name, v);
+                actor.set_state_field(name, value);
             }
             actor
         };
 
-        // Track the grain identity.
+        // Track canonical schema and grain identity.
+        self.recovery_schema_names
+            .insert(stable_actor_id, grain_id.grain_type.clone());
         self.actors.insert(stable_actor_id, actor);
         self.grain_residents
             .insert(grain_id.clone(), stable_actor_id);
@@ -5699,52 +5940,46 @@ impl Runtime {
             }
         };
 
-        let is_workflow = module.actor_metadata.iter().any(|m| m.is_workflow);
-        let is_agent = module.actor_metadata.iter().any(|m| m.is_agent);
-
-        let actor = match Self::restore_actor_from_snapshot(
-            actor_id,
-            &module,
-            &snapshot,
-            is_workflow,
-            is_agent,
-        ) {
-            Ok(actor) => actor,
-            Err(err) => {
-                warn!(
-                    "nulang-migrate: invalid authority manifest for actor {}: {}",
-                    actor_id, err
-                );
-                return false;
+        let schema_meta = if module.actor_metadata.is_empty() && snapshot.schema_name.is_none() {
+            None
+        } else {
+            match schema_identity::resolve_snapshot_actor_meta(
+                &module,
+                snapshot.schema_name.as_deref(),
+            ) {
+                Ok(meta) => Some(meta.clone()),
+                Err(err) => {
+                    warn!(
+                        "nulang-migrate: invalid schema identity for actor {}: {}",
+                        actor_id, err
+                    );
+                    return false;
+                }
             }
         };
+        let is_workflow = schema_meta.as_ref().is_some_and(|meta| meta.is_workflow);
 
-        // Register the recovery module.
-        let offsets: Vec<usize> = module
-            .behaviors
-            .iter()
-            .map(|b| b.code_offset as usize)
-            .collect();
-        // Filter compensation_offsets to this actor's own behaviors using
-        // behavior_indices from the first workflow ActorMeta (a migrated
-        // actor module carries its own metadata).
-        let compensation_offsets: Vec<Option<usize>> = module
-            .actor_metadata
-            .iter()
-            .find(|m| m.is_workflow)
-            .map(|meta| {
-                meta.behavior_indices
-                    .iter()
-                    .map(|&i| module.behaviors[i].compensate_offset.map(|o| o as usize))
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                module
-                    .behaviors
-                    .iter()
-                    .map(|b| b.compensate_offset.map(|o| o as usize))
-                    .collect()
-            });
+        let actor =
+            match Self::restore_actor_from_snapshot(actor_id, &module, &snapshot, None, None) {
+                Ok(actor) => actor,
+                Err(err) => {
+                    warn!(
+                        "nulang-migrate: invalid durable snapshot for actor {}: {}",
+                        actor_id, err
+                    );
+                    return false;
+                }
+            };
+
+        // Register exactly the runtime-local layout selected during restore.
+        // Workflows use compressed local behavior ids and must not be widened
+        // back to the module-global behavior table.
+        let offsets = actor.bytecode_offsets.clone();
+        let compensation_offsets = actor.compensation_offsets.clone();
+        if let Some(meta) = &schema_meta {
+            self.recovery_schema_names
+                .insert(actor_id, meta.name.clone());
+        }
         self.recovery_modules
             .insert(actor_id, (module, offsets, compensation_offsets));
 
@@ -5771,10 +6006,10 @@ impl Runtime {
             }
         }
 
+        self.actors.insert(actor_id, actor);
         if is_workflow {
             self.layout_workflow_behavior_table(actor_id);
         }
-        self.actors.insert(actor_id, actor);
         if let Some(ref mut mgr) = self.crdt_manager {
             if let Some(actor) = self.actors.get(&actor_id) {
                 mgr.register_actor_fields(actor_id, actor);
