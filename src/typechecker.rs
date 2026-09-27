@@ -3976,7 +3976,7 @@ impl TypeChecker {
             Type::Nominal { underlying, .. } => self.validate_ffi_type(underlying, span),
             _ => Err(NuError::TypeError {
                 msg: format!(
-                    "Unsupported FFI type: {}. Only Int, Float, Bool, String, and Unit are allowed in this MVP.",
+                    "Unsupported FFI type: {}. Allowed types are Int, Float, Bool, String, Unit, and opaque wrappers whose underlying type is one of those primitives.",
                     ty
                 ),
                 span,
