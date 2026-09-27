@@ -259,7 +259,6 @@ pub fn validate_noalloc_contracts(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
