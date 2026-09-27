@@ -11,7 +11,7 @@
 > `conformance/grammar/` (positive + negative examples) validates the parser
 > against this grammar; see `conformance/README.md` for the check harness.
 >
-> Experimental surface (actors' `@backend`, `workflow`, `agent`, FFI `extern`,
+> Experimental surface (actors' `@backend`, `workflow`, `agent`, FFI `unsafe extern`,
 > Python interop, WIT) is **out of scope** for this grammar and is not part of
 > the frozen or stable language.
 >
@@ -35,7 +35,7 @@ Reserved keywords (not usable as identifiers): `fn`, `let`, `if`, `else`,
 `match`, `return`, `type`, `alias`, `enum`, `struct`, `effect`, `handle`,
 `perform`, `actor`, `behavior`, `spawn`, `send`, `receive`, `val`, `iso`,
 `trn`, `box`, `tag`, `lineariso`, `true`, `false`, `nil`, `unit`, `pub`,
-`extern`, `where`, `priv`, `loop`, `node`, `monitor`, `link`, `exit`,
+`unsafe`, `extern`, `where`, `priv`, `loop`, `node`, `monitor`, `link`, `exit`,
 `await`, `subworkflow`, `case`, `do`.
 
 ## 2. Core productions (Frozen — RFC 0002)
