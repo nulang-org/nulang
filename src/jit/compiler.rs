@@ -96,6 +96,9 @@ pub fn is_opcode_compilable(op: OpCode) -> bool {
             | OpCode::ArrStore
             | OpCode::ArrLen
             | OpCode::FieldL
+            | OpCode::ArrAlloc
+            | OpCode::RecMk
+            | OpCode::TupleMk
             | OpCode::PerformDirect
     )
 }
@@ -138,6 +141,15 @@ pub(crate) fn make_void_reg4_sig<M: Module>(module: &M) -> Signature {
 
 /// `(*mut u64 regs, i64 func_idx, i64 argc, i64 dst) -> i64` for
 /// `nulang_jit_direct_call` (returns a nonzero status on runtime error).
+pub(crate) fn make_alloc_obj_at_sig<M: Module>(module: &M) -> Signature {
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(types::I64)); // tagged slot count
+    sig.params.push(AbiParam::new(types::I32)); // TypeTag discriminant
+    sig.params.push(AbiParam::new(types::I64)); // absolute bytecode pc
+    sig.returns.push(AbiParam::new(types::I64)); // tagged pointer / nil
+    sig
+}
+
 pub(crate) fn make_direct_call_sig<M: Module>(module: &M) -> Signature {
     let mut sig = module.make_signature();
     sig.params.push(AbiParam::new(types::I64)); // regs ptr
@@ -737,6 +749,48 @@ pub fn compile_bytecode_region(
             }
             OpCode::DbgPrint => {}
 
+            OpCode::ArrAlloc => {
+                let slots = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
+                emit_composite_alloc(
+                    &mut builder,
+                    &helpers,
+                    regs_ptr,
+                    slots,
+                    TypeTag::Array,
+                    pc,
+                    instr.op2 as usize,
+                );
+            }
+            OpCode::RecMk => {
+                let slots = builder.ins().iconst(
+                    types::I64,
+                    crate::vm::Value::int(instr.op1 as i64).as_raw() as i64,
+                );
+                emit_composite_alloc(
+                    &mut builder,
+                    &helpers,
+                    regs_ptr,
+                    slots,
+                    TypeTag::Record,
+                    pc,
+                    instr.op2 as usize,
+                );
+            }
+            OpCode::TupleMk => {
+                let slots = builder.ins().iconst(
+                    types::I64,
+                    crate::vm::Value::int(instr.op1 as i64).as_raw() as i64,
+                );
+                emit_composite_alloc(
+                    &mut builder,
+                    &helpers,
+                    regs_ptr,
+                    slots,
+                    TypeTag::Tuple,
+                    pc,
+                    instr.op2 as usize,
+                );
+            }
             OpCode::ArrLoad => {
                 emit_arr_load(
                     &mut builder,
@@ -991,6 +1045,25 @@ fn emit_unary(
     let result = builder.inst_results(call)[0];
     store_reg(builder, regs_ptr, dst, result);
 }
+fn emit_composite_alloc(
+    builder: &mut FunctionBuilder,
+    helpers: &HashMap<RuntimeHelper, FuncRef>,
+    regs_ptr: Value,
+    tagged_slot_count: Value,
+    type_tag: TypeTag,
+    pc: usize,
+    dst: usize,
+) {
+    let type_tag = builder.ins().iconst(types::I32, type_tag as i64);
+    let pc = builder.ins().iconst(types::I64, pc as i64);
+    let call = builder.ins().call(
+        helpers[&RuntimeHelper::AllocObjAt],
+        &[tagged_slot_count, type_tag, pc],
+    );
+    let result = builder.inst_results(call)[0];
+    store_reg(builder, regs_ptr, dst, result);
+}
+
 fn emit_self_unary(
     builder: &mut FunctionBuilder,
     helpers: &HashMap<RuntimeHelper, FuncRef>,

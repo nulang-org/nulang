@@ -3093,6 +3093,16 @@ impl VM {
                 .unwrap_or(false)
     }
 
+    /// Query allocation placement for native helpers executing this VM.
+    ///
+    /// The JIT receives only the exact bytecode PC; the VM remains the single
+    /// owner of the escape-analysis result so native lowering cannot drift
+    /// from interpreter placement semantics.
+    #[inline(always)]
+    pub(crate) fn jit_iso_arena_site(&self, module_idx: usize, pc: usize) -> bool {
+        self.iso_arena_site(module_idx, pc)
+    }
+
     #[inline]
     fn finish_activation(&mut self, value: Value) -> NuResult<Value> {
         if self.iso_arena_enabled {

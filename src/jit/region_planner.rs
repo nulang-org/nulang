@@ -208,6 +208,9 @@ fn is_non_suspending_op(op: crate::bytecode::OpCode) -> bool {
             | OpCode::ArrStore
             | OpCode::ArrLen
             | OpCode::FieldL
+            | OpCode::ArrAlloc
+            | OpCode::RecMk
+            | OpCode::TupleMk
     )
 }
 

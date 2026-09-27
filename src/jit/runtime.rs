@@ -921,6 +921,54 @@ unsafe fn drop_obj(ptr: *mut u8) {
 // AOT value-based runtime helpers
 // ---------------------------------------------------------------------------
 
+/// Allocate a composite object for a specific bytecode allocation site.
+///
+/// Tiered JIT code passes the tagged slot-count Value plus the exact absolute
+/// bytecode PC. The active VM owns the escape-analysis bitmap and decides
+/// whether this site is activation-local; native code therefore shares the
+/// interpreter's allocation-placement decision instead of reimplementing it.
+#[no_mangle]
+pub unsafe extern "C" fn nulang_jit_alloc_obj_at(
+    slot_count_value: u64,
+    type_tag_raw: u32,
+    pc: u64,
+) -> u64 {
+    let tag: HeapTypeTag = match type_tag_raw {
+        1 => HeapTypeTag::Array,
+        3 => HeapTypeTag::Record,
+        6 => HeapTypeTag::Tuple,
+        _ => return Value::nil().as_raw(),
+    };
+    let count = Value::from_raw(slot_count_value).as_int().unwrap_or(0) as usize;
+    let size = count.checked_mul(std::mem::size_of::<Value>()).unwrap_or(0);
+
+    let use_arena = get_jit_module_idx()
+        .map(|module_idx| {
+            let vm_ptr = get_jit_vm();
+            !vm_ptr.is_null() && (&*vm_ptr).jit_iso_arena_site(module_idx, pc as usize)
+        })
+        .unwrap_or(false);
+
+    let ptr = if use_arena {
+        match try_with_callbacks(|cb| cb.alloc_arena(size, tag)) {
+            Some(Some(ptr)) => Some(ptr),
+            _ => alloc_obj(size, tag),
+        }
+    } else {
+        alloc_obj(size, tag)
+    };
+
+    if let Some(ptr) = ptr {
+        let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, count);
+        for slot in slots.iter_mut() {
+            *slot = Value::nil();
+        }
+        Value::ptr(ptr).as_raw()
+    } else {
+        Value::nil().as_raw()
+    }
+}
+
 /// Allocate a heap object with `slot_count` slots of type `type_tag`.
 /// Returns tagged pointer or nil.
 #[no_mangle]
