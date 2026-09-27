@@ -540,3 +540,129 @@ impl fmt::Display for WalError {
 }
 
 impl std::error::Error for WalError {}
+
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use std::fs;
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_WAL: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_wal(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "nulang_nudb_wal_hardening_{name}_{}_{}.wal",
+            std::process::id(),
+            NEXT_WAL.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn descriptor() -> TabletDescriptor {
+        TabletDescriptor::new(
+            TabletId::new(91).unwrap(),
+            super::super::tablet::KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            1,
+        )
+        .unwrap()
+    }
+
+    fn write(previous: u64, key: &[u8]) -> TabletWrite {
+        TabletWrite::prepare(
+            &descriptor(),
+            1,
+            previous,
+            previous,
+            vec![TabletMutation::Put {
+                key: key.to_vec(),
+                value: b"value".to_vec(),
+            }],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn corrupted_record_header_is_not_treated_as_a_torn_tail() {
+        let path = temp_wal("header_corruption");
+        let _ = fs::remove_file(&path);
+
+        {
+            let mut wal = FileWal::open(&path).unwrap();
+            wal.append_write(&write(0, b"k")).unwrap();
+        }
+
+        {
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            // File magic (8) + record magic (4) + record version (2) => payload length.
+            file.seek(SeekFrom::Start(14)).unwrap();
+            let mut length = [0_u8; 4];
+            std::io::Read::read_exact(&mut file, &mut length).unwrap();
+            length[0] ^= 0x40;
+            file.seek(SeekFrom::Start(14)).unwrap();
+            file.write_all(&length).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        assert!(matches!(
+            FileWal::open(&path).unwrap_err(),
+            WalError::HeaderChecksumMismatch { .. }
+        ));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn append_io_failure_poisons_live_wal_until_reopen() {
+        let path = temp_wal("poison");
+        let _ = fs::remove_file(&path);
+
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.append_write(&write(0, b"k1")).unwrap();
+        wal.set_append_failpoint_for_test(AppendFailPoint::AfterPayload);
+
+        assert!(matches!(
+            wal.append_write(&write(1, b"k2")),
+            Err(WalError::Io { .. })
+        ));
+        assert_eq!(wal.append_write(&write(1, b"k3")).unwrap_err(), WalError::Poisoned);
+
+        drop(wal);
+
+        let mut reopened = FileWal::open(&path).unwrap();
+        assert_eq!(reopened.last_sequence(), 1);
+        reopened.append_write(&write(1, b"k4")).unwrap();
+        assert_eq!(reopened.last_sequence(), 2);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn injected_error_after_sync_is_ambiguous_but_live_handle_stays_poisoned() {
+        let path = temp_wal("after_sync");
+        let _ = fs::remove_file(&path);
+
+        let mut wal = FileWal::open(&path).unwrap();
+        wal.set_append_failpoint_for_test(AppendFailPoint::AfterSync);
+
+        assert!(matches!(
+            wal.append_write(&write(0, b"k")),
+            Err(WalError::Io { .. })
+        ));
+        assert_eq!(wal.append_write(&write(0, b"retry")).unwrap_err(), WalError::Poisoned);
+
+        drop(wal);
+
+        // The injected failure happens after sync_data: reopening resolves the
+        // ambiguous outcome by recovering the durable record.
+        let reopened = FileWal::open(&path).unwrap();
+        assert_eq!(reopened.last_sequence(), 1);
+        assert_eq!(reopened.records().len(), 1);
+
+        let _ = fs::remove_file(path);
+    }
+}
