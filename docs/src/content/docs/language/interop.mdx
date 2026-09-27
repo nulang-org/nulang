@@ -104,7 +104,7 @@ The FFI has three faces, all in `src/ffi/` behind the default-on `ffi` cargo fea
 
 ### extern blocks
 
-Declare external functions with an `extern "library" { ... }` block. Parameters must have explicit types, a return type is mandatory, and only `Int`, `Float`, `Bool`, `String`, and `Unit` may cross the boundary — anything else is rejected at parse time. The library is resolved lazily at call time:
+Declare external functions with an `extern "library" { ... }` block. Parameters must have explicit types, a return type is mandatory, and `Int`, `Float`, `Bool`, `String`, and `Unit` may cross the boundary. An `opaque type` whose underlying type is one of those supported primitives is ABI-transparent and may cross with the same C representation while remaining nominally distinct inside Nulang. Opaque records, arrays, functions, references, and actor types remain rejected. The library is resolved lazily at call time:
 
 ```nulang
 // Verified with: nulang libm_demo.nula  (Linux, requires libm)
