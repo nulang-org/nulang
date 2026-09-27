@@ -2,7 +2,7 @@
 
 use super::gc::OrcaGc;
 use super::*;
-use crate::runtime::object_store::ObjectId;
+use crate::runtime::object_store::{ObjectId, ObjectStore};
 use crate::vm::Value;
 use std::collections::{HashMap, HashSet};
 
@@ -351,6 +351,9 @@ pub struct Actor {
     /// Object-store ids held by this actor.  Populated when a message carrying
     /// an object ref is delivered.  Dropped on actor exit.
     pub held_objects: HashSet<ObjectId>,
+    /// Store handle paired with held_objects so actor destruction releases
+    /// manual ObjectStore refcounts even when removal bypasses Runtime reaping.
+    pub(crate) held_object_store: Option<ObjectStore>,
 }
 
 /// State of an actor's in-flight timed selective receive.
@@ -448,6 +451,7 @@ impl Actor {
             idle_ms: 0,
             pinned: false,
             held_objects: HashSet::new(),
+            held_object_store: None,
         }
     }
 
@@ -794,5 +798,15 @@ mod tests {
         assert!(recorder.is_empty());
         assert_eq!(recorder.entries.capacity(), 0);
         assert_eq!(recorder.next_seq, 0);
+    }
+}
+
+impl Drop for Actor {
+    fn drop(&mut self) {
+        let Some(store) = self.held_object_store.take() else {
+            return;
+        };
+        let held = std::mem::take(&mut self.held_objects);
+        store.drop_refs(&held);
     }
 }
