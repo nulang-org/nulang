@@ -68,7 +68,7 @@ wasmfx-backend = ["wasm-backend", "wasmtime/gc-null"]
 http-client = ["dep:reqwest", "dep:tokio"]
 otel = ["dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", "dep:tokio", "dep:tracing-opentelemetry"]
 tls = []
-# Dynamic native library loading (`extern` FFI) via libloading and arbitrary
+# Dynamic native library loading (`unsafe extern` FFI) via libloading and arbitrary
 # arity native calls via libffi. Disable for a minimal build without these
 # dependencies.
 ffi = ["dep:libloading", "dep:libffi"]
