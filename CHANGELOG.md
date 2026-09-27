@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Durable actor schema identity — 2026-09-27
+- **Durable snapshots now preserve the canonical actor schema that owns their state and behavior history.** Recovery, migration, restart preflight, and virtual-actor hydration resolve exactly that `ActorMeta.name` instead of flattening metadata across a multi-actor module.
+- **Legacy compatibility is explicit and fail-closed.** Snapshots without schema identity remain readable only when the loaded module exposes one unambiguous actor schema; unknown, mismatched, or ambiguous identities are rejected before actor publication.
+- **Durable behavior ownership survives replay boundaries.** Journal behavior IDs are validated against the recovered schema, workflow-local behavior layouts remain actor-local after migration/recovery, and relational/JSON/RocksDB snapshot paths carry the same schema field.
+
 ### Runtime behavior ownership enforcement — 2026-09-27
 - **Bytecode behavior names and numeric IDs are now scoped to the target actor schema.** Foreign-schema IDs are rejected before local or cross-shard mailbox publication, workflow-local IDs translate through their own `ActorMeta.behavior_indices`, and virtual actor instances resolve only their declared grain schema.
 - **Anonymous low-level runtime actors keep their compatibility path.** Inert numeric behavior id 0 remains admissible only when the actor has no declared native or bytecode behavior surface.
