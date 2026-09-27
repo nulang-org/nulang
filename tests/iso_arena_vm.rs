@@ -187,7 +187,6 @@ fn escaping_allocation_stays_on_heap() {
     );
 }
 
-
 #[cfg(feature = "native-codegen")]
 #[test]
 fn hot_allocation_loop_jit_preserves_iso_arena_routing() {
@@ -198,9 +197,7 @@ fn hot_allocation_loop_jit_preserves_iso_arena_routing() {
 
     let mut module = CodeModule::new("jit-iso-arena-routing");
     let len = module.add_constant(Constant::Int(4));
-    let limit = module.add_constant(Constant::Int(
-        (nulang::jit::HOT_THRESHOLD + 32) as i64,
-    ));
+    let limit = module.add_constant(Constant::Int((nulang::jit::HOT_THRESHOLD + 32) as i64));
 
     module.emit(Instruction::new3(
         OpCode::ConstU,
