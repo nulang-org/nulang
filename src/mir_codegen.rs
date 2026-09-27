@@ -3646,6 +3646,21 @@ mod optimize_tests {
     }
 
     #[test]
+    fn test_compile_opaque_scalar_ffi_signature() {
+        let source = r#"
+opaque type UserId = Int
+
+extern "__nulang_registered__" {
+    fn echo_id(x: UserId) -> UserId
+}
+
+fn main() -> Int { 0 }
+"#;
+        compile_source(source)
+            .expect("opaque scalar newtypes should lower through the underlying primitive FFI ABI");
+    }
+
+    #[test]
     fn test_fold_const_add() {
         // `1 + 2` folds to a single constant; no IAdd survives.
         let value = run_source("1 + 2").unwrap();

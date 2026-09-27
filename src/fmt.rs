@@ -159,9 +159,14 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             name,
             type_params,
             body,
+            opaque,
             ..
         } => {
-            out.push_str(&format!("{}type {}", sp, name));
+            if *opaque {
+                out.push_str(&format!("{}opaque type {}", sp, name));
+            } else {
+                out.push_str(&format!("{}type {}", sp, name));
+            }
             if !type_params.is_empty() {
                 out.push_str(&format!("[{}]", type_params.join(", ")));
             }
@@ -1328,6 +1333,17 @@ impl Eq Int {
             "got: {out}"
         );
         assert!(out.contains("on_entry Connecting {"), "got: {out}");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_preserves_opaque_type_contract() {
+        let src = "opaque type UserId = Int\n";
+        let out = format_source(src).expect("opaque type formats");
+        assert_eq!(
+            out, src,
+            "formatter must not erase opaque nominal semantics"
+        );
         assert_idempotent(src);
     }
 

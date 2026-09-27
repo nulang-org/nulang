@@ -3964,7 +3964,8 @@ impl TypeChecker {
     // -----------------------------------------------------------------------
 
     /// Validate that a type is usable as an FFI parameter/return type in the MVP.
-    /// Only primitive Int, Float, Bool, String, and Unit are supported.
+    /// Int, Float, Bool, String, Unit, and opaque nominal wrappers over those
+    /// same primitives are supported. Opaque non-scalar shapes remain rejected.
     fn validate_ffi_type(&self, ty: &Type, span: Span) -> NuResult<()> {
         match ty {
             Type::Primitive(PrimitiveType::Int)
@@ -3972,9 +3973,10 @@ impl TypeChecker {
             | Type::Primitive(PrimitiveType::Bool)
             | Type::Primitive(PrimitiveType::String)
             | Type::Primitive(PrimitiveType::Unit) => Ok(()),
+            Type::Nominal { underlying, .. } => self.validate_ffi_type(underlying, span),
             _ => Err(NuError::TypeError {
                 msg: format!(
-                    "Unsupported FFI type: {}. Only Int, Float, Bool, String, and Unit are allowed in this MVP.",
+                    "Unsupported FFI type: {}. Allowed types are Int, Float, Bool, String, Unit, and opaque wrappers whose underlying type is one of those primitives.",
                     ty
                 ),
                 span,
@@ -5454,6 +5456,40 @@ mod tests {
         let module = parser.parse_module()?;
         let mut tc = TypeChecker::new();
         tc.check_module(&module)
+    }
+
+    #[test]
+    fn test_ffi_accepts_opaque_scalar_newtype() {
+        let result = check_src(
+            r#"
+opaque type UserId = Int
+extern "__nulang_registered__" {
+    fn echo_id(x: UserId) -> UserId
+}
+"#,
+        );
+        assert!(
+            result.is_ok(),
+            "scalar opaque newtypes erase to their underlying FFI representation: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_ffi_rejects_opaque_non_scalar_newtype() {
+        let result = check_src(
+            r#"
+opaque type Header = { value: Int }
+extern "__nulang_registered__" {
+    fn echo_header(x: Header) -> Header
+}
+"#,
+        );
+        let err = result.expect_err("opaque records must not become C-layout structs implicitly");
+        assert!(
+            err.to_string().contains("Unsupported FFI type"),
+            "unexpected opaque-record diagnostic: {err}"
+        );
     }
 
     #[test]

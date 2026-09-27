@@ -105,6 +105,7 @@ pub mod ffi {
                     PrimitiveType::Unit => Some(FfiType::Unit),
                     _ => None,
                 },
+                Type::Nominal { underlying, .. } => nulang_type_to_ffi_type(underlying),
                 _ => None,
             }
         }
