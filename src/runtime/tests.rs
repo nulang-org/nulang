@@ -4200,6 +4200,7 @@ fn test_actor_migration_between_two_nodes() {
             waiting_signal: actor.waiting_signal.clone(),
             crdt_snapshot,
             crdt_field_map,
+            schema_name: Some(actor.name.clone()),
             authority_tokens: Default::default(),
         };
         let json = serde_json::to_vec(&snapshot).unwrap();
