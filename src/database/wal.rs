@@ -17,7 +17,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use super::tablet::{TabletId, TabletMutation, TabletWrite};
+use super::tablet::{
+    MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite,
+};
 
 const WAL_MAGIC: &[u8; 8] = b"NUDBWAL1";
 const WAL_RECORD_VERSION: u16 = 1;
@@ -244,6 +246,41 @@ impl FileWal {
         self.record_end_offsets.get(index).copied()
     }
 
+    /// Rebuild the single-node MVCC tablet from the durable WAL prefix.
+    ///
+    /// Historical ownership epochs are retained as log metadata but are not
+    /// compared with the descriptor's current owner epoch during replay.
+    /// Tablet identity, sequence order, and key-range membership remain
+    /// fail-closed.
+    pub fn recover_memory_tablet(
+        &self,
+        descriptor: TabletDescriptor,
+    ) -> Result<MemoryTablet, WalError> {
+        if let Some(existing) = self.tablet_id {
+            if existing != descriptor.id() {
+                return Err(WalError::TabletMismatch {
+                    expected: descriptor.id(),
+                    presented: existing,
+                });
+            }
+        }
+
+        let mut tablet = MemoryTablet::new(descriptor);
+        for record in &self.records {
+            tablet
+                .replay_committed(
+                    record.sequence,
+                    record.expected_previous_sequence,
+                    record.mutations.clone(),
+                )
+                .map_err(|error| WalError::ReplayRejected {
+                    sequence: record.sequence,
+                    reason: error.to_string(),
+                })?;
+        }
+        Ok(tablet)
+    }
+
     /// Durably append one prepared tablet write.
     ///
     /// The in-memory tail advances only after the complete record and checksum
@@ -400,6 +437,10 @@ pub enum WalError {
         expected_previous: u64,
     },
     SequenceOverflow,
+    ReplayRejected {
+        sequence: u64,
+        reason: String,
+    },
     Serialization {
         message: String,
     },
@@ -450,6 +491,9 @@ impl fmt::Display for WalError {
                 "WAL predecessor {expected_previous} does not match committed sequence {committed}"
             ),
             Self::SequenceOverflow => f.write_str("WAL sequence overflow"),
+            Self::ReplayRejected { sequence, reason } => {
+                write!(f, "WAL replay rejected sequence {sequence}: {reason}")
+            }
             Self::Serialization { message } => {
                 write!(f, "WAL serialization error: {message}")
             }
