@@ -429,9 +429,7 @@ fn validate_call(
         return Ok(None);
     }
     let qualified_prefix = format!("{}.", actor_name);
-    let behavior_key = behavior
-        .strip_prefix(&qualified_prefix)
-        .unwrap_or(behavior);
+    let behavior_key = behavior.strip_prefix(&qualified_prefix).unwrap_or(behavior);
 
     let Some(sig) = protocol.behaviors.get(behavior_key) else {
         let mut available: Vec<String> = protocol.behaviors.keys().cloned().collect();
