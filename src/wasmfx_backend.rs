@@ -146,6 +146,7 @@ impl WasmFxBackend {
     // ── Compile ───────────────────────────────────────────────────
 
     pub fn compile(&mut self, mir_module: &mir::Module, _module_name: &str) -> NuResult<Vec<u8>> {
+        crate::cost_model::prove_noalloc_contracts(mir_module)?;
         // Pre-scan: closures and user-defined handler/resume semantics are
         // unsupported. WasmFX suspension for built-in async effects is real,
         // but user-defined effect-handler Resume is still an MVP stub in CIR
