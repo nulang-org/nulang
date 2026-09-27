@@ -352,9 +352,18 @@ impl MemoryTablet {
     /// unchanged.
     pub fn commit(&mut self, write: TabletWrite) -> Result<u64, TabletError> {
         self.validate_write(&write)?;
+        Ok(self.publish_validated(write))
+    }
+
+    /// Publish a write after `validate_write` has succeeded.
+    ///
+    /// This operation is intentionally infallible so a WAL-backed coordinator
+    /// can perform all fallible validation before fsync, then publish the
+    /// already-durable write without creating an ambiguous commit result.
+    pub(crate) fn publish_validated(&mut self, write: TabletWrite) -> u64 {
         let sequence = write.sequence;
         self.apply_mutations(sequence, write.mutations);
-        Ok(sequence)
+        sequence
     }
 
     /// Replay one already checksummed/validated WAL record into MVCC state.
