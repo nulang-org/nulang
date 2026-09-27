@@ -165,6 +165,26 @@ fn recovery_rejects_unknown_and_ambiguous_legacy_schema() {
 }
 
 #[test]
+fn persisted_schema_claim_requires_registered_module_context() {
+    let actor_id = 7008;
+    let mut rt = Runtime::new();
+    rt.persistence
+        .save_snapshot(ActorSnapshot {
+            actor_id,
+            schema_name: Some("Counter".to_string()),
+            ..ActorSnapshot::default()
+        })
+        .expect("snapshot");
+
+    assert_eq!(
+        rt.recover_actor(actor_id),
+        None,
+        "persisted schema identity must not be trusted without compiler-owned module metadata"
+    );
+    assert!(!rt.actors.contains_key(&actor_id));
+}
+
+#[test]
 fn legacy_single_schema_snapshot_still_recovers() {
     let module = compile(
         r#"
