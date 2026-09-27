@@ -1333,7 +1333,7 @@ impl Eq Int {
 
     #[test]
     fn test_fmt_extern() {
-        let src = r#"extern "libm.so.6" {
+        let src = r#"unsafe extern "libm.so.6" {
     fn sqrt(x: Float) -> Float
 }"#;
         let out = format_source(src).expect("extern formats");
