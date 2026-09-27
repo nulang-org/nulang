@@ -606,6 +606,19 @@ mod authority_tests {
             .unwrap()
     }
 
+    fn compile_module(source: &str) -> CodeModule {
+        let tokens = crate::lexer::Lexer::new(source).lex().expect("lex");
+        let ast = crate::parser::Parser::new(tokens)
+            .parse_module()
+            .expect("parse");
+        let mut typechecker = crate::typechecker::TypeChecker::new();
+        typechecker.check_module(&ast).expect("typecheck");
+        let hir = crate::hir_lower::lower_module(&ast, &typechecker.inferred_decl_types);
+        let mut mir = crate::mir_lower::lower_module(&hir).expect("MIR lowering");
+        crate::mir_codegen::compile_mir(&mut mir, "spawn-schema-preflight")
+            .expect("codegen")
+    }
+
     #[derive(Clone)]
     struct RecordingStore {
         inner: std::sync::Arc<std::sync::Mutex<crate::runtime::persistence::MemoryStore>>,
@@ -919,6 +932,101 @@ mod authority_tests {
             .allows(&AuthorityGrant::SecretRead {
                 name: "RESTART_KEY".into(),
             }));
+    }
+
+    #[test]
+    fn schema_mismatched_restart_fails_before_init_or_publish() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let module = compile_module(
+            r#"
+            persistent actor First {
+                state durable first_only: Int = 1
+                behavior hit() { nil }
+            }
+            persistent actor Second {
+                state durable second_only: Int = 2
+                behavior hit() { nil }
+            }
+            "#,
+        );
+        let mut rt = Runtime::new();
+        let actor_id = 910_003;
+        rt.persistence
+            .save_snapshot(ActorSnapshot {
+                actor_id,
+                schema_name: Some("First".to_string()),
+                ..ActorSnapshot::default()
+            })
+            .unwrap();
+
+        let init_ran = Rc::new(Cell::new(false));
+        let init_flag = Rc::clone(&init_ran);
+        let returned = try_spawn_actor_with_id(
+            &mut rt,
+            actor_id,
+            Box::new(move || {
+                init_flag.set(true);
+                vec![("second_only".to_string(), Value::int(2))]
+            }),
+            std::collections::HashMap::new(),
+            true,
+            None,
+            None,
+            Some((&module, "Second")),
+        )
+        .unwrap();
+
+        assert_eq!(returned, actor_id);
+        assert!(
+            !init_ran.get(),
+            "schema mismatch must abort before actor initialization"
+        );
+        assert!(
+            !rt.actors.contains_key(&actor_id),
+            "schema mismatch must not publish a runnable actor"
+        );
+    }
+
+    #[test]
+    fn schema_bound_restart_without_schema_context_fails_closed() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let mut rt = Runtime::new();
+        let actor_id = 910_004;
+        rt.persistence
+            .save_snapshot(ActorSnapshot {
+                actor_id,
+                schema_name: Some("Counter".to_string()),
+                ..ActorSnapshot::default()
+            })
+            .unwrap();
+
+        let init_ran = Rc::new(Cell::new(false));
+        let init_flag = Rc::clone(&init_ran);
+        let returned = spawn_actor_with_id(
+            &mut rt,
+            actor_id,
+            Box::new(move || {
+                init_flag.set(true);
+                vec![]
+            }),
+            std::collections::HashMap::new(),
+            true,
+            None,
+        );
+
+        assert_eq!(returned, actor_id);
+        assert!(
+            !init_ran.get(),
+            "schema-bound snapshot must not initialize without schema context"
+        );
+        assert!(
+            !rt.actors.contains_key(&actor_id),
+            "schema-bound snapshot must not publish through a generic spawn"
+        );
     }
 
     #[test]
