@@ -104,7 +104,6 @@ fn local_array_module(escapes: bool) -> CodeModule {
     module
 }
 
-
 fn local_fixed_composite_module(opcode: OpCode) -> CodeModule {
     let mut module = CodeModule::new("iso-arena-fixed-composite-routing");
     module.emit(Instruction::new2(opcode, 2, 2));
