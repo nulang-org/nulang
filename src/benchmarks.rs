@@ -208,24 +208,31 @@ fn bench_ab_shard_scaling() {
             }
         }
 
-        let start = Instant::now();
-        let shards = std::thread::scope(|scope| {
+        // Spawn worker threads before timing, then release all shard schedulers
+        // through one barrier so thread-creation cost is not mistaken for
+        // runtime scaling overhead.
+        let start_gate = std::sync::Arc::new(std::sync::Barrier::new(shard_count + 1));
+        let (shards, elapsed) = std::thread::scope(|scope| {
             let handles: Vec<_> = shards
                 .into_iter()
                 .map(|mut shard| {
+                    let start_gate = start_gate.clone();
                     scope.spawn(move || {
+                        start_gate.wait();
                         shard.run_scheduler();
                         shard
                     })
                 })
                 .collect();
 
-            handles
+            let start = Instant::now();
+            start_gate.wait();
+            let shards = handles
                 .into_iter()
                 .map(|handle| handle.join().expect("shard benchmark worker panicked"))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (shards, start.elapsed())
         });
-        let elapsed = start.elapsed();
 
         let processed: u64 = shards
             .iter()
