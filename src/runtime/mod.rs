@@ -5943,52 +5943,48 @@ impl Runtime {
             }
         };
 
-        let is_workflow = module.actor_metadata.iter().any(|m| m.is_workflow);
-        let is_agent = module.actor_metadata.iter().any(|m| m.is_agent);
-
-        let actor = match Self::restore_actor_from_snapshot(
-            actor_id,
-            &module,
-            &snapshot,
-            is_workflow,
-            is_agent,
-        ) {
-            Ok(actor) => actor,
-            Err(err) => {
-                warn!(
-                    "nulang-migrate: invalid authority manifest for actor {}: {}",
-                    actor_id, err
-                );
-                return false;
+        let schema_meta = if module.actor_metadata.is_empty() && snapshot.schema_name.is_none() {
+            None
+        } else {
+            match schema_identity::resolve_snapshot_actor_meta(
+                &module,
+                snapshot.schema_name.as_deref(),
+            ) {
+                Ok(meta) => Some(meta.clone()),
+                Err(err) => {
+                    warn!(
+                        "nulang-migrate: invalid schema identity for actor {}: {}",
+                        actor_id, err
+                    );
+                    return false;
+                }
             }
         };
+        let is_workflow = schema_meta
+            .as_ref()
+            .is_some_and(|meta| meta.is_workflow);
 
-        // Register the recovery module.
-        let offsets: Vec<usize> = module
-            .behaviors
-            .iter()
-            .map(|b| b.code_offset as usize)
-            .collect();
-        // Filter compensation_offsets to this actor's own behaviors using
-        // behavior_indices from the first workflow ActorMeta (a migrated
-        // actor module carries its own metadata).
-        let compensation_offsets: Vec<Option<usize>> = module
-            .actor_metadata
-            .iter()
-            .find(|m| m.is_workflow)
-            .map(|meta| {
-                meta.behavior_indices
-                    .iter()
-                    .map(|&i| module.behaviors[i].compensate_offset.map(|o| o as usize))
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                module
-                    .behaviors
-                    .iter()
-                    .map(|b| b.compensate_offset.map(|o| o as usize))
-                    .collect()
-            });
+        let actor =
+            match Self::restore_actor_from_snapshot(actor_id, &module, &snapshot, None, None) {
+                Ok(actor) => actor,
+                Err(err) => {
+                    warn!(
+                        "nulang-migrate: invalid durable snapshot for actor {}: {}",
+                        actor_id, err
+                    );
+                    return false;
+                }
+            };
+
+        // Register exactly the runtime-local layout selected during restore.
+        // Workflows use compressed local behavior ids and must not be widened
+        // back to the module-global behavior table.
+        let offsets = actor.bytecode_offsets.clone();
+        let compensation_offsets = actor.compensation_offsets.clone();
+        if let Some(meta) = &schema_meta {
+            self.recovery_schema_names
+                .insert(actor_id, meta.name.clone());
+        }
         self.recovery_modules
             .insert(actor_id, (module, offsets, compensation_offsets));
 
@@ -6015,10 +6011,10 @@ impl Runtime {
             }
         }
 
+        self.actors.insert(actor_id, actor);
         if is_workflow {
             self.layout_workflow_behavior_table(actor_id);
         }
-        self.actors.insert(actor_id, actor);
         if let Some(ref mut mgr) = self.crdt_manager {
             if let Some(actor) = self.actors.get(&actor_id) {
                 mgr.register_actor_fields(actor_id, actor);
