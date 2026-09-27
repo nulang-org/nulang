@@ -5169,6 +5169,32 @@ impl Runtime {
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
+        let selected_meta = if let Some((module, _, _)) = self.recovery_modules.get(&actor_id) {
+            if module.actor_metadata.is_empty() && snapshot.schema_name.is_none() {
+                None
+            } else {
+                match schema_identity::resolve_snapshot_actor_meta(
+                    module,
+                    snapshot.schema_name.as_deref(),
+                ) {
+                    Ok(meta) => Some(meta.clone()),
+                    Err(err) => {
+                        warn!(
+                            "nulang-recover: refusing actor {} with invalid schema identity: {}",
+                            actor_id, err
+                        );
+                        return None;
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        let recovery_schema_name = selected_meta
+            .as_ref()
+            .map(|meta| meta.name.clone())
+            .or_else(|| snapshot.schema_name.clone());
+
         let authority_manifest =
             match crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens) {
                 Ok(manifest) => manifest,
@@ -5181,18 +5207,52 @@ impl Runtime {
                 }
             };
         let workflow_events = self.persistence.read_workflow_events(actor_id);
-        let is_workflow = self
-            .recovery_modules
-            .get(&actor_id)
-            .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_workflow))
+        let is_workflow = selected_meta
+            .as_ref()
+            .map(|meta| meta.is_workflow)
             .unwrap_or(!workflow_events.is_empty());
-        let is_agent = self
-            .recovery_modules
-            .get(&actor_id)
-            .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_agent))
+        let is_agent = selected_meta
+            .as_ref()
+            .map(|meta| meta.is_agent)
             .unwrap_or(false);
 
-        let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
+        let journal_to_replay: Vec<JournalEntry> = if is_workflow {
+            Vec::new()
+        } else {
+            self.persistence
+                .read_journal(actor_id)
+                .into_iter()
+                .filter(|entry| entry.sequence > snapshot.sequence)
+                .collect()
+        };
+        if let (Some(meta), Some((module, _, _))) = (
+            selected_meta.as_ref(),
+            self.recovery_modules.get(&actor_id),
+        ) {
+            for entry in &journal_to_replay {
+                if behavior_ownership::module_behavior_index_for_runtime_id(
+                    module,
+                    &meta.name,
+                    entry.behavior_id as usize,
+                )
+                .is_none()
+                {
+                    warn!(
+                        "nulang-recover: refusing actor {}: journal behavior id {} is not owned by schema '{}'",
+                        actor_id, entry.behavior_id, meta.name
+                    );
+                    return None;
+                }
+            }
+        }
+
+        let mut actor = Actor::new(
+            actor_id,
+            recovery_schema_name
+                .clone()
+                .unwrap_or_else(|| format!("actor_{}", actor_id)),
+            0,
+        );
         actor.persistent = true;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
@@ -5239,17 +5299,13 @@ impl Runtime {
         }
         // Parse cached retry/fallback configs from restored state for agents.
         if is_agent {
-            if let Some(module) = actor
-                .bytecode_module
-                .as_ref()
-                .or_else(|| self.recovery_modules.get(&actor_id).map(|(m, _, _)| m))
-            {
-                for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
-                    if let crate::bytecode::Constant::String(json) = c {
+            if let Some(meta) = selected_meta.as_ref() {
+                for (name, constant) in &meta.state_defaults {
+                    if let crate::bytecode::Constant::String(json) = constant {
                         if name == "retry_config" {
-                            actor.retry_config = serde_json::from_str(&json).ok();
+                            actor.retry_config = serde_json::from_str(json).ok();
                         } else if name == "fallback_config" {
-                            actor.fallback_config = serde_json::from_str(&json).unwrap_or_default();
+                            actor.fallback_config = serde_json::from_str(json).unwrap_or_default();
                         }
                     }
                 }
@@ -5292,8 +5348,12 @@ impl Runtime {
         // persisted events legitimately has no value yet either, but
         // that's a separate, pre-existing question this fix doesn't
         // change.
-        if let Some(module) = self.recovery_modules.get(&actor_id).map(|(m, _, _)| m) {
-            for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
+        if self.recovery_modules.contains_key(&actor_id) {
+            let defaults = selected_meta
+                .as_ref()
+                .map(|meta| meta.state_defaults.as_slice())
+                .unwrap_or(&[]);
+            for (name, c) in defaults {
                 if actor.get_state_field(name).is_some() {
                     continue;
                 }
@@ -5320,18 +5380,19 @@ impl Runtime {
             // would drop Durable fields from the snapshot entirely, and
             // EventSourced fields would stop accumulating via emitted
             // events.
-            actor.state_models = module
-                .actor_metadata
-                .iter()
-                .flat_map(|m| &m.state_models)
+            actor.state_models = selected_meta
+                .as_ref()
+                .into_iter()
+                .flat_map(|meta| &meta.state_models)
                 .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
                 .collect();
         }
+        if let Some(schema_name) = recovery_schema_name {
+            self.recovery_schema_names.insert(actor_id, schema_name);
+        }
+        self.actors.insert(actor_id, actor);
         if is_workflow {
-            self.actors.insert(actor_id, actor);
             self.layout_workflow_behavior_table(actor_id);
-        } else {
-            self.actors.insert(actor_id, actor);
         }
         // Ensure CRDT-backed fields are registered (or re-registered after
         // recovery). `register_actor_fields` is idempotent, so declared fields
@@ -5412,14 +5473,8 @@ impl Runtime {
                 }
             }
         } else {
-            // Replay journal entries that arrived after the snapshot.
-            let journal = self.persistence.read_journal(actor_id);
-            let entries_to_replay: Vec<_> = journal
-                .iter()
-                .filter(|e| e.sequence > snapshot.sequence)
-                .cloned()
-                .collect();
-            for entry in entries_to_replay {
+            // Replay entries that were schema-validated before actor publication.
+            for entry in journal_to_replay {
                 let behavior_idx = entry.behavior_id as usize;
                 let payload: Vec<Value> = entry.payload.iter().map(|p| p.to_value()).collect();
                 if self.has_native_handler(actor_id, behavior_idx) {
