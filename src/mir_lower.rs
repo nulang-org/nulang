@@ -383,7 +383,11 @@ impl ModuleCtx {
 
         if !actor_name_hint.is_empty() {
             let full_name = format!("{}.{}", actor_name_hint, behavior);
-            if let Some(idx) = self.behavior_names.iter().position(|name| *name == full_name) {
+            if let Some(idx) = self
+                .behavior_names
+                .iter()
+                .position(|name| *name == full_name)
+            {
                 return Ok(idx);
             }
         }
