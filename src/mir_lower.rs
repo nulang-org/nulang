@@ -370,21 +370,64 @@ impl ModuleCtx {
             .unwrap_or(self.behaviors.len())
     }
 
-    /// Resolve `send`/`ask actor behavior(...)` to a behavior-table index by
-    /// name. Mirrors the stable compiler's `behavior_table_index`: an exact
-    /// "ActorName.behavior" match first, falling back to any behavior with a
-    /// matching suffix if the receiver expression isn't a bare actor-typed
-    /// variable name (a known ambiguity inherited from the stable compiler,
-    /// not introduced here).
-    fn send_behavior_idx(&self, actor_name_hint: &str, behavior: &str) -> usize {
-        let full_name = format!("{}.{}", actor_name_hint, behavior);
-        if let Some(idx) = self.behavior_names.iter().position(|n| *n == full_name) {
-            return idx;
+    /// Resolve `send`/`ask actor behavior(...)` to a behavior-table index.
+    ///
+    /// Exact qualified identities always win. A unique short-name suffix is
+    /// retained as a compatibility path for dynamic actor references, but an
+    /// ambiguous suffix must fail closed: selecting the first matching actor
+    /// would execute code from the wrong nominal actor schema.
+    ///
+    /// No match keeps the historical out-of-range sentinel for opaque/dynamic
+    /// actor compatibility. Runtime dispatch treats that sentinel as missing
+    /// and must never reinterpret it as behavior 0.
+    fn send_behavior_idx(&self, actor_name_hint: &str, behavior: &str) -> NuResult<usize> {
+        if let Some(idx) = self.behavior_names.iter().position(|n| n == behavior) {
+            return Ok(idx);
         }
+
+        if !actor_name_hint.is_empty() {
+            let full_name = format!("{}.{}", actor_name_hint, behavior);
+            if let Some(idx) = self.behavior_names.iter().position(|n| *n == full_name) {
+                return Ok(idx);
+            }
+        }
+
+        let suffix = format!(".{}", behavior);
+        let candidates: Vec<(usize, &str)> = self
+            .behavior_names
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, name)| name.ends_with(&suffix).then_some((idx, name.as_str())))
+            .collect();
+
+        match candidates.as_slice() {
+            [] => Ok(self.behaviors.len()),
+            [(idx, _)] => Ok(*idx),
+            _ => Err(compile_err(
+                format!(
+                    "ambiguous actor behavior '{}'; candidates: {}. \
+                     The receiver's nominal actor identity must be preserved before MIR lowering",
+                    behavior,
+                    candidates
+                        .iter()
+                        .map(|(_, name)| *name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Span::default(),
+            )),
+        }
+    }
+
+    /// Legacy receive-arm resolver. Selective receive does not yet carry the
+    /// current actor's nominal identity into MIR lowering, so changing its
+    /// behavior-id mapping belongs to the nominal-identity follow-up rather
+    /// than the send/ask containment fix.
+    fn receive_behavior_idx(&self, behavior: &str) -> usize {
         let suffix = format!(".{}", behavior);
         self.behavior_names
             .iter()
-            .position(|n| n.ends_with(&suffix))
+            .position(|name| name == behavior || name.ends_with(&suffix))
             .unwrap_or(self.behaviors.len())
     }
 
@@ -1468,7 +1511,7 @@ impl<'c> FnLowerer<'c> {
                 ..
             } => {
                 let actor_hint = operand_name_hint(actor);
-                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior);
+                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior)?;
                 let actor_id = self.lower_operand(actor)?;
                 let mut arg_ids = Vec::with_capacity(args.len());
                 for a in args {
@@ -1494,7 +1537,7 @@ impl<'c> FnLowerer<'c> {
                 ..
             } => {
                 let actor_hint = operand_name_hint(actor);
-                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior);
+                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior)?;
                 let actor_id = self.lower_operand(actor)?;
                 let mut arg_ids = Vec::with_capacity(args.len());
                 for a in args {
@@ -1690,7 +1733,7 @@ impl<'c> FnLowerer<'c> {
         }
         let behavior_ids: Vec<u16> = arms
             .iter()
-            .map(|(name, _, _, _)| self.ctx.send_behavior_idx("", name) as u16)
+            .map(|(name, _, _, _)| self.ctx.receive_behavior_idx(name) as u16)
             .collect();
         let max_params = arms.iter().map(|(_, p, _, _)| p.len()).max().unwrap_or(0);
         let timeout = match after {
@@ -2896,6 +2939,48 @@ mod tests {
         let hir_module = hir::Module::new("test");
         let mir_module = lower_module(&hir_module).unwrap();
         assert_eq!(mir_module.name, "test");
+    }
+
+    #[test]
+    fn ambiguous_short_behavior_name_fails_closed() {
+        let err = lower_source(
+            r#"
+            actor First {
+                state n: Int = 0
+                behavior hit() { self.n = self.n + 100 }
+            }
+            actor Second {
+                state n: Int = 0
+                behavior hit() { self.n = self.n + 1 }
+            }
+            fn main() {
+                let s = spawn Second {}
+                send s hit()
+            }
+            "#,
+        )
+        .expect_err("ambiguous behavior dispatch must not select the first suffix match");
+        let msg = format!("{err}");
+        assert!(msg.contains("ambiguous actor behavior 'hit'"), "{msg}");
+        assert!(msg.contains("First.hit"), "{msg}");
+        assert!(msg.contains("Second.hit"), "{msg}");
+    }
+
+    #[test]
+    fn unique_short_behavior_name_keeps_compatibility_resolution() {
+        let module = lower_source(
+            r#"
+            actor Counter {
+                behavior hit() { nil }
+            }
+            fn main() {
+                let c = spawn Counter {}
+                send c hit()
+            }
+            "#,
+        )
+        .expect("a unique behavior suffix remains resolvable");
+        assert_eq!(module.behaviors.len(), 1);
     }
 
     // -----------------------------------------------------------------------
