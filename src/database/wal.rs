@@ -3,7 +3,7 @@
 //! The format is intentionally small and self-validating:
 //!
 //! ```text
-//! file := magic ("NUDBWAL1") record*
+//! file := magic ("NUDBWAL2") record*
 //! record := frame_header payload:[u8; payload_len] payload_blake3:[u8; 32]
 //! frame_header := "NREC" frame_version:u16 payload_len:u32 header_blake3:[u8; 32]
 //! ```
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use super::tablet::{MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite};
 
-const WAL_MAGIC: &[u8; 8] = b"NUDBWAL1";
+const WAL_MAGIC: &[u8; 8] = b"NUDBWAL2";
 const WAL_FRAME_MAGIC: &[u8; 4] = b"NREC";
 const WAL_FRAME_VERSION: u16 = 1;
 const WAL_RECORD_VERSION: u16 = 1;
@@ -148,7 +148,7 @@ pub struct FileWal {
 impl FileWal {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
             fs::create_dir_all(parent)?;
         }
 
@@ -680,7 +680,6 @@ impl fmt::Display for WalError {
 
 impl std::error::Error for WalError {}
 
-
 #[cfg(test)]
 mod hardening_tests {
     use super::*;
@@ -737,7 +736,7 @@ mod hardening_tests {
                 .write(true)
                 .open(&path)
                 .unwrap();
-            // File magic (8) + record magic (4) + record version (2) => payload length.
+            // File magic (8) + record magic (4) + frame version (2) => payload length.
             file.seek(SeekFrom::Start(14)).unwrap();
             let mut length = [0_u8; 4];
             std::io::Read::read_exact(&mut file, &mut length).unwrap();
@@ -756,26 +755,59 @@ mod hardening_tests {
     }
 
     #[test]
-    fn append_io_failure_poisons_live_wal_until_reopen() {
-        let path = temp_wal("poison");
+    fn partial_frame_failures_poison_live_wal_and_reopen_truncates_tail() {
+        for failpoint in [AppendFailPoint::AfterHeader, AppendFailPoint::AfterPayload] {
+            let path = temp_wal("partial_poison");
+            let _ = fs::remove_file(&path);
+
+            let mut wal = FileWal::open(&path).unwrap();
+            wal.append_write(&write(0, b"k1")).unwrap();
+            wal.set_append_failpoint_for_test(failpoint);
+
+            assert!(matches!(
+                wal.append_write(&write(1, b"k2")),
+                Err(WalError::Io { .. })
+            ));
+            assert_eq!(
+                wal.append_write(&write(1, b"k3")).unwrap_err(),
+                WalError::Poisoned
+            );
+
+            drop(wal);
+
+            let mut reopened = FileWal::open(&path).unwrap();
+            assert_eq!(reopened.last_sequence(), 1);
+            reopened.append_write(&write(1, b"k4")).unwrap();
+            assert_eq!(reopened.last_sequence(), 2);
+
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn complete_frame_error_before_sync_still_poisons_live_wal() {
+        let path = temp_wal("before_sync");
         let _ = fs::remove_file(&path);
 
         let mut wal = FileWal::open(&path).unwrap();
-        wal.append_write(&write(0, b"k1")).unwrap();
-        wal.set_append_failpoint_for_test(AppendFailPoint::AfterPayload);
+        wal.set_append_failpoint_for_test(AppendFailPoint::AfterChecksum);
 
         assert!(matches!(
-            wal.append_write(&write(1, b"k2")),
+            wal.append_write(&write(0, b"k")),
             Err(WalError::Io { .. })
         ));
-        assert_eq!(wal.append_write(&write(1, b"k3")).unwrap_err(), WalError::Poisoned);
+        assert_eq!(
+            wal.append_write(&write(0, b"retry")).unwrap_err(),
+            WalError::Poisoned
+        );
 
         drop(wal);
 
-        let mut reopened = FileWal::open(&path).unwrap();
+        // A complete frame can be visible on reopen even though no durability
+        // acknowledgement was returned. Recovery, not an in-process retry,
+        // resolves that ambiguous outcome.
+        let reopened = FileWal::open(&path).unwrap();
         assert_eq!(reopened.last_sequence(), 1);
-        reopened.append_write(&write(1, b"k4")).unwrap();
-        assert_eq!(reopened.last_sequence(), 2);
 
         let _ = fs::remove_file(path);
     }
