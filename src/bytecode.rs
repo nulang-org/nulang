@@ -631,7 +631,7 @@ pub enum FfiType {
     Value,
 }
 
-/// A foreign function declared in an `extern "lib" { ... }` block.
+/// A foreign function declared in an `unsafe extern "lib" { ... }` block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ForeignFunctionDef {
     pub library: String,
