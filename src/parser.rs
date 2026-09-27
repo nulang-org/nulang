@@ -8172,6 +8172,31 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_noalloc_annotation_without_parentheses() {
+        let ast = parse("@noalloc\nfn add(a: Int, b: Int) -> Int { a + b }")
+            .expect("@noalloc marker should parse without parentheses");
+        match &ast.decls[0] {
+            Decl::Function { annotations, .. } => assert!(
+                annotations
+                    .iter()
+                    .any(|annotation| matches!(annotation, FunctionAnnotation::NoAlloc)),
+                "function must retain the @noalloc contract"
+            ),
+            other => panic!("expected function declaration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_noalloc_rejects_non_function_declaration() {
+        let err = parse("@noalloc\ntype Id = Int")
+            .expect_err("@noalloc must only annotate functions");
+        assert!(
+            err.to_string().contains("@noalloc may only annotate a function"),
+            "unexpected diagnostic: {err}"
+        );
+    }
+
+    #[test]
     fn test_parse_extern_block() {
         let ast = parse(r#"extern "libm.so.6" { fn sqrt(x: Float) -> Float fn pow(x: Float, y: Float) -> Float }"#).unwrap();
         assert_eq!(ast.decls.len(), 1);
