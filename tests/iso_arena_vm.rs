@@ -186,3 +186,67 @@ fn escaping_allocation_stays_on_heap() {
         "completed activation still resets arena"
     );
 }
+
+
+#[cfg(feature = "native-codegen")]
+#[test]
+fn hot_allocation_loop_jit_preserves_iso_arena_routing() {
+    let stats = Rc::new(RefCell::new(AllocStats::default()));
+    let mut vm = VM::new();
+    vm.set_iso_arena_enabled(true);
+    vm.set_actor_callbacks(Box::new(TrackingCallbacks::new(stats.clone())));
+
+    let mut module = CodeModule::new("jit-iso-arena-routing");
+    let len = module.add_constant(Constant::Int(4));
+    let limit = module.add_constant(Constant::Int(
+        (nulang::jit::HOT_THRESHOLD + 32) as i64,
+    ));
+
+    module.emit(Instruction::new3(
+        OpCode::ConstU,
+        ((len >> 8) & 0xff) as u8,
+        (len & 0xff) as u8,
+        1,
+    )); // 0: r1 = array length
+    module.emit(Instruction::new3(
+        OpCode::ConstU,
+        ((limit >> 8) & 0xff) as u8,
+        (limit & 0xff) as u8,
+        2,
+    )); // 1: r2 = iteration limit
+    module.emit(Instruction::new1(OpCode::Const0, 3)); // 2: counter
+    module.emit(Instruction::new2(OpCode::ArrAlloc, 1, 4)); // 3: local scratch array
+    module.emit(Instruction::new1(OpCode::Const0, 4)); // 4: kill the only alias
+    module.emit(Instruction::new1(OpCode::IInc, 3)); // 5
+    module.emit(Instruction::new3(OpCode::ICmpLt, 3, 2, 5)); // 6
+    module.emit(Instruction {
+        opcode: OpCode::JmpT,
+        op1: 5,
+        op2: 0xff,
+        op3: 0xfc,
+    }); // 7: back-edge to pc 3
+    module.emit(Instruction::new0(OpCode::Halt)); // 8
+    module.entry_point = Some(0);
+
+    vm.load_module(module);
+    vm.run().expect("VM run should succeed");
+
+    assert!(
+        vm.jit_compiled_count() > 0,
+        "the hot loop containing ArrAlloc should compile instead of fragmenting at allocation"
+    );
+    let stats = stats.borrow();
+    assert_eq!(
+        stats.heap_allocs, 0,
+        "both interpreted and JIT executions of the qualifying site must bypass the heap"
+    );
+    assert_eq!(
+        stats.arena_allocs as u64,
+        nulang::jit::HOT_THRESHOLD + 32,
+        "every loop allocation should be served from the activation arena"
+    );
+    assert_eq!(
+        stats.arena_resets, 1,
+        "the activation arena must still reset exactly once after native execution"
+    );
+}
