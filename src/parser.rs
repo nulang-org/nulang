@@ -720,6 +720,28 @@ impl Parser {
 
     // === Declarations ===
 
+    /// `unsafe` is contextual rather than globally reserved: it introduces a
+    /// native ABI declaration only when the next declaration token is `extern`.
+    /// Elsewhere it remains an ordinary identifier.
+    fn is_unsafe_extern_start(&self) -> bool {
+        if !matches!(self.peek_kind(), TokenKind::Ident(name) if name == "unsafe") {
+            return false;
+        }
+        let mut pos = self.pos + 1;
+        while pos < self.tokens.len()
+            && matches!(
+                self.tokens[pos].kind,
+                TokenKind::Newline | TokenKind::DocComment(_)
+            )
+        {
+            pos += 1;
+        }
+        matches!(
+            self.tokens.get(pos).map(|token| &token.kind),
+            Some(TokenKind::Extern)
+        )
+    }
+
     fn parse_decl(&mut self) -> NuResult<Decl> {
         self.local_type_params.clear();
         let _span = self.current_span();
@@ -727,6 +749,14 @@ impl Parser {
         self.skip_newlines();
         let public = self.consume_if(&TokenKind::Pub);
         self.skip_newlines();
+
+        if self.is_unsafe_extern_start() {
+            self.advance(); // contextual `unsafe`
+            self.skip_newlines();
+            debug_assert!(matches!(self.peek_kind(), TokenKind::Extern));
+            return self.parse_extern(public);
+        }
+
         match self.peek_kind() {
             TokenKind::Fn => self.parse_function(public, annotations),
             TokenKind::Actor
@@ -769,18 +799,6 @@ impl Parser {
             }
             TokenKind::Handler => self.parse_named_handler(),
             TokenKind::Effect => self.parse_effect_decl(),
-            TokenKind::Unsafe => {
-                let unsafe_span = self.current_span();
-                self.advance(); // consume 'unsafe'
-                self.skip_newlines();
-                if !matches!(self.peek_kind(), TokenKind::Extern) {
-                    return Err(NuError::parse_error(
-                        "Expected `extern` after `unsafe`",
-                        unsafe_span,
-                    ));
-                }
-                self.parse_extern(public)
-            }
             TokenKind::Extern => {
                 let span = self.current_span();
                 self.advance(); // consume so parse_module preserves this declaration error
@@ -4592,7 +4610,6 @@ impl Parser {
             TokenKind::Database,
             TokenKind::Type,
             TokenKind::Effect,
-            TokenKind::Unsafe,
             TokenKind::Extern,
             TokenKind::Import,
             TokenKind::Module,
@@ -4611,13 +4628,16 @@ impl Parser {
                     return;
                 }
                 let next = self.peek_kind();
-                if SYNC_TOKENS.contains(next) || *next == TokenKind::Eof {
+                if SYNC_TOKENS.contains(next)
+                    || self.is_unsafe_extern_start()
+                    || *next == TokenKind::Eof
+                {
                     self.pos = saved;
                     return;
                 }
                 self.pos = saved;
             }
-            if SYNC_TOKENS.contains(&kind) {
+            if SYNC_TOKENS.contains(&kind) || self.is_unsafe_extern_start() {
                 return;
             }
             // Track brace depth to avoid syncing inside nested blocks
@@ -8189,6 +8209,13 @@ mod tests {
             result.is_err(),
             "Expected parse error for effect op missing arrow"
         );
+    }
+
+    #[test]
+    fn test_unsafe_remains_identifier_outside_extern() {
+        let ast = parse("fn identity(unsafe: Int) -> Int { unsafe }")
+            .expect("unsafe should remain a normal identifier outside unsafe extern");
+        assert_eq!(ast.decls.len(), 1);
     }
 
     #[test]
