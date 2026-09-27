@@ -127,6 +127,7 @@ pub struct FileWal {
     records: Vec<WalRecord>,
     record_end_offsets: Vec<u64>,
     tablet_id: Option<TabletId>,
+    latest_ownership_epoch: Option<u64>,
 }
 
 impl FileWal {
@@ -159,6 +160,7 @@ impl FileWal {
         let mut records = Vec::new();
         let mut record_end_offsets = Vec::new();
         let mut tablet_id = None;
+        let mut latest_ownership_epoch = None;
         let mut last_sequence = 0_u64;
 
         loop {
@@ -209,11 +211,13 @@ impl FileWal {
             validate_record_chain(
                 &record,
                 tablet_id,
+                latest_ownership_epoch,
                 last_sequence,
                 record_start,
             )?;
 
             tablet_id = Some(record.tablet_id);
+            latest_ownership_epoch = Some(record.ownership_epoch);
             last_sequence = record.sequence;
             records.push(record);
             record_end_offsets.push(file.stream_position()?);
@@ -227,6 +231,7 @@ impl FileWal {
             records,
             record_end_offsets,
             tablet_id,
+            latest_ownership_epoch,
         })
     }
 
@@ -265,6 +270,14 @@ impl FileWal {
                 });
             }
         }
+        if let Some(durable_epoch) = self.latest_ownership_epoch {
+            if descriptor.ownership_epoch() < durable_epoch {
+                return Err(WalError::StaleOwnershipEpoch {
+                    durable: durable_epoch,
+                    presented: descriptor.ownership_epoch(),
+                });
+            }
+        }
 
         let mut tablet = MemoryTablet::new(descriptor);
         for record in &self.records {
@@ -291,7 +304,16 @@ impl FileWal {
         let record = WalRecord::from_write(write);
         let last_sequence = self.last_sequence();
 
-        if record.expected_previous_sequence != last_sequence {
+        if let Some(durable_epoch) = latest_ownership_epoch {
+        if record.ownership_epoch < durable_epoch {
+            return Err(WalError::StaleOwnershipEpoch {
+                durable: durable_epoch,
+                presented: record.ownership_epoch,
+            });
+        }
+    }
+
+    if record.expected_previous_sequence != last_sequence {
             return Err(WalError::SequenceMismatch {
                 committed: last_sequence,
                 expected_previous: record.expected_previous_sequence,
@@ -314,6 +336,14 @@ impl FileWal {
                 return Err(WalError::TabletMismatch {
                     expected: existing,
                     presented: record.tablet_id,
+                });
+            }
+        }
+        if let Some(durable_epoch) = self.latest_ownership_epoch {
+            if record.ownership_epoch < durable_epoch {
+                return Err(WalError::StaleOwnershipEpoch {
+                    durable: durable_epoch,
+                    presented: record.ownership_epoch,
                 });
             }
         }
@@ -344,6 +374,7 @@ impl FileWal {
 
         let end = self.file.stream_position()?;
         self.tablet_id = Some(record.tablet_id);
+        self.latest_ownership_epoch = Some(record.ownership_epoch);
         self.records.push(record);
         self.record_end_offsets.push(end);
         Ok(())
@@ -353,6 +384,7 @@ impl FileWal {
 fn validate_record_chain(
     record: &WalRecord,
     expected_tablet: Option<TabletId>,
+    latest_ownership_epoch: Option<u64>,
     last_sequence: u64,
     offset: u64,
 ) -> Result<(), WalError> {
@@ -433,6 +465,10 @@ pub enum WalError {
         expected: TabletId,
         presented: TabletId,
     },
+    StaleOwnershipEpoch {
+        durable: u64,
+        presented: u64,
+    },
     SequenceMismatch {
         committed: u64,
         expected_previous: u64,
@@ -483,6 +519,10 @@ impl fmt::Display for WalError {
                 "WAL tablet mismatch: expected {}, got {}",
                 expected.get(),
                 presented.get()
+            ),
+            Self::StaleOwnershipEpoch { durable, presented } => write!(
+                f,
+                "WAL ownership epoch {presented} is stale; durable epoch is {durable}"
             ),
             Self::SequenceMismatch {
                 committed,
