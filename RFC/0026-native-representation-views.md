@@ -192,18 +192,20 @@ of the existing, concrete Nulang native-FFI projections below:
 | opaque wrapper over one of the above | same as underlying type | same as underlying type | same as underlying type |
 
 This table is the target Phase-1 aggregate ABI and is derived from the existing
-`FfiType -> CType -> libffi::middle::Type` path. Two existing scalar-FFI
-details must be repaired before this table is treated as a stable aggregate
-contract:
+`FfiType -> CType -> libffi::middle::Type` path. Two details are
+load-bearing:
 
-1. **Int range checking.** Nulang's tagged runtime stores a signed 48-bit
-   integer payload even though its foreign call slot is `i64`. Copy-in is
-   lossless for every valid Nulang Int. Copy-out from C must reject values
-   outside `[-2^47, 2^47 - 1]`; masking/truncation is forbidden.
-2. **Bool ABI normalization.** The libffi path currently uses an unsigned
-   one-byte value, while the no-`ffi` fixed-arity fallback is expressed with
-   Rust `bool`. Phase 1 requires one canonical one-byte 0/1 foreign contract
-   across both paths before aggregate layout is enabled.
+1. **Int ABI width is not Int semantic width.** Nulang's tagged runtime stores
+   a signed 48-bit integer payload with defined 48-bit wrapping arithmetic,
+   even though its foreign call slot is `i64`. Copy-in is lossless for every
+   Nulang Int. Copy-out from C must canonicalize the i64 through the same
+   48-bit wrapping rule used by `Value::int`/the VM; the wider slot does not
+   expand Nulang's logical Int domain. A future checked or full-width integer
+   type would be a separate language feature.
+2. **Bool ABI normalization is a prerequisite.** The libffi path currently
+   uses an unsigned one-byte value, while the no-`ffi` fixed-arity fallback
+   is expressed with Rust `bool`. Phase 1 requires one canonical one-byte
+   0/1 foreign contract across both paths before aggregate layout is enabled.
 
 Although scalar FFI calls already support `String` and `Unit`, they are not
 Phase-1 aggregate fields:
@@ -244,9 +246,9 @@ For Phase 1, the boundary semantics are:
    the ABI buffer at the canonical offset;
 2. **native call:** libffi receives the aggregate using the canonical field
    sequence/layout;
-3. **return:** validate every foreign scalar (including the signed 48-bit
-   Nulang Int range), then copy the returned C aggregate into a fresh logical
-   Nulang record field-by-field;
+3. **return:** canonicalize every foreign scalar according to Nulang semantics
+   (including the defined 48-bit wrapping rule for Int), then copy the returned
+   C aggregate into a fresh logical Nulang record field-by-field;
 4. **no borrowed aggregate pointers:** C never receives a pointer into the
    actor heap, and Nulang never retains a pointer into the temporary ABI
    buffer after the call.
