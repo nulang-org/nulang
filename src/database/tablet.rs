@@ -52,21 +52,11 @@ impl KeyRange {
     }
 
     pub fn contains(&self, key: &[u8]) -> bool {
-        key >= self.start.as_slice()
-            && self
-                .end
-                .as_deref()
-                .map(|end| key < end)
-                .unwrap_or(true)
+        key >= self.start.as_slice() && self.end.as_deref().map(|end| key < end).unwrap_or(true)
     }
 
     fn contains_interior_split(&self, key: &[u8]) -> bool {
-        key > self.start.as_slice()
-            && self
-                .end
-                .as_deref()
-                .map(|end| key < end)
-                .unwrap_or(true)
+        key > self.start.as_slice() && self.end.as_deref().map(|end| key < end).unwrap_or(true)
     }
 
     fn split_at(&self, split_key: &[u8]) -> Result<(Self, Self), TabletError> {
@@ -89,11 +79,7 @@ pub struct TabletDescriptor {
 }
 
 impl TabletDescriptor {
-    pub fn new(
-        id: TabletId,
-        range: KeyRange,
-        ownership_epoch: u64,
-    ) -> Result<Self, TabletError> {
+    pub fn new(id: TabletId, range: KeyRange, ownership_epoch: u64) -> Result<Self, TabletError> {
         if ownership_epoch == 0 {
             return Err(TabletError::InvalidOwnershipEpoch);
         }
@@ -265,9 +251,18 @@ pub enum TabletError {
     InvalidOwnershipEpoch,
     SplitKeyOutsideInterior,
     DuplicateChildTablet,
-    EpochNotAdvanced { current: u64, proposed: u64 },
-    StaleEpoch { current: u64, presented: u64 },
-    UnknownEpoch { current: u64, presented: u64 },
+    EpochNotAdvanced {
+        current: u64,
+        proposed: u64,
+    },
+    StaleEpoch {
+        current: u64,
+        presented: u64,
+    },
+    UnknownEpoch {
+        current: u64,
+        presented: u64,
+    },
     SequenceMismatch {
         committed: u64,
         expected_previous: u64,
