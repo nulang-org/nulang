@@ -17,9 +17,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use super::tablet::{
-    MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite,
-};
+use super::tablet::{MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite};
 
 const WAL_MAGIC: &[u8; 8] = b"NUDBWAL1";
 const WAL_RECORD_VERSION: u16 = 1;
@@ -304,16 +302,7 @@ impl FileWal {
         let record = WalRecord::from_write(write);
         let last_sequence = self.last_sequence();
 
-        if let Some(durable_epoch) = latest_ownership_epoch {
-        if record.ownership_epoch < durable_epoch {
-            return Err(WalError::StaleOwnershipEpoch {
-                durable: durable_epoch,
-                presented: record.ownership_epoch,
-            });
-        }
-    }
-
-    if record.expected_previous_sequence != last_sequence {
+        if record.expected_previous_sequence != last_sequence {
             return Err(WalError::SequenceMismatch {
                 committed: last_sequence,
                 expected_previous: record.expected_previous_sequence,
@@ -348,11 +337,10 @@ impl FileWal {
             }
         }
 
-        let payload = serde_json::to_vec(&record.to_disk()).map_err(|error| {
-            WalError::Serialization {
+        let payload =
+            serde_json::to_vec(&record.to_disk()).map_err(|error| WalError::Serialization {
                 message: error.to_string(),
-            }
-        })?;
+            })?;
         if payload.len() > MAX_WAL_RECORD_BYTES {
             return Err(WalError::RecordTooLarge {
                 offset: self.file.stream_position()?,
@@ -393,6 +381,15 @@ fn validate_record_chain(
             return Err(WalError::TabletMismatch {
                 expected,
                 presented: record.tablet_id,
+            });
+        }
+    }
+
+    if let Some(durable_epoch) = latest_ownership_epoch {
+        if record.ownership_epoch < durable_epoch {
+            return Err(WalError::StaleOwnershipEpoch {
+                durable: durable_epoch,
+                presented: record.ownership_epoch,
             });
         }
     }
