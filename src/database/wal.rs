@@ -4,13 +4,15 @@
 //!
 //! ```text
 //! file := magic ("NUDBWAL1") record*
-//! record := payload_len:u32-le payload:[u8; payload_len] blake3:[u8; 32]
+//! record := frame_header payload:[u8; payload_len] payload_blake3:[u8; 32]
+//! frame_header := "NREC" frame_version:u16 payload_len:u32 header_blake3:[u8; 32]
 //! ```
 //!
 //! Payloads are versioned JSON today so the correctness contract can evolve
-//! independently of a future compact binary codec. Checksums are verified
-//! before deserialization, and an incomplete final record is treated as a
-//! crash tail and truncated back to the last complete record.
+//! independently of a future compact binary codec. Both framing metadata and
+//! payload bytes are checksummed before deserialization. An incomplete final
+//! frame is treated as a crash tail and truncated back to the last complete
+//! record, while a complete-but-corrupt frame fails closed.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -150,6 +152,7 @@ impl FileWal {
             fs::create_dir_all(parent)?;
         }
 
+        let file_existed = path.exists();
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -160,6 +163,9 @@ impl FileWal {
         if file.metadata()?.len() == 0 {
             file.write_all(WAL_MAGIC)?;
             file.sync_data()?;
+            if !file_existed {
+                sync_parent_directory(&path)?;
+            }
         } else {
             let mut magic = [0_u8; WAL_MAGIC.len()];
             let read = read_up_to(&mut file, &mut magic)?;
@@ -505,6 +511,22 @@ fn validate_record_chain(
             ),
         });
     }
+
+    Ok(())
+}
+
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        File::open(parent)?.sync_all()?;
+    }
+
+    #[cfg(not(unix))]
+    let _ = path;
 
     Ok(())
 }
