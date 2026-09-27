@@ -61,11 +61,7 @@ fn mvcc_deletes_are_tombstones_without_destroying_older_snapshots() {
     tablet.commit(put).unwrap();
 
     let delete = tablet
-        .prepare_write(
-            1,
-            1,
-            vec![TabletMutation::Delete { key: b"k".to_vec() }],
-        )
+        .prepare_write(1, 1, vec![TabletMutation::Delete { key: b"k".to_vec() }])
         .unwrap();
     tablet.commit(delete).unwrap();
 
