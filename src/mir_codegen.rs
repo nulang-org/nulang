@@ -351,6 +351,26 @@ impl MirCodegen {
         // treat main as the entry point (matching the legacy compiler).
         let effective_main = main_idx.or(user_main_idx);
 
+        // Validate source-level @noalloc against optimized emitted bytecode.
+        // The cost model also follows statically resolved direct calls
+        // transitively and fails closed for unresolved/closure calls.
+        if let Err(violations) = crate::cost_model::validate_noalloc_contracts(mir, &self.module) {
+            let details = violations
+                .iter()
+                .map(|violation| {
+                    format!(
+                        "@noalloc fn '{}': {}",
+                        violation.function, violation.reason
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(compile_err(
+                format!("noalloc contract violation: {}", details),
+                Span::default(),
+            ));
+        }
+
         // Actor behaviors compile through the exact same machinery as
         // ordinary functions, but land in CodeModule.behaviors instead of
         // function_table — Spawn/Send/Ask reference them by index there,
@@ -3324,6 +3344,7 @@ mod tests {
                 effect: crate::types::EffectRow::empty(),
                 cap: crate::types::Capability::Ref,
                 placement: None,
+                no_alloc: false,
                 body: {
                     let mut b = crate::hir::Body::new();
                     b.push(crate::hir::Stmt::Let {
@@ -3368,6 +3389,7 @@ mod tests {
             effect: crate::types::EffectRow::empty(),
             cap: crate::types::Capability::Ref,
             placement: None,
+            no_alloc: false,
             body: {
                 let mut b = crate::hir::Body::new();
                 b.set_terminator(crate::hir::Terminator::Yield(crate::hir::Operand::Var(
@@ -3399,6 +3421,7 @@ mod tests {
             effect: crate::types::EffectRow::empty(),
             cap: crate::types::Capability::Ref,
             placement: None,
+            no_alloc: false,
             body: {
                 let mut b = crate::hir::Body::new();
                 b.set_terminator(crate::hir::Terminator::Yield(crate::hir::Operand::Var(
