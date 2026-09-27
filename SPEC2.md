@@ -40,7 +40,7 @@ This document is the design target for Nulang 2.0. The implementation in this re
 
 - Triple-quoted multi-line strings (`\"\"\"...\"\"\"`) and `\u{...}` unicode escapes: standard escapes processed inside triple-quoted strings; interpolation not supported inside them; surrogate/out-of-range code points rejected with a `LexError` — `src/lexer.rs`. (Stable)
 - The core expression language: literals (`Int`, `Float`, `String`, `Bool`, `Unit`, `Nil`), `let` / `let rec` bindings with `in`, `fn` lambdas, tuples, records, arrays, `if`/`then`/`else`, `match` (wildcard, variable, literal, tuple, record, variant, and `@` alias patterns), blocks, the pipe operator `|>`, and the operator set of Chapter 2.
-- Top-level declarations: `fn` (with `[T]` type parameters, `->` return types, `!` effect rows, `: cap` capability annotations, and `@tool` annotations), `type` (alias, record, and variant forms), `effect`, `actor` / `persistent actor`, `entity`, `organization`, `agent`, `workflow`, `module`, `import`, and `extern` FFI blocks.
+- Top-level declarations: `fn` (with `[T]` type parameters, `->` return types, `!` effect rows, `: cap` capability annotations, and `@tool` annotations), `type` (alias, record, and variant forms), `effect`, `actor` / `persistent actor`, `entity`, `organization`, `agent`, `workflow`, `module`, `import`, and `unsafe extern` FFI blocks.
 - Hindley-Milner type inference (Algorithm W) over tuples, records, variants, arrays, function types carrying effect rows and capabilities, and `&cap T` reference types.
 - Algebraic effects: `perform Effect.op(args)`, `handle body { | Effect.op(x) => value }`, closed and open effect rows written `{IO, FS}` and `{IO, | row}`, enforced `!` annotations on `fn` and `behavior` bodies, and runtime handlers with resume semantics.
 - Reference capabilities `iso`, `trn`, `ref`, `val`, `box`, `tag`, plus `lineariso` with exactly-once consumption tracking. Capabilities are checked at compile time and erased at runtime. Sendability (`lineariso`, `iso`, `val`, `tag`) is enforced for message arguments.
@@ -1798,7 +1798,7 @@ Related expression forms:
 
 ## 7.1 Declaration Overview
 
-Declarations introduce names into the module scope. The supported declaration forms are: function definitions (`fn`), actor definitions (`actor`, `persistent actor`), agent definitions (`agent`), workflow definitions (`workflow`), type definitions (`type`, `type alias`), effect definitions (`effect`), foreign function declarations (`extern`), imports (`import`), and nested modules (`module`).
+Declarations introduce names into the module scope. The supported declaration forms are: function definitions (`fn`), actor definitions (`actor`, `persistent actor`), agent definitions (`agent`), workflow definitions (`workflow`), type definitions (`type`, `type alias`), effect definitions (`effect`), foreign function declarations (`unsafe extern`), imports (`import`), and nested modules (`module`).
 
 A top-level expression that is not a declaration is wrapped by the parser into a synthetic `__main` function, which is what the runtime executes.
 

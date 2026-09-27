@@ -11,9 +11,12 @@
 > `conformance/grammar/` (positive + negative examples) validates the parser
 > against this grammar; see `conformance/README.md` for the check harness.
 >
-> Experimental surface (actors' `@backend`, `workflow`, `agent`, FFI `extern`,
+> Experimental surface (actors' `@backend`, `workflow`, `agent`, FFI `unsafe extern`,
 > Python interop, WIT) is **out of scope** for this grammar and is not part of
 > the frozen or stable language.
+>
+> `unsafe` is a contextual marker for the Experimental `unsafe extern` form;
+> it is not globally reserved and may still be used as an identifier elsewhere.
 >
 > EBNF conventions: `{ X }` = zero or more; `[ X ]` = optional; `X | Y` =
 > alternation; `"tok"` = literal terminal; `(* comment *)`. Newlines and

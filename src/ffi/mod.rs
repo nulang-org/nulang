@@ -72,7 +72,7 @@ mod tests {
         }
 
         let source = r#"
-            extern "__nulang_registered__" {
+            unsafe extern "__nulang_registered__" {
               fn double_int(x: Int) -> Int
             }
             double_int(21)

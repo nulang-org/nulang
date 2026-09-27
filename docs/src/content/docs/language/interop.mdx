@@ -1,6 +1,6 @@
 ---
 title: Python & FFI Interop
-description: Call Python through the built-in Python.* effects and C libraries through extern blocks — two experimental interop surfaces.
+description: Call Python through the built-in Python.* effects and C libraries through unsafe extern blocks — two experimental interop surfaces.
 ---
 import CopyMarkdown from '../../../components/CopyMarkdown.astro';
 
@@ -11,7 +11,7 @@ import CopyMarkdown from '../../../components/CopyMarkdown.astro';
 Nulang has two ways to reach foreign code:
 
 - **Python interop** — built-in `Python.*` effects dispatched by the actor runtime into an embedded CPython interpreter (PyO3).
-- **C FFI** — `extern` blocks that declare functions in shared libraries, plus a stable C API for embedding Nulang in host applications.
+- **C FFI** — `unsafe extern` blocks that explicitly acknowledge ABI trust and declare functions in shared libraries, plus a stable C API for embedding Nulang in host applications.
 
 Both surfaces are **Experimental** tier (see `spec/grammar.ebnf` §4): they work today but may change without an RFC, and each has rough edges called out below. The C FFI path is the more mature of the two.
 
@@ -104,11 +104,11 @@ The FFI has three faces, all in `src/ffi/` behind the default-on `ffi` cargo fea
 
 ### extern blocks
 
-Declare external functions with an `extern "library" { ... }` block. Parameters must have explicit types, a return type is mandatory, and only `Int`, `Float`, `Bool`, `String`, and `Unit` may cross the boundary — anything else is rejected at parse time. The library is resolved lazily at call time:
+Declare external functions with an `unsafe extern "library" { ... }` block. The `unsafe` acknowledgement means the declared C ABI/signature is trusted rather than compiler-verified. Parameters must have explicit types, a return type is mandatory, and only `Int`, `Float`, `Bool`, `String`, and `Unit` may cross the boundary — anything else is rejected at parse time. The library is resolved lazily at call time:
 
 ```nulang
 // Verified with: nulang libm_demo.nula  (Linux, requires libm)
-extern "libm.so.6" {
+unsafe extern "libm.so.6" {
     fn sqrt(x: Float) -> Float
     fn pow(x: Float, y: Float) -> Float
 }
@@ -122,18 +122,18 @@ fn main() {
 
 `String` arguments are copied into temporary C strings for the duration of the call; returned C strings are copied into the Nulang heap.
 
-An `extern` block **without** a library string targets `__nulang_registered__` — functions registered in-process by the host via the Rust API `ffi::register_native_function` or the C API `nulang_register_native_function`:
+An `unsafe extern` block **without** a library string targets `__nulang_registered__` — functions registered in-process by the host via the Rust API `ffi::register_native_function` or the C API `nulang_register_native_function`:
 
 ```nulang
 // fragment — the host must register `host_lookup` before running
-extern {
+unsafe extern {
     fn host_lookup(key: String) -> String
 }
 ```
 
 ### Sandboxing and authority
 
-For untrusted programs, the CLI offers an allowlist: `--ffi-sandbox --ffi-allow libm.so.6` restricts `extern` calls to named libraries (and pre-registered functions). When actor behavior code makes FFI calls, each call additionally requires an exact authority grant naming the library and symbol — `spawn Worker {} with [FFI::Call("libm.so.6::cbrt")]` — so permission to call one symbol cannot authorize another.
+For untrusted programs, the CLI offers an allowlist: `--ffi-sandbox --ffi-allow libm.so.6` restricts FFI calls declared by `unsafe extern` to named libraries (and pre-registered functions). When actor behavior code makes FFI calls, each call additionally requires an exact authority grant naming the library and symbol — `spawn Worker {} with [FFI::Call("libm.so.6::cbrt")]` — so permission to call one symbol cannot authorize another.
 
 ### Embedding Nulang in C
 

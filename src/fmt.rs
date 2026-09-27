@@ -249,7 +249,7 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             }
         }
         Decl::Extern { library, funcs, .. } => {
-            out.push_str(&format!("{}extern \"{}\" {{\n", sp, library));
+            out.push_str(&format!("{}unsafe extern \"{}\" {{\n", sp, library));
             for f in funcs {
                 out.push_str(&format!("{}    fn {}(", sp, f.name));
                 for (j, (pn, pt)) in f.params.iter().enumerate() {
@@ -1333,11 +1333,11 @@ impl Eq Int {
 
     #[test]
     fn test_fmt_extern() {
-        let src = r#"extern "libm.so.6" {
+        let src = r#"unsafe extern "libm.so.6" {
     fn sqrt(x: Float) -> Float
 }"#;
         let out = format_source(src).expect("extern formats");
-        assert!(out.contains("extern \"libm.so.6\" {"), "got: {out}");
+        assert!(out.contains("unsafe extern \"libm.so.6\" {"), "got: {out}");
         assert!(out.contains("fn sqrt(x: Float) -> Float"), "got: {out}");
         assert_idempotent(src);
     }

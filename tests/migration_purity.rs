@@ -29,7 +29,7 @@ fn migration_cannot_launder_perform_through_handler() {
 #[test]
 fn migration_rejects_direct_extern_call() {
     let source = r#"
-        extern "libm.so.6" { fn sqrt(x: Float) -> Float }
+        unsafe extern "libm.so.6" { fn sqrt(x: Float) -> Float }
         entity Counter {
             version: 2
             state value: Float = 0.0

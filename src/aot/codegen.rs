@@ -5253,7 +5253,7 @@ mod tests {
 
     #[test]
     fn test_aot_ffi_call() {
-        // `extern { fn double_int(x: Int) -> Int }` invoked from AOT-compiled
+        // `unsafe extern { fn double_int(x: Int) -> Int }` invoked from AOT-compiled
         // code must resolve the pre-registered native function through the
         // global FFI registry (the same resolve_or_load + call_native path the
         // bytecode FFICall opcode uses) and deliver its result.

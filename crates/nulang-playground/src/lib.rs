@@ -80,10 +80,10 @@ pub mod core_vm;
 
 // -- Native-only shims -------------------------------------------------------
 //
-// `mir_codegen` maps Nulang types onto FFI types for `extern` declarations.
+// `mir_codegen` maps Nulang types onto FFI types for `unsafe extern` declarations.
 // The real mapping lives in `src/ffi/marshal.rs` alongside libloading-based
 // native calls, which cannot exist in a browser. The pure type mapping is
-// reproduced here (same logic, same types) so `extern` declarations still
+// reproduced here (same logic, same types) so `unsafe extern` declarations still
 // type-check and compile; actually *calling* a native function is rejected
 // by the CoreVM, which has no FFI.
 
