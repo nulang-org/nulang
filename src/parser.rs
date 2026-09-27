@@ -727,6 +727,16 @@ impl Parser {
         self.skip_newlines();
         let public = self.consume_if(&TokenKind::Pub);
         self.skip_newlines();
+        if annotations
+            .iter()
+            .any(|annotation| matches!(annotation, FunctionAnnotation::NoAlloc))
+            && !matches!(self.peek_kind(), TokenKind::Fn)
+        {
+            return Err(NuError::parse_error(
+                "@noalloc may only annotate a function declaration".to_string(),
+                self.current_span(),
+            ));
+        }
         match self.peek_kind() {
             TokenKind::Fn => self.parse_function(public, annotations),
             TokenKind::Actor
@@ -829,6 +839,13 @@ impl Parser {
                     ));
                 }
             };
+            // Marker annotations intentionally do not need empty parentheses.
+            // Keep accepting `@noalloc()` for tools that normalize annotations.
+            if name == "noalloc" && !self.match_token(&TokenKind::LParen) {
+                annotations.push(FunctionAnnotation::NoAlloc);
+                self.skip_newlines();
+                continue;
+            }
             self.expect(TokenKind::LParen)?;
             let mut fields: FxHashMap<String, String> = FxHashMap::default();
             self.skip_newlines();
@@ -877,6 +894,15 @@ impl Parser {
                         .map(|(k, v)| if k.is_empty() { v } else { k })
                         .collect();
                     annotations.push(FunctionAnnotation::Derive(names));
+                }
+                "noalloc" => {
+                    if !fields.is_empty() {
+                        return Err(NuError::parse_error(
+                            "@noalloc does not accept arguments".to_string(),
+                            self.current_span(),
+                        ));
+                    }
+                    annotations.push(FunctionAnnotation::NoAlloc);
                 }
                 "placement" => {
                     let value = fields.remove("").unwrap_or_default();
