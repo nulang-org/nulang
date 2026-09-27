@@ -3075,6 +3075,24 @@ mod tests {
     }
 
     #[test]
+    fn test_wasm_backend_cannot_bypass_noalloc_contract() {
+        let err = compile_source(
+            r#"
+@noalloc
+fn make() { [1, 2, 3] }
+
+fn main() -> Int { 0 }
+"#,
+        )
+        .expect_err("WASM backend must enforce the canonical @noalloc proof");
+
+        assert!(
+            err.to_string().contains("noalloc contract violation"),
+            "unexpected WASM @noalloc diagnostic: {err}"
+        );
+    }
+
+    #[test]
     fn test_compile_literal_int() {
         let wasm = compile_source("42").expect("compile");
         assert_eq!(&wasm[0..4], b"\0asm");
