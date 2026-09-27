@@ -147,7 +147,6 @@ fn wal_fails_closed_on_checksum_corruption() {
     let _ = fs::remove_file(path);
 }
 
-
 #[test]
 fn wal_replay_reconstructs_mvcc_snapshots_after_restart() {
     let path = temp_wal("replay");
