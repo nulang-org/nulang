@@ -23,7 +23,8 @@ use std::time::Instant;
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::runtime::{
-    Mailbox, Message, MessagePayload, MessagePriority, Runtime, RuntimeVmCallbacks,
+    Actor, ActorState, Mailbox, Message, MessagePayload, MessagePriority, Runtime,
+    RuntimeVmCallbacks,
 };
 use crate::typechecker::TypeChecker;
 use crate::vm::{Value, VM};
@@ -73,7 +74,7 @@ fn report_ab(name: &str, operations: u64, elapsed: std::time::Duration) {
     );
 }
 
-fn ab_noop_handler(_actor: &mut crate::runtime::Actor, _args: &[Value]) {}
+fn ab_noop_handler(_actor: &mut Actor, _args: &[Value]) {}
 
 /// Lower-bound local mailbox admission probe for one inline primitive value.
 ///
@@ -156,6 +157,152 @@ fn bench_ab_enqueue_payload_sweep() {
             .mailbox
             .is_empty());
     }
+}
+
+/// Host-wide ideal shard-scaling probe over a fixed amount of local actor work.
+///
+/// The ordinary A/B harness pins child processes to one logical CPU; this probe
+/// is therefore opt-in and is run separately without CPU affinity. It measures
+/// independent shard schedulers draining equal shares of a fixed 200k-message
+/// workload. There is deliberately no cross-shard traffic here: the result is
+/// the runtime's local-shard parallelism ceiling, not an end-to-end routing
+/// benchmark.
+#[test]
+fn bench_ab_shard_scaling() {
+    if std::env::var("NULANG_BENCH_SHARD_SCALING").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    const TOTAL_MESSAGES: usize = 200_000;
+    const ACTORS_PER_SHARD: usize = 32;
+
+    for shard_count in [1usize, 2, 4, 8] {
+        let mut shards = Runtime::new_sharded(shard_count);
+        let mut actor_ids_by_shard = Vec::with_capacity(shard_count);
+
+        for (shard_idx, shard) in shards.iter_mut().enumerate() {
+            let mut actor_ids = Vec::with_capacity(ACTORS_PER_SHARD);
+            for actor_index in 0..ACTORS_PER_SHARD {
+                // Choose ids that satisfy the production ownership invariant:
+                // actor_id % shard_count == shard_idx.
+                let actor_id = ((actor_index + 1) * shard_count + shard_idx) as u64;
+                let mut actor = Actor::new(
+                    actor_id,
+                    format!("bench_scale_{shard_idx}_{actor_index}"),
+                    0,
+                );
+                actor.state = ActorState::Running;
+                actor.register_behavior("handle", ab_noop_handler);
+                shard.actors.insert(actor_id, actor);
+                actor_ids.push(actor_id);
+            }
+            actor_ids_by_shard.push(actor_ids);
+        }
+
+        let messages_per_shard = TOTAL_MESSAGES / shard_count;
+        for (shard_idx, shard) in shards.iter_mut().enumerate() {
+            let actor_ids = &actor_ids_by_shard[shard_idx];
+            for message_index in 0..messages_per_shard {
+                let actor_id = actor_ids[message_index % actor_ids.len()];
+                shard.send_message_by_id(actor_id, 0, &[]);
+            }
+        }
+
+        let start = Instant::now();
+        let shards = std::thread::scope(|scope| {
+            let handles: Vec<_> = shards
+                .into_iter()
+                .map(|mut shard| {
+                    scope.spawn(move || {
+                        shard.run_scheduler();
+                        shard
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("shard benchmark worker panicked"))
+                .collect::<Vec<_>>()
+        });
+        let elapsed = start.elapsed();
+
+        let processed: u64 = shards
+            .iter()
+            .flat_map(|shard| shard.actors.values())
+            .map(|actor| actor.reduction_count as u64)
+            .sum();
+        assert_eq!(
+            processed,
+            TOTAL_MESSAGES as u64,
+            "shard scaling probe must process every admitted message"
+        );
+
+        println!(
+            "[scale-bench] benchmark=actor_drain shards={shard_count} operations={TOTAL_MESSAGES} elapsed_ns={}",
+            elapsed.as_nanos()
+        );
+    }
+}
+
+#[cfg(feature = "native-codegen")]
+#[test]
+fn bench_ab_jit_transition_floor() {
+    const TRIPS: usize = 100_000;
+    const REPEATS: usize = 10;
+
+    // Keep the hot region intentionally tiny. Once warmed, most useful work per
+    // loop iteration is two increments, so the result is sensitive to the
+    // current native-transition machinery (including the conservative register
+    // snapshot) without pretending to isolate one memcpy in artificial code.
+    let source = format!(
+        "var x = 0; var i = 0; while i < {TRIPS} {{ x = x + 1; i = i + 1; }}; x"
+    );
+    let tokens = Lexer::new(&source).lex().expect("bench: lex failed");
+    let ast = Parser::new(tokens)
+        .parse_module()
+        .expect("bench: parse failed");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("bench: typecheck failed");
+    let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = crate::mir_lower::lower_module(&hir).expect("bench: MIR lower failed");
+    let module = crate::mir_codegen::compile_mir(&mut mir, "bench-ab-jit-transition")
+        .expect("bench: codegen failed");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module.clone());
+    let warm_result = jit_vm.run().expect("bench: JIT warmup failed");
+    assert_eq!(warm_result.as_int(), Some(TRIPS as i64));
+
+    let jit_start = Instant::now();
+    let mut jit_result = None;
+    for _ in 0..REPEATS {
+        jit_result = Some(jit_vm.run().expect("bench: warmed JIT run failed"));
+    }
+    let jit_elapsed = jit_start.elapsed();
+
+    let mut interp_vm = VM::new_without_jit();
+    interp_vm.load_module(module);
+    let interp_start = Instant::now();
+    let mut interp_result = None;
+    for _ in 0..REPEATS {
+        interp_result = Some(
+            interp_vm
+                .run()
+                .expect("bench: interpreter transition control failed"),
+        );
+    }
+    let interp_elapsed = interp_start.elapsed();
+
+    assert_eq!(
+        jit_result.and_then(|value| value.as_int()),
+        interp_result.and_then(|value| value.as_int()),
+        "tiny-region JIT probe must preserve interpreter parity"
+    );
+
+    let operations = (TRIPS * REPEATS) as u64;
+    report_ab("jit_transition_tiny_warm", operations, jit_elapsed);
+    report_ab("jit_transition_tiny_interp", operations, interp_elapsed);
 }
 
 #[cfg(feature = "native-codegen")]
