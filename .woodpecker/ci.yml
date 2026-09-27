@@ -10,6 +10,7 @@ when:
   - event: push
     branch: main
   - event: manual
+    evaluate: 'NULANG_VERIFICATION_LANE == "ci" || NULANG_VERIFICATION_LANE == "all"'
 
 variables:
   rust-base: &rust-base
