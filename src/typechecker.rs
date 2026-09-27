@@ -5479,7 +5479,7 @@ extern "__nulang_registered__" {
     fn test_ffi_rejects_opaque_non_scalar_newtype() {
         let result = check_src(
             r#"
-opaque type Header = { tag: Int }
+opaque type Header = { value: Int }
 extern "__nulang_registered__" {
     fn echo_header(x: Header) -> Header
 }
