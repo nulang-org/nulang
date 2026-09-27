@@ -3375,11 +3375,12 @@ impl VM {
                 if let Some(module) = self.modules.get(module_idx) {
                     if pc >= module.instructions.len() {
                         // PC past end — program complete
-                        return self.finish_activation(self
-                            .frames
-                            .get(idx)
-                            .map(|f| f.regs[0])
-                            .unwrap_or(Value::unit()));
+                        return self.finish_activation(
+                            self.frames
+                                .get(idx)
+                                .map(|f| f.regs[0])
+                                .unwrap_or(Value::unit()),
+                        );
                     }
                     // Check if next instruction is Halt
                     if module
@@ -3389,11 +3390,12 @@ impl VM {
                         .unwrap_or(false)
                     {
                         self.frames[idx].pc += 1;
-                        return self.finish_activation(self
-                            .frames
-                            .get(idx)
-                            .map(|f| f.regs[0])
-                            .unwrap_or(Value::unit()));
+                        return self.finish_activation(
+                            self.frames
+                                .get(idx)
+                                .map(|f| f.regs[0])
+                                .unwrap_or(Value::unit()),
+                        );
                     }
                 } else {
                     return self.finish_activation(Value::unit());
@@ -3405,11 +3407,12 @@ impl VM {
             match self.step() {
                 Ok(()) => {}
                 Err(NuError::VMError { msg, span: _ }) if msg == "Halt" => {
-                    return self.finish_activation(self
-                        .current_frame_idx
-                        .and_then(|i| self.frames.get(i))
-                        .map(|f| f.regs[0])
-                        .unwrap_or(Value::unit()));
+                    return self.finish_activation(
+                        self.current_frame_idx
+                            .and_then(|i| self.frames.get(i))
+                            .map(|f| f.regs[0])
+                            .unwrap_or(Value::unit()),
+                    );
                 }
                 Err(NuError::VMError { msg, span }) => {
                     return Err(NuError::VMError {
@@ -3481,11 +3484,12 @@ impl VM {
                     }
                 }
                 Err(NuError::VMError { msg, span: _ }) if msg == "Halt" => {
-                    return self.finish_activation(self
-                        .current_frame_idx
-                        .and_then(|i| self.frames.get(i))
-                        .map(|f| f.regs[0])
-                        .unwrap_or(Value::unit()));
+                    return self.finish_activation(
+                        self.current_frame_idx
+                            .and_then(|i| self.frames.get(i))
+                            .map(|f| f.regs[0])
+                            .unwrap_or(Value::unit()),
+                    );
                 }
                 Err(NuError::VMError { msg, span }) => {
                     return Err(NuError::VMError {
@@ -3539,11 +3543,12 @@ impl VM {
                 let pc = self.frames[idx].pc;
                 if let Some(module) = self.modules.get(m_idx) {
                     if pc >= module.instructions.len() {
-                        return self.finish_activation(self
-                            .current_frame_idx
-                            .and_then(|i| self.frames.get(i))
-                            .map(|f| f.regs[0])
-                            .unwrap_or(Value::unit()));
+                        return self.finish_activation(
+                            self.current_frame_idx
+                                .and_then(|i| self.frames.get(i))
+                                .map(|f| f.regs[0])
+                                .unwrap_or(Value::unit()),
+                        );
                     }
                     if module
                         .instructions
@@ -3552,11 +3557,12 @@ impl VM {
                         .unwrap_or(false)
                     {
                         self.frames[idx].pc += 1;
-                        return self.finish_activation(self
-                            .current_frame_idx
-                            .and_then(|i| self.frames.get(i))
-                            .map(|f| f.regs[0])
-                            .unwrap_or(Value::unit()));
+                        return self.finish_activation(
+                            self.current_frame_idx
+                                .and_then(|i| self.frames.get(i))
+                                .map(|f| f.regs[0])
+                                .unwrap_or(Value::unit()),
+                        );
                     }
                 } else {
                     return self.finish_activation(Value::unit());
@@ -3572,11 +3578,12 @@ impl VM {
                     }
                 }
                 Err(NuError::VMError { msg, span: _ }) if msg == "Halt" => {
-                    return self.finish_activation(self
-                        .current_frame_idx
-                        .and_then(|i| self.frames.get(i))
-                        .map(|f| f.regs[0])
-                        .unwrap_or(Value::unit()));
+                    return self.finish_activation(
+                        self.current_frame_idx
+                            .and_then(|i| self.frames.get(i))
+                            .map(|f| f.regs[0])
+                            .unwrap_or(Value::unit()),
+                    );
                 }
                 Err(NuError::VMError { msg, span }) => {
                     return Err(NuError::VMError {
@@ -5600,8 +5607,7 @@ impl VM {
                 } else {
                     self.actor_callbacks.alloc(size, HeapTypeTag::Array)
                 };
-                frame.regs[instr.op2 as usize] = if let Some(ptr) = allocation
-                {
+                frame.regs[instr.op2 as usize] = if let Some(ptr) = allocation {
                     unsafe {
                         let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, len);
                         for slot in slots.iter_mut() {
@@ -5648,8 +5654,7 @@ impl VM {
                 } else {
                     self.actor_callbacks.alloc(size, HeapTypeTag::Record)
                 };
-                frame.regs[instr.op2 as usize] = if let Some(ptr) = allocation
-                {
+                frame.regs[instr.op2 as usize] = if let Some(ptr) = allocation {
                     unsafe {
                         let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, slot_count);
                         for slot in slots.iter_mut() {
@@ -5686,8 +5691,7 @@ impl VM {
                 } else {
                     self.actor_callbacks.alloc(size, HeapTypeTag::Tuple)
                 };
-                frame.regs[instr.op2 as usize] = if let Some(ptr) = allocation
-                {
+                frame.regs[instr.op2 as usize] = if let Some(ptr) = allocation {
                     unsafe {
                         let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, count);
                         for slot in slots.iter_mut() {
