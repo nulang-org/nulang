@@ -99,12 +99,7 @@ fn execution_artifacts_are_reference_based_and_preserve_usage_and_tool_state() {
 fn sessions_runs_changesets_and_usage_have_stable_default_states() {
     let session = AgentSession::new("project-a", "agent-7", "smart");
     let run = AgentRun::new(session.id, None, 1);
-    let change = ChangeSet::new(
-        Uuid::new_v4(),
-        "workspace-42",
-        "rev-base",
-        vec![],
-    );
+    let change = ChangeSet::new(Uuid::new_v4(), "workspace-42", "rev-base", vec![]);
     let usage = Usage::default();
 
     assert_eq!(session.status, SessionStatus::Created);
