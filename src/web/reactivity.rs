@@ -58,8 +58,9 @@ impl SignalGraph {
     }
 }
 
-/// One statically discovered web component and the execution environment its
-/// function requires after transitive effect inference.
+/// One statically discovered web component and its intrinsic execution
+/// environment. Child components stay separate so they can become islands
+/// instead of forcing the parent into the child's placement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentNode {
     pub name: String,
@@ -81,9 +82,10 @@ pub struct ComponentGraph {
 ///
 /// Components are functions whose names are capitalized or functions referenced
 /// by a capitalized component call. Placement uses explicit `@placement`
-/// annotations first, then the effect checker's transitive row, then a declared
-/// row as a fallback. Pure components intentionally retain `None` so the
-/// future island planner can inherit the surrounding static context.
+/// annotations first, then the effect checker's row, then a declared row as a
+/// fallback. In component context an otherwise-pure component is static by
+/// default; child placement is represented by graph edges rather than promoted
+/// into the parent.
 pub fn analyze_component_graph(
     module: &AstModule,
     checker: Option<&EffectChecker>,
@@ -165,7 +167,7 @@ fn collect_component_nodes(
 
                 out.push(ComponentNode {
                     name: name.clone(),
-                    placement: explicit.or(inferred),
+                    placement: Some(explicit.or(inferred).unwrap_or(Placement::Static)),
                     children,
                 });
             }
@@ -178,10 +180,8 @@ fn collect_component_nodes(
 }
 
 fn collect_component_calls(expr: &Expr, out: &mut BTreeSet<String>) {
-    if let Expr::App { func, .. } = expr {
-        if let Some(name) = component_name(func) {
-            out.insert(name);
-        }
+    if let Some(name) = component_call_name(expr) {
+        out.insert(name);
     }
 
     match expr {
@@ -323,6 +323,20 @@ fn collect_component_calls(expr: &Expr, out: &mut BTreeSet<String>) {
             collect_component_calls(node, out);
         }
         _ => {}
+    }
+}
+
+fn component_call_name(expr: &Expr) -> Option<String> {
+    match expr {
+        // JSX currently lowers every tag to el("tag", attrs, children).
+        // Preserve capitalized-tag identity here so compiler planning can see
+        // component boundaries even before the parser grows a dedicated
+        // component-call AST node.
+        Expr::App { func, args, .. } if is_var(func, "el") && args.len() == 3 => {
+            string_literal(&args[0]).filter(|name| is_component_identifier(name))
+        }
+        Expr::App { func, .. } => component_name(func),
+        _ => None,
     }
 }
 
@@ -1294,7 +1308,9 @@ fn Dashboard() -> Html {
             dashboard.children,
             vec!["ServerPanel".to_string(), "StaticCard".to_string()]
         );
-        assert_eq!(dashboard.placement, Some(Placement::Server));
+        // A server child is an island boundary; it must not force the static
+        // shell itself onto the server.
+        assert_eq!(dashboard.placement, Some(Placement::Static));
         assert_eq!(static_card.placement, Some(Placement::Static));
         assert_eq!(server_panel.placement, Some(Placement::Server));
     }
