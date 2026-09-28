@@ -204,3 +204,34 @@ fn repeated_checkpoints_preserve_tombstone_history_and_advance_the_wal_anchor() 
     let _ = fs::remove_file(wal_path);
     let _ = fs::remove_file(checkpoint_path);
 }
+
+
+#[test]
+fn incomplete_checkpoint_temp_file_is_ignored_after_crash_before_rename() {
+    let (wal_path, checkpoint_path) = paths("temp_crash");
+    let _ = fs::remove_file(&wal_path);
+    let _ = fs::remove_file(&checkpoint_path);
+
+    {
+        let mut tablet =
+            WalBackedTablet::open_with_checkpoint(descriptor(), &wal_path, &checkpoint_path)
+                .unwrap();
+        put(&mut tablet, b"k", b"v1");
+        tablet.checkpoint(&checkpoint_path).unwrap();
+        put(&mut tablet, b"k", b"v2");
+    }
+
+    let checkpoint_name = checkpoint_path.file_name().unwrap().to_string_lossy();
+    let temp_path = checkpoint_path.with_file_name(format!(".{checkpoint_name}.tmp"));
+    fs::write(&temp_path, b"partial checkpoint bytes").unwrap();
+
+    let tablet =
+        WalBackedTablet::open_with_checkpoint(descriptor(), &wal_path, &checkpoint_path).unwrap();
+    assert_eq!(tablet.current_sequence(), 2);
+    assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
+    assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
+
+    let _ = fs::remove_file(wal_path);
+    let _ = fs::remove_file(checkpoint_path);
+    let _ = fs::remove_file(temp_path);
+}
