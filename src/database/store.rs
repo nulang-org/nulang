@@ -100,10 +100,7 @@ impl WalBackedTablet {
     /// Reclamation happens only after checkpoint publication succeeds. If
     /// reclamation fails, the durable checkpoint plus the unreclaimed WAL
     /// remains a valid recovery state.
-    pub fn checkpoint(
-        &mut self,
-        checkpoint_path: impl AsRef<Path>,
-    ) -> Result<u64, WalBackedError> {
+    pub fn checkpoint(&mut self, checkpoint_path: impl AsRef<Path>) -> Result<u64, WalBackedError> {
         if self.wal.is_poisoned() {
             return Err(WalError::Poisoned.into());
         }
