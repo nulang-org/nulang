@@ -441,5 +441,4 @@ mod tests {
         assert!(json.contains(&attempt_id.to_string()));
         assert!(json.contains(""lease_epoch":9"));
     }
-
 }
