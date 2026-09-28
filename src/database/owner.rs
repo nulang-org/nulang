@@ -99,11 +99,7 @@ impl TabletOwner {
         matches!(self.state, TabletOwnerState::Draining { .. }) && self.queue.is_empty()
     }
 
-    pub fn read_at(
-        &self,
-        key: &[u8],
-        snapshot: u64,
-    ) -> Result<Option<&[u8]>, TabletOwnerError> {
+    pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletOwnerError> {
         if self.state == TabletOwnerState::Faulted {
             return Err(TabletOwnerError::Faulted);
         }
