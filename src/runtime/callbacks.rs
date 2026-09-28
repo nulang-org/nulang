@@ -405,6 +405,14 @@ pub(crate) fn perform_web_builtin(
             out.push('>');
             Some(callbacks.alloc_string(&out))
         }
+        Some("fragment") => {
+            let children = read_array(callbacks, *regs.first()?);
+            let mut out = String::new();
+            for child in &children {
+                out.push_str(&resolve(constants, *child));
+            }
+            Some(callbacks.alloc_string(&out))
+        }
         Some("text") => {
             let s = resolve(constants, *regs.first()?);
             Some(callbacks.alloc_string(&html_escape(&s)))
