@@ -3071,6 +3071,14 @@ impl VM {
             .unwrap_or(0)
     }
 
+    /// Number of separately compiled native leaf thunks used by direct calls.
+    pub fn jit_native_leaf_compiled_count(&self) -> usize {
+        self.jit_session
+            .as_ref()
+            .map(|jit| jit.native_leaf_compiled_count())
+            .unwrap_or(0)
+    }
+
     /// Compiler-only telemetry for this VM's JIT session.
     ///
     /// This excludes interpreter warm-up and generated-code execution time.
