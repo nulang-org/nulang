@@ -78,6 +78,74 @@ pub struct ComponentGraph {
     pub components: Vec<ComponentNode>,
 }
 
+
+/// Client/server execution boundary selected by the component planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IslandPlacement {
+    Client,
+    Server,
+}
+
+/// A child component that must execute outside its parent's environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IslandBoundary {
+    pub parent: String,
+    pub component: String,
+    pub placement: IslandPlacement,
+}
+
+/// Select the minimal client/server island boundaries from a component graph.
+///
+/// Static children never require a runtime boundary. Client and server-like
+/// children become islands only when their parent is not already executing in
+/// the same environment, which naturally coalesces nested components that share
+/// a placement into one island.
+pub fn plan_component_islands(graph: &ComponentGraph) -> Vec<IslandBoundary> {
+    let by_name: BTreeMap<&str, &ComponentNode> = graph
+        .components
+        .iter()
+        .map(|component| (component.name.as_str(), component))
+        .collect();
+    let mut islands = Vec::new();
+
+    for parent in &graph.components {
+        let parent_placement = runtime_island_placement(parent.placement);
+        for child_name in &parent.children {
+            let Some(child) = by_name.get(child_name.as_str()) else {
+                continue;
+            };
+            let child_placement = runtime_island_placement(child.placement);
+            let Some(placement) = child_placement else {
+                continue;
+            };
+            if parent_placement == Some(placement) {
+                continue;
+            }
+            islands.push(IslandBoundary {
+                parent: parent.name.clone(),
+                component: child.name.clone(),
+                placement,
+            });
+        }
+    }
+
+    islands.sort_by(|a, b| {
+        (&a.parent, &a.component).cmp(&(&b.parent, &b.component))
+    });
+    islands
+}
+
+fn runtime_island_placement(placement: Option<Placement>) -> Option<IslandPlacement> {
+    match placement {
+        Some(Placement::Client) => Some(IslandPlacement::Client),
+        Some(Placement::Server | Placement::Edge | Placement::Actor | Placement::Workflow) => {
+            Some(IslandPlacement::Server)
+        }
+        Some(Placement::Static) | None => None,
+    }
+}
+
 /// Build a deterministic component call graph from a parsed module.
 ///
 /// Components are functions whose names are capitalized or functions referenced
