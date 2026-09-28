@@ -353,7 +353,7 @@ fn collect_component_calls(
         Expr::Handle { body, handlers, .. } => {
             collect_component_calls(body, component_names, out);
             for handler in handlers {
-                collect_component_calls(&handler.body, out);
+                collect_component_calls(&handler.body, component_names, out);
             }
         }
         Expr::Perform { args, .. } | Expr::Emit { args, .. } => {
