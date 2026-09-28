@@ -1,4 +1,12 @@
 # Nulang Changelog
+### JIT iso-arena composite allocation — 2026-09-27
+- **Hot Cranelift regions may now include `ArrAlloc`, `RecMk`, and `TupleMk` without fragmenting back to the interpreter.** Native lowering calls a PC-aware allocation helper that reuses the VM's existing escape-analysis decision instead of maintaining a second native-only analysis.
+- **Native allocation preserves interpreter placement semantics.** Qualifying sites use the activation-local iso arena, non-qualifying sites use the ordinary heap, missing arena support falls back to the heap, and newly allocated composite slots remain nil-initialized.
+
+### Activation-local composite allocation — 2026-09-27
+- **Proven activation-local arrays, records, and tuples can now use the actor iso arena instead of the ORCA heap.** The VM reuses the existing conservative escape analysis at bytecode allocation sites, keeps escaping values heap-backed, and falls back to the normal heap when an embedder has no arena allocator.
+- **Arena lifetime follows behavior activation lifetime.** Normal completion resets the bump arena in O(1), while suspension and JIT yield preserve arena contents until the activation actually completes.
+
 ### Node-shared immutable object store — 2026-09-27
 - **Immutable object-store payloads are now shared across runtime shards without copying their bytes.** `TAG_OBJECT` handles keep a single node-local allocation while actor-lifetime holds protect queued and delivered messages; duplicate deliveries no longer over-increment object references.
 - **Cross-node object transport remains explicit and compatible.** Remote sends still serialize object bytes and intern a fresh local object on the receiving node, while actor heaps and ORCA ownership remain shard-confined.
