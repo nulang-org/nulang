@@ -4657,12 +4657,12 @@ impl Parser {
 
     fn parse_html_text_run(&mut self) -> NuResult<String> {
         let first_span = self.current_span();
-        let first_start = first_span.start;
+        let first_start = first_span.start as usize;
         let previous_end = self
             .pos
             .checked_sub(1)
             .and_then(|index| self.tokens.get(index))
-            .map(|token| token.span.end)
+            .map(|token| token.span.end as usize)
             .unwrap_or(first_start);
 
         let mut end = first_start;
@@ -4672,7 +4672,7 @@ impl Parser {
                 TokenKind::Lt | TokenKind::LBrace | TokenKind::Newline
             )
         {
-            end = self.advance_token().span.end;
+            end = self.advance_token().span.end as usize;
         }
 
         if end <= first_start {
