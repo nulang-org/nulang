@@ -1908,7 +1908,7 @@ fn fold_one_const(
 #[derive(Clone)]
 enum ScalarComposite {
     Tuple(Vec<mir::LocalId>),
-    Record(std::collections::HashMap<String, mir::LocalId>),
+    Record(Vec<(String, mir::LocalId)>),
     Array(Vec<mir::LocalId>),
 }
 
@@ -1979,9 +1979,7 @@ fn scalar_replace_local_composites(
             }
             definitions[index] = match op {
                 mir::RValue::Tuple(items) => Some(ScalarComposite::Tuple(items.clone())),
-                mir::RValue::Record(fields) => {
-                    Some(ScalarComposite::Record(fields.iter().cloned().collect()))
-                }
+                mir::RValue::Record(fields) => Some(ScalarComposite::Record(fields.clone()))
                 mir::RValue::ArrayLit(items) => Some(ScalarComposite::Array(items.clone())),
                 _ => None,
             };
@@ -1998,6 +1996,16 @@ fn scalar_replace_local_composites(
     }
 
     candidates.retain(|container, composite| {
+        let self_referential = match composite {
+            ScalarComposite::Tuple(items) | ScalarComposite::Array(items) => {
+                items.contains(container)
+            }
+            ScalarComposite::Record(fields) => fields.iter().any(|(_, source)| source == container),
+        };
+        if self_referential {
+            return false;
+        }
+
         for block in &func.blocks {
             for stmt in &block.stmts {
                 match stmt {
