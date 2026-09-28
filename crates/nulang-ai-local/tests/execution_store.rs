@@ -81,22 +81,8 @@ fn task_attempt_listing_is_scoped_to_one_task_and_ordered_by_attempt_number() {
 
     let task_id = Uuid::new_v4();
     let other_task_id = Uuid::new_v4();
-    let attempt_two = TaskAttempt::new(
-        task_id,
-        2,
-        session.id,
-        "agent-7",
-        "workspace-2",
-        "rev-2",
-    );
-    let attempt_one = TaskAttempt::new(
-        task_id,
-        1,
-        session.id,
-        "agent-7",
-        "workspace-1",
-        "rev-1",
-    );
+    let attempt_two = TaskAttempt::new(task_id, 2, session.id, "agent-7", "workspace-2", "rev-2");
+    let attempt_one = TaskAttempt::new(task_id, 1, session.id, "agent-7", "workspace-1", "rev-1");
     let other = TaskAttempt::new(
         other_task_id,
         1,
