@@ -4759,7 +4759,11 @@ impl Parser {
                     .get(previous_end..first_start)
                     .map(|gap| !gap.contains('\n') && !gap.contains('\r'))
                     .unwrap_or(false);
-            let start = if include_gap { previous_end } else { first_start };
+            let start = if include_gap {
+                previous_end
+            } else {
+                first_start
+            };
             if let Some(text) = source.get(start..end) {
                 return Ok(text.to_string());
             }
@@ -9224,7 +9228,10 @@ fn main() {
             unreachable!()
         };
         assert_eq!(
-            params.iter().map(|param| param.name.as_str()).collect::<Vec<_>>(),
+            params
+                .iter()
+                .map(|param| param.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["title", "__component_slot"]
         );
         assert!(annotations
@@ -9253,7 +9260,6 @@ fn main() {
                 if matches!(func.as_ref(), Expr::Var(name, _) if name == "fragment")
         ));
     }
-
 
     #[test]
     fn test_html_text_preserves_spaces_and_punctuation() {
@@ -9289,7 +9295,6 @@ fn main() {
                 if matches!(&args[0], Expr::Literal(Literal::String(text), _) if text == "Hello from slot. Welcome, Nulang Web!")
         ));
     }
-
 
     #[test]
     fn test_component_jsx_resolves_later_declaration() {
@@ -9327,5 +9332,4 @@ component ServerPanel(message: String) {
             Expr::Literal(Literal::String(value), _) if value == "hello"
         ));
     }
-
 }
