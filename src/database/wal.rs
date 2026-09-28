@@ -541,9 +541,7 @@ impl FileWal {
         #[cfg(test)]
         {
             self.maybe_fail_append_for_test(AppendFailPoint::AfterSync)?;
-            super::interruption::hit(
-                super::interruption::StorageInterruptionPoint::WalAfterSync,
-            )?;
+            super::interruption::hit(super::interruption::StorageInterruptionPoint::WalAfterSync)?;
         }
 
         let end = self.file.stream_position()?;
