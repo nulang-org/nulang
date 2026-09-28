@@ -1,4 +1,8 @@
 # Nulang Changelog
+### NulangDB tablet ownership and admission boundary — 2026-09-28
+- **Tablet writes now have an explicit ownership-aware dispatch path that keeps same-shard storage execution direct.** Ownership epochs are fenced before admission, another local shard receives a typed request through a bounded queue with explicit queue-full backpressure, and another node becomes an explicit remote handoff rather than touching local tablet state.
+- **Cross-shard admission can wake the owning runtime/shard without coupling the database kernel to the generic actor mailbox.** Successful enqueue triggers the installed owner waker exactly once; rejected queue-full writes do not produce spurious wakeups.
+
 ### NulangDB checkpoint and WAL reclamation — 2026-09-28
 - **Single-node tablets can now publish checksummed atomic MVCC checkpoints before reclaiming durable WAL history.** Recovery accepts both safe crash states: a checkpoint plus the original full WAL, or a checkpoint plus a compacted WAL whose header persists the checkpoint base sequence.
 - **Compacted WALs retain sequence, tablet, and ownership fencing metadata.** Reclamation is tail-only in this first slice, so a checkpoint at sequence N rewrites the WAL to an empty log based at N and the next durable write must prove predecessor N before sequence N+1 is accepted.
