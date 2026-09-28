@@ -78,7 +78,6 @@ pub struct ComponentGraph {
     pub components: Vec<ComponentNode>,
 }
 
-
 /// Client/server execution boundary selected by the component planner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -130,9 +129,7 @@ pub fn plan_component_islands(graph: &ComponentGraph) -> Vec<IslandBoundary> {
         }
     }
 
-    islands.sort_by(|a, b| {
-        (&a.parent, &a.component).cmp(&(&b.parent, &b.component))
-    });
+    islands.sort_by(|a, b| (&a.parent, &a.component).cmp(&(&b.parent, &b.component)));
     islands
 }
 
@@ -1433,5 +1430,4 @@ fn Dashboard() -> Html {
             ]
         );
     }
-
 }
