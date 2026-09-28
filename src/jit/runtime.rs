@@ -969,6 +969,42 @@ pub unsafe extern "C" fn nulang_jit_alloc_obj_at(
     }
 }
 
+/// Allocate a composite object in the current activation arena.
+///
+/// AOT/MIR escape analysis makes the placement decision at compile time, so
+/// this helper receives a raw slot count rather than a bytecode PC. If native
+/// code is running without actor arena callbacks, allocation conservatively
+/// falls back to the ordinary heap.
+#[no_mangle]
+pub unsafe extern "C" fn nulang_aot_alloc_local_obj(
+    slot_count: u64,
+    type_tag_raw: u32,
+) -> u64 {
+    let count = slot_count as usize;
+    let tag: HeapTypeTag = match type_tag_raw {
+        1 => HeapTypeTag::Array,
+        3 => HeapTypeTag::Record,
+        6 => HeapTypeTag::Tuple,
+        _ => return Value::nil().as_raw(),
+    };
+    let size = count.checked_mul(std::mem::size_of::<Value>()).unwrap_or(0);
+
+    let ptr = match try_with_callbacks(|cb| cb.alloc_arena(size, tag)) {
+        Some(Some(ptr)) => Some(ptr),
+        _ => alloc_obj(size, tag),
+    };
+
+    if let Some(ptr) = ptr {
+        let slots = std::slice::from_raw_parts_mut(ptr as *mut Value, count);
+        for slot in slots.iter_mut() {
+            *slot = Value::nil();
+        }
+        Value::ptr(ptr).as_raw()
+    } else {
+        Value::nil().as_raw()
+    }
+}
+
 /// Allocate a heap object with `slot_count` slots of type `type_tag`.
 /// Returns tagged pointer or nil.
 #[no_mangle]
