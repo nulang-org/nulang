@@ -479,6 +479,11 @@ pub struct EffectChecker {
     /// so that a direct call site (`Expr::App` on a `Var`) propagates the
     /// callee's declared or inferred row (SPEC2 §4.9).
     fn_rows: FxHashMap<String, EffectRow>,
+    /// Functions declared through the web `component` surface. A direct
+    /// component call evaluates its prop/slot arguments in the parent but does
+    /// not merge the child's own effects into the parent effect row: that
+    /// boundary is executed according to the component's placement.
+    component_names: FxHashSet<String>,
     /// Names currently bound by local constructs (let bindings, lambda
     /// parameters, pattern variables, ...). A locally-bound name shadows a
     /// same-named module function, so calls through it are not charged the
@@ -509,6 +514,7 @@ impl EffectChecker {
         EffectChecker {
             diagnostics: Vec::new(),
             fn_rows: FxHashMap::default(),
+            component_names: FxHashSet::default(),
             shadowed: Vec::new(),
             resource_grants: None,
         }
@@ -586,7 +592,7 @@ impl EffectChecker {
                     row = effect_row_union(&row, &self.infer_effects(ctx, arg)?);
                 }
                 if let Expr::Var(name, _) = func.as_ref() {
-                    if !self.shadowed.contains(name) {
+                    if !self.shadowed.contains(name) && !self.component_names.contains(name) {
                         if let Some(callee_row) = self.fn_rows.get(name) {
                             row = effect_row_union(&row, callee_row);
                         }
@@ -1028,9 +1034,21 @@ impl EffectChecker {
     pub fn register_function_rows(&mut self, decls: &[&Decl]) -> NuResult<()> {
         let ctx = EffectContext::empty();
         for decl in decls {
-            if let Decl::Function { name, effect, .. } = decl {
+            if let Decl::Function {
+                name,
+                effect,
+                annotations,
+                ..
+            } = decl
+            {
                 let row = effect.clone().unwrap_or_else(EffectRow::empty);
                 self.fn_rows.insert(name.clone(), row);
+                if annotations
+                    .iter()
+                    .any(|annotation| matches!(annotation, crate::ast::FunctionAnnotation::Component))
+                {
+                    self.component_names.insert(name.clone());
+                }
             }
         }
         for _ in 0..self.fn_rows.len() {
