@@ -6,6 +6,7 @@ license = "Apache-2.0"
 description = "AI runtime types for Nulang — LLM clients, memory, pipelines, debates, supervisor teams"
 
 [dependencies]
+nulang-ai-core = { path = "../nulang-ai-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
