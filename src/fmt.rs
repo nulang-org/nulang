@@ -1396,4 +1396,23 @@ fn main() {
         assert!(out.contains("emit Event(1)"), "got: {out}");
         assert_idempotent(src);
     }
+
+    #[test]
+    fn test_fmt_component_preserves_component_surface() {
+        let src = r#"
+component Card(title: String) {
+    <div><h2>{title}</h2><slot /></div>
+}
+
+fn main() {
+    <Card title="Components"><p>Hello from slot</p></Card>
+}
+"#;
+        let out = format_source(src).expect("component formats");
+        assert!(out.contains("component Card(title: String)"), "got: {out}");
+        assert!(!out.contains("__component_slot"), "synthetic slot leaked: {out}");
+        assert!(!out.contains("fn Card("), "component degraded to fn: {out}");
+        assert_idempotent(src);
+    }
+
 }
