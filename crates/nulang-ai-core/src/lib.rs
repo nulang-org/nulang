@@ -413,4 +413,22 @@ mod tests {
         assert!(!lease.authorizes(&replacement));
     }
 
+
+    #[test]
+    fn task_attempt_event_carries_fencing_identity() {
+        let task_id = Uuid::new_v4();
+        let attempt_id = Uuid::new_v4();
+        let event = SwarmEvent::TaskAttemptStarted {
+            task_id,
+            attempt_id,
+            worker_id: "worker-a".into(),
+            lease_epoch: 9,
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("task_attempt_started"));
+        assert!(json.contains(&attempt_id.to_string()));
+        assert!(json.contains(""lease_epoch":9"));
+    }
+
 }
