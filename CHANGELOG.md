@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Zero-copy non-reentrant JIT register entry — 2026-09-28
+- **JIT regions proven unable to re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
+- **Compiled-region metadata records whether native execution may grow or replace the VM frame stack.** Helper-backed direct-call regions retain detached register storage because interpreter re-entry may reallocate `VM::frames`; typed, SIMD, and scalar no-call regions use direct frame registers.
+- **The direct-frame path keeps interned-string semantics without exposing the parent VM.** A separate immutable active-`CodeModule` context serves string-aware helpers, and regression tests pin both direct-call fallback classification and hot string equality.
+- **Promotion remains evidence-gated.** The exact-base paired A/B workflow measures the warmed non-reentrant arithmetic loop and the call-heavy re-entry control before this draft is made ready.
+
 ### NulangDB checkpoint and WAL reclamation — 2026-09-28
 - **Single-node tablets can now publish checksummed atomic MVCC checkpoints before reclaiming durable WAL history.** Recovery accepts both safe crash states: a checkpoint plus the original full WAL, or a checkpoint plus a compacted WAL whose header persists the checkpoint base sequence.
 - **Compacted WALs retain sequence, tablet, and ownership fencing metadata.** Reclamation is tail-only in this first slice, so a checkpoint at sequence N rewrites the WAL to an empty log based at N and the next durable write must prove predecessor N before sequence N+1 is accepted.
