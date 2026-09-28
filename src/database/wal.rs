@@ -401,11 +401,7 @@ impl FileWal {
             .truncate(true)
             .write(true)
             .open(&temp)?;
-        let header = encode_wal_header(
-            base_sequence,
-            self.tablet_id,
-            self.latest_ownership_epoch,
-        );
+        let header = encode_wal_header(base_sequence, self.tablet_id, self.latest_ownership_epoch);
         replacement.write_all(&header)?;
         replacement.sync_data()?;
         drop(replacement);
@@ -566,7 +562,11 @@ fn decode_wal_header(
     } else {
         Some(TabletId::new(tablet_raw).map_err(|_| WalError::InvalidHeader)?)
     };
-    let ownership_epoch = if epoch_raw == 0 { None } else { Some(epoch_raw) };
+    let ownership_epoch = if epoch_raw == 0 {
+        None
+    } else {
+        Some(epoch_raw)
+    };
     if base_sequence > 0 && (tablet_id.is_none() || ownership_epoch.is_none()) {
         return Err(WalError::InvalidHeader);
     }
@@ -786,9 +786,7 @@ impl fmt::Display for WalError {
         match self {
             Self::Io { message, .. } => write!(f, "WAL I/O error: {message}"),
             Self::InvalidHeader => f.write_str("invalid NuDB WAL header"),
-            Self::WalHeaderChecksumMismatch => {
-                f.write_str("NuDB WAL header checksum mismatch")
-            }
+            Self::WalHeaderChecksumMismatch => f.write_str("NuDB WAL header checksum mismatch"),
             Self::InvalidFrameHeader { offset, reason } => {
                 write!(
                     f,
