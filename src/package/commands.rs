@@ -2221,6 +2221,8 @@ fn cmd_deploy(
             version: 1,
             routes: Vec::new(),
             signals: serde_json::Value::Object(Default::default()),
+            components: Vec::new(),
+            islands: Vec::new(),
             capabilities: Vec::new(),
             budgets: Default::default(),
             middleware: Vec::new(),
