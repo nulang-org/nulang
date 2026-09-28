@@ -300,6 +300,19 @@ pub enum SwarmEvent {
         task_id: Uuid,
         agent_id: String,
     },
+    TaskAttemptStarted {
+        task_id: Uuid,
+        attempt_id: Uuid,
+        worker_id: String,
+        lease_epoch: u64,
+    },
+    TaskAttemptFinished {
+        task_id: Uuid,
+        attempt_id: Uuid,
+        worker_id: String,
+        lease_epoch: u64,
+        status: TaskAttemptStatus,
+    },
     TaskProgress {
         task_id: Uuid,
         agent_id: String,
