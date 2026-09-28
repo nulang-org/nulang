@@ -126,6 +126,11 @@ pub trait JitBackend {
     /// Number of regions compiled through the type-directed path.
     fn typed_compiled_count(&self) -> usize;
 
+    /// Number of separately compiled native leaf thunks.
+    fn native_leaf_compiled_count(&self) -> usize {
+        0
+    }
+
     /// Whether this backend has proven that retrying first-tier compilation
     /// for `(module_idx, pc)` cannot become useful without replacing/resetting
     /// the loaded module/session. The VM may retire such PCs from its hotness
