@@ -4639,9 +4639,15 @@ impl Parser {
                 break;
             }
 
-            // Text node: consume the next token as literal text
-            let text = self.html_token_text()?;
-            children.push(self.html_text(&text, span));
+            // Text node: preserve the original source slice across all
+            // contiguous tokens. The lexer intentionally discards horizontal
+            // whitespace, so reconstructing text one token at a time would
+            // turn "Hello from slot" into "Hellofromslot" and reject
+            // punctuation tokens such as '.'.
+            let text = self.parse_html_text_run()?;
+            if !text.is_empty() {
+                children.push(self.html_text(&text, span));
+            }
         }
         Err(NuError::parse_error(
             format!("Unclosed HTML tag <{}>", close_tag),
@@ -4649,46 +4655,49 @@ impl Parser {
         ))
     }
 
-    fn html_token_text(&mut self) -> NuResult<String> {
-        let span = self.current_span();
-        match self.peek_kind().clone() {
-            TokenKind::Ident(s) | TokenKind::UpperIdent(s) => {
-                self.advance();
-                Ok(s)
-            }
-            other if Self::is_keyword_token(&other) => {
-                self.advance();
-                Ok(other.to_string())
-            }
-            TokenKind::IntLit(n) => {
-                self.advance();
-                Ok(n.to_string())
-            }
-            TokenKind::FloatLit(n) => {
-                self.advance();
-                Ok(n.to_string())
-            }
-            TokenKind::StringLit(s) => {
-                self.advance();
-                Ok(s)
-            }
-            TokenKind::BoolLit(b) => {
-                self.advance();
-                Ok(b.to_string())
-            }
-            TokenKind::NilLit => {
-                self.advance();
-                Ok("nil".to_string())
-            }
-            TokenKind::UnitLit => {
-                self.advance();
-                Ok("unit".to_string())
-            }
-            other => Err(NuError::parse_error(
-                format!("Unexpected token in HTML text: {}", other),
-                span,
-            )),
+    fn parse_html_text_run(&mut self) -> NuResult<String> {
+        let first_span = self.current_span();
+        let first_start = first_span.start;
+        let previous_end = self
+            .pos
+            .checked_sub(1)
+            .and_then(|index| self.tokens.get(index))
+            .map(|token| token.span.end)
+            .unwrap_or(first_start);
+
+        let mut end = first_start;
+        while !self.is_at_end()
+            && !matches!(
+                self.peek_kind(),
+                TokenKind::Lt | TokenKind::LBrace | TokenKind::Newline
+            )
+        {
+            end = self.advance_token().span.end;
         }
+
+        if end <= first_start {
+            return Err(NuError::parse_error(
+                "Expected HTML text".to_string(),
+                first_span,
+            ));
+        }
+
+        if let Some(source) = crate::types::current_source_text() {
+            let include_gap = previous_end <= first_start
+                && source
+                    .get(previous_end..first_start)
+                    .map(|gap| !gap.contains('\n') && !gap.contains('\r'))
+                    .unwrap_or(false);
+            let start = if include_gap { previous_end } else { first_start };
+            if let Some(text) = source.get(start..end) {
+                return Ok(text.to_string());
+            }
+        }
+
+        Err(NuError::parse_error(
+            "Unable to recover HTML text from source span".to_string(),
+            first_span,
+        ))
     }
 
     // === Helper Methods ===
