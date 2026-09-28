@@ -962,6 +962,7 @@ impl Parser {
             params.iter().map(|param| param.name.clone()).collect(),
         );
         params.push(crate::ast::Param::new("__component_slot", None));
+        let default_values = vec![None; params.len()];
         annotations.push(FunctionAnnotation::Component);
         let body = self.parse_expr()?;
 
@@ -970,7 +971,7 @@ impl Parser {
             type_params: vec![],
             type_param_constraints: vec![],
             params,
-            default_values: vec![],
+            default_values,
             using_params: vec![],
             ret_type: None,
             error_type: None,
