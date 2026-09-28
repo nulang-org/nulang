@@ -246,7 +246,7 @@ impl TabletDispatchChannels {
                     waker.wake();
                 }
                 Ok(())
-            },
+            }
             Err(TrySendError::Full(_)) => Err(TabletDispatchError::QueueFull(shard)),
             Err(TrySendError::Disconnected(_)) => {
                 Err(TabletDispatchError::QueueDisconnected(shard))
