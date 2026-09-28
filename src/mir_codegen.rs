@@ -59,6 +59,71 @@ fn compile_err(msg: impl Into<String>, span: Span) -> NuError {
     }
 }
 
+fn validate_field_id_budget(mir: &mir::Module) -> NuResult<()> {
+    fn note(name: &str, seen: &mut HashSet<String>) -> NuResult<()> {
+        if seen.contains(name) {
+            return Ok(());
+        }
+        if seen.len() >= u8::MAX as usize + 1 {
+            return Err(compile_err(
+                format!(
+                    "module has more than {} distinct record/tuple field names (limit for the current u8 field-id encoding); '{}' has no id left to assign",
+                    u8::MAX as usize + 1,
+                    name
+                ),
+                Span::default(),
+            ));
+        }
+        seen.insert(name.to_string());
+        Ok(())
+    }
+
+    fn visit_rvalue(rv: &mir::RValue, seen: &mut HashSet<String>) -> NuResult<()> {
+        match rv {
+            mir::RValue::Record(fields) => {
+                for (name, _) in fields {
+                    note(name, seen)?;
+                }
+            }
+            mir::RValue::RecordUpdate { overrides, .. } => {
+                for (name, _) in overrides {
+                    note(name, seen)?;
+                }
+            }
+            mir::RValue::LoadFieldNamed { field, .. } => note(field, seen)?,
+            mir::RValue::Spawn { init, .. } => {
+                for (_, init_rv) in init {
+                    visit_rvalue(init_rv, seen)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn visit_function(func: &mir::Function, seen: &mut HashSet<String>) -> NuResult<()> {
+        for block in &func.blocks {
+            for stmt in &block.stmts {
+                match stmt {
+                    mir::Stmt::Assign { op, .. } => visit_rvalue(op, seen)?,
+                    mir::Stmt::StoreFieldNamed { field, .. } => note(field, seen)?,
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let mut seen = HashSet::new();
+    for func in &mir.functions {
+        visit_function(func, &mut seen)?;
+    }
+    for func in &mir.behaviors {
+        visit_function(func, &mut seen)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 enum JumpKind {
     Jmp,
@@ -270,13 +335,18 @@ impl MirCodegen {
     }
 
     pub fn compile_module(&mut self, mir: &mut mir::Module) -> NuResult<&CodeModule> {
+        // Record field ids are a module-wide u8 ABI. Validate the source MIR
+        // before optimization so scalar replacement/DCE cannot erase field
+        // names and accidentally bypass the established 256-name limit.
+        validate_field_id_budget(mir)?;
+
         // Capture compiler-owned semantic effect sites before optimization.
         // Optimizations may rewrite locals/control flow but must preserve the
         // observable order and identity of effect operations.
         let semantic_effect_sites = effect_sites_for_mir(mir);
 
         // MIR optimization pass: constant folding, identity simplification,
-        // jump threading, and dead-store elimination. Runs on every
+        // scalar replacement, jump threading, and dead-store elimination. Runs on every
         // function and behavior before codegen.
         let mut module_consts = Vec::new();
         for func in &mut mir.functions {
@@ -1988,7 +2058,7 @@ fn scalar_replace_local_composites(
         }
     }
 
-    let mut candidates: HashMap<mir::LocalId, ScalarComposite> = HashMap::new();
+    let mut candidates: FxHashMap<mir::LocalId, ScalarComposite> = FxHashMap::default();
     for (index, definition) in definitions.into_iter().enumerate() {
         if def_count[index] == 1 {
             if let Some(definition) = definition {
@@ -2013,7 +2083,7 @@ fn scalar_replace_local_composites(
                 match stmt {
                     mir::Stmt::Assign { dst, .. } if dst == container => {}
                     mir::Stmt::Assign { op, .. } if rvalue_reads_local(op, *container) => {
-                        if static_composite_load(op, *container, composite, const_locals).is_none()
+                        if static_composite_load(op, *container, &composite, const_locals).is_none()
                         {
                             return false;
                         }
