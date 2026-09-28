@@ -842,7 +842,11 @@ fn web_main() {
         );
 
         let compiled = compile_module_contracts(&module);
-        assert!(compiled.diagnostics.is_empty(), "{:?}", compiled.diagnostics);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
 
         let static_route = compiled
             .routes
@@ -858,5 +862,4 @@ fn web_main() {
             .expect("dynamic route");
         assert_eq!(dynamic_route.placement.as_deref(), Some("server"));
     }
-
 }
