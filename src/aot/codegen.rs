@@ -3938,7 +3938,7 @@ mod tests {
         let source = r#"
             actor ScalarScratch {
                 behavior run() {
-                    let values = [1, 2, 3] in values[0]
+                    [1, 2, 3][0]
                 }
             }
             fn main() { 0 }
