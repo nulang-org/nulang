@@ -1109,7 +1109,14 @@ pub fn compile_mir_function_body(
     let local_base = mir::FunctionBuilder::LOCAL_BASE;
     let type_meta = mir_func.type_metadata.clone();
     aot.cap_metadata = CapabilityMetadata::from_mir_function(mir_func);
-    let arena_alloc_sites = crate::mir_iso_arena::qualifying_alloc_sites(mir_func);
+    let iso_arena_enabled = std::env::var("NULANG_ISO_ARENA")
+        .map(|value| !value.is_empty() && value != "0")
+        .unwrap_or(false);
+    let arena_alloc_sites = if iso_arena_enabled {
+        crate::mir_iso_arena::qualifying_alloc_sites(mir_func)
+    } else {
+        HashSet::new()
+    };
 
     // Analyze block predecessors.
     let preds = compute_predecessors(mir_func);
@@ -3883,8 +3890,14 @@ mod tests {
 
         let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
         let mir_module = crate::mir_lower::lower_module(&hir).unwrap();
-        let aot = crate::aot::AotModule::compile(&mir_module)
-            .expect("AOT compile of local composite behavior should succeed");
+        let previous_iso_arena = std::env::var_os("NULANG_ISO_ARENA");
+        std::env::set_var("NULANG_ISO_ARENA", "1");
+        let compiled = crate::aot::AotModule::compile(&mir_module);
+        match previous_iso_arena {
+            Some(value) => std::env::set_var("NULANG_ISO_ARENA", value),
+            None => std::env::remove_var("NULANG_ISO_ARENA"),
+        }
+        let aot = compiled.expect("AOT compile of local composite behavior should succeed");
         let native = aot
             .fn_ptr_for_behavior("Scratch.run")
             .expect("behavior 'Scratch.run' should be compiled");
