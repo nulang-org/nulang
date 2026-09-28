@@ -2036,16 +2036,19 @@ fn scalar_replace_local_composites(
     const_locals: &std::collections::HashMap<mir::LocalId, Constant>,
 ) -> bool {
     let mut def_count = vec![0usize; func.locals.len()];
+    let mut def_site: Vec<Option<(usize, usize)>> = vec![None; func.locals.len()];
     let mut definitions: Vec<Option<ScalarComposite>> = vec![None; func.locals.len()];
 
-    for block in &func.blocks {
-        for stmt in &block.stmts {
+    for (block_index, block) in func.blocks.iter().enumerate() {
+        for (stmt_index, stmt) in block.stmts.iter().enumerate() {
             let mir::Stmt::Assign { dst, op } = stmt else {
                 continue;
             };
             let index = dst.0 as usize;
             def_count[index] += 1;
-            if def_count[index] != 1 {
+            if def_count[index] == 1 {
+                def_site[index] = Some((block_index, stmt_index));
+            } else {
                 definitions[index] = None;
                 continue;
             }
@@ -2080,19 +2083,36 @@ fn scalar_replace_local_composites(
 
         // A composite snapshots its component values at construction. Reusing
         // the original source local for a later scalarized load is sound only
-        // while that source is stable; otherwise a later redefinition would
-        // make the rewritten load observe the new value instead of the
-        // captured one. Parameters/captures have zero MIR definitions and are
-        // stable; ordinary single-assignment locals have one.
-        let has_redefined_component = match composite {
+        // when that source cannot change after the snapshot. Zero-definition
+        // locals are externally initialized and remain stable. A locally
+        // assigned source qualifies only when it has exactly one definition,
+        // and that definition appears earlier in the same basic block as the
+        // composite construction. This deliberately rejects cross-block
+        // dominance cases until MIR has a shared dominance analysis.
+        let Some((alloc_block, alloc_stmt)) = def_site[container.0 as usize] else {
+            return false;
+        };
+        let source_is_stable = |source: mir::LocalId| {
+            let index = source.0 as usize;
+            match def_count[index] {
+                0 => true,
+                1 => matches!(
+                    def_site[index],
+                    Some((source_block, source_stmt))
+                        if source_block == alloc_block && source_stmt < alloc_stmt
+                ),
+                _ => false,
+            }
+        };
+        let has_unstable_component = match composite {
             ScalarComposite::Tuple(items) | ScalarComposite::Array(items) => {
-                items.iter().any(|source| def_count[source.0 as usize] > 1)
+                items.iter().any(|source| !source_is_stable(*source))
             }
             ScalarComposite::Record(fields) => fields
                 .iter()
-                .any(|(_, source)| def_count[source.0 as usize] > 1),
+                .any(|(_, source)| !source_is_stable(*source)),
         };
-        if has_redefined_component {
+        if has_unstable_component {
             return false;
         }
 
