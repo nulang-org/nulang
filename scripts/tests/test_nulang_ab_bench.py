@@ -71,6 +71,42 @@ class PairedComparisonTests(unittest.TestCase):
             nulang_ab_bench.paired_comparisons(samples)
 
 
+class WithinVariantComparisonTests(unittest.TestCase):
+    def test_within_variant_paired_comparison_uses_same_round_ratios(self):
+        rows = {
+            "ab/aot_alloc_heavy_heap": [
+                {"messages": 100, "elapsed_ns": 200},
+                {"messages": 100, "elapsed_ns": 300},
+                {"messages": 100, "elapsed_ns": 400},
+            ],
+            "ab/aot_alloc_heavy_arena": [
+                {"messages": 100, "elapsed_ns": 100},
+                {"messages": 100, "elapsed_ns": 200},
+                {"messages": 100, "elapsed_ns": 200},
+            ],
+        }
+
+        result = nulang_ab_bench.within_variant_paired_comparison(
+            rows,
+            "ab/aot_alloc_heavy_heap",
+            "ab/aot_alloc_heavy_arena",
+        )
+
+        self.assertEqual(3, result["pairs"])
+        self.assertAlmostEqual(2.0, result["median_speedup_x"])
+        self.assertAlmostEqual(100.0, result["median_throughput_change_pct"])
+        self.assertAlmostEqual(-50.0, result["median_latency_change_pct"])
+
+    def test_within_variant_paired_comparison_returns_none_when_probe_missing(self):
+        self.assertIsNone(
+            nulang_ab_bench.within_variant_paired_comparison(
+                {},
+                "ab/aot_alloc_heavy_heap",
+                "ab/aot_alloc_heavy_arena",
+            )
+        )
+
+
 class CommandOutputTests(unittest.TestCase):
     def test_failed_command_preserves_captured_diagnostics_on_stderr(self):
         completed = subprocess.CompletedProcess(

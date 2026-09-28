@@ -303,6 +303,56 @@ def paired_comparisons(
     return out
 
 
+def within_variant_paired_comparison(
+    workloads: dict[str, list[dict[str, int]]],
+    baseline_name: str,
+    optimized_name: str,
+) -> dict[str, float | int] | None:
+    """Compare two diagnostics emitted in the same rounds by one variant."""
+    if baseline_name not in workloads or optimized_name not in workloads:
+        return None
+
+    baseline_rows = workloads[baseline_name]
+    optimized_rows = workloads[optimized_name]
+    if not baseline_rows or not optimized_rows:
+        return None
+    if len(baseline_rows) != len(optimized_rows):
+        raise RuntimeError(
+            f"{baseline_name} vs {optimized_name}: paired sample count changed "
+            f"(baseline={len(baseline_rows)}, optimized={len(optimized_rows)})"
+        )
+
+    speedups: list[float] = []
+    throughput_changes: list[float] = []
+    latency_changes: list[float] = []
+    for index, (baseline, optimized) in enumerate(zip(baseline_rows, optimized_rows)):
+        if baseline["messages"] != optimized["messages"]:
+            raise RuntimeError(
+                f"{baseline_name} vs {optimized_name}: operation count changed in pair {index} "
+                f"(baseline={baseline['messages']}, optimized={optimized['messages']})"
+            )
+        baseline_ns = float(baseline["elapsed_ns"])
+        optimized_ns = float(optimized["elapsed_ns"])
+        if baseline_ns <= 0 or optimized_ns <= 0:
+            raise RuntimeError(
+                f"{baseline_name} vs {optimized_name}: elapsed_ns must be positive"
+            )
+        speedup = baseline_ns / optimized_ns
+        speedups.append(speedup)
+        throughput_changes.append((speedup - 1.0) * 100.0)
+        latency_changes.append((optimized_ns / baseline_ns - 1.0) * 100.0)
+
+    lower, upper = _bootstrap_median_ci(speedups)
+    return {
+        "pairs": len(speedups),
+        "median_speedup_x": statistics.median(speedups),
+        "median_throughput_change_pct": statistics.median(throughput_changes),
+        "median_latency_change_pct": statistics.median(latency_changes),
+        "speedup_ci95_lower": lower,
+        "speedup_ci95_upper": upper,
+    }
+
+
 def print_paired_table(
     paired: dict[str, dict[str, float | int]],
 ) -> None:
@@ -352,6 +402,25 @@ def print_table(
             f"{name:<19}  {base:>11,.0f}  {candidate:>17,.0f}  "
             f"{delta:>+16.2f}%  {speedup:>6.3f}x"
         )
+
+def print_within_candidate_comparison(
+    label: str,
+    row: dict[str, float | int] | None,
+) -> None:
+    if row is None:
+        return
+    print()
+    print(f"within-candidate paired diagnostic: {label}")
+    print("-----------------------------------------------")
+    print(
+        f"pairs={int(row['pairs'])} "
+        f"median_speedup={float(row['median_speedup_x']):.3f}x "
+        f"throughput_delta={float(row['median_throughput_change_pct']):+.2f}% "
+        f"latency_delta={float(row['median_latency_change_pct']):+.2f}% "
+        f"ci95=[{float(row['speedup_ci95_lower']):.3f}, "
+        f"{float(row['speedup_ci95_upper']):.3f}]"
+    )
+
 
 def print_candidate_only(
     summary: dict[str, dict[str, dict[str, float | int]]]
@@ -466,8 +535,14 @@ def main() -> int:
         summary = summarize(samples)
         compare = comparisons(summary)
         paired = paired_comparisons(samples)
+        aot_iso_arena = within_variant_paired_comparison(
+            samples["candidate"],
+            "ab/aot_alloc_heavy_heap",
+            "ab/aot_alloc_heavy_arena",
+        )
         print_table(summary, compare)
         print_paired_table(paired)
+        print_within_candidate_comparison("AOT heap -> iso arena", aot_iso_arena)
         print_candidate_only(summary)
 
         allowed = (
@@ -513,6 +588,9 @@ def main() -> int:
             "summary": summary,
             "comparison": compare,
             "paired_comparison": paired,
+            "within_candidate_comparison": {
+                "aot_iso_arena": aot_iso_arena,
+            },
         }
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)

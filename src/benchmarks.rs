@@ -424,6 +424,134 @@ fn bench_ab_aot_actor_drain() {
     );
 }
 
+#[cfg(feature = "native-codegen")]
+#[test]
+fn bench_ab_aot_iso_arena_alloc_heavy() {
+    use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
+
+    const WARMUP: usize = 1_000;
+    const N: usize = 50_000;
+    let source = r#"
+        actor Scratch {
+            state total: Int = 0
+            behavior Work(n: Int) {
+                let values = [n, n + 1, n + 2, n + 3] in
+                self.total = self.total + values[0] + values[3]
+            }
+        }
+        fn main() { 0 }
+    "#;
+
+    let tokens = Lexer::new(source).lex().expect("bench: lex failed");
+    let ast = Parser::new(tokens)
+        .parse_module()
+        .expect("bench: parse failed");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("bench: typecheck failed");
+    let mut ec = EffectChecker::new();
+    ec.check_module(&ast.decls)
+        .expect("bench: effect check failed");
+    let mut ca = CapabilityAnalyzer::new();
+    let ctx = CapContext::new();
+    for decl in crate::effect_checker::flatten_decls(&ast.decls) {
+        if let crate::ast::Decl::Function { body, .. } = decl {
+            ca.infer_cap(&ctx, body)
+                .expect("bench: capability analysis failed");
+        }
+    }
+
+    let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = crate::mir_lower::lower_module(&hir).expect("bench: MIR lower failed");
+
+    let previous_iso_arena = std::env::var_os("NULANG_ISO_ARENA");
+    std::env::set_var("NULANG_ISO_ARENA", "0");
+    let heap_aot = crate::aot::AotModule::compile(&mir).expect("bench: heap AOT compile failed");
+    std::env::set_var("NULANG_ISO_ARENA", "1");
+    let arena_aot = crate::aot::AotModule::compile(&mir).expect("bench: arena AOT compile failed");
+    match previous_iso_arena {
+        Some(value) => std::env::set_var("NULANG_ISO_ARENA", value),
+        None => std::env::remove_var("NULANG_ISO_ARENA"),
+    }
+
+    let code = crate::mir_codegen::compile_mir(&mut mir, "bench-ab-aot-arena")
+        .expect("bench: bytecode companion codegen failed");
+
+    let run = |aot: crate::aot::AotModule, expect_arena: bool| {
+        let mut rt = Runtime::new();
+        rt.register_aot_module(aot);
+        let actor_id = rt
+            .spawn_from_module(&code, 0, Vec::new())
+            .as_actor_id()
+            .expect("bench: AOT actor spawn failed");
+
+        for _ in 0..WARMUP {
+            rt.send_message_by_id(actor_id, 0, &[Value::int(1)]);
+        }
+        rt.run_scheduler();
+        rt.actors
+            .get_mut(&actor_id)
+            .expect("bench: AOT actor live after warmup")
+            .set_state_field("total", Value::int(0));
+
+        let arena_before = rt
+            .actors
+            .get(&actor_id)
+            .expect("bench: actor live before measurement")
+            .iso_arena
+            .total_allocs();
+
+        for _ in 0..N {
+            rt.send_message_by_id(actor_id, 0, &[Value::int(1)]);
+        }
+        let start = Instant::now();
+        rt.run_scheduler();
+        let elapsed = start.elapsed();
+
+        let actor = rt
+            .actors
+            .get(&actor_id)
+            .expect("bench: actor live after measurement");
+        let total = actor
+            .get_state_field("total")
+            .and_then(|value| value.as_int());
+        assert_eq!(
+            total,
+            Some((N * 5) as i64),
+            "allocation-heavy AOT actor must preserve heap/arena semantics"
+        );
+
+        let arena_delta = actor.iso_arena.total_allocs() - arena_before;
+        if expect_arena {
+            assert_eq!(
+                arena_delta, N,
+                "arena-mode AOT must serve exactly one local composite per message"
+            );
+        } else {
+            assert_eq!(
+                arena_delta, 0,
+                "heap-mode AOT must not accidentally use the activation arena"
+            );
+        }
+
+        elapsed
+    };
+
+    let heap_elapsed = run(heap_aot, false);
+    let arena_elapsed = run(arena_aot, true);
+
+    report_ab("aot_alloc_heavy_heap", N as u64, heap_elapsed);
+    report_ab("aot_alloc_heavy_arena", N as u64, arena_elapsed);
+
+    let heap_ns = heap_elapsed.as_nanos() as f64;
+    let arena_ns = arena_elapsed.as_nanos() as f64;
+    println!(
+        "[backend-bench] workload=aot_alloc_heavy operations={N} heap_ns={} arena_ns={} arena_speedup_x={:.3}",
+        heap_elapsed.as_nanos(),
+        arena_elapsed.as_nanos(),
+        heap_ns / arena_ns
+    );
+}
+
 /// Counting: one actor, main thread floods it with N messages.
 /// Measures single-actor mailbox throughput + scheduler drain.
 #[test]
