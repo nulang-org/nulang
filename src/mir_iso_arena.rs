@@ -50,10 +50,7 @@ fn any_alias(ids: &[mir::LocalId], aliases: &HashSet<mir::LocalId>) -> bool {
     ids.iter().any(|id| aliases.contains(id))
 }
 
-fn rvalue_escapes_or_invalidates(
-    rv: &mir::RValue,
-    aliases: &HashSet<mir::LocalId>,
-) -> bool {
+fn rvalue_escapes_or_invalidates(rv: &mir::RValue, aliases: &HashSet<mir::LocalId>) -> bool {
     match rv {
         mir::RValue::Load(_) => false,
         mir::RValue::ArrayLen(_)
@@ -92,11 +89,7 @@ fn rvalue_escapes_or_invalidates(
     }
 }
 
-fn site_qualifies(
-    func: &mir::Function,
-    site: MirAllocSite,
-    dst: mir::LocalId,
-) -> bool {
+fn site_qualifies(func: &mir::Function, site: MirAllocSite, dst: mir::LocalId) -> bool {
     let block_index: HashMap<mir::BlockId, usize> = func
         .blocks
         .iter()
@@ -114,10 +107,7 @@ fn site_qualifies(
             return false;
         };
         let block = &func.blocks[bi];
-        let aliases = in_sets
-            .get(&(bid, stmt_index))
-            .cloned()
-            .unwrap_or_default();
+        let aliases = in_sets.get(&(bid, stmt_index)).cloned().unwrap_or_default();
         if aliases.is_empty() {
             continue;
         }
