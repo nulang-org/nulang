@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Unified web placement inference — 2026-09-28
+- **HIR lowering, web route contracts, placement diagnostics, and reactive action classification now consume one canonical effect-row placement rule.** Render/Web-only functions infer `static`, browser-local Client/Render functions infer `client`, empty rows remain unspecified, and other effectful web functions conservatively infer `server`.
+- **Route deployment metadata no longer drops effect-derived placement when `@placement` is omitted.** This removes a compiler/Web-IR disagreement that would otherwise make later static/client/server island planning unreliable.
+
 ### NulangDB checkpoint and WAL reclamation — 2026-09-28
 - **Single-node tablets can now publish checksummed atomic MVCC checkpoints before reclaiming durable WAL history.** Recovery accepts both safe crash states: a checkpoint plus the original full WAL, or a checkpoint plus a compacted WAL whose header persists the checkpoint base sequence.
 - **Compacted WALs retain sequence, tablet, and ownership fencing metadata.** Reclamation is tail-only in this first slice, so a checkpoint at sequence N rewrites the WAL to an empty log based at N and the next durable write must prove predecessor N before sequence N+1 is accepted.
