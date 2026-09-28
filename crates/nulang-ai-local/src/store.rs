@@ -518,7 +518,9 @@ impl SqliteStore {
         let mut stmt = conn.prepare(
             "SELECT payload FROM artifacts WHERE attempt_id = ?1 ORDER BY created_at ASC, id ASC",
         )?;
-        let rows = stmt.query_map(params![attempt_id.to_string()], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![attempt_id.to_string()], |row| {
+            row.get::<_, String>(0)
+        })?;
         let payloads = rows.collect::<Result<Vec<_>, _>>()?;
         payloads
             .into_iter()
@@ -544,10 +546,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub fn list_evidence_for_attempt(
-        &self,
-        attempt_id: Uuid,
-    ) -> Result<Vec<Evidence>, StoreError> {
+    pub fn list_evidence_for_attempt(&self, attempt_id: Uuid) -> Result<Vec<Evidence>, StoreError> {
         let conn = Connection::open(&self.path)?;
         let mut stmt = conn.prepare(
             "SELECT payload FROM evidence WHERE attempt_id = ?1 ORDER BY created_at ASC, id ASC",
