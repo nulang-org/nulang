@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, OnceLock};
 
 use super::store::{WalBackedError, WalBackedTablet};
 use super::tablet::{TabletId, TabletWrite};
@@ -23,6 +24,7 @@ pub enum TabletDispatchConfigError {
     InvalidQueueCapacity,
     InvalidLocalShard { shard: u16, shard_count: u16 },
     InvalidOwnershipEpoch,
+    WakeAlreadyInstalled(u16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +112,10 @@ pub enum TabletExecutionError {
     ReplyDisconnected,
 }
 
+pub trait TabletDispatchWake: Send + Sync {
+    fn wake(&self);
+}
+
 #[derive(Debug, Clone)]
 pub struct TabletRemoteRequest {
     owner: TabletOwner,
@@ -171,6 +177,7 @@ struct TabletShardRequest {
 #[derive(Clone)]
 pub struct TabletDispatchChannels {
     senders: Vec<SyncSender<TabletShardRequest>>,
+    wakers: Arc<Vec<OnceLock<Arc<dyn TabletDispatchWake>>>>,
 }
 
 impl TabletDispatchChannels {
@@ -193,11 +200,39 @@ impl TabletDispatchChannels {
             inboxes.push(TabletShardInbox { shard, receiver });
         }
 
-        Ok((Self { senders }, inboxes))
+        let wakers = Arc::new(
+            (0..shard_count)
+                .map(|_| OnceLock::<Arc<dyn TabletDispatchWake>>::new())
+                .collect(),
+        );
+
+        Ok((Self { senders, wakers }, inboxes))
     }
 
     pub fn shard_count(&self) -> u16 {
         self.senders.len() as u16
+    }
+
+    pub fn install_waker(
+        &self,
+        shard: u16,
+        waker: Arc<dyn TabletDispatchWake>,
+    ) -> Result<(), TabletDispatchConfigError> {
+        let Some(slot) = self.wakers.get(shard as usize) else {
+            return Err(TabletDispatchConfigError::InvalidLocalShard {
+                shard,
+                shard_count: self.shard_count(),
+            });
+        };
+        slot.set(waker)
+            .map_err(|_| TabletDispatchConfigError::WakeAlreadyInstalled(shard))
+    }
+
+    fn waker_for(&self, shard: u16) -> Option<Arc<dyn TabletDispatchWake>> {
+        self.wakers
+            .get(shard as usize)
+            .and_then(OnceLock::get)
+            .cloned()
     }
 
     fn try_send(&self, shard: u16, request: TabletShardRequest) -> Result<(), TabletDispatchError> {
@@ -206,7 +241,12 @@ impl TabletDispatchChannels {
         };
 
         match sender.try_send(request) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Some(waker) = self.waker_for(shard) {
+                    waker.wake();
+                }
+                Ok(())
+            },
             Err(TrySendError::Full(_)) => Err(TabletDispatchError::QueueFull(shard)),
             Err(TrySendError::Disconnected(_)) => {
                 Err(TabletDispatchError::QueueDisconnected(shard))
@@ -294,6 +334,14 @@ impl TabletDispatcher {
 
     pub fn placement(&self) -> &TabletPlacementMap {
         &self.placement
+    }
+
+    pub fn install_waker(
+        &self,
+        shard: u16,
+        waker: Arc<dyn TabletDispatchWake>,
+    ) -> Result<(), TabletDispatchConfigError> {
+        self.channels.install_waker(shard, waker)
     }
 
     pub fn install_placement(&mut self, placement: TabletPlacementMap) {
