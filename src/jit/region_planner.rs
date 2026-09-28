@@ -427,6 +427,147 @@ pub(crate) fn find_compilable_region(
     }
 }
 
+const NATIVE_LEAF_MAX_INSTRS: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeLeafPlan {
+    pub(crate) start: usize,
+    pub(crate) body_len: usize,
+    pub(crate) argc: u8,
+    pub(crate) ret_reg: u8,
+    pub(crate) clobbers: Vec<u8>,
+}
+
+fn native_leaf_reads_writes(
+    instr: &crate::bytecode::Instruction,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    use crate::bytecode::OpCode;
+
+    let one = |reg| vec![reg];
+    let two = |a, b| vec![a, b];
+
+    match instr.opcode {
+        OpCode::Nop => Some((Vec::new(), Vec::new())),
+        OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
+            Some((Vec::new(), one(instr.op1)))
+        }
+        OpCode::ConstU => Some((Vec::new(), one(instr.op3))),
+        OpCode::Load | OpCode::Store | OpCode::Move | OpCode::Dup => {
+            Some((one(instr.op1), one(instr.op2)))
+        }
+        OpCode::Swap => Some((two(instr.op1, instr.op2), two(instr.op1, instr.op2))),
+        OpCode::IAdd
+        | OpCode::ISub
+        | OpCode::IMul
+        | OpCode::IDiv
+        | OpCode::IMod
+        | OpCode::IPow
+        | OpCode::FPow
+        | OpCode::Xor
+        | OpCode::Shl
+        | OpCode::Shr
+        | OpCode::BitAnd
+        | OpCode::BitOr
+        | OpCode::FAdd
+        | OpCode::FSub
+        | OpCode::FMul
+        | OpCode::FDiv
+        | OpCode::ICmpEq
+        | OpCode::ICmpLt
+        | OpCode::ICmpGt
+        | OpCode::ICmpLe
+        | OpCode::ICmpGe
+        | OpCode::FCmpEq
+        | OpCode::FCmpLt
+        | OpCode::FCmpGt
+        | OpCode::And
+        | OpCode::Or => Some((two(instr.op1, instr.op2), one(instr.op3))),
+        OpCode::FNeg => Some((one(instr.op1), one(instr.op3))),
+        OpCode::Not | OpCode::IToF | OpCode::FToI => {
+            Some((one(instr.op1), one(instr.op2)))
+        }
+        OpCode::IInc | OpCode::IDec => Some((one(instr.op1), one(instr.op1))),
+        // INeg can raise an exact VM overflow/type error that the first leaf
+        // thunk ABI cannot surface. Control flow, calls, heap/container work,
+        // effects, actor/FFI operations, refcounting and suspension are also
+        // outside this deliberately small proof.
+        _ => None,
+    }
+}
+
+/// Prove that a function can execute as an in-place native leaf thunk.
+///
+/// The interpreter creates a fresh callee frame with only r0..r(argc-1)
+/// populated from staged arguments. A native leaf shares the caller register
+/// file, so every read must be either one of those arguments or definitely
+/// written earlier in this straight-line body. This prevents arbitrary caller
+/// register contents from becoming observable through the optimization.
+pub(crate) fn analyze_native_leaf(
+    module: &crate::bytecode::CodeModule,
+    func_idx: usize,
+) -> Option<NativeLeafPlan> {
+    use crate::bytecode::OpCode;
+
+    let start = *module.function_table.get(func_idx)?;
+    let info = module
+        .debug_functions
+        .iter()
+        .find(|info| info.code_offset == start)?;
+    let argc = u8::try_from(info.params.len()).ok()?;
+    let end = start.checked_add(info.code_len)?;
+    if end > module.instructions.len() || end <= start {
+        return None;
+    }
+
+    let terminal_pc = end - 1;
+    let terminal = *module.instructions.get(terminal_pc)?;
+    let ret_reg = match terminal.opcode {
+        OpCode::Ret => 0,
+        OpCode::RetVal => terminal.op1,
+        _ => return None,
+    };
+
+    let body_len = terminal_pc - start;
+    if body_len > NATIVE_LEAF_MAX_INSTRS {
+        return None;
+    }
+
+    let mut defined = [false; 256];
+    for reg in 0..argc {
+        defined[reg as usize] = true;
+    }
+    let mut clobbered = [false; 256];
+
+    for instr in &module.instructions[start..terminal_pc] {
+        let (reads, writes) = native_leaf_reads_writes(instr)?;
+        if reads.iter().any(|&reg| !defined[reg as usize]) {
+            return None;
+        }
+        for reg in writes {
+            defined[reg as usize] = true;
+            clobbered[reg as usize] = true;
+        }
+    }
+
+    if !defined[ret_reg as usize] {
+        return None;
+    }
+
+    let clobbers = clobbered
+        .iter()
+        .enumerate()
+        .filter_map(|(reg, &written)| written.then_some(reg as u8))
+        .collect();
+
+    Some(NativeLeafPlan {
+        start,
+        body_len,
+        argc,
+        ret_reg,
+        clobbers,
+    })
+}
+
 /// The code offset of the function containing `pc` (largest
 /// `function_table[i] <= pc`), bounding `direct_call_target`'s backward walk.
 pub(crate) fn func_start_for(module: &crate::bytecode::CodeModule, pc: usize) -> usize {
