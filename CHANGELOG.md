@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Backend-neutral JIT compile telemetry — 2026-09-28
+- **JIT backends now expose aggregate Fast and Optimized compilation counts and compiler-only wall time through `JitCompileStats`.** The counters exclude interpreter warm-up and generated-code execution so tiering decisions can separate compile cost from runtime payoff.
+- **`VM::jit_compile_stats` exposes the telemetry without leaking Cranelift-specific APIs**, and the tier-promotion regression requires one Fast plus one Optimized compile across the tested promotion.
+- **A dedicated `nulang-jit-bench` runner reports timed interpreter, first-run JIT, warmed JIT, and compiler-only deltas** across dense numeric crossover points (1k–100k loop trips) plus call-heavy and branch-heavy controls, in human or JSONL form.
+- **Threshold changes remain separate from measurement.** This PR adds the evidence needed to evaluate tiering policy without changing `HOT_THRESHOLD` or `TIER2_THRESHOLD` in the same patch.
+
 ### Unified web placement inference — 2026-09-28
 - **HIR lowering, web route contracts, placement diagnostics, and reactive action classification now consume one canonical effect-row placement rule.** Render/Web-only functions infer `static`, browser-local Client/Render functions infer `client`, empty rows remain unspecified, and other effectful web functions conservatively infer `server`.
 - **Route deployment metadata no longer drops effect-derived placement when `@placement` is omitted.** This removes a compiler/Web-IR disagreement that would otherwise make later static/client/server island planning unreliable.
