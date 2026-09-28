@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 
 use super::tablet::{MemoryTablet, TabletCheckpointImage, TabletDescriptor, TabletError};
 
-const CHECKPOINT_MAGIC: &[u8; 8] = b"NUDBCP01";
-const CHECKPOINT_VERSION: u16 = 1;
+const CHECKPOINT_MAGIC: &[u8; 8] = b"NUDBCP02";
+const CHECKPOINT_VERSION: u16 = 2;
 const HEADER_PREFIX_BYTES: usize = 2 + 8;
 const HEADER_BYTES: usize = HEADER_PREFIX_BYTES + 32;
 const MAX_CHECKPOINT_BYTES: usize = 512 * 1024 * 1024;
@@ -28,11 +28,18 @@ const MAX_CHECKPOINT_BYTES: usize = 512 * 1024 * 1024;
 struct DiskCheckpoint {
     version: u16,
     image: TabletCheckpointImage,
+    wal_anchor_digest: Option<[u8; 32]>,
+}
+
+pub(crate) struct LoadedCheckpoint {
+    pub tablet: MemoryTablet,
+    pub wal_anchor_digest: Option<[u8; 32]>,
 }
 
 pub(crate) fn write_checkpoint(
     path: impl AsRef<Path>,
     tablet: &MemoryTablet,
+    wal_anchor_digest: Option<[u8; 32]>,
 ) -> Result<u64, CheckpointError> {
     let path = path.as_ref();
     if let Some(parent) = path
@@ -45,6 +52,7 @@ pub(crate) fn write_checkpoint(
     let payload = serde_json::to_vec(&DiskCheckpoint {
         version: CHECKPOINT_VERSION,
         image: tablet.checkpoint_image(),
+        wal_anchor_digest,
     })
     .map_err(|error| CheckpointError::Serialization {
         message: error.to_string(),
@@ -84,7 +92,7 @@ pub(crate) fn write_checkpoint(
 pub(crate) fn load_checkpoint(
     path: impl AsRef<Path>,
     descriptor: TabletDescriptor,
-) -> Result<Option<MemoryTablet>, CheckpointError> {
+) -> Result<Option<LoadedCheckpoint>, CheckpointError> {
     let path = path.as_ref();
     let mut file = match File::open(path) {
         Ok(file) => file,
@@ -132,7 +140,16 @@ pub(crate) fn load_checkpoint(
     }
 
     let tablet = MemoryTablet::from_checkpoint_image(descriptor, disk.image)?;
-    Ok(Some(tablet))
+    if tablet.current_sequence() == 0 && disk.wal_anchor_digest.is_some() {
+        return Err(CheckpointError::InvalidAnchor);
+    }
+    if tablet.current_sequence() != 0 && disk.wal_anchor_digest.is_none() {
+        return Err(CheckpointError::InvalidAnchor);
+    }
+    Ok(Some(LoadedCheckpoint {
+        tablet,
+        wal_anchor_digest: disk.wal_anchor_digest,
+    }))
 }
 
 fn encode_header(payload_len: u64) -> [u8; HEADER_BYTES] {
@@ -219,6 +236,7 @@ pub enum CheckpointError {
         section: &'static str,
     },
     TrailingData,
+    InvalidAnchor,
     Serialization {
         message: String,
     },
@@ -257,6 +275,9 @@ impl fmt::Display for CheckpointError {
                 write!(f, "truncated NuDB checkpoint while reading {section}")
             }
             Self::TrailingData => f.write_str("NuDB checkpoint contains trailing data"),
+            Self::InvalidAnchor => {
+                f.write_str("NuDB checkpoint WAL anchor does not match its sequence")
+            }
             Self::Serialization { message } => {
                 write!(f, "NuDB checkpoint serialization error: {message}")
             }
