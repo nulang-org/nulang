@@ -285,7 +285,6 @@ fn cross_shard_admission_wakes_owner_only_after_successful_enqueue() {
     assert_eq!(wake.count(), 1);
 }
 
-
 #[test]
 fn queued_write_is_revalidated_if_owner_epoch_advances_before_execution() {
     let wal_path = temp_wal("stale_after_queue");
@@ -303,10 +302,7 @@ fn queued_write_is_revalidated_if_owner_epoch_advances_before_execution() {
     let dispatcher = TabletDispatcher::new(1, 0, placement, channels).unwrap();
     let mut ingress_tablets = BTreeMap::new();
     let outcome = dispatcher
-        .dispatch_write(
-            &mut ingress_tablets,
-            put(&ingress_descriptor, 0, b"stale"),
-        )
+        .dispatch_write(&mut ingress_tablets, put(&ingress_descriptor, 0, b"stale"))
         .unwrap();
     let reply = match outcome {
         TabletDispatchOutcome::LocalQueued { reply, .. } => reply,
