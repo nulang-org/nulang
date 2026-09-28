@@ -93,13 +93,21 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Build
         run: cargo build --locked --all-targets
 
       - name: Test
-        # Cluster partition/healing coverage uses the virtual-clock harness;
-        # fail on the first suite failure so CI never masks a real regression.
-        run: cargo test --locked
+        # nextest isolates individual tests in their own processes and schedules
+        # test binaries concurrently, reducing wall-clock time without changing
+        # the default-feature test selection.
+        run: cargo nextest run --locked
+
+      - name: Test doctests
+        # nextest intentionally does not execute rustdoc tests.
+        run: cargo test --locked --doc
 
       - name: Install cargo-llvm-cov
         if: env.CODECOV_TOKEN != ''

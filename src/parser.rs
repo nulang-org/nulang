@@ -162,8 +162,15 @@ impl Parser {
     /// splices the `(param vars, expanded body)` pairs into this parser's
     /// imported-type cache — the same path `import stdlib::*` uses, so
     /// use-site type arguments are substituted on cache hits.
-    fn seed_prelude_types(&mut self) {
-        let entries = PRELUDE_TYPE_CACHE.get_or_init(|| {
+    /// Parse and resolve the prelude type cache without leaking the prelude's
+    /// SourceMap into the caller. Lexer::new installs source text thread-locally,
+    /// so nested compiler work must restore whatever diagnostic source context
+    /// was active before it started.
+    fn build_prelude_type_cache() -> Vec<(String, Vec<TypeVar>, Type)> {
+        let caller_source_map = crate::types::current_source_text()
+            .map(|source| (source, crate::types::source_map_file()));
+
+        let entries = (|| {
             let source = crate::prelude_source::PRELUDE_SOURCE;
             let mut lexer = crate::lexer::Lexer::new(source);
             let tokens = match lexer.lex() {
@@ -188,7 +195,20 @@ impl Parser {
                 }
             }
             out
-        });
+        })();
+
+        match caller_source_map {
+            Some((source, file)) => {
+                crate::types::set_source_map_with_file(&source, file.as_deref());
+            }
+            None => crate::types::clear_source_map(),
+        }
+
+        entries
+    }
+
+    fn seed_prelude_types(&mut self) {
+        let entries = PRELUDE_TYPE_CACHE.get_or_init(Self::build_prelude_type_cache);
         for (name, param_vars, ty) in entries {
             self.imported_type_cache
                 .insert(name.clone(), (param_vars.clone(), ty.clone()));
@@ -6910,6 +6930,24 @@ mod tests {
         let tokens = lexer.lex()?;
         let mut parser = Parser::new(tokens);
         parser.parse_expr()
+    }
+
+    #[test]
+    fn test_prelude_cache_build_preserves_active_source_map() {
+        let source = "let t = ((1, 2), 3) in t.0.1";
+        crate::types::set_source_map_with_file(source, Some("caller.nula"));
+
+        let entries = Parser::build_prelude_type_cache();
+
+        assert!(
+            !entries.is_empty(),
+            "prelude type cache should resolve entries"
+        );
+        assert_eq!(crate::types::current_source_text().as_deref(), Some(source));
+        assert_eq!(
+            crate::types::source_map_file().as_deref(),
+            Some("caller.nula")
+        );
     }
 
     #[test]
