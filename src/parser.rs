@@ -9219,4 +9219,42 @@ fn main() {
         ));
     }
 
+
+    #[test]
+    fn test_component_jsx_resolves_later_declaration() {
+        let ast = parse(
+            r#"
+component Dashboard() {
+    <ServerPanel message="hello" />
+}
+
+component ServerPanel(message: String) {
+    <section>{message}</section>
+}
+"#,
+        )
+        .unwrap();
+
+        let dashboard = ast
+            .decls
+            .iter()
+            .find(|decl| matches!(decl, Decl::Function { name, .. } if name == "Dashboard"))
+            .unwrap();
+        let Decl::Function { body, .. } = dashboard else {
+            unreachable!()
+        };
+        let Expr::Block { exprs, .. } = body else {
+            panic!("component body");
+        };
+        let Expr::App { func, args, .. } = &exprs[0] else {
+            panic!("forward component JSX must lower to a direct call");
+        };
+        assert!(matches!(func.as_ref(), Expr::Var(name, _) if name == "ServerPanel"));
+        assert_eq!(args.len(), 2, "prop plus synthetic slot");
+        assert!(matches!(
+            &args[0],
+            Expr::Literal(Literal::String(value), _) if value == "hello"
+        ));
+    }
+
 }
