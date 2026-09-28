@@ -248,4 +248,48 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("goal_created"));
     }
+
+    #[test]
+    fn newer_task_lease_epoch_fences_older_attempt() {
+        let task_id = Uuid::new_v4();
+        let old_attempt = TaskAttempt::new(task_id, "worker-a", 4);
+        let new_attempt = TaskAttempt::new(task_id, "worker-b", 5);
+
+        let old_lease = TaskLease::for_attempt(&old_attempt);
+        let new_lease = TaskLease::for_attempt(&new_attempt);
+
+        assert_eq!(new_lease.validate_against(&old_lease), Ok(()));
+        assert!(matches!(
+            old_lease.validate_against(&new_lease),
+            Err(TaskLeaseError::Stale { .. })
+        ));
+    }
+
+    #[test]
+    fn same_task_lease_epoch_cannot_change_owner() {
+        let task_id = Uuid::new_v4();
+        let attempt_a = TaskAttempt::new(task_id, "worker-a", 7);
+        let attempt_b = TaskAttempt::new(task_id, "worker-b", 7);
+
+        let lease_a = TaskLease::for_attempt(&attempt_a);
+        let lease_b = TaskLease::for_attempt(&attempt_b);
+
+        assert!(matches!(
+            lease_b.validate_against(&lease_a),
+            Err(TaskLeaseError::ConflictingOwner { .. })
+        ));
+    }
+
+    #[test]
+    fn task_lease_only_authorizes_exact_attempt() {
+        let task_id = Uuid::new_v4();
+        let attempt = TaskAttempt::new(task_id, "worker-a", 3);
+        let lease = TaskLease::for_attempt(&attempt);
+
+        assert!(lease.authorizes(&attempt));
+
+        let replacement = TaskAttempt::new(task_id, "worker-a", 4);
+        assert!(!lease.authorizes(&replacement));
+    }
+
 }
