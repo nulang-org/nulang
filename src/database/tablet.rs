@@ -251,6 +251,28 @@ struct VersionedValue {
     value: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TabletCheckpointVersion {
+    pub sequence: u64,
+    pub value: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TabletCheckpointRow {
+    pub key: Vec<u8>,
+    pub versions: Vec<TabletCheckpointVersion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TabletCheckpointImage {
+    pub tablet_id: u64,
+    pub range_start: Vec<u8>,
+    pub range_end: Option<Vec<u8>>,
+    pub ownership_epoch: u64,
+    pub sequence: u64,
+    pub rows: Vec<TabletCheckpointRow>,
+}
+
 /// Minimal single-node MVCC tablet used to prove transaction semantics before
 /// introducing WAL and replication.
 ///
@@ -279,6 +301,101 @@ impl MemoryTablet {
 
     pub fn current_sequence(&self) -> u64 {
         self.current_sequence
+    }
+
+    pub(crate) fn checkpoint_image(&self) -> TabletCheckpointImage {
+        TabletCheckpointImage {
+            tablet_id: self.descriptor.id.get(),
+            range_start: self.descriptor.range.start.clone(),
+            range_end: self.descriptor.range.end.clone(),
+            ownership_epoch: self.descriptor.ownership_epoch,
+            sequence: self.current_sequence,
+            rows: self
+                .rows
+                .iter()
+                .map(|(key, versions)| TabletCheckpointRow {
+                    key: key.clone(),
+                    versions: versions
+                        .iter()
+                        .map(|version| TabletCheckpointVersion {
+                            sequence: version.sequence,
+                            value: version.value.clone(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn from_checkpoint_image(
+        descriptor: TabletDescriptor,
+        image: TabletCheckpointImage,
+    ) -> Result<Self, TabletError> {
+        if image.tablet_id != descriptor.id.get() {
+            return Err(TabletError::InvalidCheckpoint {
+                reason: "checkpoint tablet id does not match descriptor".to_string(),
+            });
+        }
+        if image.range_start != descriptor.range.start || image.range_end != descriptor.range.end {
+            return Err(TabletError::InvalidCheckpoint {
+                reason: "checkpoint key range does not match descriptor".to_string(),
+            });
+        }
+        if image.ownership_epoch > descriptor.ownership_epoch {
+            return Err(TabletError::InvalidCheckpoint {
+                reason: "checkpoint ownership epoch is newer than descriptor".to_string(),
+            });
+        }
+
+        let mut rows = BTreeMap::new();
+        for row in image.rows {
+            if !descriptor.range.contains(&row.key) {
+                return Err(TabletError::InvalidCheckpoint {
+                    reason: "checkpoint row falls outside tablet range".to_string(),
+                });
+            }
+            if row.versions.is_empty() {
+                return Err(TabletError::InvalidCheckpoint {
+                    reason: "checkpoint row contains no versions".to_string(),
+                });
+            }
+
+            let mut previous = 0_u64;
+            let mut versions = Vec::with_capacity(row.versions.len());
+            for version in row.versions {
+                if version.sequence == 0
+                    || version.sequence <= previous
+                    || version.sequence > image.sequence
+                {
+                    return Err(TabletError::InvalidCheckpoint {
+                        reason: "checkpoint row versions are not strictly ordered".to_string(),
+                    });
+                }
+                previous = version.sequence;
+                versions.push(VersionedValue {
+                    sequence: version.sequence,
+                    value: version.value,
+                });
+            }
+
+            if rows.insert(row.key, versions).is_some() {
+                return Err(TabletError::InvalidCheckpoint {
+                    reason: "checkpoint contains duplicate row keys".to_string(),
+                });
+            }
+        }
+
+        if image.sequence == 0 && !rows.is_empty() {
+            return Err(TabletError::InvalidCheckpoint {
+                reason: "sequence-zero checkpoint contains row history".to_string(),
+            });
+        }
+
+        Ok(Self {
+            descriptor,
+            current_sequence: image.sequence,
+            rows,
+        })
     }
 
     pub fn prepare_write(
@@ -489,6 +606,9 @@ pub enum TabletError {
         committed: u64,
         requested: u64,
     },
+    InvalidCheckpoint {
+        reason: String,
+    },
     KeyOutsideTabletRange,
 }
 
@@ -545,6 +665,9 @@ impl fmt::Display for TabletError {
                 f,
                 "snapshot {requested} is ahead of committed tablet sequence {committed}"
             ),
+            Self::InvalidCheckpoint { reason } => {
+                write!(f, "invalid tablet checkpoint: {reason}")
+            }
             Self::KeyOutsideTabletRange => {
                 f.write_str("tablet mutation key falls outside the owned key range")
             }
