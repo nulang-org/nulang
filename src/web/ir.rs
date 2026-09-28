@@ -503,15 +503,15 @@ mod tests {
         std::fs::write(
             root.join("main.nula"),
             r#"
-fn ClientCounter() -> Html ! {Client, Render} {
+fn ClientCounter() ! {Client, Render} {
     <button>Count</button>
 }
 
-fn ServerPanel() -> Html ! {DB, Render, Web} {
+fn ServerPanel() ! {DB, Render, Web} {
     <section>Server</section>
 }
 
-fn Dashboard() -> Html {
+fn Dashboard() {
     <main>
         <ClientCounter />
         <ServerPanel />
