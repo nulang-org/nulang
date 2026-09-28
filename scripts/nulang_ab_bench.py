@@ -403,6 +403,25 @@ def print_table(
             f"{delta:>+16.2f}%  {speedup:>6.3f}x"
         )
 
+def print_within_candidate_comparison(
+    label: str,
+    row: dict[str, float | int] | None,
+) -> None:
+    if row is None:
+        return
+    print()
+    print(f"within-candidate paired diagnostic: {label}")
+    print("-----------------------------------------------")
+    print(
+        f"pairs={int(row['pairs'])} "
+        f"median_speedup={float(row['median_speedup_x']):.3f}x "
+        f"throughput_delta={float(row['median_throughput_change_pct']):+.2f}% "
+        f"latency_delta={float(row['median_latency_change_pct']):+.2f}% "
+        f"ci95=[{float(row['speedup_ci95_lower']):.3f}, "
+        f"{float(row['speedup_ci95_upper']):.3f}]"
+    )
+
+
 def print_candidate_only(
     summary: dict[str, dict[str, dict[str, float | int]]]
 ) -> None:
@@ -516,8 +535,14 @@ def main() -> int:
         summary = summarize(samples)
         compare = comparisons(summary)
         paired = paired_comparisons(samples)
+        aot_iso_arena = within_variant_paired_comparison(
+            samples["candidate"],
+            "ab/aot_alloc_heavy_heap",
+            "ab/aot_alloc_heavy_arena",
+        )
         print_table(summary, compare)
         print_paired_table(paired)
+        print_within_candidate_comparison("AOT heap -> iso arena", aot_iso_arena)
         print_candidate_only(summary)
 
         allowed = (
@@ -563,6 +588,9 @@ def main() -> int:
             "summary": summary,
             "comparison": compare,
             "paired_comparison": paired,
+            "within_candidate_comparison": {
+                "aot_iso_arena": aot_iso_arena,
+            },
         }
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
