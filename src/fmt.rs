@@ -1437,5 +1437,4 @@ fn main() {
         assert!(!out.contains("fn Card("), "component degraded to fn: {out}");
         assert_idempotent(src);
     }
-
 }
