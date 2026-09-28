@@ -77,9 +77,7 @@ pub(crate) fn write_checkpoint(path: &Path, tablet: &MemoryTablet) -> Result<(),
 
     fs::rename(&temp, path)?;
     #[cfg(test)]
-    super::interruption::hit(
-        super::interruption::StorageInterruptionPoint::CheckpointAfterRename,
-    )?;
+    super::interruption::hit(super::interruption::StorageInterruptionPoint::CheckpointAfterRename)?;
 
     sync_parent_directory(path)?;
     #[cfg(test)]
