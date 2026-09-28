@@ -135,7 +135,6 @@ fn corrupt_checkpoint_fails_closed_instead_of_falling_back_to_compacted_wal() {
     let _ = fs::remove_file(&checkpoint);
 }
 
-
 #[test]
 fn checkpoint_ahead_of_wal_tail_fails_closed() {
     let wal_path = temp_wal("checkpoint_ahead");
