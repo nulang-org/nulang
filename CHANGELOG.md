@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Typed JIT composite allocation — 2026-09-27
+- **Allocation-containing hot regions can now stay on the typed Cranelift path.** The typed compiler models `ArrAlloc`, `RecMk`, and `TupleMk`, preserves unrelated Int/Float type facts across scratch allocations, and reuses the same PC-aware arena allocator as baseline JIT code.
+- **Known integer array lengths remain in native SSA across allocation calls.** Only unproven array-length values force register-cache materialization, while record/tuple allocation does not flush unrelated numeric caches.
+
 ### JIT iso-arena composite allocation — 2026-09-27
 - **Hot Cranelift regions may now include `ArrAlloc`, `RecMk`, and `TupleMk` without fragmenting back to the interpreter.** Native lowering calls a PC-aware allocation helper that reuses the VM's existing escape-analysis decision instead of maintaining a second native-only analysis.
 - **Native allocation preserves interpreter placement semantics.** Qualifying sites use the activation-local iso arena, non-qualifying sites use the ordinary heap, missing arena support falls back to the heap, and newly allocated composite slots remain nil-initialized.
