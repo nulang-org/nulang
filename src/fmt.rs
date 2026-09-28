@@ -114,6 +114,22 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             let is_component = annotations
                 .iter()
                 .any(|annotation| matches!(annotation, crate::ast::FunctionAnnotation::Component));
+            for annotation in annotations {
+                if let crate::ast::FunctionAnnotation::Placement(placement) = annotation {
+                    out.push_str(&format!(
+                        "{}@placement({})\n",
+                        sp,
+                        match placement {
+                            crate::types::Placement::Static => "static",
+                            crate::types::Placement::Server => "server",
+                            crate::types::Placement::Edge => "edge",
+                            crate::types::Placement::Client => "client",
+                            crate::types::Placement::Actor => "actor",
+                            crate::types::Placement::Workflow => "workflow",
+                        }
+                    ));
+                }
+            }
             let visible_params: Vec<_> = if is_component {
                 params
                     .iter()
