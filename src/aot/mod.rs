@@ -1117,6 +1117,9 @@ pub fn dispatch_aot_runtime_behavior(
     let mut callbacks = AotRuntimeCallbacks { runtime, actor_id };
     unsafe { crate::jit::runtime::set_jit_callbacks(&mut callbacks) };
     let status = call_aot_behavior(target.fn_ptr, actor_id, args);
+    if status == crate::native_abi::NativeActorStatus::Completed {
+        crate::vm::ActorVmCallbacks::reset_arena(&mut callbacks);
+    }
 
     crate::jit::runtime::restore_aot_helper_thread_state(saved_helpers);
     AOT_RUNTIME_CTX.with(|cell| cell.set(saved_runtime));
@@ -1152,6 +1155,9 @@ pub fn aot_behavior_adapter(actor: &mut crate::runtime::Actor, args: &[crate::vm
         };
         unsafe { crate::jit::runtime::set_jit_callbacks(&mut cb) };
         let status = call_aot_behavior(target.fn_ptr, actor.id, args);
+        if status == crate::native_abi::NativeActorStatus::Completed {
+            crate::vm::ActorVmCallbacks::reset_arena(&mut cb);
+        }
         if status != crate::native_abi::NativeActorStatus::Completed {
             tracing::warn!(
                 actor_id = actor.id,
@@ -1202,9 +1208,23 @@ impl crate::vm::ActorVmCallbacks for AotActorCallbacks {
         unsafe { (*self.actor).heap.alloc(size, type_tag) }
     }
 
+    fn alloc_arena(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
+        unsafe { (*self.actor).iso_arena.alloc(size, type_tag) }
+    }
+
+    fn reset_arena(&mut self) {
+        unsafe { (*self.actor).iso_arena.reset() };
+    }
+
+    fn is_arena_ptr(&self, ptr: *const u8) -> bool {
+        unsafe { (*self.actor).iso_arena.contains(ptr) }
+    }
+
     fn drop_ref(&mut self, ptr: *mut u8) {
-        // SAFETY: both raw pointers are valid; `ptr` is from this actor's heap.
         unsafe {
+            if (*self.actor).iso_arena.contains(ptr) {
+                return;
+            }
             (*self.actor)
                 .orca_gc
                 .drop_local_ref(&mut (*self.actor).heap, ptr)
@@ -1212,8 +1232,12 @@ impl crate::vm::ActorVmCallbacks for AotActorCallbacks {
     }
 
     fn retain_ref(&mut self, ptr: *mut u8) {
-        // SAFETY: both raw pointers are valid; `ptr` is from this actor's heap.
-        unsafe { (*self.actor).orca_gc.local_ref(&(*self.actor).heap, ptr) };
+        unsafe {
+            if (*self.actor).iso_arena.contains(ptr) {
+                return;
+            }
+            (*self.actor).orca_gc.local_ref(&(*self.actor).heap, ptr)
+        };
     }
 
     fn array_len(&self, ptr: *mut u8) -> Option<usize> {
@@ -1350,9 +1374,40 @@ impl crate::vm::ActorVmCallbacks for AotRuntimeCallbacks {
         }
     }
 
+    fn alloc_arena(&mut self, size: usize, type_tag: HeapTypeTag) -> Option<*mut u8> {
+        unsafe {
+            (*self.runtime)
+                .actors
+                .get_mut(&self.actor_id)?
+                .iso_arena
+                .alloc(size, type_tag)
+        }
+    }
+
+    fn reset_arena(&mut self) {
+        unsafe {
+            if let Some(actor) = (*self.runtime).actors.get_mut(&self.actor_id) {
+                actor.iso_arena.reset();
+            }
+        }
+    }
+
+    fn is_arena_ptr(&self, ptr: *const u8) -> bool {
+        unsafe {
+            (*self.runtime)
+                .actors
+                .get(&self.actor_id)
+                .map(|actor| actor.iso_arena.contains(ptr))
+                .unwrap_or(false)
+        }
+    }
+
     fn drop_ref(&mut self, ptr: *mut u8) {
         unsafe {
             if let Some(actor) = (*self.runtime).actors.get_mut(&self.actor_id) {
+                if actor.iso_arena.contains(ptr) {
+                    return;
+                }
                 actor.orca_gc.drop_local_ref(&mut actor.heap, ptr);
             }
         }
@@ -1361,6 +1416,9 @@ impl crate::vm::ActorVmCallbacks for AotRuntimeCallbacks {
     fn retain_ref(&mut self, ptr: *mut u8) {
         unsafe {
             if let Some(actor) = (*self.runtime).actors.get_mut(&self.actor_id) {
+                if actor.iso_arena.contains(ptr) {
+                    return;
+                }
                 actor.orca_gc.local_ref(&actor.heap, ptr);
             }
         }
@@ -1830,6 +1888,10 @@ fn create_isa_builder(target: &str) -> NuResult<isa::Builder> {
 /// Single source of truth: `src/jit/helpers.rs` `define_helpers!` macro.
 fn register_runtime_helpers(builder: &mut JITBuilder) {
     crate::jit::helpers::register_with_builder(builder);
+    builder.symbol(
+        "nulang_aot_alloc_local_obj",
+        crate::jit::runtime::nulang_aot_alloc_local_obj as *const u8,
+    );
 }
 
 /// Scan MIR statements to collect field names and string constants.

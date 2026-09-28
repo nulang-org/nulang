@@ -1109,6 +1109,14 @@ pub fn compile_mir_function_body(
     let local_base = mir::FunctionBuilder::LOCAL_BASE;
     let type_meta = mir_func.type_metadata.clone();
     aot.cap_metadata = CapabilityMetadata::from_mir_function(mir_func);
+    let iso_arena_enabled = std::env::var("NULANG_ISO_ARENA")
+        .map(|value| !value.is_empty() && value != "0")
+        .unwrap_or(false);
+    let arena_alloc_sites = if iso_arena_enabled {
+        crate::mir_iso_arena::qualifying_alloc_sites(mir_func)
+    } else {
+        HashSet::new()
+    };
 
     // Analyze block predecessors.
     let preds = compute_predecessors(mir_func);
@@ -1226,17 +1234,17 @@ pub fn compile_mir_function_body(
             h.insert(*name, func_ref);
         }
 
-        // alloc_obj: (i64, i32) -> i64
-        {
+        // Composite allocators: (i64, i32) -> i64.
+        for name in ["nulang_alloc_obj", "nulang_aot_alloc_local_obj"] {
             let mut h_sig = module.make_signature();
             h_sig.params.push(AbiParam::new(types::I64));
             h_sig.params.push(AbiParam::new(types::I32));
             h_sig.returns.push(AbiParam::new(types::I64));
             let h_id = module
-                .declare_function("nulang_alloc_obj", Linkage::Import, &h_sig)
+                .declare_function(name, Linkage::Import, &h_sig)
                 .map_err(|e| AotCompileError::Cranelift(e.to_string()))?;
             let func_ref = module.declare_func_in_func(h_id, builder.func);
-            h.insert("nulang_alloc_obj", func_ref);
+            h.insert(name, func_ref);
         }
 
         // obj_set: (i64, i64, i64) -> void
@@ -1795,6 +1803,7 @@ pub fn compile_mir_function_body(
                     &handler_threaded_width,
                     &site_extras,
                     &mut cont_thread,
+                    &arena_alloc_sites,
                     stmt_idx,
                     bid,
                 )?;
@@ -2034,6 +2043,7 @@ fn compile_stmt(
     handler_threaded_width: &HashMap<mir::BlockId, usize>,
     site_extras: &HashMap<(mir::BlockId, usize), Vec<u32>>,
     cont_thread: &mut Vec<u32>,
+    arena_alloc_sites: &HashSet<crate::mir_iso_arena::MirAllocSite>,
     stmt_idx: usize,
     current_block: mir::BlockId,
 ) -> AotResult<()> {
@@ -2240,9 +2250,14 @@ fn compile_stmt(
                     captured_closure_locals.insert(reg);
                 }
             }
+            let arena_alloc = arena_alloc_sites.contains(&crate::mir_iso_arena::MirAllocSite {
+                block: current_block,
+                stmt_index: stmt_idx,
+            });
             let val = compile_rvalue(
                 builder,
                 op,
+                arena_alloc,
                 type_meta,
                 helpers,
                 call_targets,
@@ -2370,6 +2385,7 @@ fn compile_stmt(
 fn compile_rvalue(
     builder: &mut FunctionBuilder,
     rv: &mir::RValue,
+    arena_alloc: bool,
     type_meta: &TypeMetadata,
     helpers: &HashMap<&str, FuncRef>,
     call_targets: &HashMap<usize, FuncRef>,
@@ -2608,7 +2624,12 @@ fn compile_rvalue(
             // alloc_obj(slot_count, type_tag=3 for Record)
             let count_val = builder.ins().iconst(types::I64, slot_count as i64);
             let tag_val = builder.ins().iconst(types::I32, 3);
-            let ptr = call_helper(builder, helpers, "nulang_alloc_obj", &[count_val, tag_val])?;
+            let alloc_helper = if arena_alloc {
+                "nulang_aot_alloc_local_obj"
+            } else {
+                "nulang_alloc_obj"
+            };
+            let ptr = call_helper(builder, helpers, alloc_helper, &[count_val, tag_val])?;
 
             for (name, val_id) in fields {
                 let val_reg = mir::FunctionBuilder::LOCAL_BASE + val_id.0;
@@ -2632,7 +2653,12 @@ fn compile_rvalue(
             let count = elements.len() as u64;
             let count_val = builder.ins().iconst(types::I64, count as i64);
             let tag_val = builder.ins().iconst(types::I32, 6);
-            let ptr = call_helper(builder, helpers, "nulang_alloc_obj", &[count_val, tag_val])?;
+            let alloc_helper = if arena_alloc {
+                "nulang_aot_alloc_local_obj"
+            } else {
+                "nulang_alloc_obj"
+            };
+            let ptr = call_helper(builder, helpers, alloc_helper, &[count_val, tag_val])?;
 
             for (i, val_id) in elements.iter().enumerate() {
                 let val_reg = mir::FunctionBuilder::LOCAL_BASE + val_id.0;
@@ -2650,7 +2676,12 @@ fn compile_rvalue(
             let count = elements.len() as u64;
             let count_val = builder.ins().iconst(types::I64, count as i64);
             let tag_val = builder.ins().iconst(types::I32, 1);
-            let ptr = call_helper(builder, helpers, "nulang_alloc_obj", &[count_val, tag_val])?;
+            let alloc_helper = if arena_alloc {
+                "nulang_aot_alloc_local_obj"
+            } else {
+                "nulang_alloc_obj"
+            };
+            let ptr = call_helper(builder, helpers, alloc_helper, &[count_val, tag_val])?;
 
             for (i, val_id) in elements.iter().enumerate() {
                 let val_reg = mir::FunctionBuilder::LOCAL_BASE + val_id.0;
@@ -3012,6 +3043,7 @@ fn compile_rvalue(
                 let val = compile_rvalue(
                     builder,
                     val_rv,
+                    false,
                     type_meta,
                     helpers,
                     call_targets,
@@ -3825,6 +3857,74 @@ mod tests {
             count,
             Some(12),
             "AOT-native behavior should accumulate state"
+        );
+    }
+
+    #[test]
+    fn test_aot_local_composite_uses_iso_arena_and_resets() {
+        use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        use crate::typechecker::TypeChecker;
+
+        let source = r#"
+            actor Scratch {
+                behavior run() {
+                    let values = [1, 2, 3] in values[0]
+                }
+            }
+            fn main() { 0 }
+        "#;
+        let tokens = Lexer::new(source).lex().unwrap();
+        let ast = Parser::new(tokens).parse_module().unwrap();
+        let mut tc = TypeChecker::new();
+        tc.check_module(&ast).unwrap();
+        let mut ec = EffectChecker::new();
+        ec.check_module(&ast.decls).unwrap();
+        let mut ca = CapabilityAnalyzer::new();
+        let ctx = CapContext::new();
+        for d in crate::effect_checker::flatten_decls(&ast.decls) {
+            if let crate::ast::Decl::Function { body, .. } = d {
+                ca.infer_cap(&ctx, body).unwrap();
+            }
+        }
+
+        let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+        let mir_module = crate::mir_lower::lower_module(&hir).unwrap();
+        let previous_iso_arena = std::env::var_os("NULANG_ISO_ARENA");
+        std::env::set_var("NULANG_ISO_ARENA", "1");
+        let compiled = crate::aot::AotModule::compile(&mir_module);
+        match previous_iso_arena {
+            Some(value) => std::env::set_var("NULANG_ISO_ARENA", value),
+            None => std::env::remove_var("NULANG_ISO_ARENA"),
+        }
+        let aot = compiled.expect("AOT compile of local composite behavior should succeed");
+        let native = aot
+            .fn_ptr_for_behavior("Scratch.run")
+            .expect("behavior 'Scratch.run' should be compiled");
+
+        let mut actor = crate::runtime::Actor::new(17, "Scratch", 64);
+        actor.register_behavior("run", crate::aot::aot_behavior_adapter);
+
+        crate::aot::set_aot_dispatch(Some(crate::aot::AotDispatchTarget::standalone(
+            native, &aot,
+        )));
+        (actor.behavior_table[0].handler_fn)(&mut actor, &[]);
+
+        assert_eq!(
+            actor.iso_arena.total_allocs(),
+            1,
+            "the proven-local array literal should bypass the ORCA heap"
+        );
+        assert_eq!(
+            actor.iso_arena.epoch_allocs(),
+            0,
+            "completed native behavior must reset the activation arena"
+        );
+        assert_eq!(
+            actor.iso_arena.resets(),
+            1,
+            "completed native behavior should reset the arena exactly once"
         );
     }
 
