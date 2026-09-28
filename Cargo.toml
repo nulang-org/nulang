@@ -198,6 +198,11 @@ path = "src/bin/nula_difffuzz.rs"
 required-features = ["difffuzz"]
 
 [[bin]]
+name = "nulang-jit-bench"
+path = "src/bin/nulang_jit_bench.rs"
+required-features = ["native-codegen"]
+
+[[bin]]
 name = "nulang-savina"
 path = "src/bin/nulang_savina.rs"
 required-features = ["savina-bench"]
