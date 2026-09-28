@@ -1388,8 +1388,9 @@ component StaticLogo() {
     <strong>Logo</strong>
 }
 
+@placement(client)
 component ClientCounter() {
-    perform Client.hydrate()
+    <button>Count</button>
 }
 
 component ServerPanel() {
@@ -1427,4 +1428,28 @@ component Dashboard() {
             ]
         );
     }
+
+    #[test]
+    fn test_capitalized_function_is_not_a_component() {
+        let module = parse(
+            r#"
+fn Helper() {
+    1
+}
+
+fn main() {
+    Helper()
+}
+"#,
+        );
+        let mut checker = crate::effect_checker::EffectChecker::new();
+        checker.check_module(&module.decls).unwrap();
+
+        let graph = analyze_component_graph(&module, Some(&checker));
+        assert!(
+            graph.components.is_empty(),
+            "capitalization alone must not create web component semantics"
+        );
+    }
+
 }
