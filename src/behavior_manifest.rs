@@ -1,10 +1,11 @@
 //! Experimental RFC 0020 Behavior Manifest support.
 //!
 //! This module intentionally implements a narrow, enforceable subset first:
-//! artifact/compiler identity plus durable actor state-schema identity and
-//! migration topology. It is designed for deployment admission and upgrade
+//! artifact/compiler identity, canonical explicit spawn-authority inventory,
+//! durable actor state-schema identity, and migration topology. It is designed for deployment admission and upgrade
 //! preflight checks, not as a claim that runtime migration execution is
-//! complete. Migration bodies do not yet have a canonical semantic encoding,
+//! complete. Effect-derived ambient authority and migration bodies do not yet
+//! have complete canonical semantic encodings,
 //! so `migration_identity` is explicitly `topology-only`.
 
 use crate::artifact_identity::ArtifactIdentityManifest;
