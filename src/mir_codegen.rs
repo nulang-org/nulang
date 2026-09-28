@@ -3668,14 +3668,19 @@ mod optimize_tests {
         optimize_function(&mut func, &mut Vec::new());
 
         assert!(
-            func.blocks.iter().flat_map(|block| &block.stmts).all(|stmt| {
-                !matches!(
+            !func.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
+                matches!(
                     stmt,
                     mir::Stmt::Assign {
-                        op: mir::RValue::Tuple(_)
-                            | mir::RValue::LoadFieldPos { obj, .. },
+                        op: mir::RValue::Tuple(_),
                         ..
-                    } if !matches!(stmt, mir::Stmt::Assign { op: mir::RValue::LoadFieldPos { obj, .. }, .. } if *obj != tuple)
+                    }
+                ) || matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        op: mir::RValue::LoadFieldPos { obj, .. },
+                        ..
+                    } if *obj == tuple
                 )
             }),
             "a scalar-only local tuple consumed only by a static field load should be eliminated: {:?}",
@@ -3688,7 +3693,7 @@ mod optimize_tests {
         let mut b = mir::FunctionBuilder::new("record_sroa", Some(Type::int()));
         let one = b.add_temp(Type::int());
         b.assign(one, mir::RValue::Const(Constant::Int(1)));
-        let record = b.add_temp(Type::Record(vec![("x".into(), Type::int())], None));
+        let record = b.add_temp(Type::Record(vec![("x".into(), Type::int())]));
         b.assign(record, mir::RValue::Record(vec![("x".into(), one)]));
         let result = b.add_temp(Type::int());
         b.assign(
@@ -3708,9 +3713,15 @@ mod optimize_tests {
                 matches!(
                     stmt,
                     mir::Stmt::Assign {
-                        op: mir::RValue::Record(_) | mir::RValue::LoadFieldNamed { obj, .. },
+                        op: mir::RValue::Record(_),
                         ..
-                    } if !matches!(stmt, mir::Stmt::Assign { op: mir::RValue::LoadFieldNamed { obj, .. }, .. } if *obj != record)
+                    }
+                ) || matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        op: mir::RValue::LoadFieldNamed { obj, .. },
+                        ..
+                    } if *obj == record
                 )
             }),
             "a scalar-only local record consumed only by a named field load should be eliminated"
@@ -3740,9 +3751,15 @@ mod optimize_tests {
                 matches!(
                     stmt,
                     mir::Stmt::Assign {
-                        op: mir::RValue::ArrayLit(_) | mir::RValue::ArrayLoad { arr: base, .. },
+                        op: mir::RValue::ArrayLit(_),
                         ..
-                    } if !matches!(stmt, mir::Stmt::Assign { op: mir::RValue::ArrayLoad { arr: base, .. }, .. } if *base != arr)
+                    }
+                ) || matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        op: mir::RValue::ArrayLoad { arr: base, .. },
+                        ..
+                    } if *base == arr
                 )
             }),
             "a scalar-only local array read at a constant index should be eliminated"
