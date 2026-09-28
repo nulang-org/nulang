@@ -33,9 +33,7 @@ use cranelift_module::{Linkage, Module};
 use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::{CodeModule, Constant, Instruction, OpCode};
-use crate::jit::compiler::{
-    emit_arr_load, emit_yield_pc, make_alloc_obj_at_sig, CompileError,
-};
+use crate::jit::compiler::{emit_arr_load, emit_yield_pc, make_alloc_obj_at_sig, CompileError};
 use crate::runtime::heap::TypeTag;
 
 // ---------------------------------------------------------------------------
@@ -2649,12 +2647,7 @@ pub fn compile_bytecode_region_typed(
                     let count = int_cache.load(&mut builder, regs_ptr, len_reg);
                     emit_tag_int(&mut builder, count)
                 } else {
-                    flush_native_caches(
-                        &mut builder,
-                        regs_ptr,
-                        &mut int_cache,
-                        &mut float_cache,
-                    );
+                    flush_native_caches(&mut builder, regs_ptr, &mut int_cache, &mut float_cache);
                     load_reg(&mut builder, regs_ptr, len_reg)
                 };
                 let dst = instr.op2 as usize;
