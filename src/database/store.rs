@@ -37,9 +37,7 @@ impl WalBackedTablet {
             Some(tablet) => tablet,
             None => wal.recover_memory_tablet(descriptor)?,
         };
-        if tablet.current_sequence() > 0 {
-            wal.replay_after_checkpoint(&mut tablet)?;
-        }
+        wal.replay_after_checkpoint(&mut tablet)?;
         Ok(Self {
             tablet,
             wal,
