@@ -1237,7 +1237,7 @@ impl EffectChecker {
             let is_component = annotations
                 .iter()
                 .any(|annotation| matches!(annotation, crate::ast::FunctionAnnotation::Component));
-            if !is_component && !effect_row_contains_web_effect(&row) {
+            if !is_component && !Self::effect_row_contains_web_effect(&row) {
                 continue;
             }
 
