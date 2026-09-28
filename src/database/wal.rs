@@ -920,7 +920,7 @@ impl fmt::Display for WalError {
                 write!(f, "WAL serialization error: {message}")
             }
             Self::Poisoned => f.write_str(
-                "NuDB WAL handle is poisoned after an ambiguous append; reopen before retrying",
+                "NuDB WAL handle is poisoned after an ambiguous storage mutation; reopen before retrying",
             ),
         }
     }
