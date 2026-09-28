@@ -9174,4 +9174,40 @@ fn main() {
         ));
     }
 
+
+    #[test]
+    fn test_html_text_preserves_spaces_and_punctuation() {
+        let ast = parse(
+            r#"
+fn main() {
+    <p>Hello from slot. Welcome, Nulang Web!</p>
+}
+"#,
+        )
+        .unwrap();
+        let main = ast
+            .decls
+            .iter()
+            .find(|decl| matches!(decl, Decl::Function { name, .. } if name == "main"))
+            .unwrap();
+        let Decl::Function { body, .. } = main else {
+            unreachable!()
+        };
+        let Expr::Block { exprs, .. } = body else {
+            panic!("main body");
+        };
+        let Expr::App { args, .. } = &exprs[0] else {
+            panic!("html element");
+        };
+        let Expr::Array(children, _) = &args[2] else {
+            panic!("html children");
+        };
+        assert_eq!(children.len(), 1, "contiguous text should stay one node");
+        assert!(matches!(
+            &children[0],
+            Expr::App { args, .. }
+                if matches!(&args[0], Expr::Literal(Literal::String(text), _) if text == "Hello from slot. Welcome, Nulang Web!")
+        ));
+    }
+
 }
