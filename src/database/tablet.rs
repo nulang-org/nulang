@@ -252,9 +252,15 @@ pub(crate) struct VersionedValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TabletSnapshotRow {
+    pub(crate) key: Vec<u8>,
+    pub(crate) versions: Vec<VersionedValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TabletSnapshotState {
     pub(crate) current_sequence: u64,
-    pub(crate) rows: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
+    pub(crate) rows: Vec<TabletSnapshotRow>,
 }
 
 /// Minimal single-node MVCC tablet used to prove transaction semantics before
@@ -290,7 +296,14 @@ impl MemoryTablet {
     pub(crate) fn snapshot_state(&self) -> TabletSnapshotState {
         TabletSnapshotState {
             current_sequence: self.current_sequence,
-            rows: self.rows.clone(),
+            rows: self
+                .rows
+                .iter()
+                .map(|(key, versions)| TabletSnapshotRow {
+                    key: key.clone(),
+                    versions: versions.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -298,13 +311,14 @@ impl MemoryTablet {
         descriptor: TabletDescriptor,
         state: TabletSnapshotState,
     ) -> Result<Self, TabletError> {
-        for (key, versions) in &state.rows {
-            if !descriptor.range.contains(key) {
+        let mut rows = BTreeMap::new();
+        for row in state.rows {
+            if !descriptor.range.contains(&row.key) {
                 return Err(TabletError::KeyOutsideTabletRange);
             }
 
             let mut previous = 0_u64;
-            for version in versions {
+            for version in &row.versions {
                 if version.sequence == 0
                     || version.sequence > state.current_sequence
                     || version.sequence <= previous
@@ -313,12 +327,15 @@ impl MemoryTablet {
                 }
                 previous = version.sequence;
             }
+            if rows.insert(row.key, row.versions).is_some() {
+                return Err(TabletError::InvalidSnapshotHistory);
+            }
         }
 
         Ok(Self {
             descriptor,
             current_sequence: state.current_sequence,
-            rows: state.rows,
+            rows,
         })
     }
 
