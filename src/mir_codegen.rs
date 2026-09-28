@@ -2078,6 +2078,24 @@ fn scalar_replace_local_composites(
             return false;
         }
 
+        // A composite snapshots its component values at construction. Reusing
+        // the original source local for a later scalarized load is sound only
+        // while that source is stable; otherwise a later redefinition would
+        // make the rewritten load observe the new value instead of the
+        // captured one. Parameters/captures have zero MIR definitions and are
+        // stable; ordinary single-assignment locals have one.
+        let has_redefined_component = match composite {
+            ScalarComposite::Tuple(items) | ScalarComposite::Array(items) => items
+                .iter()
+                .any(|source| def_count[source.0 as usize] > 1),
+            ScalarComposite::Record(fields) => fields
+                .iter()
+                .any(|(_, source)| def_count[source.0 as usize] > 1),
+        };
+        if has_redefined_component {
+            return false;
+        }
+
         for block in &func.blocks {
             for stmt in &block.stmts {
                 match stmt {
