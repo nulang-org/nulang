@@ -1,4 +1,8 @@
 # Nulang Changelog
+### NLAP task-attempt lease fencing contract — 2026-09-28
+- **NLAP now distinguishes logical tasks from concrete worker attempts.** `TaskAttempt` carries retry lineage, worker identity, lifecycle state, and a monotonic lease epoch so retries and reassignments do not reuse one ambiguous task execution identity.
+- **`TaskLease` provides the runtime-neutral fencing proof for one authoritative attempt.** Swarm events carry attempt and lease identity explicitly, allowing Nulang Cloud to reject stale workers and bind durable side effects to the exact attempt that owns the task.
+
 ### NulangDB checkpoint and WAL reclamation — 2026-09-28
 - **Single-node tablets can now publish checksummed atomic MVCC checkpoints before reclaiming durable WAL history.** Recovery accepts both safe crash states: a checkpoint plus the original full WAL, or a checkpoint plus a compacted WAL whose header persists the checkpoint base sequence.
 - **Compacted WALs retain sequence, tablet, and ownership fencing metadata.** Reclamation is tail-only in this first slice, so a checkpoint at sequence N rewrites the WAL to an empty log based at N and the next durable write must prove predecessor N before sequence N+1 is accepted.
