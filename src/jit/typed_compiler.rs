@@ -33,7 +33,10 @@ use cranelift_module::{Linkage, Module};
 use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::{CodeModule, Constant, Instruction, OpCode};
-use crate::jit::compiler::{emit_arr_load, emit_yield_pc, CompileError};
+use crate::jit::compiler::{
+    emit_arr_load, emit_yield_pc, make_alloc_obj_at_sig, CompileError,
+};
+use crate::runtime::heap::TypeTag;
 
 // ---------------------------------------------------------------------------
 // NaN-tag constants and CLIF helpers — single source in `cranelift_utils`
@@ -313,6 +316,9 @@ fn apply_type_transfer(instr: &Instruction, module: &CodeModule, state: &mut [Kn
         }
         OpCode::FToI => {
             state[op2] = KnownType::Int;
+        }
+        OpCode::ArrAlloc | OpCode::RecMk | OpCode::TupleMk => {
+            state[op2] = KnownType::Unknown;
         }
 
         // ArrLoad result is Unknown (array elements have runtime-only types).
@@ -861,6 +867,9 @@ fn apply_local_type_transfer(instr: &Instruction, state: &mut [KnownType; 256]) 
         OpCode::And | OpCode::Or => state[op3] = KnownType::Bool,
         OpCode::IToF => state[op2] = KnownType::Float,
         OpCode::FToI => state[op2] = KnownType::Int,
+        OpCode::ArrAlloc | OpCode::RecMk | OpCode::TupleMk => {
+            state[op2] = KnownType::Unknown;
+        }
         OpCode::ArrLoad => state[op3] = KnownType::Unknown,
         OpCode::ArrStore => {}
         _ => state.fill(KnownType::Unknown),
@@ -1102,7 +1111,8 @@ pub(crate) fn register_runtime_helpers<M: Module>(
         let sig = match helper.sig() {
             HelperSig::Bin => make_bin_sig(module),
             HelperSig::Unary => make_unary_sig(module),
-            _ => continue, // reg3/reg4 not used by typed_compiler
+            HelperSig::AllocObjAt => make_alloc_obj_at_sig(module),
+            _ => continue, // reg3/reg4/direct-call not used by typed_compiler
         };
         let func_id = module
             .declare_function(name, Linkage::Import, &sig)
@@ -1564,6 +1574,29 @@ fn emit_unary_runtime(
     store_reg(builder, regs_ptr, dst, result);
 }
 
+fn emit_composite_alloc_runtime(
+    builder: &mut FunctionBuilder,
+    helpers: &HashMap<&str, FuncRef>,
+    regs_ptr: Value,
+    int_cache: &mut NativeIntCache,
+    float_cache: &mut NativeFloatCache,
+    tagged_slot_count: Value,
+    type_tag: TypeTag,
+    pc: usize,
+    dst: usize,
+) {
+    let tag = builder.ins().iconst(types::I32, type_tag as i64);
+    let pc = builder.ins().iconst(types::I64, pc as i64);
+    let call = builder.ins().call(
+        helpers["nulang_jit_alloc_obj_at"],
+        &[tagged_slot_count, tag, pc],
+    );
+    let result = builder.inst_results(call)[0];
+    store_reg(builder, regs_ptr, dst, result);
+    int_cache.invalidate(dst);
+    float_cache.invalidate(dst);
+}
+
 // ---------------------------------------------------------------------------
 // Main Compilation Entry Point (typed)
 // ---------------------------------------------------------------------------
@@ -1625,6 +1658,9 @@ pub fn is_opcode_supported_typed(op: OpCode) -> bool {
             | OpCode::JmpF
             | OpCode::IToF
             | OpCode::FToI
+            | OpCode::ArrAlloc
+            | OpCode::RecMk
+            | OpCode::TupleMk
             | OpCode::DbgPrint
             | OpCode::Ret
             | OpCode::RetVal
@@ -2604,6 +2640,58 @@ pub fn compile_bytecode_region_typed(
                 meta.set_bool_result(instr.op3 as usize);
                 int_cache.invalidate(instr.op3 as usize);
                 float_cache.invalidate(instr.op3 as usize);
+            }
+
+            // -- Composite allocation --
+            OpCode::ArrAlloc => {
+                let len_reg = instr.op1 as usize;
+                let tagged_count = if meta.is_known(len_reg, KnownType::Int) {
+                    let count = int_cache.load(&mut builder, regs_ptr, len_reg);
+                    emit_tag_int(&mut builder, count)
+                } else {
+                    flush_native_caches(
+                        &mut builder,
+                        regs_ptr,
+                        &mut int_cache,
+                        &mut float_cache,
+                    );
+                    load_reg(&mut builder, regs_ptr, len_reg)
+                };
+                let dst = instr.op2 as usize;
+                emit_composite_alloc_runtime(
+                    &mut builder,
+                    &helpers,
+                    regs_ptr,
+                    &mut int_cache,
+                    &mut float_cache,
+                    tagged_count,
+                    TypeTag::Array,
+                    pc,
+                    dst,
+                );
+                meta.set_type(dst, KnownType::Unknown);
+            }
+            OpCode::RecMk | OpCode::TupleMk => {
+                let count = crate::vm::Value::int(instr.op1 as i64).as_raw();
+                let tagged_count = builder.ins().iconst(types::I64, count as i64);
+                let type_tag = if instr.opcode == OpCode::RecMk {
+                    TypeTag::Record
+                } else {
+                    TypeTag::Tuple
+                };
+                let dst = instr.op2 as usize;
+                emit_composite_alloc_runtime(
+                    &mut builder,
+                    &helpers,
+                    regs_ptr,
+                    &mut int_cache,
+                    &mut float_cache,
+                    tagged_count,
+                    type_tag,
+                    pc,
+                    dst,
+                );
+                meta.set_type(dst, KnownType::Unknown);
             }
 
             // -- Control Flow --
