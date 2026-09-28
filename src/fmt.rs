@@ -1418,6 +1418,22 @@ fn main() {
     }
 
     #[test]
+    fn test_fmt_component_preserves_placement_annotation() {
+        let src = r#"
+@placement(client)
+component Counter() {
+    <button>Count</button>
+}
+"#;
+        let out = format_source(src).expect("placed component formats");
+        assert!(
+            out.contains("@placement(client)\ncomponent Counter()"),
+            "component placement annotation was dropped: {out}"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
     fn test_fmt_component_preserves_component_surface() {
         let src = r#"
 component Card(title: String) {
