@@ -145,8 +145,8 @@ fn runtime_island_placement(placement: Option<Placement>) -> Option<IslandPlacem
 
 /// Build a deterministic component call graph from a parsed module.
 ///
-/// Components are functions whose names are capitalized or functions referenced
-/// by a capitalized component call. Placement uses explicit `@placement`
+/// Components are functions produced by the `component` declaration surface.
+/// Placement uses explicit `@placement`
 /// annotations first, then the effect checker's row, then a declared row as a
 /// fallback. In component context an otherwise-pure component is static by
 /// default; child placement is represented by graph edges rather than promoted
@@ -156,9 +156,9 @@ pub fn analyze_component_graph(
     checker: Option<&EffectChecker>,
 ) -> ComponentGraph {
     let mut component_names = BTreeSet::new();
+    collect_component_names(&module.decls, &mut component_names);
     let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-
-    collect_component_edges(&module.decls, &mut component_names, &mut edges);
+    collect_component_edges(&module.decls, &component_names, &mut edges);
 
     let mut components = Vec::new();
     collect_component_nodes(
@@ -173,23 +173,33 @@ pub fn analyze_component_graph(
     ComponentGraph { components }
 }
 
+fn collect_component_names(decls: &[Decl], out: &mut BTreeSet<String>) {
+    for decl in decls {
+        match decl {
+            Decl::Function {
+                name, annotations, ..
+            } if annotations
+                .iter()
+                .any(|annotation| matches!(annotation, FunctionAnnotation::Component)) =>
+            {
+                out.insert(name.clone());
+            }
+            Decl::Module { decls, .. } => collect_component_names(decls, out),
+            _ => {}
+        }
+    }
+}
+
 fn collect_component_edges(
     decls: &[Decl],
-    component_names: &mut BTreeSet<String>,
+    component_names: &BTreeSet<String>,
     edges: &mut BTreeMap<String, BTreeSet<String>>,
 ) {
     for decl in decls {
         match decl {
-            Decl::Function { name, body, .. } => {
-                if is_component_identifier(name) {
-                    component_names.insert(name.clone());
-                }
-
+            Decl::Function { name, body, .. } if component_names.contains(name) => {
                 let mut calls = BTreeSet::new();
-                collect_component_calls(body, &mut calls);
-                for child in &calls {
-                    component_names.insert(child.clone());
-                }
+                collect_component_calls(body, component_names, &mut calls);
                 if !calls.is_empty() {
                     edges.entry(name.clone()).or_default().extend(calls);
                 }
@@ -244,22 +254,30 @@ fn collect_component_nodes(
     }
 }
 
-fn collect_component_calls(expr: &Expr, out: &mut BTreeSet<String>) {
-    if let Some(name) = component_call_name(expr) {
-        out.insert(name);
+fn collect_component_calls(
+    expr: &Expr,
+    component_names: &BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    if let Expr::App { func, .. } = expr {
+        if let Some(name) = component_name(func) {
+            if component_names.contains(&name) {
+                out.insert(name);
+            }
+        }
     }
 
     match expr {
-        Expr::Lambda { body, .. } => collect_component_calls(body, out),
+        Expr::Lambda { body, .. } => collect_component_calls(body, component_names, out),
         Expr::App { func, args, .. } => {
-            collect_component_calls(func, out);
+            collect_component_calls(func, component_names, out);
             for arg in args {
-                collect_component_calls(arg, out);
+                collect_component_calls(arg, component_names, out);
             }
         }
         Expr::Let { value, body, .. } | Expr::LetRec { value, body, .. } => {
-            collect_component_calls(value, out);
-            collect_component_calls(body, out);
+            collect_component_calls(value, component_names, out);
+            collect_component_calls(body, component_names, out);
         }
         Expr::If {
             cond,
@@ -267,21 +285,21 @@ fn collect_component_calls(expr: &Expr, out: &mut BTreeSet<String>) {
             else_branch,
             ..
         } => {
-            collect_component_calls(cond, out);
-            collect_component_calls(then_branch, out);
+            collect_component_calls(cond, component_names, out);
+            collect_component_calls(then_branch, component_names, out);
             if let Some(else_branch) = else_branch {
-                collect_component_calls(else_branch, out);
+                collect_component_calls(else_branch, component_names, out);
             }
         }
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            collect_component_calls(scrutinee, out);
+            collect_component_calls(scrutinee, component_names, out);
             for (_, guard, body) in arms {
                 if let Some(guard) = guard {
-                    collect_component_calls(guard, out);
+                    collect_component_calls(guard, component_names, out);
                 }
-                collect_component_calls(body, out);
+                collect_component_calls(body, component_names, out);
             }
         }
         Expr::Block { exprs, .. }
@@ -290,57 +308,57 @@ fn collect_component_calls(expr: &Expr, out: &mut BTreeSet<String>) {
         | Expr::Array(exprs, ..)
         | Expr::FString(exprs, ..) => {
             for expr in exprs {
-                collect_component_calls(expr, out);
+                collect_component_calls(expr, component_names, out);
             }
         }
         Expr::Record(fields, ..) | Expr::RecordUpdate { fields, .. } => {
             for (_, expr) in fields {
-                collect_component_calls(expr, out);
+                collect_component_calls(expr, component_names, out);
             }
         }
         Expr::FieldAccess { expr, .. }
         | Expr::Unary { expr, .. }
         | Expr::Consume { expr, .. }
         | Expr::CapAnnotate { expr, .. }
-        | Expr::TypeAnnotate { expr, .. } => collect_component_calls(expr, out),
+        | Expr::TypeAnnotate { expr, .. } => collect_component_calls(expr, component_names, out),
         Expr::Index { arr, idx, .. } => {
-            collect_component_calls(arr, out);
-            collect_component_calls(idx, out);
+            collect_component_calls(arr, component_names, out);
+            collect_component_calls(idx, component_names, out);
         }
         Expr::Binary { left, right, .. } | Expr::Pipe { left, right, .. } => {
-            collect_component_calls(left, out);
-            collect_component_calls(right, out);
+            collect_component_calls(left, component_names, out);
+            collect_component_calls(right, component_names, out);
         }
         Expr::Assign { target, value, .. } => {
-            collect_component_calls(target, out);
-            collect_component_calls(value, out);
+            collect_component_calls(target, component_names, out);
+            collect_component_calls(value, component_names, out);
         }
         Expr::For { iterable, body, .. } => {
-            collect_component_calls(iterable, out);
-            collect_component_calls(body, out);
+            collect_component_calls(iterable, component_names, out);
+            collect_component_calls(body, component_names, out);
         }
         Expr::While { cond, body, .. } => {
-            collect_component_calls(cond, out);
-            collect_component_calls(body, out);
+            collect_component_calls(cond, component_names, out);
+            collect_component_calls(body, component_names, out);
         }
         Expr::Return(value, ..) | Expr::Break(value, ..) => {
             if let Some(value) = value {
-                collect_component_calls(value, out);
+                collect_component_calls(value, component_names, out);
             }
         }
         Expr::Recover { body, .. } | Expr::Hide { body, .. } | Expr::Seal { body, .. } => {
-            collect_component_calls(body, out);
+            collect_component_calls(body, component_names, out);
         }
-        Expr::Defer { expr, .. } => collect_component_calls(expr, out),
+        Expr::Defer { expr, .. } => collect_component_calls(expr, component_names, out),
         Expr::Handle { body, handlers, .. } => {
-            collect_component_calls(body, out);
+            collect_component_calls(body, component_names, out);
             for handler in handlers {
                 collect_component_calls(&handler.body, out);
             }
         }
         Expr::Perform { args, .. } | Expr::Emit { args, .. } => {
             for arg in args {
-                collect_component_calls(arg, out);
+                collect_component_calls(arg, component_names, out);
             }
         }
         Expr::Spawn {
@@ -350,67 +368,47 @@ fn collect_component_calls(expr: &Expr, out: &mut BTreeSet<String>) {
             target_node,
             ..
         } => {
-            collect_component_calls(actor_type, out);
+            collect_component_calls(actor_type, component_names, out);
             for (_, expr) in init {
-                collect_component_calls(expr, out);
+                collect_component_calls(expr, component_names, out);
             }
             if let Some(args) = positional_args {
                 for arg in args {
-                    collect_component_calls(arg, out);
+                    collect_component_calls(arg, component_names, out);
                 }
             }
             if let Some(target) = target_node {
-                collect_component_calls(target, out);
+                collect_component_calls(target, component_names, out);
             }
         }
         Expr::Send { actor, args, .. } | Expr::Ask { actor, args, .. } => {
-            collect_component_calls(actor, out);
+            collect_component_calls(actor, component_names, out);
             for arg in args {
-                collect_component_calls(arg, out);
+                collect_component_calls(arg, component_names, out);
             }
         }
         Expr::Receive { arms, after, .. } => {
             for (_, _, guard, body) in arms {
                 if let Some(guard) = guard {
-                    collect_component_calls(guard, out);
+                    collect_component_calls(guard, component_names, out);
                 }
-                collect_component_calls(body, out);
+                collect_component_calls(body, component_names, out);
             }
             if let Some((timeout, body)) = after {
-                collect_component_calls(timeout, out);
-                collect_component_calls(body, out);
+                collect_component_calls(timeout, component_names, out);
+                collect_component_calls(body, component_names, out);
             }
         }
-        Expr::GrainRef { key, .. } => collect_component_calls(key, out),
-        Expr::Resume { value, .. } => collect_component_calls(value, out),
+        Expr::GrainRef { key, .. } => collect_component_calls(key, component_names, out),
+        Expr::Resume { value, .. } => collect_component_calls(value, component_names, out),
         Expr::Migrate { actor, node, .. } => {
-            collect_component_calls(actor, out);
-            collect_component_calls(node, out);
+            collect_component_calls(actor, component_names, out);
+            collect_component_calls(node, component_names, out);
         }
         _ => {}
     }
 }
 
-fn component_call_name(expr: &Expr) -> Option<String> {
-    match expr {
-        // JSX currently lowers every tag to el("tag", attrs, children).
-        // Preserve capitalized-tag identity here so compiler planning can see
-        // component boundaries even before the parser grows a dedicated
-        // component-call AST node.
-        Expr::App { func, args, .. } if is_var(func, "el") && args.len() == 3 => {
-            string_literal(&args[0]).filter(|name| is_component_identifier(name))
-        }
-        Expr::App { func, .. } => component_name(func),
-        _ => None,
-    }
-}
-
-fn is_component_identifier(name: &str) -> bool {
-    name.chars()
-        .next()
-        .map(|ch| ch.is_uppercase())
-        .unwrap_or(false)
-}
 
 /// Analyze a module and build its signal graph.
 ///
@@ -1333,15 +1331,15 @@ fn card() -> Html {
 import stdlib::web::html
 import stdlib::web::types
 
-fn StaticCard() -> Html ! {Render, Web} {
+component StaticCard() {
     <span>Static</span>
 }
 
-fn ServerPanel() -> Html ! {DB, Render, Web} {
-    <section>Server</section>
+component ServerPanel() {
+    perform DB.query("select 1")
 }
 
-fn Dashboard() -> Html {
+component Dashboard() {
     <div>
         <StaticCard />
         <ServerPanel />
@@ -1387,19 +1385,19 @@ fn Dashboard() -> Html {
 import stdlib::web::html
 import stdlib::web::types
 
-fn StaticLogo() -> Html ! {Render, Web} {
+component StaticLogo() {
     <strong>Logo</strong>
 }
 
-fn ClientCounter() -> Html ! {Client, Render} {
-    <button>Count</button>
+component ClientCounter() {
+    perform Client.hydrate()
 }
 
-fn ServerPanel() -> Html ! {DB, Render, Web} {
-    <section>Server</section>
+component ServerPanel() {
+    perform DB.query("select 1")
 }
 
-fn Dashboard() -> Html {
+component Dashboard() {
     <main>
         <StaticLogo />
         <ClientCounter />
