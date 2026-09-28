@@ -21,10 +21,7 @@ use super::tablet::{TabletId, TabletWrite};
 pub enum TabletDispatchConfigError {
     InvalidShardCount,
     InvalidQueueCapacity,
-    InvalidLocalShard {
-        shard: u16,
-        shard_count: u16,
-    },
+    InvalidLocalShard { shard: u16, shard_count: u16 },
     InvalidOwnershipEpoch,
 }
 
@@ -98,10 +95,7 @@ impl TabletPlacementMap {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TabletDispatchError {
     UnknownTablet(TabletId),
-    OwnershipEpochMismatch {
-        placement: u64,
-        presented: u64,
-    },
+    OwnershipEpochMismatch { placement: u64, presented: u64 },
     MissingLocalTablet(TabletId),
     UnknownLocalShard(u16),
     QueueFull(u16),
@@ -164,16 +158,9 @@ impl TabletLocalReply {
 
 #[derive(Debug)]
 pub enum TabletDispatchOutcome {
-    Executed {
-        sequence: u64,
-    },
-    LocalQueued {
-        shard: u16,
-        reply: TabletLocalReply,
-    },
-    Remote {
-        request: TabletRemoteRequest,
-    },
+    Executed { sequence: u64 },
+    LocalQueued { shard: u16, reply: TabletLocalReply },
+    Remote { request: TabletRemoteRequest },
 }
 
 struct TabletShardRequest {
@@ -221,7 +208,9 @@ impl TabletDispatchChannels {
         match sender.try_send(request) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err(TabletDispatchError::QueueFull(shard)),
-            Err(TrySendError::Disconnected(_)) => Err(TabletDispatchError::QueueDisconnected(shard)),
+            Err(TrySendError::Disconnected(_)) => {
+                Err(TabletDispatchError::QueueDisconnected(shard))
+            }
         }
     }
 }
@@ -236,10 +225,7 @@ impl TabletShardInbox {
         self.shard
     }
 
-    pub fn try_process_one(
-        &mut self,
-        tablets: &mut BTreeMap<TabletId, WalBackedTablet>,
-    ) -> bool {
+    pub fn try_process_one(&mut self, tablets: &mut BTreeMap<TabletId, WalBackedTablet>) -> bool {
         let request = match self.receiver.try_recv() {
             Ok(request) => request,
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => return false,
