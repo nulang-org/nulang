@@ -63,11 +63,29 @@ pub(crate) fn write_checkpoint(path: &Path, tablet: &MemoryTablet) -> Result<(),
     file.write_all(&(payload.len() as u32).to_le_bytes())?;
     file.write_all(&payload)?;
     file.write_all(blake3::hash(&payload).as_bytes())?;
+    #[cfg(test)]
+    super::interruption::hit(
+        super::interruption::StorageInterruptionPoint::CheckpointAfterTempWrite,
+    )?;
+
     file.sync_data()?;
+    #[cfg(test)]
+    super::interruption::hit(
+        super::interruption::StorageInterruptionPoint::CheckpointAfterTempSync,
+    )?;
     drop(file);
 
     fs::rename(&temp, path)?;
+    #[cfg(test)]
+    super::interruption::hit(
+        super::interruption::StorageInterruptionPoint::CheckpointAfterRename,
+    )?;
+
     sync_parent_directory(path)?;
+    #[cfg(test)]
+    super::interruption::hit(
+        super::interruption::StorageInterruptionPoint::CheckpointAfterDirectorySync,
+    )?;
     Ok(())
 }
 
