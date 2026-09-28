@@ -71,7 +71,6 @@ pub struct CloudConfigEntry {
     pub required_by: String,
 }
 
-
 /// Component placement metadata exported for deployment/build adapters.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IrComponent {
@@ -540,5 +539,4 @@ fn Dashboard() {
 
         std::fs::remove_dir_all(root).unwrap();
     }
-
 }
