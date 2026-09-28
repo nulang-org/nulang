@@ -502,15 +502,15 @@ mod tests {
         std::fs::write(
             root.join("main.nula"),
             r#"
-fn ClientCounter() ! {Client, Render} {
-    <button>Count</button>
+component ClientCounter() {
+    perform Client.hydrate()
 }
 
-fn ServerPanel() ! {DB, Render, Web} {
-    <section>Server</section>
+component ServerPanel() {
+    perform DB.query("select 1")
 }
 
-fn Dashboard() {
+component Dashboard() {
     <main>
         <ClientCounter />
         <ServerPanel />
