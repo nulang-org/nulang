@@ -3,7 +3,8 @@
 //! The format is intentionally small and self-validating:
 //!
 //! ```text
-//! file := magic ("NUDBWAL2") record*
+//! file := wal_header record*
+//! wal_header := "NUDBWAL3" base_sequence:u64 tablet_id:u64 ownership_epoch:u64 header_blake3:[u8; 32]
 //! record := frame_header payload:[u8; payload_len] payload_blake3:[u8; 32]
 //! frame_header := "NREC" frame_version:u16 payload_len:u32 header_blake3:[u8; 32]
 //! ```
@@ -21,7 +22,9 @@ use std::path::{Path, PathBuf};
 
 use super::tablet::{MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite};
 
-const WAL_MAGIC: &[u8; 8] = b"NUDBWAL2";
+const WAL_MAGIC: &[u8; 8] = b"NUDBWAL3";
+const WAL_HEADER_PREFIX_BYTES: usize = 8 + 8 + 8 + 8;
+const WAL_HEADER_BYTES: usize = WAL_HEADER_PREFIX_BYTES + 32;
 const WAL_FRAME_MAGIC: &[u8; 4] = b"NREC";
 const WAL_FRAME_VERSION: u16 = 1;
 const WAL_RECORD_VERSION: u16 = 1;
@@ -139,6 +142,7 @@ pub struct FileWal {
     file: File,
     records: Vec<WalRecord>,
     record_end_offsets: Vec<u64>,
+    base_sequence: u64,
     tablet_id: Option<TabletId>,
     latest_ownership_epoch: Option<u64>,
     poisoned: bool,
@@ -165,26 +169,27 @@ impl FileWal {
             .open(&path)?;
 
         if file.metadata()?.len() == 0 {
-            file.write_all(WAL_MAGIC)?;
+            let header = encode_wal_header(0, None, None);
+            file.write_all(&header)?;
             file.sync_data()?;
             if !file_existed {
                 sync_parent_directory(&path)?;
             }
-        } else {
-            let mut magic = [0_u8; WAL_MAGIC.len()];
-            let read = read_up_to(&mut file, &mut magic)?;
-            if read != WAL_MAGIC.len() || &magic != WAL_MAGIC {
-                return Err(WalError::InvalidHeader);
-            }
         }
 
-        file.seek(SeekFrom::Start(WAL_MAGIC.len() as u64))?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut wal_header = [0_u8; WAL_HEADER_BYTES];
+        if read_up_to(&mut file, &mut wal_header)? != WAL_HEADER_BYTES {
+            return Err(WalError::InvalidHeader);
+        }
+        let (base_sequence, mut tablet_id, mut latest_ownership_epoch) =
+            decode_wal_header(&wal_header)?;
+
+        file.seek(SeekFrom::Start(WAL_HEADER_BYTES as u64))?;
 
         let mut records = Vec::new();
         let mut record_end_offsets = Vec::new();
-        let mut tablet_id = None;
-        let mut latest_ownership_epoch = None;
-        let mut last_sequence = 0_u64;
+        let mut last_sequence = base_sequence;
 
         loop {
             let record_start = file.stream_position()?;
@@ -247,6 +252,7 @@ impl FileWal {
             file,
             records,
             record_end_offsets,
+            base_sequence,
             tablet_id,
             latest_ownership_epoch,
             poisoned: false,
@@ -263,8 +269,15 @@ impl FileWal {
         &self.records
     }
 
+    pub fn base_sequence(&self) -> u64 {
+        self.base_sequence
+    }
+
     pub fn last_sequence(&self) -> u64 {
-        self.records.last().map(WalRecord::sequence).unwrap_or(0)
+        self.records
+            .last()
+            .map(WalRecord::sequence)
+            .unwrap_or(self.base_sequence)
     }
 
     /// Absolute file offset immediately after the indexed record.
@@ -299,6 +312,12 @@ impl FileWal {
             }
         }
 
+        if self.base_sequence != 0 {
+            return Err(WalError::CheckpointRequired {
+                base_sequence: self.base_sequence,
+            });
+        }
+
         let mut tablet = MemoryTablet::new(descriptor);
         for record in &self.records {
             tablet
@@ -313,6 +332,88 @@ impl FileWal {
                 })?;
         }
         Ok(tablet)
+    }
+
+    /// Replay records newer than an already restored checkpoint.
+    pub fn replay_after_checkpoint(&self, tablet: &mut MemoryTablet) -> Result<(), WalError> {
+        if tablet.current_sequence() < self.base_sequence {
+            return Err(WalError::CheckpointTooOld {
+                checkpoint: tablet.current_sequence(),
+                wal_base: self.base_sequence,
+            });
+        }
+        if let Some(existing) = self.tablet_id {
+            if existing != tablet.descriptor().id() {
+                return Err(WalError::TabletMismatch {
+                    expected: tablet.descriptor().id(),
+                    presented: existing,
+                });
+            }
+        }
+        if let Some(durable_epoch) = self.latest_ownership_epoch {
+            if tablet.descriptor().ownership_epoch() < durable_epoch {
+                return Err(WalError::StaleOwnershipEpoch {
+                    durable: durable_epoch,
+                    presented: tablet.descriptor().ownership_epoch(),
+                });
+            }
+        }
+
+        for record in self
+            .records
+            .iter()
+            .filter(|record| record.sequence > tablet.current_sequence())
+        {
+            tablet
+                .replay_committed(
+                    record.sequence,
+                    record.expected_previous_sequence,
+                    record.mutations.clone(),
+                )
+                .map_err(|error| WalError::ReplayRejected {
+                    sequence: record.sequence,
+                    reason: error.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Atomically replace the WAL with an empty log whose durable predecessor
+    /// is `base_sequence`. Initial reclamation is intentionally tail-only:
+    /// checkpoints are taken at the current committed sequence, so no retained
+    /// post-checkpoint records need to be copied during the rewrite.
+    pub fn reclaim_through(&mut self, base_sequence: u64) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(WalError::Poisoned);
+        }
+        let current = self.last_sequence();
+        if base_sequence != current {
+            return Err(WalError::InvalidReclaimSequence {
+                current,
+                requested: base_sequence,
+            });
+        }
+
+        let temp = reclaim_temp_path(&self.path);
+        let mut replacement = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp)?;
+        let header = encode_wal_header(
+            base_sequence,
+            self.tablet_id,
+            self.latest_ownership_epoch,
+        );
+        replacement.write_all(&header)?;
+        replacement.sync_data()?;
+        drop(replacement);
+
+        fs::rename(&temp, &self.path)?;
+        sync_parent_directory(&self.path)?;
+
+        *self = Self::open(&self.path)?;
+        Ok(())
     }
 
     /// Durably append one prepared tablet write.
@@ -430,6 +531,47 @@ impl FileWal {
     }
 }
 
+fn encode_wal_header(
+    base_sequence: u64,
+    tablet_id: Option<TabletId>,
+    ownership_epoch: Option<u64>,
+) -> [u8; WAL_HEADER_BYTES] {
+    let mut header = [0_u8; WAL_HEADER_BYTES];
+    header[..8].copy_from_slice(WAL_MAGIC);
+    header[8..16].copy_from_slice(&base_sequence.to_le_bytes());
+    header[16..24].copy_from_slice(&tablet_id.map(TabletId::get).unwrap_or(0).to_le_bytes());
+    header[24..32].copy_from_slice(&ownership_epoch.unwrap_or(0).to_le_bytes());
+    let checksum = blake3::hash(&header[..WAL_HEADER_PREFIX_BYTES]);
+    header[WAL_HEADER_PREFIX_BYTES..].copy_from_slice(checksum.as_bytes());
+    header
+}
+
+fn decode_wal_header(
+    header: &[u8; WAL_HEADER_BYTES],
+) -> Result<(u64, Option<TabletId>, Option<u64>), WalError> {
+    if &header[..8] != WAL_MAGIC {
+        return Err(WalError::InvalidHeader);
+    }
+    let expected = blake3::hash(&header[..WAL_HEADER_PREFIX_BYTES]);
+    if &header[WAL_HEADER_PREFIX_BYTES..] != expected.as_bytes() {
+        return Err(WalError::WalHeaderChecksumMismatch);
+    }
+
+    let base_sequence = u64::from_le_bytes(header[8..16].try_into().unwrap());
+    let tablet_raw = u64::from_le_bytes(header[16..24].try_into().unwrap());
+    let epoch_raw = u64::from_le_bytes(header[24..32].try_into().unwrap());
+    let tablet_id = if tablet_raw == 0 {
+        None
+    } else {
+        Some(TabletId::new(tablet_raw).map_err(|_| WalError::InvalidHeader)?)
+    };
+    let ownership_epoch = if epoch_raw == 0 { None } else { Some(epoch_raw) };
+    if base_sequence > 0 && (tablet_id.is_none() || ownership_epoch.is_none()) {
+        return Err(WalError::InvalidHeader);
+    }
+    Ok((base_sequence, tablet_id, ownership_epoch))
+}
+
 fn encode_frame_header(payload_len: u32) -> [u8; WAL_FRAME_HEADER_BYTES] {
     let mut header = [0_u8; WAL_FRAME_HEADER_BYTES];
     header[..4].copy_from_slice(WAL_FRAME_MAGIC);
@@ -520,6 +662,12 @@ fn validate_record_chain(
     Ok(())
 }
 
+fn reclaim_temp_path(path: &Path) -> PathBuf {
+    let mut temp = path.as_os_str().to_os_string();
+    temp.push(".reclaim.tmp");
+    PathBuf::from(temp)
+}
+
 fn sync_parent_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -562,6 +710,7 @@ pub enum WalError {
         message: String,
     },
     InvalidHeader,
+    WalHeaderChecksumMismatch,
     InvalidFrameHeader {
         offset: u64,
         reason: String,
@@ -605,6 +754,17 @@ pub enum WalError {
         sequence: u64,
         reason: String,
     },
+    CheckpointRequired {
+        base_sequence: u64,
+    },
+    CheckpointTooOld {
+        checkpoint: u64,
+        wal_base: u64,
+    },
+    InvalidReclaimSequence {
+        current: u64,
+        requested: u64,
+    },
     Serialization {
         message: String,
     },
@@ -625,6 +785,9 @@ impl fmt::Display for WalError {
         match self {
             Self::Io { message, .. } => write!(f, "WAL I/O error: {message}"),
             Self::InvalidHeader => f.write_str("invalid NuDB WAL header"),
+            Self::WalHeaderChecksumMismatch => {
+                f.write_str("NuDB WAL header checksum mismatch")
+            }
             Self::InvalidFrameHeader { offset, reason } => {
                 write!(
                     f,
@@ -679,6 +842,21 @@ impl fmt::Display for WalError {
             Self::ReplayRejected { sequence, reason } => {
                 write!(f, "WAL replay rejected sequence {sequence}: {reason}")
             }
+            Self::CheckpointRequired { base_sequence } => write!(
+                f,
+                "WAL starts at checkpoint base sequence {base_sequence}; a checkpoint is required"
+            ),
+            Self::CheckpointTooOld {
+                checkpoint,
+                wal_base,
+            } => write!(
+                f,
+                "checkpoint sequence {checkpoint} is older than WAL base sequence {wal_base}"
+            ),
+            Self::InvalidReclaimSequence { current, requested } => write!(
+                f,
+                "cannot reclaim WAL through sequence {requested}; current tail is {current}"
+            ),
             Self::Serialization { message } => {
                 write!(f, "WAL serialization error: {message}")
             }
