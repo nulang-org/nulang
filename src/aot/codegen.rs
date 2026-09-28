@@ -1109,6 +1109,7 @@ pub fn compile_mir_function_body(
     let local_base = mir::FunctionBuilder::LOCAL_BASE;
     let type_meta = mir_func.type_metadata.clone();
     aot.cap_metadata = CapabilityMetadata::from_mir_function(mir_func);
+    let arena_alloc_sites = crate::mir_iso_arena::qualifying_alloc_sites(mir_func);
 
     // Analyze block predecessors.
     let preds = compute_predecessors(mir_func);
@@ -1226,17 +1227,17 @@ pub fn compile_mir_function_body(
             h.insert(*name, func_ref);
         }
 
-        // alloc_obj: (i64, i32) -> i64
-        {
+        // Composite allocators: (i64, i32) -> i64.
+        for name in ["nulang_alloc_obj", "nulang_aot_alloc_local_obj"] {
             let mut h_sig = module.make_signature();
             h_sig.params.push(AbiParam::new(types::I64));
             h_sig.params.push(AbiParam::new(types::I32));
             h_sig.returns.push(AbiParam::new(types::I64));
             let h_id = module
-                .declare_function("nulang_alloc_obj", Linkage::Import, &h_sig)
+                .declare_function(name, Linkage::Import, &h_sig)
                 .map_err(|e| AotCompileError::Cranelift(e.to_string()))?;
             let func_ref = module.declare_func_in_func(h_id, builder.func);
-            h.insert("nulang_alloc_obj", func_ref);
+            h.insert(name, func_ref);
         }
 
         // obj_set: (i64, i64, i64) -> void
@@ -1795,6 +1796,7 @@ pub fn compile_mir_function_body(
                     &handler_threaded_width,
                     &site_extras,
                     &mut cont_thread,
+                    &arena_alloc_sites,
                     stmt_idx,
                     bid,
                 )?;
@@ -2034,6 +2036,7 @@ fn compile_stmt(
     handler_threaded_width: &HashMap<mir::BlockId, usize>,
     site_extras: &HashMap<(mir::BlockId, usize), Vec<u32>>,
     cont_thread: &mut Vec<u32>,
+    arena_alloc_sites: &HashSet<crate::mir_iso_arena::MirAllocSite>,
     stmt_idx: usize,
     current_block: mir::BlockId,
 ) -> AotResult<()> {
@@ -2240,9 +2243,14 @@ fn compile_stmt(
                     captured_closure_locals.insert(reg);
                 }
             }
+            let arena_alloc = arena_alloc_sites.contains(&crate::mir_iso_arena::MirAllocSite {
+                block: current_block,
+                stmt_index: stmt_idx,
+            });
             let val = compile_rvalue(
                 builder,
                 op,
+                arena_alloc,
                 type_meta,
                 helpers,
                 call_targets,
@@ -2370,6 +2378,7 @@ fn compile_stmt(
 fn compile_rvalue(
     builder: &mut FunctionBuilder,
     rv: &mir::RValue,
+    arena_alloc: bool,
     type_meta: &TypeMetadata,
     helpers: &HashMap<&str, FuncRef>,
     call_targets: &HashMap<usize, FuncRef>,
@@ -2608,7 +2617,12 @@ fn compile_rvalue(
             // alloc_obj(slot_count, type_tag=3 for Record)
             let count_val = builder.ins().iconst(types::I64, slot_count as i64);
             let tag_val = builder.ins().iconst(types::I32, 3);
-            let ptr = call_helper(builder, helpers, "nulang_alloc_obj", &[count_val, tag_val])?;
+            let alloc_helper = if arena_alloc {
+                "nulang_aot_alloc_local_obj"
+            } else {
+                "nulang_alloc_obj"
+            };
+            let ptr = call_helper(builder, helpers, alloc_helper, &[count_val, tag_val])?;
 
             for (name, val_id) in fields {
                 let val_reg = mir::FunctionBuilder::LOCAL_BASE + val_id.0;
@@ -2632,7 +2646,12 @@ fn compile_rvalue(
             let count = elements.len() as u64;
             let count_val = builder.ins().iconst(types::I64, count as i64);
             let tag_val = builder.ins().iconst(types::I32, 6);
-            let ptr = call_helper(builder, helpers, "nulang_alloc_obj", &[count_val, tag_val])?;
+            let alloc_helper = if arena_alloc {
+                "nulang_aot_alloc_local_obj"
+            } else {
+                "nulang_alloc_obj"
+            };
+            let ptr = call_helper(builder, helpers, alloc_helper, &[count_val, tag_val])?;
 
             for (i, val_id) in elements.iter().enumerate() {
                 let val_reg = mir::FunctionBuilder::LOCAL_BASE + val_id.0;
@@ -2650,7 +2669,12 @@ fn compile_rvalue(
             let count = elements.len() as u64;
             let count_val = builder.ins().iconst(types::I64, count as i64);
             let tag_val = builder.ins().iconst(types::I32, 1);
-            let ptr = call_helper(builder, helpers, "nulang_alloc_obj", &[count_val, tag_val])?;
+            let alloc_helper = if arena_alloc {
+                "nulang_aot_alloc_local_obj"
+            } else {
+                "nulang_alloc_obj"
+            };
+            let ptr = call_helper(builder, helpers, alloc_helper, &[count_val, tag_val])?;
 
             for (i, val_id) in elements.iter().enumerate() {
                 let val_reg = mir::FunctionBuilder::LOCAL_BASE + val_id.0;
