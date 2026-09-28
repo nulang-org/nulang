@@ -1,4 +1,8 @@
 # Nulang Changelog
+### NulangDB checkpoint and WAL reclamation — 2026-09-28
+- **Single-node tablets can now publish checksummed atomic MVCC checkpoints before reclaiming durable WAL history.** Recovery accepts both safe crash states: a checkpoint plus the original full WAL, or a checkpoint plus a compacted WAL whose header persists the checkpoint base sequence.
+- **Compacted WALs retain sequence, tablet, and ownership fencing metadata.** Reclamation is tail-only in this first slice, so a checkpoint at sequence N rewrites the WAL to an empty log based at N and the next durable write must prove predecessor N before sequence N+1 is accepted.
+
 ### NuDB single-node tablet and WAL foundation — 2026-09-27
 - **NuDB now has an experimental single-node range-tablet kernel with ownership-epoch and predecessor-sequence fencing, MVCC snapshot reads, tombstones, deterministic split plans, and WAL-before-visibility commits.** Database hot loops remain ordinary local computation; actors are reserved for future tablet ownership, placement, migration, and distributed coordination.
 - **The prototype WAL fails closed on corrupt framing and payloads and requires recovery after ambiguous append failures.** `NUDBWAL2` protects record metadata and payload bytes independently, truncates only genuinely incomplete crash tails, poisons a live WAL handle after post-emission I/O failure, and fsyncs new WAL directory entries on Unix.
