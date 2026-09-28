@@ -3606,7 +3606,17 @@ impl VM {
             jit.prepare_tiered_step(module_idx, pc, module)
         };
         if !prepared {
+            let terminally_rejected = jit.is_terminally_rejected(module_idx, pc);
             self.jit_session = Some(jit);
+            if terminally_rejected {
+                if let Some(candidate) = self
+                    .jit_candidate_pcs
+                    .get_mut(module_idx)
+                    .and_then(|row| row.get_mut(pc))
+                {
+                    *candidate = false;
+                }
+            }
             return false;
         }
 
