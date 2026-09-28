@@ -76,9 +76,10 @@
 //!   any non-whitelisted opcode rejects the site.  Broader coverage (type
 //!   directed capability proofs, inter-procedural escape) is deferred to
 //!   later waves.
-//! * VM interpreter only; JIT/AOT keep their existing allocation paths.
-//!   The arena is an allocation strategy, not a semantics change, so
-//!   cross-backend observable behaviour is identical.
+//! * The bytecode VM and JIT use bytecode-site escape analysis; native/AOT
+//!   uses a separate, stricter MIR analysis in `mir_iso_arena`.  WASM keeps
+//!   its existing allocation path.  The arena is an allocation strategy, not
+//!   a semantics change, so cross-backend observable behaviour is identical.
 //!
 //! The feature is gated by `NULANG_ISO_ARENA=1` (env) / `--iso-arena` (CLI)
 //! and is **off by default**.
