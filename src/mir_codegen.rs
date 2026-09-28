@@ -1614,15 +1614,17 @@ fn float_locals(func: &mir::Function) -> Vec<bool> {
 // ===========================================================================
 //
 // A lightweight, conservative MIR→MIR optimizer that runs on every function
-// and behavior before bytecode emission. Four transforms in one fixpoint
+// and behavior before bytecode emission. Five transforms in one fixpoint
 // loop (capped at MAX_OPT_ITERATIONS rounds):
 //
 //   1. constant folding     — arithmetic/comparison on Const operands
 //                             (int, float, bool, string concat) and Unary;
 //   2. identity folding     — x+0, x*1, x|0, x&&true, x*0, ... collapses;
-//   3. jump threading       — trampoline blocks (0 stmts + Jump) are
+//   3. scalar replacement   — non-escaping tuple/record/array literals used
+//                             only by static loads collapse to their inputs;
+//   4. jump threading       — trampoline blocks (0 stmts + Jump) are
 //                             bypassed and marked unreachable;
-//   4. dead-store elimination — stores whose dst is never read anywhere in
+//   5. dead-store elimination — stores whose dst is never read anywhere in
 //                             the function are dropped (function-wide read
 //                             set — block-local liveness alone would be
 //                             unsound across loop back-edges and joins).
@@ -3916,6 +3918,68 @@ mod optimize_tests {
                     )
                 }),
             "a scalar-only local array read at a constant index should be eliminated"
+        );
+    }
+
+    #[test]
+    fn test_scalar_replacement_rejects_returned_composite() {
+        let mut b = mir::FunctionBuilder::new(
+            "returned_tuple",
+            Some(Type::Tuple(vec![Type::int(), Type::int()])),
+        );
+        let one = b.add_temp(Type::int());
+        b.assign(one, mir::RValue::Const(Constant::Int(1)));
+        let two = b.add_temp(Type::int());
+        b.assign(two, mir::RValue::Const(Constant::Int(2)));
+        let tuple = b.add_temp(Type::Tuple(vec![Type::int(), Type::int()]));
+        b.assign(tuple, mir::RValue::Tuple(vec![one, two]));
+        b.terminate(mir::Terminator::Return(Some(tuple)));
+        let mut func = b.build();
+
+        optimize_function(&mut func, &mut Vec::new());
+
+        assert!(
+            func.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
+                matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        dst,
+                        op: mir::RValue::Tuple(_),
+                    } if *dst == tuple
+                )
+            }),
+            "returned composites must retain object identity/allocation"
+        );
+    }
+
+    #[test]
+    fn test_scalar_replacement_rejects_dynamic_array_index() {
+        let mut b = mir::FunctionBuilder::new("dynamic_index", Some(Type::int()));
+        let index = b.add_param("index", Type::int());
+        let eleven = b.add_temp(Type::int());
+        b.assign(eleven, mir::RValue::Const(Constant::Int(11)));
+        let twenty_two = b.add_temp(Type::int());
+        b.assign(twenty_two, mir::RValue::Const(Constant::Int(22)));
+        let arr = b.add_temp(Type::Array(Box::new(Type::int())));
+        b.assign(arr, mir::RValue::ArrayLit(vec![eleven, twenty_two]));
+        let result = b.add_temp(Type::int());
+        b.assign(result, mir::RValue::ArrayLoad { arr, idx: index });
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let mut func = b.build();
+
+        optimize_function(&mut func, &mut Vec::new());
+
+        assert!(
+            func.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
+                matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        dst,
+                        op: mir::RValue::ArrayLit(_),
+                    } if *dst == arr
+                )
+            }),
+            "dynamic array indexing must keep the backing allocation"
         );
     }
 
