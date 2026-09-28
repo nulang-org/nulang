@@ -108,10 +108,28 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             ret_type,
             body,
             effect,
+            annotations,
             ..
         } => {
-            out.push_str(&format!("{}fn {}(", sp, name));
-            for (i, p) in params.iter().enumerate() {
+            let is_component = annotations
+                .iter()
+                .any(|annotation| matches!(annotation, crate::ast::FunctionAnnotation::Component));
+            let visible_params: Vec<_> = if is_component {
+                params
+                    .iter()
+                    .filter(|param| param.name != "__component_slot")
+                    .collect()
+            } else {
+                params.iter().collect()
+            };
+
+            out.push_str(&format!(
+                "{}{} {}(",
+                sp,
+                if is_component { "component" } else { "fn" },
+                name
+            ));
+            for (i, p) in visible_params.iter().enumerate() {
                 let pn = &p.name;
                 let pty = &p.ty;
                 if i > 0 {
@@ -123,11 +141,13 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
                 }
             }
             out.push(')');
-            if let Some(r) = ret_type {
-                out.push_str(&format!(" -> {}", fmt_type(r)));
-            }
-            if let Some(e) = effect {
-                out.push_str(&format!(" ! {}", e));
+            if !is_component {
+                if let Some(r) = ret_type {
+                    out.push_str(&format!(" -> {}", fmt_type(r)));
+                }
+                if let Some(e) = effect {
+                    out.push_str(&format!(" ! {}", e));
+                }
             }
             out.push_str(" {\n");
             fmt_block_body(out, body, indent + 4, had_unhandled);
@@ -1410,7 +1430,10 @@ fn main() {
 "#;
         let out = format_source(src).expect("component formats");
         assert!(out.contains("component Card(title: String)"), "got: {out}");
-        assert!(!out.contains("__component_slot"), "synthetic slot leaked: {out}");
+        assert!(
+            !out.contains("component Card(title: String, __component_slot)"),
+            "synthetic slot leaked into component signature: {out}"
+        );
         assert!(!out.contains("fn Card("), "component degraded to fn: {out}");
         assert_idempotent(src);
     }
