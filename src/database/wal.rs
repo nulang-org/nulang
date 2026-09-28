@@ -409,11 +409,29 @@ impl FileWal {
             .open(&temp)?;
         let header = encode_wal_header(base_sequence, self.tablet_id, self.latest_ownership_epoch);
         replacement.write_all(&header)?;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::WalReclaimAfterReplacementWrite,
+        )?;
+
         replacement.sync_data()?;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::WalReclaimAfterReplacementSync,
+        )?;
         drop(replacement);
 
         fs::rename(&temp, &self.path)?;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::WalReclaimAfterRename,
+        )?;
+
         sync_parent_directory(&self.path)?;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::WalReclaimAfterDirectorySync,
+        )?;
 
         *self = Self::open(&self.path)?;
         Ok(())
@@ -494,19 +512,39 @@ impl FileWal {
 
         self.file.write_all(&header)?;
         #[cfg(test)]
-        self.maybe_fail_append_for_test(AppendFailPoint::AfterHeader)?;
+        {
+            self.maybe_fail_append_for_test(AppendFailPoint::AfterHeader)?;
+            super::interruption::hit(
+                super::interruption::StorageInterruptionPoint::WalAfterHeader,
+            )?;
+        }
 
         self.file.write_all(&payload)?;
         #[cfg(test)]
-        self.maybe_fail_append_for_test(AppendFailPoint::AfterPayload)?;
+        {
+            self.maybe_fail_append_for_test(AppendFailPoint::AfterPayload)?;
+            super::interruption::hit(
+                super::interruption::StorageInterruptionPoint::WalAfterPayload,
+            )?;
+        }
 
         self.file.write_all(checksum.as_bytes())?;
         #[cfg(test)]
-        self.maybe_fail_append_for_test(AppendFailPoint::AfterChecksum)?;
+        {
+            self.maybe_fail_append_for_test(AppendFailPoint::AfterChecksum)?;
+            super::interruption::hit(
+                super::interruption::StorageInterruptionPoint::WalAfterChecksum,
+            )?;
+        }
 
         self.file.sync_data()?;
         #[cfg(test)]
-        self.maybe_fail_append_for_test(AppendFailPoint::AfterSync)?;
+        {
+            self.maybe_fail_append_for_test(AppendFailPoint::AfterSync)?;
+            super::interruption::hit(
+                super::interruption::StorageInterruptionPoint::WalAfterSync,
+            )?;
+        }
 
         let end = self.file.stream_position()?;
         self.tablet_id = Some(record.tablet_id);
