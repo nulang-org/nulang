@@ -4050,6 +4050,44 @@ mod optimize_tests {
     }
 
     #[test]
+    fn test_scalar_replacement_rejects_redefined_component() {
+        let mut b = mir::FunctionBuilder::new("redefined_component", Some(Type::int()));
+        let value = b.add_temp(Type::int());
+        b.assign(value, mir::RValue::Const(Constant::Int(1)));
+        let tuple = b.add_temp(Type::Tuple(vec![Type::int()]));
+        b.assign(tuple, mir::RValue::Tuple(vec![value]));
+        b.assign(value, mir::RValue::Const(Constant::Int(2)));
+        let result = b.add_temp(Type::int());
+        b.assign(
+            result,
+            mir::RValue::LoadFieldPos {
+                obj: tuple,
+                index: 0,
+            },
+        );
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let mut func = b.build();
+
+        optimize_function(&mut func, &mut Vec::new());
+
+        assert!(
+            func.blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .any(|stmt| {
+                    matches!(
+                        stmt,
+                        mir::Stmt::Assign {
+                            dst,
+                            op: mir::RValue::Tuple(_),
+                        } if *dst == tuple
+                    )
+                }),
+            "a composite must keep its snapshot allocation when a captured component is redefined"
+        );
+    }
+
+    #[test]
     fn test_scalar_replacement_rejects_returned_composite() {
         let mut b = mir::FunctionBuilder::new(
             "returned_tuple",
