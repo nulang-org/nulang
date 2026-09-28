@@ -11,7 +11,7 @@
 
 use crate::ast::{AstModule, Decl, Expr, Literal};
 use crate::effect_checker::EffectChecker;
-use crate::types::{Effect, EffectRow, Span};
+use crate::types::{infer_web_placement, Placement, Span};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -311,28 +311,12 @@ fn classify_action(handler: &str, checker: Option<&EffectChecker>) -> ActionPlac
     let Some(row) = checker.function_row(handler) else {
         return ActionPlacement::Client;
     };
-    let effects: Vec<_> = match row {
-        EffectRow::Closed(effs) | EffectRow::Open(effs, _) => effs.clone(),
-    };
-    let server_effects = [
-        Effect::Request,
-        Effect::Respond,
-        Effect::DB,
-        Effect::Spawn,
-        Effect::Send,
-        Effect::Receive,
-        Effect::Net,
-        Effect::Realtime,
-        Effect::Migrate,
-        Effect::Python,
-        Effect::Process,
-        Effect::System,
-        Effect::FFI,
-    ];
-    if effects.iter().any(|e| server_effects.contains(e)) {
-        ActionPlacement::Server
-    } else {
-        ActionPlacement::Client
+
+    match infer_web_placement(row) {
+        Some(Placement::Server | Placement::Edge | Placement::Actor | Placement::Workflow) => {
+            ActionPlacement::Server
+        }
+        Some(Placement::Static | Placement::Client) | None => ActionPlacement::Client,
     }
 }
 
