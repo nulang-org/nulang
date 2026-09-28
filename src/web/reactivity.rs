@@ -971,4 +971,57 @@ fn card() -> Html {
             path: "div > span".to_string(),
         }));
     }
+
+    #[test]
+    fn test_component_graph_tracks_calls_and_inferred_placements() {
+        let module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+fn StaticCard() -> Html ! {Render, Web} {
+    <span>Static</span>
+}
+
+fn ServerPanel() -> Html ! {DB, Render, Web} {
+    <section>Server</section>
+}
+
+fn Dashboard() -> Html {
+    <div>
+        <StaticCard />
+        <ServerPanel />
+    </div>
+}
+"#,
+        );
+        let mut checker = crate::effect_checker::EffectChecker::new();
+        checker.check_module(&module.decls).unwrap();
+
+        let graph = analyze_component_graph(&module, Some(&checker));
+        let dashboard = graph
+            .components
+            .iter()
+            .find(|component| component.name == "Dashboard")
+            .expect("Dashboard component");
+        let static_card = graph
+            .components
+            .iter()
+            .find(|component| component.name == "StaticCard")
+            .expect("StaticCard component");
+        let server_panel = graph
+            .components
+            .iter()
+            .find(|component| component.name == "ServerPanel")
+            .expect("ServerPanel component");
+
+        assert_eq!(
+            dashboard.children,
+            vec!["ServerPanel".to_string(), "StaticCard".to_string()]
+        );
+        assert_eq!(dashboard.placement, Some(Placement::Server));
+        assert_eq!(static_card.placement, Some(Placement::Static));
+        assert_eq!(server_panel.placement, Some(Placement::Server));
+    }
+
 }
