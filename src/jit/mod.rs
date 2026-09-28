@@ -45,8 +45,9 @@ pub use compiler::*;
 
 use native_codegen::{
     CraneliftCodegen, NativeCodegenBackend, NativeCompileKind, NativeCompileRequest,
+    NativeLeafCall,
 };
-use region_planner::RegionPlanner;
+use region_planner::{analyze_native_leaf, RegionPlanner};
 #[cfg(test)]
 use region_planner::{
     compute_may_suspend, compute_recursive, direct_call_target, find_compilable_region,
@@ -160,6 +161,12 @@ pub struct JitSession {
     /// Regions compiled through the type-directed (guard-stripped) path in
     /// `typed_compiler`, i.e. where inferred register types were available.
     typed_regions: FxHashSet<(usize, usize)>,
+    /// Separately compiled straight-line leaf thunks. The argument count is
+    /// part of the key because the frame-isolation proof starts with exactly
+    /// r0..r(argc-1) defined.
+    native_leafs: FxHashMap<(usize, usize, u8), NativeLeafCall>,
+    /// Static leaf analyses/codegen failures are terminal for the loaded module.
+    native_leaf_rejected: FxHashSet<(usize, usize, u8)>,
     /// Backend-neutral region/safety/type analysis. Cranelift consumes the
     /// resulting plans but does not own the language-level planning rules.
     region_planner: RegionPlanner,
@@ -182,6 +189,8 @@ impl JitSession {
             compile_stats: crate::backends::JitCompileStats::default(),
             hot_counts: Vec::new(),
             typed_regions: FxHashSet::default(),
+            native_leafs: FxHashMap::default(),
+            native_leaf_rejected: FxHashSet::default(),
             region_planner: RegionPlanner::default(),
             tier2_counters: FxHashMap::default(),
             promotion_serial: 0,
@@ -262,6 +271,80 @@ impl JitSession {
             optimization,
             compile_time_ns,
         });
+    }
+
+    fn native_leaf_for(
+        &mut self,
+        module_idx: usize,
+        func_idx: usize,
+        argc: u8,
+        module: &crate::bytecode::CodeModule,
+    ) -> Option<NativeLeafCall> {
+        let key = (module_idx, func_idx, argc);
+        if let Some(existing) = self.native_leafs.get(&key) {
+            return Some(existing.clone());
+        }
+        if self.native_leaf_rejected.contains(&key) {
+            return None;
+        }
+
+        let Some(plan) = analyze_native_leaf(module, func_idx) else {
+            self.native_leaf_rejected.insert(key);
+            return None;
+        };
+        if plan.argc != argc {
+            self.native_leaf_rejected.insert(key);
+            return None;
+        }
+
+        let symbol = format!("nulang_leaf_{module_idx}_{func_idx}_{argc}");
+        let started = std::time::Instant::now();
+        let ptr = match self.codegen.compile(NativeCompileRequest {
+            symbol: &symbol,
+            start_offset: plan.start,
+            num_instrs: plan.body_len,
+            instructions: &module.instructions,
+            optimization: CodegenOptimization::Fast,
+            kind: NativeCompileKind::Leaf,
+        }) {
+            Ok(ptr) => ptr,
+            Err(_) => {
+                self.native_leaf_rejected.insert(key);
+                return None;
+            }
+        };
+        let compile_time_ns = Self::elapsed_ns(started);
+        self.compile_stats.fast_compiles = self.compile_stats.fast_compiles.saturating_add(1);
+        self.compile_stats.fast_compile_ns = self
+            .compile_stats
+            .fast_compile_ns
+            .saturating_add(compile_time_ns);
+
+        let leaf = NativeLeafCall {
+            ptr,
+            ret_reg: plan.ret_reg,
+            clobbers: plan.clobbers,
+        };
+        self.native_leafs.insert(key, leaf.clone());
+        Some(leaf)
+    }
+
+    fn native_leaf_calls_for_region(
+        &mut self,
+        module_idx: usize,
+        module: &crate::bytecode::CodeModule,
+        native_calls: &std::collections::HashMap<usize, usize>,
+    ) -> std::collections::HashMap<usize, NativeLeafCall> {
+        let mut leaves = std::collections::HashMap::new();
+        for (&pc, &func_idx) in native_calls {
+            let Some(call) = module.instructions.get(pc) else {
+                continue;
+            };
+            if let Some(leaf) = self.native_leaf_for(module_idx, func_idx, call.op2, module) {
+                leaves.insert(pc, leaf);
+            }
+        }
+        leaves
     }
 
     fn next_promotion_name(&mut self, prefix: &str, module_idx: usize, offset: usize) -> String {
