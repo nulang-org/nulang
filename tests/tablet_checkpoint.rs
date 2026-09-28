@@ -157,3 +157,50 @@ fn compacted_wal_without_checkpoint_refuses_state_recovery() {
 
     let _ = fs::remove_file(wal_path);
 }
+
+
+#[test]
+fn repeated_checkpoints_preserve_tombstone_history_and_advance_the_wal_anchor() {
+    let (wal_path, checkpoint_path) = paths("repeat");
+    let _ = fs::remove_file(&wal_path);
+    let _ = fs::remove_file(&checkpoint_path);
+
+    {
+        let mut tablet =
+            WalBackedTablet::open_with_checkpoint(descriptor(), &wal_path, &checkpoint_path)
+                .unwrap();
+
+        put(&mut tablet, b"k", b"v1");
+
+        let delete = tablet
+            .prepare_write(
+                3,
+                tablet.current_sequence(),
+                vec![TabletMutation::Delete { key: b"k".to_vec() }],
+            )
+            .unwrap();
+        tablet.commit(delete).unwrap();
+        tablet.checkpoint(&checkpoint_path).unwrap();
+
+        put(&mut tablet, b"k", b"v3");
+        put(&mut tablet, b"x", b"other");
+        tablet.checkpoint(&checkpoint_path).unwrap();
+    }
+
+    let wal = FileWal::open(&wal_path).unwrap();
+    assert_eq!(wal.base_sequence(), 3);
+    assert_eq!(wal.records().len(), 1);
+    assert_eq!(wal.records()[0].sequence(), 4);
+    drop(wal);
+
+    let tablet =
+        WalBackedTablet::open_with_checkpoint(descriptor(), &wal_path, &checkpoint_path).unwrap();
+    assert_eq!(tablet.current_sequence(), 4);
+    assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
+    assert_eq!(tablet.read_at(b"k", 2).unwrap(), None);
+    assert_eq!(tablet.read_at(b"k", 3).unwrap(), Some(&b"v3"[..]));
+    assert_eq!(tablet.read_latest(b"x"), Some(&b"other"[..]));
+
+    let _ = fs::remove_file(wal_path);
+    let _ = fs::remove_file(checkpoint_path);
+}
