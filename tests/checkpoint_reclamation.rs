@@ -134,3 +134,28 @@ fn corrupt_checkpoint_fails_closed_instead_of_falling_back_to_compacted_wal() {
     let _ = fs::remove_file(&wal_path);
     let _ = fs::remove_file(&checkpoint);
 }
+
+
+#[test]
+fn checkpoint_ahead_of_wal_tail_fails_closed() {
+    let wal_path = temp_wal("checkpoint_ahead");
+    let checkpoint = checkpoint_path(&wal_path);
+    let _ = fs::remove_file(&wal_path);
+    let _ = fs::remove_file(&checkpoint);
+
+    {
+        let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+        commit_put(&mut tablet, b"k", b"value");
+        tablet.publish_checkpoint().unwrap();
+    }
+
+    // Simulate loss/rollback of the WAL after checkpoint publication. A
+    // checkpoint at sequence 1 cannot be paired with a durable WAL tail at 0.
+    fs::remove_file(&wal_path).unwrap();
+    FileWal::open(&wal_path).unwrap();
+
+    assert!(WalBackedTablet::open(descriptor(), &wal_path).is_err());
+
+    let _ = fs::remove_file(&wal_path);
+    let _ = fs::remove_file(&checkpoint);
+}
