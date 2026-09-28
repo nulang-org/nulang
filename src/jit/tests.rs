@@ -93,6 +93,10 @@ fn test_rejected_hot_region_becomes_terminal_until_reset() {
         !crate::backends::JitBackend::prepare_tiered_step(&mut jit, 0, 0, &module),
         "short straight-line region should be rejected"
     );
+    assert!(
+        crate::backends::JitBackend::is_terminally_rejected(&jit, 0, 0),
+        "backend must expose terminal rejection so the VM can retire the candidate PC"
+    );
 
     for _ in 0..HOT_THRESHOLD * 2 {
         assert!(
@@ -102,6 +106,10 @@ fn test_rejected_hot_region_becomes_terminal_until_reset() {
     }
 
     crate::backends::JitBackend::reset_hot_counters(&mut jit);
+    assert!(
+        !crate::backends::JitBackend::is_terminally_rejected(&jit, 0, 0),
+        "explicit reset must clear terminal rejection visibility"
+    );
     for _ in 0..HOT_THRESHOLD - 1 {
         assert!(
             !crate::backends::JitBackend::probe_and_maybe_hot(&mut jit, 0, 0),
