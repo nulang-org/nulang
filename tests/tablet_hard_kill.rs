@@ -113,7 +113,10 @@ fn acknowledged_commit_survives_abrupt_process_kill_and_restart() {
         .expect("spawn NuDB crash child");
 
     let ack = wait_for_ack(&mut child);
-    assert!(ack.contains("NUDB_ACK:1"), "unexpected acknowledgement: {ack}");
+    assert!(
+        ack.contains("NUDB_ACK:1"),
+        "unexpected acknowledgement: {ack}"
+    );
 
     child.kill().expect("abruptly kill NuDB child");
     child.wait().expect("reap NuDB child");
