@@ -1052,7 +1052,7 @@ impl crate::backends::JitBackend for JitSession {
     }
 
     fn native_leaf_compiled_count(&self) -> usize {
-        self.native_leaf_compiled_count()
+        JitSession::native_leaf_compiled_count(self)
     }
 
     fn is_terminally_rejected(&self, module_idx: usize, pc: usize) -> bool {
