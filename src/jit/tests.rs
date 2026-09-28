@@ -71,6 +71,50 @@ fn test_hot_counters_are_per_session() {
 }
 
 #[test]
+fn test_rejected_hot_region_becomes_terminal_until_reset() {
+    let mut jit = make_jit();
+    let mut module = CodeModule::new("terminal_rejection");
+    module.emit(Instruction::new3(OpCode::IAdd, 0, 1, 2));
+    module.emit(Instruction::new3(OpCode::ISub, 0, 1, 2));
+    module.emit(Instruction::new0(OpCode::Ret));
+    module.entry_point = Some(0);
+
+    for _ in 0..HOT_THRESHOLD - 1 {
+        assert!(
+            !crate::backends::JitBackend::probe_and_maybe_hot(&mut jit, 0, 0),
+            "region must remain cold before the threshold"
+        );
+    }
+    assert!(
+        crate::backends::JitBackend::probe_and_maybe_hot(&mut jit, 0, 0),
+        "region should become hot at the threshold"
+    );
+    assert!(
+        !crate::backends::JitBackend::prepare_tiered_step(&mut jit, 0, 0, &module),
+        "short straight-line region should be rejected"
+    );
+
+    for _ in 0..HOT_THRESHOLD * 2 {
+        assert!(
+            !crate::backends::JitBackend::probe_and_maybe_hot(&mut jit, 0, 0),
+            "static rejection must be terminal instead of re-planning every threshold"
+        );
+    }
+
+    crate::backends::JitBackend::reset_hot_counters(&mut jit);
+    for _ in 0..HOT_THRESHOLD - 1 {
+        assert!(
+            !crate::backends::JitBackend::probe_and_maybe_hot(&mut jit, 0, 0),
+            "reset must clear terminal rejection state"
+        );
+    }
+    assert!(
+        crate::backends::JitBackend::probe_and_maybe_hot(&mut jit, 0, 0),
+        "region should become hot again after explicit reset"
+    );
+}
+
+#[test]
 fn test_find_compilable_region() {
     // A SMALL straight-line region (function body) is rejected: it is
     // re-entered per call and JIT enter/exit exceeds interpretation below
