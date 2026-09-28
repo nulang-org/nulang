@@ -3869,8 +3869,8 @@ mod tests {
 
         let source = r#"
             actor Scratch {
-                behavior run() {
-                    let values = [1, 2, 3] in values[0]
+                behavior run(index: Int) {
+                    let values = [1, 2, 3] in values[index]
                 }
             }
             fn main() { 0 }
@@ -3909,7 +3909,7 @@ mod tests {
         crate::aot::set_aot_dispatch(Some(crate::aot::AotDispatchTarget::standalone(
             native, &aot,
         )));
-        (actor.behavior_table[0].handler_fn)(&mut actor, &[]);
+        (actor.behavior_table[0].handler_fn)(&mut actor, &[crate::vm::Value::int(0)]);
 
         assert_eq!(
             actor.iso_arena.total_allocs(),
@@ -3925,6 +3925,69 @@ mod tests {
             actor.iso_arena.resets(),
             1,
             "completed native behavior should reset the arena exactly once"
+        );
+    }
+
+    #[test]
+    fn test_aot_static_local_composite_is_scalar_replaced() {
+        use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        use crate::typechecker::TypeChecker;
+
+        let source = r#"
+            actor ScalarScratch {
+                behavior run() {
+                    [1, 2, 3][0]
+                }
+            }
+            fn main() { 0 }
+        "#;
+        let tokens = Lexer::new(source).lex().unwrap();
+        let ast = Parser::new(tokens).parse_module().unwrap();
+        let mut tc = TypeChecker::new();
+        tc.check_module(&ast).unwrap();
+        let mut ec = EffectChecker::new();
+        ec.check_module(&ast.decls).unwrap();
+        let mut ca = CapabilityAnalyzer::new();
+        let ctx = CapContext::new();
+        for d in crate::effect_checker::flatten_decls(&ast.decls) {
+            if let crate::ast::Decl::Function { body, .. } = d {
+                ca.infer_cap(&ctx, body).unwrap();
+            }
+        }
+
+        let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+        let mir_module = crate::mir_lower::lower_module(&hir).unwrap();
+        let previous_iso_arena = std::env::var_os("NULANG_ISO_ARENA");
+        std::env::set_var("NULANG_ISO_ARENA", "1");
+        let compiled = crate::aot::AotModule::compile(&mir_module);
+        match previous_iso_arena {
+            Some(value) => std::env::set_var("NULANG_ISO_ARENA", value),
+            None => std::env::remove_var("NULANG_ISO_ARENA"),
+        }
+        let aot = compiled.expect("AOT compile of scalar-replaceable behavior should succeed");
+        let native = aot
+            .fn_ptr_for_behavior("ScalarScratch.run")
+            .expect("behavior 'ScalarScratch.run' should be compiled");
+
+        let mut actor = crate::runtime::Actor::new(18, "ScalarScratch", 64);
+        actor.register_behavior("run", crate::aot::aot_behavior_adapter);
+
+        crate::aot::set_aot_dispatch(Some(crate::aot::AotDispatchTarget::standalone(
+            native, &aot,
+        )));
+        (actor.behavior_table[0].handler_fn)(&mut actor, &[]);
+
+        assert_eq!(
+            actor.iso_arena.total_allocs(),
+            0,
+            "shared MIR optimization should remove the static local array before AOT codegen"
+        );
+        assert_eq!(
+            actor.iso_arena.resets(),
+            1,
+            "completed native behavior should still reset its activation arena"
         );
     }
 
