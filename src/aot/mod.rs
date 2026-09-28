@@ -1888,6 +1888,10 @@ fn create_isa_builder(target: &str) -> NuResult<isa::Builder> {
 /// Single source of truth: `src/jit/helpers.rs` `define_helpers!` macro.
 fn register_runtime_helpers(builder: &mut JITBuilder) {
     crate::jit::helpers::register_with_builder(builder);
+    builder.symbol(
+        "nulang_aot_alloc_local_obj",
+        crate::jit::runtime::nulang_aot_alloc_local_obj as *const u8,
+    );
 }
 
 /// Scan MIR statements to collect field names and string constants.
