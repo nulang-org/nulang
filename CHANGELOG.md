@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Terminal JIT rejection cache — 2026-09-28
+- **Hot bytecode regions that static planning proves too small or fragmented now become terminal for the current JIT session**, instead of resetting their hot counter and repeating the same immutable planning work every `HOT_THRESHOLD` hits. Native-codegen failures remain retryable.
+- **Terminal state reuses the existing dense `u32` hot-counter slot via a sentinel**, adding no hash lookup or allocation to the backend probe path; `reset_hot_counters()` explicitly clears the state for tests and deliberate re-heating.
+- **The VM retires terminally rejected PCs from its precomputed JIT-candidate bitmap**, so subsequent executions skip the backend vtable call and hot-counter lookup entirely.
+- **The change is motivated by branch-heavy telemetry:** the workload can produce zero compiled regions while a JIT-enabled VM still pays persistent warm-run overhead, making futile retry work a measurable target.
+
 ### Backend-neutral JIT compile telemetry — 2026-09-28
 - **JIT backends now expose aggregate Fast and Optimized compilation counts and compiler-only wall time through `JitCompileStats`.** The counters exclude interpreter warm-up and generated-code execution so tiering decisions can separate compile cost from runtime payoff.
 - **`VM::jit_compile_stats` exposes the telemetry without leaking Cranelift-specific APIs**, and the tier-promotion regression requires one Fast plus one Optimized compile across the tested promotion.

@@ -62,6 +62,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 /// before it becomes eligible for JIT compilation.
 pub const HOT_THRESHOLD: u64 = 1000;
 
+/// Dense hot-counter sentinel for a region whose static plan/codegen has
+/// already been rejected in this session. Module bytecode and type metadata
+/// are immutable after load, so retrying the same rejection cannot reveal
+/// new information. `reset_hot_counters` clears this state explicitly.
+const HOT_REJECTED: u32 = u32::MAX;
+
 /// Threshold for tier-2 recompilation: after an already-compiled region
 /// has been executed this many additional times, a more aggressive
 /// compilation strategy is attempted (typed path if not already typed,
@@ -306,6 +312,9 @@ impl JitSession {
             row.resize(new_len, 0);
         }
         let count = &mut row[offset];
+        if *count == HOT_REJECTED {
+            return false;
+        }
         *count += 1;
         u64::from(*count) >= HOT_THRESHOLD
     }
@@ -853,6 +862,9 @@ impl crate::backends::JitBackend for JitSession {
             row.resize(new_len, 0);
         }
         let count = &mut row[pc];
+        if *count == HOT_REJECTED {
+            return false;
+        }
         *count += 1;
         u64::from(*count) >= HOT_THRESHOLD
     }
@@ -874,6 +886,9 @@ impl crate::backends::JitBackend for JitSession {
             row.resize(new_len, 0);
         }
         let count = &mut row[pc];
+        if *count == HOT_REJECTED {
+            return false;
+        }
         *count += 1;
 
         // Return true if just became hot (will trigger compilation)
@@ -890,6 +905,14 @@ impl crate::backends::JitBackend for JitSession {
 
     fn typed_compiled_count(&self) -> usize {
         self.typed_regions.len()
+    }
+
+    fn is_terminally_rejected(&self, module_idx: usize, pc: usize) -> bool {
+        self.hot_counts
+            .get(module_idx)
+            .and_then(|row| row.get(pc))
+            .copied()
+            == Some(HOT_REJECTED)
     }
 
     fn compile_stats(&self) -> crate::backends::JitCompileStats {
@@ -932,12 +955,21 @@ impl crate::backends::JitBackend for JitSession {
             {
                 return true;
             }
+
+            // Native codegen failure is not a static language-level rejection.
+            // Keep it retryable: an exceptional backend/resource failure must
+            // not permanently retire this PC from the VM candidate bitmap.
+            if module_idx < self.hot_counts.len() && pc < self.hot_counts[module_idx].len() {
+                self.hot_counts[module_idx][pc] = 0;
+            }
+            return false;
         }
 
-        // Rejected (too small / fragmented) or compile failed. Reset the hot
-        // counter so the next interpreted execution does not rescan every step.
+        // Region planning depends only on immutable module/type state for this
+        // session. A too-small/fragmented plan cannot become compilable later,
+        // so make only this static rejection terminal.
         if module_idx < self.hot_counts.len() && pc < self.hot_counts[module_idx].len() {
-            self.hot_counts[module_idx][pc] = 0;
+            self.hot_counts[module_idx][pc] = HOT_REJECTED;
         }
         false
     }
