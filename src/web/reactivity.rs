@@ -58,7 +58,6 @@ impl SignalGraph {
     }
 }
 
-
 /// One statically discovered web component and the execution environment its
 /// function requires after transitive effect inference.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,11 +91,7 @@ pub fn analyze_component_graph(
     let mut component_names = BTreeSet::new();
     let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
-    collect_component_edges(
-        &module.decls,
-        &mut component_names,
-        &mut edges,
-    );
+    collect_component_edges(&module.decls, &mut component_names, &mut edges);
 
     let mut components = Vec::new();
     collect_component_nodes(
@@ -1303,5 +1298,4 @@ fn Dashboard() -> Html {
         assert_eq!(static_card.placement, Some(Placement::Static));
         assert_eq!(server_panel.placement, Some(Placement::Server));
     }
-
 }
