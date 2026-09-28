@@ -62,6 +62,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 /// before it becomes eligible for JIT compilation.
 pub const HOT_THRESHOLD: u64 = 1000;
 
+/// Dense hot-counter sentinel for a region whose static plan/codegen has
+/// already been rejected in this session. Module bytecode and type metadata
+/// are immutable after load, so retrying the same rejection cannot reveal
+/// new information. `reset_hot_counters` clears this state explicitly.
+const HOT_REJECTED: u32 = u32::MAX;
+
 /// Threshold for tier-2 recompilation: after an already-compiled region
 /// has been executed this many additional times, a more aggressive
 /// compilation strategy is attempted (typed path if not already typed,
@@ -306,6 +312,9 @@ impl JitSession {
             row.resize(new_len, 0);
         }
         let count = &mut row[offset];
+        if *count == HOT_REJECTED {
+            return false;
+        }
         *count += 1;
         u64::from(*count) >= HOT_THRESHOLD
     }
@@ -853,6 +862,9 @@ impl crate::backends::JitBackend for JitSession {
             row.resize(new_len, 0);
         }
         let count = &mut row[pc];
+        if *count == HOT_REJECTED {
+            return false;
+        }
         *count += 1;
         u64::from(*count) >= HOT_THRESHOLD
     }
@@ -874,6 +886,9 @@ impl crate::backends::JitBackend for JitSession {
             row.resize(new_len, 0);
         }
         let count = &mut row[pc];
+        if *count == HOT_REJECTED {
+            return false;
+        }
         *count += 1;
 
         // Return true if just became hot (will trigger compilation)
@@ -934,10 +949,12 @@ impl crate::backends::JitBackend for JitSession {
             }
         }
 
-        // Rejected (too small / fragmented) or compile failed. Reset the hot
-        // counter so the next interpreted execution does not rescan every step.
+        // Rejected (too small / fragmented) or compile failed. Planning and
+        // first-tier codegen depend only on immutable module/type state for
+        // this session, so mark the PC terminal rather than repeating the same
+        // work every HOT_THRESHOLD interpretations.
         if module_idx < self.hot_counts.len() && pc < self.hot_counts[module_idx].len() {
-            self.hot_counts[module_idx][pc] = 0;
+            self.hot_counts[module_idx][pc] = HOT_REJECTED;
         }
         false
     }
