@@ -551,7 +551,9 @@ impl SqliteStore {
         let mut stmt = conn.prepare(
             "SELECT payload FROM evidence WHERE attempt_id = ?1 ORDER BY created_at ASC, id ASC",
         )?;
-        let rows = stmt.query_map(params![attempt_id.to_string()], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![attempt_id.to_string()], |row| {
+            row.get::<_, String>(0)
+        })?;
         let payloads = rows.collect::<Result<Vec<_>, _>>()?;
         payloads
             .into_iter()
