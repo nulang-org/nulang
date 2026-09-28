@@ -8,8 +8,10 @@ use nulang::database::dispatch::{
     TabletDispatchChannels, TabletDispatchConfigError, TabletDispatchError, TabletDispatchOutcome,
     TabletDispatchWake, TabletDispatcher, TabletExecutionError, TabletOwner, TabletPlacementMap,
 };
-use nulang::database::store::WalBackedTablet;
-use nulang::database::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation, TabletWrite};
+use nulang::database::store::{WalBackedError, WalBackedTablet};
+use nulang::database::tablet::{
+    KeyRange, TabletDescriptor, TabletError, TabletId, TabletMutation, TabletWrite,
+};
 
 static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
 
@@ -281,4 +283,46 @@ fn cross_shard_admission_wakes_owner_only_after_successful_enqueue() {
         TabletDispatchError::QueueFull(1)
     );
     assert_eq!(wake.count(), 1);
+}
+
+
+#[test]
+fn queued_write_is_revalidated_if_owner_epoch_advances_before_execution() {
+    let wal_path = temp_wal("stale_after_queue");
+    cleanup(&wal_path);
+
+    let ingress_descriptor = descriptor(108, 5);
+    let owner_descriptor = descriptor(108, 6);
+    let tablet_id = ingress_descriptor.id();
+    let tablet = WalBackedTablet::open(owner_descriptor, &wal_path).unwrap();
+
+    let (channels, mut inboxes) = TabletDispatchChannels::new(2, 4).unwrap();
+    let mut placement = TabletPlacementMap::new();
+    placement.insert(tablet_id, TabletOwner::new(1, 1, 5).unwrap());
+
+    let dispatcher = TabletDispatcher::new(1, 0, placement, channels).unwrap();
+    let mut ingress_tablets = BTreeMap::new();
+    let outcome = dispatcher
+        .dispatch_write(
+            &mut ingress_tablets,
+            put(&ingress_descriptor, 0, b"stale"),
+        )
+        .unwrap();
+    let reply = match outcome {
+        TabletDispatchOutcome::LocalQueued { reply, .. } => reply,
+        other => panic!("unexpected dispatch outcome: {other:?}"),
+    };
+
+    let mut owner_tablets = BTreeMap::from([(tablet_id, tablet)]);
+    assert!(inboxes[1].try_process_one(&mut owner_tablets));
+    assert_eq!(
+        reply.recv().unwrap_err(),
+        TabletExecutionError::Commit(WalBackedError::Tablet(TabletError::StaleEpoch {
+            current: 6,
+            presented: 5,
+        }))
+    );
+    assert_eq!(owner_tablets.get(&tablet_id).unwrap().current_sequence(), 0);
+
+    cleanup(&wal_path);
 }
