@@ -1451,5 +1451,4 @@ fn main() {
             "capitalization alone must not create web component semantics"
         );
     }
-
 }
