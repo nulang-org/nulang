@@ -1107,11 +1107,9 @@ impl crate::backends::JitBackend for JitSession {
                 return true;
             }
         }
-
-        // Rejected (too small / fragmented) or compile failed. Planning and
-        // first-tier codegen depend only on immutable module/type state for
-        // this session, so mark the PC terminal rather than repeating the same
-        // work every HOT_THRESHOLD interpretations.
+        // Region planning depends only on immutable module/type state for this
+        // session. A too-small/fragmented plan cannot become compilable later,
+        // so make only this static rejection terminal.
         if module_idx < self.hot_counts.len() && pc < self.hot_counts[module_idx].len() {
             self.hot_counts[module_idx][pc] = HOT_REJECTED;
         }
