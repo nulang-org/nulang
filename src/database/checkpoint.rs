@@ -29,10 +29,7 @@ pub(crate) fn checkpoint_path_for_wal(wal_path: &Path) -> PathBuf {
     wal_path.with_extension("checkpoint")
 }
 
-pub(crate) fn write_checkpoint(
-    path: &Path,
-    tablet: &MemoryTablet,
-) -> Result<(), CheckpointError> {
+pub(crate) fn write_checkpoint(path: &Path, tablet: &MemoryTablet) -> Result<(), CheckpointError> {
     let descriptor = tablet.descriptor();
     let disk = DiskCheckpoint {
         version: CHECKPOINT_VERSION,
@@ -43,8 +40,8 @@ pub(crate) fn write_checkpoint(
         state: tablet.snapshot_state(),
     };
 
-    let payload =
-        serde_json::to_vec(&disk).map_err(|error| CheckpointError::Serialization(error.to_string()))?;
+    let payload = serde_json::to_vec(&disk)
+        .map_err(|error| CheckpointError::Serialization(error.to_string()))?;
     if payload.len() > MAX_CHECKPOINT_BYTES {
         return Err(CheckpointError::TooLarge(payload.len()));
     }
