@@ -220,9 +220,80 @@ impl Parser {
         }
     }
 
+    /// Pre-register component names and prop order before parsing bodies so
+    /// JSX resolution is independent of declaration order. This intentionally
+    /// scans only the shallow component header; the normal parser remains the
+    /// source of truth for types and diagnostics.
+    fn prescan_component_params(&mut self) {
+        let mut i = 0;
+        while i + 2 < self.tokens.len() {
+            let is_component =
+                matches!(&self.tokens[i].kind, TokenKind::Ident(name) if name == "component");
+            if !is_component {
+                i += 1;
+                continue;
+            }
+
+            let name = match &self.tokens[i + 1].kind {
+                TokenKind::Ident(name) | TokenKind::UpperIdent(name) => name.clone(),
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            if self.tokens[i + 2].kind != TokenKind::LParen {
+                i += 1;
+                continue;
+            }
+
+            let mut params = Vec::new();
+            let mut j = i + 3;
+            let mut paren_depth = 1usize;
+            let mut bracket_depth = 0usize;
+            let mut brace_depth = 0usize;
+            let mut expect_param = true;
+
+            while j < self.tokens.len() && paren_depth > 0 {
+                match &self.tokens[j].kind {
+                    TokenKind::LParen => paren_depth += 1,
+                    TokenKind::RParen => {
+                        paren_depth -= 1;
+                        if paren_depth == 0 {
+                            break;
+                        }
+                    }
+                    TokenKind::LBracket => bracket_depth += 1,
+                    TokenKind::RBracket => bracket_depth = bracket_depth.saturating_sub(1),
+                    TokenKind::LBrace => brace_depth += 1,
+                    TokenKind::RBrace => brace_depth = brace_depth.saturating_sub(1),
+                    TokenKind::Comma
+                        if paren_depth == 1 && bracket_depth == 0 && brace_depth == 0 =>
+                    {
+                        expect_param = true;
+                    }
+                    TokenKind::Ident(param) | TokenKind::UpperIdent(param)
+                        if expect_param
+                            && paren_depth == 1
+                            && bracket_depth == 0
+                            && brace_depth == 0 =>
+                    {
+                        params.push(param.clone());
+                        expect_param = false;
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+
+            self.component_params.entry(name).or_insert(params);
+            i = j.saturating_add(1);
+        }
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
     pub fn parse_module(&mut self) -> NuResult<AstModule> {
         self.diagnostics.clear();
+        self.prescan_component_params();
         let mut decls = Vec::new();
         let mut pending_lets: Vec<Decl> = Vec::new();
         let mut app_decls: Vec<ParsedApp> = Vec::new();
