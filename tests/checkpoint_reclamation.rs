@@ -97,7 +97,7 @@ fn published_checkpoint_is_usable_even_when_wal_prefix_was_not_reclaimed() {
         let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
         commit_put(&mut tablet, b"k", b"v1");
         commit_put(&mut tablet, b"k", b"v2");
-        tablet.write_checkpoint_without_reclaim_for_test().unwrap();
+        tablet.publish_checkpoint().unwrap();
     }
 
     // Simulates a crash after atomic checkpoint publication but before the WAL
