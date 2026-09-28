@@ -3043,6 +3043,7 @@ fn compile_rvalue(
                 let val = compile_rvalue(
                     builder,
                     val_rv,
+                    false,
                     type_meta,
                     helpers,
                     call_targets,
