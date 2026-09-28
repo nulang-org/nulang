@@ -3932,6 +3932,51 @@ mod optimize_tests {
     }
 
     #[test]
+    fn test_scalar_replacement_preserves_pointer_child_ownership() {
+        let mut b = mir::FunctionBuilder::new("pointer_child", Some(Type::string()));
+        let lhs = b.add_param("lhs", Type::string());
+        let rhs = b.add_param("rhs", Type::string());
+        let child = b.add_temp(Type::string());
+        b.assign(child, mir::RValue::StrConcat(lhs, rhs));
+        let tuple = b.add_temp(Type::Tuple(vec![Type::string()]));
+        b.assign(tuple, mir::RValue::Tuple(vec![child]));
+        let result = b.add_temp(Type::string());
+        b.assign(
+            result,
+            mir::RValue::LoadFieldPos {
+                obj: tuple,
+                index: 0,
+            },
+        );
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let mut func = b.build();
+
+        optimize_function(&mut func, &mut Vec::new());
+        let plan = plan_drops(&func);
+
+        assert!(
+            !func.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
+                matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        dst,
+                        op: mir::RValue::Tuple(_),
+                    } if *dst == tuple
+                )
+            }),
+            "the unobservable tuple container should be eliminated"
+        );
+        assert!(
+            plan.ownership_transfer.values().any(|source| *source == child)
+                || !plan
+                    .after_stmt
+                    .values()
+                    .any(|ids| ids.contains(&child)),
+            "scalar replacement must not schedule a drop that invalidates the returned child"
+        );
+    }
+
+    #[test]
     fn test_scalar_replacement_rejects_returned_composite() {
         let mut b = mir::FunctionBuilder::new(
             "returned_tuple",
