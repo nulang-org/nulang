@@ -46,6 +46,8 @@ Each JSONL row (schema 2) contains:
   code retained.
 - `compiled_regions` and `typed_regions`: installed region counts after
   both runs.
+- `native_leaf_thunks`: separately compiled direct-callee thunks used by
+  native-to-native leaf calls.
 - `first_compile.fast_*` / `first_compile.optimized_*`: cumulative
   successful native compilation count and compiler wall time after the first
   run.
