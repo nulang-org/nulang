@@ -1,4 +1,8 @@
 # Nulang Changelog
+### NulangDB tablet ownership and admission core — 2026-09-28
+- **Single-node tablets now have a typed owner/admission state machine above WAL/MVCC.** It serializes writes FIFO, projects predecessor sequences across queued work, applies bounded backpressure, and fences stale or future ownership epochs before work enters the storage path.
+- **Ownership handoff can drain admitted writes without accepting new work.** The handoff epoch is fixed once draining begins; storage ambiguity faults reads/writes until durable reopen, and the failure result identifies both the failed request and later queued requests invalidated by that fault.
+
 ### NulangDB checkpoint and WAL reclamation — 2026-09-28
 - **Single-node tablets can now publish checksummed atomic MVCC checkpoints before reclaiming durable WAL history.** Recovery accepts both safe crash states: a checkpoint plus the original full WAL, or a checkpoint plus a compacted WAL whose header persists the checkpoint base sequence.
 - **Compacted WALs retain sequence, tablet, and ownership fencing metadata.** Reclamation is tail-only in this first slice, so a checkpoint at sequence N rewrites the WAL to an empty log based at N and the next durable write must prove predecessor N before sequence N+1 is accepted.
