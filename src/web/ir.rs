@@ -402,4 +402,57 @@ mod tests {
         let stack_no_auth = infer_middleware(src_no_auth);
         assert!(!stack_no_auth.contains(&"auth".to_string()));
     }
+
+    #[test]
+    fn test_deployment_ir_contains_component_and_island_plan() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "nulang-web-ir-components-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("main.nula"),
+            r#"
+fn ClientCounter() -> Html ! {Client, Render} {
+    <button>Count</button>
+}
+
+fn ServerPanel() -> Html ! {DB, Render, Web} {
+    <section>Server</section>
+}
+
+fn Dashboard() -> Html {
+    <main>
+        <ClientCounter />
+        <ServerPanel />
+    </main>
+}
+"#,
+        )
+        .unwrap();
+
+        let ir = generate_deployment_ir(&[], None, &root, &BudgetsSection::default());
+
+        assert_eq!(ir.components.len(), 3);
+        assert_eq!(ir.islands.len(), 2);
+        assert!(ir
+            .islands
+            .iter()
+            .any(|island| island.component == "ClientCounter"));
+        assert!(ir
+            .islands
+            .iter()
+            .any(|island| island.component == "ServerPanel"));
+
+        let json = ir.to_json();
+        assert!(json.contains("\"components\""));
+        assert!(json.contains("\"islands\""));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
 }
