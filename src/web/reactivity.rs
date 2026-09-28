@@ -409,7 +409,6 @@ fn collect_component_calls(
     }
 }
 
-
 /// Analyze a module and build its signal graph.
 ///
 /// If an `EffectChecker` is supplied, action handlers are classified as
