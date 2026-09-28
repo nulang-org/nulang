@@ -133,7 +133,6 @@ impl Task {
     }
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskAttemptStatus {
@@ -425,7 +424,6 @@ mod tests {
         let replacement = TaskAttempt::new(task_id, "worker-a", 4);
         assert!(!lease.authorizes(&replacement));
     }
-
 
     #[test]
     fn task_attempt_event_carries_fencing_identity() {
