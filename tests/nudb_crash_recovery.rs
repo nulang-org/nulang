@@ -1,7 +1,9 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nulang::database::store::WalBackedTablet;
@@ -26,9 +28,14 @@ fn descriptor() -> TabletDescriptor {
     .unwrap()
 }
 
+fn ack_path(wal_path: &Path) -> PathBuf {
+    wal_path.with_extension("ack")
+}
+
 fn cleanup(wal_path: &Path) {
     let _ = fs::remove_file(wal_path);
     let _ = fs::remove_file(wal_path.with_extension("checkpoint"));
+    let _ = fs::remove_file(ack_path(wal_path));
 }
 
 fn commit_put(tablet: &mut WalBackedTablet, key: &[u8], value: &[u8]) {
@@ -47,27 +54,29 @@ fn commit_put(tablet: &mut WalBackedTablet, key: &[u8], value: &[u8]) {
 }
 
 fn run_until_ack_then_kill(wal_path: &Path, action: &str) -> String {
+    let ack_path = ack_path(wal_path);
+    let _ = fs::remove_file(&ack_path);
+
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "crash_fixture_child", "--ignored", "--nocapture"])
         .env("NULANG_NUDB_CRASH_CHILD_WAL", wal_path)
+        .env("NULANG_NUDB_CRASH_CHILD_ACK", &ack_path)
         .env("NULANG_NUDB_CRASH_CHILD_ACTION", action)
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
 
-    let stdout = child.stdout.take().unwrap();
-    let mut reader = BufReader::new(stdout);
-    let mut ack = String::new();
-    for _ in 0..16 {
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap() == 0 {
+    let mut ack = None;
+    for _ in 0..1_000 {
+        if let Ok(value) = fs::read_to_string(&ack_path) {
+            ack = Some(value);
             break;
         }
-        if line.starts_with("ACK ") {
-            ack = line;
-            break;
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("crash fixture exited before acknowledgement: {status}");
         }
+        thread::sleep(Duration::from_millis(5));
     }
 
     // Always terminate the fixture before asserting on its output so a failed
@@ -77,6 +86,7 @@ fn run_until_ack_then_kill(wal_path: &Path, action: &str) -> String {
     child.kill().unwrap();
     let status = child.wait().unwrap();
 
+    let ack = ack.expect("fixture did not publish a durability acknowledgement");
     assert!(
         ack.starts_with("ACK "),
         "fixture must acknowledge only after its durability boundary, got {ack:?}"
@@ -93,8 +103,10 @@ fn crash_fixture_child() {
     };
     let action = std::env::var("NULANG_NUDB_CRASH_CHILD_ACTION")
         .expect("crash fixture action must be supplied by parent");
+    let ack_path = std::env::var_os("NULANG_NUDB_CRASH_CHILD_ACK")
+        .expect("crash fixture ack path must be supplied by parent");
 
-    match action.as_str() {
+    let acknowledgement = match action.as_str() {
         "commit" => {
             let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
             let sequence = tablet.current_sequence();
@@ -109,26 +121,36 @@ fn crash_fixture_child() {
                 )
                 .unwrap();
             let committed = tablet.commit(write).unwrap();
-            println!("ACK COMMIT {committed}");
+            format!("ACK COMMIT {committed}")
         }
         "publish-checkpoint" => {
             let tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
             let sequence = tablet.current_sequence();
             tablet.publish_checkpoint().unwrap();
-            println!("ACK CHECKPOINT {sequence}");
+            format!("ACK CHECKPOINT {sequence}")
         }
         "checkpoint" => {
             let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
             let sequence = tablet.current_sequence();
             tablet.checkpoint().unwrap();
-            println!("ACK CHECKPOINT_RECLAIMED {sequence}");
+            format!("ACK CHECKPOINT_RECLAIMED {sequence}")
         }
         other => panic!("unknown crash fixture action: {other}"),
-    }
-    std::io::stdout().flush().unwrap();
+    };
+
+    let ack_path = PathBuf::from(ack_path);
+    let mut temp = ack_path.as_os_str().to_os_string();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
+    let mut file = fs::File::create(&temp).unwrap();
+    file.write_all(acknowledgement.as_bytes()).unwrap();
+    file.write_all(b"\n").unwrap();
+    file.sync_data().unwrap();
+    drop(file);
+    fs::rename(&temp, &ack_path).unwrap();
 
     // A successful fixture never exits normally. The parent observes the
-    // durability ACK, then kills this process immediately.
+    // atomically published durability ACK, then kills this process immediately.
     loop {
         std::thread::park();
     }
