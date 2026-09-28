@@ -4088,6 +4088,50 @@ mod optimize_tests {
     }
 
     #[test]
+    fn test_scalar_replacement_record_duplicate_field_uses_last_value() {
+        let mut b = mir::FunctionBuilder::new("duplicate_record_field", Some(Type::int()));
+        let first = b.add_param("first", Type::int());
+        let last = b.add_param("last", Type::int());
+        let record = b.add_temp(Type::Record(vec![
+            ("x".into(), Type::int()),
+            ("x".into(), Type::int()),
+        ]));
+        b.assign(
+            record,
+            mir::RValue::Record(vec![("x".into(), first), ("x".into(), last)]),
+        );
+        let result = b.add_temp(Type::int());
+        b.assign(
+            result,
+            mir::RValue::LoadFieldNamed {
+                obj: record,
+                field: "x".into(),
+            },
+        );
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let mut func = b.build();
+
+        optimize_function(&mut func, &mut Vec::new());
+
+        let result_source = func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .find_map(|stmt| match stmt {
+                mir::Stmt::Assign {
+                    dst,
+                    op: mir::RValue::Load(source),
+                } if *dst == result => Some(*source),
+                _ => None,
+            });
+        assert_eq!(
+            result_source,
+            Some(last),
+            "record SROA must preserve RecS last-write-wins semantics for duplicate field names"
+        );
+    }
+
+    #[test]
     fn test_scalar_replacement_rejects_reassigned_parameter_component() {
         let mut b = mir::FunctionBuilder::new("reassigned_param_component", Some(Type::int()));
         let value = b.add_param("value", Type::int());
