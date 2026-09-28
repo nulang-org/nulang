@@ -17,13 +17,25 @@ use super::simd_analyzer::SimdRegion;
 use super::typed_compiler::TypeMetadata;
 use super::{compiler, simd_compiler, typed_compiler, CodegenOptimization};
 
+/// Compiled native leaf metadata consumed by a caller region.
+#[derive(Debug, Clone)]
+pub(crate) struct NativeLeafCall {
+    pub(crate) ptr: *const u8,
+    pub(crate) ret_reg: u8,
+    pub(crate) clobbers: Vec<u8>,
+}
+
 /// Specialization requested from a native code generator.
 #[derive(Clone, Copy)]
 pub(crate) enum NativeCompileKind<'a> {
     /// Generic NaN-tag-aware scalar lowering.
     Scalar {
         native_calls: &'a HashMap<usize, usize>,
+        native_leaf_calls: &'a HashMap<usize, NativeLeafCall>,
     },
+    /// Straight-line leaf thunk entered only from an already-native caller.
+    /// It deliberately omits the outer-region safepoint.
+    Leaf,
     /// Type-directed lowering with guard stripping.
     Typed {
         type_metadata: Option<&'a TypeMetadata>,
@@ -131,7 +143,10 @@ impl CraneliftCodegen {
         request: NativeCompileRequest<'_>,
     ) -> Result<*const u8, String> {
         match request.kind {
-            NativeCompileKind::Scalar { native_calls } => compiler::compile_bytecode_region(
+            NativeCompileKind::Scalar {
+                native_calls,
+                native_leaf_calls,
+            } => compiler::compile_bytecode_region_with_options(
                 module,
                 builder_context,
                 ctx,
@@ -140,6 +155,21 @@ impl CraneliftCodegen {
                 request.num_instrs,
                 request.instructions,
                 native_calls,
+                native_leaf_calls,
+                true,
+            )
+            .map_err(|e| format!("{e:?}")),
+            NativeCompileKind::Leaf => compiler::compile_bytecode_region_with_options(
+                module,
+                builder_context,
+                ctx,
+                request.symbol,
+                request.start_offset,
+                request.num_instrs,
+                request.instructions,
+                &HashMap::new(),
+                &HashMap::new(),
+                false,
             )
             .map_err(|e| format!("{e:?}")),
             NativeCompileKind::Typed { type_metadata } => {
@@ -214,6 +244,7 @@ mod tests {
                     optimization,
                     kind: NativeCompileKind::Scalar {
                         native_calls: &native_calls,
+                        native_leaf_calls: &HashMap::new(),
                     },
                 })
                 .expect("scalar request should compile");
