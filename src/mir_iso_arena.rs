@@ -274,6 +274,26 @@ mod tests {
     }
 
     #[test]
+    fn mutated_candidate_is_rejected() {
+        let mut b = mir::FunctionBuilder::new("f", None);
+        let one = b.add_temp(Type::Primitive(PrimitiveType::Int));
+        b.assign(one, mir::RValue::Const(Constant::Int(1)));
+        let zero = b.add_temp(Type::Primitive(PrimitiveType::Int));
+        b.assign(zero, mir::RValue::Const(Constant::Int(0)));
+        let arr = b.add_temp(array_of(Type::Primitive(PrimitiveType::Int)));
+        b.assign(arr, mir::RValue::ArrayLit(vec![one]));
+        b.emit(mir::Stmt::ArrayStore {
+            arr,
+            idx: zero,
+            src: one,
+        });
+        b.terminate(mir::Terminator::Return(None));
+        let f = b.build();
+
+        assert!(qualifying_alloc_sites(&f).is_empty());
+    }
+
+    #[test]
     fn alias_stored_to_state_is_rejected() {
         let mut b = mir::FunctionBuilder::new("f", None);
         let one = b.add_temp(Type::Primitive(PrimitiveType::Int));
