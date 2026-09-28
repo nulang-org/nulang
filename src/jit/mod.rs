@@ -714,7 +714,10 @@ impl JitSession {
             num_instrs,
             instructions,
             optimization: CodegenOptimization::Optimized,
-            kind: NativeCompileKind::Scalar { native_calls },
+            kind: NativeCompileKind::Scalar {
+                native_calls,
+                native_leaf_calls,
+            },
         }) {
             Ok(ptr) => {
                 self.store_compiled_with_metadata(
