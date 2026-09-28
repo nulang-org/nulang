@@ -1652,9 +1652,10 @@ fn optimize_function(func: &mut mir::Function, _module_consts: &mut Vec<mir::RVa
         let const_locals = collect_const_locals(func);
         let is_float = float_locals(func);
         let folded = fold_function(func, &const_locals, &is_float);
+        let scalar_replaced = scalar_replace_local_composites(func, &const_locals);
         let threaded = thread_jumps(func);
         let dce = dead_store_elim(func);
-        if !folded && !threaded && !dce {
+        if !folded && !scalar_replaced && !threaded && !dce {
             break;
         }
     }
@@ -1900,6 +1901,148 @@ fn fold_one_const(
         (false, BinOp::Or, Nil) if guard => Some(RValue::Load(other)),
         _ => None,
     }
+}
+
+
+#[derive(Clone)]
+enum ScalarComposite {
+    Tuple(Vec<mir::LocalId>),
+    Record(std::collections::HashMap<String, mir::LocalId>),
+    Array(Vec<mir::LocalId>),
+}
+
+fn static_composite_load(
+    rv: &mir::RValue,
+    container: mir::LocalId,
+    composite: &ScalarComposite,
+    const_locals: &std::collections::HashMap<mir::LocalId, Constant>,
+) -> Option<mir::LocalId> {
+    match (rv, composite) {
+        (
+            mir::RValue::LoadFieldPos { obj, index },
+            ScalarComposite::Tuple(items),
+        ) if *obj == container => items.get(*index as usize).copied(),
+        (
+            mir::RValue::LoadFieldNamed { obj, field },
+            ScalarComposite::Record(fields),
+        ) if *obj == container => fields.get(field).copied(),
+        (
+            mir::RValue::ArrayLoad { arr, idx },
+            ScalarComposite::Array(items),
+        ) if *arr == container => match const_locals.get(idx) {
+            Some(Constant::Int(index)) if *index >= 0 => items.get(*index as usize).copied(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn rvalue_reads_local(rv: &mir::RValue, local: mir::LocalId) -> bool {
+    let mut reads = HashSet::new();
+    rvalue_reads(rv, &mut reads);
+    reads.contains(&local)
+}
+
+/// Scalar-replace a deliberately narrow class of immutable, non-escaping
+/// composites.
+///
+/// First wave invariants:
+/// - the composite local has exactly one definition;
+/// - it is a tuple, record, or array literal;
+/// - every use is a direct static field/index load;
+/// - no aliases, mutations, calls, effects, state stores, returns, or other
+///   observations of the composite survive.
+///
+/// The load becomes a plain Load from the original element local. Ordinary
+/// DCE in the same optimizer fixpoint then removes the now-dead allocation.
+fn scalar_replace_local_composites(
+    func: &mut mir::Function,
+    const_locals: &std::collections::HashMap<mir::LocalId, Constant>,
+) -> bool {
+    let mut def_count = vec![0usize; func.locals.len()];
+    let mut definitions: Vec<Option<ScalarComposite>> = vec![None; func.locals.len()];
+
+    for block in &func.blocks {
+        for stmt in &block.stmts {
+            let mir::Stmt::Assign { dst, op } = stmt else {
+                continue;
+            };
+            let index = dst.0 as usize;
+            def_count[index] += 1;
+            if def_count[index] != 1 {
+                definitions[index] = None;
+                continue;
+            }
+            definitions[index] = match op {
+                mir::RValue::Tuple(items) => Some(ScalarComposite::Tuple(items.clone())),
+                mir::RValue::Record(fields) => Some(ScalarComposite::Record(
+                    fields.iter().cloned().collect(),
+                )),
+                mir::RValue::ArrayLit(items) => Some(ScalarComposite::Array(items.clone())),
+                _ => None,
+            };
+        }
+    }
+
+    let mut candidates: HashMap<mir::LocalId, ScalarComposite> = HashMap::new();
+    for (index, definition) in definitions.into_iter().enumerate() {
+        if def_count[index] == 1 {
+            if let Some(definition) = definition {
+                candidates.insert(mir::LocalId(index as u32), definition);
+            }
+        }
+    }
+
+    candidates.retain(|container, composite| {
+        for block in &func.blocks {
+            for stmt in &block.stmts {
+                match stmt {
+                    mir::Stmt::Assign { dst, .. } if dst == container => {}
+                    mir::Stmt::Assign { op, .. } if rvalue_reads_local(op, *container) => {
+                        if static_composite_load(op, *container, composite, const_locals).is_none() {
+                            return false;
+                        }
+                    }
+                    _ => {
+                        let mut reads = HashSet::new();
+                        stmt_reads(stmt, &mut reads);
+                        if reads.contains(container) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            let mut term_reads = HashSet::new();
+            terminator_reads(&block.terminator, &mut term_reads);
+            if term_reads.contains(container) {
+                return false;
+            }
+        }
+        true
+    });
+
+    if candidates.is_empty() {
+        return false;
+    }
+
+    let mut changed = false;
+    for block in &mut func.blocks {
+        for stmt in &mut block.stmts {
+            let mir::Stmt::Assign { op, .. } = stmt else {
+                continue;
+            };
+            for (container, composite) in &candidates {
+                if let Some(source) =
+                    static_composite_load(op, *container, composite, const_locals)
+                {
+                    *op = mir::RValue::Load(source);
+                    changed = true;
+                    break;
+                }
+            }
+        }
+    }
+    changed
 }
 
 /// Thread jumps through trampoline blocks: a block with zero statements and
