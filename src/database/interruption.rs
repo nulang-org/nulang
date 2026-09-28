@@ -41,7 +41,10 @@ pub(crate) fn with_interruption<T>(
     operation: impl FnOnce() -> T,
 ) -> T {
     ACTIVE.with(|active| {
-        assert!(active.get().is_none(), "nested storage interruption is unsupported");
+        assert!(
+            active.get().is_none(),
+            "nested storage interruption is unsupported"
+        );
         active.set(Some(point));
     });
     let _reset = ResetInterruption;
@@ -160,10 +163,7 @@ mod tests {
             (StorageInterruptionPoint::CheckpointAfterTempWrite, false),
             (StorageInterruptionPoint::CheckpointAfterTempSync, false),
             (StorageInterruptionPoint::CheckpointAfterRename, true),
-            (
-                StorageInterruptionPoint::CheckpointAfterDirectorySync,
-                true,
-            ),
+            (StorageInterruptionPoint::CheckpointAfterDirectorySync, true),
         ] {
             let wal_path = temp_wal("checkpoint");
             cleanup(&wal_path);
@@ -173,7 +173,10 @@ mod tests {
             commit_put(&mut tablet, b"v2");
 
             let result = with_interruption(point, || tablet.publish_checkpoint());
-            assert!(result.is_err(), "{point:?} must interrupt checkpoint publication");
+            assert!(
+                result.is_err(),
+                "{point:?} must interrupt checkpoint publication"
+            );
             drop(tablet);
 
             assert_eq!(
@@ -204,11 +207,7 @@ mod tests {
                 2,
             ),
             (StorageInterruptionPoint::WalReclaimAfterRename, 2, 0),
-            (
-                StorageInterruptionPoint::WalReclaimAfterDirectorySync,
-                2,
-                0,
-            ),
+            (StorageInterruptionPoint::WalReclaimAfterDirectorySync, 2, 0),
         ] {
             let wal_path = temp_wal("reclaim");
             cleanup(&wal_path);
