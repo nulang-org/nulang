@@ -540,6 +540,26 @@ impl JitSession {
         instructions: &[crate::bytecode::Instruction],
         native_calls: &std::collections::HashMap<usize, usize>,
     ) -> Option<JitFunctionPtr> {
+        let no_leaf_calls = std::collections::HashMap::new();
+        self.compile_region_with_leaf_calls(
+            module_idx,
+            start_offset,
+            num_instrs,
+            instructions,
+            native_calls,
+            &no_leaf_calls,
+        )
+    }
+
+    unsafe fn compile_region_with_leaf_calls(
+        &mut self,
+        module_idx: usize,
+        start_offset: usize,
+        num_instrs: usize,
+        instructions: &[crate::bytecode::Instruction],
+        native_calls: &std::collections::HashMap<usize, usize>,
+        native_leaf_calls: &std::collections::HashMap<usize, NativeLeafCall>,
+    ) -> Option<JitFunctionPtr> {
         // Check if already compiled
         if let Some(region) = self.compiled_entry(module_idx, start_offset) {
             return Some(std::mem::transmute(region.ptr));
@@ -555,7 +575,10 @@ impl JitSession {
             num_instrs,
             instructions,
             optimization: CodegenOptimization::Fast,
-            kind: NativeCompileKind::Scalar { native_calls },
+            kind: NativeCompileKind::Scalar {
+                native_calls,
+                native_leaf_calls,
+            },
         }) {
             Ok(ptr) => {
                 self.store_compiled_with_metadata(
@@ -593,6 +616,28 @@ impl JitSession {
         instructions: &[crate::bytecode::Instruction],
         type_metadata: Option<&crate::jit::typed_compiler::TypeMetadata>,
         native_calls: &std::collections::HashMap<usize, usize>,
+    ) -> Option<JitFunctionPtr> {
+        let no_leaf_calls = std::collections::HashMap::new();
+        self.compile_region_typed_with_leaf_calls(
+            module_idx,
+            start_offset,
+            num_instrs,
+            instructions,
+            type_metadata,
+            native_calls,
+            &no_leaf_calls,
+        )
+    }
+
+    unsafe fn compile_region_typed_with_leaf_calls(
+        &mut self,
+        module_idx: usize,
+        start_offset: usize,
+        num_instrs: usize,
+        instructions: &[crate::bytecode::Instruction],
+        type_metadata: Option<&crate::jit::typed_compiler::TypeMetadata>,
+        native_calls: &std::collections::HashMap<usize, usize>,
+        native_leaf_calls: &std::collections::HashMap<usize, NativeLeafCall>,
     ) -> Option<JitFunctionPtr> {
         // Check if already compiled
         if let Some(region) = self.compiled_entry(module_idx, start_offset) {
@@ -636,12 +681,13 @@ impl JitSession {
             // Typed compilation failed: fall through to the scalar compiler.
         }
 
-        self.compile_region(
+        self.compile_region_with_leaf_calls(
             module_idx,
             start_offset,
             num_instrs,
             instructions,
             native_calls,
+            native_leaf_calls,
         )
     }
 
@@ -652,6 +698,7 @@ impl JitSession {
         num_instrs: usize,
         instructions: &[crate::bytecode::Instruction],
         native_calls: &std::collections::HashMap<usize, usize>,
+        native_leaf_calls: &std::collections::HashMap<usize, NativeLeafCall>,
     ) -> Option<JitFunctionPtr> {
         let func_name = self.next_promotion_name("nulang_jit_opt", module_idx, start_offset);
         let started = std::time::Instant::now();
