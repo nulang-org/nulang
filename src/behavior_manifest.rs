@@ -8,6 +8,7 @@
 //! so `migration_identity` is explicitly `topology-only`.
 
 use crate::artifact_identity::ArtifactIdentityManifest;
+use crate::authority::AuthorityManifest;
 use crate::content_identity::{ArtifactId, SemanticId, SourceId};
 use crate::format::constants::LANGUAGE_VERSION_STR;
 use crate::hir;
@@ -19,15 +20,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
-pub const BEHAVIOR_MANIFEST_SCHEMA: &str = "nulang.behavior/v0alpha1";
+pub const BEHAVIOR_MANIFEST_SCHEMA: &str = "nulang.behavior/v0alpha2";
 pub const BEHAVIOR_ARTIFACT_KIND_NBC_V1: &str = "nulang-bytecode-v1";
-const BEHAVIOR_MANIFEST_DIGEST_DOMAIN: &[u8] = b"nulang.behavior-manifest.v0alpha1\0";
+const BEHAVIOR_MANIFEST_DIGEST_DOMAIN: &[u8] = b"nulang.behavior-manifest.v0alpha2\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BehaviorManifest {
     pub schema: String,
     pub package: BehaviorPackage,
     pub artifact: BehaviorArtifact,
+    pub authority: BehaviorAuthorityInventory,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actors: Vec<BehaviorActor>,
 }
@@ -54,6 +56,22 @@ pub struct BehaviorArtifact {
     pub backend: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BehaviorAuthorityInventory {
+    pub coverage: BehaviorAuthorityCoverage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grants: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BehaviorAuthorityCoverage {
+    /// Inventory contains every explicit authority grant delegated by a
+    /// source-level spawn expression. Effect-derived ambient authority is not
+    /// yet included and must not be inferred by consumers.
+    ExplicitSpawnGrants,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +176,7 @@ impl BehaviorManifest {
                 backend: artifact.backend().to_string(),
                 flags: artifact.flags().map(str::to_string).collect(),
             },
+            authority: authority_inventory_from_hir(hir)?,
             actors,
         };
         manifest.normalize();
@@ -318,6 +337,8 @@ impl BehaviorManifest {
     fn normalize(&mut self) {
         self.artifact.flags.sort();
         self.artifact.flags.dedup();
+        self.authority.grants.sort();
+        self.authority.grants.dedup();
         self.actors
             .sort_by(|left, right| left.name.cmp(&right.name));
         for actor in &mut self.actors {
@@ -371,6 +392,18 @@ impl BehaviorManifest {
             return Err(BehaviorManifestError::ArtifactIdentityMismatch {
                 expected: expected_artifact_id,
                 actual: artifact_id,
+            });
+        }
+
+        let authority = AuthorityManifest::from_tokens(
+            self.authority.grants.iter().map(String::as_str),
+        )
+        .map_err(|error| BehaviorManifestError::InvalidAuthority {
+            message: error.to_string(),
+        })?;
+        if authority.canonical_tokens() != self.authority.grants {
+            return Err(BehaviorManifestError::InvalidAuthority {
+                message: "authority grants must be canonical, sorted, and deduplicated".to_string(),
             });
         }
 
@@ -532,6 +565,108 @@ fn classify_persistence(actor: &hir::ActorDef) -> BehaviorPersistence {
     }
 }
 
+fn authority_inventory_from_hir(
+    module: &hir::Module,
+) -> Result<BehaviorAuthorityInventory, BehaviorManifestError> {
+    let mut tokens = BTreeSet::new();
+    collect_authority_from_decls(&module.decls, &mut tokens);
+    let manifest = AuthorityManifest::from_tokens(tokens.iter().map(String::as_str)).map_err(
+        |error| BehaviorManifestError::InvalidAuthority {
+            message: error.to_string(),
+        },
+    )?;
+
+    Ok(BehaviorAuthorityInventory {
+        coverage: BehaviorAuthorityCoverage::ExplicitSpawnGrants,
+        grants: manifest.canonical_tokens(),
+    })
+}
+
+fn collect_authority_from_decls(decls: &[hir::Decl], out: &mut BTreeSet<String>) {
+    for decl in decls {
+        match decl {
+            hir::Decl::Function(function) => collect_authority_from_body(&function.body, out),
+            hir::Decl::Actor(actor) => {
+                for behavior in &actor.behaviors {
+                    collect_authority_from_body(&behavior.body, out);
+                    if let Some(compensate) = &behavior.compensate {
+                        collect_authority_from_body(compensate, out);
+                    }
+                }
+            }
+            hir::Decl::Module { decls, .. } => collect_authority_from_decls(decls, out),
+            hir::Decl::Constant { body, .. } => collect_authority_from_body(body, out),
+            _ => {}
+        }
+    }
+}
+
+fn collect_authority_from_body(body: &hir::Body, out: &mut BTreeSet<String>) {
+    for stmt in &body.stmts {
+        match stmt {
+            hir::Stmt::Let { value, .. } | hir::Stmt::Assign { value, .. } => {
+                collect_authority_from_rvalue(value, out)
+            }
+            hir::Stmt::StateSet { .. }
+            | hir::Stmt::Emit { .. }
+            | hir::Stmt::ParallelMarker { .. } => {}
+        }
+    }
+}
+
+fn collect_authority_from_rvalue(value: &hir::RValue, out: &mut BTreeSet<String>) {
+    match value {
+        hir::RValue::Spawn { capabilities, .. } => {
+            out.extend(capabilities.iter().cloned());
+        }
+        hir::RValue::Closure { body, .. }
+        | hir::RValue::RecClosure { body, .. }
+        | hir::RValue::Block(body) => collect_authority_from_body(body, out),
+        hir::RValue::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            collect_authority_from_body(then_body, out);
+            if let Some(else_body) = else_body {
+                collect_authority_from_body(else_body, out);
+            }
+        }
+        hir::RValue::Match { arms, .. } => {
+            for (_, guard, arm) in arms {
+                if let Some(guard) = guard {
+                    collect_authority_from_body(guard, out);
+                }
+                collect_authority_from_body(arm, out);
+            }
+        }
+        hir::RValue::For { body, .. } => collect_authority_from_body(body, out),
+        hir::RValue::While { cond, body, .. } => {
+            collect_authority_from_body(cond, out);
+            collect_authority_from_body(body, out);
+        }
+        hir::RValue::Handle { body, handlers, .. } => {
+            collect_authority_from_body(body, out);
+            for handler in handlers {
+                collect_authority_from_body(&handler.body, out);
+            }
+        }
+        hir::RValue::Receive { arms, after, .. } => {
+            for (_, _, guard, arm) in arms {
+                if let Some(guard) = guard {
+                    collect_authority_from_body(guard, out);
+                }
+                collect_authority_from_body(arm, out);
+            }
+            if let Some((timeout, body)) = after {
+                collect_authority_from_body(timeout, out);
+                collect_authority_from_body(body, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn actor_defs_by_name(module: &hir::Module) -> BTreeMap<String, &hir::ActorDef> {
     fn collect<'a>(
         decls: &'a [hir::Decl],
@@ -593,6 +728,9 @@ pub enum BehaviorManifestError {
     ActorSchemaMismatch {
         actor: String,
     },
+    InvalidAuthority {
+        message: String,
+    },
     InvalidActor {
         actor: String,
         message: String,
@@ -631,6 +769,9 @@ impl fmt::Display for BehaviorManifestError {
             ),
             Self::ActorSchemaMismatch { actor } => {
                 write!(f, "typed actor schema '{actor}' has no matching HIR actor")
+            }
+            Self::InvalidAuthority { message } => {
+                write!(f, "invalid behavior manifest authority inventory: {message}")
             }
             Self::InvalidActor { actor, message } => {
                 write!(f, "invalid behavior manifest actor '{actor}': {message}")
@@ -856,6 +997,10 @@ mod tests {
                 abi: "abi".to_string(),
                 backend: "bytecode".to_string(),
                 flags: Vec::new(),
+            },
+            authority: BehaviorAuthorityInventory {
+                coverage: BehaviorAuthorityCoverage::ExplicitSpawnGrants,
+                grants: Vec::new(),
             },
             actors: vec![actor],
         }
