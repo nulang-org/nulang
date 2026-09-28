@@ -1,4 +1,8 @@
 # Nulang Changelog
+### NuDB single-node tablet and WAL foundation — 2026-09-27
+- **NuDB now has an experimental single-node range-tablet kernel with ownership-epoch and predecessor-sequence fencing, MVCC snapshot reads, tombstones, deterministic split plans, and WAL-before-visibility commits.** Database hot loops remain ordinary local computation; actors are reserved for future tablet ownership, placement, migration, and distributed coordination.
+- **The prototype WAL fails closed on corrupt framing and payloads and requires recovery after ambiguous append failures.** `NUDBWAL2` protects record metadata and payload bytes independently, truncates only genuinely incomplete crash tails, poisons a live WAL handle after post-emission I/O failure, and fsyncs new WAL directory entries on Unix.
+
 ### Node-shared immutable object store — 2026-09-27
 - **Immutable object-store payloads are now shared across runtime shards without copying their bytes.** `TAG_OBJECT` handles keep a single node-local allocation while actor-lifetime holds protect queued and delivered messages; duplicate deliveries no longer over-increment object references.
 - **Cross-node object transport remains explicit and compatible.** Remote sends still serialize object bytes and intern a fresh local object on the receiving node, while actor heaps and ORCA ownership remain shard-confined.
