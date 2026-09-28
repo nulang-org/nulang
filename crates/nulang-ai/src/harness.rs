@@ -201,7 +201,10 @@ impl<W: WorkspaceExecutor> AgentHarness<W> {
     }
 
     pub async fn apply_change_set(&self, change: &ChangeSet) -> Result<String, WorkspaceError> {
-        let current_revision = self.workspace.current_revision(&change.workspace_id).await?;
+        let current_revision = self
+            .workspace
+            .current_revision(&change.workspace_id)
+            .await?;
         if current_revision != change.base_revision {
             return Err(WorkspaceError::RevisionMismatch {
                 expected: change.base_revision.clone(),
