@@ -701,19 +701,45 @@ pub fn compile_bytecode_region(
             ),
 
             OpCode::Call => {
-                // A direct, provably-non-suspending call (recovered by
-                // `find_compilable_region_with_calls`): run the callee to
-                // completion via the re-entrant `nulang_jit_direct_call`
-                // helper while this region stays resident in native code.
+                // The recovered direct target is only a compile-time hint.
+                // Re-check the live function value immediately before dispatch
+                // so stale analysis can never invoke the wrong callee.
                 let func_idx = match native_calls.get(&pc) {
-                    Some(&idx) => idx as i64,
+                    Some(&idx) => idx,
                     None => {
                         return Err(CompileError::Internal(
                             "Call in compiled region without a native-call entry".into(),
                         ))
                     }
                 };
-                let fidx = builder.ins().iconst(types::I64, func_idx);
+                let live_func = load_reg(&mut builder, regs_ptr, instr.op1 as usize);
+                let expected_bits = TAG_INT | ((func_idx as u64) & PAYLOAD_MASK);
+                let expected = builder.ins().iconst(types::I64, expected_bits as i64);
+                let target_matches = builder.ins().icmp(IntCC::Equal, live_func, expected);
+                let call_block = builder.create_block();
+                let mismatch_block = builder.create_block();
+                builder
+                    .ins()
+                    .brif(target_matches, call_block, &[], mismatch_block, &[]);
+
+                builder.switch_to_block(mismatch_block);
+                builder.set_cold_block(mismatch_block);
+                emit_yield_pc(
+                    &mut builder,
+                    helpers[&RuntimeHelper::SetBranchExit],
+                    start_offset,
+                    pc,
+                );
+                builder.ins().jump(return_block, &[]);
+                builder.seal_block(mismatch_block);
+
+                builder.switch_to_block(call_block);
+                builder.seal_block(call_block);
+
+                // Proven target: run the non-suspending callee to completion
+                // via the re-entrant interpreter helper while this region
+                // remains resident in native code.
+                let fidx = builder.ins().iconst(types::I64, func_idx as i64);
                 let argcv = builder.ins().iconst(types::I64, instr.op2 as i64);
                 let dstv = builder.ins().iconst(types::I64, instr.op3 as i64);
                 let status_inst = builder.ins().call(
