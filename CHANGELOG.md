@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Proven native JIT leaf calls — 2026-09-28
+- **Tiny straight-line direct callees can now compile as separate native thunks and be called directly from an already-native caller**, avoiding the interpreter-frame round trip while retaining the existing live-target validation/deoptimization gate.
+- **Leaf eligibility proves interpreter-frame isolation, not just purity.** Only staged argument registers are initially defined; every other register read must be dominated by a write, so sharing the caller register buffer cannot expose values that a fresh callee frame would initialize to nil.
+- **The first slice is deliberately bounded:** at most 32 body instructions, no control flow, nested calls, effects, actor/FFI operations, heap/container mutation, suspension, or `INeg`. Exact callee clobbers are saved/restored around the thunk and the return value is captured before restoration.
+- **Leaf machine-code generation stays behind `NativeCodegenBackend` and its compile cost contributes to JIT telemetry.** Successful/rejected leaf analyses are cached by module, function, and argument count, and Tier-2 baseline replacement preserves the native-leaf fast path.
+
 ### JIT direct-call target validation — 2026-09-28
 - **Compiled direct calls now treat the recovered function index as a hint rather than an unchecked dispatch target.** Native code compares the live tagged callee value immediately before the helper call and deoptimizes to the exact `Call` PC on mismatch.
 - **Static direct-call recovery now walks only the compiler-owned argument-staging sequence** (spill loads and moves into argument registers), so unrelated instructions or stale writes to `r254` terminate recovery instead of being scanned through.
