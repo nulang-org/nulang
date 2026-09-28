@@ -1999,6 +1999,7 @@ fn static_composite_load(
         {
             fields
                 .iter()
+                .rev()
                 .find_map(|(name, source)| (name == field).then_some(*source))
         }
         (mir::RValue::ArrayLoad { arr, idx }, ScalarComposite::Array(items))
