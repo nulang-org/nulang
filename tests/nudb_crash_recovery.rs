@@ -59,16 +59,18 @@ fn run_until_ack_then_kill(wal_path: &Path, action: &str) -> String {
     let mut reader = BufReader::new(stdout);
     let mut ack = String::new();
     reader.read_line(&mut ack).unwrap();
+
+    // Always terminate the fixture before asserting on its output so a failed
+    // acknowledgement cannot leak a parked child process into later tests.
+    // std::process::Child::kill maps to abrupt process termination on the host
+    // platform.
+    child.kill().unwrap();
+    let status = child.wait().unwrap();
+
     assert!(
         ack.starts_with("ACK "),
         "fixture must acknowledge only after its durability boundary, got {ack:?}"
     );
-
-    // std::process::Child::kill maps to an abrupt process termination on the
-    // host platform. The fixture intentionally remains alive after ACK so this
-    // cannot degrade into a graceful shutdown test.
-    child.kill().unwrap();
-    let status = child.wait().unwrap();
     assert!(!status.success(), "fixture unexpectedly exited gracefully");
     ack
 }
