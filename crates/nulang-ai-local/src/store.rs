@@ -2,7 +2,8 @@
 
 use chrono::{DateTime, Utc};
 use nulang_ai_core::{
-    ConversationState, Goal, GoalGraph, GoalStatus, ManagerKind, Task, TaskStatus,
+    AgentSession, ArtifactRef, ConversationState, Evidence, Goal, GoalGraph, GoalStatus,
+    ManagerKind, Task, TaskAttempt, TaskStatus, WorkspaceLease,
 };
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
@@ -21,6 +22,12 @@ pub enum StoreError {
     GoalNotFound(Uuid),
     #[error("conversation not found: {0}")]
     ConversationNotFound(Uuid),
+    #[error("agent session not found: {0}")]
+    SessionNotFound(Uuid),
+    #[error("task attempt not found: {0}")]
+    TaskAttemptNotFound(Uuid),
+    #[error("workspace lease not found: {0}")]
+    WorkspaceLeaseNotFound(Uuid),
 }
 
 pub struct SqliteStore {
@@ -79,6 +86,50 @@ impl SqliteStore {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS agent_sessions (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_sessions_project
+                ON agent_sessions(project_id);
+            CREATE TABLE IF NOT EXISTS task_attempts (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                attempt_number INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_task_attempts_task
+                ON task_attempts(task_id, attempt_number);
+            CREATE TABLE IF NOT EXISTS workspace_leases (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                holder_attempt_id TEXT NOT NULL,
+                lease_epoch INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                acquired_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_workspace_leases_workspace
+                ON workspace_leases(project_id, workspace_id, lease_epoch);
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id TEXT PRIMARY KEY,
+                attempt_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_artifacts_attempt
+                ON artifacts(attempt_id, created_at);
+            CREATE TABLE IF NOT EXISTS evidence (
+                id TEXT PRIMARY KEY,
+                attempt_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_evidence_attempt
+                ON evidence(attempt_id, created_at);
             "#,
         )?;
         Ok(())
@@ -313,6 +364,200 @@ impl SqliteStore {
         })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    pub fn upsert_session(&self, session: &AgentSession) -> Result<(), StoreError> {
+        let conn = Connection::open(&self.path)?;
+        conn.execute(
+            r#"INSERT INTO agent_sessions (id, project_id, payload, updated_at)
+               VALUES (?1, ?2, ?3, ?4)
+               ON CONFLICT(id) DO UPDATE SET
+                   project_id=excluded.project_id,
+                   payload=excluded.payload,
+                   updated_at=excluded.updated_at"#,
+            params![
+                session.id.to_string(),
+                session.project_id,
+                serde_json::to_string(session)?,
+                session.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_session(&self, id: Uuid) -> Result<AgentSession, StoreError> {
+        let conn = Connection::open(&self.path)?;
+        let payload = conn
+            .query_row(
+                "SELECT payload FROM agent_sessions WHERE id = ?1",
+                params![id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::SessionNotFound(id),
+                other => StoreError::Sqlite(other),
+            })?;
+        Ok(serde_json::from_str(&payload)?)
+    }
+
+    pub fn upsert_task_attempt(&self, attempt: &TaskAttempt) -> Result<(), StoreError> {
+        let conn = Connection::open(&self.path)?;
+        conn.execute(
+            r#"INSERT INTO task_attempts (id, task_id, attempt_number, payload, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)
+               ON CONFLICT(id) DO UPDATE SET
+                   task_id=excluded.task_id,
+                   attempt_number=excluded.attempt_number,
+                   payload=excluded.payload,
+                   updated_at=excluded.updated_at"#,
+            params![
+                attempt.id.to_string(),
+                attempt.task_id.to_string(),
+                i64::from(attempt.attempt_number),
+                serde_json::to_string(attempt)?,
+                attempt.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_task_attempt(&self, id: Uuid) -> Result<TaskAttempt, StoreError> {
+        let conn = Connection::open(&self.path)?;
+        let payload = conn
+            .query_row(
+                "SELECT payload FROM task_attempts WHERE id = ?1",
+                params![id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::TaskAttemptNotFound(id),
+                other => StoreError::Sqlite(other),
+            })?;
+        Ok(serde_json::from_str(&payload)?)
+    }
+
+    pub fn list_task_attempts_for_task(
+        &self,
+        task_id: Uuid,
+    ) -> Result<Vec<TaskAttempt>, StoreError> {
+        let conn = Connection::open(&self.path)?;
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM task_attempts WHERE task_id = ?1 ORDER BY attempt_number ASC",
+        )?;
+        let rows = stmt.query_map(params![task_id.to_string()], |row| row.get::<_, String>(0))?;
+        let payloads = rows.collect::<Result<Vec<_>, _>>()?;
+        payloads
+            .into_iter()
+            .map(|payload| serde_json::from_str(&payload).map_err(StoreError::from))
+            .collect()
+    }
+
+    pub fn upsert_workspace_lease(&self, lease: &WorkspaceLease) -> Result<(), StoreError> {
+        let conn = Connection::open(&self.path)?;
+        conn.execute(
+            r#"INSERT INTO workspace_leases (
+                   id, project_id, workspace_id, holder_attempt_id, lease_epoch, payload, acquired_at
+               ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+               ON CONFLICT(id) DO UPDATE SET
+                   project_id=excluded.project_id,
+                   workspace_id=excluded.workspace_id,
+                   holder_attempt_id=excluded.holder_attempt_id,
+                   lease_epoch=excluded.lease_epoch,
+                   payload=excluded.payload"#,
+            params![
+                lease.id.to_string(),
+                lease.project_id,
+                lease.workspace_id,
+                lease.holder_attempt_id.to_string(),
+                lease.lease_epoch as i64,
+                serde_json::to_string(lease)?,
+                lease.acquired_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_workspace_lease(&self, id: Uuid) -> Result<WorkspaceLease, StoreError> {
+        let conn = Connection::open(&self.path)?;
+        let payload = conn
+            .query_row(
+                "SELECT payload FROM workspace_leases WHERE id = ?1",
+                params![id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::WorkspaceLeaseNotFound(id),
+                other => StoreError::Sqlite(other),
+            })?;
+        Ok(serde_json::from_str(&payload)?)
+    }
+
+    pub fn upsert_artifact(&self, artifact: &ArtifactRef) -> Result<(), StoreError> {
+        let conn = Connection::open(&self.path)?;
+        conn.execute(
+            r#"INSERT INTO artifacts (id, attempt_id, payload, created_at)
+               VALUES (?1, ?2, ?3, ?4)
+               ON CONFLICT(id) DO UPDATE SET
+                   attempt_id=excluded.attempt_id,
+                   payload=excluded.payload"#,
+            params![
+                artifact.id.to_string(),
+                artifact.attempt_id.to_string(),
+                serde_json::to_string(artifact)?,
+                artifact.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_artifacts_for_attempt(
+        &self,
+        attempt_id: Uuid,
+    ) -> Result<Vec<ArtifactRef>, StoreError> {
+        let conn = Connection::open(&self.path)?;
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM artifacts WHERE attempt_id = ?1 ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![attempt_id.to_string()], |row| row.get::<_, String>(0))?;
+        let payloads = rows.collect::<Result<Vec<_>, _>>()?;
+        payloads
+            .into_iter()
+            .map(|payload| serde_json::from_str(&payload).map_err(StoreError::from))
+            .collect()
+    }
+
+    pub fn upsert_evidence(&self, evidence: &Evidence) -> Result<(), StoreError> {
+        let conn = Connection::open(&self.path)?;
+        conn.execute(
+            r#"INSERT INTO evidence (id, attempt_id, payload, created_at)
+               VALUES (?1, ?2, ?3, ?4)
+               ON CONFLICT(id) DO UPDATE SET
+                   attempt_id=excluded.attempt_id,
+                   payload=excluded.payload"#,
+            params![
+                evidence.id.to_string(),
+                evidence.attempt_id.to_string(),
+                serde_json::to_string(evidence)?,
+                evidence.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_evidence_for_attempt(
+        &self,
+        attempt_id: Uuid,
+    ) -> Result<Vec<Evidence>, StoreError> {
+        let conn = Connection::open(&self.path)?;
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM evidence WHERE attempt_id = ?1 ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![attempt_id.to_string()], |row| row.get::<_, String>(0))?;
+        let payloads = rows.collect::<Result<Vec<_>, _>>()?;
+        payloads
+            .into_iter()
+            .map(|payload| serde_json::from_str(&payload).map_err(StoreError::from))
+            .collect()
     }
 }
 
