@@ -976,10 +976,7 @@ pub unsafe extern "C" fn nulang_jit_alloc_obj_at(
 /// code is running without actor arena callbacks, allocation conservatively
 /// falls back to the ordinary heap.
 #[no_mangle]
-pub unsafe extern "C" fn nulang_aot_alloc_local_obj(
-    slot_count: u64,
-    type_tag_raw: u32,
-) -> u64 {
+pub unsafe extern "C" fn nulang_aot_alloc_local_obj(slot_count: u64, type_tag_raw: u32) -> u64 {
     let count = slot_count as usize;
     let tag: HeapTypeTag = match type_tag_raw {
         1 => HeapTypeTag::Array,
