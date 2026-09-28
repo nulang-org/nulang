@@ -1,4 +1,8 @@
 # Nulang Changelog
+### MIR/AOT activation-local composite allocation — 2026-09-28
+- **Native/AOT actor code can now route proven activation-local arrays, records, and tuples through the actor iso arena when `NULANG_ISO_ARENA=1`.** A separate MIR-level may-alias/lifetime analysis keeps the native backend independent of bytecode-PC mappings while preserving the same off-by-default feature gate.
+- **The first AOT wave is intentionally stricter than the bytecode/JIT path.** Only scalar-initialized composites that remain activation-local and immutable after construction qualify; returned, state-stored, nested, mutated, pointer-child, interprocedural, effectful, FFI, actor-message, and suspension cases remain heap-backed. Completed native actor activations reset the arena in O(1).
+
 ### Typed JIT composite allocation — 2026-09-27
 - **Allocation-containing hot regions can now stay on the typed Cranelift path.** The typed compiler models `ArrAlloc`, `RecMk`, and `TupleMk`, preserves unrelated Int/Float type facts across scratch allocations, and reuses the same PC-aware arena allocator as baseline JIT code.
 - **Known integer array lengths remain in native SSA across allocation calls.** Only unproven array-length values force register-cache materialization, while record/tuple allocation does not flush unrelated numeric caches.
