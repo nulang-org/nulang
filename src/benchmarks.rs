@@ -467,8 +467,7 @@ fn bench_ab_aot_iso_arena_alloc_heavy() {
     std::env::set_var("NULANG_ISO_ARENA", "0");
     let heap_aot = crate::aot::AotModule::compile(&mir).expect("bench: heap AOT compile failed");
     std::env::set_var("NULANG_ISO_ARENA", "1");
-    let arena_aot =
-        crate::aot::AotModule::compile(&mir).expect("bench: arena AOT compile failed");
+    let arena_aot = crate::aot::AotModule::compile(&mir).expect("bench: arena AOT compile failed");
     match previous_iso_arena {
         Some(value) => std::env::set_var("NULANG_ISO_ARENA", value),
         None => std::env::remove_var("NULANG_ISO_ARENA"),
@@ -512,7 +511,9 @@ fn bench_ab_aot_iso_arena_alloc_heavy() {
             .actors
             .get(&actor_id)
             .expect("bench: actor live after measurement");
-        let total = actor.get_state_field("total").and_then(|value| value.as_int());
+        let total = actor
+            .get_state_field("total")
+            .and_then(|value| value.as_int());
         assert_eq!(
             total,
             Some((N * 5) as i64),
