@@ -1234,6 +1234,12 @@ impl EffectChecker {
                     .cloned()
                     .unwrap_or_else(EffectRow::empty),
             };
+            let is_component = annotations
+                .iter()
+                .any(|annotation| matches!(annotation, crate::ast::FunctionAnnotation::Component));
+            if !is_component && !effect_row_contains_web_effect(&row) {
+                continue;
+            }
 
             match infer_web_placement(&row) {
                 Some(Placement::Server) => self.diagnostics.push(format!(
@@ -1253,6 +1259,23 @@ impl EffectChecker {
             let _ = body_span; // reserved for future line/column diagnostics
         }
     }
+
+fn effect_row_contains_web_effect(row: &EffectRow) -> bool {
+    let effects = match row {
+        EffectRow::Closed(effects) | EffectRow::Open(effects, _) => effects,
+    };
+    effects.iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::Render
+                | Effect::Request
+                | Effect::Respond
+                | Effect::Realtime
+                | Effect::Client
+                | Effect::Web
+        )
+    })
+}
 
     /// Emit a deprecation warning for a single declaration if it uses language
     /// surface scheduled for removal. See RFC 0004.
