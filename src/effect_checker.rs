@@ -1217,25 +1217,21 @@ impl EffectChecker {
                     .cloned()
                     .unwrap_or_else(EffectRow::empty),
             };
-            let effects: Vec<_> = match &row {
-                EffectRow::Closed(effs) => effs.clone(),
-                EffectRow::Open(effs, _) => effs.clone(),
-            };
-            let has_request = effects.iter().any(|e| *e == Effect::Request);
-            let only_render_or_web = effects
-                .iter()
-                .all(|e| *e == Effect::Render || *e == Effect::Web)
-                && !effects.is_empty();
-            if has_request {
-                self.diagnostics.push(format!(
-                    "warning: function '{}' has no @placement; inferred placement: server (because it performs Request)",
+
+            match infer_web_placement(&row) {
+                Some(Placement::Server) => self.diagnostics.push(format!(
+                    "warning: function '{}' has no @placement; inferred placement: server",
                     name
-                ));
-            } else if only_render_or_web {
-                self.diagnostics.push(format!(
-                    "warning: function '{}' has no @placement; inferred placement: static (because it only performs Render or Web)",
+                )),
+                Some(Placement::Static) => self.diagnostics.push(format!(
+                    "warning: function '{}' has no @placement; inferred placement: static",
                     name
-                ));
+                )),
+                Some(Placement::Client) => self.diagnostics.push(format!(
+                    "warning: function '{}' has no @placement; inferred placement: client",
+                    name
+                )),
+                _ => {}
             }
             let _ = body_span; // reserved for future line/column diagnostics
         }
