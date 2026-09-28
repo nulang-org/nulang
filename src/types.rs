@@ -2692,7 +2692,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod web_placement_tests {
     use super::*;
