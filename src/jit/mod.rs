@@ -1106,7 +1106,15 @@ impl crate::backends::JitBackend for JitSession {
             {
                 return true;
             }
+
+            // Backend compilation failure is not a static rejection. Keep the
+            // caller PC retryable instead of retiring it from the VM gate.
+            if module_idx < self.hot_counts.len() && pc < self.hot_counts[module_idx].len() {
+                self.hot_counts[module_idx][pc] = 0;
+            }
+            return false;
         }
+
         // Region planning depends only on immutable module/type state for this
         // session. A too-small/fragmented plan cannot become compilable later,
         // so make only this static rejection terminal.
