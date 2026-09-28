@@ -114,11 +114,33 @@ pub(crate) fn direct_call_target(
 ) -> Option<usize> {
     use crate::bytecode::{Constant, OpCode};
     const FUNC_VALUE_REG: u8 = 254;
+    const SPILL_TEMP_MIN: u8 = 12;
+    const SPILL_TEMP_MAX: u8 = 14;
+
+    let call = *module.instructions.get(pc)?;
+    if call.opcode != OpCode::Call {
+        return None;
+    }
+    let argc = call.op2;
+
+    // MIR emits one exact direct-call staging shape:
+    //   load direct callee -> r254
+    //   [optional SpillLoad -> r12..r14]*
+    //   [optional Move -> r0..r(argc-1)]*
+    //   Call r254, argc, dst
+    //
+    // Scan only through those argument-staging instructions. Stopping at the
+    // first unrelated opcode prevents a stale earlier r254 definition from
+    // being accepted as the live direct-call target.
     let mut p = pc;
     while p > func_start {
         p -= 1;
         let instr = module.instructions[p];
         match instr.opcode {
+            OpCode::Move if instr.op2 < argc => continue,
+            OpCode::SpillLoad if (SPILL_TEMP_MIN..=SPILL_TEMP_MAX).contains(&instr.op3) => {
+                continue
+            }
             OpCode::Const0 | OpCode::Const1 | OpCode::Const2 if instr.op1 == FUNC_VALUE_REG => {
                 let idx = match instr.opcode {
                     OpCode::Const0 => 0,
@@ -127,7 +149,7 @@ pub(crate) fn direct_call_target(
                 };
                 return Some(idx);
             }
-            OpCode::ConstM1 if instr.op1 == FUNC_VALUE_REG => return None, // -1 is not a function
+            OpCode::ConstM1 if instr.op1 == FUNC_VALUE_REG => return None,
             OpCode::ConstU if instr.op3 == FUNC_VALUE_REG => {
                 let pool = instr.imm16() as usize;
                 return match module.constants.get(pool) {
@@ -135,8 +157,8 @@ pub(crate) fn direct_call_target(
                     _ => None,
                 };
             }
-            OpCode::Move if instr.op2 == FUNC_VALUE_REG => return None, // indirect
-            _ => {}
+            OpCode::Move if instr.op2 == FUNC_VALUE_REG => return None,
+            _ => return None,
         }
     }
     None
