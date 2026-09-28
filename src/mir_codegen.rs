@@ -3955,23 +3955,26 @@ mod optimize_tests {
         let plan = plan_drops(&func);
 
         assert!(
-            !func.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
-                matches!(
-                    stmt,
-                    mir::Stmt::Assign {
-                        dst,
-                        op: mir::RValue::Tuple(_),
-                    } if *dst == tuple
-                )
-            }),
+            !func
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .any(|stmt| {
+                    matches!(
+                        stmt,
+                        mir::Stmt::Assign {
+                            dst,
+                            op: mir::RValue::Tuple(_),
+                        } if *dst == tuple
+                    )
+                }),
             "the unobservable tuple container should be eliminated"
         );
         assert!(
-            plan.ownership_transfer.values().any(|source| *source == child)
-                || !plan
-                    .after_stmt
-                    .values()
-                    .any(|ids| ids.contains(&child)),
+            plan.ownership_transfer
+                .values()
+                .any(|source| *source == child)
+                || !plan.after_stmt.values().any(|ids| ids.contains(&child)),
             "scalar replacement must not schedule a drop that invalidates the returned child"
         );
     }
