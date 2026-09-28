@@ -752,6 +752,9 @@ mod tests {
     use crate::ast::{Expr, Literal, MigrationDecl, StateModel};
     use crate::content_identity::SemanticId;
     use crate::hir::{ActorDef, Module, Operand};
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
     use crate::types::{PrimitiveType, Span, Type};
 
     fn artifact() -> ArtifactIdentityManifest {
@@ -816,6 +819,14 @@ mod tests {
 
     fn schema_id(seed: &[u8]) -> String {
         SemanticId::from_canonical_bytes(seed, []).to_string()
+    }
+
+    fn lower_source(source: &str) -> Module {
+        let tokens = Lexer::new(source).lex().unwrap();
+        let ast = Parser::new(tokens).parse_module().unwrap();
+        let mut type_checker = TypeChecker::new();
+        type_checker.check_module(&ast).unwrap();
+        crate::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types)
     }
 
     fn base_manifest(actor: BehaviorActor) -> BehaviorManifest {
@@ -1036,4 +1047,94 @@ mod tests {
             Err(BehaviorManifestError::InvalidActor { .. })
         ));
     }
+
+    #[test]
+    fn typed_hir_emits_canonical_explicit_authority_inventory() {
+        let hir = lower_source(
+            r#"
+actor Child {
+    behavior ping() { 1 }
+}
+fn main() {
+    let first = spawn Child {} with [
+        Tool::Invoke("email.send"),
+        Secret::Read("MAIL_KEY")
+    ]
+    let second = spawn Child {} with [
+        Secret::Read("MAIL_KEY"),
+        Tool::Invoke("email.send")
+    ]
+    second
+}
+"#,
+        );
+
+        let manifest = BehaviorManifest::from_typed_hir(
+            "authority-demo",
+            "0.1.0",
+            &artifact(),
+            b"compiled-nbc",
+            &hir,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manifest.authority.coverage,
+            BehaviorAuthorityCoverage::ExplicitSpawnGrants
+        );
+        assert_eq!(
+            manifest.authority.grants,
+            vec![
+                "Secret::Read(MAIL_KEY)".to_string(),
+                "Tool::Invoke(email.send)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn authority_inventory_participates_in_canonical_manifest_identity() {
+        let mut first = base_manifest(actor(1, b"schema-v1"));
+        first.authority.grants = vec![
+            "Tool::Invoke(email.send)".to_string(),
+            "Secret::Read(MAIL_KEY)".to_string(),
+            "Tool::Invoke(email.send)".to_string(),
+        ];
+
+        let mut second = first.clone();
+        second.authority.grants.reverse();
+
+        assert_eq!(first.to_json().unwrap(), second.to_json().unwrap());
+        assert_eq!(first.digest().unwrap(), second.digest().unwrap());
+    }
+
+    #[test]
+    fn malformed_authority_inventory_fails_closed() {
+        let valid = base_manifest(actor(1, b"schema-v1"));
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&valid.to_json().unwrap()).unwrap();
+        value["authority"]["grants"] =
+            serde_json::json!(["Net::TcpOut(api.example.com)"]);
+
+        let error = BehaviorManifest::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+        assert!(matches!(
+            error,
+            BehaviorManifestError::InvalidAuthority { .. }
+        ));
+    }
+
+    #[test]
+    fn legacy_schema_cannot_masquerade_as_empty_authority() {
+        let valid = base_manifest(actor(1, b"schema-v1"));
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&valid.to_json().unwrap()).unwrap();
+        value["schema"] = serde_json::Value::from("nulang.behavior/v0alpha1");
+        value.as_object_mut().unwrap().remove("authority");
+
+        assert!(matches!(
+            BehaviorManifest::from_json(&serde_json::to_vec(&value).unwrap()),
+            Err(BehaviorManifestError::UnsupportedSchema(schema))
+                if schema == "nulang.behavior/v0alpha1"
+        ));
+    }
+
 }
