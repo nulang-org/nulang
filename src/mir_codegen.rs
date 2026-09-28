@@ -3947,15 +3947,18 @@ mod optimize_tests {
         optimize_function(&mut func, &mut Vec::new());
 
         assert!(
-            func.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
-                matches!(
-                    stmt,
-                    mir::Stmt::Assign {
-                        dst,
-                        op: mir::RValue::Tuple(_),
-                    } if *dst == tuple
-                )
-            }),
+            func.blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .any(|stmt| {
+                    matches!(
+                        stmt,
+                        mir::Stmt::Assign {
+                            dst,
+                            op: mir::RValue::Tuple(_),
+                        } if *dst == tuple
+                    )
+                }),
             "returned composites must retain object identity/allocation"
         );
     }
@@ -3978,15 +3981,18 @@ mod optimize_tests {
         optimize_function(&mut func, &mut Vec::new());
 
         assert!(
-            func.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
-                matches!(
-                    stmt,
-                    mir::Stmt::Assign {
-                        dst,
-                        op: mir::RValue::ArrayLit(_),
-                    } if *dst == arr
-                )
-            }),
+            func.blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .any(|stmt| {
+                    matches!(
+                        stmt,
+                        mir::Stmt::Assign {
+                            dst,
+                            op: mir::RValue::ArrayLit(_),
+                        } if *dst == arr
+                    )
+                }),
             "dynamic array indexing must keep the backing allocation"
         );
     }
