@@ -4995,4 +4995,30 @@ mod tests {
         assert!(checker.check_module(&ast.decls).is_ok());
         assert!(checker.diagnostics.is_empty());
     }
+
+    #[test]
+    fn test_component_call_is_an_effect_boundary() {
+        let ast = parse_module(
+            r#"
+component ServerPanel() {
+    perform DB.query("select 1")
+}
+
+fn Dashboard() ! {} {
+    <ServerPanel />
+}
+"#,
+        );
+        let mut checker = EffectChecker::new();
+        checker
+            .check_module(&ast.decls)
+            .expect("component child effects must not escape into the parent shell");
+
+        assert!(checker.fn_rows["ServerPanel"].contains(&Effect::DB));
+        assert!(
+            checker.fn_rows["Dashboard"].effects().is_empty(),
+            "static parent must not inherit child component effects"
+        );
+    }
+
 }
