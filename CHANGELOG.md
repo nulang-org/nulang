@@ -1,4 +1,9 @@
 # Nulang Changelog
+### JIT direct-call target validation — 2026-09-28
+- **Compiled direct calls now treat the recovered function index as a hint rather than an unchecked dispatch target.** Native code compares the live tagged callee value immediately before the helper call and deoptimizes to the exact `Call` PC on mismatch.
+- **Static direct-call recovery now walks only the compiler-owned argument-staging sequence** (spill loads and moves into argument registers), so unrelated instructions or stale writes to `r254` terminate recovery instead of being scanned through.
+- **Regression coverage pins both failure modes** before native-to-native leaf-call specialization builds on this path.
+
 ### Terminal JIT rejection cache — 2026-09-28
 - **Hot bytecode regions that static planning or first-tier native codegen rejects now become terminal for the current JIT session**, instead of resetting their hot counter and repeating the same work every `HOT_THRESHOLD` hits.
 - **Terminal state reuses the existing dense `u32` hot-counter slot via a sentinel**, adding no hash lookup or allocation to the backend probe path; `reset_hot_counters()` explicitly clears the state for tests and deliberate re-heating.
