@@ -364,11 +364,11 @@ impl MemoryTablet {
             let mut versions = Vec::with_capacity(row.versions.len());
             for version in row.versions {
                 if version.sequence == 0
-                    || version.sequence <= previous
+                    || version.sequence < previous
                     || version.sequence > image.sequence
                 {
                     return Err(TabletError::InvalidCheckpoint {
-                        reason: "checkpoint row versions are not strictly ordered".to_string(),
+                        reason: "checkpoint row versions are not ordered".to_string(),
                     });
                 }
                 previous = version.sequence;
