@@ -126,6 +126,14 @@ pub trait JitBackend {
     /// Number of regions compiled through the type-directed path.
     fn typed_compiled_count(&self) -> usize;
 
+    /// Whether this backend has proven that retrying first-tier compilation
+    /// for `(module_idx, pc)` cannot become useful without replacing/resetting
+    /// the loaded module/session. The VM may retire such PCs from its hotness
+    /// candidate bitmap and avoid future backend dispatch entirely.
+    fn is_terminally_rejected(&self, _module_idx: usize, _pc: usize) -> bool {
+        false
+    }
+
     /// Aggregate compiler-only latency telemetry. Backends that do not expose
     /// compiler timing may keep the zero-valued default.
     fn compile_stats(&self) -> JitCompileStats {
