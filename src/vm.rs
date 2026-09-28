@@ -7074,6 +7074,39 @@ mod vm_tests {
         );
     }
 
+    #[cfg(feature = "native-codegen")]
+    #[test]
+    fn test_terminal_jit_rejection_retires_candidate_pc() {
+        let mut module = CodeModule::new("terminal_jit_candidate");
+        module.emit(Instruction::new3(OpCode::IAdd, 0, 1, 2));
+        module.emit(Instruction::new3(OpCode::ISub, 0, 1, 2));
+        module.emit(Instruction::new0(OpCode::Ret));
+        module.entry_point = Some(0);
+
+        let mut vm = VM::new();
+        vm.load_module(module);
+        vm.frames.push(Frame::new(None, 0));
+
+        assert!(
+            vm.jit_candidate_pcs[0][0],
+            "entry point should initially be a JIT candidate"
+        );
+        for _ in 0..crate::jit::HOT_THRESHOLD - 1 {
+            assert!(
+                !vm.try_jit_execute(0),
+                "candidate should remain interpreted before tier-up"
+            );
+        }
+        assert!(
+            !vm.try_jit_execute(0),
+            "static rejection should stay in the interpreter"
+        );
+        assert!(
+            !vm.jit_candidate_pcs[0][0],
+            "terminal rejection should retire the PC before the next VM step"
+        );
+    }
+
     /// Test 16: JIT-compiled hot loop produces the same result as the interpreter.
     #[test]
     fn test_jit_hot_loop_matches_interpreter() {
