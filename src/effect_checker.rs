@@ -5060,4 +5060,30 @@ fn Dashboard() ! {} {
             "static parent must not inherit child component effects"
         );
     }
+
+    #[test]
+    fn test_placement_warnings_ignore_non_web_effects() {
+        let ast = parse_module(
+            r#"
+fn do_io() ! {IO} {
+    perform IO.print("hello")
+}
+
+fn caller() ! {IO} {
+    do_io()
+}
+"#,
+        );
+        let mut checker = EffectChecker::new();
+        checker.check_module(&ast.decls).unwrap();
+        assert!(
+            checker
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.contains("@placement")),
+            "ordinary non-web effects must not emit web placement warnings: {:?}",
+            checker.diagnostics
+        );
+    }
+
 }
