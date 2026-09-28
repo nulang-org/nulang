@@ -2,6 +2,7 @@
 ### Unified web placement inference — 2026-09-28
 - **HIR lowering, web route contracts, placement diagnostics, and reactive action classification now consume one canonical effect-row placement rule.** Render/Web-only functions infer `static`, browser-local Client/Render functions infer `client`, empty rows remain unspecified, and other effectful web functions conservatively infer `server`.
 - **Route deployment metadata no longer drops effect-derived placement when `@placement` is omitted.** This removes a compiler/Web-IR disagreement that would otherwise make later static/client/server island planning unreliable.
+- **Component placement graph + island planning** (Experimental, `src/web/reactivity.rs`, `src/web/ir.rs`). Capitalized JSX tags are now retained as compiler-visible component edges despite the current `el(\"Tag\", ...)` JSX lowering; pure component shells default to `static`, and client/server-like children form minimal execution boundaries without promoting the parent. The additive deployment IR now exports `components` and `islands` metadata for adapters and later resumability/runtime work.
 
 ### NulangDB checkpoint and WAL reclamation — 2026-09-28
 - **Single-node tablets can now publish checksummed atomic MVCC checkpoints before reclaiming durable WAL history.** Recovery accepts both safe crash states: a checkpoint plus the original full WAL, or a checkpoint plus a compacted WAL whose header persists the checkpoint base sequence.
