@@ -359,10 +359,11 @@ impl FileWal {
             }
         }
 
+        let checkpoint_sequence = tablet.current_sequence();
         for record in self
             .records
             .iter()
-            .filter(|record| record.sequence > tablet.current_sequence())
+            .filter(|record| record.sequence > checkpoint_sequence)
         {
             tablet
                 .replay_committed(
