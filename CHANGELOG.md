@@ -1,4 +1,8 @@
 # Nulang Changelog
+### MIR scalar replacement for local composites — 2026-09-28
+- **The bytecode/JIT MIR optimizer can now eliminate single-definition tuple, record, and array literals whose only observations are statically known field or element reads.** Those reads are rewritten to the original component locals and ordinary dead-store elimination removes the now-unobservable container allocation entirely.
+- **The first scalar-replacement wave is deliberately identity-safe.** Returned, aliased, mutated, state/effect-observed, dynamically indexed, multiply-defined, and self-referential composites remain allocated; out-of-range static accesses also stay on the existing runtime path.
+
 ### MIR/AOT activation-local composite allocation — 2026-09-28
 - **Native/AOT actor code can now route proven activation-local arrays, records, and tuples through the actor iso arena when `NULANG_ISO_ARENA=1`.** A separate MIR-level may-alias/lifetime analysis keeps the native backend independent of bytecode-PC mappings while preserving the same off-by-default feature gate.
 - **The first AOT wave is intentionally stricter than the bytecode/JIT path.** Only scalar-initialized composites that remain activation-local and immutable after construction qualify; returned, state-stored, nested, mutated, pointer-child, interprocedural, effectful, FFI, actor-message, and suspension cases remain heap-backed. Completed native actor activations reset the arena in O(1).
