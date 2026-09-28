@@ -1979,7 +1979,7 @@ fn scalar_replace_local_composites(
             }
             definitions[index] = match op {
                 mir::RValue::Tuple(items) => Some(ScalarComposite::Tuple(items.clone())),
-                mir::RValue::Record(fields) => Some(ScalarComposite::Record(fields.clone()))
+                mir::RValue::Record(fields) => Some(ScalarComposite::Record(fields.clone())),
                 mir::RValue::ArrayLit(items) => Some(ScalarComposite::Array(items.clone())),
                 _ => None,
             };
