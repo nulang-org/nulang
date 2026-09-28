@@ -401,6 +401,13 @@ impl FileWal {
             });
         }
 
+        // Reclamation can replace the canonical WAL path while `self.file`
+        // still references the old inode. From the first fallible mutation
+        // onward, any error therefore requires reopening the WAL before another
+        // append is allowed. A successful reopen below replaces `self` and
+        // clears the poison state.
+        self.poisoned = true;
+
         let temp = reclaim_temp_path(&self.path);
         let mut replacement = OpenOptions::new()
             .create(true)
