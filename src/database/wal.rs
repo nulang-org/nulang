@@ -141,6 +141,7 @@ pub struct FileWal {
     record_end_offsets: Vec<u64>,
     tablet_id: Option<TabletId>,
     latest_ownership_epoch: Option<u64>,
+    base_sequence: u64,
     poisoned: bool,
     #[cfg(test)]
     append_failpoint: Option<AppendFailPoint>,
@@ -184,6 +185,7 @@ impl FileWal {
         let mut record_end_offsets = Vec::new();
         let mut tablet_id = None;
         let mut latest_ownership_epoch = None;
+        let mut base_sequence = None;
         let mut last_sequence = 0_u64;
 
         loop {
@@ -225,6 +227,10 @@ impl FileWal {
                     reason: error.to_string(),
                 })?;
             let record = WalRecord::from_disk(disk, record_start)?;
+            if base_sequence.is_none() {
+                base_sequence = Some(record.expected_previous_sequence);
+                last_sequence = record.expected_previous_sequence;
+            }
             validate_record_chain(
                 &record,
                 tablet_id,
@@ -249,6 +255,7 @@ impl FileWal {
             record_end_offsets,
             tablet_id,
             latest_ownership_epoch,
+            base_sequence: base_sequence.unwrap_or(0),
             poisoned: false,
             #[cfg(test)]
             append_failpoint: None,
@@ -263,8 +270,19 @@ impl FileWal {
         &self.records
     }
 
+    pub fn base_sequence(&self) -> u64 {
+        self.base_sequence
+    }
+
     pub fn last_sequence(&self) -> u64 {
-        self.records.last().map(WalRecord::sequence).unwrap_or(0)
+        self.records
+            .last()
+            .map(WalRecord::sequence)
+            .unwrap_or(self.base_sequence)
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     /// Absolute file offset immediately after the indexed record.
@@ -282,25 +300,61 @@ impl FileWal {
         &self,
         descriptor: TabletDescriptor,
     ) -> Result<MemoryTablet, WalError> {
+        if self.base_sequence != 0 {
+            return Err(WalError::MissingCheckpointBase {
+                wal_base: self.base_sequence,
+                tablet_sequence: 0,
+            });
+        }
+
+        let mut tablet = MemoryTablet::new(descriptor);
+        self.replay_into(&mut tablet)?;
+        Ok(tablet)
+    }
+
+    /// Replay WAL records newer than an already-restored tablet checkpoint.
+    ///
+    /// This accepts both the pre-reclamation form (full WAL beginning at
+    /// sequence 1) and the post-reclamation form whose first retained record
+    /// names a non-zero predecessor. Records at or below the checkpoint
+    /// sequence are already represented by the checkpoint and are skipped.
+    pub fn replay_into(&self, tablet: &mut MemoryTablet) -> Result<(), WalError> {
         if let Some(existing) = self.tablet_id {
-            if existing != descriptor.id() {
+            if existing != tablet.descriptor().id() {
                 return Err(WalError::TabletMismatch {
-                    expected: descriptor.id(),
+                    expected: tablet.descriptor().id(),
                     presented: existing,
                 });
             }
         }
         if let Some(durable_epoch) = self.latest_ownership_epoch {
-            if descriptor.ownership_epoch() < durable_epoch {
+            if tablet.descriptor().ownership_epoch() < durable_epoch {
                 return Err(WalError::StaleOwnershipEpoch {
                     durable: durable_epoch,
-                    presented: descriptor.ownership_epoch(),
+                    presented: tablet.descriptor().ownership_epoch(),
                 });
             }
         }
 
-        let mut tablet = MemoryTablet::new(descriptor);
-        for record in &self.records {
+        let tablet_sequence = tablet.current_sequence();
+        if tablet_sequence < self.base_sequence {
+            return Err(WalError::MissingCheckpointBase {
+                wal_base: self.base_sequence,
+                tablet_sequence,
+            });
+        }
+        if tablet_sequence > self.last_sequence() {
+            return Err(WalError::CheckpointAheadOfWal {
+                checkpoint: tablet_sequence,
+                wal_tail: self.last_sequence(),
+            });
+        }
+
+        for record in self
+            .records
+            .iter()
+            .filter(|record| record.sequence > tablet_sequence)
+        {
             tablet
                 .replay_committed(
                     record.sequence,
@@ -312,7 +366,72 @@ impl FileWal {
                     reason: error.to_string(),
                 })?;
         }
-        Ok(tablet)
+        Ok(())
+    }
+
+    /// Atomically rewrite the WAL so the checkpointed record is retained as a
+    /// one-record anchor and all older history is reclaimed.
+    ///
+    /// Retaining sequence N means the compacted WAL self-describes base N-1
+    /// through that record's predecessor. Startup without the matching
+    /// checkpoint therefore fails closed instead of reconstructing partial
+    /// state from the retained suffix.
+    pub fn reclaim_through(&mut self, sequence: u64) -> Result<(), WalError> {
+        if self.poisoned {
+            return Err(WalError::Poisoned);
+        }
+        if sequence == 0 {
+            return Ok(());
+        }
+        let wal_tail = self.last_sequence();
+        if sequence > wal_tail {
+            return Err(WalError::ReclaimAheadOfWal {
+                requested: sequence,
+                wal_tail,
+            });
+        }
+
+        let anchor = self
+            .records
+            .iter()
+            .position(|record| record.sequence == sequence)
+            .ok_or(WalError::ReclaimAnchorMissing { sequence })?;
+        let retained = &self.records[anchor..];
+
+        let name = self
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default();
+        let temp_path = self.path.with_file_name(format!(".{name}.rewrite.tmp"));
+        let mut replacement = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp_path)?;
+        replacement.write_all(WAL_MAGIC)?;
+        for record in retained {
+            write_record_frame(&mut replacement, record)?;
+        }
+        replacement.sync_all()?;
+        drop(replacement);
+
+        fs::rename(&temp_path, &self.path)?;
+        if let Err(error) = sync_parent_directory(&self.path) {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+
+        match Self::open(&self.path) {
+            Ok(reopened) => {
+                *self = reopened;
+                Ok(())
+            }
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
+        }
     }
 
     /// Durably append one prepared tablet write.
@@ -428,6 +547,30 @@ impl FileWal {
         }
         Ok(())
     }
+}
+
+fn write_record_frame(file: &mut File, record: &WalRecord) -> Result<(), WalError> {
+    let payload =
+        serde_json::to_vec(&record.to_disk()).map_err(|error| WalError::Serialization {
+            message: error.to_string(),
+        })?;
+    if payload.len() > MAX_WAL_RECORD_BYTES {
+        return Err(WalError::RecordTooLarge {
+            offset: file.stream_position()?,
+            length: payload.len(),
+        });
+    }
+
+    let payload_len = u32::try_from(payload.len()).map_err(|_| WalError::RecordTooLarge {
+        offset: file.stream_position().unwrap_or(0),
+        length: payload.len(),
+    })?;
+    let header = encode_frame_header(payload_len);
+    let checksum = blake3::hash(&payload);
+    file.write_all(&header)?;
+    file.write_all(&payload)?;
+    file.write_all(checksum.as_bytes())?;
+    Ok(())
 }
 
 fn encode_frame_header(payload_len: u32) -> [u8; WAL_FRAME_HEADER_BYTES] {
@@ -601,6 +744,21 @@ pub enum WalError {
         expected_previous: u64,
     },
     SequenceOverflow,
+    MissingCheckpointBase {
+        wal_base: u64,
+        tablet_sequence: u64,
+    },
+    CheckpointAheadOfWal {
+        checkpoint: u64,
+        wal_tail: u64,
+    },
+    ReclaimAheadOfWal {
+        requested: u64,
+        wal_tail: u64,
+    },
+    ReclaimAnchorMissing {
+        sequence: u64,
+    },
     ReplayRejected {
         sequence: u64,
         reason: String,
@@ -676,6 +834,31 @@ impl fmt::Display for WalError {
                 "WAL predecessor {expected_previous} does not match committed sequence {committed}"
             ),
             Self::SequenceOverflow => f.write_str("WAL sequence overflow"),
+            Self::MissingCheckpointBase {
+                wal_base,
+                tablet_sequence,
+            } => write!(
+                f,
+                "WAL begins after sequence {wal_base}, but restored tablet is only at {tablet_sequence}"
+            ),
+            Self::CheckpointAheadOfWal {
+                checkpoint,
+                wal_tail,
+            } => write!(
+                f,
+                "checkpoint sequence {checkpoint} is ahead of WAL tail {wal_tail}"
+            ),
+            Self::ReclaimAheadOfWal {
+                requested,
+                wal_tail,
+            } => write!(
+                f,
+                "cannot reclaim WAL through sequence {requested}; durable tail is {wal_tail}"
+            ),
+            Self::ReclaimAnchorMissing { sequence } => write!(
+                f,
+                "cannot reclaim WAL through sequence {sequence}; anchor record is unavailable"
+            ),
             Self::ReplayRejected { sequence, reason } => {
                 write!(f, "WAL replay rejected sequence {sequence}: {reason}")
             }
