@@ -136,8 +136,24 @@ struct ParsedApp {
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
+        // Lexer::new installs the caller's source text in a thread-local
+        // SourceMap. Cold prelude initialization lexes PRELUDE_SOURCE below,
+        // which temporarily replaces that map. Preserve/restore the caller
+        // map so span-backed parsing (notably chained tuple access like
+        // t.0.1) never reads bytes from the prelude by accident.
+        let caller_source_map = crate::types::current_source_text()
+            .map(|source| (source, crate::types::source_map_file()));
+
         let mut parser = Self::new_raw(tokens);
         parser.seed_prelude_types();
+
+        match caller_source_map {
+            Some((source, file)) => {
+                crate::types::set_source_map_with_file(&source, file.as_deref());
+            }
+            None => crate::types::clear_source_map(),
+        }
+
         parser
     }
 
