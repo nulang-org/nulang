@@ -2,7 +2,7 @@
 ### NuDB single-node tablet and WAL foundation — 2026-09-27
 - **NuDB now has an experimental single-node range-tablet kernel with ownership-epoch and predecessor-sequence fencing, MVCC snapshot reads, tombstones, deterministic split plans, and WAL-before-visibility commits.** Database hot loops remain ordinary local computation; actors are reserved for future tablet ownership, placement, migration, and distributed coordination.
 - **The prototype WAL fails closed on corrupt framing and payloads and requires recovery after ambiguous append failures.** `NUDBWAL2` protects record metadata and payload bytes independently, truncates only genuinely incomplete crash tails, poisons a live WAL handle after post-emission I/O failure, and fsyncs new WAL directory entries on Unix.
-- **Tablet checkpoints now preserve full MVCC history and publish before WAL reclamation.** Recovery accepts both an unreclaimed full WAL and a compacted anchored suffix, while compacted WAL state without its matching checkpoint fails closed.
+- **Tablet checkpoints now preserve full MVCC history, bind cryptographically to their exact WAL anchor record, and publish before WAL reclamation.** Recovery accepts both an unreclaimed full WAL and a compacted anchored suffix, rejects same-sequence history splices, and fails closed when compacted WAL state lacks its matching checkpoint.
 
 ### Node-shared immutable object store — 2026-09-27
 - **Immutable object-store payloads are now shared across runtime shards without copying their bytes.** `TAG_OBJECT` handles keep a single node-local allocation while actor-lifetime holds protect queued and delivered messages; duplicate deliveries no longer over-increment object references.
