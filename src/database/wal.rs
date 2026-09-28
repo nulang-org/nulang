@@ -342,6 +342,12 @@ impl FileWal {
                 wal_base: self.base_sequence,
             });
         }
+        if tablet.current_sequence() > self.last_sequence() {
+            return Err(WalError::CheckpointAheadOfWal {
+                checkpoint: tablet.current_sequence(),
+                wal_tail: self.last_sequence(),
+            });
+        }
         if let Some(existing) = self.tablet_id {
             if existing != tablet.descriptor().id() {
                 return Err(WalError::TabletMismatch {
@@ -762,6 +768,10 @@ pub enum WalError {
         checkpoint: u64,
         wal_base: u64,
     },
+    CheckpointAheadOfWal {
+        checkpoint: u64,
+        wal_tail: u64,
+    },
     InvalidReclaimSequence {
         current: u64,
         requested: u64,
@@ -851,6 +861,13 @@ impl fmt::Display for WalError {
             } => write!(
                 f,
                 "checkpoint sequence {checkpoint} is older than WAL base sequence {wal_base}"
+            ),
+            Self::CheckpointAheadOfWal {
+                checkpoint,
+                wal_tail,
+            } => write!(
+                f,
+                "checkpoint sequence {checkpoint} is ahead of durable WAL tail {wal_tail}"
             ),
             Self::InvalidReclaimSequence { current, requested } => write!(
                 f,
