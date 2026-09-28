@@ -133,6 +133,127 @@ impl Task {
     }
 }
 
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskAttemptStatus {
+    Assigned,
+    Running,
+    AwaitingApproval,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Fenced,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskAttempt {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub worker_id: String,
+    pub lease_epoch: u64,
+    pub status: TaskAttemptStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl TaskAttempt {
+    pub fn new(task_id: Uuid, worker_id: impl Into<String>, lease_epoch: u64) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            task_id,
+            worker_id: worker_id.into(),
+            lease_epoch,
+            status: TaskAttemptStatus::Assigned,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskLease {
+    pub task_id: Uuid,
+    pub attempt_id: Uuid,
+    pub worker_id: String,
+    pub epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskLeaseError {
+    TaskMismatch {
+        expected_task_id: Uuid,
+        task_id: Uuid,
+    },
+    Stale {
+        epoch: u64,
+        current_epoch: u64,
+    },
+    ConflictingOwner {
+        epoch: u64,
+        current_worker_id: String,
+        worker_id: String,
+        current_attempt_id: Uuid,
+        attempt_id: Uuid,
+    },
+}
+
+impl TaskLease {
+    pub fn for_attempt(attempt: &TaskAttempt) -> Self {
+        Self {
+            task_id: attempt.task_id,
+            attempt_id: attempt.id,
+            worker_id: attempt.worker_id.clone(),
+            epoch: attempt.lease_epoch,
+        }
+    }
+
+    pub fn authorizes(&self, attempt: &TaskAttempt) -> bool {
+        self.task_id == attempt.task_id
+            && self.attempt_id == attempt.id
+            && self.worker_id == attempt.worker_id
+            && self.epoch == attempt.lease_epoch
+    }
+
+    /// Validate this candidate lease against the currently authoritative lease.
+    ///
+    /// Higher epochs supersede older ownership. The same epoch is idempotent
+    /// only for the exact same worker and attempt; changing either at the same
+    /// epoch is a split-brain conflict. Lower epochs are stale.
+    pub fn validate_against(&self, current: &Self) -> Result<(), TaskLeaseError> {
+        if self.task_id != current.task_id {
+            return Err(TaskLeaseError::TaskMismatch {
+                expected_task_id: current.task_id,
+                task_id: self.task_id,
+            });
+        }
+
+        if self.epoch > current.epoch {
+            return Ok(());
+        }
+
+        if self.epoch < current.epoch {
+            return Err(TaskLeaseError::Stale {
+                epoch: self.epoch,
+                current_epoch: current.epoch,
+            });
+        }
+
+        if self.worker_id == current.worker_id && self.attempt_id == current.attempt_id {
+            return Ok(());
+        }
+
+        Err(TaskLeaseError::ConflictingOwner {
+            epoch: self.epoch,
+            current_worker_id: current.worker_id.clone(),
+            worker_id: self.worker_id.clone(),
+            current_attempt_id: current.attempt_id,
+            attempt_id: self.attempt_id,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentRef {
     pub id: String,
