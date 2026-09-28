@@ -819,6 +819,58 @@ fn test_native_leaf_rejects_control_flow_and_erroring_ineg() {
 }
 
 #[test]
+fn test_native_leaf_branchy_callee_keeps_helper_fallback() {
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    let source = r#"
+        fn adjust(x: Int) -> Int {
+            if x > 0 then { x + 1 } else { x - 1 }
+        }
+        fn main() {
+            var s = 0;
+            var i = 0;
+            while i < 20000 {
+                s = adjust(s);
+                i = i + 1
+            };
+            s
+        }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_branchy_leaf_fallback").expect("codegen");
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interpreter run");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let result = jit_vm.run().expect("JIT run");
+
+    assert_eq!(result.as_raw(), expected.as_raw());
+    assert!(
+        jit_vm.jit_compiled_count() > 0,
+        "caller loop should still JIT around the safe direct call"
+    );
+    assert_eq!(
+        jit_vm.jit_native_leaf_compiled_count(),
+        0,
+        "branchy adjust() must stay on the re-entrant helper in the first leaf slice"
+    );
+}
+
+#[test]
 fn test_jit_direct_call_recursion_stays_interpreter() {
     // Recursive calls (fib -> fib) are in a direct-call cycle and must NOT be
     // folded into a compiled region: the re-entrant helper consumes native
