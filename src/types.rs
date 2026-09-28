@@ -320,6 +320,43 @@ impl std::fmt::Display for Placement {
     }
 }
 
+/// Infer the default web execution placement from a function's effect row.
+///
+/// This is the canonical compiler rule used by HIR lowering, web contracts,
+/// diagnostics, and reactive action classification. Explicit `@placement`
+/// annotations remain authoritative and bypass this inference.
+///
+/// Pure/empty rows stay unspecified so callers may choose a context-specific
+/// default. Render/Web-only work can be emitted statically. Browser-local
+/// Client effects stay on the client. Any effect that requires process-local,
+/// ambient, networked, stateful, or user-defined execution is conservatively
+/// placed on the server.
+pub fn infer_web_placement(row: &EffectRow) -> Option<Placement> {
+    let effects = match row {
+        EffectRow::Closed(effects) | EffectRow::Open(effects, _) => effects,
+    };
+
+    if effects.is_empty() {
+        return None;
+    }
+
+    if effects
+        .iter()
+        .all(|effect| matches!(effect, Effect::Render | Effect::Web))
+    {
+        return Some(Placement::Static);
+    }
+
+    if effects
+        .iter()
+        .all(|effect| matches!(effect, Effect::Client | Effect::Render))
+    {
+        return Some(Placement::Client);
+    }
+
+    Some(Placement::Server)
+}
+
 /// Effect row: either closed (fixed set) or open (set + row variable).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EffectRow {
