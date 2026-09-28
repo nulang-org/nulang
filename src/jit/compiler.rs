@@ -32,6 +32,7 @@ use cranelift_module::{Linkage, Module};
 use crate::bytecode::{Instruction, OpCode};
 use crate::runtime::heap::{ActorHeap, OrcaHeader, TypeTag};
 use crate::value_layout::{PAYLOAD_MASK, TAG_INT, TAG_MASK, TAG_NIL, TAG_PTR};
+use super::native_codegen::NativeLeafCall;
 
 // ---------------------------------------------------------------------------
 // Opcode Support Matrix
@@ -228,6 +229,32 @@ pub fn compile_bytecode_region(
     instructions: &[Instruction],
     native_calls: &HashMap<usize, usize>,
 ) -> Result<*const u8, CompileError> {
+    compile_bytecode_region_with_options(
+        module,
+        builder_context,
+        ctx,
+        func_name,
+        start_offset,
+        num_instrs,
+        instructions,
+        native_calls,
+        &HashMap::new(),
+        true,
+    )
+}
+
+pub(crate) fn compile_bytecode_region_with_options(
+    module: &mut JITModule,
+    builder_context: &mut FunctionBuilderContext,
+    ctx: &mut codegen::Context,
+    func_name: &str,
+    start_offset: usize,
+    num_instrs: usize,
+    instructions: &[Instruction],
+    native_calls: &HashMap<usize, usize>,
+    native_leaf_calls: &HashMap<usize, NativeLeafCall>,
+    inject_safepoint: bool,
+) -> Result<*const u8, CompileError> {
     ctx.clear();
 
     let pointer_type = module.isa().pointer_type();
@@ -252,37 +279,40 @@ pub fn compile_bytecode_region(
         blocks.insert(i, builder.create_block());
     }
     let return_block = builder.create_block();
-    // Inject a thread-local JIT safepoint check. A runtime helper is used
-    // instead of an embedded process-global pointer so concurrent VMs cannot
-    // consume each other's actor reduction counters.
-    let zero = builder.ins().iconst(types::I64, 0);
-    let safepoint = builder
-        .ins()
-        .call(helpers[&RuntimeHelper::SafePoint], &[zero]);
-    let safepoint_result = builder.inst_results(safepoint)[0];
-    let exhausted = builder.ins().icmp(IntCC::NotEqual, safepoint_result, zero);
-    let yield_block = builder.create_block();
-    if let Some(&first_block) = blocks.get(&start_offset) {
+    if inject_safepoint {
+        // Outer JIT regions own scheduler preemption. Leaf thunks deliberately
+        // skip this check because an early leaf return would be indistinguishable
+        // from successful callee completion to the native caller.
+        let zero = builder.ins().iconst(types::I64, 0);
+        let safepoint = builder
+            .ins()
+            .call(helpers[&RuntimeHelper::SafePoint], &[zero]);
+        let safepoint_result = builder.inst_results(safepoint)[0];
+        let exhausted = builder.ins().icmp(IntCC::NotEqual, safepoint_result, zero);
+        let yield_block = builder.create_block();
+        if let Some(&first_block) = blocks.get(&start_offset) {
+            builder
+                .ins()
+                .brif(exhausted, yield_block, &[], first_block, &[]);
+        } else {
+            builder
+                .ins()
+                .brif(exhausted, yield_block, &[], return_block, &[]);
+        }
+
+        builder.switch_to_block(yield_block);
+        builder.set_cold_block(yield_block);
+        let zero = builder.ins().iconst(types::I64, 0);
         builder
             .ins()
-            .brif(exhausted, yield_block, &[], first_block, &[]);
+            .call(helpers[&RuntimeHelper::SetYield], &[zero]);
+        builder.ins().jump(return_block, &[]);
+        builder.seal_block(yield_block);
+    } else if let Some(&first_block) = blocks.get(&start_offset) {
+        builder.ins().jump(first_block, &[]);
     } else {
-        builder
-            .ins()
-            .brif(exhausted, yield_block, &[], return_block, &[]);
+        builder.ins().jump(return_block, &[]);
     }
-
-    // Yield block: mark a relative resume offset in thread-local state.
-    builder.switch_to_block(yield_block);
-    builder.set_cold_block(yield_block);
-    let zero = builder.ins().iconst(types::I64, 0);
-    builder
-        .ins()
-        .call(helpers[&RuntimeHelper::SetYield], &[zero]);
-    builder.ins().jump(return_block, &[]);
-
-    // Seal all new blocks.
-    builder.seal_block(yield_block);
     for pc in start_offset..end_offset {
         let instr = instructions[pc];
         let block = *blocks
