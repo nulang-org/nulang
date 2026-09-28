@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use nulang::database::dispatch::{
     TabletDispatchChannels, TabletDispatchConfigError, TabletDispatchError, TabletDispatchOutcome,
-    TabletDispatcher, TabletExecutionError, TabletOwner, TabletPlacementMap,
+    TabletDispatcher, TabletDispatchWake, TabletExecutionError, TabletOwner, TabletPlacementMap,
 };
 use nulang::database::store::WalBackedTablet;
 use nulang::database::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation, TabletWrite};
@@ -226,4 +227,59 @@ fn dispatch_configuration_rejects_zero_shards_and_zero_capacity() {
         TabletDispatchChannels::new(1, 0),
         Err(TabletDispatchConfigError::InvalidQueueCapacity)
     ));
+}
+
+
+struct CountWake {
+    count: AtomicUsize,
+}
+
+impl CountWake {
+    fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+}
+
+impl TabletDispatchWake for CountWake {
+    fn wake(&self) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn cross_shard_admission_wakes_owner_only_after_successful_enqueue() {
+    let descriptor = descriptor(107, 5);
+    let tablet_id = descriptor.id();
+
+    let (channels, _inboxes) = TabletDispatchChannels::new(2, 1).unwrap();
+    let mut placement = TabletPlacementMap::new();
+    placement.insert(tablet_id, TabletOwner::new(1, 1, 5).unwrap());
+
+    let dispatcher = TabletDispatcher::new(1, 0, placement, channels).unwrap();
+    let wake = Arc::new(CountWake::new());
+    dispatcher.install_waker(1, wake.clone()).unwrap();
+    let mut tablets = BTreeMap::new();
+
+    let first = dispatcher
+        .dispatch_write(&mut tablets, put(&descriptor, 0, b"v1"))
+        .unwrap();
+    assert!(matches!(
+        first,
+        TabletDispatchOutcome::LocalQueued { shard: 1, .. }
+    ));
+    assert_eq!(wake.count(), 1);
+
+    assert_eq!(
+        dispatcher
+            .dispatch_write(&mut tablets, put(&descriptor, 0, b"v2"))
+            .unwrap_err(),
+        TabletDispatchError::QueueFull(1)
+    );
+    assert_eq!(wake.count(), 1);
 }
