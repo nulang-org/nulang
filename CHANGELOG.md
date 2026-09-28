@@ -1,6 +1,6 @@
 # Nulang Changelog
 ### Terminal JIT rejection cache — 2026-09-28
-- **Hot bytecode regions that static planning or first-tier native codegen rejects now become terminal for the current JIT session**, instead of resetting their hot counter and repeating the same work every `HOT_THRESHOLD` hits.
+- **Hot bytecode regions that static planning proves too small or fragmented now become terminal for the current JIT session**, instead of resetting their hot counter and repeating the same immutable planning work every `HOT_THRESHOLD` hits. Native-codegen failures remain retryable.
 - **Terminal state reuses the existing dense `u32` hot-counter slot via a sentinel**, adding no hash lookup or allocation to the backend probe path; `reset_hot_counters()` explicitly clears the state for tests and deliberate re-heating.
 - **The VM retires terminally rejected PCs from its precomputed JIT-candidate bitmap**, so subsequent executions skip the backend vtable call and hot-counter lookup entirely.
 - **The change is motivated by branch-heavy telemetry:** the workload can produce zero compiled regions while a JIT-enabled VM still pays persistent warm-run overhead, making futile retry work a measurable target.
