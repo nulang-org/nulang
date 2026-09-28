@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Behavior Manifest v0alpha2 authority inventory — 2026-09-28
+- **Behavior manifests now carry compiler-derived external-authority inventory.** The schema advances to `nulang.behavior/v0alpha2` and emits canonical, sorted, deduplicated authority tokens discovered from explicit source-level spawn grants.
+- **Authority coverage is explicit rather than overstated.** `coverage = explicit-spawn-grants` tells admission systems that effect-derived ambient authority is not yet represented, so consumers can fail closed instead of inferring missing authority.
+- **Malformed or non-canonical authority fails closed.** Manifest parsing validates every token through the typed `AuthorityManifest` boundary, and authority participates in deterministic manifest identity.
+
 ### NLAP task-attempt lease fencing contract — 2026-09-28
 - **NLAP now distinguishes logical tasks from concrete worker attempts.** `TaskAttempt` carries retry lineage, worker identity, lifecycle state, and a monotonic lease epoch so retries and reassignments do not reuse one ambiguous task execution identity.
 - **`TaskLease` provides the runtime-neutral fencing proof for one authoritative attempt.** Swarm events carry attempt and lease identity explicitly, allowing Nulang Cloud to reject stale workers and bind durable side effects to the exact attempt that owns the task.
