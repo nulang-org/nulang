@@ -1988,7 +1988,7 @@ fn scalar_replace_local_composites(
         }
     }
 
-    let mut candidates: HashMap<mir::LocalId, ScalarComposite> = HashMap::new();
+    let mut candidates: FxHashMap<mir::LocalId, ScalarComposite> = FxHashMap::default();
     for (index, definition) in definitions.into_iter().enumerate() {
         if def_count[index] == 1 {
             if let Some(definition) = definition {
@@ -2013,7 +2013,7 @@ fn scalar_replace_local_composites(
                 match stmt {
                     mir::Stmt::Assign { dst, .. } if dst == container => {}
                     mir::Stmt::Assign { op, .. } if rvalue_reads_local(op, *container) => {
-                        if static_composite_load(op, *container, composite, const_locals).is_none()
+                        if static_composite_load(op, *container, &composite, const_locals).is_none()
                         {
                             return false;
                         }
