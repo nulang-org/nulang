@@ -3646,6 +3646,110 @@ mod optimize_tests {
     }
 
     #[test]
+    fn test_scalar_replace_local_tuple_field_load() {
+        let mut b = mir::FunctionBuilder::new("tuple_sroa", Some(Type::int()));
+        let one = b.add_temp(Type::int());
+        b.assign(one, mir::RValue::Const(Constant::Int(1)));
+        let two = b.add_temp(Type::int());
+        b.assign(two, mir::RValue::Const(Constant::Int(2)));
+        let tuple = b.add_temp(Type::Tuple(vec![Type::int(), Type::int()]));
+        b.assign(tuple, mir::RValue::Tuple(vec![one, two]));
+        let result = b.add_temp(Type::int());
+        b.assign(
+            result,
+            mir::RValue::LoadFieldPos {
+                obj: tuple,
+                index: 1,
+            },
+        );
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let mut func = b.build();
+
+        optimize_function(&mut func, &mut Vec::new());
+
+        assert!(
+            func.blocks.iter().flat_map(|block| &block.stmts).all(|stmt| {
+                !matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        op: mir::RValue::Tuple(_)
+                            | mir::RValue::LoadFieldPos { obj, .. },
+                        ..
+                    } if !matches!(stmt, mir::Stmt::Assign { op: mir::RValue::LoadFieldPos { obj, .. }, .. } if *obj != tuple)
+                )
+            }),
+            "a scalar-only local tuple consumed only by a static field load should be eliminated: {:?}",
+            func.blocks
+        );
+    }
+
+    #[test]
+    fn test_scalar_replace_local_record_field_load() {
+        let mut b = mir::FunctionBuilder::new("record_sroa", Some(Type::int()));
+        let one = b.add_temp(Type::int());
+        b.assign(one, mir::RValue::Const(Constant::Int(1)));
+        let record = b.add_temp(Type::Record(vec![("x".into(), Type::int())], None));
+        b.assign(record, mir::RValue::Record(vec![("x".into(), one)]));
+        let result = b.add_temp(Type::int());
+        b.assign(
+            result,
+            mir::RValue::LoadFieldNamed {
+                obj: record,
+                field: "x".into(),
+            },
+        );
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let mut func = b.build();
+
+        optimize_function(&mut func, &mut Vec::new());
+
+        assert!(
+            !func.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
+                matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        op: mir::RValue::Record(_) | mir::RValue::LoadFieldNamed { obj, .. },
+                        ..
+                    } if !matches!(stmt, mir::Stmt::Assign { op: mir::RValue::LoadFieldNamed { obj, .. }, .. } if *obj != record)
+                )
+            }),
+            "a scalar-only local record consumed only by a named field load should be eliminated"
+        );
+    }
+
+    #[test]
+    fn test_scalar_replace_local_array_constant_index() {
+        let mut b = mir::FunctionBuilder::new("array_sroa", Some(Type::int()));
+        let eleven = b.add_temp(Type::int());
+        b.assign(eleven, mir::RValue::Const(Constant::Int(11)));
+        let twenty_two = b.add_temp(Type::int());
+        b.assign(twenty_two, mir::RValue::Const(Constant::Int(22)));
+        let arr = b.add_temp(Type::Array(Box::new(Type::int())));
+        b.assign(arr, mir::RValue::ArrayLit(vec![eleven, twenty_two]));
+        let idx = b.add_temp(Type::int());
+        b.assign(idx, mir::RValue::Const(Constant::Int(1)));
+        let result = b.add_temp(Type::int());
+        b.assign(result, mir::RValue::ArrayLoad { arr, idx });
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let mut func = b.build();
+
+        optimize_function(&mut func, &mut Vec::new());
+
+        assert!(
+            !func.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
+                matches!(
+                    stmt,
+                    mir::Stmt::Assign {
+                        op: mir::RValue::ArrayLit(_) | mir::RValue::ArrayLoad { arr: base, .. },
+                        ..
+                    } if !matches!(stmt, mir::Stmt::Assign { op: mir::RValue::ArrayLoad { arr: base, .. }, .. } if *base != arr)
+                )
+            }),
+            "a scalar-only local array read at a constant index should be eliminated"
+        );
+    }
+
+    #[test]
     fn test_fold_const_add() {
         // `1 + 2` folds to a single constant; no IAdd survives.
         let value = run_source("1 + 2").unwrap();
