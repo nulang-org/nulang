@@ -2109,9 +2109,9 @@ fn scalar_replace_local_composites(
             ScalarComposite::Tuple(items) | ScalarComposite::Array(items) => {
                 items.iter().any(|source| !source_is_stable(*source))
             }
-            ScalarComposite::Record(fields) => fields
-                .iter()
-                .any(|(_, source)| !source_is_stable(*source)),
+            ScalarComposite::Record(fields) => {
+                fields.iter().any(|(_, source)| !source_is_stable(*source))
+            }
         };
         if has_unstable_component {
             return false;
