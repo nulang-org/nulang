@@ -1927,7 +1927,9 @@ fn static_composite_load(
         (mir::RValue::LoadFieldNamed { obj, field }, ScalarComposite::Record(fields))
             if *obj == container =>
         {
-            fields.get(field).copied()
+            fields
+                .iter()
+                .find_map(|(name, source)| (name == field).then_some(*source))
         }
         (mir::RValue::ArrayLoad { arr, idx }, ScalarComposite::Array(items))
             if *arr == container =>
