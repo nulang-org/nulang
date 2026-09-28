@@ -235,3 +235,44 @@ fn incomplete_checkpoint_temp_file_is_ignored_after_crash_before_rename() {
     let _ = fs::remove_file(checkpoint_path);
     let _ = fs::remove_file(temp_path);
 }
+
+
+#[test]
+fn checkpoint_preserves_multiple_mutations_to_one_key_in_one_commit() {
+    let (wal_path, checkpoint_path) = paths("same_sequence_versions");
+    let _ = fs::remove_file(&wal_path);
+    let _ = fs::remove_file(&checkpoint_path);
+
+    {
+        let mut tablet =
+            WalBackedTablet::open_with_checkpoint(descriptor(), &wal_path, &checkpoint_path)
+                .unwrap();
+        let write = tablet
+            .prepare_write(
+                3,
+                0,
+                vec![
+                    TabletMutation::Put {
+                        key: b"k".to_vec(),
+                        value: b"first".to_vec(),
+                    },
+                    TabletMutation::Put {
+                        key: b"k".to_vec(),
+                        value: b"last".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+        tablet.commit(write).unwrap();
+        assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"last"[..]));
+        tablet.checkpoint(&checkpoint_path).unwrap();
+    }
+
+    let tablet =
+        WalBackedTablet::open_with_checkpoint(descriptor(), &wal_path, &checkpoint_path).unwrap();
+    assert_eq!(tablet.current_sequence(), 1);
+    assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"last"[..]));
+
+    let _ = fs::remove_file(wal_path);
+    let _ = fs::remove_file(checkpoint_path);
+}
