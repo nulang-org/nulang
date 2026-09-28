@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use nulang_ai::{
-    AgentHarness, ContextLedger, Diagnostic, ExecRequest, ExecResult, ObservedFile,
-    WorkspaceError, WorkspaceExecutor,
+    AgentHarness, ContextLedger, Diagnostic, ExecRequest, ExecResult, ObservedFile, WorkspaceError,
+    WorkspaceExecutor,
 };
 use nulang_ai_core::{AnchoredEdit, ChangeSet, Goal};
 use std::collections::HashMap;
@@ -152,7 +152,12 @@ fn harness_rejects_a_changeset_when_the_workspace_revision_is_stale() {
     runtime().block_on(async {
         let workspace = FakeWorkspace::new();
         let harness = AgentHarness::new(workspace);
-        let change = ChangeSet::new(Goal::new("project-a", "id-seed", 0.0).id, "workspace-42", "rev-old", vec![]);
+        let change = ChangeSet::new(
+            Goal::new("project-a", "id-seed", 0.0).id,
+            "workspace-42",
+            "rev-old",
+            vec![],
+        );
 
         let err = harness.apply_change_set(&change).await.unwrap_err();
 
@@ -179,7 +184,12 @@ fn harness_rejects_an_edit_that_does_not_match_the_content_the_agent_observed() 
             after_anchor: None,
             replacement: "fn authenticate() { secure(); }\n".into(),
         };
-        let change = ChangeSet::new(Goal::new("project-a", "id-seed", 0.0).id, "workspace-42", "rev-1", vec![edit]);
+        let change = ChangeSet::new(
+            Goal::new("project-a", "id-seed", 0.0).id,
+            "workspace-42",
+            "rev-1",
+            vec![edit],
+        );
 
         let err = harness.apply_change_set(&change).await.unwrap_err();
 
@@ -205,7 +215,12 @@ fn harness_applies_a_matching_anchored_change_and_returns_the_new_revision() {
             after_anchor: None,
             replacement: "fn authenticate() { secure(); }\n".into(),
         };
-        let change = ChangeSet::new(Goal::new("project-a", "id-seed", 0.0).id, "workspace-42", "rev-1", vec![edit]);
+        let change = ChangeSet::new(
+            Goal::new("project-a", "id-seed", 0.0).id,
+            "workspace-42",
+            "rev-1",
+            vec![edit],
+        );
 
         let revision = harness.apply_change_set(&change).await.unwrap();
 
