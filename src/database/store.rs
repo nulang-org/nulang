@@ -11,8 +11,9 @@
 //! No fallible validation is performed after the WAL acknowledges durability.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use super::checkpoint::{self, CheckpointError};
 use super::tablet::{MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite};
 use super::wal::{FileWal, WalError};
 
@@ -20,6 +21,7 @@ use super::wal::{FileWal, WalError};
 pub struct WalBackedTablet {
     tablet: MemoryTablet,
     wal: FileWal,
+    checkpoint_path: PathBuf,
 }
 
 impl WalBackedTablet {
@@ -28,9 +30,21 @@ impl WalBackedTablet {
         descriptor: TabletDescriptor,
         wal_path: impl AsRef<Path>,
     ) -> Result<Self, WalBackedError> {
+        let wal_path = wal_path.as_ref();
+        let checkpoint_path = checkpoint::checkpoint_path_for_wal(wal_path);
         let wal = FileWal::open(wal_path)?;
-        let tablet = wal.recover_memory_tablet(descriptor)?;
-        Ok(Self { tablet, wal })
+        let mut tablet = match checkpoint::load_checkpoint(&checkpoint_path, descriptor.clone())? {
+            Some(tablet) => tablet,
+            None => wal.recover_memory_tablet(descriptor)?,
+        };
+        if tablet.current_sequence() > 0 {
+            wal.replay_after_checkpoint(&mut tablet)?;
+        }
+        Ok(Self {
+            tablet,
+            wal,
+            checkpoint_path,
+        })
     }
 
     pub fn descriptor(&self) -> &TabletDescriptor {
@@ -65,12 +79,32 @@ impl WalBackedTablet {
     pub fn read_latest(&self, key: &[u8]) -> Option<&[u8]> {
         self.tablet.read_latest(key)
     }
+
+    /// Atomically publish a checkpoint without reclaiming the WAL.
+    ///
+    /// This is a valid crash state and is intentionally public so operators can
+    /// separate checkpoint publication from later space reclamation.
+    pub fn publish_checkpoint(&self) -> Result<(), WalBackedError> {
+        checkpoint::write_checkpoint(&self.checkpoint_path, &self.tablet)?;
+        Ok(())
+    }
+
+    /// Publish a durable checkpoint, then reclaim the WAL through that exact
+    /// committed sequence. The ordering is safety-critical: if reclamation
+    /// fails, the already-published checkpoint plus the full WAL remain a valid
+    /// recovery state.
+    pub fn checkpoint(&mut self) -> Result<(), WalBackedError> {
+        self.publish_checkpoint()?;
+        self.wal.reclaim_through(self.tablet.current_sequence())?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalBackedError {
     Tablet(TabletError),
     Wal(WalError),
+    Checkpoint(CheckpointError),
 }
 
 impl From<TabletError> for WalBackedError {
@@ -85,11 +119,18 @@ impl From<WalError> for WalBackedError {
     }
 }
 
+impl From<CheckpointError> for WalBackedError {
+    fn from(error: CheckpointError) -> Self {
+        Self::Checkpoint(error)
+    }
+}
+
 impl fmt::Display for WalBackedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Tablet(error) => write!(f, "tablet commit rejected: {error}"),
             Self::Wal(error) => write!(f, "tablet WAL failure: {error}"),
+            Self::Checkpoint(error) => write!(f, "tablet checkpoint failure: {error}"),
         }
     }
 }
