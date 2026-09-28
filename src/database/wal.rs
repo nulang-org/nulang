@@ -925,12 +925,12 @@ mod hardening_tests {
                 .write(true)
                 .open(&path)
                 .unwrap();
-            // File magic (8) + record magic (4) + frame version (2) => payload length.
-            file.seek(SeekFrom::Start(14)).unwrap();
+            // WAL header (64) + record magic (4) + frame version (2) => payload length.
+            file.seek(SeekFrom::Start(70)).unwrap();
             let mut length = [0_u8; 4];
             std::io::Read::read_exact(&mut file, &mut length).unwrap();
             length[0] ^= 0x40;
-            file.seek(SeekFrom::Start(14)).unwrap();
+            file.seek(SeekFrom::Start(70)).unwrap();
             file.write_all(&length).unwrap();
             file.sync_all().unwrap();
         }
