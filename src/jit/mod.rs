@@ -813,6 +813,11 @@ impl JitSession {
         self.compiled_count
     }
 
+    /// Number of separately compiled native leaf thunks.
+    pub fn native_leaf_compiled_count(&self) -> usize {
+        self.native_leafs.len()
+    }
+
     /// Compile a SIMD-vectorizable bytecode region.
     /// First analyzes the region for vectorizable array loop patterns. If found,
     /// emits SIMD CLIF (I64x2/F64x2/I32x4/F32x4), falling back to the
@@ -1041,6 +1046,10 @@ impl crate::backends::JitBackend for JitSession {
 
     fn typed_compiled_count(&self) -> usize {
         self.typed_regions.len()
+    }
+
+    fn native_leaf_compiled_count(&self) -> usize {
+        self.native_leaf_compiled_count()
     }
 
     fn is_terminally_rejected(&self, module_idx: usize, pc: usize) -> bool {
