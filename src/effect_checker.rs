@@ -1043,10 +1043,9 @@ impl EffectChecker {
             {
                 let row = effect.clone().unwrap_or_else(EffectRow::empty);
                 self.fn_rows.insert(name.clone(), row);
-                if annotations
-                    .iter()
-                    .any(|annotation| matches!(annotation, crate::ast::FunctionAnnotation::Component))
-                {
+                if annotations.iter().any(|annotation| {
+                    matches!(annotation, crate::ast::FunctionAnnotation::Component)
+                }) {
                     self.component_names.insert(name.clone());
                 }
             }
@@ -5038,5 +5037,4 @@ fn Dashboard() ! {} {
             "static parent must not inherit child component effects"
         );
     }
-
 }
