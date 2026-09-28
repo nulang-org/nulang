@@ -232,6 +232,10 @@ fn hot_allocation_loop_jit_preserves_iso_arena_routing() {
         vm.jit_compiled_count() > 0,
         "the hot loop containing ArrAlloc should compile instead of fragmenting at allocation"
     );
+    assert!(
+        vm.jit_typed_compiled_count() > 0,
+        "allocation-containing hot regions should use the typed Cranelift path when type metadata is available"
+    );
     let stats = stats.borrow();
     assert_eq!(
         stats.heap_allocs, 0,
