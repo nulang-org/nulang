@@ -3829,6 +3829,68 @@ mod tests {
     }
 
     #[test]
+    fn test_aot_local_composite_uses_iso_arena_and_resets() {
+        use crate::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        use crate::typechecker::TypeChecker;
+
+        let source = r#"
+            actor Scratch {
+                behavior run() {
+                    let values = [1, 2, 3] in values[0]
+                }
+            }
+            fn main() { 0 }
+        "#;
+        let tokens = Lexer::new(source).lex().unwrap();
+        let ast = Parser::new(tokens).parse_module().unwrap();
+        let mut tc = TypeChecker::new();
+        tc.check_module(&ast).unwrap();
+        let mut ec = EffectChecker::new();
+        ec.check_module(&ast.decls).unwrap();
+        let mut ca = CapabilityAnalyzer::new();
+        let ctx = CapContext::new();
+        for d in crate::effect_checker::flatten_decls(&ast.decls) {
+            if let crate::ast::Decl::Function { body, .. } = d {
+                ca.infer_cap(&ctx, body).unwrap();
+            }
+        }
+
+        let hir = crate::hir_lower::lower_module(&ast, &tc.inferred_decl_types);
+        let mir_module = crate::mir_lower::lower_module(&hir).unwrap();
+        let aot = crate::aot::AotModule::compile(&mir_module)
+            .expect("AOT compile of local composite behavior should succeed");
+        let native = aot
+            .fn_ptr_for_behavior("Scratch.run")
+            .expect("behavior 'Scratch.run' should be compiled");
+
+        let mut actor = crate::runtime::Actor::new(17, "Scratch", 64);
+        actor.register_behavior("run", crate::aot::aot_behavior_adapter);
+
+        crate::aot::set_aot_dispatch(Some(crate::aot::AotDispatchTarget::standalone(
+            native, &aot,
+        )));
+        (actor.behavior_table[0].handler_fn)(&mut actor, &[]);
+
+        assert_eq!(
+            actor.iso_arena.total_allocs(),
+            1,
+            "the proven-local array literal should bypass the ORCA heap"
+        );
+        assert_eq!(
+            actor.iso_arena.epoch_allocs(),
+            0,
+            "completed native behavior must reset the activation arena"
+        );
+        assert_eq!(
+            actor.iso_arena.resets(),
+            1,
+            "completed native behavior should reset the arena exactly once"
+        );
+    }
+
+    #[test]
     fn test_aot_native_send() {
         // Native message passing end-to-end: A's behavior executes a `send`
         // through the compiled `nulang_aot_send_N` helper, which delivers into
