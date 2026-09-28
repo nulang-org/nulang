@@ -766,26 +766,55 @@ pub(crate) fn compile_bytecode_region_with_options(
                 builder.switch_to_block(call_block);
                 builder.seal_block(call_block);
 
-                // Proven target: run the non-suspending callee to completion
-                // via the re-entrant interpreter helper while this region
-                // remains resident in native code.
-                let fidx = builder.ins().iconst(types::I64, func_idx as i64);
-                let argcv = builder.ins().iconst(types::I64, instr.op2 as i64);
-                let dstv = builder.ins().iconst(types::I64, instr.op3 as i64);
-                let status_inst = builder.ins().call(
-                    helpers[&RuntimeHelper::DirectCall],
-                    &[regs_ptr, fidx, argcv, dstv],
-                );
-                let status = builder.inst_results(status_inst)[0];
-                // On nonzero status the callee raised (e.g. step-limit); the
-                // error is already recorded in the pending-error thread-local,
-                // so exit the region and let the VM propagate it.
-                let zero = builder.ins().iconst(types::I64, 0);
-                let is_err = builder.ins().icmp(IntCC::NotEqual, status, zero);
-                let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
-                builder
-                    .ins()
-                    .brif(is_err, return_block, &[], fallthrough, &[]);
+                if let Some(leaf) = native_leaf_calls.get(&pc) {
+                    // A leaf thunk runs against the caller's register buffer.
+                    // Preserve every register the callee may write, capture its
+                    // return value, restore the caller frame, then write only
+                    // the Call destination. Definite-definition analysis in
+                    // the planner proves the leaf cannot observe any other
+                    // caller registers.
+                    let saved: Vec<(u8, Value)> = leaf
+                        .clobbers
+                        .iter()
+                        .copied()
+                        .map(|reg| (reg, load_reg(&mut builder, regs_ptr, reg as usize)))
+                        .collect();
+
+                    let mut leaf_sig = module.make_signature();
+                    leaf_sig.params.push(AbiParam::new(pointer_type));
+                    leaf_sig.params.push(AbiParam::new(pointer_type));
+                    let leaf_sig_ref = builder.import_signature(leaf_sig);
+                    let callee = builder.ins().iconst(pointer_type, leaf.ptr as i64);
+                    builder
+                        .ins()
+                        .call_indirect(leaf_sig_ref, callee, &[regs_ptr, consts_ptr]);
+
+                    let ret = load_reg(&mut builder, regs_ptr, leaf.ret_reg as usize);
+                    for (reg, value) in saved {
+                        store_reg(&mut builder, regs_ptr, reg as usize, value);
+                    }
+                    store_reg(&mut builder, regs_ptr, instr.op3 as usize, ret);
+
+                    let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
+                    builder.ins().jump(fallthrough, &[]);
+                } else {
+                    // Safe fallback for all other direct callees: run the
+                    // non-suspending callee on the interpreter frame stack.
+                    let fidx = builder.ins().iconst(types::I64, func_idx as i64);
+                    let argcv = builder.ins().iconst(types::I64, instr.op2 as i64);
+                    let dstv = builder.ins().iconst(types::I64, instr.op3 as i64);
+                    let status_inst = builder.ins().call(
+                        helpers[&RuntimeHelper::DirectCall],
+                        &[regs_ptr, fidx, argcv, dstv],
+                    );
+                    let status = builder.inst_results(status_inst)[0];
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_err = builder.ins().icmp(IntCC::NotEqual, status, zero);
+                    let fallthrough = *blocks.get(&(pc + 1)).unwrap_or(&return_block);
+                    builder
+                        .ins()
+                        .brif(is_err, return_block, &[], fallthrough, &[]);
+                }
             }
 
             OpCode::Ret | OpCode::RetVal => {
