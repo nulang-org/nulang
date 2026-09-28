@@ -273,3 +273,40 @@ fn checkpoint_preserves_multiple_mutations_to_one_key_in_one_commit() {
     let _ = fs::remove_file(wal_path);
     let _ = fs::remove_file(checkpoint_path);
 }
+
+
+#[test]
+fn checkpoint_rejects_a_same_sequence_wal_from_a_different_history() {
+    let (wal_a, checkpoint_a) = paths("lineage_a");
+    let (wal_b, checkpoint_b) = paths("lineage_b");
+    for path in [&wal_a, &checkpoint_a, &wal_b, &checkpoint_b] {
+        let _ = fs::remove_file(path);
+    }
+
+    {
+        let mut tablet =
+            WalBackedTablet::open_with_checkpoint(descriptor(), &wal_a, &checkpoint_a).unwrap();
+        put(&mut tablet, b"k", b"history-a-1");
+        put(&mut tablet, b"x", b"history-a-2");
+        tablet.checkpoint(&checkpoint_a).unwrap();
+    }
+
+    {
+        let mut tablet =
+            WalBackedTablet::open_with_checkpoint(descriptor(), &wal_b, &checkpoint_b).unwrap();
+        put(&mut tablet, b"k", b"history-b-1");
+        put(&mut tablet, b"x", b"history-b-2");
+        tablet.checkpoint(&checkpoint_b).unwrap();
+    }
+
+    fs::copy(&wal_b, &wal_a).unwrap();
+
+    assert!(
+        WalBackedTablet::open_with_checkpoint(descriptor(), &wal_a, &checkpoint_a).is_err(),
+        "checkpoint recovery must bind to the exact WAL history, not only its sequence"
+    );
+
+    for path in [wal_a, checkpoint_a, wal_b, checkpoint_b] {
+        let _ = fs::remove_file(path);
+    }
+}
