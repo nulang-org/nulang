@@ -1314,4 +1314,56 @@ fn Dashboard() -> Html {
         assert_eq!(static_card.placement, Some(Placement::Static));
         assert_eq!(server_panel.placement, Some(Placement::Server));
     }
+
+    #[test]
+    fn test_island_plan_splits_static_shell_from_client_and_server_children() {
+        let module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+fn StaticLogo() -> Html ! {Render, Web} {
+    <strong>Logo</strong>
+}
+
+fn ClientCounter() -> Html ! {Client, Render} {
+    <button>Count</button>
+}
+
+fn ServerPanel() -> Html ! {DB, Render, Web} {
+    <section>Server</section>
+}
+
+fn Dashboard() -> Html {
+    <main>
+        <StaticLogo />
+        <ClientCounter />
+        <ServerPanel />
+    </main>
+}
+"#,
+        );
+        let mut checker = crate::effect_checker::EffectChecker::new();
+        checker.check_module(&module.decls).unwrap();
+
+        let graph = analyze_component_graph(&module, Some(&checker));
+        let islands = plan_component_islands(&graph);
+
+        assert_eq!(
+            islands,
+            vec![
+                IslandBoundary {
+                    parent: "Dashboard".to_string(),
+                    component: "ClientCounter".to_string(),
+                    placement: IslandPlacement::Client,
+                },
+                IslandBoundary {
+                    parent: "Dashboard".to_string(),
+                    component: "ServerPanel".to_string(),
+                    placement: IslandPlacement::Server,
+                },
+            ]
+        );
+    }
+
 }
