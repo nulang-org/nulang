@@ -107,6 +107,14 @@ impl WalRecord {
         }
     }
 
+    fn digest(&self) -> Result<[u8; 32], WalError> {
+        let payload =
+            serde_json::to_vec(&self.to_disk()).map_err(|error| WalError::Serialization {
+                message: error.to_string(),
+            })?;
+        Ok(*blake3::hash(&payload).as_bytes())
+    }
+
     pub fn tablet_id(&self) -> TabletId {
         self.tablet_id
     }
@@ -283,6 +291,33 @@ impl FileWal {
 
     pub(crate) fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    pub(crate) fn checkpoint_anchor_digest(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<[u8; 32]>, WalError> {
+        if sequence == 0 {
+            return Ok(None);
+        }
+        let record = self
+            .records
+            .iter()
+            .find(|record| record.sequence == sequence)
+            .ok_or(WalError::CheckpointAnchorMissing { sequence })?;
+        Ok(Some(record.digest()?))
+    }
+
+    pub(crate) fn verify_checkpoint_anchor(
+        &self,
+        sequence: u64,
+        expected_digest: Option<[u8; 32]>,
+    ) -> Result<(), WalError> {
+        let actual_digest = self.checkpoint_anchor_digest(sequence)?;
+        if actual_digest != expected_digest {
+            return Err(WalError::CheckpointAnchorMismatch { sequence });
+        }
+        Ok(())
     }
 
     /// Absolute file offset immediately after the indexed record.
@@ -752,6 +787,12 @@ pub enum WalError {
         checkpoint: u64,
         wal_tail: u64,
     },
+    CheckpointAnchorMissing {
+        sequence: u64,
+    },
+    CheckpointAnchorMismatch {
+        sequence: u64,
+    },
     ReclaimAheadOfWal {
         requested: u64,
         wal_tail: u64,
@@ -847,6 +888,14 @@ impl fmt::Display for WalError {
             } => write!(
                 f,
                 "checkpoint sequence {checkpoint} is ahead of WAL tail {wal_tail}"
+            ),
+            Self::CheckpointAnchorMissing { sequence } => write!(
+                f,
+                "checkpoint sequence {sequence} has no matching WAL anchor record"
+            ),
+            Self::CheckpointAnchorMismatch { sequence } => write!(
+                f,
+                "checkpoint sequence {sequence} does not match the retained WAL history"
             ),
             Self::ReclaimAheadOfWal {
                 requested,
