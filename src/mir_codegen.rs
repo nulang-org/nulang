@@ -1999,6 +1999,7 @@ fn static_composite_load(
         {
             fields
                 .iter()
+                .rev()
                 .find_map(|(name, source)| (name == field).then_some(*source))
         }
         (mir::RValue::ArrayLoad { arr, idx }, ScalarComposite::Array(items))
@@ -2036,16 +2037,19 @@ fn scalar_replace_local_composites(
     const_locals: &std::collections::HashMap<mir::LocalId, Constant>,
 ) -> bool {
     let mut def_count = vec![0usize; func.locals.len()];
+    let mut def_site: Vec<Option<(usize, usize)>> = vec![None; func.locals.len()];
     let mut definitions: Vec<Option<ScalarComposite>> = vec![None; func.locals.len()];
 
-    for block in &func.blocks {
-        for stmt in &block.stmts {
+    for (block_index, block) in func.blocks.iter().enumerate() {
+        for (stmt_index, stmt) in block.stmts.iter().enumerate() {
             let mir::Stmt::Assign { dst, op } = stmt else {
                 continue;
             };
             let index = dst.0 as usize;
             def_count[index] += 1;
-            if def_count[index] != 1 {
+            if def_count[index] == 1 {
+                def_site[index] = Some((block_index, stmt_index));
+            } else {
                 definitions[index] = None;
                 continue;
             }
@@ -2075,6 +2079,41 @@ fn scalar_replace_local_composites(
             ScalarComposite::Record(fields) => fields.iter().any(|(_, source)| source == container),
         };
         if self_referential {
+            return false;
+        }
+
+        // A composite snapshots its component values at construction. Reusing
+        // the original source local for a later scalarized load is sound only
+        // when that source cannot change after the snapshot. Zero-definition
+        // locals are externally initialized and remain stable. A locally
+        // assigned source qualifies only when it has exactly one definition,
+        // and that definition appears earlier in the same basic block as the
+        // composite construction. This deliberately rejects cross-block
+        // dominance cases until MIR has a shared dominance analysis.
+        let Some((alloc_block, alloc_stmt)) = def_site[container.0 as usize] else {
+            return false;
+        };
+        let source_is_stable = |source: mir::LocalId| {
+            let index = source.0 as usize;
+            match def_count[index] {
+                0 => true,
+                1 => matches!(
+                    def_site[index],
+                    Some((source_block, source_stmt))
+                        if source_block == alloc_block && source_stmt < alloc_stmt
+                ),
+                _ => false,
+            }
+        };
+        let has_unstable_component = match composite {
+            ScalarComposite::Tuple(items) | ScalarComposite::Array(items) => {
+                items.iter().any(|source| !source_is_stable(*source))
+            }
+            ScalarComposite::Record(fields) => {
+                fields.iter().any(|(_, source)| !source_is_stable(*source))
+            }
+        };
+        if has_unstable_component {
             return false;
         }
 
@@ -4046,6 +4085,125 @@ mod optimize_tests {
                 .any(|source| *source == child)
                 || !plan.after_stmt.values().any(|ids| ids.contains(&child)),
             "scalar replacement must not schedule a drop that invalidates the returned child"
+        );
+    }
+
+    #[test]
+    fn test_scalar_replacement_record_duplicate_field_uses_last_value() {
+        let mut b = mir::FunctionBuilder::new("duplicate_record_field", Some(Type::int()));
+        let first = b.add_param("first", Type::int());
+        let last = b.add_param("last", Type::int());
+        let record = b.add_temp(Type::Record(vec![
+            ("x".into(), Type::int()),
+            ("x".into(), Type::int()),
+        ]));
+        b.assign(
+            record,
+            mir::RValue::Record(vec![("x".into(), first), ("x".into(), last)]),
+        );
+        let result = b.add_temp(Type::int());
+        b.assign(
+            result,
+            mir::RValue::LoadFieldNamed {
+                obj: record,
+                field: "x".into(),
+            },
+        );
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let mut func = b.build();
+
+        optimize_function(&mut func, &mut Vec::new());
+
+        let result_source = func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .find_map(|stmt| match stmt {
+                mir::Stmt::Assign {
+                    dst,
+                    op: mir::RValue::Load(source),
+                } if *dst == result => Some(*source),
+                _ => None,
+            });
+        assert_eq!(
+            result_source,
+            Some(last),
+            "record SROA must preserve RecS last-write-wins semantics for duplicate field names"
+        );
+    }
+
+    #[test]
+    fn test_scalar_replacement_rejects_reassigned_parameter_component() {
+        let mut b = mir::FunctionBuilder::new("reassigned_param_component", Some(Type::int()));
+        let value = b.add_param("value", Type::int());
+        let tuple = b.add_temp(Type::Tuple(vec![Type::int()]));
+        b.assign(tuple, mir::RValue::Tuple(vec![value]));
+        b.assign(value, mir::RValue::Const(Constant::Int(2)));
+        let result = b.add_temp(Type::int());
+        b.assign(
+            result,
+            mir::RValue::LoadFieldPos {
+                obj: tuple,
+                index: 0,
+            },
+        );
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let mut func = b.build();
+
+        optimize_function(&mut func, &mut Vec::new());
+
+        assert!(
+            func.blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .any(|stmt| {
+                    matches!(
+                        stmt,
+                        mir::Stmt::Assign {
+                            dst,
+                            op: mir::RValue::Tuple(_),
+                        } if *dst == tuple
+                    )
+                }),
+            "a composite must keep its snapshot when an externally initialized component is later reassigned"
+        );
+    }
+
+    #[test]
+    fn test_scalar_replacement_rejects_redefined_component() {
+        let mut b = mir::FunctionBuilder::new("redefined_component", Some(Type::int()));
+        let value = b.add_temp(Type::int());
+        b.assign(value, mir::RValue::Const(Constant::Int(1)));
+        let tuple = b.add_temp(Type::Tuple(vec![Type::int()]));
+        b.assign(tuple, mir::RValue::Tuple(vec![value]));
+        b.assign(value, mir::RValue::Const(Constant::Int(2)));
+        let result = b.add_temp(Type::int());
+        b.assign(
+            result,
+            mir::RValue::LoadFieldPos {
+                obj: tuple,
+                index: 0,
+            },
+        );
+        b.terminate(mir::Terminator::Return(Some(result)));
+        let mut func = b.build();
+
+        optimize_function(&mut func, &mut Vec::new());
+
+        assert!(
+            func.blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .any(|stmt| {
+                    matches!(
+                        stmt,
+                        mir::Stmt::Assign {
+                            dst,
+                            op: mir::RValue::Tuple(_),
+                        } if *dst == tuple
+                    )
+                }),
+            "a composite must keep its snapshot allocation when a captured component is redefined"
         );
     }
 
