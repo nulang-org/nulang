@@ -4,9 +4,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::store::WalBackedTablet;
+use super::store::{WalBackedError, WalBackedTablet};
 use super::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation};
-use super::wal::FileWal;
+use super::wal::{FileWal, WalError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StorageInterruptionPoint {
@@ -218,6 +218,28 @@ mod tests {
 
             let result = with_interruption(point, || tablet.checkpoint());
             assert!(result.is_err(), "{point:?} must interrupt WAL reclamation");
+
+            // Once reclamation starts, any error must make the live WAL
+            // unusable. After rename, self.file can still refer to the old
+            // unlinked inode while the canonical path names the replacement;
+            // accepting another commit in that state could acknowledge data
+            // that disappears on restart.
+            let sequence = tablet.current_sequence();
+            let retry = tablet
+                .prepare_write(
+                    7,
+                    sequence,
+                    vec![TabletMutation::Put {
+                        key: b"k".to_vec(),
+                        value: b"must-not-commit".to_vec(),
+                    }],
+                )
+                .unwrap();
+            assert_eq!(
+                tablet.commit(retry).unwrap_err(),
+                WalBackedError::Wal(WalError::Poisoned),
+                "live tablet must require reopen after {point:?}"
+            );
             drop(tablet);
 
             assert!(
