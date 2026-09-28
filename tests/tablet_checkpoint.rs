@@ -274,7 +274,6 @@ fn checkpoint_preserves_multiple_mutations_to_one_key_in_one_commit() {
     let _ = fs::remove_file(checkpoint_path);
 }
 
-
 #[test]
 fn checkpoint_rejects_a_same_sequence_wal_from_a_different_history() {
     let (wal_a, checkpoint_a) = paths("lineage_a");
