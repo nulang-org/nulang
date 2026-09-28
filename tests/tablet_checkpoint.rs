@@ -15,7 +15,10 @@ fn paths(name: &str) -> (PathBuf, PathBuf) {
         std::process::id(),
         id
     ));
-    (base.with_extension("wal"), base.with_extension("checkpoint"))
+    (
+        base.with_extension("wal"),
+        base.with_extension("checkpoint"),
+    )
 }
 
 fn descriptor() -> TabletDescriptor {
@@ -125,12 +128,9 @@ fn checkpoint_corruption_fails_closed() {
     bytes[last] ^= 0x5a;
     fs::write(&checkpoint_path, bytes).unwrap();
 
-    assert!(WalBackedTablet::open_with_checkpoint(
-        descriptor(),
-        &wal_path,
-        &checkpoint_path
-    )
-    .is_err());
+    assert!(
+        WalBackedTablet::open_with_checkpoint(descriptor(), &wal_path, &checkpoint_path).is_err()
+    );
 
     let _ = fs::remove_file(wal_path);
     let _ = fs::remove_file(checkpoint_path);
@@ -157,7 +157,6 @@ fn compacted_wal_without_checkpoint_refuses_state_recovery() {
 
     let _ = fs::remove_file(wal_path);
 }
-
 
 #[test]
 fn repeated_checkpoints_preserve_tombstone_history_and_advance_the_wal_anchor() {
@@ -205,7 +204,6 @@ fn repeated_checkpoints_preserve_tombstone_history_and_advance_the_wal_anchor() 
     let _ = fs::remove_file(checkpoint_path);
 }
 
-
 #[test]
 fn incomplete_checkpoint_temp_file_is_ignored_after_crash_before_rename() {
     let (wal_path, checkpoint_path) = paths("temp_crash");
@@ -235,7 +233,6 @@ fn incomplete_checkpoint_temp_file_is_ignored_after_crash_before_rename() {
     let _ = fs::remove_file(checkpoint_path);
     let _ = fs::remove_file(temp_path);
 }
-
 
 #[test]
 fn checkpoint_preserves_multiple_mutations_to_one_key_in_one_commit() {
