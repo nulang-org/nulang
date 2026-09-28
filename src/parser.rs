@@ -6939,7 +6939,10 @@ mod tests {
 
         let entries = Parser::build_prelude_type_cache();
 
-        assert!(!entries.is_empty(), "prelude type cache should resolve entries");
+        assert!(
+            !entries.is_empty(),
+            "prelude type cache should resolve entries"
+        );
         assert_eq!(crate::types::current_source_text().as_deref(), Some(source));
         assert_eq!(
             crate::types::source_map_file().as_deref(),
