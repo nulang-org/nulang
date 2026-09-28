@@ -245,10 +245,16 @@ impl TabletWrite {
 }
 
 /// One committed value version in the in-memory MVCC prototype.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct VersionedValue {
-    sequence: u64,
-    value: Option<Vec<u8>>,
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct VersionedValue {
+    pub(crate) sequence: u64,
+    pub(crate) value: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TabletSnapshotState {
+    pub(crate) current_sequence: u64,
+    pub(crate) rows: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
 }
 
 /// Minimal single-node MVCC tablet used to prove transaction semantics before
@@ -279,6 +285,41 @@ impl MemoryTablet {
 
     pub fn current_sequence(&self) -> u64 {
         self.current_sequence
+    }
+
+    pub(crate) fn snapshot_state(&self) -> TabletSnapshotState {
+        TabletSnapshotState {
+            current_sequence: self.current_sequence,
+            rows: self.rows.clone(),
+        }
+    }
+
+    pub(crate) fn restore_snapshot(
+        descriptor: TabletDescriptor,
+        state: TabletSnapshotState,
+    ) -> Result<Self, TabletError> {
+        for (key, versions) in &state.rows {
+            if !descriptor.range.contains(key) {
+                return Err(TabletError::KeyOutsideTabletRange);
+            }
+
+            let mut previous = 0_u64;
+            for version in versions {
+                if version.sequence == 0
+                    || version.sequence > state.current_sequence
+                    || version.sequence <= previous
+                {
+                    return Err(TabletError::InvalidSnapshotHistory);
+                }
+                previous = version.sequence;
+            }
+        }
+
+        Ok(Self {
+            descriptor,
+            current_sequence: state.current_sequence,
+            rows: state.rows,
+        })
     }
 
     pub fn prepare_write(
@@ -489,6 +530,7 @@ pub enum TabletError {
         committed: u64,
         requested: u64,
     },
+    InvalidSnapshotHistory,
     KeyOutsideTabletRange,
 }
 
@@ -545,6 +587,9 @@ impl fmt::Display for TabletError {
                 f,
                 "snapshot {requested} is ahead of committed tablet sequence {committed}"
             ),
+            Self::InvalidSnapshotHistory => {
+                f.write_str("tablet snapshot contains invalid MVCC version history")
+            }
             Self::KeyOutsideTabletRange => {
                 f.write_str("tablet mutation key falls outside the owned key range")
             }
