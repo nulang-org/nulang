@@ -2654,3 +2654,30 @@ mod tests {
         assert_eq!(canonical_type_bytes(&ty), canonical_type_bytes(&ty));
     }
 }
+
+
+#[cfg(test)]
+mod web_placement_tests {
+    use super::*;
+
+    #[test]
+    fn infers_web_placement_from_effect_rows() {
+        assert_eq!(
+            infer_web_placement(&EffectRow::Closed(vec![Effect::Render, Effect::Web])),
+            Some(Placement::Static)
+        );
+        assert_eq!(
+            infer_web_placement(&EffectRow::Closed(vec![
+                Effect::Request,
+                Effect::Web,
+                Effect::Render,
+            ])),
+            Some(Placement::Server)
+        );
+        assert_eq!(
+            infer_web_placement(&EffectRow::Closed(vec![Effect::DB])),
+            Some(Placement::Server)
+        );
+        assert_eq!(infer_web_placement(&EffectRow::empty()), None);
+    }
+}
