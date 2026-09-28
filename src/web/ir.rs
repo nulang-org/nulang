@@ -5,12 +5,18 @@
 //! capabilities, signal graph, budgets, and middleware. Adapters consume this
 //! IR to deploy to Nulang Cloud, static hosts, or Docker.
 
+use crate::effect_checker::EffectChecker;
+use crate::lexer::Lexer;
 use crate::package::manifest::BudgetsSection;
+use crate::parser::Parser;
 use crate::runtime::WebRoute;
 use crate::web::bindings::{compile_route_bindings, RouteBindingContract};
 use crate::web::contracts::{HandlerParamContract, RouteContract, RouteParamContract};
 use crate::web::modules::ModuleRegistry;
 use crate::web::package_contracts::compile_contracts_from_tree;
+use crate::web::reactivity::{
+    analyze_component_graph, plan_component_islands, ComponentGraph, ComponentNode, IslandBoundary,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -65,11 +71,25 @@ pub struct CloudConfigEntry {
     pub required_by: String,
 }
 
+
+/// Component placement metadata exported for deployment/build adapters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrComponent {
+    pub name: String,
+    pub placement: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeploymentIr {
     pub version: u32,
     pub routes: Vec<IrRoute>,
     pub signals: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<IrComponent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub islands: Vec<IslandBoundary>,
     pub capabilities: Vec<String>,
     pub budgets: BudgetsIr,
     pub middleware: Vec<String>,
@@ -147,6 +167,8 @@ pub fn generate_deployment_ir(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
 
+    let (components, islands) = compile_component_plan_from_tree(src_root);
+
     let source_text = collect_source_text(src_root);
     let mut capabilities = BTreeSet::new();
     for cap in infer_capabilities(&source_text) {
@@ -179,10 +201,74 @@ pub fn generate_deployment_ir(
         version: 1,
         routes: ir_routes,
         signals,
+        components,
+        islands,
         capabilities,
         budgets: budgets_ir,
         middleware,
         cloud_config,
+    }
+}
+
+fn compile_component_plan_from_tree(src_root: &Path) -> (Vec<IrComponent>, Vec<IslandBoundary>) {
+    let mut nodes = std::collections::BTreeMap::<String, ComponentNode>::new();
+    collect_component_nodes_from_tree(src_root, &mut nodes);
+
+    let graph = ComponentGraph {
+        components: nodes.into_values().collect(),
+    };
+    let islands = plan_component_islands(&graph);
+    let components = graph
+        .components
+        .into_iter()
+        .map(|component| IrComponent {
+            name: component.name,
+            placement: component
+                .placement
+                .map(|placement| placement.to_string())
+                .unwrap_or_else(|| "static".to_string()),
+            children: component.children,
+        })
+        .collect();
+
+    (components, islands)
+}
+
+fn collect_component_nodes_from_tree(
+    path: &Path,
+    out: &mut std::collections::BTreeMap<String, ComponentNode>,
+) {
+    if path.is_dir() {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
+        entries.sort_by_key(|entry| entry.path());
+        for entry in entries {
+            collect_component_nodes_from_tree(&entry.path(), out);
+        }
+        return;
+    }
+
+    if path.extension().and_then(|ext| ext.to_str()) != Some("nula") {
+        return;
+    }
+
+    let Ok(source) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(tokens) = Lexer::new(&source).lex() else {
+        return;
+    };
+    let Ok(module) = Parser::new(tokens).parse_module() else {
+        return;
+    };
+
+    let mut checker = EffectChecker::new();
+    let checked = checker.check_module(&module.decls).is_ok();
+    let graph = analyze_component_graph(&module, checked.then_some(&checker));
+    for node in graph.components {
+        out.entry(node.name.clone()).or_insert(node);
     }
 }
 
