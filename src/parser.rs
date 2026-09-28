@@ -8993,4 +8993,64 @@ mod tests {
         let result = parse_expr("par");
         assert!(result.is_err(), "bare 'par' must be a parse error");
     }
+
+    #[test]
+    fn test_component_declaration_and_jsx_call_preserve_boundary() {
+        let ast = parse(
+            r#"
+component Card(title: String) {
+    <div><h2>{title}</h2><slot /></div>
+}
+
+fn main() {
+    <Card title="Components"><p>Hello</p></Card>
+}
+"#,
+        )
+        .unwrap();
+
+        let card = ast
+            .decls
+            .iter()
+            .find(|decl| matches!(decl, Decl::Function { name, .. } if name == "Card"))
+            .expect("component desugars to a marked function");
+        let Decl::Function {
+            params,
+            annotations,
+            ..
+        } = card
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            params.iter().map(|param| param.name.as_str()).collect::<Vec<_>>(),
+            vec!["title", "__component_slot"]
+        );
+        assert!(annotations
+            .iter()
+            .any(|annotation| matches!(annotation, FunctionAnnotation::Component)));
+
+        let main = ast
+            .decls
+            .iter()
+            .find(|decl| matches!(decl, Decl::Function { name, .. } if name == "main"))
+            .expect("main function");
+        let Decl::Function { body, .. } = main else {
+            unreachable!()
+        };
+        let Expr::Block { exprs, .. } = body else {
+            panic!("main body should remain a block");
+        };
+        let Expr::App { func, args, .. } = &exprs[0] else {
+            panic!("component JSX should lower to a direct component call");
+        };
+        assert!(matches!(func.as_ref(), Expr::Var(name, _) if name == "Card"));
+        assert_eq!(args.len(), 2, "named prop plus synthetic slot");
+        assert!(matches!(
+            &args[1],
+            Expr::App { func, .. }
+                if matches!(func.as_ref(), Expr::Var(name, _) if name == "fragment")
+        ));
+    }
+
 }
