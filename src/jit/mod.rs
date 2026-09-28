@@ -458,6 +458,8 @@ impl JitSession {
                             )
                         };
                     } else {
+                        let native_leaf_calls =
+                            self.native_leaf_calls_for_region(module_idx, module, &plan.native_calls);
                         let _ = unsafe {
                             self.promote_region_baseline(
                                 module_idx,
@@ -465,10 +467,13 @@ impl JitSession {
                                 region.len,
                                 instructions,
                                 &plan.native_calls,
+                                &native_leaf_calls,
                             )
                         };
                     }
                 } else {
+                    let native_leaf_calls =
+                        self.native_leaf_calls_for_region(module_idx, module, &plan.native_calls);
                     let _ = unsafe {
                         self.promote_region_baseline(
                             module_idx,
@@ -476,6 +481,7 @@ impl JitSession {
                             region.len,
                             instructions,
                             &plan.native_calls,
+                            &native_leaf_calls,
                         )
                     };
                 }
@@ -1071,14 +1077,17 @@ impl crate::backends::JitBackend for JitSession {
 
         let plan = self.region_planner.plan(module_idx, pc, module);
         if plan.len >= 3 {
+            let native_leaf_calls =
+                self.native_leaf_calls_for_region(module_idx, module, &plan.native_calls);
             if unsafe {
-                self.compile_region_typed(
+                self.compile_region_typed_with_leaf_calls(
                     module_idx,
                     pc,
                     plan.len,
                     instructions,
                     plan.type_metadata(),
                     &plan.native_calls,
+                    &native_leaf_calls,
                 )
             }
             .is_some()
