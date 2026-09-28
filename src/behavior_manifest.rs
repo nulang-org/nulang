@@ -396,12 +396,11 @@ impl BehaviorManifest {
             });
         }
 
-        let authority = AuthorityManifest::from_tokens(
-            self.authority.grants.iter().map(String::as_str),
-        )
-        .map_err(|error| BehaviorManifestError::InvalidAuthority {
-            message: error.to_string(),
-        })?;
+        let authority =
+            AuthorityManifest::from_tokens(self.authority.grants.iter().map(String::as_str))
+                .map_err(|error| BehaviorManifestError::InvalidAuthority {
+                    message: error.to_string(),
+                })?;
         if authority.canonical_tokens() != self.authority.grants {
             return Err(BehaviorManifestError::InvalidAuthority {
                 message: "authority grants must be canonical, sorted, and deduplicated".to_string(),
@@ -571,11 +570,12 @@ fn authority_inventory_from_hir(
 ) -> Result<BehaviorAuthorityInventory, BehaviorManifestError> {
     let mut tokens = BTreeSet::new();
     collect_authority_from_decls(&module.decls, &mut tokens);
-    let manifest = AuthorityManifest::from_tokens(tokens.iter().map(String::as_str)).map_err(
-        |error| BehaviorManifestError::InvalidAuthority {
-            message: error.to_string(),
-        },
-    )?;
+    let manifest =
+        AuthorityManifest::from_tokens(tokens.iter().map(String::as_str)).map_err(|error| {
+            BehaviorManifestError::InvalidAuthority {
+                message: error.to_string(),
+            }
+        })?;
 
     Ok(BehaviorAuthorityInventory {
         coverage: BehaviorAuthorityCoverage::ExplicitSpawnGrants,
@@ -1258,8 +1258,7 @@ fn main() {
         let valid = base_manifest(actor(1, b"schema-v1"));
         let mut value: serde_json::Value =
             serde_json::from_slice(&valid.to_json().unwrap()).unwrap();
-        value["authority"]["grants"] =
-            serde_json::json!(["Net::TcpOut(api.example.com)"]);
+        value["authority"]["grants"] = serde_json::json!(["Net::TcpOut(api.example.com)"]);
 
         let error = BehaviorManifest::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_err();
         assert!(matches!(
@@ -1282,5 +1281,4 @@ fn main() {
                 if schema == "nulang.behavior/v0alpha1"
         ));
     }
-
 }
