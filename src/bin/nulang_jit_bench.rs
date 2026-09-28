@@ -86,6 +86,7 @@ struct Measurement {
     warm_stats: JitCompileStats,
     compiled_regions: usize,
     typed_regions: usize,
+    native_leaf_thunks: usize,
 }
 
 fn compile(source: &str) -> CodeModule {
@@ -148,6 +149,7 @@ fn measure(workload: Workload, module: &CodeModule) -> Measurement {
         warm_stats,
         compiled_regions: vm.jit_compiled_count(),
         typed_regions: vm.jit_typed_compiled_count(),
+        native_leaf_thunks: vm.jit_native_leaf_compiled_count(),
     }
 }
 
@@ -169,7 +171,7 @@ fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
     match format {
         OutputFormat::Human => {
             println!(
-                "[jit-codegen] {} iteration={} interp={:.3}ms first={:.3}ms warm={:.3}ms regions={} typed={}",
+                "[jit-codegen] {} iteration={} interp={:.3}ms first={:.3}ms warm={:.3}ms regions={} typed={} leaves={}",
                 measurement.workload,
                 iteration,
                 measurement.interpreter_run.as_secs_f64() * 1_000.0,
@@ -177,6 +179,7 @@ fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
                 measurement.warm_run.as_secs_f64() * 1_000.0,
                 measurement.compiled_regions,
                 measurement.typed_regions,
+                measurement.native_leaf_thunks,
             );
             println!(
                 "  first compile: fast={} ({:.3}ms) optimized={} ({:.3}ms)",
@@ -210,6 +213,7 @@ fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
                         .expect("warm run duration must fit in u64"),
                     "compiled_regions": measurement.compiled_regions,
                     "typed_regions": measurement.typed_regions,
+                    "native_leaf_thunks": measurement.native_leaf_thunks,
                     "first_compile": {
                         "fast_compiles": measurement.first_stats.fast_compiles,
                         "fast_compile_ns": measurement.first_stats.fast_compile_ns,
