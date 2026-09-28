@@ -281,7 +281,7 @@ impl FileWal {
             .unwrap_or(self.base_sequence)
     }
 
-    pub fn is_poisoned(&self) -> bool {
+    pub(crate) fn is_poisoned(&self) -> bool {
         self.poisoned
     }
 
@@ -318,7 +318,7 @@ impl FileWal {
     /// sequence 1) and the post-reclamation form whose first retained record
     /// names a non-zero predecessor. Records at or below the checkpoint
     /// sequence are already represented by the checkpoint and are skipped.
-    pub fn replay_into(&self, tablet: &mut MemoryTablet) -> Result<(), WalError> {
+    pub(crate) fn replay_into(&self, tablet: &mut MemoryTablet) -> Result<(), WalError> {
         if let Some(existing) = self.tablet_id {
             if existing != tablet.descriptor().id() {
                 return Err(WalError::TabletMismatch {
@@ -376,7 +376,7 @@ impl FileWal {
     /// through that record's predecessor. Startup without the matching
     /// checkpoint therefore fails closed instead of reconstructing partial
     /// state from the retained suffix.
-    pub fn reclaim_through(&mut self, sequence: u64) -> Result<(), WalError> {
+    pub(crate) fn reclaim_through(&mut self, sequence: u64) -> Result<(), WalError> {
         if self.poisoned {
             return Err(WalError::Poisoned);
         }
