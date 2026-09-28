@@ -46,7 +46,9 @@ impl WalBackedTablet {
     ) -> Result<Self, WalBackedError> {
         let wal = FileWal::open(wal_path)?;
         let tablet = match load_checkpoint(checkpoint_path, descriptor.clone())? {
-            Some(mut tablet) => {
+            Some(loaded) => {
+                let mut tablet = loaded.tablet;
+                wal.verify_checkpoint_anchor(tablet.current_sequence(), loaded.wal_anchor_digest)?;
                 wal.replay_into(&mut tablet)?;
                 tablet
             }
@@ -92,7 +94,10 @@ impl WalBackedTablet {
         if self.wal.is_poisoned() {
             return Err(WalError::Poisoned.into());
         }
-        Ok(write_checkpoint(checkpoint_path, &self.tablet)?)
+        let anchor = self
+            .wal
+            .checkpoint_anchor_digest(self.tablet.current_sequence())?;
+        Ok(write_checkpoint(checkpoint_path, &self.tablet, anchor)?)
     }
 
     /// Atomically publish a checkpoint and then reclaim older WAL history.
@@ -104,7 +109,10 @@ impl WalBackedTablet {
         if self.wal.is_poisoned() {
             return Err(WalError::Poisoned.into());
         }
-        let sequence = write_checkpoint(checkpoint_path, &self.tablet)?;
+        let anchor = self
+            .wal
+            .checkpoint_anchor_digest(self.tablet.current_sequence())?;
+        let sequence = write_checkpoint(checkpoint_path, &self.tablet, anchor)?;
         self.wal.reclaim_through(sequence)?;
         Ok(sequence)
     }
