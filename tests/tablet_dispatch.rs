@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use nulang::database::dispatch::{
     TabletDispatchChannels, TabletDispatchConfigError, TabletDispatchError, TabletDispatchOutcome,
-    TabletDispatcher, TabletDispatchWake, TabletExecutionError, TabletOwner, TabletPlacementMap,
+    TabletDispatchWake, TabletDispatcher, TabletExecutionError, TabletOwner, TabletPlacementMap,
 };
 use nulang::database::store::WalBackedTablet;
 use nulang::database::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation, TabletWrite};
@@ -228,7 +228,6 @@ fn dispatch_configuration_rejects_zero_shards_and_zero_capacity() {
         Err(TabletDispatchConfigError::InvalidQueueCapacity)
     ));
 }
-
 
 struct CountWake {
     count: AtomicUsize,
