@@ -138,9 +138,7 @@ pub(crate) fn direct_call_target(
         let instr = module.instructions[p];
         match instr.opcode {
             OpCode::Move if instr.op2 < argc => continue,
-            OpCode::SpillLoad if (SPILL_TEMP_MIN..=SPILL_TEMP_MAX).contains(&instr.op3) => {
-                continue
-            }
+            OpCode::SpillLoad if (SPILL_TEMP_MIN..=SPILL_TEMP_MAX).contains(&instr.op3) => continue,
             OpCode::Const0 | OpCode::Const1 | OpCode::Const2 if instr.op1 == FUNC_VALUE_REG => {
                 let idx = match instr.opcode {
                     OpCode::Const0 => 0,
