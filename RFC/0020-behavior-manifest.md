@@ -9,7 +9,7 @@
 
 ## Implementation status
 
-An experimental v0alpha1 durability/admission subset is implemented in
+An experimental v0alpha2 durability/admission subset is implemented in
 `src/behavior_manifest.rs`. Package bytecode builds emit
 `<package>.behavior.json` and deployment bundles include it. The current
 implementation covers compiler artifact identity, an exact BLAKE3 digest binding
@@ -18,7 +18,7 @@ state-schema semantic identity, schema versions, migration topology,
 deterministic manifest hashing, and structural upgrade preflight.
 
 This does **not** resolve the RFC or complete its full proposed surface:
-effects, authority inventories, interfaces, resources, provenance attestations,
+effect-derived ambient authority, interfaces, resources, provenance attestations,
 and canonical migration-body identity remain follow-up work. Migration identity
 is explicitly marked `topology-only` until migration expressions have a
 canonical semantic representation.
@@ -113,7 +113,7 @@ A future package/container format may bundle both without changing manifest sema
 Initial experimental media type / schema identity:
 
 ```text
-schema: nulang.behavior/v0alpha1
+schema: nulang.behavior/v0alpha2
 ```
 
 The schema is experimental until separately stabilized. Schema versioning is independent from the Nulang language version and executable format version.
@@ -208,6 +208,14 @@ These classifications must describe the semantic boundary precisely. Local snaps
 ## External authority
 
 The manifest serializes the program's **required authority shape**, not credentials.
+
+The implemented `v0alpha2` subset emits a canonical, sorted, deduplicated
+inventory of explicit source-level spawn grants and marks its coverage as
+`explicit-spawn-grants`. Consumers MUST NOT interpret the absence of a grant as
+proof that effect-derived ambient authority is unnecessary; that coverage is a
+later compiler milestone. This partial coverage is nevertheless safe for
+default-deny admission because it can authorize less than the eventual complete
+inventory, never more.
 
 Examples include:
 
