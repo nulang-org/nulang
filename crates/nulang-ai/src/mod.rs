@@ -8,6 +8,7 @@
 
 pub mod client;
 pub mod debate;
+pub mod harness;
 pub mod memory;
 pub mod mock;
 pub mod pipeline;
@@ -22,6 +23,10 @@ pub mod usage;
 
 pub use client::{complete_sync, LlmClient};
 pub use debate::{Debate, DebateRuntime, Participant, Stance};
+pub use harness::{
+    AgentHarness, ContextLedger, ContextObservation, Diagnostic, ExecRequest, ExecResult,
+    ObservedFile, WorkspaceError, WorkspaceExecutor,
+};
 pub use memory::{EpisodicMemory, Turn};
 pub use mock::MockLlmClient;
 pub use pipeline::{Pipeline, PipelineRuntime, PipelineStage};
