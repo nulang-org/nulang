@@ -731,6 +731,91 @@ fn test_jit_direct_call_loop_tiers_up() {
         jit_vm.jit_compiled_count() > 0,
         "the loop region must compile around the folded direct call"
     );
+    assert!(
+        jit_vm.jit_native_leaf_compiled_count() > 0,
+        "bump() should compile as a native-to-native leaf thunk"
+    );
+}
+
+#[test]
+fn test_native_leaf_analysis_tracks_clobbers_and_arguments() {
+    let mut module = CodeModule::new("native_leaf_analysis");
+    module.function_table.push(0);
+    module.emit(Instruction::new2(OpCode::Move, 0, 15));
+    module.emit(Instruction::new1(OpCode::IInc, 15));
+    module.emit(Instruction::new1(OpCode::RetVal, 15));
+    module.debug_functions.push(DebugFunctionInfo {
+        name: "bump".into(),
+        code_offset: 0,
+        code_len: 3,
+        params: vec![15],
+        locals: vec![(15, Some("x".into()))],
+    });
+
+    let plan = analyze_native_leaf(&module, 0)
+        .expect("straight-line pure leaf with one staged argument should be eligible");
+    assert_eq!(plan.start, 0);
+    assert_eq!(plan.body_len, 2);
+    assert_eq!(plan.argc, 1);
+    assert_eq!(plan.ret_reg, 15);
+    assert_eq!(plan.clobbers, vec![15]);
+}
+
+#[test]
+fn test_native_leaf_rejects_read_before_definition() {
+    let mut module = CodeModule::new("native_leaf_read_before_def");
+    module.function_table.push(0);
+    module.emit(Instruction::new1(OpCode::IInc, 15));
+    module.emit(Instruction::new1(OpCode::RetVal, 15));
+    module.debug_functions.push(DebugFunctionInfo {
+        name: "bad".into(),
+        code_offset: 0,
+        code_len: 2,
+        params: vec![],
+        locals: vec![(15, Some("uninitialized".into()))],
+    });
+
+    assert!(
+        analyze_native_leaf(&module, 0).is_none(),
+        "leaf thunk must not observe caller register contents that a fresh VM frame would initialize to nil"
+    );
+}
+
+#[test]
+fn test_native_leaf_rejects_control_flow_and_erroring_ineg() {
+    let mut branchy = CodeModule::new("native_leaf_branch");
+    branchy.function_table.push(0);
+    branchy.emit(Instruction::new3(OpCode::ICmpGt, 0, 1, 2));
+    branchy.emit(Instruction::new3(OpCode::JmpT, 2, 0, 2));
+    branchy.emit(Instruction::new1(OpCode::RetVal, 0));
+    branchy.debug_functions.push(DebugFunctionInfo {
+        name: "branchy".into(),
+        code_offset: 0,
+        code_len: 3,
+        params: vec![15],
+        locals: vec![],
+    });
+    assert!(
+        analyze_native_leaf(&branchy, 0).is_none(),
+        "first native leaf slice must stay straight-line"
+    );
+
+    let mut ineg = CodeModule::new("native_leaf_ineg");
+    ineg.function_table.push(0);
+    ineg.emit(Instruction::new2(OpCode::Move, 0, 15));
+    ineg.emit(Instruction::new2(OpCode::INeg, 15, 16));
+    ineg.emit(Instruction::new1(OpCode::RetVal, 16));
+    ineg.debug_functions.push(DebugFunctionInfo {
+        name: "neg".into(),
+        code_offset: 0,
+        code_len: 3,
+        params: vec![15],
+        locals: vec![(15, Some("x".into())), (16, Some("result".into()))],
+    });
+    assert!(
+        analyze_native_leaf(&ineg, 0).is_none(),
+        "INeg error semantics are not yet representable by the native leaf thunk"
+    );
 }
 
 #[test]
