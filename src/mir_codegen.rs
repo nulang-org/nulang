@@ -1903,7 +1903,6 @@ fn fold_one_const(
     }
 }
 
-
 #[derive(Clone)]
 enum ScalarComposite {
     Tuple(Vec<mir::LocalId>),
@@ -1918,21 +1917,24 @@ fn static_composite_load(
     const_locals: &std::collections::HashMap<mir::LocalId, Constant>,
 ) -> Option<mir::LocalId> {
     match (rv, composite) {
-        (
-            mir::RValue::LoadFieldPos { obj, index },
-            ScalarComposite::Tuple(items),
-        ) if *obj == container => items.get(*index as usize).copied(),
-        (
-            mir::RValue::LoadFieldNamed { obj, field },
-            ScalarComposite::Record(fields),
-        ) if *obj == container => fields.get(field).copied(),
-        (
-            mir::RValue::ArrayLoad { arr, idx },
-            ScalarComposite::Array(items),
-        ) if *arr == container => match const_locals.get(idx) {
-            Some(Constant::Int(index)) if *index >= 0 => items.get(*index as usize).copied(),
-            _ => None,
-        },
+        (mir::RValue::LoadFieldPos { obj, index }, ScalarComposite::Tuple(items))
+            if *obj == container =>
+        {
+            items.get(*index as usize).copied()
+        }
+        (mir::RValue::LoadFieldNamed { obj, field }, ScalarComposite::Record(fields))
+            if *obj == container =>
+        {
+            fields.get(field).copied()
+        }
+        (mir::RValue::ArrayLoad { arr, idx }, ScalarComposite::Array(items))
+            if *arr == container =>
+        {
+            match const_locals.get(idx) {
+                Some(Constant::Int(index)) if *index >= 0 => items.get(*index as usize).copied(),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -1975,9 +1977,9 @@ fn scalar_replace_local_composites(
             }
             definitions[index] = match op {
                 mir::RValue::Tuple(items) => Some(ScalarComposite::Tuple(items.clone())),
-                mir::RValue::Record(fields) => Some(ScalarComposite::Record(
-                    fields.iter().cloned().collect(),
-                )),
+                mir::RValue::Record(fields) => {
+                    Some(ScalarComposite::Record(fields.iter().cloned().collect()))
+                }
                 mir::RValue::ArrayLit(items) => Some(ScalarComposite::Array(items.clone())),
                 _ => None,
             };
@@ -1999,7 +2001,8 @@ fn scalar_replace_local_composites(
                 match stmt {
                     mir::Stmt::Assign { dst, .. } if dst == container => {}
                     mir::Stmt::Assign { op, .. } if rvalue_reads_local(op, *container) => {
-                        if static_composite_load(op, *container, composite, const_locals).is_none() {
+                        if static_composite_load(op, *container, composite, const_locals).is_none()
+                        {
                             return false;
                         }
                     }
@@ -2032,8 +2035,7 @@ fn scalar_replace_local_composites(
                 continue;
             };
             for (container, composite) in &candidates {
-                if let Some(source) =
-                    static_composite_load(op, *container, composite, const_locals)
+                if let Some(source) = static_composite_load(op, *container, composite, const_locals)
                 {
                     *op = mir::RValue::Load(source);
                     changed = true;
@@ -3852,21 +3854,25 @@ mod optimize_tests {
         optimize_function(&mut func, &mut Vec::new());
 
         assert!(
-            !func.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
-                matches!(
-                    stmt,
-                    mir::Stmt::Assign {
-                        op: mir::RValue::Record(_),
-                        ..
-                    }
-                ) || matches!(
-                    stmt,
-                    mir::Stmt::Assign {
-                        op: mir::RValue::LoadFieldNamed { obj, .. },
-                        ..
-                    } if *obj == record
-                )
-            }),
+            !func
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .any(|stmt| {
+                    matches!(
+                        stmt,
+                        mir::Stmt::Assign {
+                            op: mir::RValue::Record(_),
+                            ..
+                        }
+                    ) || matches!(
+                        stmt,
+                        mir::Stmt::Assign {
+                            op: mir::RValue::LoadFieldNamed { obj, .. },
+                            ..
+                        } if *obj == record
+                    )
+                }),
             "a scalar-only local record consumed only by a named field load should be eliminated"
         );
     }
@@ -3890,21 +3896,25 @@ mod optimize_tests {
         optimize_function(&mut func, &mut Vec::new());
 
         assert!(
-            !func.blocks.iter().flat_map(|block| &block.stmts).any(|stmt| {
-                matches!(
-                    stmt,
-                    mir::Stmt::Assign {
-                        op: mir::RValue::ArrayLit(_),
-                        ..
-                    }
-                ) || matches!(
-                    stmt,
-                    mir::Stmt::Assign {
-                        op: mir::RValue::ArrayLoad { arr: base, .. },
-                        ..
-                    } if *base == arr
-                )
-            }),
+            !func
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .any(|stmt| {
+                    matches!(
+                        stmt,
+                        mir::Stmt::Assign {
+                            op: mir::RValue::ArrayLit(_),
+                            ..
+                        }
+                    ) || matches!(
+                        stmt,
+                        mir::Stmt::Assign {
+                            op: mir::RValue::ArrayLoad { arr: base, .. },
+                            ..
+                        } if *base == arr
+                    )
+                }),
             "a scalar-only local array read at a constant index should be eliminated"
         );
     }
