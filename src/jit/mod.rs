@@ -907,6 +907,14 @@ impl crate::backends::JitBackend for JitSession {
         self.typed_regions.len()
     }
 
+    fn is_terminally_rejected(&self, module_idx: usize, pc: usize) -> bool {
+        self.hot_counts
+            .get(module_idx)
+            .and_then(|row| row.get(pc))
+            .copied()
+            == Some(HOT_REJECTED)
+    }
+
     fn compile_stats(&self) -> crate::backends::JitCompileStats {
         self.compile_stats
     }
