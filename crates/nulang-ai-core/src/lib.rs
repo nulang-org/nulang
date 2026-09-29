@@ -296,7 +296,7 @@ mod tests {
         assert_eq!(role.as_str(), "proposal");
 
         let json = serde_json::to_string(&role).unwrap();
-        assert_eq!(json, "\\\"proposal\\\"");
+        assert_eq!(json, "\"proposal\"");
         let roundtrip: AgentRole = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtrip, role);
     }
