@@ -48,20 +48,53 @@ pub enum TaskStatus {
 
 /// Open-ended application-defined role identifier for an agent task.
 ///
-/// NLAP deliberately does not enumerate product roles: Dev Plane may use
-/// `security` or `reviewer`, while Adacavo may use `proposal` or
-/// `inventory`, without requiring a Nulang protocol change.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct AgentRole(String);
+/// The five original NLAP manager roles remain explicit variants for source
+/// compatibility. Any application may introduce an additional role through
+/// `AgentRole::new` without changing the Nulang protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AgentRole {
+    Engineering,
+    Research,
+    Operations,
+    Data,
+    Voice,
+    Custom(String),
+}
 
 impl AgentRole {
     pub fn new(role: impl Into<String>) -> Self {
-        Self(role.into())
+        match role.into().as_str() {
+            "engineering" => Self::Engineering,
+            "research" => Self::Research,
+            "operations" => Self::Operations,
+            "data" => Self::Data,
+            "voice" => Self::Voice,
+            other => Self::Custom(other.to_string()),
+        }
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        match self {
+            Self::Engineering => "engineering",
+            Self::Research => "research",
+            Self::Operations => "operations",
+            Self::Data => "data",
+            Self::Voice => "voice",
+            Self::Custom(role) => role.as_str(),
+        }
+    }
+}
+
+impl Serialize for AgentRole {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentRole {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let role = String::deserialize(deserializer)?;
+        Ok(Self::new(role))
     }
 }
 
@@ -83,34 +116,12 @@ impl std::fmt::Display for AgentRole {
     }
 }
 
-/// Legacy built-in roles retained as a source-compatibility shim.
+/// Source-compatible alias for the original closed manager-role type.
 ///
-/// New code should use `AgentRole` so applications can define roles without
-/// extending Nulang core.
+/// New code should name the type `AgentRole`. Existing consumers may keep
+/// using `ManagerKind::Engineering` while migrating.
 #[deprecated(note = "use AgentRole for open-ended application-defined roles")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ManagerKind {
-    Engineering,
-    Research,
-    Operations,
-    Data,
-    Voice,
-}
-
-#[allow(deprecated)]
-impl From<ManagerKind> for AgentRole {
-    fn from(value: ManagerKind) -> Self {
-        let role = match value {
-            ManagerKind::Engineering => "engineering",
-            ManagerKind::Research => "research",
-            ManagerKind::Operations => "operations",
-            ManagerKind::Data => "data",
-            ManagerKind::Voice => "voice",
-        };
-        Self::new(role)
-    }
-}
+pub type ManagerKind = AgentRole;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Goal {
@@ -153,10 +164,9 @@ pub struct Task {
     pub id: Uuid,
     pub goal_id: Uuid,
     pub parent_task_id: Option<Uuid>,
-    /// Application-defined role. NLAP v1 retains the legacy wire key
-    /// `manager` for compatibility while allowing arbitrary string values.
-    #[serde(rename = "manager")]
-    pub role: AgentRole,
+    /// Application-defined role. The legacy field name is retained for
+    /// source and NLAP v1 wire compatibility.
+    pub manager: AgentRole,
     pub description: String,
     pub dependencies: Vec<Uuid>,
     pub required_capabilities: Vec<String>,
@@ -177,7 +187,7 @@ impl Task {
             id: Uuid::new_v4(),
             goal_id,
             parent_task_id: None,
-            role: role.into(),
+            manager: role.into(),
             description: description.into(),
             dependencies: Vec::new(),
             required_capabilities: Vec::new(),
