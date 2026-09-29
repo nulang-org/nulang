@@ -3923,7 +3923,9 @@ fn test_three_node_cluster_membership_converges() {
     let mut rt_c = start_distributed_node();
 
     let addr_a = rt_a.distributed.transport.as_ref().unwrap().listen_addr();
+    let addr_a = rt_a.distributed.transport.as_ref().unwrap().listen_addr();
     let addr_b = rt_b.distributed.transport.as_ref().unwrap().listen_addr();
+    let addr_c = rt_c.distributed.transport.as_ref().unwrap().listen_addr();
     let node_a = rt_a.distributed.node_id.unwrap();
     let node_b = rt_b.distributed.node_id.unwrap();
     let node_c = rt_c.distributed.node_id.unwrap();
@@ -4846,6 +4848,22 @@ fn test_three_node_cluster_split_brain_detects_and_heals() {
     assert!(
         healed,
         "cluster did not heal after the partition was lifted"
+    );
+
+    // Membership/status recovery can precede transport-address recovery:
+    // gossip may temporarily retain a peer's ephemeral source port. Do not
+    // assert remote delivery until every node has relearned the authoritative
+    // listen addresses. This is the same transport invariant enforced by the
+    // rolling-restart and five-node split-brain recovery tests.
+    let expected_addresses = [
+        (node_a, addr_a),
+        (node_b, addr_b),
+        (node_c, addr_c),
+    ];
+    pump_until_addresses_converge(
+        &mut [&mut rt_a, &mut rt_b, &mut rt_c],
+        &expected_addresses,
+        Duration::from_secs(15),
     );
 
     // Prove the healed cluster does real cross-boundary work: C sends a
