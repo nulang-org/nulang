@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Runtime actor schema identity — 2026-09-29
+- **Actors spawned from compiler-produced module metadata now retain their canonical `ActorMeta.name`.** Module actors no longer discard their owning schema in favor of only `actor_<id>`; manually spawned/native actors keep their synthetic runtime instance names. This is the prerequisite for target-schema behavior ownership and durable recovery checks.
+
 ### Nominal actor behavior identity — 2026-09-29
 - **Statically-known actor receivers now preserve their nominal schema through HIR/MIR behavior resolution.** Colliding short behavior names such as `First.hit` and `Second.hit` no longer select another actor schema by global suffix order; qualified identities win, while ambiguous dynamic short-name fallback fails closed.
 
