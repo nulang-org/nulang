@@ -1,9 +1,7 @@
 //! SQLite persistence for goals, tasks, and conversations.
 
 use chrono::{DateTime, Utc};
-use nulang_ai_core::{
-    AgentRole, ConversationState, Goal, GoalGraph, GoalStatus, Task, TaskStatus,
-};
+use nulang_ai_core::{AgentRole, ConversationState, Goal, GoalGraph, GoalStatus, Task, TaskStatus};
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
