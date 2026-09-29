@@ -652,6 +652,48 @@ fn test_jit_direct_call_loop_tiers_up() {
 }
 
 #[test]
+fn branchy_hot_loop_compiles_a_native_region() {
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    // Same control-flow shape as the branch_loop JIT telemetry workload, but
+    // short enough for a focused regression test while still exceeding the
+    // first-tier HOT_THRESHOLD.
+    let source = "var sum = 0; var i = 0; while i < 5000 { if i < 2500 then { sum = sum + i } else { sum = sum - 1 }; i = i + 1; }; sum";
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_branch_loop_coverage").expect("codegen");
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interpreter branch loop should run");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let actual = jit_vm.run().expect("JIT branch loop should run");
+
+    assert_eq!(
+        actual.as_int(),
+        expected.as_int(),
+        "branch-containing hot loop must preserve interpreter semantics"
+    );
+    assert_eq!(expected.as_int(), Some(3_121_250), "branch-loop result is wrong");
+    assert!(
+        jit_vm.jit_compiled_count() > 0,
+        "a hot loop with an internal conditional branch should compile at least one native region"
+    );
+}
+
+#[test]
 fn test_jit_direct_call_recursion_stays_interpreter() {
     // Recursive calls (fib -> fib) are in a direct-call cycle and must NOT be
     // folded into a compiled region: the re-entrant helper consumes native
