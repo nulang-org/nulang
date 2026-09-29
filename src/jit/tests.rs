@@ -687,7 +687,11 @@ fn branchy_hot_loop_compiles_a_native_region() {
         expected.as_int(),
         "branch-containing hot loop must preserve interpreter semantics"
     );
-    assert_eq!(expected.as_int(), Some(3_121_250), "branch-loop result is wrong");
+    assert_eq!(
+        expected.as_int(),
+        Some(3_121_250),
+        "branch-loop result is wrong"
+    );
     assert!(
         jit_vm.jit_compiled_count() > 0,
         "a hot loop with an internal conditional branch should compile at least one native region; instructions={instructions:?}"
