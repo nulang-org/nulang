@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Current hard-kill durability proof — 2026-09-29
+- **Atomic libSQL transitions are now exercised across a real process kill.** The test child acknowledges only after `commit_transition()` returns, is immediately terminated by the parent, and the same database is reopened to verify sequence, snapshot state, and workflow history.
+- **Completed durable external-effect receipts survive the same hard-kill boundary and replay without redispatch.** Recovery must return the recorded provider result and must not append a new durable transition.
+- **The release durability script runs this destructive gate with the minimal `sqlite` feature profile.** The legacy JSON store remains intentionally fail-closed for atomic durable effects rather than being treated as equivalent persistent proof.
+
 ### Paired Criterion regression confirmation — 2026-09-29
 - **Historical benchmark alerts now emit a machine-readable regression manifest and trigger an exact-parent Criterion A/B confirmation instead of re-running only the candidate.** Base and candidate builds use isolated Cargo targets, measured runs alternate order on one host, and the benchmark process is pinned to one logical CPU by default.
 - **A historical alert blocks only when the paired median latency regression exceeds that benchmark's own historical threshold and its bootstrap 95% ratio interval remains above 1.0.** Shared-runner drift can still be recorded and investigated without being misattributed to the latest commit.
