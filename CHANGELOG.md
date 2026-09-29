@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Local-send layer probes — 2026-09-29
+- **The same-host Nulang A/B harness now decomposes one-value local sends into mailbox-only, actor-lookup + mailbox, actor-lookup + mailbox + ready-state publication, and full `send_message_by_id` measurements.** This makes the next actor-runtime optimization target measurable before changing routing, scheduling, GC, or receive-wake semantics.
+
 ### Paired Criterion regression confirmation — 2026-09-29
 - **Historical benchmark alerts now emit a machine-readable regression manifest and trigger an exact-parent Criterion A/B confirmation instead of re-running only the candidate.** Base and candidate builds use isolated Cargo targets, measured runs alternate order on one host, and the benchmark process is pinned to one logical CPU by default.
 - **A historical alert blocks only when the paired median latency regression exceeds that benchmark's own historical threshold and its bootstrap 95% ratio interval remains above 1.0.** Shared-runner drift can still be recorded and investigated without being misattributed to the latest commit.
