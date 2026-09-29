@@ -7614,3 +7614,18 @@ fn p0_cross_shard_named_send_resolves_only_on_owner() {
         "unknown cross-shard behavior must not execute behavior zero"
     );
 }
+
+#[test]
+fn test_primitive_local_message_scans_object_refs_once_at_admission() {
+    let mut rt = Runtime::new();
+    let receiver = rt.spawn_actor(Box::new(|| vec![]));
+
+    rt.object_ref_scan_count = 0;
+    rt.send_message_by_id(receiver, 0, &[Value::int(42)]);
+    rt.run_scheduler();
+
+    assert_eq!(
+        rt.object_ref_scan_count, 1,
+        "primitive local delivery should scan ObjectRefs once at mailbox admission"
+    );
+}

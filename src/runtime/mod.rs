@@ -559,6 +559,8 @@ pub struct Runtime {
     // privileged host effects must not have a pre-authority dispatch hook.
     #[cfg(test)]
     test_handlers: HashMap<String, Box<dyn Fn(&[Value]) -> Option<Value>>>,
+    #[cfg(test)]
+    object_ref_scan_count: u64,
     /// Cryptographic provider (hashing, random, signing).
     /// Defaults to [`crate::backends::DefaultCryptoProvider`].
     pub crypto: Box<dyn crate::backends::CryptoProvider>,
@@ -699,6 +701,8 @@ impl Runtime {
             http_server: None,
             #[cfg(test)]
             test_handlers: HashMap::new(),
+            #[cfg(test)]
+            object_ref_scan_count: 0,
             shard_idx: 0,
             shard_count: 1,
             cross_shard_tx: None,
@@ -3468,12 +3472,6 @@ impl Runtime {
     /// its local references or exits first.  Holds are recorded on the
     /// receiver's `OrcaGc` and released by [`release_held_foreign_refs`].
     fn hold_payload_refs(&mut self, receiver_id: u64, payload: &[Value]) {
-        // Object refs are acquired at mailbox admission so the backing bytes
-        // remain alive while a message waits to be processed. Keep this call
-        // as a fallback for direct/internal delivery paths; actor-level set
-        // semantics make repeated acquisition a no-op.
-        self.hold_object_refs(receiver_id, payload);
-
         for value in payload {
             if value.is_object() {
                 continue;
@@ -3510,6 +3508,10 @@ impl Runtime {
     /// release its creator reference immediately after a successful send.
     /// Duplicate ObjectIds are held only once per actor.
     fn hold_object_refs(&mut self, receiver_id: u64, payload: &[Value]) {
+        #[cfg(test)]
+        {
+            self.object_ref_scan_count += 1;
+        }
         for value in payload {
             let Some(id) = value.as_object_id() else {
                 continue;
