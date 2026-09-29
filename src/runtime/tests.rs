@@ -4694,11 +4694,13 @@ fn advance_all(nodes: &mut [&mut Runtime], step: Duration) {
         rt.process_network();
     }
     // Let the real loopback TCP threads deliver packets written this
-    // round before the next round reads them. 10 ms (was 2 ms): under
-    // heavy CI load the reader threads can be delayed past the virtual
-    // heartbeat deadline, making heartbeats appear lost and breaking
-    // convergence (observed flake: 5-node split-brain test).
+    // round before virtual time advances again. Under CI load a packet
+    // may arrive during this yield; drain once more at the SAME virtual
+    // timestamp so failure detection cannot outrun real TCP delivery.
     sleep(Duration::from_millis(10));
+    for rt in nodes.iter_mut() {
+        rt.process_network();
+    }
 }
 
 /// The status of `node` in `rt`'s cluster view, if known.
