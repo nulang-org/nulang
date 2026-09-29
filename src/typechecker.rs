@@ -1921,10 +1921,15 @@ impl TypeChecker {
             Expr::Block { exprs, span } => self.infer_block(ctx, exprs, *span),
 
             // Par: validate independence now, even though execution remains
-            // sequential until RFC 0024's scoped-concurrency backend lands.
+            // sequential until RFC 0026's scoped-concurrency backend lands.
+            // Every non-empty branch contributes a result in source order.
             Expr::Par { exprs, span } => {
                 crate::parallel_analysis::validate_parallel_branches(exprs, *span)?;
-                self.infer_block(ctx, exprs, *span)
+                if exprs.is_empty() {
+                    Ok((vec![], Type::unit()))
+                } else {
+                    self.infer_tuple(ctx, exprs, *span)
+                }
             }
 
             // Spawn actor
