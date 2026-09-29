@@ -171,11 +171,7 @@ pub struct Task {
 }
 
 impl Task {
-    pub fn new(
-        goal_id: Uuid,
-        description: impl Into<String>,
-        role: impl Into<AgentRole>,
-    ) -> Self {
+    pub fn new(goal_id: Uuid, description: impl Into<String>, role: impl Into<AgentRole>) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
