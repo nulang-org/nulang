@@ -7,6 +7,12 @@ use uuid::Uuid;
 
 pub trait Manager: Send + Sync {
     fn role(&self) -> AgentRole;
+
+    #[allow(deprecated)]
+    fn manager_kind(&self) -> nulang_ai_core::ManagerKind {
+        self.role()
+    }
+
     fn plan_tasks(&self, goal_id: Uuid, intent: &str, budget_usd: f64) -> Vec<Task>;
 }
 
