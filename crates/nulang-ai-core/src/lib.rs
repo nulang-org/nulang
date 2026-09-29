@@ -444,4 +444,28 @@ mod tests {
         let roundtrip: SwarmEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtrip, event);
     }
+
+    #[test]
+    fn checked_in_nlap_schema_covers_task_attempt_contract() {
+        let domain: serde_json::Value =
+            serde_json::from_str(include_str!("../../../spec/agent/v1/domain.schema.json"))
+                .unwrap();
+        assert!(domain["properties"].get("task_attempt").is_some());
+        assert!(domain["properties"].get("task_lease").is_some());
+        assert!(domain["$defs"].get("task_attempt").is_some());
+        assert!(domain["$defs"].get("task_lease").is_some());
+
+        let events: serde_json::Value =
+            serde_json::from_str(include_str!("../../../spec/agent/v1/events.schema.json"))
+                .unwrap();
+        let event_types: Vec<&str> = events["properties"]["event"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|event| event["properties"]["type"]["const"].as_str())
+            .collect();
+
+        assert!(event_types.contains(&"task_attempt_started"));
+        assert!(event_types.contains(&"task_attempt_finished"));
+    }
 }
