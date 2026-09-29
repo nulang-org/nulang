@@ -2418,6 +2418,14 @@ impl Runtime {
         self.current_actor = prev;
     }
 
+    #[inline]
+    fn plain_local_send_fast_path_available(&self, target_is_local: bool) -> bool {
+        target_is_local
+            && self.shard_count == 1
+            && self.migrated_actors.is_empty()
+            && self.actor_grain_id.is_empty()
+    }
+
     #[tracing::instrument(level = "trace", skip(self, args))]
     pub fn send_message_by_id(&mut self, target_id: u64, behavior_id: u16, args: &[Value]) {
         // Stamp the outgoing message with the current handler's trace span (if
@@ -2430,6 +2438,16 @@ impl Runtime {
         let out_trace = self.current_trace.as_ref().map(|t| t.to_traceparent());
         let sender = self.current_actor.unwrap_or(0);
         let target_is_local = self.actors.contains_key(&target_id);
+
+        // Plain local actors are the dominant send path. If there is no
+        // migration state, no resident grain state, and only one shard, none
+        // of the routing layers below can change the destination. Bypass their
+        // map probes and hand the message directly to local admission.
+        if self.plain_local_send_fast_path_available(target_is_local) {
+            self.deliver_local_message(target_id, behavior_id, args, out_trace);
+            return;
+        }
+
         // Cross-node routing by bare actor-ref value (RFC-0007 gap): a
         // spawn@node placeholder or reply-by-ref id whose hosting node we
         // know routes over the wire instead of the local mailbox. The
