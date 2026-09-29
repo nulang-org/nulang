@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::durable_effect::DurableEffectId;
@@ -899,9 +899,98 @@ impl PersistenceStore for MemoryStore {
     }
 }
 
+/// Canonical JSON-file representation of one RFC 0022 transition.
+///
+/// Durable-effect records use their existing versioned JSON encoding so the
+/// persistence layer does not create a second serialization contract for them.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct JsonDurableTransitionRecord {
+    version: u16,
+    actor_id: u64,
+    activation_epoch: u64,
+    sequence: u64,
+    expected_previous_sequence: u64,
+    command: Option<JournalEntry>,
+    snapshot: Option<ActorSnapshot>,
+    workflow_events: Vec<WorkflowEvent>,
+    domain_events: Vec<EventEntry>,
+    durable_effects: Vec<Vec<u8>>,
+    outbox: Vec<DurableOutboxMessage>,
+    digest: [u8; 32],
+}
+
+impl JsonDurableTransitionRecord {
+    fn from_transition(transition: &DurableTransition, digest: [u8; 32]) -> io::Result<Self> {
+        Ok(Self {
+            version: transition.version,
+            actor_id: transition.actor_id,
+            activation_epoch: transition.activation_epoch,
+            sequence: transition.sequence,
+            expected_previous_sequence: transition.expected_previous_sequence,
+            command: transition.command.clone(),
+            snapshot: transition.snapshot.clone(),
+            workflow_events: transition.workflow_events.clone(),
+            domain_events: transition.domain_events.clone(),
+            durable_effects: transition
+                .durable_effects
+                .iter()
+                .map(|record| {
+                    record
+                        .to_json()
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                })
+                .collect::<io::Result<Vec<_>>>()?,
+            outbox: transition.outbox.clone(),
+            digest,
+        })
+    }
+
+    fn to_transition(&self) -> io::Result<DurableTransition> {
+        let transition = DurableTransition {
+            version: self.version,
+            actor_id: self.actor_id,
+            activation_epoch: self.activation_epoch,
+            sequence: self.sequence,
+            expected_previous_sequence: self.expected_previous_sequence,
+            command: self.command.clone(),
+            snapshot: self.snapshot.clone(),
+            workflow_events: self.workflow_events.clone(),
+            domain_events: self.domain_events.clone(),
+            durable_effects: self
+                .durable_effects
+                .iter()
+                .map(|bytes| {
+                    DurableEffectPersistenceRecord::from_json(bytes)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                })
+                .collect::<io::Result<Vec<_>>>()?,
+            outbox: self.outbox.clone(),
+        };
+        transition.validate_structure()?;
+        let digest = transition.digest()?;
+        if digest != self.digest {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "JSON durable transition digest mismatch",
+            ));
+        }
+        Ok(transition)
+    }
+
+    fn tail(&self) -> DurableTail {
+        DurableTail {
+            activation_epoch: self.activation_epoch,
+            sequence: self.sequence,
+            digest: self.digest,
+        }
+    }
+}
+
 /// File-backed persistence store using JSON.
-/// Each actor gets `<base_dir>/<actor_id>/snapshot.json`, `journal.jsonl`,
-/// and `workflow_events.jsonl`.
+///
+/// Legacy snapshot/journal JSON files remain readable. New RFC 0022 atomic
+/// commits use one framed append-only `transitions.log` per actor as the
+/// canonical commit record.
 #[derive(Debug, Clone)]
 pub struct JsonFileStore {
     base_dir: PathBuf,
@@ -933,9 +1022,291 @@ impl JsonFileStore {
     fn events_path(&self, actor_id: u64) -> PathBuf {
         self.actor_dir(actor_id).join("events.jsonl")
     }
+
+    fn transitions_path(&self, actor_id: u64) -> PathBuf {
+        self.actor_dir(actor_id).join("transitions.log")
+    }
+
+    fn load_legacy_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
+        let path = self.snapshot_path(actor_id);
+        let data = fs::read_to_string(&path).ok()?;
+        match serde_json::from_str(&data) {
+            Ok(snapshot) => Some(snapshot),
+            Err(e) => {
+                warn!(
+                    "nulang-persist: failed to parse snapshot for actor {} at {}: {}",
+                    actor_id,
+                    path.display(),
+                    e
+                );
+                None
+            }
+        }
+    }
+
+    fn read_legacy_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
+        let data = match fs::read_to_string(self.journal_path(actor_id)) {
+            Ok(data) => data,
+            Err(_) => return Vec::new(),
+        };
+        data.lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    fn read_legacy_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
+        let data = match fs::read_to_string(self.workflow_events_path(actor_id)) {
+            Ok(data) => data,
+            Err(_) => return Vec::new(),
+        };
+        data.lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    fn read_legacy_events(&self, actor_id: u64) -> Vec<EventEntry> {
+        let data = match fs::read_to_string(self.events_path(actor_id)) {
+            Ok(data) => data,
+            Err(_) => return Vec::new(),
+        };
+        data.lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    fn read_transition_records(
+        &self,
+        actor_id: u64,
+    ) -> io::Result<(Vec<JsonDurableTransitionRecord>, u64)> {
+        const MAGIC: &[u8; 4] = b"NDT1";
+        const HEADER_LEN: usize = 12;
+        const CHECKSUM_LEN: usize = 32;
+
+        let path = self.transitions_path(actor_id);
+        let data = match fs::read(&path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), 0));
+            }
+            Err(error) => return Err(error),
+        };
+
+        let mut records = Vec::new();
+        let mut offset = 0usize;
+        while offset < data.len() {
+            // A short final header proves the last append never completed.
+            if data.len() - offset < HEADER_LEN {
+                return Ok((records, offset as u64));
+            }
+            if &data[offset..offset + 4] != MAGIC {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "corrupt JSON durable transition framing for actor {} at byte {}",
+                        actor_id, offset
+                    ),
+                ));
+            }
+
+            let mut length_bytes = [0u8; 8];
+            length_bytes.copy_from_slice(&data[offset + 4..offset + HEADER_LEN]);
+            let payload_len = u64::from_be_bytes(length_bytes) as usize;
+            let payload_start = offset + HEADER_LEN;
+            let Some(payload_end) = payload_start.checked_add(payload_len) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "JSON durable transition frame length overflow",
+                ));
+            };
+            let Some(frame_end) = payload_end.checked_add(CHECKSUM_LEN) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "JSON durable transition checksum offset overflow",
+                ));
+            };
+
+            // Missing payload/checksum at EOF is a torn final append. It is
+            // safe to ignore because sync_all never reported this frame as a
+            // completed commit.
+            if frame_end > data.len() {
+                return Ok((records, offset as u64));
+            }
+
+            let payload = &data[payload_start..payload_end];
+            let expected = blake3::hash(payload);
+            if expected.as_bytes() != &data[payload_end..frame_end] {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "JSON durable transition checksum mismatch for actor {} at byte {}",
+                        actor_id, offset
+                    ),
+                ));
+            }
+
+            let record: JsonDurableTransitionRecord = serde_json::from_slice(payload)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if record.actor_id != actor_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "JSON durable transition actor id does not match journal directory",
+                ));
+            }
+            record.to_transition()?;
+            records.push(record);
+            offset = frame_end;
+        }
+
+        Ok((records, offset as u64))
+    }
+
+    fn append_transition_record(
+        &self,
+        actor_id: u64,
+        record: &JsonDurableTransitionRecord,
+        valid_len: u64,
+    ) -> io::Result<()> {
+        const MAGIC: &[u8; 4] = b"NDT1";
+
+        let dir = self.actor_dir(actor_id);
+        fs::create_dir_all(&dir)?;
+        let payload = serde_json::to_vec(record)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let payload_len = u64::try_from(payload.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "JSON durable transition payload is too large",
+            )
+        })?;
+        let checksum = blake3::hash(&payload);
+        let path = self.transitions_path(actor_id);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)?;
+
+        // Remove only a proven torn final frame before retrying. Earlier
+        // corruption is rejected by read_transition_records and never reaches
+        // this point.
+        file.set_len(valid_len)?;
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(MAGIC)?;
+        file.write_all(&payload_len.to_be_bytes())?;
+        file.write_all(&payload)?;
+        file.write_all(checksum.as_bytes())?;
+        file.sync_all()
+    }
+
+    fn legacy_latest_sequence(&self, actor_id: u64) -> u64 {
+        let snapshot = self
+            .load_legacy_snapshot(actor_id)
+            .map(|snapshot| snapshot.sequence)
+            .unwrap_or(0);
+        let journal = self
+            .read_legacy_journal(actor_id)
+            .last()
+            .map(|entry| entry.sequence)
+            .unwrap_or(0);
+        let workflow = self
+            .read_legacy_workflow_events(actor_id)
+            .last()
+            .map(WorkflowEvent::sequence)
+            .unwrap_or(0);
+        let events = self
+            .read_legacy_events(actor_id)
+            .last()
+            .map(|entry| entry.sequence)
+            .unwrap_or(0);
+        snapshot.max(journal).max(workflow).max(events)
+    }
 }
 
 impl PersistenceStore for JsonFileStore {
+    fn load_durable_effect(
+        &self,
+        actor_id: u64,
+        effect_id: DurableEffectId,
+    ) -> io::Result<Option<DurableEffectPersistenceRecord>> {
+        let (records, _) = self.read_transition_records(actor_id)?;
+        for record in records.iter().rev() {
+            let transition = record.to_transition()?;
+            if let Some(found) = transition
+                .durable_effects
+                .iter()
+                .rev()
+                .find(|candidate| candidate.effect().spec().id == effect_id)
+            {
+                return Ok(Some(found.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn commit_transition(&mut self, transition: DurableTransition) -> io::Result<DurableCommit> {
+        transition.validate_structure()?;
+        let digest = transition.digest()?;
+        let (records, valid_len) = self.read_transition_records(transition.actor_id)?;
+        let current_tail = records.last().map(JsonDurableTransitionRecord::tail);
+        let legacy_tail = self.legacy_latest_sequence(transition.actor_id);
+
+        if let Some(tail) = current_tail {
+            if transition.activation_epoch == tail.activation_epoch
+                && transition.sequence == tail.sequence
+            {
+                if digest == tail.digest {
+                    return Ok(DurableCommit {
+                        actor_id: transition.actor_id,
+                        activation_epoch: transition.activation_epoch,
+                        sequence: transition.sequence,
+                        digest,
+                    });
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "conflicting durable transition already committed at this epoch/sequence",
+                ));
+            }
+            if transition.activation_epoch < tail.activation_epoch {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "stale durable activation epoch {}; committed epoch is {}",
+                        transition.activation_epoch, tail.activation_epoch
+                    ),
+                ));
+            }
+            let effective_tail = tail.sequence.max(legacy_tail);
+            if transition.expected_previous_sequence != effective_tail {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "durable transition predecessor {} does not match persisted tail {}",
+                        transition.expected_previous_sequence, effective_tail
+                    ),
+                ));
+            }
+        } else if transition.expected_previous_sequence != legacy_tail {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "first atomic durable transition predecessor {} does not match legacy tail {}",
+                    transition.expected_previous_sequence, legacy_tail
+                ),
+            ));
+        }
+
+        let record = JsonDurableTransitionRecord::from_transition(&transition, digest)?;
+        self.append_transition_record(transition.actor_id, &record, valid_len)?;
+
+        Ok(DurableCommit {
+            actor_id: transition.actor_id,
+            activation_epoch: transition.activation_epoch,
+            sequence: transition.sequence,
+            digest,
+        })
+    }
+
     fn save_snapshot(&mut self, snapshot: ActorSnapshot) -> io::Result<()> {
         let dir = self.actor_dir(snapshot.actor_id);
         fs::create_dir_all(&dir)?;
@@ -956,23 +1327,22 @@ impl PersistenceStore for JsonFileStore {
     }
 
     fn load_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
-        let path = self.snapshot_path(actor_id);
-        // A missing file is the normal "no snapshot yet" case — stay silent.
-        let data = fs::read_to_string(&path).ok()?;
-        match serde_json::from_str(&data) {
-            Ok(snapshot) => Some(snapshot),
-            Err(e) => {
-                // A present-but-unparseable snapshot means corruption (e.g. an
-                // older non-atomic write); log it instead of silently resetting
-                // the actor's durable state on recovery.
+        let legacy = self.load_legacy_snapshot(actor_id);
+        let atomic = match self.read_transition_records(actor_id) {
+            Ok((records, _)) => records.into_iter().rev().find_map(|record| record.snapshot),
+            Err(error) => {
                 warn!(
-                    "nulang-persist: failed to parse snapshot for actor {} at {}: {}",
-                    actor_id,
-                    path.display(),
-                    e
+                    "nulang-persist: refusing snapshot recovery for actor {} because transitions.log is corrupt: {}",
+                    actor_id, error
                 );
-                None
+                return None;
             }
+        };
+
+        match (legacy, atomic) {
+            (Some(legacy), Some(atomic)) if legacy.sequence > atomic.sequence => Some(legacy),
+            (_, Some(atomic)) => Some(atomic),
+            (legacy, None) => legacy,
         }
     }
 
@@ -994,14 +1364,20 @@ impl PersistenceStore for JsonFileStore {
     }
 
     fn read_journal(&self, actor_id: u64) -> Vec<JournalEntry> {
-        let path = self.journal_path(actor_id);
-        let data = match fs::read_to_string(path) {
-            Ok(d) => d,
-            Err(_) => return Vec::new(),
+        let mut entries = self.read_legacy_journal(actor_id);
+        let records = match self.read_transition_records(actor_id) {
+            Ok((records, _)) => records,
+            Err(error) => {
+                warn!(
+                    "nulang-persist: refusing atomic journal recovery for actor {}: {}",
+                    actor_id, error
+                );
+                return Vec::new();
+            }
         };
-        data.lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect()
+        entries.extend(records.into_iter().filter_map(|record| record.command));
+        entries.sort_by_key(|entry| entry.sequence);
+        entries
     }
 
     fn append_workflow_event(&mut self, actor_id: u64, event: WorkflowEvent) -> io::Result<()> {
@@ -1022,14 +1398,22 @@ impl PersistenceStore for JsonFileStore {
     }
 
     fn read_workflow_events(&self, actor_id: u64) -> Vec<WorkflowEvent> {
-        let path = self.workflow_events_path(actor_id);
-        let data = match fs::read_to_string(path) {
-            Ok(d) => d,
-            Err(_) => return Vec::new(),
+        let mut events = self.read_legacy_workflow_events(actor_id);
+        let records = match self.read_transition_records(actor_id) {
+            Ok((records, _)) => records,
+            Err(error) => {
+                warn!(
+                    "nulang-persist: refusing atomic workflow recovery for actor {}: {}",
+                    actor_id, error
+                );
+                return Vec::new();
+            }
         };
-        data.lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect()
+        for record in records {
+            events.extend(record.workflow_events);
+        }
+        events.sort_by_key(WorkflowEvent::sequence);
+        events
     }
 
     fn append_event(&mut self, actor_id: u64, entry: EventEntry) -> io::Result<()> {
@@ -1052,40 +1436,37 @@ impl PersistenceStore for JsonFileStore {
     }
 
     fn read_events(&self, actor_id: u64) -> Vec<EventEntry> {
-        let path = self.events_path(actor_id);
-        let data = match fs::read_to_string(path) {
-            Ok(d) => d,
-            Err(_) => return Vec::new(),
+        let mut events = self.read_legacy_events(actor_id);
+        let records = match self.read_transition_records(actor_id) {
+            Ok((records, _)) => records,
+            Err(error) => {
+                warn!(
+                    "nulang-persist: refusing atomic event recovery for actor {}: {}",
+                    actor_id, error
+                );
+                return Vec::new();
+            }
         };
-        data.lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect()
+        for record in records {
+            events.extend(record.domain_events);
+        }
+        events.sort_by_key(|entry| entry.sequence);
+        events
     }
 
     fn latest_sequence(&self, actor_id: u64) -> u64 {
-        let snapshot_seq = self
-            .load_snapshot(actor_id)
-            .map(|s| s.sequence)
-            .unwrap_or(0);
-        let journal_seq = self
-            .read_journal(actor_id)
-            .last()
-            .map(|e| e.sequence)
-            .unwrap_or(0);
-        let wf_event_seq = self
-            .read_workflow_events(actor_id)
-            .last()
-            .map(|e| e.sequence())
-            .unwrap_or(0);
-        let event_seq = self
-            .read_events(actor_id)
-            .last()
-            .map(|e| e.sequence)
-            .unwrap_or(0);
-        snapshot_seq
-            .max(journal_seq)
-            .max(wf_event_seq)
-            .max(event_seq)
+        let legacy = self.legacy_latest_sequence(actor_id);
+        let atomic = match self.read_transition_records(actor_id) {
+            Ok((records, _)) => records.last().map(|record| record.sequence).unwrap_or(0),
+            Err(error) => {
+                warn!(
+                    "nulang-persist: refusing atomic tail recovery for actor {}: {}",
+                    actor_id, error
+                );
+                return legacy;
+            }
+        };
+        legacy.max(atomic)
     }
 
     fn clear(&mut self, actor_id: u64) -> io::Result<()> {
