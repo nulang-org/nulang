@@ -298,6 +298,18 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
+    fn legacy_manager_source_api_remains_compatible() {
+        let task = Task::new(
+            Uuid::new_v4(),
+            "Legacy engineering task",
+            ManagerKind::Engineering,
+        );
+        assert_eq!(task.manager.as_str(), "engineering");
+        assert_eq!(ManagerKind::Research.as_str(), "research");
+    }
+
+    #[test]
     fn task_keeps_nlap_v1_manager_wire_key_for_custom_roles() {
         let task = Task::new(Uuid::new_v4(), "Draft proposal", AgentRole::new("proposal"));
         let json = serde_json::to_value(&task).unwrap();
