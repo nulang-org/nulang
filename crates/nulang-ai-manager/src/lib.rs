@@ -1,20 +1,20 @@
 //! Manager agents decompose goals into executable tasks.
 
 use chrono::Utc;
-use nulang_ai_core::{ManagerKind, Task, TaskStatus};
+use nulang_ai_core::{AgentRole, Task, TaskStatus};
 use std::time::Duration;
 use uuid::Uuid;
 
 pub trait Manager: Send + Sync {
-    fn manager_kind(&self) -> ManagerKind;
+    fn role(&self) -> AgentRole;
     fn plan_tasks(&self, goal_id: Uuid, intent: &str, budget_usd: f64) -> Vec<Task>;
 }
 
 pub struct EngineeringManager;
 
 impl Manager for EngineeringManager {
-    fn manager_kind(&self) -> ManagerKind {
-        ManagerKind::Engineering
+    fn role(&self) -> AgentRole {
+        AgentRole::new("engineering")
     }
 
     fn plan_tasks(&self, goal_id: Uuid, intent: &str, budget_usd: f64) -> Vec<Task> {
@@ -23,7 +23,7 @@ impl Manager for EngineeringManager {
             id: Uuid::new_v4(),
             goal_id,
             parent_task_id: None,
-            manager: ManagerKind::Engineering,
+            role: self.role(),
             description: format!("Engineering plan for: {}", intent),
             dependencies: Vec::new(),
             required_capabilities: vec!["code".into(), "test".into()],
