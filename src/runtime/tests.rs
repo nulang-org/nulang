@@ -14,6 +14,28 @@ use std::time::{Duration, Instant};
 
 fn noop_test_behavior(_actor: &mut Actor, _args: &[Value]) {}
 
+#[test]
+fn plain_local_send_fast_path_requires_empty_auxiliary_routing_state() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(Vec::new));
+
+    assert!(rt.plain_local_send_fast_path_available(rt.actors.contains_key(&actor_id)));
+
+    rt.migrated_actors
+        .insert(actor_id + 1, (NodeId::LOCAL, Instant::now()));
+    assert!(!rt.plain_local_send_fast_path_available(rt.actors.contains_key(&actor_id)));
+    rt.migrated_actors.clear();
+
+    let grain_id = GrainId::new("BenchFastPath", "unrelated");
+    rt.actor_grain_id.insert(actor_id + 1, grain_id);
+    assert!(!rt.plain_local_send_fast_path_available(rt.actors.contains_key(&actor_id)));
+
+    rt.actor_grain_id.clear();
+    rt.shard_count = 2;
+    assert!(!rt.plain_local_send_fast_path_available(rt.actors.contains_key(&actor_id)));
+}
+
+
 fn declare_test_behavior(rt: &mut Runtime, actor_id: u64, name: &str) {
     rt.actors
         .get_mut(&actor_id)
