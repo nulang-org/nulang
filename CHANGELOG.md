@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Static rejection of impossible typed match patterns — 2026-09-29
+- **Pattern matching now rejects contradictions that are already provable from the scrutinee type.** Unknown variant constructors, variant payload-shape mismatches, tuple arity/type mismatches, and invalid closed-record fields fail during type checking instead of compiling as dead arms that can only fail to match at runtime.
+- **Inference remains conservative for unresolved shapes and open record rows.** This change does not make non-exhaustive matches fatal and does not replace the separate finite-domain coverage diagnostics work.
+
 ### Paired Criterion regression confirmation — 2026-09-29
 - **Historical benchmark alerts now emit a machine-readable regression manifest and trigger an exact-parent Criterion A/B confirmation instead of re-running only the candidate.** Base and candidate builds use isolated Cargo targets, measured runs alternate order on one host, and the benchmark process is pinned to one logical CPU by default.
 - **A historical alert blocks only when the paired median latency regression exceeds that benchmark's own historical threshold and its bootstrap 95% ratio interval remains above 1.0.** Shared-runner drift can still be recorded and investigated without being misattributed to the latest commit.

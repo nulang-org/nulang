@@ -3427,42 +3427,85 @@ impl TypeChecker {
                 let _ = mgu(scrut_ty, &lit_ty, Span::default())?;
                 Ok(ctx.clone())
             }
-            Pattern::Tuple(pats) => {
-                match scrut_ty {
-                    Type::Tuple(tys) if tys.len() == pats.len() => {
-                        let mut new_ctx = ctx.clone();
-                        for (pat, ty) in pats.iter().zip(tys.iter()) {
-                            new_ctx = self.bind_pattern(&new_ctx, pat, ty)?;
-                        }
-                        Ok(new_ctx)
+            Pattern::Tuple(pats) => match scrut_ty {
+                Type::Tuple(tys) => {
+                    if tys.len() != pats.len() {
+                        return Err(NuError::TypeError {
+                            msg: format!(
+                                "Tuple pattern arity mismatch: expected {} elements, found {}",
+                                tys.len(),
+                                pats.len()
+                            ),
+                            span: Span::default(),
+                            expected_type: Some(format!(
+                                "tuple pattern with {} elements",
+                                tys.len()
+                            )),
+                            found_type: Some(format!("tuple pattern with {} elements", pats.len())),
+                            similar_names: None,
+                        });
                     }
-                    _ => {
-                        // Create fresh type vars for tuple elements
-                        let mut new_ctx = ctx.clone();
-                        for pat in pats {
-                            let elem_ty = Type::Var(TypeVar::fresh());
-                            new_ctx = self.bind_pattern(&new_ctx, pat, &elem_ty)?;
-                        }
-                        Ok(new_ctx)
+
+                    let mut new_ctx = ctx.clone();
+                    for (pat, ty) in pats.iter().zip(tys.iter()) {
+                        new_ctx = self.bind_pattern(&new_ctx, pat, ty)?;
                     }
+                    Ok(new_ctx)
                 }
-            }
+                Type::Var(_) => {
+                    // Preserve inference for an unresolved scrutinee shape.
+                    let mut new_ctx = ctx.clone();
+                    for pat in pats {
+                        let elem_ty = Type::Var(TypeVar::fresh());
+                        new_ctx = self.bind_pattern(&new_ctx, pat, &elem_ty)?;
+                    }
+                    Ok(new_ctx)
+                }
+                other => Err(NuError::TypeError {
+                    msg: format!("Tuple pattern requires a tuple scrutinee, found {other}"),
+                    span: Span::default(),
+                    expected_type: Some("tuple".to_string()),
+                    found_type: Some(other.to_string()),
+                    similar_names: None,
+                }),
+            },
             Pattern::Record(pats) => match scrut_ty {
                 Type::Record(fields) => {
                     let mut new_ctx = ctx.clone();
-                    let field_map: FxHashMap<String, Type> =
-                        fields.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
+                    let field_map: FxHashMap<String, Type> = fields
+                        .iter()
+                        .filter(|(name, _)| name != RECORD_ROW_TAIL_FIELD)
+                        .map(|(n, t)| (n.clone(), t.clone()))
+                        .collect();
+                    let is_open = fields.iter().any(|(name, _)| name == RECORD_ROW_TAIL_FIELD);
+
                     for (field_name, pat) in pats {
                         if let Some(ty) = field_map.get(field_name) {
                             new_ctx = self.bind_pattern(&new_ctx, pat, ty)?;
-                        } else {
+                        } else if is_open {
+                            // An open row may contain the field; keep its type
+                            // unconstrained until row unification closes it.
                             let fresh = Type::Var(TypeVar::fresh());
                             new_ctx = self.bind_pattern(&new_ctx, pat, &fresh)?;
+                        } else {
+                            return Err(NuError::TypeError {
+                                msg: format!(
+                                    "Unknown record field `{field_name}` in match pattern"
+                                ),
+                                span: Span::default(),
+                                expected_type: Some(format!(
+                                    "record fields: {}",
+                                    field_map.keys().cloned().collect::<Vec<_>>().join(", ")
+                                )),
+                                found_type: Some(field_name.clone()),
+                                similar_names: None,
+                            });
                         }
                     }
                     Ok(new_ctx)
                 }
-                _ => {
+                Type::Var(_) => {
+                    // Preserve inference for an unresolved scrutinee shape.
                     let mut new_ctx = ctx.clone();
                     for (_, pat) in pats {
                         let fresh = Type::Var(TypeVar::fresh());
@@ -3470,25 +3513,70 @@ impl TypeChecker {
                     }
                     Ok(new_ctx)
                 }
+                other => Err(NuError::TypeError {
+                    msg: format!("Record pattern requires a record scrutinee, found {other}"),
+                    span: Span::default(),
+                    expected_type: Some("record".to_string()),
+                    found_type: Some(other.to_string()),
+                    similar_names: None,
+                }),
             },
             Pattern::Variant(name, pat) => match scrut_ty {
                 Type::Variant(variants) => {
-                    let mut new_ctx = ctx.clone();
-                    if let Some((_, Some(ty))) = variants.iter().find(|(n, _)| n == name) {
-                        if let Some(p) = pat {
-                            new_ctx = self.bind_pattern(&new_ctx, p, ty)?;
+                    let Some((_, payload_ty)) = variants.iter().find(|(n, _)| n == name) else {
+                        return Err(NuError::TypeError {
+                            msg: format!("Unknown variant constructor `{name}` in match pattern"),
+                            span: Span::default(),
+                            expected_type: Some(format!(
+                                "one of: {}",
+                                variants
+                                    .iter()
+                                    .map(|(variant_name, _)| variant_name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )),
+                            found_type: Some(name.clone()),
+                            similar_names: None,
+                        });
+                    };
+
+                    match (payload_ty, pat) {
+                        (Some(ty), Some(payload_pattern)) => {
+                            self.bind_pattern(ctx, payload_pattern, ty)
                         }
+                        (Some(_), None) => Err(NuError::TypeError {
+                            msg: format!("Variant constructor `{name}` requires a payload pattern"),
+                            span: Span::default(),
+                            expected_type: Some("payload pattern".to_string()),
+                            found_type: Some("no payload pattern".to_string()),
+                            similar_names: None,
+                        }),
+                        (None, Some(_)) => Err(NuError::TypeError {
+                            msg: format!("Variant constructor `{name}` does not carry a payload"),
+                            span: Span::default(),
+                            expected_type: Some("no payload pattern".to_string()),
+                            found_type: Some("payload pattern".to_string()),
+                            similar_names: None,
+                        }),
+                        (None, None) => Ok(ctx.clone()),
                     }
-                    Ok(new_ctx)
                 }
-                _ => {
-                    if let Some(p) = pat {
+                Type::Var(_) => {
+                    // Preserve inference for an unresolved scrutinee shape.
+                    if let Some(payload_pattern) = pat {
                         let fresh = Type::Var(TypeVar::fresh());
-                        self.bind_pattern(ctx, p, &fresh)
+                        self.bind_pattern(ctx, payload_pattern, &fresh)
                     } else {
                         Ok(ctx.clone())
                     }
                 }
+                other => Err(NuError::TypeError {
+                    msg: format!("Variant pattern requires a variant scrutinee, found {other}"),
+                    span: Span::default(),
+                    expected_type: Some("variant".to_string()),
+                    found_type: Some(other.to_string()),
+                    similar_names: None,
+                }),
             },
             Pattern::Alias(name, pat) => {
                 let mut new_ctx =
