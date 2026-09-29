@@ -1,9 +1,7 @@
 //! SQLite persistence for goals, tasks, and conversations.
 
 use chrono::{DateTime, Utc};
-use nulang_ai_core::{
-    ConversationState, Goal, GoalGraph, GoalStatus, ManagerKind, Task, TaskStatus,
-};
+use nulang_ai_core::{AgentRole, ConversationState, Goal, GoalGraph, GoalStatus, Task, TaskStatus};
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -141,7 +139,7 @@ impl SqliteStore {
                 task.id.to_string(),
                 task.goal_id.to_string(),
                 task.parent_task_id.map(|u| u.to_string()),
-                manager_kind_str(&task.manager),
+                task.manager.as_str(),
                 task.description,
                 serde_json::to_string(&task.dependencies)?,
                 serde_json::to_string(&task.required_capabilities)?,
@@ -256,7 +254,7 @@ impl SqliteStore {
                     parent_task_id: row
                         .get::<_, Option<String>>(2)?
                         .and_then(|s| Uuid::parse_str(&s).ok()),
-                    manager: parse_manager_kind(row.get(3)?),
+                    manager: AgentRole::new(row.get::<_, String>(3)?),
                     description: row.get(4)?,
                     dependencies: serde_json::from_str(&row.get::<_, String>(5)?)
                         .unwrap_or_default(),
@@ -372,22 +370,27 @@ fn parse_task_status(raw: String) -> TaskStatus {
     }
 }
 
-fn manager_kind_str(kind: &ManagerKind) -> &'static str {
-    match kind {
-        ManagerKind::Engineering => "engineering",
-        ManagerKind::Research => "research",
-        ManagerKind::Operations => "operations",
-        ManagerKind::Data => "data",
-        ManagerKind::Voice => "voice",
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn parse_manager_kind(raw: String) -> ManagerKind {
-    match raw.as_str() {
-        "research" => ManagerKind::Research,
-        "operations" => ManagerKind::Operations,
-        "data" => ManagerKind::Data,
-        "voice" => ManagerKind::Voice,
-        _ => ManagerKind::Engineering,
+    #[test]
+    fn preserves_application_defined_task_roles() {
+        let root = std::env::temp_dir().join(format!("nulang-agent-store-{}", Uuid::new_v4()));
+        let store = SqliteStore::open(&root).unwrap();
+        let mut goal = Goal::new("adacavo", "Draft a proposal", 10.0);
+        store.upsert_goal(&goal).unwrap();
+
+        let task = Task::new(goal.id, "Build proposal", AgentRole::new("proposal"));
+        store.upsert_task(&task).unwrap();
+
+        goal.status = GoalStatus::Running;
+        store.upsert_goal(&goal).unwrap();
+
+        let graph = store.get_goal_graph(goal.id).unwrap();
+        assert_eq!(graph.tasks.len(), 1);
+        assert_eq!(graph.tasks[0].manager.as_str(), "proposal");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -115,13 +115,7 @@
           "format": "uuid"
         },
         "manager": {
-          "enum": [
-            "engineering",
-            "research",
-            "operations",
-            "data",
-            "voice"
-          ]
+          "type": "string"
         },
         "description": {
           "type": "string"
