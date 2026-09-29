@@ -46,6 +46,48 @@ pub enum TaskStatus {
     Cancelled,
 }
 
+/// Open-ended application-defined role identifier for an agent task.
+///
+/// NLAP deliberately does not enumerate product roles: Dev Plane may use
+/// `security` or `reviewer`, while Adacavo may use `proposal` or
+/// `inventory`, without requiring a Nulang protocol change.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AgentRole(String);
+
+impl AgentRole {
+    pub fn new(role: impl Into<String>) -> Self {
+        Self(role.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for AgentRole {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for AgentRole {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl std::fmt::Display for AgentRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Legacy built-in roles retained as a source-compatibility shim.
+///
+/// New code should use `AgentRole` so applications can define roles without
+/// extending Nulang core.
+#[deprecated(note = "use AgentRole for open-ended application-defined roles")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagerKind {
@@ -54,6 +96,20 @@ pub enum ManagerKind {
     Operations,
     Data,
     Voice,
+}
+
+#[allow(deprecated)]
+impl From<ManagerKind> for AgentRole {
+    fn from(value: ManagerKind) -> Self {
+        let role = match value {
+            ManagerKind::Engineering => "engineering",
+            ManagerKind::Research => "research",
+            ManagerKind::Operations => "operations",
+            ManagerKind::Data => "data",
+            ManagerKind::Voice => "voice",
+        };
+        Self::new(role)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -97,7 +153,10 @@ pub struct Task {
     pub id: Uuid,
     pub goal_id: Uuid,
     pub parent_task_id: Option<Uuid>,
-    pub manager: ManagerKind,
+    /// Application-defined role. NLAP v1 retains the legacy wire key
+    /// `manager` for compatibility while allowing arbitrary string values.
+    #[serde(rename = "manager")]
+    pub role: AgentRole,
     pub description: String,
     pub dependencies: Vec<Uuid>,
     pub required_capabilities: Vec<String>,
@@ -112,13 +171,17 @@ pub struct Task {
 }
 
 impl Task {
-    pub fn new(goal_id: Uuid, description: impl Into<String>, manager: ManagerKind) -> Self {
+    pub fn new(
+        goal_id: Uuid,
+        description: impl Into<String>,
+        role: impl Into<AgentRole>,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
             goal_id,
             parent_task_id: None,
-            manager,
+            role: role.into(),
             description: description.into(),
             dependencies: Vec::new(),
             required_capabilities: Vec::new(),
@@ -236,6 +299,14 @@ mod tests {
         assert_eq!(json, "\\\"proposal\\\"");
         let roundtrip: AgentRole = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtrip, role);
+    }
+
+    #[test]
+    fn task_keeps_nlap_v1_manager_wire_key_for_custom_roles() {
+        let task = Task::new(Uuid::new_v4(), "Draft proposal", AgentRole::new("proposal"));
+        let json = serde_json::to_value(&task).unwrap();
+        assert_eq!(json["manager"], "proposal");
+        assert!(json.get("role").is_none());
     }
 
     #[test]
