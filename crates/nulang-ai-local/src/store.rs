@@ -139,7 +139,7 @@ impl SqliteStore {
                 task.id.to_string(),
                 task.goal_id.to_string(),
                 task.parent_task_id.map(|u| u.to_string()),
-                task.role.as_str(),
+                task.manager.as_str(),
                 task.description,
                 serde_json::to_string(&task.dependencies)?,
                 serde_json::to_string(&task.required_capabilities)?,
@@ -254,7 +254,7 @@ impl SqliteStore {
                     parent_task_id: row
                         .get::<_, Option<String>>(2)?
                         .and_then(|s| Uuid::parse_str(&s).ok()),
-                    role: AgentRole::new(row.get::<_, String>(3)?),
+                    manager: AgentRole::new(row.get::<_, String>(3)?),
                     description: row.get(4)?,
                     dependencies: serde_json::from_str(&row.get::<_, String>(5)?)
                         .unwrap_or_default(),
@@ -390,7 +390,7 @@ mod tests {
 
         let graph = store.get_goal_graph(goal.id).unwrap();
         assert_eq!(graph.tasks.len(), 1);
-        assert_eq!(graph.tasks[0].role.as_str(), "proposal");
+        assert_eq!(graph.tasks[0].manager.as_str(), "proposal");
 
         let _ = std::fs::remove_dir_all(root);
     }
