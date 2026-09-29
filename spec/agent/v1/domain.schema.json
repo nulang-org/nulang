@@ -115,8 +115,7 @@
           "format": "uuid"
         },
         "manager": {
-          "type": "string",
-          "minLength": 1
+          "type": "string"
         },
         "description": {
           "type": "string"
