@@ -439,6 +439,9 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("task_attempt_started"));
         assert!(json.contains(&attempt_id.to_string()));
-        assert!(json.contains(""lease_epoch":9"));
+        assert!(json.contains(r#""lease_epoch":9"#));
+
+        let roundtrip: SwarmEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip, event);
     }
 }
