@@ -46,7 +46,7 @@ pub use compiler::*;
 use native_codegen::{
     CraneliftCodegen, NativeCodegenBackend, NativeCompileKind, NativeCompileRequest,
 };
-use region_planner::RegionPlanner;
+use region_planner::{analyze_native_leaf, RegionPlanner};
 #[cfg(test)]
 use region_planner::{
     compute_may_suspend, compute_recursive, direct_call_target, find_compilable_region,
@@ -157,6 +157,11 @@ pub struct JitSession {
     /// Backend-neutral region/safety/type analysis. Cranelift consumes the
     /// resulting plans but does not own the language-level planning rules.
     region_planner: RegionPlanner,
+    /// Separately compiled native thunks for proven straight-line leaves.
+    native_leafs: FxHashMap<(usize, usize), compiler::NativeLeafCall>,
+    /// Static leaf analyses/compilations that failed. Retrying cannot become
+    /// useful until the module changes.
+    native_leaf_rejected: FxHashSet<(usize, usize)>,
     /// Monotonic suffix for replacement compilations. Cranelift keeps prior
     /// function declarations alive, so every promotion needs a fresh symbol.
     promotion_serial: u64,
@@ -177,6 +182,8 @@ impl JitSession {
             hot_counts: Vec::new(),
             typed_regions: FxHashSet::default(),
             region_planner: RegionPlanner::default(),
+            native_leafs: FxHashMap::default(),
+            native_leaf_rejected: FxHashSet::default(),
             tier2_counters: FxHashMap::default(),
             promotion_serial: 0,
         })
@@ -266,6 +273,76 @@ impl JitSession {
 
     fn elapsed_ns(started: std::time::Instant) -> u64 {
         started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+    }
+
+    fn native_leaf_for(
+        &mut self,
+        module_idx: usize,
+        func_idx: usize,
+        module: &crate::bytecode::CodeModule,
+    ) -> Option<compiler::NativeLeafCall> {
+        let key = (module_idx, func_idx);
+        if let Some(existing) = self.native_leafs.get(&key) {
+            return Some(existing.clone());
+        }
+        if self.native_leaf_rejected.contains(&key) {
+            return None;
+        }
+
+        let Some(plan) = analyze_native_leaf(module, func_idx) else {
+            self.native_leaf_rejected.insert(key);
+            return None;
+        };
+
+        let symbol = format!("nulang_leaf_{module_idx}_{func_idx}");
+        let started = std::time::Instant::now();
+        let ptr = match self.codegen.compile(NativeCompileRequest {
+            symbol: &symbol,
+            start_offset: plan.start,
+            num_instrs: plan.body_len,
+            instructions: &module.instructions,
+            optimization: CodegenOptimization::Fast,
+            kind: NativeCompileKind::Leaf,
+        }) {
+            Ok(ptr) => ptr,
+            Err(_) => {
+                self.native_leaf_rejected.insert(key);
+                return None;
+            }
+        };
+
+        let elapsed = Self::elapsed_ns(started);
+        self.compile_stats.fast_compiles = self.compile_stats.fast_compiles.saturating_add(1);
+        self.compile_stats.fast_compile_ns =
+            self.compile_stats.fast_compile_ns.saturating_add(elapsed);
+
+        let leaf = compiler::NativeLeafCall {
+            ptr,
+            ret_reg: plan.ret_reg,
+            clobbers: plan.clobbers,
+        };
+        self.native_leafs.insert(key, leaf.clone());
+        Some(leaf)
+    }
+
+    fn native_leaf_calls_for_region(
+        &mut self,
+        module_idx: usize,
+        module: &crate::bytecode::CodeModule,
+        native_calls: &std::collections::HashMap<usize, usize>,
+    ) -> std::collections::HashMap<usize, compiler::NativeLeafCall> {
+        let mut result = std::collections::HashMap::new();
+        for (&pc, &func_idx) in native_calls {
+            if let Some(leaf) = self.native_leaf_for(module_idx, func_idx, module) {
+                result.insert(pc, leaf);
+            }
+        }
+        result
+    }
+
+    /// Number of separately compiled native leaf thunks.
+    pub fn native_leaf_compiled_count(&self) -> usize {
+        self.native_leafs.len()
     }
 
     /// Tier currently installed for a compiled region.
@@ -366,24 +443,30 @@ impl JitSession {
                             )
                         };
                     } else {
+                        let native_leaf_calls =
+                            self.native_leaf_calls_for_region(module_idx, module, &plan.native_calls);
                         let _ = unsafe {
-                            self.promote_region_baseline(
+                            self.promote_region_baseline_with_leaf_calls(
                                 module_idx,
                                 pc,
                                 region.len,
                                 instructions,
                                 &plan.native_calls,
+                                &native_leaf_calls,
                             )
                         };
                     }
                 } else {
+                    let native_leaf_calls =
+                        self.native_leaf_calls_for_region(module_idx, module, &plan.native_calls);
                     let _ = unsafe {
-                        self.promote_region_baseline(
+                        self.promote_region_baseline_with_leaf_calls(
                             module_idx,
                             pc,
                             region.len,
                             instructions,
                             &plan.native_calls,
+                            &native_leaf_calls,
                         )
                     };
                 }
@@ -448,14 +531,39 @@ impl JitSession {
         instructions: &[crate::bytecode::Instruction],
         native_calls: &std::collections::HashMap<usize, usize>,
     ) -> Option<JitFunctionPtr> {
-        // Check if already compiled
+        self.compile_region_with_leaf_calls(
+            module_idx,
+            start_offset,
+            num_instrs,
+            instructions,
+            native_calls,
+            &std::collections::HashMap::new(),
+        )
+    }
+
+    unsafe fn compile_region_with_leaf_calls(
+        &mut self,
+        module_idx: usize,
+        start_offset: usize,
+        num_instrs: usize,
+        instructions: &[crate::bytecode::Instruction],
+        native_calls: &std::collections::HashMap<usize, usize>,
+        native_leaf_calls: &std::collections::HashMap<usize, compiler::NativeLeafCall>,
+    ) -> Option<JitFunctionPtr> {
         if let Some(region) = self.compiled_entry(module_idx, start_offset) {
             return Some(std::mem::transmute(region.ptr));
         }
 
-        // Build the function
         let func_name = format!("nulang_jit_{}_{}", module_idx, start_offset);
         let started = std::time::Instant::now();
+        let kind = if native_leaf_calls.is_empty() {
+            NativeCompileKind::Scalar { native_calls }
+        } else {
+            NativeCompileKind::ScalarWithLeafCalls {
+                native_calls,
+                native_leaf_calls,
+            }
+        };
 
         match self.codegen.compile(NativeCompileRequest {
             symbol: &func_name,
@@ -463,7 +571,7 @@ impl JitSession {
             num_instrs,
             instructions,
             optimization: CodegenOptimization::Fast,
-            kind: NativeCompileKind::Scalar { native_calls },
+            kind,
         }) {
             Ok(ptr) => {
                 self.store_compiled_with_metadata(
@@ -502,7 +610,27 @@ impl JitSession {
         type_metadata: Option<&crate::jit::typed_compiler::TypeMetadata>,
         native_calls: &std::collections::HashMap<usize, usize>,
     ) -> Option<JitFunctionPtr> {
-        // Check if already compiled
+        self.compile_region_typed_with_leaf_calls(
+            module_idx,
+            start_offset,
+            num_instrs,
+            instructions,
+            type_metadata,
+            native_calls,
+            &std::collections::HashMap::new(),
+        )
+    }
+
+    unsafe fn compile_region_typed_with_leaf_calls(
+        &mut self,
+        module_idx: usize,
+        start_offset: usize,
+        num_instrs: usize,
+        instructions: &[crate::bytecode::Instruction],
+        type_metadata: Option<&crate::jit::typed_compiler::TypeMetadata>,
+        native_calls: &std::collections::HashMap<usize, usize>,
+        native_leaf_calls: &std::collections::HashMap<usize, compiler::NativeLeafCall>,
+    ) -> Option<JitFunctionPtr> {
         if let Some(region) = self.compiled_entry(module_idx, start_offset) {
             return Some(std::mem::transmute(region.ptr));
         }
@@ -544,12 +672,13 @@ impl JitSession {
             // Typed compilation failed: fall through to the scalar compiler.
         }
 
-        self.compile_region(
+        self.compile_region_with_leaf_calls(
             module_idx,
             start_offset,
             num_instrs,
             instructions,
             native_calls,
+            native_leaf_calls,
         )
     }
 
@@ -561,15 +690,42 @@ impl JitSession {
         instructions: &[crate::bytecode::Instruction],
         native_calls: &std::collections::HashMap<usize, usize>,
     ) -> Option<JitFunctionPtr> {
+        self.promote_region_baseline_with_leaf_calls(
+            module_idx,
+            start_offset,
+            num_instrs,
+            instructions,
+            native_calls,
+            &std::collections::HashMap::new(),
+        )
+    }
+
+    unsafe fn promote_region_baseline_with_leaf_calls(
+        &mut self,
+        module_idx: usize,
+        start_offset: usize,
+        num_instrs: usize,
+        instructions: &[crate::bytecode::Instruction],
+        native_calls: &std::collections::HashMap<usize, usize>,
+        native_leaf_calls: &std::collections::HashMap<usize, compiler::NativeLeafCall>,
+    ) -> Option<JitFunctionPtr> {
         let func_name = self.next_promotion_name("nulang_jit_opt", module_idx, start_offset);
         let started = std::time::Instant::now();
+        let kind = if native_leaf_calls.is_empty() {
+            NativeCompileKind::Scalar { native_calls }
+        } else {
+            NativeCompileKind::ScalarWithLeafCalls {
+                native_calls,
+                native_leaf_calls,
+            }
+        };
         match self.codegen.compile(NativeCompileRequest {
             symbol: &func_name,
             start_offset,
             num_instrs,
             instructions,
             optimization: CodegenOptimization::Optimized,
-            kind: NativeCompileKind::Scalar { native_calls },
+            kind,
         }) {
             Ok(ptr) => {
                 self.store_compiled_with_metadata(
@@ -892,6 +1048,10 @@ impl crate::backends::JitBackend for JitSession {
         self.typed_regions.len()
     }
 
+    fn native_leaf_compiled_count(&self) -> usize {
+        self.native_leafs.len()
+    }
+
     fn compile_stats(&self) -> crate::backends::JitCompileStats {
         self.compile_stats
     }
@@ -918,14 +1078,17 @@ impl crate::backends::JitBackend for JitSession {
 
         let plan = self.region_planner.plan(module_idx, pc, module);
         if plan.len >= 3 {
+            let native_leaf_calls =
+                self.native_leaf_calls_for_region(module_idx, module, &plan.native_calls);
             if unsafe {
-                self.compile_region_typed(
+                self.compile_region_typed_with_leaf_calls(
                     module_idx,
                     pc,
                     plan.len,
                     instructions,
                     plan.type_metadata(),
                     &plan.native_calls,
+                    &native_leaf_calls,
                 )
             }
             .is_some()
