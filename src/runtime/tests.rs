@@ -4747,7 +4747,9 @@ fn test_three_node_cluster_split_brain_detects_and_heals() {
     let mut rt_b = start_virtual_clock_node();
     let mut rt_c = start_virtual_clock_node();
 
+    let addr_a = rt_a.distributed.transport.as_ref().unwrap().listen_addr();
     let addr_b = rt_b.distributed.transport.as_ref().unwrap().listen_addr();
+    let addr_c = rt_c.distributed.transport.as_ref().unwrap().listen_addr();
     let node_a = rt_a.distributed.node_id.unwrap();
     let node_b = rt_b.distributed.node_id.unwrap();
     let node_c = rt_c.distributed.node_id.unwrap();
@@ -4846,6 +4848,17 @@ fn test_three_node_cluster_split_brain_detects_and_heals() {
     assert!(
         healed,
         "cluster did not heal after the partition was lifted"
+    );
+
+    // Membership/status recovery can precede transport-address recovery:
+    // gossip may temporarily retain a peer's ephemeral source port. Do not
+    // assert remote delivery until every node has relearned the authoritative
+    // listen addresses.
+    let expected_addresses = [(node_a, addr_a), (node_b, addr_b), (node_c, addr_c)];
+    pump_until_addresses_converge(
+        &mut [&mut rt_a, &mut rt_b, &mut rt_c],
+        &expected_addresses,
+        Duration::from_secs(15),
     );
 
     // Prove the healed cluster does real cross-boundary work: C sends a
@@ -5130,6 +5143,16 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
         }
     }
     assert!(healed, "5-node cluster did not heal after the split-brain");
+
+    // Membership convergence alone does not guarantee that every peer has
+    // relearned the authoritative listen address after a partition.
+    let expected_addresses: Vec<(NodeId, SocketAddr)> =
+        ids.iter().copied().zip(addrs.iter().copied()).collect();
+    pump_until_addresses_converge(
+        &mut nodes.iter_mut().collect::<Vec<_>>(),
+        &expected_addresses,
+        Duration::from_secs(15),
+    );
 
     // Cross-boundary delivery after healing: E (node 4) -> actor on A
     // (node 0).

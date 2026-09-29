@@ -133,6 +133,126 @@ impl Task {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskAttemptStatus {
+    Assigned,
+    Running,
+    AwaitingApproval,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Fenced,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskAttempt {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub worker_id: String,
+    pub lease_epoch: u64,
+    pub status: TaskAttemptStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl TaskAttempt {
+    pub fn new(task_id: Uuid, worker_id: impl Into<String>, lease_epoch: u64) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            task_id,
+            worker_id: worker_id.into(),
+            lease_epoch,
+            status: TaskAttemptStatus::Assigned,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskLease {
+    pub task_id: Uuid,
+    pub attempt_id: Uuid,
+    pub worker_id: String,
+    pub epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskLeaseError {
+    TaskMismatch {
+        expected_task_id: Uuid,
+        task_id: Uuid,
+    },
+    Stale {
+        epoch: u64,
+        current_epoch: u64,
+    },
+    ConflictingOwner {
+        epoch: u64,
+        current_worker_id: String,
+        worker_id: String,
+        current_attempt_id: Uuid,
+        attempt_id: Uuid,
+    },
+}
+
+impl TaskLease {
+    pub fn for_attempt(attempt: &TaskAttempt) -> Self {
+        Self {
+            task_id: attempt.task_id,
+            attempt_id: attempt.id,
+            worker_id: attempt.worker_id.clone(),
+            epoch: attempt.lease_epoch,
+        }
+    }
+
+    pub fn authorizes(&self, attempt: &TaskAttempt) -> bool {
+        self.task_id == attempt.task_id
+            && self.attempt_id == attempt.id
+            && self.worker_id == attempt.worker_id
+            && self.epoch == attempt.lease_epoch
+    }
+
+    /// Validate this candidate lease against the currently authoritative lease.
+    ///
+    /// Higher epochs supersede older ownership. The same epoch is idempotent
+    /// only for the exact same worker and attempt; changing either at the same
+    /// epoch is a split-brain conflict. Lower epochs are stale.
+    pub fn validate_against(&self, current: &Self) -> Result<(), TaskLeaseError> {
+        if self.task_id != current.task_id {
+            return Err(TaskLeaseError::TaskMismatch {
+                expected_task_id: current.task_id,
+                task_id: self.task_id,
+            });
+        }
+
+        if self.epoch > current.epoch {
+            return Ok(());
+        }
+
+        if self.epoch < current.epoch {
+            return Err(TaskLeaseError::Stale {
+                epoch: self.epoch,
+                current_epoch: current.epoch,
+            });
+        }
+
+        if self.worker_id == current.worker_id && self.attempt_id == current.attempt_id {
+            return Ok(());
+        }
+
+        Err(TaskLeaseError::ConflictingOwner {
+            epoch: self.epoch,
+            current_worker_id: current.worker_id.clone(),
+            worker_id: self.worker_id.clone(),
+            current_attempt_id: current.attempt_id,
+            attempt_id: self.attempt_id,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentRef {
     pub id: String,
@@ -178,6 +298,19 @@ pub enum SwarmEvent {
     TaskStarted {
         task_id: Uuid,
         agent_id: String,
+    },
+    TaskAttemptStarted {
+        task_id: Uuid,
+        attempt_id: Uuid,
+        worker_id: String,
+        lease_epoch: u64,
+    },
+    TaskAttemptFinished {
+        task_id: Uuid,
+        attempt_id: Uuid,
+        worker_id: String,
+        lease_epoch: u64,
+        status: TaskAttemptStatus,
     },
     TaskProgress {
         task_id: Uuid,
@@ -247,5 +380,92 @@ mod tests {
         );
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("goal_created"));
+    }
+
+    #[test]
+    fn newer_task_lease_epoch_fences_older_attempt() {
+        let task_id = Uuid::new_v4();
+        let old_attempt = TaskAttempt::new(task_id, "worker-a", 4);
+        let new_attempt = TaskAttempt::new(task_id, "worker-b", 5);
+
+        let old_lease = TaskLease::for_attempt(&old_attempt);
+        let new_lease = TaskLease::for_attempt(&new_attempt);
+
+        assert_eq!(new_lease.validate_against(&old_lease), Ok(()));
+        assert!(matches!(
+            old_lease.validate_against(&new_lease),
+            Err(TaskLeaseError::Stale { .. })
+        ));
+    }
+
+    #[test]
+    fn same_task_lease_epoch_cannot_change_owner() {
+        let task_id = Uuid::new_v4();
+        let attempt_a = TaskAttempt::new(task_id, "worker-a", 7);
+        let attempt_b = TaskAttempt::new(task_id, "worker-b", 7);
+
+        let lease_a = TaskLease::for_attempt(&attempt_a);
+        let lease_b = TaskLease::for_attempt(&attempt_b);
+
+        assert!(matches!(
+            lease_b.validate_against(&lease_a),
+            Err(TaskLeaseError::ConflictingOwner { .. })
+        ));
+    }
+
+    #[test]
+    fn task_lease_only_authorizes_exact_attempt() {
+        let task_id = Uuid::new_v4();
+        let attempt = TaskAttempt::new(task_id, "worker-a", 3);
+        let lease = TaskLease::for_attempt(&attempt);
+
+        assert!(lease.authorizes(&attempt));
+
+        let replacement = TaskAttempt::new(task_id, "worker-a", 4);
+        assert!(!lease.authorizes(&replacement));
+    }
+
+    #[test]
+    fn task_attempt_event_carries_fencing_identity() {
+        let task_id = Uuid::new_v4();
+        let attempt_id = Uuid::new_v4();
+        let event = SwarmEvent::TaskAttemptStarted {
+            task_id,
+            attempt_id,
+            worker_id: "worker-a".into(),
+            lease_epoch: 9,
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("task_attempt_started"));
+        assert!(json.contains(&attempt_id.to_string()));
+        assert!(json.contains(r#""lease_epoch":9"#));
+
+        let roundtrip: SwarmEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip, event);
+    }
+
+    #[test]
+    fn checked_in_nlap_schema_covers_task_attempt_contract() {
+        let domain: serde_json::Value =
+            serde_json::from_str(include_str!("../../../spec/agent/v1/domain.schema.json"))
+                .unwrap();
+        assert!(domain["properties"].get("task_attempt").is_some());
+        assert!(domain["properties"].get("task_lease").is_some());
+        assert!(domain["$defs"].get("task_attempt").is_some());
+        assert!(domain["$defs"].get("task_lease").is_some());
+
+        let events: serde_json::Value =
+            serde_json::from_str(include_str!("../../../spec/agent/v1/events.schema.json"))
+                .unwrap();
+        let event_types: Vec<&str> = events["properties"]["event"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|event| event["properties"]["type"]["const"].as_str())
+            .collect();
+
+        assert!(event_types.contains(&"task_attempt_started"));
+        assert!(event_types.contains(&"task_attempt_finished"));
     }
 }
