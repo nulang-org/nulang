@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Plain local-send routing shortcut — 2026-09-29
+- **Single-shard plain actors now bypass migration and grain-routing probes when both auxiliary routing tables are empty,** preserving the existing local-admission path while removing common-case hash lookups before mailbox delivery.
+- **A focused runtime contract test keeps the shortcut fail-closed:** it is disabled whenever migration state, grain residency state, or multi-shard routing is present.
+
 ### Scalar local-send fast path — 2026-09-29
 - **Primitive local actor sends now combine mailbox admission, ready-state transition, priority capture, and receive-wait inspection under one target-actor lookup.** Payloads containing object handles or actor-heap pointers continue through the existing object-store/ORCA reference-tracking path unchanged.
 - **Local residency is cached across the remote-ref and grain-hydration routing checks,** removing a redundant actor-table lookup from the common local path while preserving migrated, cross-shard, grain, trace, backpressure, and DLQ behavior.
