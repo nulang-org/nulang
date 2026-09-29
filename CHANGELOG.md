@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Scalar local-send fast path — 2026-09-29
+- **Primitive local actor sends now combine mailbox admission, ready-state transition, priority capture, and receive-wait inspection under one target-actor lookup.** Payloads containing object handles or actor-heap pointers continue through the existing object-store/ORCA reference-tracking path unchanged.
+- **Local residency is cached across the remote-ref and grain-hydration routing checks,** removing a redundant actor-table lookup from the common local path while preserving migrated, cross-shard, grain, trace, backpressure, and DLQ behavior.
+
 ### Local-send layer probes — 2026-09-29
 - **The same-host Nulang A/B harness now decomposes one-value local sends into mailbox-only, actor-lookup + mailbox, actor-lookup + mailbox + ready-state publication, and full `send_message_by_id` measurements.** This makes the next actor-runtime optimization target measurable before changing routing, scheduling, GC, or receive-wake semantics.
 
