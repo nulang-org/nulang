@@ -23,7 +23,7 @@ impl Manager for EngineeringManager {
             id: Uuid::new_v4(),
             goal_id,
             parent_task_id: None,
-            role: self.role(),
+            manager: self.role(),
             description: format!("Engineering plan for: {}", intent),
             dependencies: Vec::new(),
             required_capabilities: vec!["code".into(), "test".into()],
