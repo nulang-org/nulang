@@ -109,6 +109,9 @@ jobs:
         # nextest intentionally does not execute rustdoc tests.
         run: cargo test --locked --doc
 
+      - name: Test benchmark harness scripts
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
       - name: Install cargo-llvm-cov
         if: env.CODECOV_TOKEN != ''
         run: cargo install cargo-llvm-cov --locked
@@ -452,25 +455,26 @@ jobs:
         run: |
           python3 scripts/check_bench_regression.py \
             --latest "benchmarks/${{ github.sha }}.json" \
-            --history-dir benchmarks
+            --history-dir benchmarks \
+            --regressions-out "benchmarks/regressions-${{ github.sha }}.json"
 
-      # Shared GitHub runners occasionally produce an isolated wall-clock
-      # outlier even after the MAD-based noise filter. Confirm a detected
-      # regression with one independent Criterion measurement in the same job.
-      # The collector overwrites this commit's JSON, so history records the
-      # confirmation sample rather than the noisy first pass.
-      - name: Confirm detected regressions
+      # A historical alert is only blocking if the candidate reproduces it
+      # against the exact first parent on the same host and logical CPU. This
+      # distinguishes code regressions from persistent shared-runner drift.
+      - name: Confirm detected regressions with paired parent A/B
         id: regression_confirmation
         if: steps.regression_check.outcome == 'failure'
-        continue-on-error: true
         run: |
-          echo "First benchmark sample exceeded its historical threshold; re-measuring once."
-          cargo bench --locked --bench bench_main
-          python3 scripts/collect_bench_results.py \
-            --out "benchmarks/${{ github.sha }}.json"
-          python3 scripts/check_bench_regression.py \
-            --latest "benchmarks/${{ github.sha }}.json" \
-            --history-dir benchmarks
+          set +e
+          python3 scripts/confirm_bench_regression.py \
+            --base-ref HEAD^ \
+            --manifest "benchmarks/regressions-${{ github.sha }}.json" \
+            --runs 8 \
+            --output "benchmarks/paired-confirmation-${{ github.sha }}.json"
+          status=$?
+          set -e
+          echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Upload results as build artifact
         uses: actions/upload-artifact@v7
@@ -479,6 +483,8 @@ jobs:
           path: |
             benchmarks/${{ github.sha }}.json
             benchmarks/savina-${{ github.sha }}.jsonl
+            benchmarks/regressions-${{ github.sha }}.json
+            benchmarks/paired-confirmation-${{ github.sha }}.json
           retention-days: 90
 
       - name: Persist benchmark history
@@ -487,12 +493,21 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add benchmarks/*.json
+          # Only the canonical Criterion snapshot belongs in rolling history.
+          # Regression manifests and paired A/B reports are diagnostic artifacts,
+          # not collect_bench_results-compatible history inputs.
+          git add "benchmarks/${{ github.sha }}.json"
           git diff --staged --quiet || git commit -m "bench: record results for ${{ github.sha }} [skip ci]"
           git push --force-with-lease origin "HEAD:refs/heads/${BENCH_HISTORY_BRANCH}"
 
-      # Preserve the confirmed sample before failing. A one-off first-pass
-      # outlier no longer blocks main; a reproduced regression still does.
+      # The rolling history alert alone is informational; only a regression
+      # reproduced against the exact parent on the same host blocks the job.
+      - name: Fail the job if paired confirmation failed operationally
+        if: steps.regression_check.outcome == 'failure' && steps.regression_confirmation.outputs.exit_code != '0' && steps.regression_confirmation.outputs.exit_code != '1'
+        run: |
+          echo "Paired benchmark confirmation failed operationally (exit ${{ steps.regression_confirmation.outputs.exit_code }})."
+          exit 1
+
       - name: Fail the job if a regression was confirmed
-        if: steps.regression_check.outcome == 'failure' && steps.regression_confirmation.outcome == 'failure'
+        if: steps.regression_check.outcome == 'failure' && steps.regression_confirmation.outputs.exit_code == '1'
         run: exit 1

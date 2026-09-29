@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Paired Criterion regression confirmation — 2026-09-29
+- **Historical benchmark alerts now emit a machine-readable regression manifest and trigger an exact-parent Criterion A/B confirmation instead of re-running only the candidate.** Base and candidate builds use isolated Cargo targets, measured runs alternate order on one host, and the benchmark process is pinned to one logical CPU by default.
+- **A historical alert blocks only when the paired median latency regression exceeds that benchmark's own historical threshold and its bootstrap 95% ratio interval remains above 1.0.** Shared-runner drift can still be recorded and investigated without being misattributed to the latest commit.
+- **Focused Python tests pin the manifest schema, reject malformed/non-finite thresholds, enforce balanced four-round ordering, preserve report shape for empty manifests, distinguish harness failures from confirmed regressions, and cover regex-safe Criterion filtering plus confirmation statistics.**
+
 ### Criterion teardown isolation for runtime benchmarks — 2026-09-29
 - **Actor, interpreter, bytecode VM, and JIT Criterion fixtures now use `iter_batched_ref` so destruction of prepared runtimes, VMs, mailboxes, and queued messages occurs outside the measured routine.** This removes teardown cost from operation latency signals while keeping setup outside timing.
 - **A benchmark-timing contract test prevents owned `iter_batched` from returning to these fixture families,** and the main benchmark job runs that contract before collecting longitudinal results.
