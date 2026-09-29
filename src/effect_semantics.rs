@@ -170,10 +170,7 @@ mod tests {
     fn suspension_points_are_never_worker_parallel_by_default() {
         for (effect, operation) in [("Timer", "sleep"), ("Signal", "wait"), ("Inference", "ask")] {
             let semantics = classify_effect_operation(effect, operation);
-            assert_eq!(
-                semantics.parallel,
-                ParallelEffectConstraint::SequentialOnly
-            );
+            assert_eq!(semantics.parallel, ParallelEffectConstraint::SequentialOnly);
             assert!(semantics.may_suspend);
         }
     }
