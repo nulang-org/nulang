@@ -370,7 +370,6 @@ fn parse_task_status(raw: String) -> TaskStatus {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
