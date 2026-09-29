@@ -109,13 +109,9 @@
           "format": "uuid"
         },
         "manager": {
-          "enum": [
-            "engineering",
-            "research",
-            "operations",
-            "data",
-            "voice"
-          ]
+          "type": "string",
+          "minLength": 1,
+          "description": "Application-defined agent role. The field name is retained for NLAP v1 wire compatibility."
         },
         "description": {
           "type": "string"
