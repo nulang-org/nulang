@@ -72,18 +72,39 @@ fn memory_store_loads_newest_record_for_logical_effect() {
 }
 
 #[test]
-fn unsupported_store_fails_closed_instead_of_reporting_missing_effect() {
+fn json_store_loads_newest_record_for_logical_effect_after_reopen() {
     let base = std::env::temp_dir().join(format!(
         "nulang_durable_effect_recovery_{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&base);
-    let store = JsonFileStore::new(&base).unwrap();
 
-    let error = store
-        .load_durable_effect(42, spec().id)
-        .expect_err("legacy non-atomic backend must not pretend recovery history is empty");
-    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    let prepared = DurableEffectRecord::prepare(spec(), b"request");
+    let id = prepared.spec().id;
+    let completed = prepared.clone().complete(b"result".to_vec());
+
+    {
+        let mut store = JsonFileStore::new(&base).unwrap();
+        let first = transition(
+            &store,
+            42,
+            1,
+            DurableEffectPersistenceRecord::from_effect(prepared),
+        );
+        store.commit_transition(first).unwrap();
+
+        let second = transition(
+            &store,
+            42,
+            1,
+            DurableEffectPersistenceRecord::from_effect(completed.clone()),
+        );
+        store.commit_transition(second).unwrap();
+    }
+
+    let reopened = JsonFileStore::new(&base).unwrap();
+    let loaded = reopened.load_durable_effect(42, id).unwrap().unwrap();
+    assert_eq!(loaded.effect(), &completed);
 
     let _ = std::fs::remove_dir_all(base);
 }
