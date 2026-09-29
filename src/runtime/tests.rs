@@ -5131,6 +5131,23 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
     }
     assert!(healed, "5-node cluster did not heal after the split-brain");
 
+    // Membership convergence alone does not guarantee that every peer has
+    // relearned the authoritative listen address after a partition. The
+    // heartbeat/discovery path can temporarily retain an ephemeral source
+    // port, so wait for address convergence before asserting cross-boundary
+    // delivery. The rolling-restart test enforces the same transport
+    // precondition before its post-recovery send.
+    let expected_addresses: Vec<(NodeId, SocketAddr)> = ids
+        .iter()
+        .copied()
+        .zip(addrs.iter().copied())
+        .collect();
+    pump_until_addresses_converge(
+        &mut nodes.iter_mut().collect::<Vec<_>>(),
+        &expected_addresses,
+        Duration::from_secs(15),
+    );
+
     // Cross-boundary delivery after healing: E (node 4) -> actor on A
     // (node 0).
     let actor_id = nodes[0].spawn_actor(Box::new(|| vec![("received".to_string(), Value::int(0))]));
