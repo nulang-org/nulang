@@ -672,7 +672,7 @@ fn branchy_hot_loop_compiles_a_native_region() {
     let hir = lower_module(&ast, &tc.inferred_decl_types);
     let mut mir = lower_mir(&hir).expect("mir");
     let module = compile_mir(&mut mir, "jit_branch_loop_coverage").expect("codegen");
-    let opcodes: Vec<OpCode> = module.instructions.iter().map(|ins| ins.opcode).collect();
+    let instructions = module.instructions.clone();
 
     let mut interp = VM::new_without_jit();
     interp.load_module(module.clone());
@@ -690,7 +690,7 @@ fn branchy_hot_loop_compiles_a_native_region() {
     assert_eq!(expected.as_int(), Some(3_121_250), "branch-loop result is wrong");
     assert!(
         jit_vm.jit_compiled_count() > 0,
-        "a hot loop with an internal conditional branch should compile at least one native region; opcodes={opcodes:?}"
+        "a hot loop with an internal conditional branch should compile at least one native region; instructions={instructions:?}"
     );
 }
 
