@@ -404,6 +404,9 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Verify benchmark timing contracts
+        run: python3 -m unittest scripts/tests/test_benchmark_timing_contract.py
+
       - name: Run benchmarks
         run: cargo bench --locked --bench bench_main
 
