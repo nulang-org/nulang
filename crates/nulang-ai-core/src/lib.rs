@@ -328,6 +328,18 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_nlap_schema_accepts_application_defined_agent_roles() {
+        let domain: serde_json::Value =
+            serde_json::from_str(include_str!("../../../spec/agent/v1/domain.schema.json"))
+                .unwrap();
+        let manager = &domain["$defs"]["task"]["properties"]["manager"];
+
+        assert_eq!(manager["type"], "string");
+        assert_eq!(manager["minLength"], 1);
+        assert!(manager.get("enum").is_none());
+    }
+
+    #[test]
     fn goal_roundtrip_json() {
         let goal = Goal::new("demo", "Optimize API", 25.0);
         let json = serde_json::to_string(&goal).unwrap();
