@@ -4855,11 +4855,7 @@ fn test_three_node_cluster_split_brain_detects_and_heals() {
     // assert remote delivery until every node has relearned the authoritative
     // listen addresses. This is the same transport invariant enforced by the
     // rolling-restart and five-node split-brain recovery tests.
-    let expected_addresses = [
-        (node_a, addr_a),
-        (node_b, addr_b),
-        (node_c, addr_c),
-    ];
+    let expected_addresses = [(node_a, addr_a), (node_b, addr_b), (node_c, addr_c)];
     pump_until_addresses_converge(
         &mut [&mut rt_a, &mut rt_b, &mut rt_c],
         &expected_addresses,
@@ -5155,11 +5151,8 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
     // port, so wait for address convergence before asserting cross-boundary
     // delivery. The rolling-restart test enforces the same transport
     // precondition before its post-recovery send.
-    let expected_addresses: Vec<(NodeId, SocketAddr)> = ids
-        .iter()
-        .copied()
-        .zip(addrs.iter().copied())
-        .collect();
+    let expected_addresses: Vec<(NodeId, SocketAddr)> =
+        ids.iter().copied().zip(addrs.iter().copied()).collect();
     pump_until_addresses_converge(
         &mut nodes.iter_mut().collect::<Vec<_>>(),
         &expected_addresses,
