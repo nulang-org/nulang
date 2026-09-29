@@ -489,6 +489,8 @@ pub(crate) fn find_compilable_region_with_calls(
     let mut len = 0;
     let mut first_branch: Option<usize> = None;
     let mut has_back_edge = false;
+    let mut max_forward_target = offset;
+
     for i in offset..instructions.len().min(offset + 500) {
         let op = instructions[i].opcode;
         if op == crate::bytecode::OpCode::Call {
@@ -501,16 +503,21 @@ pub(crate) fn find_compilable_region_with_calls(
         } else if !compiler::is_opcode_compilable(op) {
             break;
         }
-        // Stop *before* return/halt so the VM still executes the return (frame
-        // pop) / halt itself after the JIT region.
-        if matches!(
-            op,
-            crate::bytecode::OpCode::Ret
-                | crate::bytecode::OpCode::RetVal
-                | crate::bytecode::OpCode::Halt
-        ) {
+
+        if op == crate::bytecode::OpCode::Halt {
             break;
         }
+        if matches!(
+            op,
+            crate::bytecode::OpCode::Ret | crate::bytecode::OpCode::RetVal
+        ) {
+            if max_forward_target <= i {
+                break;
+            }
+            len += 1;
+            continue;
+        }
+
         let is_branch = matches!(
             op,
             crate::bytecode::OpCode::Jmp
@@ -527,12 +534,20 @@ pub(crate) fn find_compilable_region_with_calls(
                 }
                 _ => (i as i64 + instructions[i].offset16() as i64) as usize,
             };
+            if target > i {
+                max_forward_target = max_forward_target.max(target);
+            }
             if target >= offset && target < i {
                 has_back_edge = true;
             }
         }
+
         len += 1;
+        if has_back_edge && i >= max_forward_target {
+            break;
+        }
     }
+
     if !has_back_edge && first_branch.unwrap_or(len) < STRAIGHT_LINE_MIN {
         (0, std::collections::HashMap::new())
     } else {
