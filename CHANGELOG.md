@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Structured `par` source-ordered results — 2026-09-29
+- **Experimental `par { ... }` now returns every branch result in source order instead of inheriting block-style last-expression semantics.** Non-empty regions infer and lower to tuples, one branch remains a one-element tuple, and an empty region remains `Unit`. Execution is still sequential.
+- **Unary tuple patterns now preserve their trailing-comma marker.** `(x,)` parses and formats as a one-element tuple pattern rather than collapsing to grouped `x`, keeping one-branch `par` results destructurable and source-round-trippable.
+
 ### Paired Criterion regression confirmation — 2026-09-29
 - **Historical benchmark alerts now emit a machine-readable regression manifest and trigger an exact-parent Criterion A/B confirmation instead of re-running only the candidate.** Base and candidate builds use isolated Cargo targets, measured runs alternate order on one host, and the benchmark process is pinned to one logical CPU by default.
 - **A historical alert blocks only when the paired median latency regression exceeds that benchmark's own historical threshold and its bootstrap 95% ratio interval remains above 1.0.** Shared-runner drift can still be recorded and investigated without being misattributed to the latest commit.
