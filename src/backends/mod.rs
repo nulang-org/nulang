@@ -126,6 +126,11 @@ pub trait JitBackend {
     /// Number of regions compiled through the type-directed path.
     fn typed_compiled_count(&self) -> usize;
 
+    /// Number of separately compiled straight-line native leaf thunks.
+    fn native_leaf_compiled_count(&self) -> usize {
+        0
+    }
+
     /// Aggregate compiler-only latency telemetry. Backends that do not expose
     /// compiler timing may keep the zero-valued default.
     fn compile_stats(&self) -> JitCompileStats {
