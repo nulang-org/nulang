@@ -5042,10 +5042,16 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
         .map(|rt| rt.distributed.node_id.unwrap())
         .collect();
 
-    // Chain-seed: everyone joins through node 0, so gossip converges
-    // transitively.
-    for i in 1..5 {
-        nodes[i].join_cluster(addrs[0]);
+    // Seed every peer explicitly so this split-brain test isolates the
+    // failure-detector/topology behavior from probabilistic gossip discovery.
+    // The runtime still promotes peers through real loopback heartbeat
+    // exchanges; this only removes an unrelated transitive-gossip prerequisite.
+    for i in 0..nodes.len() {
+        for (j, addr) in addrs.iter().enumerate() {
+            if i != j {
+                nodes[i].join_cluster(*addr);
+            }
+        }
     }
     let step = Duration::from_millis(100);
     let mut converged = false;
