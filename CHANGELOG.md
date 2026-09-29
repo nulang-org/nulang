@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Atomic JSON durable transitions — 2026-09-29
+- **JsonFileStore now persists RFC 0022 atomic transitions in a framed, checksummed, fsynced `transitions.log` per actor.** A commit returns only after the complete frame reaches the file durability boundary.
+- **Recovery validates transition structure and digest, ignores only a proven torn final frame, and truncates that torn tail before the next append.** Earlier corruption remains fail-closed.
+- **Legacy snapshot/journal/workflow/domain JSON files remain readable.** Atomic and legacy histories are merged by sequence during recovery so existing local durable state is not discarded.
+- **Durable external-effect receipts are recoverable from the JSON atomic log.** Same-sequence retries are idempotent only for the same digest; conflicting retries and stale activation epochs fail closed.
+
 ### Paired Criterion regression confirmation — 2026-09-29
 - **Historical benchmark alerts now emit a machine-readable regression manifest and trigger an exact-parent Criterion A/B confirmation instead of re-running only the candidate.** Base and candidate builds use isolated Cargo targets, measured runs alternate order on one host, and the benchmark process is pinned to one logical CPU by default.
 - **A historical alert blocks only when the paired median latency regression exceeds that benchmark's own historical threshold and its bootstrap 95% ratio interval remains above 1.0.** Shared-runner drift can still be recorded and investigated without being misattributed to the latest commit.
