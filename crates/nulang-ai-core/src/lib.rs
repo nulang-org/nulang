@@ -228,6 +228,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agent_role_accepts_product_specific_roles() {
+        let role = AgentRole::new("proposal");
+        assert_eq!(role.as_str(), "proposal");
+
+        let json = serde_json::to_string(&role).unwrap();
+        assert_eq!(json, "\\\"proposal\\\"");
+        let roundtrip: AgentRole = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip, role);
+    }
+
+    #[test]
     fn goal_roundtrip_json() {
         let goal = Goal::new("demo", "Optimize API", 25.0);
         let json = serde_json::to_string(&goal).unwrap();
