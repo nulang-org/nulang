@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Structured `par` effect scheduling metadata — 2026-09-29
+- **The compiler now owns a conservative effect-execution classifier for future scoped-task scheduling.** Host operations reuse the canonical `HostReplayClass` registry while parallel scheduling remains a separate axis: unconstrained, actor-thread-only, or sequential-only.
+- **`parallel_analysis` records each branch's strongest effect constraint and suspension capability.** Unknown/custom effects fail closed to sequential scheduling; this does not reject existing `par` programs or enable concurrent execution.
+
 ### Paired Criterion regression confirmation — 2026-09-29
 - **Historical benchmark alerts now emit a machine-readable regression manifest and trigger an exact-parent Criterion A/B confirmation instead of re-running only the candidate.** Base and candidate builds use isolated Cargo targets, measured runs alternate order on one host, and the benchmark process is pinned to one logical CPU by default.
 - **A historical alert blocks only when the paired median latency regression exceeds that benchmark's own historical threshold and its bootstrap 95% ratio interval remains above 1.0.** Shared-runner drift can still be recorded and investigated without being misattributed to the latest commit.
