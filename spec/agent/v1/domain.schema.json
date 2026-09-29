@@ -12,6 +12,12 @@
     },
     "conversation": {
       "$ref": "#/$defs/conversation"
+    },
+    "task_attempt": {
+      "$ref": "#/$defs/task_attempt"
+    },
+    "task_lease": {
+      "$ref": "#/$defs/task_lease"
     }
   },
   "$defs": {
@@ -231,6 +237,80 @@
         "updated_at": {
           "type": "string",
           "format": "date-time"
+        }
+      }
+    },
+    "task_attempt": {
+      "type": "object",
+      "required": [
+        "id",
+        "task_id",
+        "worker_id",
+        "lease_epoch",
+        "status",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "worker_id": {
+          "type": "string"
+        },
+        "lease_epoch": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "status": {
+          "enum": [
+            "assigned",
+            "running",
+            "awaiting_approval",
+            "succeeded",
+            "failed",
+            "cancelled",
+            "fenced"
+          ]
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "task_lease": {
+      "type": "object",
+      "required": [
+        "task_id",
+        "attempt_id",
+        "worker_id",
+        "epoch"
+      ],
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "attempt_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "worker_id": {
+          "type": "string"
+        },
+        "epoch": {
+          "type": "integer",
+          "minimum": 0
         }
       }
     }
