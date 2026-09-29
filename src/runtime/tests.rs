@@ -4854,11 +4854,7 @@ fn test_three_node_cluster_split_brain_detects_and_heals() {
     // gossip may temporarily retain a peer's ephemeral source port. Do not
     // assert remote delivery until every node has relearned the authoritative
     // listen addresses.
-    let expected_addresses = [
-        (node_a, addr_a),
-        (node_b, addr_b),
-        (node_c, addr_c),
-    ];
+    let expected_addresses = [(node_a, addr_a), (node_b, addr_b), (node_c, addr_c)];
     pump_until_addresses_converge(
         &mut [&mut rt_a, &mut rt_b, &mut rt_c],
         &expected_addresses,
@@ -5150,11 +5146,8 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
 
     // Membership convergence alone does not guarantee that every peer has
     // relearned the authoritative listen address after a partition.
-    let expected_addresses: Vec<(NodeId, SocketAddr)> = ids
-        .iter()
-        .copied()
-        .zip(addrs.iter().copied())
-        .collect();
+    let expected_addresses: Vec<(NodeId, SocketAddr)> =
+        ids.iter().copied().zip(addrs.iter().copied()).collect();
     pump_until_addresses_converge(
         &mut nodes.iter_mut().collect::<Vec<_>>(),
         &expected_addresses,
