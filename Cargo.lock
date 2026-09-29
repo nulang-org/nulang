@@ -2551,8 +2551,10 @@ name = "nulang-ai-mcp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "hmac",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -2587,16 +2589,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
-]
-
-[[package]]
-name = "nulang-cloud-control"
-version = "0.1.0"
-dependencies = [
- "nulang-capacity",
- "postgres",
- "serde",
- "serde_json",
 ]
 
 [[package]]

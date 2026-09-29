@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Capability-scoped forge gateway for AI agents — 2026-09-28
+- **AI agents now use a provider-neutral forge contract with exact repository and operation grants instead of ambient forge credentials.** The initial MCP surface covers repository reads, branch creation, file commits, change creation/review/merge, and check reads while keeping merge authority distinct from coding authority.
+- **Forge authority is host-managed and fails closed.** MCP callers cannot inject sessions, grants, operations, expiry, or subject fields; hosted execution can delegate policy, approvals, credentials, and audit to Dev Plane while standalone hosts retain the provider-neutral backend boundary.
+
 ### Backend-neutral JIT compile telemetry — 2026-09-28
 - **JIT backends now expose aggregate Fast and Optimized compilation counts and compiler-only wall time through `JitCompileStats`.** The counters exclude interpreter warm-up and generated-code execution so tiering decisions can separate compile cost from runtime payoff.
 - **`VM::jit_compile_stats` exposes the telemetry without leaking Cranelift-specific APIs**, and the tier-promotion regression requires one Fast plus one Optimized compile across the tested promotion.
