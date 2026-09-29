@@ -3855,10 +3855,9 @@ impl Parser {
         })
     }
 
-    /// Parse a `par { e1; e2; ... }` block — an independence annotation
-    /// (see `Expr::Par`). The sub-expressions are evaluated in order, just
-    /// like a `Block`; the distinct node lets later passes exploit the
-    /// declared independence. Mirrors `parse_block`.
+    /// Parse a `par { e1; e2; ... }` region (see `Expr::Par`). Branches
+    /// still execute sequentially today but produce a source-ordered tuple
+    /// result and retain explicit structure for scoped-concurrency passes.
     fn parse_par(&mut self) -> NuResult<Expr> {
         let span = self.current_span();
         self.advance(); // consume 'par'
@@ -6518,6 +6517,7 @@ impl Parser {
             TokenKind::LParen => {
                 self.advance();
                 let mut pats = Vec::new();
+                let mut saw_comma = false;
                 self.skip_newlines();
                 while self.peek_kind() != &TokenKind::RParen && !self.is_at_end() {
                     pats.push(self.parse_pattern()?);
@@ -6525,10 +6525,11 @@ impl Parser {
                     if !self.consume_if(&TokenKind::Comma) {
                         break;
                     }
+                    saw_comma = true;
                     self.skip_newlines();
                 }
                 self.expect(TokenKind::RParen)?;
-                if pats.len() == 1 {
+                if pats.len() == 1 && !saw_comma {
                     Ok(pats[0].clone())
                 } else {
                     Ok(Pattern::Tuple(pats))

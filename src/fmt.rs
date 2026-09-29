@@ -1121,6 +1121,9 @@ fn fmt_pat(out: &mut String, pat: &Pattern) {
                 }
                 fmt_pat(out, p);
             }
+            if elems.len() == 1 {
+                out.push(',');
+            }
             out.push(')');
         }
         Pattern::Record(fields) => {

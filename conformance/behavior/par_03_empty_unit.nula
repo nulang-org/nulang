@@ -1,0 +1,3 @@
+// par_03 — an empty structured-concurrency region has Unit type.
+let result: Unit = par {}
+perform IO.print(7)
