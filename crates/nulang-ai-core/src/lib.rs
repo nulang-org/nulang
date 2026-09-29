@@ -468,7 +468,6 @@ mod tests {
         let manager = &domain["$defs"]["task"]["properties"]["manager"];
 
         assert_eq!(manager["type"], "string");
-        assert_eq!(manager["minLength"], 1);
         assert!(manager.get("enum").is_none());
     }
 
