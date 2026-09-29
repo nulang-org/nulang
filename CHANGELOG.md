@@ -1,4 +1,7 @@
 # Nulang Changelog
+### Nominal actor behavior identity — 2026-09-29
+- **Statically-known actor receivers now preserve their nominal schema through HIR/MIR behavior resolution.** Colliding short behavior names such as `First.hit` and `Second.hit` no longer select another actor schema by global suffix order; qualified identities win, while ambiguous dynamic short-name fallback fails closed.
+
 ### Paired Criterion regression confirmation — 2026-09-29
 - **Historical benchmark alerts now emit a machine-readable regression manifest and trigger an exact-parent Criterion A/B confirmation instead of re-running only the candidate.** Base and candidate builds use isolated Cargo targets, measured runs alternate order on one host, and the benchmark process is pinned to one logical CPU by default.
 - **A historical alert blocks only when the paired median latency regression exceeds that benchmark's own historical threshold and its bootstrap 95% ratio interval remains above 1.0.** Shared-runner drift can still be recorded and investigated without being misattributed to the latest commit.
