@@ -1,0 +1,32 @@
+name: Refresh Wasmtime lockfile
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/wasmtime-lock-refresh.yml
+
+permissions:
+  contents: read
+
+jobs:
+  lockfile:
+    if: github.head_ref == 'fix/wasmtime-rustsec-20260929'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+      - name: Refresh Wasmtime dependency family
+        run: cargo update -p wasmtime --precise 48.0.3
+      - name: Verify resolved Wasmtime version
+        run: cargo tree --features wasm-backend -i wasmtime | grep -F 'wasmtime v48.0.3'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wasmtime-lockfile
+          path: Cargo.lock
+          retention-days: 1
