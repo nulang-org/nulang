@@ -224,9 +224,7 @@ fn bench_selective_receive(c: &mut Criterion) {
             |b, _| {
                 b.iter_batched_ref(
                     || selective_receive_mailbox(4096, HIT),
-                    |mailbox| {
-                        black_box(mailbox.receive_match(black_box(behavior_ids.as_slice())))
-                    },
+                    |mailbox| black_box(mailbox.receive_match(black_box(behavior_ids.as_slice()))),
                     BatchSize::SmallInput,
                 )
             },
