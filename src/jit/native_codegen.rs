@@ -24,6 +24,14 @@ pub(crate) enum NativeCompileKind<'a> {
     Scalar {
         native_calls: &'a HashMap<usize, usize>,
     },
+    /// Scalar lowering with selected direct calls replaced by proven native
+    /// leaf thunks.
+    ScalarWithLeafCalls {
+        native_calls: &'a HashMap<usize, usize>,
+        native_leaf_calls: &'a HashMap<usize, compiler::NativeLeafCall>,
+    },
+    /// Straight-line leaf thunk. It omits the outer-region scheduler safepoint.
+    Leaf,
     /// Type-directed lowering with guard stripping.
     Typed {
         type_metadata: Option<&'a TypeMetadata>,
@@ -140,6 +148,35 @@ impl CraneliftCodegen {
                 request.num_instrs,
                 request.instructions,
                 native_calls,
+            )
+            .map_err(|e| format!("{e:?}")),
+            NativeCompileKind::ScalarWithLeafCalls {
+                native_calls,
+                native_leaf_calls,
+            } => compiler::compile_bytecode_region_with_options(
+                module,
+                builder_context,
+                ctx,
+                request.symbol,
+                request.start_offset,
+                request.num_instrs,
+                request.instructions,
+                native_calls,
+                native_leaf_calls,
+                true,
+            )
+            .map_err(|e| format!("{e:?}")),
+            NativeCompileKind::Leaf => compiler::compile_bytecode_region_with_options(
+                module,
+                builder_context,
+                ctx,
+                request.symbol,
+                request.start_offset,
+                request.num_instrs,
+                request.instructions,
+                &HashMap::new(),
+                &HashMap::new(),
+                false,
             )
             .map_err(|e| format!("{e:?}")),
             NativeCompileKind::Typed { type_metadata } => {

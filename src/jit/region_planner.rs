@@ -23,6 +23,19 @@ pub(crate) struct RegionPlan {
     pub(crate) type_metadata: TypeMetadata,
 }
 
+/// Backend-neutral proof that a function can run as an isolated native leaf.
+///
+/// Leaf code executes against the caller's physical register buffer, so
+/// `clobbers` is the exact set that must be preserved to recreate the
+/// interpreter's separate callee frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeLeafPlan {
+    pub(crate) start: usize,
+    pub(crate) body_len: usize,
+    pub(crate) ret_reg: u8,
+    pub(crate) clobbers: Vec<u8>,
+}
+
 impl RegionPlan {
     #[inline]
     pub(crate) fn type_metadata(&self) -> Option<&TypeMetadata> {
@@ -114,11 +127,29 @@ pub(crate) fn direct_call_target(
 ) -> Option<usize> {
     use crate::bytecode::{Constant, OpCode};
     const FUNC_VALUE_REG: u8 = 254;
+    const SPILL_TEMP_MIN: u8 = 12;
+    const SPILL_TEMP_MAX: u8 = 14;
+
+    let call = *module.instructions.get(pc)?;
+    if call.opcode != OpCode::Call {
+        return None;
+    }
+    let argc = call.op2;
+
+    // MIR emits one exact staging shape:
+    //   load direct callee -> r254
+    //   [optional SpillLoad -> r12..r14]*
+    //   [optional Move -> r0..r(argc-1)]*
+    //   Call r254, argc, dst
+    //
+    // Do not scan across unrelated code looking for a stale r254 definition.
     let mut p = pc;
     while p > func_start {
         p -= 1;
         let instr = module.instructions[p];
         match instr.opcode {
+            OpCode::Move if instr.op2 < argc => continue,
+            OpCode::SpillLoad if (SPILL_TEMP_MIN..=SPILL_TEMP_MAX).contains(&instr.op3) => continue,
             OpCode::Const0 | OpCode::Const1 | OpCode::Const2 if instr.op1 == FUNC_VALUE_REG => {
                 let idx = match instr.opcode {
                     OpCode::Const0 => 0,
@@ -127,7 +158,7 @@ pub(crate) fn direct_call_target(
                 };
                 return Some(idx);
             }
-            OpCode::ConstM1 if instr.op1 == FUNC_VALUE_REG => return None, // -1 is not a function
+            OpCode::ConstM1 if instr.op1 == FUNC_VALUE_REG => return None,
             OpCode::ConstU if instr.op3 == FUNC_VALUE_REG => {
                 let pool = instr.imm16() as usize;
                 return match module.constants.get(pool) {
@@ -135,8 +166,8 @@ pub(crate) fn direct_call_target(
                     _ => None,
                 };
             }
-            OpCode::Move if instr.op2 == FUNC_VALUE_REG => return None, // indirect
-            _ => {}
+            OpCode::Move if instr.op2 == FUNC_VALUE_REG => return None,
+            _ => return None,
         }
     }
     None
@@ -428,6 +459,130 @@ pub(crate) fn find_compilable_region(
     }
 }
 
+const NATIVE_LEAF_MAX_INSTRS: usize = 32;
+
+/// Prove that a named function can execute as a native leaf thunk.
+///
+/// This is intentionally strict: one straight-line body, no nested calls,
+/// branches, heap/container operations, effects, or suspension. The returned
+/// clobber set is exact for the accepted opcode subset.
+pub(crate) fn analyze_native_leaf(
+    module: &crate::bytecode::CodeModule,
+    func_idx: usize,
+) -> Option<NativeLeafPlan> {
+    use crate::bytecode::OpCode;
+
+    let start = *module.function_table.get(func_idx)?;
+    let mut end = module.instructions.len();
+
+    if let Some(info) = module
+        .debug_functions
+        .iter()
+        .find(|info| info.code_offset == start)
+    {
+        end = end.min(start.saturating_add(info.code_len));
+    }
+    for &offset in &module.function_table {
+        if offset > start {
+            end = end.min(offset);
+        }
+    }
+    for behavior in &module.behaviors {
+        if behavior.code_offset > start {
+            end = end.min(behavior.code_offset);
+        }
+    }
+    if let Some(entry) = module.entry_point {
+        if entry > start {
+            end = end.min(entry);
+        }
+    }
+    if end <= start {
+        return None;
+    }
+
+    let terminal_pc = end - 1;
+    let terminal = *module.instructions.get(terminal_pc)?;
+    let ret_reg = match terminal.opcode {
+        OpCode::Ret => 0,
+        OpCode::RetVal => terminal.op1,
+        _ => return None,
+    };
+
+    let body_len = terminal_pc - start;
+    if body_len > NATIVE_LEAF_MAX_INSTRS {
+        return None;
+    }
+
+    let mut writes = rustc_hash::FxHashSet::default();
+    for instr in &module.instructions[start..terminal_pc] {
+        match instr.opcode {
+            OpCode::Nop => {}
+            OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
+                writes.insert(instr.op1);
+            }
+            OpCode::ConstU => {
+                writes.insert(instr.op3);
+            }
+            OpCode::Load | OpCode::Store | OpCode::Move | OpCode::Dup => {
+                writes.insert(instr.op2);
+            }
+            OpCode::Swap => {
+                writes.insert(instr.op1);
+                writes.insert(instr.op2);
+            }
+            OpCode::IAdd
+            | OpCode::ISub
+            | OpCode::IMul
+            | OpCode::IDiv
+            | OpCode::IMod
+            | OpCode::IPow
+            | OpCode::FPow
+            | OpCode::Xor
+            | OpCode::Shl
+            | OpCode::Shr
+            | OpCode::BitAnd
+            | OpCode::BitOr
+            | OpCode::FAdd
+            | OpCode::FSub
+            | OpCode::FMul
+            | OpCode::FDiv
+            | OpCode::ICmpEq
+            | OpCode::ICmpLt
+            | OpCode::ICmpGt
+            | OpCode::ICmpLe
+            | OpCode::ICmpGe
+            | OpCode::FCmpEq
+            | OpCode::FCmpLt
+            | OpCode::FCmpGt
+            | OpCode::And
+            | OpCode::Or => {
+                writes.insert(instr.op3);
+            }
+            OpCode::INeg => return None,
+            OpCode::Not | OpCode::IToF | OpCode::FToI => {
+                writes.insert(instr.op2);
+            }
+            OpCode::FNeg => {
+                writes.insert(instr.op3);
+            }
+            OpCode::IInc | OpCode::IDec => {
+                writes.insert(instr.op1);
+            }
+            _ => return None,
+        }
+    }
+
+    let mut clobbers: Vec<u8> = writes.into_iter().collect();
+    clobbers.sort_unstable();
+    Some(NativeLeafPlan {
+        start,
+        body_len,
+        ret_reg,
+        clobbers,
+    })
+}
+
 /// The code offset of the function containing `pc` (largest
 /// `function_table[i] <= pc`), bounding `direct_call_target`'s backward walk.
 pub(crate) fn func_start_for(module: &crate::bytecode::CodeModule, pc: usize) -> usize {
@@ -579,6 +734,53 @@ mod planner_tests {
         assert!(
             plan.type_metadata().is_some(),
             "planner should preserve type facts for the backend"
+        );
+    }
+
+    #[test]
+    fn test_native_leaf_analysis_tracks_exact_clobbers() {
+        let mut module = CodeModule::new("native_leaf_analysis");
+        module.function_table.push(0);
+        module.emit(Instruction::new2(OpCode::Move, 0, 15));
+        module.emit(Instruction::new1(OpCode::IInc, 15));
+        module.emit(Instruction::new1(OpCode::RetVal, 15));
+
+        let leaf = analyze_native_leaf(&module, 0).expect("straight-line leaf must be eligible");
+        assert_eq!(leaf.start, 0);
+        assert_eq!(leaf.body_len, 2);
+        assert_eq!(leaf.ret_reg, 15);
+        assert_eq!(leaf.clobbers, vec![15]);
+    }
+
+    #[test]
+    fn test_native_leaf_analysis_rejects_erroring_and_branchy_bodies() {
+        let mut ineg = CodeModule::new("native_leaf_ineg");
+        ineg.function_table.push(0);
+        ineg.emit(Instruction::new2(OpCode::INeg, 0, 15));
+        ineg.emit(Instruction::new1(OpCode::RetVal, 15));
+        assert!(analyze_native_leaf(&ineg, 0).is_none());
+
+        let mut branchy = CodeModule::new("native_leaf_branchy");
+        branchy.function_table.push(0);
+        branchy.emit(Instruction::new3(OpCode::ICmpGt, 0, 1, 2));
+        branchy.emit(Instruction::new3(OpCode::JmpT, 2, 0, 2));
+        branchy.emit(Instruction::new1(OpCode::RetVal, 0));
+        assert!(analyze_native_leaf(&branchy, 0).is_none());
+    }
+
+    #[test]
+    fn test_direct_call_target_rejects_stale_r254_definition() {
+        let mut module = CodeModule::new("direct_call_stale_target");
+        module.function_table.push(0);
+        module.emit(Instruction::new1(OpCode::Const0, 254));
+        module.emit(Instruction::new1(OpCode::Const1, 1));
+        module.emit(Instruction::new3(OpCode::IAdd, 1, 1, 254));
+        let call_pc = module.emit(Instruction::new3(OpCode::Call, 254, 0, 10));
+
+        assert_eq!(
+            direct_call_target(&module, call_pc, 0),
+            None,
+            "direct-call recovery must not cross an unrelated r254 write"
         );
     }
 

@@ -1,4 +1,11 @@
 # Nulang Changelog
+### Native straight-line JIT leaf calls — 2026-09-28
+- **Hot compiled callers can invoke proven tiny leaf functions directly in native code** instead of re-entering the interpreter for every call.
+- **Leaf eligibility is backend-neutral and deliberately strict**: at most 32 straight-line body instructions, no nested calls, branches, heap/container operations, effects, suspension, actor/FFI operations, or error-capable `INeg`.
+- **Caller frame isolation preserves the exact callee clobber set.** Generated code captures the leaf return value before restoring caller registers and writing only the call destination.
+- **Direct-call recovery and dispatch both fail closed.** Planner recovery stops at unrelated staging code, generated code re-checks the live function value immediately before dispatch, and a mismatch deopts to the exact `Call` PC.
+- **Ineligible leaves keep the existing re-entrant interpreter helper.** Successful and rejected leaf decisions are cached per module/function, and leaf compilation cost is included in `JitCompileStats`.
+
 ### Paired Criterion regression confirmation — 2026-09-29
 - **Historical benchmark alerts now emit a machine-readable regression manifest and trigger an exact-parent Criterion A/B confirmation instead of re-running only the candidate.** Base and candidate builds use isolated Cargo targets, measured runs alternate order on one host, and the benchmark process is pinned to one logical CPU by default.
 - **A historical alert blocks only when the paired median latency regression exceeds that benchmark's own historical threshold and its bootstrap 95% ratio interval remains above 1.0.** Shared-runner drift can still be recorded and investigated without being misattributed to the latest commit.

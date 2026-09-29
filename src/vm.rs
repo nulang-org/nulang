@@ -3081,6 +3081,15 @@ impl VM {
             .unwrap_or_default()
     }
 
+    /// Number of straight-line leaf functions compiled as native thunks for
+    /// folded direct calls.
+    pub fn jit_native_leaf_compiled_count(&self) -> usize {
+        self.jit_session
+            .as_ref()
+            .map(|jit| jit.native_leaf_compiled_count())
+            .unwrap_or(0)
+    }
+
     /// Discard all closure capture environments.
     ///
     /// Only call this when no live value can reference an existing

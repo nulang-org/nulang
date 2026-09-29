@@ -597,6 +597,36 @@ fn test_jit_pow_loop_tiers_up() {
 }
 
 #[test]
+fn test_compiled_direct_call_deopts_when_live_target_changed() {
+    use crate::vm::Value;
+
+    let mut jit = make_jit();
+    let instructions = vec![
+        Instruction::new3(OpCode::Call, 254, 0, 0),
+        Instruction::new0(OpCode::Nop),
+        Instruction::new0(OpCode::Nop),
+    ];
+    let mut native_calls = std::collections::HashMap::new();
+    native_calls.insert(0, 0);
+
+    let func = unsafe {
+        jit.compile_region(0, 0, instructions.len(), &instructions, &native_calls)
+            .expect("direct-call region should compile")
+    };
+
+    let mut regs = [Value::nil().to_bits(); 256];
+    regs[254] = Value::int(1).to_bits();
+    let constants: [u64; 0] = [];
+    func(regs.as_mut_ptr(), constants.as_ptr());
+
+    assert_eq!(
+        crate::jit::runtime::take_jit_branch_exit_pc(),
+        Some(0),
+        "stale direct-call target must deopt to the Call instruction"
+    );
+}
+
+#[test]
 fn test_jit_direct_call_loop_tiers_up() {
     // A hot loop calling a provably-non-suspending leaf must fold the direct
     // call into the compiled region (`find_compilable_region_with_calls`) and
@@ -648,6 +678,60 @@ fn test_jit_direct_call_loop_tiers_up() {
     assert!(
         jit_vm.jit_compiled_count() > 0,
         "the loop region must compile around the folded direct call"
+    );
+    assert!(
+        jit_vm.jit_native_leaf_compiled_count() > 0,
+        "bump() should compile as a native-to-native leaf thunk"
+    );
+}
+
+#[test]
+fn test_native_leaf_rejects_branchy_callee_and_keeps_helper_fallback() {
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    let source = r#"
+        fn adjust(x: Int) -> Int {
+            if x > 0 then { x + 1 } else { x - 1 }
+        }
+        fn main() {
+            var s = 1;
+            var i = 0;
+            while i < 20000 {
+                s = adjust(s);
+                i = i + 1
+            };
+            s
+        }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_branchy_direct_call_test").expect("codegen");
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interp loop should run");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let result = jit_vm.run().expect("jit loop should run");
+
+    assert_eq!(result.as_int(), expected.as_int());
+    assert_eq!(expected.as_int(), Some(20001));
+    assert!(jit_vm.jit_compiled_count() > 0);
+    assert_eq!(
+        jit_vm.jit_native_leaf_compiled_count(),
+        0,
+        "branchy adjust() must use the interpreter helper fallback"
     );
 }
 
