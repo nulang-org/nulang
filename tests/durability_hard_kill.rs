@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+#![cfg(feature = "sqlite")]\n\nuse std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
