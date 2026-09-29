@@ -116,6 +116,78 @@
           "required": [
             "type",
             "task_id",
+            "attempt_id",
+            "worker_id",
+            "lease_epoch"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_attempt_started"
+            },
+            "task_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "attempt_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "worker_id": {
+              "type": "string"
+            },
+            "lease_epoch": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "task_id",
+            "attempt_id",
+            "worker_id",
+            "lease_epoch",
+            "status"
+          ],
+          "properties": {
+            "type": {
+              "const": "task_attempt_finished"
+            },
+            "task_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "attempt_id": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "worker_id": {
+              "type": "string"
+            },
+            "lease_epoch": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "status": {
+              "enum": [
+                "assigned",
+                "running",
+                "awaiting_approval",
+                "succeeded",
+                "failed",
+                "cancelled",
+                "fenced"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "task_id",
             "agent_id",
             "progress",
             "message"
