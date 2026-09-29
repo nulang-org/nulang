@@ -45,6 +45,7 @@ pub mod durable_effect;
 pub mod durable_effect_persistence;
 pub mod durable_effect_runtime;
 pub mod effect_checker;
+pub mod effect_semantics;
 pub mod ffi;
 pub mod fmt;
 pub mod format;
