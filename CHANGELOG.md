@@ -1,4 +1,8 @@
 # Nulang Changelog
+### NLAP task-attempt lease fencing contract — 2026-09-28
+- **NLAP now distinguishes logical tasks from concrete worker attempts.** `TaskAttempt` carries retry lineage, worker identity, lifecycle state, and a monotonic lease epoch so retries and reassignments do not reuse one ambiguous task execution identity.
+- **`TaskLease` provides the runtime-neutral fencing proof for one authoritative attempt.** Swarm events carry attempt and lease identity explicitly, allowing Nulang Cloud to reject stale workers and bind durable side effects to the exact attempt that owns the task.
+
 ### Paired Criterion regression confirmation — 2026-09-29
 - **Historical benchmark alerts now emit a machine-readable regression manifest and trigger an exact-parent Criterion A/B confirmation instead of re-running only the candidate.** Base and candidate builds use isolated Cargo targets, measured runs alternate order on one host, and the benchmark process is pinned to one logical CPU by default.
 - **A historical alert blocks only when the paired median latency regression exceeds that benchmark's own historical threshold and its bootstrap 95% ratio interval remains above 1.0.** Shared-runner drift can still be recorded and investigated without being misattributed to the latest commit.
