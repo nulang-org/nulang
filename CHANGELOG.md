@@ -3,6 +3,9 @@
 - **Actor, interpreter, bytecode VM, and JIT Criterion fixtures now use `iter_batched_ref` so destruction of prepared runtimes, VMs, mailboxes, and queued messages occurs outside the measured routine.** This removes teardown cost from operation latency signals while keeping setup outside timing.
 - **A benchmark-timing contract test prevents owned `iter_batched` from returning to these fixture families,** and the main benchmark job runs that contract before collecting longitudinal results.
 
+### Wasmtime security update — 2026-09-29
+- **Upgrade the optional Wasmtime runtime from 46.x to 48.0.3 to clear RUSTSEC-2026-0316,** which affects dynamic record lifting under hostcall fuel limits. The WASM backend remains feature-gated and retains the same configured runtime feature set.
+
 ### Capability-scoped forge gateway for AI agents — 2026-09-28
 - **AI agents now use a provider-neutral forge contract with exact repository and operation grants instead of ambient forge credentials.** The initial MCP surface covers repository reads, branch creation, file commits, change creation/review/merge, and check reads while keeping merge authority distinct from coding authority.
 - **Forge authority is host-managed and fails closed.** MCP callers cannot inject sessions, grants, operations, expiry, or subject fields; hosted execution can delegate policy, approvals, credentials, and audit to Dev Plane while standalone hosts retain the provider-neutral backend boundary.
