@@ -292,6 +292,13 @@ pub struct Actor {
     /// turn ends. If execution suspends, the identity is copied into
     /// `SuspendedExecution` so later resumes close the same activation.
     pub current_workflow_activation: Option<WorkflowActivationId>,
+    /// Activation whose intermediate custom-event ordinal is currently tracked.
+    ///
+    /// This is execution-local replay state, not durable state. A later replay
+    /// slice will restore/consume it from committed event history.
+    pub workflow_replay_activation: Option<WorkflowActivationId>,
+    /// Next deterministic custom-event ordinal within `workflow_replay_activation`.
+    pub workflow_replay_event_ordinal: u32,
     /// Sentinel heap object used by the cycle detector to represent this
     /// actor as a holder of foreign references.
     cycle_sentinel: Option<*mut OrcaHeader>,
@@ -442,6 +449,8 @@ impl Actor {
             sequence: 0,
             activation_epoch: crate::runtime::persistence::INITIAL_ACTIVATION_EPOCH,
             current_workflow_activation: None,
+            workflow_replay_activation: None,
+            workflow_replay_event_ordinal: 0,
             cycle_sentinel: None,
             suspended_execution: None,
             waiting_signal: None,
