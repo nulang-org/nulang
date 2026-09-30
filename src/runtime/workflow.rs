@@ -10,7 +10,7 @@ use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{
     ActorSnapshot, DurableTransition, EventEntry, JournalEntry, PersistedValue,
-    WorkflowActivationId, WorkflowEvent, DURABLE_TRANSITION_VERSION,
+    WorkflowActivationId, WorkflowEvent, WorkflowReplayEventId, DURABLE_TRANSITION_VERSION,
 };
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
 use crate::vm::{Frame, Value, VM};
@@ -28,6 +28,44 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
         .get(&actor_id)
         .map(|a| matches!(a.role(), Ok(ActorRole::Workflow)))
         .unwrap_or(false)
+}
+
+fn current_custom_event_replay_id(
+    rt: &mut Runtime,
+    actor_id: u64,
+) -> Option<WorkflowReplayEventId> {
+    let actor = rt.actors.get_mut(&actor_id)?;
+    let activation = actor.current_workflow_activation?;
+
+    if actor.workflow_replay_activation != Some(activation) {
+        actor.workflow_replay_activation = Some(activation);
+        actor.workflow_replay_event_ordinal = 0;
+    }
+
+    Some(WorkflowReplayEventId::new(
+        activation,
+        actor.workflow_replay_event_ordinal,
+    ))
+}
+
+fn advance_custom_event_replay_id(
+    rt: &mut Runtime,
+    actor_id: u64,
+    committed: WorkflowReplayEventId,
+) {
+    let Some(actor) = rt.actors.get_mut(&actor_id) else {
+        return;
+    };
+    if actor.workflow_replay_activation != Some(committed.activation)
+        || actor.workflow_replay_event_ordinal != committed.ordinal
+    {
+        return;
+    }
+
+    actor.workflow_replay_event_ordinal = committed
+        .ordinal
+        .checked_add(1)
+        .expect("workflow custom-event ordinal exhausted within one activation");
 }
 
 // ---------------------------------------------------------------------------
@@ -358,15 +396,24 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 .iter()
                 .map(|v| PersistedValue::from_value_resolved(v, module))
                 .collect();
-            let _ = rt.persistence.append_workflow_event(
-                actor_id,
-                WorkflowEvent::Custom {
-                    sequence: seq,
-                    replay_id: None,
-                    name: event.to_string(),
-                    args: payload,
-                },
-            );
+            let replay_id = current_custom_event_replay_id(rt, actor_id);
+            let appended = rt
+                .persistence
+                .append_workflow_event(
+                    actor_id,
+                    WorkflowEvent::Custom {
+                        sequence: seq,
+                        replay_id,
+                        name: event.to_string(),
+                        args: payload,
+                    },
+                )
+                .is_ok();
+            if appended {
+                if let Some(replay_id) = replay_id {
+                    advance_custom_event_replay_id(rt, actor_id, replay_id);
+                }
+            }
         }
         checkpoint_actor(rt, actor_id);
     }
