@@ -6337,6 +6337,7 @@ mod vm_tests {
         }
     }
 
+    #[derive(Debug)]
     struct SiteAwareCallbacks {
         heap: ActorHeap,
         gc: crate::runtime::OrcaGc,
@@ -6361,7 +6362,9 @@ mod vm_tests {
         }
 
         fn drop_ref(&mut self, ptr: *mut u8) {
-            unsafe { self.gc.drop_local_ref(&mut self.heap, ptr) }
+            unsafe {
+                self.gc.drop_local_ref(&mut self.heap, ptr);
+            }
         }
 
         fn retain_ref(&mut self, ptr: *mut u8) {
@@ -6409,11 +6412,13 @@ mod vm_tests {
         let mut module = CodeModule::new("perform_async_site");
         let effect_idx = module.add_string_constant("Provider.ask");
         let site_id = [0x5au8; 32];
-        module.effect_sites.push(crate::bytecode::EffectSiteMetadata {
-            pc: 0,
-            id: site_id,
-            effect_operation: "Provider.ask".to_string(),
-        });
+        module
+            .effect_sites
+            .push(crate::bytecode::EffectSiteMetadata {
+                pc: 0,
+                id: site_id,
+                effect_operation: "Provider.ask".to_string(),
+            });
         vm.load_module(module);
         vm.set_actor_callbacks(Box::new(SiteAwareCallbacks::new(seen.clone())));
 
