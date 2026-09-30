@@ -595,7 +595,19 @@ pub(crate) fn append_signal_received(
     let seq = next_sequence(rt, actor_id);
     rt.persistence
         .append_signal_received(actor_id, seq, name.to_string(), payload)?;
-    try_checkpoint_actor(rt, actor_id)?;
+
+    let activation_open = rt
+        .actors
+        .get(&actor_id)
+        .and_then(|actor| actor.current_workflow_activation)
+        .is_some();
+    if !activation_open {
+        try_checkpoint_actor(rt, actor_id)?;
+    }
+    // During an open activation the SignalReceived record is the replay source
+    // of truth. Keep the last completed snapshot unchanged: it may otherwise
+    // capture state mutated before Signal.wait suspended, causing recovery to
+    // resume from a partially executed step.
     Ok(())
 }
 
