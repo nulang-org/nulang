@@ -3703,6 +3703,111 @@ fn test_workflow_actor_step_event_and_checkpoint() {
         snapshot.state.get("step_index"),
         Some(&PersistedValue::Int(1))
     );
+    assert_eq!(
+        snapshot.sequence,
+        events[1].sequence(),
+        "terminal workflow event and resulting snapshot must share one atomic transition sequence"
+    );
+    assert_eq!(
+        snapshot.activation_epoch,
+        rt.actors
+            .get(&actor_id)
+            .expect("workflow actor must remain live")
+            .activation_epoch,
+        "terminal transition must commit under the actor's canonical fencing epoch"
+    );
+}
+
+#[test]
+fn test_workflow_actor_sequential_steps_extend_atomic_tail() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "CounterWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", |actor, _args| {
+            if let Some(n) = actor.get_state_field("step_index").and_then(|v| v.as_int()) {
+                actor.set_state_field("step_index", Value::int(n + 1));
+            }
+        });
+
+    for _ in 0..2 {
+        rt.send_message(actor_id, "next", &[]);
+        run_ready_actor_turn(&mut rt, actor_id);
+    }
+
+    let actor = rt
+        .actors
+        .get(&actor_id)
+        .expect("workflow actor must remain live across atomic turns");
+    assert_eq!(
+        actor
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
+        Some(2),
+        "the second command must extend the atomic tail instead of being discarded"
+    );
+
+    let completed: Vec<_> = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .filter(|event| matches!(event, WorkflowEvent::StepCompleted { .. }))
+        .collect();
+    assert_eq!(completed.len(), 2);
+
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(snapshot.sequence, completed[1].sequence());
+}
+
+#[test]
+fn test_atomic_workflow_command_preserves_sender_heap_string_payload() {
+    let mut rt = Runtime::new();
+    let sender_id = rt.spawn_actor(Box::new(Vec::new));
+    let actor_id = rt.spawn_workflow_actor("StringWorkflow", Box::new(Vec::new), HashMap::new());
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("capture", |_actor, _args| {});
+
+    let payload = rt
+        .actors
+        .get_mut(&sender_id)
+        .unwrap()
+        .allocate_string("atomic journal");
+
+    rt.current_actor = Some(sender_id);
+    rt.send_message(actor_id, "capture", &[payload]);
+    rt.current_actor = None;
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    let journal = rt.persistence.read_journal(actor_id);
+    assert_eq!(journal.len(), 1);
+    assert_eq!(
+        journal[0].payload,
+        vec![PersistedValue::String("atomic journal".to_string())],
+        "atomic workflow command admission must reuse the actor-aware journal serializer"
+    );
+
+    let completed: Vec<_> = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .filter(|event| matches!(event, WorkflowEvent::StepCompleted { .. }))
+        .collect();
+    assert_eq!(completed.len(), 1);
+    assert!(
+        completed[0].sequence() > journal[0].sequence,
+        "the terminal transition must extend the atomically admitted command"
+    );
 }
 
 #[test]
