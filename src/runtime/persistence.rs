@@ -364,9 +364,9 @@ impl WorkflowEvent {
 
     /// Return the deterministic replay identity of an intermediate event.
     ///
-    /// Only custom events use this identity today. Other replay-sensitive
-    /// workflow records will adopt the same activation-local ordinal model in
-    /// later #836 slices.
+    /// Custom events and timer preparation share this activation-local
+    /// identity today. Other replay-sensitive workflow records will adopt the
+    /// same ordinal model in later #836 slices.
     pub fn replay_id(&self) -> Option<WorkflowReplayEventId> {
         match self {
             WorkflowEvent::TimerSet { replay_id, .. }
@@ -3972,6 +3972,27 @@ mod durable_transition_tests {
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }],
         }
+    }
+
+    #[test]
+    fn legacy_timer_set_deserialization_defaults_replay_identity() {
+        let json = r#"{"tag":"TimerSet","value":{"sequence":7,"name":"wake","duration_ms":250}}"#;
+        let event: WorkflowEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            event,
+            WorkflowEvent::TimerSet {
+                sequence: 7,
+                replay_id: None,
+                ref name,
+                duration_ms: 250,
+            } if name == "wake"
+        ));
+
+        let serialized = serde_json::to_string(&event).unwrap();
+        assert!(
+            !serialized.contains("replay_id"),
+            "legacy TimerSet encoding must stay digest-compatible when replay identity is absent"
+        );
     }
 
     #[test]
