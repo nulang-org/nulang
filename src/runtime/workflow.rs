@@ -93,6 +93,7 @@ pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::
     let snapshot = crate::runtime::persistence::ActorSnapshot {
         actor_id,
         sequence: seq,
+        activation_epoch: actor.activation_epoch,
         state,
         waiting_signal: actor.waiting_signal.clone(),
         crdt_snapshot,
