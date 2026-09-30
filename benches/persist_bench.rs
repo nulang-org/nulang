@@ -23,6 +23,7 @@ fn snapshot_with_payload(payload_bytes: usize) -> ActorSnapshot {
         waiting_signal: None,
         crdt_snapshot: None,
         crdt_field_map: None,
+        schema_name: None,
         authority_tokens: Default::default(),
     }
 }
@@ -35,6 +36,7 @@ fn empty_snapshot() -> ActorSnapshot {
         waiting_signal: None,
         crdt_snapshot: None,
         crdt_field_map: None,
+        schema_name: None,
         authority_tokens: Default::default(),
     }
 }
