@@ -330,7 +330,7 @@ pub(crate) fn compute_recursive(module: &crate::bytecode::CodeModule) -> Vec<boo
 /// Region-length scanner WITHOUT direct-call folding; used by the unit tests.
 /// The runtime path uses [`find_compilable_region_with_calls`] so direct
 /// non-suspending calls fold into regions.
-#[allow(dead_code)]
+///
 /// Return true when a compiled region contains a branch back to an earlier
 /// instruction within the same region.
 ///
@@ -366,6 +366,7 @@ pub(crate) fn region_has_internal_back_edge(
     false
 }
 
+#[allow(dead_code)]
 pub(crate) fn find_compilable_region(
     offset: usize,
     instructions: &[crate::bytecode::Instruction],
