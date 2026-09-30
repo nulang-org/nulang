@@ -3335,7 +3335,61 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 9b. Non-scalar payloads are rejected at send time
+    // 9b. Reader EOF retires the cached connection
+    // ------------------------------------------------------------------
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_connection_read_loop_removes_disconnected_peer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(listen_addr).unwrap();
+        let (server, peer_addr) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let peer_id = NodeId(0xCAFE);
+        let reader = TransportStream::Raw(server);
+        let writer = reader.try_clone().unwrap();
+        let connections = Arc::new(Mutex::new(HashMap::new()));
+        lock_ignore_poison(&connections).insert(
+            peer_id,
+            TcpConnection {
+                node_id: peer_id,
+                addr: peer_addr,
+                stream: writer,
+                last_activity: Instant::now(),
+            },
+        );
+
+        let (incoming_tx, _incoming_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let reader_connections = Arc::clone(&connections);
+        let reader_shutdown = Arc::clone(&shutdown_flag);
+        let handle = thread::spawn(move || {
+            connection_read_loop(
+                reader,
+                peer_id,
+                incoming_tx,
+                reader_connections,
+                reader_shutdown,
+            );
+        });
+
+        // EOF is the normal disconnect path. The reader must retire the
+        // cached writer so the next outbound packet reconnects instead of
+        // consuming itself on a known-dead socket.
+        drop(client);
+        handle.join().unwrap();
+
+        assert!(
+            !lock_ignore_poison(&connections).contains_key(&peer_id),
+            "reader EOF must remove the disconnected peer from the connection pool"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 9c. Non-scalar payloads are rejected at send time
     // ------------------------------------------------------------------
     #[test]
     #[cfg(feature = "tcp")]
