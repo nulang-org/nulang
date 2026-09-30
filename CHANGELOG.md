@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Native fast path for simple JIT direct calls — 2026-09-30
+- **Hot direct calls to simple, non-suspending, non-recursive leaf functions can now execute as native JIT callees instead of re-entering the interpreter.** Eligible callees are intentionally limited to straight-line scalar register code with an explicit return; branchy, effectful, recursive, indirect, heap/actor, and otherwise unsupported callees retain the existing safe fallback.
+- **Native leaf callees run against an isolated register buffer and copy back only the return value.** Caller registers are preserved, nested JIT thread-local state is saved across interpreter fallback, and leaf errors continue through the existing pending-error path.
+- **The existing `call_loop` JIT telemetry improves from the repository-history ~10.57 ms baseline to a 1.56 ms median warm run in a 20-run fixed-host probe (~6.8× faster), while all 55 focused JIT tests pass.**
+
 ### Durable actor activation epochs — 2026-09-30
 - **Durable fencing identity now survives checkpoint, recovery, migration, and node-loss takeover.** Live actors own a canonical `activation_epoch`; snapshots persist it, legacy snapshots default explicitly to initial epoch 1, and every restore path hydrates the exact persisted value.
 - **Node-loss recovery no longer duplicates epoch ownership in `respawn_opted`.** The opt-in registry is membership-only; shadow replication and directory announcements derive epochs from the live actor, failover persists the bumped epoch before announcing ownership, and graceful goodbye captures a deterministic actor/epoch manifest before reaping.
