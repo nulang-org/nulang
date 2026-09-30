@@ -200,11 +200,7 @@ fn json_atomic_store_recovers_from_torn_final_frame_before_next_commit() {
     assert_eq!(reopened.latest_sequence(ACTOR_ID), 2);
     assert!(std::fs::metadata(&log).unwrap().len() > committed_len);
     assert_eq!(
-        reopened
-            .load_snapshot(ACTOR_ID)
-            .unwrap()
-            .state
-            .get("value"),
+        reopened.load_snapshot(ACTOR_ID).unwrap().state.get("value"),
         Some(&PersistedValue::Int(20))
     );
 
