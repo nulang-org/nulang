@@ -4269,10 +4269,22 @@ fn test_signal_received_during_open_activation_keeps_safe_snapshot() {
         let actor = rt.actors.get_mut(&actor_id).unwrap();
         actor.set_state_field("count", Value::int(99));
         actor.waiting_signal = Some("go".to_string());
+        actor.current_workflow_activation = None;
+        actor.suspended_execution = Some(crate::runtime::actor::SuspendedExecution {
+            vm_state: crate::vm::SuspendedVmState {
+                frames: Vec::new(),
+                current_frame_idx: None,
+                handler_stack: Vec::new(),
+                step_count: 0,
+            },
+            behavior_idx: behavior_id as usize,
+            activation: Some(activation),
+            step_name: "next".to_string(),
+        });
     }
     rt.persist_suspension_marker(actor_id);
 
-    rt.signal_workflow(actor_id, "go", Some("resume".to_string()))
+    rt.append_signal_received(actor_id, "go", Some("resume".to_string()))
         .unwrap();
 
     let snapshot_after_signal = rt.persistence.load_snapshot(actor_id).unwrap();
