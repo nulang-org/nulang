@@ -368,6 +368,17 @@ pub struct DurableTail {
     pub digest: [u8; 32],
 }
 
+/// Minimal committed-tail metadata needed to classify crash recovery.
+///
+/// Recovery intentionally does not need the transition digest; it only needs
+/// the fencing epoch and exact committed sequence to distinguish atomic
+/// command admission from legacy journal history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableTailPosition {
+    pub activation_epoch: u64,
+    pub sequence: u64,
+}
+
 /// Result of a successfully committed durable transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableCommit {
@@ -586,6 +597,21 @@ pub trait PersistenceStore: Send + Sync {
         ))
     }
 
+    /// Load the committed atomic tail position for recovery classification.
+    ///
+    /// Backends that do not implement atomic durable transitions must return
+    /// `Unsupported`; callers use that to keep legacy recovery behavior
+    /// unchanged instead of inferring atomic history from ordinary journals.
+    fn load_durable_tail_position(
+        &self,
+        _actor_id: u64,
+    ) -> io::Result<Option<DurableTailPosition>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic durable tail reads are not supported by this persistence backend",
+        ))
+    }
+
     /// Load the newest durable record for one logical external effect.
     ///
     /// Backends that cannot recover durable-effect records MUST fail closed
@@ -783,6 +809,13 @@ impl MemoryStore {
 }
 
 impl PersistenceStore for MemoryStore {
+    fn load_durable_tail_position(&self, actor_id: u64) -> io::Result<Option<DurableTailPosition>> {
+        Ok(self.durable_tails.get(&actor_id).map(|tail| DurableTailPosition {
+            activation_epoch: tail.activation_epoch,
+            sequence: tail.sequence,
+        }))
+    }
+
     fn load_durable_effect(
         &self,
         actor_id: u64,
@@ -1586,6 +1619,41 @@ impl LibsqlStore {
 
 #[cfg(feature = "sqlite")]
 impl PersistenceStore for LibsqlStore {
+    fn load_durable_tail_position(&self, actor_id: u64) -> io::Result<Option<DurableTailPosition>> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT activation_epoch, sequence
+                     FROM durable_tails
+                     WHERE actor_id = ?1",
+                    libsql::params![actor_id as i64],
+                )
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+            match rows
+                .next()
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+            {
+                Some(row) => {
+                    let activation_epoch: i64 = row.get(0).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?;
+                    let sequence: i64 = row.get(1).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?;
+                    Ok(Some(DurableTailPosition {
+                        activation_epoch: activation_epoch as u64,
+                        sequence: sequence as u64,
+                    }))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
     fn load_durable_effect(
         &self,
         actor_id: u64,
@@ -3925,6 +3993,13 @@ mod durable_transition_tests {
                 digest: committed.digest,
             })
         );
+        assert_eq!(
+            store.load_durable_tail_position(10).unwrap(),
+            Some(DurableTailPosition {
+                activation_epoch: 1,
+                sequence: 1,
+            })
+        );
     }
 
     #[test]
@@ -4234,6 +4309,13 @@ mod libsql_atomic_transition_tests {
                 )
                 .unwrap();
             assert_eq!(rows, vec!["[4,1]".to_string()]);
+            assert_eq!(
+                store.load_durable_tail_position(77).unwrap(),
+                Some(DurableTailPosition {
+                    activation_epoch: 4,
+                    sequence: 1,
+                })
+            );
         }
 
         let _ = std::fs::remove_file(&path);
