@@ -4128,6 +4128,81 @@ fn test_committed_custom_event_keeps_pre_command_snapshot_safe_for_replay() {
 }
 
 #[test]
+fn test_timer_set_replay_consumes_matching_committed_preparation() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("ReplayTimer", Box::new(Vec::new), HashMap::new());
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", |_actor, _args| {});
+    let behavior_id = rt
+        .behavior_id_for(actor_id, "next")
+        .expect("registered workflow behavior must have a stable id");
+
+    let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let activation =
+        workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new()).unwrap();
+
+    rt.schedule_workflow_timer(actor_id, "wake", 250).unwrap();
+
+    let timer_sets: Vec<_> = rt
+        .persistence
+        .read_timer_events(actor_id)
+        .into_iter()
+        .filter(|event| matches!(event, WorkflowEvent::TimerSet { .. }))
+        .collect();
+    assert_eq!(timer_sets.len(), 1);
+    assert!(matches!(
+        &timer_sets[0],
+        WorkflowEvent::TimerSet {
+            replay_id: Some(id),
+            name,
+            duration_ms: 250,
+            ..
+        } if *id == WorkflowReplayEventId::new(activation, 0) && name == "wake"
+    ));
+    assert_eq!(
+        rt.persistence.load_snapshot(actor_id).unwrap().sequence,
+        safe_snapshot.sequence,
+        "timer preparation inside an open activation must keep the last completed snapshot safe"
+    );
+    assert_eq!(rt.timer_wheel.len(), 1);
+
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.current_workflow_activation = Some(activation);
+        actor.workflow_replay_activation = Some(activation);
+        actor.workflow_replay_event_ordinal = 0;
+    }
+
+    rt.schedule_workflow_timer(actor_id, "wake", 250).unwrap();
+
+    assert_eq!(
+        rt.persistence
+            .read_timer_events(actor_id)
+            .into_iter()
+            .filter(|event| matches!(event, WorkflowEvent::TimerSet { .. }))
+            .count(),
+        1,
+        "replay must consume the committed timer preparation instead of appending a duplicate"
+    );
+    assert_eq!(
+        rt.timer_wheel.len(),
+        1,
+        "consuming a committed timer preparation must not arm a duplicate live timer"
+    );
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .workflow_replay_event_ordinal,
+        1,
+        "the shared activation-local replay cursor must advance after consuming TimerSet"
+    );
+}
+
+#[test]
 fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
