@@ -340,16 +340,9 @@ pub(crate) fn region_has_internal_back_edge(
     instructions: &[crate::bytecode::Instruction],
 ) -> bool {
     let end = offset.saturating_add(len).min(instructions.len());
-    for (pc, instr) in instructions
-        .iter()
-        .enumerate()
-        .take(end)
-        .skip(offset)
-    {
+    for (pc, instr) in instructions.iter().enumerate().take(end).skip(offset) {
         let target = match instr.opcode {
-            crate::bytecode::OpCode::Jmp => {
-                (pc as i64 + instr.simm16() as i64) as usize
-            }
+            crate::bytecode::OpCode::Jmp => (pc as i64 + instr.simm16() as i64) as usize,
             crate::bytecode::OpCode::JmpT | crate::bytecode::OpCode::JmpF => {
                 (pc as i64 + instr.offset16() as i64) as usize
             }
