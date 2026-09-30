@@ -4244,6 +4244,71 @@ fn test_timer_set_replay_rejects_cross_type_identity_collision() {
 }
 
 #[test]
+fn test_signal_received_during_open_activation_keeps_safe_snapshot() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("count".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "ReplaySignal",
+        Box::new(|| vec![("count".to_string(), Value::int(0))]),
+        models,
+    );
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", |_actor, _args| {});
+    let behavior_id = rt
+        .behavior_id_for(actor_id, "next")
+        .expect("registered workflow behavior must have a stable id");
+    let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let activation =
+        workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new()).unwrap();
+
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.set_state_field("count", Value::int(99));
+        actor.waiting_signal = Some("go".to_string());
+    }
+    rt.persist_suspension_marker(actor_id);
+
+    rt.signal_workflow(actor_id, "go", Some("resume".to_string()))
+        .unwrap();
+
+    let snapshot_after_signal = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(
+        snapshot_after_signal.sequence, safe_snapshot.sequence,
+        "signal delivery during an open activation must not advance the last completed snapshot"
+    );
+    assert_eq!(
+        snapshot_after_signal.state.get("count"),
+        Some(&PersistedValue::Int(0)),
+        "signal delivery must not persist partially executed workflow state"
+    );
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(
+        actor.current_workflow_activation,
+        Some(activation),
+        "recovery must keep the interrupted command activation open"
+    );
+    assert_eq!(
+        actor.get_state_field("count").and_then(|value| value.as_int()),
+        Some(0),
+        "recovery must restart from the last completed state"
+    );
+    assert!(
+        actor.received_signals.iter().any(|(name, payload)| {
+            name == "go" && payload.as_deref() == Some("resume")
+        }),
+        "the durable SignalReceived event must replay even though the safe snapshot stays unchanged"
+    );
+}
+
+#[test]
 fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
