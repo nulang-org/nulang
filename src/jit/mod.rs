@@ -46,11 +46,11 @@ pub use compiler::*;
 use native_codegen::{
     CraneliftCodegen, NativeCodegenBackend, NativeCompileKind, NativeCompileRequest,
 };
-use region_planner::{region_has_internal_back_edge, RegionPlanner};
 #[cfg(test)]
 use region_planner::{
     compute_may_suspend, compute_recursive, direct_call_target, find_compilable_region,
 };
+use region_planner::{region_has_internal_back_edge, RegionPlanner};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
