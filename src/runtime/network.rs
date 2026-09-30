@@ -1898,7 +1898,6 @@ fn next_connection_generation() -> u64 {
     NEXT_CONNECTION_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
-
 /// A single TCP connection to a remote node.
 #[cfg(feature = "tcp")]
 pub(crate) struct TcpConnection {
@@ -2716,9 +2715,7 @@ fn connect_in_sender(
     let flag = Arc::clone(shutdown_flag);
     let _ = thread::Builder::new()
         .name(format!("nulang-net-reader-out-{}", addr.port()))
-        .spawn(move || {
-            connection_read_loop(read_stream, node_id, generation, in_tx, conns, flag)
-        });
+        .spawn(move || connection_read_loop(read_stream, node_id, generation, in_tx, conns, flag));
     Ok(())
 }
 
