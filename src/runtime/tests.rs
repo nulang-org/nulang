@@ -51,7 +51,7 @@ fn test_actor_module_hash_uses_exact_runtime_schema() {
     let actor_id = rt.spawn_actor(Box::new(Vec::new));
     let actor = rt.actors.get_mut(&actor_id).expect("actor");
     actor.name = "Second".to_string();
-    actor.bytecode_module = Some(module);
+    actor.bytecode_module = Some(Box::new(module));
 
     assert_eq!(
         rt.actor_module_hash(actor_id),
@@ -949,7 +949,7 @@ fn test_restarted_bytecode_child_handles_messages() {
     let child_id = rt.spawn_actor(Box::new(|| vec![("count".to_string(), Value::int(0))]));
     {
         let actor = rt.actors.get_mut(&child_id).unwrap();
-        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_module = Some(Box::new(module.clone()));
         actor.bytecode_offsets = vec![0];
         actor.compensation_offsets = vec![None];
     }
@@ -1978,7 +1978,7 @@ fn test_persistent_string_state_survives_checkpoint_and_recovery() {
     {
         let actor = rt.actors.get_mut(&actor_id).unwrap();
         actor.set_state_field("greeting", string_val);
-        actor.bytecode_module = Some(module);
+        actor.bytecode_module = Some(Box::new(module));
     }
 
     // Force a checkpoint.
@@ -2038,7 +2038,7 @@ fn test_journal_replay_restores_persisted_string_payload_on_actor_heap() {
 
     {
         let actor = rt.actors.get_mut(&actor_id).unwrap();
-        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_module = Some(Box::new(module.clone()));
         actor.bytecode_offsets = vec![0];
         actor.compensation_offsets = vec![None];
     }
@@ -2141,7 +2141,7 @@ fn test_persistent_native_ask_journal_preserves_module_string_id() {
 
     let mut module = CodeModule::new("journal-string-id");
     let string_idx = module.add_constant(Constant::String("pooled value".to_string()));
-    rt.actors.get_mut(&actor_id).unwrap().bytecode_module = Some(module);
+    rt.actors.get_mut(&actor_id).unwrap().bytecode_module = Some(Box::new(module));
 
     rt.ask_actor_sync(actor_id, 0, &[Value::string(string_idx as u32)])
         .unwrap();
@@ -6332,7 +6332,7 @@ fn test_message_retry_after_bytecode_fetch() {
     let actor_id = rt_a.spawn_actor(Box::new(|| vec![("received".to_string(), Value::int(0))]));
     {
         let actor = rt_a.actors.get_mut(&actor_id).unwrap();
-        actor.bytecode_module = Some(module);
+        actor.bytecode_module = Some(Box::new(module));
         actor.bytecode_offsets = vec![0];
         actor.register_behavior("store", |actor, args| {
             let n = args.get(0).and_then(|v| v.as_int()).unwrap_or(-1);
