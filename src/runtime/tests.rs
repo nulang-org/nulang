@@ -4382,6 +4382,41 @@ fn pump_until_addresses_converge(
     }
 }
 
+/// Pump one runtime until its transport has a live connection registered for
+/// `peer`, or fail with connection diagnostics.
+///
+/// Membership and authoritative-address convergence happen on the runtime
+/// thread, while the TCP sender establishes connections asynchronously. A
+/// recovered cluster is not yet ready for a one-shot delivery assertion until
+/// the sender-side transport has completed that reconnect.
+#[cfg(feature = "tcp")]
+fn pump_until_peer_connected(rt: &mut Runtime, peer: NodeId, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        rt.process_network();
+        let connected_addr = rt
+            .distributed
+            .transport
+            .as_ref()
+            .and_then(|transport| transport.connection_addr(peer));
+        if connected_addr.is_some() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "transport did not reconnect to peer {:?} within the timeout; local={:?}, cluster_addr={:?}",
+            peer,
+            rt.distributed.node_id,
+            rt.distributed
+                .cluster
+                .as_ref()
+                .and_then(|cluster| cluster.get_node(peer))
+                .map(|info| info.address),
+        );
+        sleep(Duration::from_millis(50));
+    }
+}
+
 #[cfg(feature = "tcp")]
 /// PLAN.md Phase 1 bullet 4 (chaos suite for distribution): a first,
 /// real step -- not the full "10^3 seeds across 5 topologies" target,
@@ -4861,6 +4896,7 @@ fn test_three_node_cluster_split_brain_detects_and_heals() {
         &expected_addresses,
         Duration::from_secs(15),
     );
+    pump_until_peer_connected(&mut rt_c, node_a, Duration::from_secs(15));
 
     // Prove the healed cluster does real cross-boundary work: C sends a
     // remote message to an actor on A, across the former partition line.
@@ -5158,6 +5194,7 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
         &expected_addresses,
         Duration::from_secs(15),
     );
+    pump_until_peer_connected(&mut nodes[4], ids[0], Duration::from_secs(15));
 
     // Cross-boundary delivery after healing: E (node 4) -> actor on A
     // (node 0).
