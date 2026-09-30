@@ -1276,6 +1276,26 @@ impl Runtime {
         }
     }
 
+    /// Restore the accepted workflow activation before resuming suspended bytecode.
+    /// The actor already owns the activation-local custom-event cursor, so a
+    /// resume of the same activation must not reset its next ordinal.
+    fn restore_suspended_workflow_activation(
+        &mut self,
+        actor_id: u64,
+        activation: Option<WorkflowActivationId>,
+    ) {
+        let Some(actor) = self.actors.get_mut(&actor_id) else {
+            return;
+        };
+        actor.current_workflow_activation = activation;
+        if let Some(activation) = activation {
+            if actor.workflow_replay_activation != Some(activation) {
+                actor.workflow_replay_activation = Some(activation);
+                actor.workflow_replay_event_ordinal = 0;
+            }
+        }
+    }
+
     /// Resume an actor that yielded at a JIT safepoint.
     ///
     /// Mirrors the structure of `resume_suspended_llm_step` but without
@@ -1288,6 +1308,7 @@ impl Runtime {
             None => return,
         };
         let Some(suspended) = suspended else { return };
+        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
 
         if self.vm.is_none() {
             if let Some(actor) = self.actors.get_mut(&actor_id) {
@@ -1609,6 +1630,7 @@ impl Runtime {
             None => return,
         };
         let Some(suspended) = suspended else { return };
+        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
 
         if self.vm.is_none() {
             // No VM available; put the suspension back so a later message
@@ -4752,6 +4774,7 @@ impl Runtime {
             // Not currently suspended - nothing to resume.
             return;
         };
+        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
         if self.vm.is_none() {
             // VM not available; restore suspension and requeue.
             if let Some(actor) = self.actors.get_mut(&actor_id) {
@@ -4845,6 +4868,7 @@ impl Runtime {
             None => return,
         };
         let Some(suspended) = suspended else { return };
+        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
 
         if self.vm.is_none() {
             // No VM available; put the suspension back so a later wake can
