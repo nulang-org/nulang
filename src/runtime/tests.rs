@@ -4197,7 +4197,10 @@ fn test_durable_effect_identity_is_stable_across_workflow_replay() {
         other => panic!("unexpected replay durable-effect decision: {other:?}"),
     };
 
-    assert_eq!(replayed_id, first_id, "replay must reuse the same stable durable effect id");
+    assert_eq!(
+        replayed_id, first_id,
+        "replay must reuse the same stable durable effect id"
+    );
     assert_eq!(
         rt.persistence.latest_sequence(actor_id),
         sequence_after_first,
@@ -4252,7 +4255,11 @@ fn test_durable_effect_occurrence_is_activation_local_and_request_drift_fails_cl
         } => operation_id,
         other => panic!("unexpected durable-effect decision: {other:?}"),
     };
-    assert_ne!(id(first), id(second), "dynamic occurrences of one semantic site need distinct ids");
+    assert_ne!(
+        id(first),
+        id(second),
+        "dynamic occurrences of one semantic site need distinct ids"
+    );
 
     {
         let actor = rt.actors.get_mut(&actor_id).unwrap();
