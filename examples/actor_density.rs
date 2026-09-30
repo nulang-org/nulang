@@ -13,6 +13,8 @@
 //!
 //! Run Nulang and any BEAM comparator on the same otherwise-idle host.
 
+use nulang::bytecode::CodeModule;
+use nulang::iso_arena::IsoArena;
 use nulang::runtime::{Actor, ActorHeap, FlightRecorder, Mailbox, OrcaGc, Runtime, TraceEntry};
 use nulang::vm::Value;
 use std::hint::black_box;
@@ -34,6 +36,8 @@ fn resident_bytes() -> Option<u64> {
 
 fn print_layout() {
     println!("actor_struct_bytes={}", size_of::<Actor>());
+    println!("code_module_struct_bytes={}", size_of::<CodeModule>());
+    println!("iso_arena_struct_bytes={}", size_of::<IsoArena>());
     println!("mailbox_struct_bytes={}", size_of::<Mailbox>());
     println!("actor_heap_struct_bytes={}", size_of::<ActorHeap>());
     println!("orca_gc_struct_bytes={}", size_of::<OrcaGc>());
