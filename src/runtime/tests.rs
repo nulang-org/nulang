@@ -22,6 +22,45 @@ fn declare_test_behavior(rt: &mut Runtime, actor_id: u64, name: &str) {
 }
 
 #[test]
+fn test_actor_module_hash_uses_exact_runtime_schema() {
+    let mut module = CodeModule::new("multi-schema-hash");
+    for (name, hash) in [("First", [1u8; 32]), ("Second", [2u8; 32])] {
+        module.add_actor_meta(ActorMeta {
+            name: name.to_string(),
+            persistent: false,
+            state_models: vec![],
+            state_defaults: vec![],
+            behavior_indices: vec![],
+            type_hash: Some(hash),
+            version: 1,
+            migrations: String::new(),
+            is_workflow: false,
+            is_agent: false,
+            is_organization: false,
+            is_virtual: false,
+            tools: vec![],
+            semantic_memory_dimensions: None,
+            procedural_memory_namespace: None,
+            backend: crate::ast::ActorBackendKind::Native,
+            fallback_config: String::new(),
+            retry_config: String::new(),
+        });
+    }
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(Vec::new));
+    let actor = rt.actors.get_mut(&actor_id).expect("actor");
+    actor.name = "Second".to_string();
+    actor.bytecode_module = Some(module);
+
+    assert_eq!(
+        rt.actor_module_hash(actor_id),
+        [2u8; 32],
+        "module/hash identity must come from Second, not the first ActorMeta"
+    );
+}
+
+#[test]
 fn test_authority_snapshot_round_trip_recovery() {
     let mut rt = Runtime::new();
     let actor_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
@@ -2045,6 +2084,7 @@ fn test_memory_store_latest_sequence() {
         waiting_signal: None,
         crdt_snapshot: None,
         crdt_field_map: None,
+        schema_name: None,
         authority_tokens: Default::default(),
     };
     store.save_snapshot(snapshot).unwrap();
@@ -2074,6 +2114,7 @@ fn test_libsql_store_save_load_snapshot() {
         waiting_signal: None,
         crdt_snapshot: None,
         crdt_field_map: None,
+        schema_name: None,
         authority_tokens: Default::default(),
     };
     store.save_snapshot(snapshot).unwrap();
@@ -2128,6 +2169,7 @@ fn test_libsql_store_latest_sequence() {
             waiting_signal: None,
             crdt_snapshot: None,
             crdt_field_map: None,
+            schema_name: None,
             authority_tokens: Default::default(),
         })
         .unwrap();
@@ -2156,6 +2198,7 @@ fn test_libsql_store_clear() {
             waiting_signal: None,
             crdt_snapshot: None,
             crdt_field_map: None,
+            schema_name: None,
             authority_tokens: Default::default(),
         })
         .unwrap();
@@ -2192,6 +2235,7 @@ fn test_libsql_store_persists_to_disk() {
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -2232,6 +2276,7 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
             waiting_signal: None,
             crdt_snapshot: Some(vec![(7, 1, vec![1, 2, 3]), (8, 2, vec![])]),
             crdt_field_map: None,
+            schema_name: None,
             authority_tokens: Default::default(),
         })
         .unwrap();
@@ -2251,6 +2296,7 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
             waiting_signal: None,
             crdt_snapshot: None,
             crdt_field_map: None,
+            schema_name: None,
             authority_tokens: Default::default(),
         })
         .unwrap();
@@ -2294,6 +2340,7 @@ fn test_libsql_store_migrates_old_schema_crdt_column() {
                 waiting_signal: None,
                 crdt_snapshot: Some(vec![(7, 1, vec![1, 2, 3])]),
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -3923,7 +3970,9 @@ fn test_three_node_cluster_membership_converges() {
     let mut rt_c = start_distributed_node();
 
     let addr_a = rt_a.distributed.transport.as_ref().unwrap().listen_addr();
+    let addr_a = rt_a.distributed.transport.as_ref().unwrap().listen_addr();
     let addr_b = rt_b.distributed.transport.as_ref().unwrap().listen_addr();
+    let addr_c = rt_c.distributed.transport.as_ref().unwrap().listen_addr();
     let node_a = rt_a.distributed.node_id.unwrap();
     let node_b = rt_b.distributed.node_id.unwrap();
     let node_c = rt_c.distributed.node_id.unwrap();
@@ -4192,6 +4241,16 @@ fn test_actor_migration_between_two_nodes() {
             waiting_signal: actor.waiting_signal.clone(),
             crdt_snapshot,
             crdt_field_map,
+            schema_name: actor
+                .bytecode_module
+                .as_ref()
+                .and_then(|module| {
+                    crate::runtime::schema_identity::canonical_schema_name_for_runtime_actor(
+                        module,
+                        &actor.name,
+                    )
+                })
+                .map(str::to_owned),
             authority_tokens: Default::default(),
         };
         let json = serde_json::to_vec(&snapshot).unwrap();
@@ -4782,9 +4841,7 @@ fn test_three_node_cluster_split_brain_detects_and_heals() {
     let mut rt_b = start_virtual_clock_node();
     let mut rt_c = start_virtual_clock_node();
 
-    let addr_a = rt_a.distributed.transport.as_ref().unwrap().listen_addr();
     let addr_b = rt_b.distributed.transport.as_ref().unwrap().listen_addr();
-    let addr_c = rt_c.distributed.transport.as_ref().unwrap().listen_addr();
     let node_a = rt_a.distributed.node_id.unwrap();
     let node_b = rt_b.distributed.node_id.unwrap();
     let node_c = rt_c.distributed.node_id.unwrap();
