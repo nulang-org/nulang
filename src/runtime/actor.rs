@@ -299,6 +299,14 @@ pub struct Actor {
     pub workflow_replay_activation: Option<WorkflowActivationId>,
     /// Next deterministic custom-event ordinal within `workflow_replay_activation`.
     pub workflow_replay_event_ordinal: u32,
+    /// Activation whose dynamic durable-effect occurrences are currently tracked.
+    ///
+    /// The map is execution-local replay state. Recovery restarts it from zero
+    /// for the unfinished activation and derives the same IDs from committed
+    /// Prepared/Completed durable-effect records.
+    pub workflow_effect_activation: Option<WorkflowActivationId>,
+    /// Next dynamic occurrence index for each compiler-owned semantic effect site.
+    pub workflow_effect_occurrences: HashMap<[u8; 32], u32>,
     /// Sentinel heap object used by the cycle detector to represent this
     /// actor as a holder of foreign references.
     cycle_sentinel: Option<*mut OrcaHeader>,
@@ -451,6 +459,8 @@ impl Actor {
             current_workflow_activation: None,
             workflow_replay_activation: None,
             workflow_replay_event_ordinal: 0,
+            workflow_effect_activation: None,
+            workflow_effect_occurrences: HashMap::new(),
             cycle_sentinel: None,
             suspended_execution: None,
             waiting_signal: None,

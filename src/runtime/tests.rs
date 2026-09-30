@@ -4137,6 +4137,159 @@ fn test_committed_custom_event_keeps_pre_command_snapshot_safe_for_replay() {
 }
 
 #[test]
+fn test_durable_effect_identity_is_stable_across_workflow_replay() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("EffectReplay", Box::new(Vec::new), HashMap::new());
+    let activation = WorkflowActivationId::new(actor_id, 80);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(activation);
+
+    let site = crate::semantic_identity::effect_site_id(
+        "effect-replay-test",
+        crate::semantic_identity::EffectSiteOwnerKind::Behavior,
+        "EffectReplay.run",
+        "Provider.ask",
+        0,
+    );
+
+    let first = workflow::begin_workflow_durable_effect(
+        &mut rt,
+        actor_id,
+        site,
+        "Provider.ask",
+        crate::primitives::EffectBoundary::External,
+        crate::primitives::DeliverySemantics::AtLeastOnce,
+        b"same-request",
+    )
+    .unwrap()
+    .expect("active workflow activation must derive a durable effect identity");
+    let first_id = match first {
+        crate::durable_effect_runtime::DurableEffectDispatchDecision::DispatchAtLeastOnce {
+            operation_id,
+        } => operation_id,
+        other => panic!("unexpected first durable-effect decision: {other:?}"),
+    };
+    let sequence_after_first = rt.persistence.latest_sequence(actor_id);
+
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.workflow_effect_activation = Some(activation);
+        actor.workflow_effect_occurrences.clear();
+    }
+
+    let replayed = workflow::begin_workflow_durable_effect(
+        &mut rt,
+        actor_id,
+        site,
+        "Provider.ask",
+        crate::primitives::EffectBoundary::External,
+        crate::primitives::DeliverySemantics::AtLeastOnce,
+        b"same-request",
+    )
+    .unwrap()
+    .expect("replayed workflow effect must keep durable identity");
+    let replayed_id = match replayed {
+        crate::durable_effect_runtime::DurableEffectDispatchDecision::DispatchAtLeastOnce {
+            operation_id,
+        } => operation_id,
+        other => panic!("unexpected replay durable-effect decision: {other:?}"),
+    };
+
+    assert_eq!(
+        replayed_id, first_id,
+        "replay must reuse the same stable durable effect id"
+    );
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        sequence_after_first,
+        "replay of an already-prepared effect must not append another durable transition"
+    );
+}
+
+#[test]
+fn test_durable_effect_occurrence_is_activation_local_and_request_drift_fails_closed() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("EffectOccurrence", Box::new(Vec::new), HashMap::new());
+    let activation = WorkflowActivationId::new(actor_id, 90);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(activation);
+
+    let site = crate::semantic_identity::effect_site_id(
+        "effect-occurrence-test",
+        crate::semantic_identity::EffectSiteOwnerKind::Behavior,
+        "EffectOccurrence.run",
+        "Provider.ask",
+        0,
+    );
+
+    let first = workflow::begin_workflow_durable_effect(
+        &mut rt,
+        actor_id,
+        site,
+        "Provider.ask",
+        crate::primitives::EffectBoundary::External,
+        crate::primitives::DeliverySemantics::AtLeastOnce,
+        b"first",
+    )
+    .unwrap()
+    .unwrap();
+    let second = workflow::begin_workflow_durable_effect(
+        &mut rt,
+        actor_id,
+        site,
+        "Provider.ask",
+        crate::primitives::EffectBoundary::External,
+        crate::primitives::DeliverySemantics::AtLeastOnce,
+        b"second",
+    )
+    .unwrap()
+    .unwrap();
+
+    let id = |decision| match decision {
+        crate::durable_effect_runtime::DurableEffectDispatchDecision::DispatchAtLeastOnce {
+            operation_id,
+        } => operation_id,
+        other => panic!("unexpected durable-effect decision: {other:?}"),
+    };
+    assert_ne!(
+        id(first),
+        id(second),
+        "dynamic occurrences of one semantic site need distinct ids"
+    );
+
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.workflow_effect_activation = Some(activation);
+        actor.workflow_effect_occurrences.clear();
+    }
+    let mismatch = workflow::begin_workflow_durable_effect(
+        &mut rt,
+        actor_id,
+        site,
+        "Provider.ask",
+        crate::primitives::EffectBoundary::External,
+        crate::primitives::DeliverySemantics::AtLeastOnce,
+        b"different-replay-request",
+    );
+    assert!(mismatch.is_err(), "replay request drift must fail closed");
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .workflow_effect_occurrences
+            .get(site.as_bytes())
+            .copied()
+            .unwrap_or(0),
+        0,
+        "failed replay validation must not consume the effect occurrence"
+    );
+}
+
+#[test]
 fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
