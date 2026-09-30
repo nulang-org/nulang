@@ -134,9 +134,132 @@ use super::{
     agent, compute_backoff, suspension_marker, BytecodeDistributedCallbacks,
     BytecodeRuntimeCallbacks, Runtime,
 };
-use crate::primitives::ActorRole;
+use crate::durable_effect_runtime::{DurableEffectDispatchDecision, DurableEffectRuntimeError};
+use crate::primitives::{ActorRole, DeliverySemantics, EffectBoundary};
 use crate::runtime::persistence::WorkflowEvent;
+use crate::semantic_identity::EffectSiteId;
 use crate::vm::Value;
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+enum DurableLlmOutcome {
+    Success(LlmResponse),
+    Failure(LlmError),
+}
+
+impl DurableLlmOutcome {
+    fn from_result(result: Result<LlmResponse, LlmError>) -> Self {
+        match result {
+            Ok(response) => Self::Success(response),
+            Err(error) => Self::Failure(error),
+        }
+    }
+
+    fn into_result(self) -> Result<LlmResponse, LlmError> {
+        match self {
+            Self::Success(response) => Ok(response),
+            Self::Failure(error) => Err(error),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum WorkflowLlmDurabilityDecision {
+    NotDurable,
+    Dispatch,
+    Replay(Result<LlmResponse, LlmError>),
+}
+
+fn durability_storage_error(message: impl Into<String>) -> DurableEffectRuntimeError {
+    DurableEffectRuntimeError::Storage(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message.into(),
+    ))
+}
+
+/// Prepare one workflow-owned LLM request before provider dispatch.
+///
+/// The exact serialized request is bound to the activation/site/occurrence
+/// identity. A completed receipt is decoded and returned immediately so the
+/// provider is not contacted again during crash replay.
+pub(crate) fn prepare_workflow_llm_effect(
+    rt: &mut Runtime,
+    actor_id: u64,
+    site_id: EffectSiteId,
+    effect_operation: &str,
+    request: &LlmRequest,
+) -> Result<WorkflowLlmDurabilityDecision, DurableEffectRuntimeError> {
+    let request_bytes = serde_json::to_vec(request)
+        .map_err(|error| durability_storage_error(format!("serialize LLM request: {error}")))?;
+    let Some(decision) = super::workflow::begin_workflow_durable_effect(
+        rt,
+        actor_id,
+        site_id,
+        effect_operation,
+        EffectBoundary::External,
+        DeliverySemantics::AtLeastOnce,
+        &request_bytes,
+    )? else {
+        return Ok(WorkflowLlmDurabilityDecision::NotDurable);
+    };
+
+    match decision {
+        DurableEffectDispatchDecision::ReplayRecordedResult(bytes) => {
+            let outcome: DurableLlmOutcome = serde_json::from_slice(&bytes).map_err(|error| {
+                durability_storage_error(format!("decode durable LLM receipt: {error}"))
+            })?;
+            Ok(WorkflowLlmDurabilityDecision::Replay(
+                outcome.into_result(),
+            ))
+        }
+        DurableEffectDispatchDecision::DispatchAtLeastOnce { operation_id }
+        | DurableEffectDispatchDecision::DispatchWithDeduplication { operation_id }
+        | DurableEffectDispatchDecision::DelegateToBackend { operation_id } => {
+            if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                actor.llm_durable_effect_id = Some(operation_id);
+                actor.llm_durable_request = Some(request_bytes);
+            }
+            Ok(WorkflowLlmDurabilityDecision::Dispatch)
+        }
+    }
+}
+
+/// Persist the terminal outcome of the currently prepared workflow LLM call.
+///
+/// If another completion already won the durable race, the original committed
+/// receipt is returned and becomes the value observed by the workflow.
+pub(crate) fn complete_workflow_llm_effect(
+    rt: &mut Runtime,
+    actor_id: u64,
+    result: Result<LlmResponse, LlmError>,
+) -> Result<Result<LlmResponse, LlmError>, DurableEffectRuntimeError> {
+    let pending = rt.actors.get(&actor_id).and_then(|actor| {
+        actor
+            .llm_durable_effect_id
+            .zip(actor.llm_durable_request.clone())
+    });
+    let Some((effect_id, request_bytes)) = pending else {
+        return Ok(result);
+    };
+
+    let outcome = DurableLlmOutcome::from_result(result);
+    let result_bytes = serde_json::to_vec(&outcome)
+        .map_err(|error| durability_storage_error(format!("serialize LLM result: {error}")))?;
+    let durable_bytes = super::workflow::complete_workflow_durable_effect(
+        rt,
+        actor_id,
+        effect_id,
+        &request_bytes,
+        result_bytes,
+    )?;
+    let durable_outcome: DurableLlmOutcome = serde_json::from_slice(&durable_bytes).map_err(|error| {
+        durability_storage_error(format!("decode completed durable LLM receipt: {error}"))
+    })?;
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.llm_durable_effect_id = None;
+        actor.llm_durable_request = None;
+    }
+    Ok(durable_outcome.into_result())
+}
 
 /// Drain completed background LLM calls and resume any actors waiting for
 /// them.
