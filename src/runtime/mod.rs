@@ -4071,24 +4071,39 @@ impl Runtime {
                     let use_atomic_workflow_turn = self.actor_is_workflow(actor_id)
                         && !self.is_internal_behavior(actor_id, behavior_idx);
                     if use_atomic_workflow_turn {
-                        match workflow::commit_workflow_command(
-                            self,
-                            actor_id,
-                            msg.behavior_id,
-                            payload,
-                        ) {
-                            Ok(activation) => {
-                                workflow_activation = Some(activation);
-                                atomic_workflow_turn = true;
-                            }
-                            Err(error) => {
-                                tracing::error!(
-                                    actor_id,
-                                    %error,
-                                    "nulang-workflow: refusing command execution after atomic durable admission failed"
-                                );
-                                self.current_actor = None;
-                                return;
+                        let recovered_activation = self.actors.get(&actor_id).and_then(|actor| {
+                            actor.current_workflow_activation.filter(|activation| {
+                                activation.actor_id == actor_id
+                                    && activation.command_sequence == actor.sequence
+                            })
+                        });
+                        if let Some(activation) = recovered_activation {
+                            // Recovery already proved that this exact command is
+                            // the open atomic tail. Execute it under the original
+                            // activation instead of admitting a duplicate
+                            // command transition.
+                            workflow_activation = Some(activation);
+                            atomic_workflow_turn = true;
+                        } else {
+                            match workflow::commit_workflow_command(
+                                self,
+                                actor_id,
+                                msg.behavior_id,
+                                payload,
+                            ) {
+                                Ok(activation) => {
+                                    workflow_activation = Some(activation);
+                                    atomic_workflow_turn = true;
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        actor_id,
+                                        %error,
+                                        "nulang-workflow: refusing command execution after atomic durable admission failed"
+                                    );
+                                    self.current_actor = None;
+                                    return;
+                                }
                             }
                         }
                     } else {
@@ -5415,6 +5430,64 @@ impl Runtime {
             .map(|meta| meta.is_agent)
             .unwrap_or(false);
 
+        // RFC 0022 Phase B: classify only the narrow crash window already
+        // covered by atomic native workflow turns. If the committed atomic tail
+        // is ahead of the last safe snapshot and the record at that exact tail
+        // is a command, the process died after admission but before a later
+        // atomic transition could close or advance the activation.
+        //
+        // Do not generalize this to commands below the atomic tail: a later
+        // tail may represent an intermediate event/effect that requires the
+        // broader activation replay contract tracked by #836.
+        let pending_atomic_workflow_replay = if is_workflow {
+            match self.persistence.load_durable_tail_position(actor_id) {
+                Ok(Some(tail)) if tail.sequence > snapshot.sequence => {
+                    if tail.activation_epoch != snapshot.activation_epoch {
+                        warn!(
+                            "nulang-recover: refusing workflow actor {}: atomic tail epoch {} does not match safe snapshot epoch {}",
+                            actor_id, tail.activation_epoch, snapshot.activation_epoch
+                        );
+                        return None;
+                    }
+
+                    let activation = WorkflowActivationId::new(actor_id, tail.sequence);
+                    let terminal_recorded = workflow_events.iter().any(|event| {
+                        matches!(
+                            event,
+                            WorkflowEvent::StepCompleted {
+                                activation: Some(id),
+                                ..
+                            } | WorkflowEvent::StepFailed {
+                                activation: Some(id),
+                                ..
+                            } if *id == activation
+                        )
+                    });
+
+                    if terminal_recorded {
+                        None
+                    } else {
+                        self.persistence
+                            .read_journal(actor_id)
+                            .into_iter()
+                            .find(|entry| entry.sequence == tail.sequence)
+                            .map(|entry| (activation, entry))
+                    }
+                }
+                Ok(_) => None,
+                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
+                Err(error) => {
+                    warn!(
+                        "nulang-recover: refusing workflow actor {} after atomic tail read failed: {}",
+                        actor_id, error
+                    );
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+
         let journal_to_replay: Vec<JournalEntry> = if is_workflow {
             Vec::new()
         } else {
@@ -5437,6 +5510,21 @@ impl Runtime {
                 {
                     warn!(
                         "nulang-recover: refusing actor {}: journal behavior id {} is not owned by schema '{}'",
+                        actor_id, entry.behavior_id, meta.name
+                    );
+                    return None;
+                }
+            }
+            if let Some((_, entry)) = &pending_atomic_workflow_replay {
+                if behavior_ownership::module_behavior_index_for_runtime_id(
+                    module,
+                    &meta.name,
+                    entry.behavior_id as usize,
+                )
+                .is_none()
+                {
+                    warn!(
+                        "nulang-recover: refusing workflow actor {}: unfinished atomic command behavior id {} is not owned by schema '{}'",
                         actor_id, entry.behavior_id, meta.name
                     );
                     return None;
@@ -5575,6 +5663,32 @@ impl Runtime {
             actor.bytecode_module = Some(module.clone());
             actor.bytecode_offsets = offsets.clone();
             actor.compensation_offsets = comp_offsets.clone();
+        }
+        if let Some((activation, entry)) = &pending_atomic_workflow_replay {
+            let payload = entry
+                .payload
+                .iter()
+                .map(|value| value.to_value_on_heap(&mut actor))
+                .collect();
+            actor.current_workflow_activation = Some(*activation);
+            actor.sequence = entry.sequence;
+            if actor
+                .mailbox
+                .push_local(Message {
+                    behavior_id: entry.behavior_id,
+                    payload: MessagePayload::from_vec(payload),
+                    sender: 0,
+                    priority: MessagePriority::Normal,
+                    trace_id: None,
+                })
+                .is_err()
+            {
+                warn!(
+                    "nulang-recover: refusing workflow actor {}: recovered atomic command could not enter empty mailbox",
+                    actor_id
+                );
+                return None;
+            }
         }
         if let Some(schema_name) = recovery_schema_name {
             self.recovery_schema_names.insert(actor_id, schema_name);
