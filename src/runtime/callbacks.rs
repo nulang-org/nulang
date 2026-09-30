@@ -42,6 +42,16 @@ pub(crate) fn migration_authority_tokens(
     Ok(manifest.canonical_token_set())
 }
 
+/// Allocate the fencing epoch owned by the migration target.
+///
+/// The source remains on `current` until it is reaped; sending `current + 1`
+/// means any stale source activation is rejected once the target publishes a
+/// durable commit. Overflow cannot preserve strict monotonicity, so migration
+/// fails closed instead of reusing the maximum epoch.
+fn next_migration_activation_epoch(current: u64) -> Option<u64> {
+    current.checked_add(1)
+}
+
 pub(crate) fn spawn_with_site_authority(
     rt: &mut Runtime,
     module: &crate::bytecode::CodeModule,
@@ -2399,6 +2409,18 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                         return;
                     }
                 };
+                let activation_epoch = match next_migration_activation_epoch(actor.activation_epoch)
+                {
+                    Some(epoch) => epoch,
+                    None => {
+                        tracing::warn!(
+                            actor_id,
+                            epoch = actor.activation_epoch,
+                            "nulang-migrate: refusing migration because activation epoch cannot advance"
+                        );
+                        return;
+                    }
+                };
                 let schema_name = actor
                     .bytecode_module
                     .as_ref()
@@ -2412,6 +2434,7 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                 let snapshot = crate::runtime::persistence::ActorSnapshot {
                     actor_id,
                     sequence: actor.sequence,
+                    activation_epoch,
                     state,
                     waiting_signal: actor.waiting_signal.clone(),
                     crdt_snapshot,
@@ -2566,10 +2589,20 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
 
 #[cfg(test)]
 mod migration_authority_tests {
-    use super::migration_authority_tokens;
+    use super::{migration_authority_tokens, next_migration_activation_epoch};
     use crate::authority::AuthorityManifest;
     use crate::authority_runtime::RuntimeAuthorityError;
     use crate::runtime::Actor;
+
+    #[test]
+    fn explicit_migration_advances_the_fencing_epoch() {
+        assert_eq!(next_migration_activation_epoch(7), Some(8));
+    }
+
+    #[test]
+    fn explicit_migration_refuses_epoch_overflow() {
+        assert_eq!(next_migration_activation_epoch(u64::MAX), None);
+    }
 
     #[test]
     fn migration_sender_preserves_canonical_actor_authority() {
