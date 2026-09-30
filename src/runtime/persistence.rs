@@ -284,6 +284,11 @@ pub enum WorkflowEvent {
     /// A timer was set for a workflow.
     TimerSet {
         sequence: u64,
+        /// Replay-stable identity for deterministic timer preparation.
+        ///
+        /// Legacy records omit this field and remain readable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replay_id: Option<WorkflowReplayEventId>,
         name: String,
         duration_ms: u64,
     },
@@ -364,7 +369,8 @@ impl WorkflowEvent {
     /// later #836 slices.
     pub fn replay_id(&self) -> Option<WorkflowReplayEventId> {
         match self {
-            WorkflowEvent::Custom { replay_id, .. } => *replay_id,
+            WorkflowEvent::TimerSet { replay_id, .. }
+            | WorkflowEvent::Custom { replay_id, .. } => *replay_id,
             _ => None,
         }
     }
@@ -696,6 +702,7 @@ pub trait PersistenceStore: Send + Sync {
             actor_id,
             WorkflowEvent::TimerSet {
                 sequence,
+                replay_id: None,
                 name,
                 duration_ms,
             },
@@ -3886,6 +3893,7 @@ mod postgres_store_tests {
                 actor_id,
                 WorkflowEvent::TimerSet {
                     sequence: 1,
+                    replay_id: None,
                     name: "t".to_string(),
                     duration_ms: 100,
                 },
