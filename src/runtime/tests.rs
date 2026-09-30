@@ -3897,6 +3897,47 @@ fn test_failed_custom_workflow_event_append_does_not_consume_replay_ordinal() {
 }
 
 #[test]
+fn test_suspended_workflow_resume_restores_custom_event_replay_cursor() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("ReplayResume", Box::new(Vec::new), HashMap::new());
+    let activation = WorkflowActivationId::new(actor_id, 50);
+
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.current_workflow_activation = None;
+        actor.workflow_replay_activation = Some(activation);
+        actor.workflow_replay_event_ordinal = 2;
+    }
+
+    rt.restore_suspended_workflow_activation(actor_id, Some(activation));
+    rt.emit_event(actor_id, "AfterResume", &[]);
+
+    let replay_id = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .find_map(|event| match event {
+            WorkflowEvent::Custom {
+                replay_id: Some(replay_id),
+                name,
+                ..
+            } if name == "AfterResume" => Some(replay_id),
+            _ => None,
+        })
+        .expect("custom event after resume must retain replay identity");
+
+    assert_eq!(replay_id, WorkflowReplayEventId::new(activation, 2));
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .workflow_replay_event_ordinal,
+        3,
+        "resume must continue the existing activation-local custom-event cursor"
+    );
+}
+
+#[test]
 fn test_parallel_branch_event_does_not_consume_custom_replay_ordinal() {
     let mut rt = Runtime::new();
     let actor_id = rt.spawn_workflow_actor("ReplayParallel", Box::new(Vec::new), HashMap::new());
