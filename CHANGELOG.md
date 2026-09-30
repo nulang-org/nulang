@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Stable workflow activation identity — 2026-09-29
+- **Accepted workflow commands now receive a stable activation identity derived from `actor_id + command journal sequence`.** The identity is created only after durable command admission succeeds and is attached to terminal `StepCompleted` / `StepFailed` events.
+- **Suspended workflow execution retains the original activation identity across signal, timer, timed-receive, JIT-yield, and LLM re-suspension paths.** Later resume events therefore close the accepted command rather than inventing identity from a later event sequence.
+- **Legacy terminal workflow events remain digest-compatible.** Their activation field is optional on deserialization and omitted when absent on serialization.
+- **Atomic durable transitions reject foreign or mismatched terminal activation identities.** Activation actor and accepted command sequence must match the transition before commit.
+
 ### Workflow durability fail-closed boundary — 2026-09-29
 - **Durable workflow timers no longer become live after a failed persistence write.** `schedule_workflow_timer` now returns the storage error and arms the timer wheel only after `TimerSet` plus the current checkpoint succeed; VM timer effects stop rather than continuing after that failure.
 - **Workflow signals no longer resume or enter in-memory signal state after a failed durable append/checkpoint.** `signal_workflow` now returns `io::Result` and mutates/resumes only after persistence succeeds.

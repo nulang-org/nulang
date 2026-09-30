@@ -7753,6 +7753,50 @@ fn workflow_broken_json_store() -> (JsonFileStore, std::path::PathBuf) {
 }
 
 #[test]
+fn workflow_command_is_not_executed_when_durable_admission_fails() {
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "fail_closed_command",
+            Box::new(|| vec![("count".to_string(), Value::int(0))]),
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("increment", |actor, _args| {
+            let count = actor
+                .get_state_field("count")
+                .and_then(|value| value.as_int())
+                .unwrap_or(0);
+            actor.set_state_field("count", Value::int(count + 1));
+        });
+
+    let (store, path) = workflow_broken_json_store();
+    rt.persistence = Box::new(store);
+
+    rt.send_message(actor_id, "increment", &[]);
+    rt.run_scheduler();
+
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|value| value.as_int()),
+        Some(0),
+        "workflow user code must not execute when command journal admission fails"
+    );
+    assert!(
+        rt.persistence.read_workflow_events(actor_id).is_empty(),
+        "a failed command admission must not create a new terminal workflow event"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn workflow_timer_is_not_armed_when_durable_timer_set_fails() {
     let mut rt = Runtime::new();
     let actor_id = rt
