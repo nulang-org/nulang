@@ -433,6 +433,7 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         None => return,
     };
     let Some(suspended) = suspended else { return };
+    rt.restore_suspended_workflow_activation(actor_id, suspended.activation);
 
     if rt.vm.is_none() {
         // No VM available; put the suspension back so a later message
