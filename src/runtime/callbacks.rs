@@ -2104,8 +2104,18 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             }
 
             if !(*rt).dispatch_llm_request(actor_id, request, prompt) {
-                // Dispatch failed: fall back to a nil response.
+                // Dispatch failed before any provider request became observable.
+                // If this was a durable workflow effect, close the Prepared
+                // record with the same terminal error that this path exposes.
                 rt.llm.inflight_count = rt.llm.inflight_count.saturating_sub(1);
+                let dispatch_error = nulang_ai::LlmError::from_string(
+                    "LLM worker dispatch unavailable before provider execution",
+                );
+                let _ = llm::complete_workflow_llm_effect(
+                    rt,
+                    actor_id,
+                    Err(dispatch_error),
+                );
                 if let Some(actor) = rt.actors.get_mut(&actor_id) {
                     actor.llm_inflight = false;
                     actor.llm_pending_prompt = None;
