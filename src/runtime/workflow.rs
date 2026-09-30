@@ -68,7 +68,6 @@ fn advance_custom_event_replay_id(
         .expect("workflow custom-event ordinal exhausted within one activation");
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CustomEventReplayDisposition {
     Append,
@@ -106,7 +105,7 @@ fn custom_event_replay_disposition(
 
     match committed {
         None => CustomEventReplayDisposition::Append,
-        Some((name, args)) if name == event && args == payload => {
+        Some((name, args)) if name == event && args.as_slice() == payload => {
             CustomEventReplayDisposition::Consume
         }
         Some(_) => CustomEventReplayDisposition::Conflict,
@@ -431,6 +430,7 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                     .unwrap_or(0);
                 actor.set_state_field("parallel_progress", Value::int(current + 1));
             }
+            checkpoint_actor(rt, actor_id);
         } else {
             let module = rt
                 .actors
@@ -493,7 +493,6 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 checkpoint_actor(rt, actor_id);
             }
         }
-
     }
 }
 
