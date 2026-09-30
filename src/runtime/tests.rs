@@ -4359,6 +4359,92 @@ fn test_completed_durable_effect_replays_recorded_result_without_redispatch() {
     );
 }
 
+#[cfg(feature = "ai-runtime")]
+#[test]
+fn test_workflow_llm_durable_receipt_replays_without_provider_dispatch() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("LlmReplay", Box::new(Vec::new), HashMap::new());
+    let activation = WorkflowActivationId::new(actor_id, 110);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(activation);
+
+    let site = crate::semantic_identity::effect_site_id(
+        "llm-replay-test",
+        crate::semantic_identity::EffectSiteOwnerKind::Behavior,
+        "LlmReplay.run",
+        "Inference.ask",
+        0,
+    );
+    let mut request = nulang_ai::LlmRequest::default();
+    request.model = "test-model".to_string();
+    request.messages.push(nulang_ai::LlmMessage {
+        role: "user".to_string(),
+        content: "hello".to_string(),
+    });
+
+    let first = llm::prepare_workflow_llm_effect(
+        &mut rt,
+        actor_id,
+        site,
+        "Inference.ask",
+        &request,
+    )
+    .unwrap();
+    assert!(
+        matches!(first, llm::WorkflowLlmDurabilityDecision::Dispatch),
+        "first execution must persist Prepared before provider dispatch"
+    );
+    assert!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .llm_durable_effect_id
+            .is_some(),
+        "dispatch path must retain the durable operation id until completion"
+    );
+
+    let response = nulang_ai::LlmResponse {
+        content: Some("recorded".to_string()),
+        tool_calls: Vec::new(),
+        model: "test-model".to_string(),
+        finish_reason: "stop".to_string(),
+        usage: Default::default(),
+    };
+    llm::complete_workflow_llm_effect(&mut rt, actor_id, Ok(response))
+        .expect("successful provider result must become a durable Completed receipt");
+    assert!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .llm_durable_effect_id
+            .is_none()
+    );
+
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.workflow_effect_activation = Some(activation);
+        actor.workflow_effect_occurrences.clear();
+    }
+
+    let replay = llm::prepare_workflow_llm_effect(
+        &mut rt,
+        actor_id,
+        site,
+        "Inference.ask",
+        &request,
+    )
+    .unwrap();
+    match replay {
+        llm::WorkflowLlmDurabilityDecision::Replay(Ok(response)) => {
+            assert_eq!(response.content.as_deref(), Some("recorded"));
+            assert_eq!(response.model, "test-model");
+        }
+        other => panic!("expected durable LLM receipt replay, got {other:?}"),
+    }
+}
+
 #[test]
 fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
     let mut rt = Runtime::new();
