@@ -280,10 +280,17 @@ pub(crate) fn store_llm_completion(
     rt.llm.inflight_count = rt.llm.inflight_count.saturating_sub(1);
     match result {
         Ok(response) => {
+            let completed = complete_workflow_llm_effect(rt, actor_id, Ok(response)).unwrap_or_else(
+                |error| {
+                    Err(LlmError::from_string(format!(
+                        "durable LLM completion persistence failed: {error}"
+                    )))
+                },
+            );
             if let Some(actor) = rt.actors.get_mut(&actor_id) {
                 actor.llm_inflight = false;
                 actor.llm_pending_prompt = None;
-                actor.llm_completed = Some(Ok(response));
+                actor.llm_completed = Some(completed);
             }
             if rt
                 .actors
@@ -309,15 +316,26 @@ pub(crate) fn handle_llm_error(rt: &mut Runtime, actor_id: u64, error: LlmError)
         .map(|a| matches!(a.role(), Ok(ActorRole::Agent)))
         .unwrap_or(false);
     if !is_agent {
-        // Non-agent actors: store the error and resume.
-        if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        // Non-agent actors (including workflow actors) treat provider errors as
+        // terminal outcomes. Persist the durable receipt before making the
+        // result visible to suspended bytecode.
+        let completed = complete_workflow_llm_effect(rt, actor_id, Err(error)).unwrap_or_else(
+            |durability_error| {
+                Err(LlmError::from_string(format!(
+                    "durable LLM error receipt persistence failed: {durability_error}"
+                )))
+            },
+        );
+        let should_resume = if let Some(actor) = rt.actors.get_mut(&actor_id) {
             actor.llm_inflight = false;
             actor.llm_pending_prompt = None;
-            actor.llm_completed = Some(Err(error));
-            if actor.suspended_execution.is_some() {
-                resume_suspended_llm_step(rt, actor_id);
-                return;
-            }
+            actor.llm_completed = Some(completed);
+            actor.suspended_execution.is_some()
+        } else {
+            false
+        };
+        if should_resume {
+            resume_suspended_llm_step(rt, actor_id);
         }
         return;
     }
