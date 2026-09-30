@@ -473,6 +473,129 @@ pub(crate) fn native_direct_call(
     Some(idx)
 }
 
+/// A direct-call callee that can execute as an isolated native leaf.
+///
+/// The first native-call slice is intentionally conservative: the body must
+/// be straight-line scalar register code ending in one `Ret`/`RetVal`, with
+/// no nested calls, branches, effects, heap mutation, actor operations, or
+/// other VM state. `required_args` is the highest read-before-write register
+/// plus one; the runtime fast path uses it to reject a call site whose staged
+/// argument count would leave a callee input uninitialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeLeafPlan {
+    pub(crate) start: usize,
+    pub(crate) len: usize,
+    pub(crate) return_reg: u8,
+    pub(crate) required_args: usize,
+}
+
+pub(crate) fn native_leaf_plan(
+    module: &crate::bytecode::CodeModule,
+    func_idx: usize,
+) -> Option<NativeLeafPlan> {
+    use crate::bytecode::OpCode;
+
+    let start = *module.function_table.get(func_idx)?;
+    let end = if func_idx + 1 < module.function_table.len() {
+        module.function_table[func_idx + 1]
+    } else {
+        module.instructions.len()
+    };
+    if end <= start {
+        return None;
+    }
+
+    let ret = *module.instructions.get(end - 1)?;
+    let return_reg = match ret.opcode {
+        OpCode::Ret => 0,
+        OpCode::RetVal => ret.op1,
+        _ => return None,
+    };
+    let body_end = end - 1;
+    if body_end <= start {
+        return None;
+    }
+
+    let mut written = [false; 256];
+    let mut required_args = 0usize;
+
+    for instr in &module.instructions[start..body_end] {
+        let mut note_read = |reg: u8| {
+            let idx = reg as usize;
+            if !written[idx] {
+                required_args = required_args.max(idx + 1);
+            }
+        };
+        match instr.opcode {
+            OpCode::Nop => {}
+            OpCode::Const0 | OpCode::Const1 | OpCode::Const2 | OpCode::ConstM1 => {
+                written[instr.op1 as usize] = true;
+            }
+            OpCode::ConstU => written[instr.op3 as usize] = true,
+            OpCode::Load | OpCode::Store | OpCode::Move | OpCode::Dup => {
+                note_read(instr.op1);
+                written[instr.op2 as usize] = true;
+            }
+            OpCode::Swap => {
+                note_read(instr.op1);
+                note_read(instr.op2);
+                written[instr.op1 as usize] = true;
+                written[instr.op2 as usize] = true;
+            }
+            OpCode::IAdd
+            | OpCode::ISub
+            | OpCode::IMul
+            | OpCode::IDiv
+            | OpCode::IMod
+            | OpCode::IPow
+            | OpCode::FPow
+            | OpCode::Xor
+            | OpCode::Shl
+            | OpCode::Shr
+            | OpCode::BitAnd
+            | OpCode::BitOr
+            | OpCode::FAdd
+            | OpCode::FSub
+            | OpCode::FMul
+            | OpCode::FDiv
+            | OpCode::ICmpEq
+            | OpCode::ICmpLt
+            | OpCode::ICmpGt
+            | OpCode::ICmpLe
+            | OpCode::ICmpGe
+            | OpCode::FCmpEq
+            | OpCode::FCmpLt
+            | OpCode::FCmpGt
+            | OpCode::And
+            | OpCode::Or => {
+                note_read(instr.op1);
+                note_read(instr.op2);
+                written[instr.op3 as usize] = true;
+            }
+            OpCode::INeg | OpCode::Not | OpCode::IToF | OpCode::FToI | OpCode::FNeg => {
+                note_read(instr.op1);
+                written[instr.op2 as usize] = true;
+            }
+            OpCode::IInc | OpCode::IDec => {
+                note_read(instr.op1);
+                written[instr.op1 as usize] = true;
+            }
+            _ => return None,
+        }
+    }
+
+    if !written[return_reg as usize] {
+        required_args = required_args.max(return_reg as usize + 1);
+    }
+
+    Some(NativeLeafPlan {
+        start,
+        len: body_end - start,
+        return_reg,
+        required_args,
+    })
+}
+
 /// Like [`find_compilable_region`], but additionally continues past `Call`
 /// instructions whose direct callee is provably non-suspending, returning the
 /// region length and the map of (absolute pc -> direct callee func index) for
