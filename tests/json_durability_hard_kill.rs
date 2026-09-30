@@ -4,9 +4,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nulang::durable_effect::{DurableEffectId, DurableEffectSpec};
-use nulang::durable_effect_runtime::{
-    DurableEffectCoordinator, DurableEffectDispatchDecision,
-};
+use nulang::durable_effect_runtime::{DurableEffectCoordinator, DurableEffectDispatchDecision};
 use nulang::primitives::{DeliverySemantics, EffectBoundary};
 use nulang::runtime::{
     ActorSnapshot, DurableTransition, JsonFileStore, PersistedValue, PersistenceStore,
@@ -119,7 +117,10 @@ fn kill_after_ack(test_name: &str, mode: &str, prefix: &str, store_dir: &std::pa
         let read = reader.read_line(&mut line).expect("must read child output");
         assert_ne!(read, 0, "child exited before durable acknowledgement");
         if let Some(value) = line.trim().strip_prefix(prefix) {
-            break value.trim().parse::<u64>().expect("ACK must carry sequence");
+            break value
+                .trim()
+                .parse::<u64>()
+                .expect("ACK must carry sequence");
         }
     };
 
