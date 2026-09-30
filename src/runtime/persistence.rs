@@ -240,6 +240,27 @@ impl WorkflowActivationId {
     }
 }
 
+/// Stable replay identity for one deterministic intermediate workflow event.
+///
+/// The ordinal is local to the accepted command activation. Re-executing the
+/// same activation from its safe boundary must derive the same ordinal for the
+/// same logical event, allowing recovery to consume committed history instead
+/// of appending the event again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowReplayEventId {
+    pub activation: WorkflowActivationId,
+    pub ordinal: u32,
+}
+
+impl WorkflowReplayEventId {
+    pub const fn new(activation: WorkflowActivationId, ordinal: u32) -> Self {
+        Self {
+            activation,
+            ordinal,
+        }
+    }
+}
+
 /// A workflow event records a durable, replayable step in a workflow actor.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "tag", content = "value")]
@@ -299,6 +320,11 @@ pub enum WorkflowEvent {
     /// Any other event emitted by a workflow handler.
     Custom {
         sequence: u64,
+        /// Replay-stable identity for deterministic intermediate events.
+        ///
+        /// Legacy records omit this field and remain readable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replay_id: Option<WorkflowReplayEventId>,
         name: String,
         args: Vec<PersistedValue>,
     },
@@ -327,6 +353,18 @@ impl WorkflowEvent {
         match self {
             WorkflowEvent::StepCompleted { activation, .. }
             | WorkflowEvent::StepFailed { activation, .. } => *activation,
+            _ => None,
+        }
+    }
+
+    /// Return the deterministic replay identity of an intermediate event.
+    ///
+    /// Only custom events use this identity today. Other replay-sensitive
+    /// workflow records will adopt the same activation-local ordinal model in
+    /// later #836 slices.
+    pub fn replay_id(&self) -> Option<WorkflowReplayEventId> {
+        match self {
+            WorkflowEvent::Custom { replay_id, .. } => *replay_id,
             _ => None,
         }
     }
@@ -4132,6 +4170,7 @@ mod libsql_atomic_transition_tests {
                 },
                 WorkflowEvent::Custom {
                     sequence,
+                    replay_id: None,
                     name: "audit".to_string(),
                     args: vec![PersistedValue::Int(sequence as i64)],
                 },
