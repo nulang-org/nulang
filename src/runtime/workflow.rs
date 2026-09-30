@@ -190,6 +190,33 @@ pub(crate) fn begin_workflow_durable_effect(
     Ok(Some(decision))
 }
 
+/// Persist the terminal receipt for one previously prepared workflow effect.
+///
+/// The coordinator enforces request identity and monotonic completion. Calling
+/// this again after a terminal receipt already exists returns the original
+/// durable bytes instead of appending another transition.
+pub(crate) fn complete_workflow_durable_effect(
+    rt: &mut Runtime,
+    actor_id: u64,
+    effect_id: DurableEffectId,
+    request: &[u8],
+    result: Vec<u8>,
+) -> Result<Vec<u8>, DurableEffectRuntimeError> {
+    let activation_epoch = rt
+        .actors
+        .get(&actor_id)
+        .map(|actor| actor.activation_epoch)
+        .ok_or_else(|| {
+            DurableEffectRuntimeError::Storage(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("workflow actor {actor_id} not found while completing durable effect"),
+            ))
+        })?;
+    let mut coordinator =
+        DurableEffectCoordinator::new(rt.persistence.as_mut(), actor_id, activation_epoch);
+    coordinator.complete(effect_id, request, result)
+}
+
 // ---------------------------------------------------------------------------
 // Checkpoint
 // ---------------------------------------------------------------------------
