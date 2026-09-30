@@ -6,7 +6,12 @@
 //! to keep the god-object at a manageable size.
 
 use crate::bytecode::Constant;
-use crate::primitives::ActorRole;
+use crate::durable_effect::{DurableEffectId, DurableEffectSpec};
+use crate::durable_effect_runtime::{
+    DurableEffectCoordinator, DurableEffectDispatchDecision, DurableEffectRuntimeError,
+};
+use crate::primitives::{ActorRole, DeliverySemantics, EffectBoundary};
+use crate::semantic_identity::EffectSiteId;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{
     ActorSnapshot, DurableTransition, EventEntry, JournalEntry, PersistedValue,
@@ -111,6 +116,84 @@ fn custom_event_replay_disposition(
         Some(_) => CustomEventReplayDisposition::Conflict,
     }
 }
+/// Begin one replay-stable durable effect owned by the currently accepted
+/// workflow activation.
+///
+/// Identity is independent of bytecode PCs and source positions: it combines
+/// the stable accepted command activation, compiler-owned semantic effect site,
+/// and dynamic occurrence of that site within the activation. The occurrence
+/// advances only after durable recovery state validates successfully.
+pub(crate) fn begin_workflow_durable_effect(
+    rt: &mut Runtime,
+    actor_id: u64,
+    site_id: EffectSiteId,
+    effect_operation: &str,
+    boundary: EffectBoundary,
+    delivery: DeliverySemantics,
+    request: &[u8],
+) -> Result<Option<DurableEffectDispatchDecision>, DurableEffectRuntimeError> {
+    let site_digest = *site_id.as_bytes();
+    let (activation, activation_epoch, occurrence) = {
+        let Some(actor) = rt.actors.get_mut(&actor_id) else {
+            return Ok(None);
+        };
+        let Some(activation) = actor.current_workflow_activation else {
+            return Ok(None);
+        };
+        if actor.workflow_effect_activation != Some(activation) {
+            actor.workflow_effect_activation = Some(activation);
+            actor.workflow_effect_occurrences.clear();
+        }
+        let occurrence = actor
+            .workflow_effect_occurrences
+            .get(&site_digest)
+            .copied()
+            .unwrap_or(0);
+        (activation, actor.activation_epoch, occurrence)
+    };
+
+    let next_occurrence = occurrence.checked_add(1).ok_or_else(|| {
+        DurableEffectRuntimeError::Storage(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "workflow durable-effect occurrence exhausted within one activation",
+        ))
+    })?;
+    let execution_key = format!(
+        "workflow-activation:{}:{}",
+        activation.actor_id, activation.command_sequence
+    );
+    let effect_id = DurableEffectId::derive_from_site(
+        actor_id,
+        &execution_key,
+        site_id,
+        occurrence,
+    );
+    let spec = DurableEffectSpec::new(effect_id, effect_operation, boundary, delivery);
+    let decision = {
+        let mut coordinator =
+            DurableEffectCoordinator::new(rt.persistence.as_mut(), actor_id, activation_epoch);
+        coordinator.begin(spec, request)?
+    };
+
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        if actor.current_workflow_activation == Some(activation)
+            && actor.workflow_effect_activation == Some(activation)
+            && actor
+                .workflow_effect_occurrences
+                .get(&site_digest)
+                .copied()
+                .unwrap_or(0)
+                == occurrence
+        {
+            actor
+                .workflow_effect_occurrences
+                .insert(site_digest, next_occurrence);
+        }
+    }
+
+    Ok(Some(decision))
+}
+
 // ---------------------------------------------------------------------------
 // Checkpoint
 // ---------------------------------------------------------------------------
