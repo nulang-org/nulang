@@ -281,6 +281,11 @@ pub struct Actor {
     turn_reductions: u32,     // Messages handled in the current scheduling turn
     pub max_reductions: u32,  // Max reductions per turn before yield (preemption)
     pub sequence: u64,        // Last persisted sequence number
+    /// Monotonic fencing epoch for durable ownership of this logical actor.
+    ///
+    /// This is the canonical live source of truth used by snapshots,
+    /// failover directory announcements, and atomic durable transitions.
+    pub activation_epoch: u64,
     /// Accepted workflow command currently executing on this actor.
     ///
     /// Set after the command is durably journaled and cleared when the direct
@@ -435,6 +440,7 @@ impl Actor {
             turn_reductions: 0,
             max_reductions: 1000,
             sequence: 0,
+            activation_epoch: crate::runtime::persistence::INITIAL_ACTIVATION_EPOCH,
             current_workflow_activation: None,
             cycle_sentinel: None,
             suspended_execution: None,

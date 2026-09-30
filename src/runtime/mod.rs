@@ -397,10 +397,11 @@ pub struct Runtime {
     /// garbage-collected after `MIGRATED_ACTOR_TTL` seconds.
     pub migrated_actors: HashMap<u64, (NodeId, Instant)>,
 
-    /// Durable actors opted into `RespawnOnNodeLoss` (RFC 0014): actor id →
-    /// current activation epoch. Enables shadow replication at checkpoint
-    /// time and directory announcement.
-    pub(crate) respawn_opted: HashMap<u64, u64>,
+    /// Durable actors opted into `RespawnOnNodeLoss` (RFC 0014).
+    ///
+    /// Epoch ownership lives on the Actor itself; this set records only
+    /// participation in node-loss shadow replication and directory gossip.
+    pub(crate) respawn_opted: HashSet<u64>,
     /// Shadow replicas this node holds (RFC 0014 §3): actor id → replica,
     /// received via `Packet::ShadowReplicate` from the actor's home node.
     /// Consumed by the re-spawn driver when the home node is confirmed gone.
@@ -652,7 +653,7 @@ impl Runtime {
             remote_links: supervision::RemoteLinkRegistry::new(),
             remote_monitors: supervision::RemoteMonitorRegistry::new(),
             migrated_actors: HashMap::new(),
-            respawn_opted: HashMap::new(),
+            respawn_opted: HashSet::new(),
             shadow_replicas: HashMap::new(),
             // Standalone runtimes use node id 0; `enable_distribution` swaps
             // this for a real node-id manager. Initialized eagerly so
@@ -3352,7 +3353,7 @@ impl Runtime {
     /// updating the actor's own sequence/dirty tracking.
     fn build_actor_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
         let mut state = std::collections::HashMap::new();
-        let (waiting_signal, schema_name, authority_tokens) = {
+        let (waiting_signal, activation_epoch, schema_name, authority_tokens) = {
             let actor = self.actors.get(&actor_id)?;
             for (name, value) in &actor.state_data {
                 let model = actor
@@ -3376,6 +3377,7 @@ impl Runtime {
             };
             (
                 actor.waiting_signal.clone(),
+                actor.activation_epoch,
                 actor
                     .bytecode_module
                     .as_ref()
@@ -3406,6 +3408,7 @@ impl Runtime {
         Some(ActorSnapshot {
             actor_id,
             sequence,
+            activation_epoch,
             state,
             waiting_signal,
             crdt_snapshot,
@@ -5295,6 +5298,13 @@ impl Runtime {
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
+        if snapshot.activation_epoch == 0 {
+            warn!(
+                "nulang-recover: refusing actor {} with invalid activation epoch 0",
+                actor_id
+            );
+            return None;
+        }
         if snapshot.schema_name.is_some() && !self.recovery_modules.contains_key(&actor_id) {
             warn!(
                 "nulang-recover: refusing actor {}: persisted schema identity has no registered compiler module",
@@ -5389,6 +5399,7 @@ impl Runtime {
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
+        actor.activation_epoch = snapshot.activation_epoch;
         actor.waiting_signal = snapshot.waiting_signal.clone();
         actor.install_authority_manifest(&authority_manifest);
         Self::restore_state_models_from_snapshot(&mut actor, selected_meta.as_ref(), &snapshot);
@@ -5678,6 +5689,12 @@ impl Runtime {
         expected_schema_name: Option<&str>,
         runtime_name: Option<String>,
     ) -> Result<Actor, String> {
+        if snapshot.activation_epoch == 0 {
+            return Err(format!(
+                "actor {} snapshot has invalid activation epoch 0",
+                actor_id
+            ));
+        }
         if module.actor_metadata.is_empty()
             && snapshot.schema_name.is_none()
             && expected_schema_name.is_none()
@@ -5692,6 +5709,7 @@ impl Runtime {
             );
             actor.persistent = true;
             actor.sequence = snapshot.sequence;
+            actor.activation_epoch = snapshot.activation_epoch;
             actor.waiting_signal = snapshot.waiting_signal.clone();
             actor.install_authority_manifest(&authority_manifest);
             actor.bytecode_module = Some(module.clone());
@@ -5752,6 +5770,7 @@ impl Runtime {
         actor.is_workflow = meta.is_workflow;
         actor.is_agent = meta.is_agent;
         actor.sequence = snapshot.sequence;
+        actor.activation_epoch = snapshot.activation_epoch;
         actor.waiting_signal = snapshot.waiting_signal.clone();
         actor.install_authority_manifest(&authority_manifest);
         actor.bytecode_module = Some(module.clone());
@@ -5994,6 +6013,17 @@ impl Runtime {
                     return false;
                 }
             };
+
+        // The target must own a durable local copy before the actor becomes
+        // runnable. Without this, a crash immediately after migration/failover
+        // would lose the received state and, critically, its fencing epoch.
+        if let Err(error) = self.persistence.save_snapshot(snapshot.clone()) {
+            warn!(
+                "nulang-migrate: refusing actor {} because the received snapshot could not be persisted locally: {}",
+                actor_id, error
+            );
+            return false;
+        }
 
         let offsets = actor.bytecode_offsets.clone();
         let compensation_offsets = actor.compensation_offsets.clone();
@@ -6728,13 +6758,18 @@ impl Runtime {
                 .map(|a| a.persistent)
                 .unwrap_or(false)
         {
-            self.respawn_opted.entry(child_id).or_insert(1);
+            self.respawn_opted.insert(child_id);
+            let epoch = self
+                .actors
+                .get(&child_id)
+                .map(|actor| actor.activation_epoch)
+                .unwrap_or(crate::runtime::persistence::INITIAL_ACTIVATION_EPOCH);
             if let Some(cluster) = self.distributed.cluster.as_mut() {
                 let node = self.distributed.node_id.unwrap_or(NodeId::LOCAL);
                 cluster.announce_directory(DurableDirectoryEntry {
                     actor_id: child_id,
                     node_id: node,
-                    epoch: 1,
+                    epoch,
                 });
             }
         }
@@ -7132,7 +7167,14 @@ impl Runtime {
         actor_id: u64,
         snapshot: &crate::runtime::persistence::ActorSnapshot,
     ) {
-        let Some(&epoch) = self.respawn_opted.get(&actor_id) else {
+        if !self.respawn_opted.contains(&actor_id) {
+            return;
+        }
+        let Some(epoch) = self
+            .actors
+            .get(&actor_id)
+            .map(|actor| actor.activation_epoch)
+        else {
             return;
         };
         let Some(cluster) = self.distributed.cluster.as_ref() else {
@@ -7196,9 +7238,10 @@ impl Runtime {
             .map(|c| {
                 self.respawn_opted
                     .iter()
-                    .filter_map(|(actor_id, epoch)| {
+                    .filter_map(|actor_id| {
+                        let epoch = self.actors.get(actor_id)?.activation_epoch;
                         c.directory_entry(*actor_id)
-                            .filter(|entry| entry.epoch > *epoch)
+                            .filter(|entry| entry.epoch > epoch)
                             .map(|entry| (*actor_id, entry.node_id))
                     })
                     .collect()
@@ -7229,26 +7272,27 @@ impl Runtime {
     /// replicates the final snapshot to its shadow) and then terminate the
     /// local copy. A goodbye that merely lists the manifest without
     /// terminating would leave two live copies once the shadow re-spawns.
-    pub(crate) fn goodbye_self(&mut self) {
-        let opted: Vec<u64> = self.respawn_opted.keys().copied().collect();
-        for actor_id in opted {
-            // Skip non-durable entries (they cannot be checkpointed and are
-            // not in the directory's re-spawn set anyway).
-            if !self
-                .actors
-                .get(&actor_id)
-                .map(|a| a.persistent)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            self.checkpoint_actor(actor_id);
+    pub(crate) fn goodbye_self(&mut self) -> Vec<(u64, u64)> {
+        let mut opted: Vec<(u64, u64)> = self
+            .respawn_opted
+            .iter()
+            .filter_map(|actor_id| {
+                self.actors
+                    .get(actor_id)
+                    .filter(|actor| actor.persistent)
+                    .map(|actor| (*actor_id, actor.activation_epoch))
+            })
+            .collect();
+        opted.sort_unstable_by_key(|(actor_id, _)| *actor_id);
+        for (actor_id, _) in &opted {
+            self.checkpoint_actor(*actor_id);
             crate::runtime::exit::reap_living_actor(
                 self,
-                actor_id,
+                *actor_id,
                 crate::types::ExitReason::Normal,
             );
         }
+        opted
     }
 }
 

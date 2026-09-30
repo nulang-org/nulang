@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Durable actor activation epochs — 2026-09-30
+- **Durable fencing identity now survives checkpoint, recovery, migration, and node-loss takeover.** Live actors own a canonical `activation_epoch`; snapshots persist it, legacy snapshots default explicitly to initial epoch 1, and every restore path hydrates the exact persisted value.
+- **Node-loss recovery no longer duplicates epoch ownership in `respawn_opted`.** The opt-in registry is membership-only; shadow replication and directory announcements derive epochs from the live actor, failover persists the bumped epoch before announcing ownership, and graceful goodbye captures a deterministic actor/epoch manifest before reaping.
+- **Migration closes its immediate-crash durability window.** A receiving node persists the validated incoming snapshot locally before publishing or enqueueing the migrated actor, so recovered state and fencing identity are not lost if the target dies immediately after takeover.
+
 ### Actor-aware durable journal payload serialization — 2026-09-30
 - **Legacy persistent message and synchronous native-ask journaling now preserve runtime strings before they reach storage.** String-pool ids resolve against the originating actor module first and the durable target as a fallback; heap-backed strings resolve only after exact live-allocation provenance.
 - **Pointer serialization fails closed by runtime type.** Only live allocations tagged `TypeTag::String` are decoded as UTF-8; raw/FFI/non-string pointers remain `PersistedValue::Nil` instead of being interpreted as C strings.

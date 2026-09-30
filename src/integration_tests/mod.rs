@@ -5574,10 +5574,17 @@ match { a: 2, b: 9 } with {
         let child_id = value.as_actor_id().expect("spawn returns an actor id");
 
         let rt_ref = rt.borrow();
+        assert!(
+            rt_ref.respawn_opted.contains(&child_id),
+            "policy 3 must opt the persistent child into RespawnOnNodeLoss"
+        );
+        let child = rt_ref
+            .actors
+            .get(&child_id)
+            .expect("the opted-in persistent child must remain live");
         assert_eq!(
-            rt_ref.respawn_opted.get(&child_id),
-            Some(&1),
-            "policy 3 must opt the persistent child into RespawnOnNodeLoss (epoch 1)"
+            child.activation_epoch, 1,
+            "initial RespawnOnNodeLoss opt-in must preserve the actor's canonical epoch"
         );
     }
 
