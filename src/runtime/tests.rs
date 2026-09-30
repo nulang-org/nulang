@@ -3811,6 +3811,162 @@ fn test_atomic_workflow_command_preserves_sender_heap_string_payload() {
 }
 
 #[test]
+fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "ReplayWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", |actor, _args| {
+            if let Some(n) = actor
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int())
+            {
+                actor.set_state_field("step_index", Value::int(n + 1));
+            }
+        });
+
+    let behavior_id = rt
+        .behavior_id_for(actor_id, "next")
+        .expect("registered workflow behavior must have a stable id");
+    let snapshot_before = rt.persistence.load_snapshot(actor_id).unwrap();
+    let activation =
+        workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new()).unwrap();
+    assert!(
+        activation.command_sequence > snapshot_before.sequence,
+        "accepted command must extend the pre-command safe snapshot"
+    );
+
+    // Crash after atomic command admission but before handler entry.
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+
+    // Native test handlers are runtime registrations, so restore the handler
+    // after actor recovery before executing the replayed mailbox command.
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", |actor, _args| {
+            if let Some(n) = actor
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int())
+            {
+                actor.set_state_field("step_index", Value::int(n + 1));
+            }
+        });
+
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    let actor = rt
+        .actors
+        .get(&actor_id)
+        .expect("recovered workflow actor must remain live");
+    assert_eq!(
+        actor
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
+        Some(1),
+        "an atomically admitted but nonterminal command must replay from the last safe snapshot"
+    );
+
+    let completed = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .any(|event| {
+            matches!(
+                event,
+                WorkflowEvent::StepCompleted {
+                    activation: Some(id),
+                    ..
+                } if id == activation
+            )
+        });
+    assert!(
+        completed,
+        "replayed command must close the original accepted activation"
+    );
+    assert_eq!(
+        rt.persistence.read_journal(actor_id).len(),
+        1,
+        "replay must execute the accepted command without admitting a duplicate"
+    );
+}
+
+#[test]
+fn test_recovery_does_not_replay_completed_atomic_native_workflow_activation() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "CompletedWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", |actor, _args| {
+            if let Some(n) = actor
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int())
+            {
+                actor.set_state_field("step_index", Value::int(n + 1));
+            }
+        });
+
+    rt.send_message(actor_id, "next", &[]);
+    run_ready_actor_turn(&mut rt, actor_id);
+    assert_eq!(rt.persistence.read_journal(actor_id).len(), 1);
+
+    let terminal_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        terminal_snapshot.sequence,
+        "successful atomic terminal commit must advance the safe snapshot to the durable tail"
+    );
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", |actor, _args| {
+            if let Some(n) = actor
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int())
+            {
+                actor.set_state_field("step_index", Value::int(n + 1));
+            }
+        });
+
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(
+        actor
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
+        Some(1),
+        "a terminally committed activation must not replay after recovery"
+    );
+    assert_eq!(
+        rt.persistence.read_journal(actor_id).len(),
+        1,
+        "terminal recovery must not admit or replay a second command"
+    );
+}
+
+#[test]
 fn test_workflow_actor_recovery_replays_step_index() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
