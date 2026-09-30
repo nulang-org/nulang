@@ -1,4 +1,4 @@
-use nulang::runtime::{WorkflowActivationId, WorkflowEvent};
+use nulang::runtime::{WorkflowActivationId, WorkflowEvent, WorkflowReplayEventId};
 
 #[test]
 fn terminal_workflow_events_carry_the_command_activation_identity() {
@@ -49,4 +49,45 @@ fn workflow_activation_identity_round_trips_exact_command_sequence() {
     assert_eq!(decoded.actor_id, 9);
     assert_eq!(decoded.command_sequence, 1234);
     assert_eq!(decoded, activation);
+}
+
+#[test]
+fn custom_workflow_events_carry_replay_stable_activation_ordinal_identity() {
+    let activation = WorkflowActivationId::new(42, 7);
+    let replay_id = WorkflowReplayEventId::new(activation, 3);
+    let event = WorkflowEvent::Custom {
+        sequence: 11,
+        replay_id: Some(replay_id),
+        name: "InventoryReserved".into(),
+        args: vec![],
+    };
+
+    assert_eq!(event.replay_id(), Some(replay_id));
+    assert_eq!(replay_id.activation, activation);
+    assert_eq!(replay_id.ordinal, 3);
+
+    let encoded = serde_json::to_string(&event).unwrap();
+    let decoded: WorkflowEvent = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded.replay_id(), Some(replay_id));
+}
+
+#[test]
+fn legacy_custom_workflow_events_without_replay_identity_remain_readable() {
+    let json = r#"{
+        "tag":"Custom",
+        "value":{"sequence":11,"name":"InventoryReserved","args":[]}
+    }"#;
+
+    let event: WorkflowEvent = serde_json::from_str(json).unwrap();
+
+    assert_eq!(event.replay_id(), None);
+    assert!(matches!(
+        event,
+        WorkflowEvent::Custom {
+            sequence: 11,
+            replay_id: None,
+            ref name,
+            ref args,
+        } if name == "InventoryReserved" && args.is_empty()
+    ));
 }
