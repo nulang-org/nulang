@@ -125,11 +125,7 @@ fn run_idle(actor_count: usize) {
     black_box(&ids);
     black_box(&runtime);
 
-    let actor_heap_used_bytes: usize = runtime
-        .actors
-        .values()
-        .map(|actor| actor.heap.used())
-        .sum();
+    let actor_heap_used_bytes: usize = runtime.actors.values().map(|actor| actor.heap.used()).sum();
 
     println!("mode=idle");
     println!("actor_count={actor_count}");
