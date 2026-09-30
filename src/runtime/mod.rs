@@ -11,6 +11,7 @@ use std::time::Instant;
 use tracing::warn;
 
 mod actor;
+mod behavior_ownership;
 mod blocking_executor;
 pub mod cache;
 pub mod cache_cluster;
@@ -2064,9 +2065,10 @@ impl Runtime {
         }
     }
 
-    /// Return whether `behavior_id` names a real native or bytecode handler on
-    /// `target_id`. Behavior id 0 is valid only when the target actually
-    /// declares handler 0; invalid ids are never aliases for it.
+    /// Return whether `behavior_id` names a real native or executable
+    /// bytecode handler on `target_id`. Bytecode execution is schema-scoped
+    /// by `has_bytecode_handler`; numeric mailbox transport itself remains a
+    /// low-level primitive and may carry inert/unknown ids.
     fn actor_has_behavior_id(&self, target_id: u64, behavior_id: u16) -> bool {
         let behavior_idx = behavior_id as usize;
         let has_native = self
@@ -2079,31 +2081,52 @@ impl Runtime {
 
     pub fn behavior_id_for(&self, target_id: u64, behavior: &str) -> Option<u16> {
         let actor = self.actors.get(&target_id)?;
-        // Allocation-free match: `entry.name == behavior`, or
-        // `entry.name` ends with `.<behavior>` (qualified name).
         let matches = |name: &str| {
             name == behavior
                 || name
                     .strip_suffix(behavior)
                     .is_some_and(|prefix| prefix.ends_with('.'))
         };
-        // Search the per-actor behavior table first (native handlers).
         if let Some(idx) = actor
             .behavior_table
             .iter()
             .position(|entry| matches(&entry.name))
         {
-            return Some(idx as u16);
+            return u16::try_from(idx).ok();
         }
-        // Fall back to the module-level behavior table (bytecode handlers).
-        // Returns the GLOBAL index into module.behaviors, which matches
-        // what bytecode_offsets expects.
+
         let module = actor.bytecode_module.as_ref()?;
-        module
-            .behaviors
-            .iter()
-            .position(|b| matches(&b.name))
-            .map(|idx| idx as u16)
+        if module.actor_metadata.is_empty() {
+            return module
+                .behaviors
+                .iter()
+                .position(|entry| matches(&entry.name))
+                .and_then(|idx| u16::try_from(idx).ok());
+        }
+
+        if let Some(idx) =
+            behavior_ownership::runtime_behavior_id_for_actor_name(module, &actor.name, behavior)
+        {
+            return u16::try_from(idx).ok();
+        }
+
+        // Transitional compatibility for durable actors recovered before the
+        // durable schema-identity slice lands. Never choose the first suffix:
+        // a synthetic actor_<id> may resolve a short name only when it is
+        // globally unique in the module.
+        if actor.name.starts_with("actor_") {
+            let mut candidates = module
+                .behaviors
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| matches(&entry.name))
+                .map(|(idx, _)| idx);
+            let idx = candidates.next()?;
+            if candidates.next().is_none() {
+                return u16::try_from(idx).ok();
+            }
+        }
+        None
     }
 
     /// Resolve a public name-based delivery without reintroducing the old
@@ -2146,13 +2169,12 @@ impl Runtime {
     /// target actor has been hydrated on the local shard.
     fn resolve_grain_behavior_id(&self, grain_id: &GrainId, behavior_name: &str) -> Option<u16> {
         let grain_type = self.grain_registry.get(&grain_id.grain_type)?;
-        let suffix = format!(".{}", behavior_name);
-        grain_type
-            .module
-            .behaviors
-            .iter()
-            .position(|b| b.name == behavior_name || b.name.ends_with(&suffix))
-            .map(|idx| idx as u16)
+        behavior_ownership::runtime_behavior_id_for_name(
+            &grain_type.module,
+            &grain_id.grain_type,
+            behavior_name,
+        )
+        .and_then(|idx| u16::try_from(idx).ok())
     }
 
     /// Send a message to an actor owned by another shard. Validates that the
@@ -4275,10 +4297,29 @@ impl Runtime {
     }
 
     fn has_bytecode_handler(&self, actor_id: u64, behavior_idx: usize) -> bool {
-        self.actors
-            .get(&actor_id)
-            .map(|a| a.bytecode_module.is_some() && behavior_idx < a.bytecode_offsets.len())
-            .unwrap_or(false)
+        let Some(actor) = self.actors.get(&actor_id) else {
+            return false;
+        };
+        let Some(module) = actor.bytecode_module.as_ref() else {
+            return false;
+        };
+        if behavior_idx >= actor.bytecode_offsets.len() {
+            return false;
+        }
+        if module.actor_metadata.is_empty() {
+            return true;
+        }
+        if behavior_ownership::module_behavior_index_for_actor(module, &actor.name, behavior_idx)
+            .is_some()
+        {
+            return true;
+        }
+
+        // Recovery predates durable schema identity in this stack layer and
+        // rebuilds ordinary actors with synthetic actor_<id> names. Preserve
+        // that legacy execution path here; the immediately-following durable
+        // schema slice binds recovery to ActorMeta.name and removes the ambiguity.
+        actor.name.starts_with("actor_")
     }
 
     fn next_sequence(&self, actor_id: u64) -> u64 {
