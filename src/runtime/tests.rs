@@ -2002,6 +2002,196 @@ fn test_persistent_string_state_survives_checkpoint_and_recovery() {
     assert!(!restored.is_nil(), "restored string must not be nil");
 }
 #[test]
+fn test_journal_replay_restores_persisted_string_payload_on_actor_heap() {
+    use crate::bytecode::{BehaviorTableEntry, CodeModule, Constant, Instruction, OpCode};
+
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("seen".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_persistent_actor(
+        Box::new(|| vec![("seen".to_string(), Value::nil())]),
+        models,
+    );
+    let sender_id = rt.spawn_actor(Box::new(Vec::new));
+
+    // Behavior "Recorder.set": self.seen = arg0.
+    let mut module = CodeModule::new("journal-string-replay");
+    let field_idx = module.add_constant(Constant::String("seen".to_string()));
+    module.add_behavior(BehaviorTableEntry {
+        name: "Recorder.set".to_string(),
+        param_count: 1,
+        code_offset: 0,
+        local_count: 1,
+        effect_mask: 0,
+        compensate_offset: None,
+        content_hash: None,
+        source_location: None,
+        parallel_branches: None,
+    });
+    module.emit(Instruction::new3(
+        OpCode::StateSet,
+        ((field_idx >> 8) & 0xFF) as u8,
+        (field_idx & 0xFF) as u8,
+        0,
+    ));
+    module.emit(Instruction::new1(OpCode::RetVal, 0));
+
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    // Persist a checkpoint followed by a journal command encoded through the
+    // same actor-aware serializer used by real message delivery. Recovery must
+    // materialize the stored string into the new actor heap before invoking the
+    // behavior, so this pins the full encode -> journal -> decode round trip.
+    rt.checkpoint_actor(actor_id);
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let runtime_string = rt
+        .actors
+        .get_mut(&sender_id)
+        .unwrap()
+        .allocate_string("replayed value");
+    let persisted_payload =
+        rt.persist_journal_payload(actor_id, Some(sender_id), &[runtime_string]);
+    assert_eq!(
+        persisted_payload,
+        vec![PersistedValue::String("replayed value".to_string())],
+        "journal encoding must preserve the sender-owned runtime string before replay"
+    );
+    rt.persistence
+        .append_journal(
+            actor_id,
+            JournalEntry {
+                sequence: snapshot.sequence + 1,
+                behavior_id: 0,
+                payload: persisted_payload,
+            },
+        )
+        .unwrap();
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    let restored = actor.get_state_field("seen").unwrap();
+    assert_eq!(
+        crate::runtime::workflow::vm_value_to_string_in_actor(&restored, actor).as_deref(),
+        Some("replayed value"),
+        "journal replay must preserve persisted string payloads instead of converting them to nil"
+    );
+
+    // A recovered string is now heap-backed. A subsequent checkpoint must
+    // serialize that live heap string semantically, otherwise a second
+    // restart silently turns the durable field back into nil.
+    rt.checkpoint_actor(actor_id);
+    let second_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(
+        second_snapshot.state.get("seen"),
+        Some(&PersistedValue::String("replayed value".to_string())),
+        "checkpoint after replay must persist the recovered heap-backed string"
+    );
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+    let actor = rt.actors.get(&actor_id).unwrap();
+    let restored_again = actor.get_state_field("seen").unwrap();
+    assert_eq!(
+        crate::runtime::workflow::vm_value_to_string_in_actor(&restored_again, actor).as_deref(),
+        Some("replayed value"),
+        "the string must survive replay, checkpoint, and a second recovery"
+    );
+}
+
+#[test]
+fn test_persistent_message_journal_preserves_sender_heap_string_payload() {
+    let mut rt = Runtime::new();
+    let sender_id = rt.spawn_actor(Box::new(Vec::new));
+    let target_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    declare_test_behavior(&mut rt, target_id, "capture");
+
+    let payload = rt
+        .actors
+        .get_mut(&sender_id)
+        .unwrap()
+        .allocate_string("journal me");
+
+    rt.current_actor = Some(sender_id);
+    rt.send_message_by_id(target_id, 0, &[payload]);
+    rt.current_actor = None;
+    run_ready_actor_turn(&mut rt, target_id);
+
+    let journal = rt.persistence.read_journal(target_id);
+    assert_eq!(journal.len(), 1);
+    assert_eq!(
+        journal[0].payload,
+        vec![PersistedValue::String("journal me".to_string())],
+        "normal persistent-message journaling must preserve a live sender-owned heap string"
+    );
+}
+
+#[test]
+fn test_persistent_native_ask_journal_preserves_module_string_id() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    declare_test_behavior(&mut rt, actor_id, "capture");
+
+    let mut module = CodeModule::new("journal-string-id");
+    let string_idx = module.add_constant(Constant::String("pooled value".to_string()));
+    rt.actors.get_mut(&actor_id).unwrap().bytecode_module = Some(module);
+
+    rt.ask_actor_sync(actor_id, 0, &[Value::string(string_idx as u32)])
+        .unwrap();
+
+    let journal = rt.persistence.read_journal(actor_id);
+    assert_eq!(journal.len(), 1);
+    assert_eq!(
+        journal[0].payload,
+        vec![PersistedValue::String("pooled value".to_string())],
+        "synchronous native ask journaling must resolve string-pool ids before persistence"
+    );
+}
+
+#[test]
+fn test_persistent_message_journal_does_not_decode_raw_heap_pointer_as_string() {
+    let mut rt = Runtime::new();
+    let sender_id = rt.spawn_actor(Box::new(Vec::new));
+    let target_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    declare_test_behavior(&mut rt, target_id, "capture");
+
+    let raw_ptr = rt
+        .actors
+        .get_mut(&sender_id)
+        .unwrap()
+        .heap
+        .alloc(8, TypeTag::Raw)
+        .unwrap();
+    unsafe {
+        std::ptr::write_bytes(raw_ptr, b'x', 8);
+    }
+    let payload = unsafe {
+        /* SAFETY: the test value points to a live ActorHeap allocation whose provenance remains owned by sender_id. */
+        Value::ptr(raw_ptr)
+    };
+
+    rt.current_actor = Some(sender_id);
+    rt.send_message_by_id(target_id, 0, &[payload]);
+    rt.current_actor = None;
+    run_ready_actor_turn(&mut rt, target_id);
+
+    let journal = rt.persistence.read_journal(target_id);
+    assert_eq!(journal.len(), 1);
+    assert_eq!(
+        journal[0].payload,
+        vec![PersistedValue::Nil],
+        "non-string heap objects must never be interpreted as C strings during journal serialization"
+    );
+}
+
+#[test]
 fn test_local_state_is_not_persisted() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();

@@ -1831,6 +1831,104 @@ impl Runtime {
         None
     }
 
+    /// Resolve a pointer-tagged value only when it is the exact payload
+    /// address of a live ActorHeap string allocation.
+    fn live_heap_string(heap: &ActorHeap, ptr: *mut u8) -> Option<String> {
+        let mut resolved = None;
+        heap.iter_live_objects(|header, payload, _| {
+            if resolved.is_some() || payload != ptr {
+                return;
+            }
+            // SAFETY: iter_live_objects yields live allocations owned by this
+            // heap, and payload equality proves exact provenance.
+            let header = unsafe { &*header };
+            if header.type_tag != TypeTag::String || header.payload_size == 0 {
+                return;
+            }
+            // SAFETY: payload_size comes from the validated live allocation.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(payload as *const u8, header.payload_size) };
+            let Some(nul) = bytes.iter().position(|byte| *byte == 0) else {
+                return;
+            };
+            let Ok(text) = std::str::from_utf8(&bytes[..nul]) else {
+                return;
+            };
+            resolved = Some(text.to_owned());
+        });
+        resolved
+    }
+
+    fn resolve_live_heap_string(&self, ptr: *mut u8) -> Option<String> {
+        if let Some(text) = Self::live_heap_string(&self.main_heap, ptr) {
+            return Some(text);
+        }
+        for actor in self.actors.values() {
+            if let Some(text) = Self::live_heap_string(&actor.heap, ptr) {
+                return Some(text);
+            }
+        }
+        for heap in &self.retired_heaps {
+            if let Some(text) = Self::live_heap_string(heap, ptr) {
+                return Some(text);
+            }
+        }
+        None
+    }
+
+    fn resolve_actor_module_string(&self, actor_id: u64, id: u32) -> Option<String> {
+        self.actors
+            .get(&actor_id)
+            .and_then(|actor| actor.bytecode_module.as_ref())
+            .and_then(|module| module.constants.get(id as usize))
+            .and_then(|constant| match constant {
+                crate::bytecode::Constant::String(text) => Some(text.clone()),
+                _ => None,
+            })
+    }
+
+    /// Canonical serializer for payloads crossing the durable journal
+    /// boundary. Module string ids resolve against the sender first, then the
+    /// target. Heap strings require exact live allocation provenance and
+    /// TypeTag::String; arbitrary pointers fail closed to Nil.
+    pub(crate) fn persist_journal_payload(
+        &self,
+        target_actor_id: u64,
+        source_actor_id: Option<u64>,
+        values: &[Value],
+    ) -> Vec<PersistedValue> {
+        values
+            .iter()
+            .map(|value| {
+                if let Some(id) = value.as_string_id() {
+                    if let Some(source_actor_id) = source_actor_id {
+                        if let Some(text) = self.resolve_actor_module_string(source_actor_id, id) {
+                            return PersistedValue::String(text);
+                        }
+                    }
+                    if source_actor_id != Some(target_actor_id) {
+                        if let Some(text) = self.resolve_actor_module_string(target_actor_id, id) {
+                            return PersistedValue::String(text);
+                        }
+                    }
+                    return PersistedValue::Nil;
+                }
+
+                if let Some(ptr) = value.as_ptr() {
+                    if ptr.is_null() {
+                        return PersistedValue::Nil;
+                    }
+                    return self
+                        .resolve_live_heap_string(ptr)
+                        .map(PersistedValue::String)
+                        .unwrap_or(PersistedValue::Nil);
+                }
+
+                PersistedValue::from_value(value)
+            })
+            .collect()
+    }
+
     /// Synchronously run a single behavior on an actor and return its result.
     /// Used by the VM's `Ask` opcode when a real runtime is attached.
     pub fn ask_actor_sync(
@@ -2025,10 +2123,11 @@ impl Runtime {
             .map(|e| !e.name.is_empty())
             .unwrap_or(false);
         if is_native {
+            let journal_source_actor = self.current_actor;
             self.current_actor = Some(actor_id);
             if self.actor_is_persistent(actor_id) {
                 let seq = self.next_sequence(actor_id);
-                let payload = args.iter().map(PersistedValue::from_value).collect();
+                let payload = self.persist_journal_payload(actor_id, journal_source_actor, args);
                 let _ = self.persistence.append_journal(
                     actor_id,
                     JournalEntry {
@@ -3262,29 +3361,7 @@ impl Runtime {
                     .copied()
                     .unwrap_or(StateModel::Local);
                 if model == StateModel::Durable || model.is_crdt() {
-                    let persisted = if name == "semantic_memory" || name == "procedural_memory" {
-                        #[cfg(feature = "ai-runtime")]
-                        {
-                            self.vm_value_to_string_in_actor(value, actor)
-                                .map(PersistedValue::String)
-                                .unwrap_or_else(|| {
-                                    PersistedValue::from_value_resolved(
-                                        value,
-                                        actor.bytecode_module.as_ref(),
-                                    )
-                                })
-                        }
-                        #[cfg(not(feature = "ai-runtime"))]
-                        {
-                            PersistedValue::from_value_resolved(
-                                value,
-                                actor.bytecode_module.as_ref(),
-                            )
-                        }
-                    } else {
-                        PersistedValue::from_value_resolved(value, actor.bytecode_module.as_ref())
-                    };
-                    state.insert(name.clone(), persisted);
+                    state.insert(name.clone(), actor.persist_value(value));
                 }
             }
             let authority_tokens = match actor.authority_manifest() {
@@ -3734,6 +3811,7 @@ impl Runtime {
                 actor.idle_ms = 0;
             }
             let behavior_idx = msg.behavior_id as usize;
+            let journal_source_actor = (msg.sender != 0).then_some(msg.sender);
 
             // ORCA receiver protocol: hold every heap pointer in the
             // received payload so the owning objects (and any retired
@@ -3765,7 +3843,8 @@ impl Runtime {
             if self.actor_is_agent(actor_id) && self.is_semantic_memory_behavior(&behavior_name) {
                 if self.actor_is_persistent(actor_id) {
                     let seq = self.next_sequence(actor_id);
-                    let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
+                    let payload =
+                        self.persist_journal_payload(actor_id, journal_source_actor, &msg.payload);
                     match self.persistence.append_journal(
                         actor_id,
                         JournalEntry {
@@ -3821,7 +3900,8 @@ impl Runtime {
             if self.actor_is_agent(actor_id) && self.is_procedural_memory_behavior(&behavior_name) {
                 if self.actor_is_persistent(actor_id) {
                     let seq = self.next_sequence(actor_id);
-                    let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
+                    let payload =
+                        self.persist_journal_payload(actor_id, journal_source_actor, &msg.payload);
                     match self.persistence.append_journal(
                         actor_id,
                         JournalEntry {
@@ -3980,7 +4060,8 @@ impl Runtime {
                 // Journal the message before handling so recovery can replay it.
                 if self.actor_is_persistent(actor_id) {
                     let seq = self.next_sequence(actor_id);
-                    let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
+                    let payload =
+                        self.persist_journal_payload(actor_id, journal_source_actor, &msg.payload);
                     match self.persistence.append_journal(
                         actor_id,
                         JournalEntry {
@@ -4019,7 +4100,8 @@ impl Runtime {
                 // Journal before executing bytecode as well.
                 if self.actor_is_persistent(actor_id) {
                     let seq = self.next_sequence(actor_id);
-                    let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
+                    let payload =
+                        self.persist_journal_payload(actor_id, journal_source_actor, &msg.payload);
                     match self.persistence.append_journal(
                         actor_id,
                         JournalEntry {
@@ -5307,8 +5389,13 @@ impl Runtime {
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
-        actor.waiting_signal = snapshot.waiting_signal;
+        actor.waiting_signal = snapshot.waiting_signal.clone();
         actor.install_authority_manifest(&authority_manifest);
+        Self::restore_state_models_from_snapshot(
+            &mut actor,
+            selected_meta.as_ref(),
+            &snapshot,
+        );
         // Restore CRDT state if present in the snapshot.
         if let Some(crdt_snap) = &snapshot.crdt_snapshot {
             if let Some(manager) = &mut self.crdt_manager {
@@ -5370,6 +5457,12 @@ impl Runtime {
         let events = self.persistence.read_events(actor_id);
         if !events.is_empty() {
             for entry in &events {
+                actor
+                    .state_models
+                    .entry(entry.field_name.clone())
+                    .or_insert(StateModel::EventSourced);
+            }
+            for entry in &events {
                 let v = entry.value.to_value_on_heap(&mut actor);
                 actor.set_state_field(&entry.field_name, v);
                 let current_seq = actor
@@ -5419,23 +5512,6 @@ impl Runtime {
             actor.bytecode_module = Some(module.clone());
             actor.bytecode_offsets = offsets.clone();
             actor.compensation_offsets = comp_offsets.clone();
-            // Restore per-field state-model tracking (Local/Durable/
-            // EventSourced/Crdt), lost when `Actor::new` built a bare
-            // actor above. Without this, `checkpoint_actor`'s
-            // Durable/Crdt snapshot filter and `emit_event`'s
-            // EventSourced "+1" bump both silently fall back to
-            // treating every field as `Local` (via their
-            // `unwrap_or(StateModel::Local)`), breaking persistence for
-            // any field mutated after this recovery: a second crash
-            // would drop Durable fields from the snapshot entirely, and
-            // EventSourced fields would stop accumulating via emitted
-            // events.
-            actor.state_models = selected_meta
-                .as_ref()
-                .into_iter()
-                .flat_map(|meta| &meta.state_models)
-                .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
-                .collect();
         }
         if let Some(schema_name) = recovery_schema_name {
             self.recovery_schema_names.insert(actor_id, schema_name);
@@ -5526,7 +5602,14 @@ impl Runtime {
             // Replay entries that were schema-validated before actor publication.
             for entry in journal_to_replay {
                 let behavior_idx = entry.behavior_id as usize;
-                let payload: Vec<Value> = entry.payload.iter().map(|p| p.to_value()).collect();
+                let payload: Vec<Value> = {
+                    let actor = self.actors.get_mut(&actor_id)?;
+                    entry
+                        .payload
+                        .iter()
+                        .map(|value| value.to_value_on_heap(actor))
+                        .collect()
+                };
                 if self.has_native_handler(actor_id, behavior_idx) {
                     let _ = self.dispatch_native_handler(actor_id, behavior_idx, &payload);
                     if let Some(actor) = self.actors.get_mut(&actor_id) {
@@ -5553,6 +5636,45 @@ impl Runtime {
     /// Restores persistent flags, state models, durable fields, and default
     /// values.  Does NOT register the recovery module, restore CRDT state,
     /// insert into `self.actors`, or enqueue - callers do those.
+    fn restore_state_models_from_snapshot(
+        actor: &mut Actor,
+        meta: Option<&crate::bytecode::ActorMeta>,
+        snapshot: &ActorSnapshot,
+    ) {
+        actor.state_models = meta
+            .into_iter()
+            .flat_map(|meta| &meta.state_models)
+            .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
+            .collect();
+
+        // Snapshot state contains only Durable or CRDT fields. Infer only
+        // runtime-created models absent from the selected compiler-owned
+        // schema; never flatten metadata across sibling actor schemas.
+        for name in snapshot.state.keys() {
+            if actor.state_models.contains_key(name) {
+                continue;
+            }
+
+            let crdt_model = snapshot
+                .crdt_field_map
+                .as_ref()
+                .and_then(|field_map| field_map.get(name))
+                .and_then(|crdt_id| {
+                    snapshot.crdt_snapshot.as_ref().and_then(|entries| {
+                        entries
+                            .iter()
+                            .find(|(id, _, _)| id == crdt_id)
+                            .and_then(|(_, ty, _)| crate::ast::CrdtType::from_u8(*ty))
+                    })
+                })
+                .map(StateModel::Crdt);
+
+            actor
+                .state_models
+                .insert(name.clone(), crdt_model.unwrap_or(StateModel::Durable));
+        }
+    }
+
     fn restore_actor_from_snapshot(
         actor_id: u64,
         module: &crate::bytecode::CodeModule,
@@ -5587,6 +5709,7 @@ impl Runtime {
                 .iter()
                 .map(|behavior| behavior.compensate_offset)
                 .collect();
+            Self::restore_state_models_from_snapshot(&mut actor, None, snapshot);
             for (name, value) in &snapshot.state {
                 let value = value.to_value_on_heap(&mut actor);
                 actor.set_state_field(name, value);
@@ -5638,11 +5761,7 @@ impl Runtime {
         actor.bytecode_module = Some(module.clone());
         actor.bytecode_offsets = offsets;
         actor.compensation_offsets = compensation_offsets;
-        actor.state_models = meta
-            .state_models
-            .iter()
-            .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
-            .collect();
+        Self::restore_state_models_from_snapshot(&mut actor, Some(meta), snapshot);
 
         for (name, value) in &snapshot.state {
             if name == "semantic_memory" || name == "procedural_memory" {
@@ -5769,7 +5888,22 @@ impl Runtime {
             let journal = self.persistence.read_journal(stable_actor_id);
             for entry in journal.iter().filter(|e| e.sequence > snap.sequence) {
                 let behavior_idx = entry.behavior_id as usize;
-                let payload: Vec<Value> = entry.payload.iter().map(|p| p.to_value()).collect();
+                let payload: Vec<Value> = {
+                    let actor = self.actors.get_mut(&stable_actor_id).ok_or_else(|| {
+                        NuError::RuntimeError {
+                            msg: format!(
+                                "virtual actor {} disappeared during journal replay",
+                                stable_actor_id
+                            ),
+                            span: Span::new(0, 0),
+                        }
+                    })?;
+                    entry
+                        .payload
+                        .iter()
+                        .map(|value| value.to_value_on_heap(actor))
+                        .collect()
+                };
                 if self.has_native_handler(stable_actor_id, behavior_idx) {
                     // Native handlers cannot be resolved until the actor is in
                     // `self.actors`, so we only support bytecode grains here.
