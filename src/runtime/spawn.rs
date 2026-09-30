@@ -210,7 +210,7 @@ fn try_spawn_actor_with_id(
                 if model.is_persistent() {
                     state.push(PersistedValue::from_value_resolved(
                         value,
-                        actor.bytecode_module.as_ref(),
+                        actor.bytecode_module.as_deref(),
                     ));
                 }
             }
@@ -420,7 +420,7 @@ fn try_spawn_from_module(
             .collect()
     };
     if let Some(actor) = rt.actors.get_mut(&id) {
-        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_module = Some(Box::new(module.clone()));
         actor.bytecode_offsets = offsets.clone();
         actor.compensation_offsets = compensation_offsets.clone();
         if let Some(meta) = meta {
