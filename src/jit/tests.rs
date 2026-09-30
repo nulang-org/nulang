@@ -1646,6 +1646,61 @@ fn test_tier2_counters_are_per_session() {
 }
 
 #[test]
+fn test_loop_region_promotes_on_first_compiled_reentry() {
+    let mut module = CodeModule::new("tier2_loop_reentry");
+    module.emit(Instruction::new1(OpCode::Const0, 0));
+    module.emit(Instruction::new1(OpCode::Const1, 1));
+    module.emit(Instruction::new3(OpCode::IAdd, 0, 1, 0));
+    module.emit(Instruction::new3(OpCode::ICmpLt, 0, 1, 2));
+    let back: i16 = -2; // pc4 -> pc2, an internal loop back-edge.
+    module.emit(Instruction::new3(
+        OpCode::JmpT,
+        2,
+        ((back as u16) >> 8) as u8,
+        (back as u16 & 0xFF) as u8,
+    ));
+    module.emit(Instruction::new0(OpCode::Halt));
+    module.entry_point = Some(0);
+
+    let mut jit = make_jit();
+    let start = 2;
+    let len = 3;
+    unsafe {
+        jit.compile_region(
+            0,
+            start,
+            len,
+            &module.instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("loop region should compile");
+
+    assert_eq!(
+        jit.compiled_optimization(0, start),
+        Some(CodegenOptimization::Fast),
+        "first-tier compilation should still minimize startup latency"
+    );
+
+    // One compiled re-entry can represent an arbitrarily large amount of
+    // native loop work because the back-edge remains inside the region.
+    // Requiring 10k region entries therefore leaves hot loops stranded on
+    // the low-optimization Cranelift tier.
+    jit.record_tier2_and_maybe_promote(0, start, &module);
+
+    assert_eq!(
+        jit.compiled_optimization(0, start),
+        Some(CodegenOptimization::Optimized),
+        "an internal-loop region should promote on its first compiled re-entry"
+    );
+    assert_eq!(
+        jit.tier2_counters.get(&(0, start)).copied(),
+        Some(0),
+        "successful loop promotion should reset the tier-2 counter"
+    );
+}
+
+#[test]
 fn test_tier2_replaces_baseline_with_typed_code() {
     let mut module = CodeModule::new("tier2_replace");
     module.emit(Instruction::new1(OpCode::Const0, 0));
