@@ -781,7 +781,15 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             vm.constant_string(module_idx, string_id)?
         };
         let duration_ms = regs.get(1)?.as_int()? as u64;
-        rt.schedule_workflow_timer(actor_id, &name, duration_ms);
+        if let Err(error) = rt.schedule_workflow_timer(actor_id, &name, duration_ms) {
+            tracing::error!(
+                actor_id,
+                timer = %name,
+                %error,
+                "nulang-workflow: durable timer scheduling failed"
+            );
+            return None;
+        }
         Some(crate::vm::Value::unit())
     }
 
@@ -1592,7 +1600,17 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             let string_id = regs.get(0)?.as_string_id()?;
             let name = vm.constant_string(module_idx, string_id)?;
             let duration_ms = regs.get(1)?.as_int()? as u64;
-            (*self.runtime).schedule_workflow_timer(self.actor_id, &name, duration_ms);
+            if let Err(error) =
+                (*self.runtime).schedule_workflow_timer(self.actor_id, &name, duration_ms)
+            {
+                tracing::error!(
+                    actor_id = self.actor_id,
+                    timer = %name,
+                    %error,
+                    "nulang-workflow: durable timer scheduling failed"
+                );
+                return None;
+            }
             Some(crate::vm::Value::unit())
         }
     }

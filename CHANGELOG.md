@@ -1,4 +1,10 @@
 # Nulang Changelog
+### Workflow durability fail-closed boundary — 2026-09-29
+- **Durable workflow timers no longer become live after a failed persistence write.** `schedule_workflow_timer` now returns the storage error and arms the timer wheel only after `TimerSet` plus the current checkpoint succeed; VM timer effects stop rather than continuing after that failure.
+- **Workflow signals no longer resume or enter in-memory signal state after a failed durable append/checkpoint.** `signal_workflow` now returns `io::Result` and mutates/resumes only after persistence succeeds.
+- **Timer expiry is fail-closed.** If `TimerFired` cannot be durably recorded, the runtime suppresses the corresponding actor message instead of executing an event that recovery cannot prove happened.
+- This deliberately preserves the current two-write event/checkpoint path until activation replay identity can move the workflow path onto RFC 0022 atomic transitions.
+
 ### Durable actor schema identity — 2026-09-29
 - **Durable snapshots now preserve the canonical actor schema that owns their state and behavior history.** Recovery, migration, restart preflight, and virtual-actor hydration resolve exactly that `ActorMeta.name` instead of flattening metadata across a multi-actor module.
 - **Legacy compatibility is explicit and fail-closed.** Snapshots without schema identity remain readable only when the loaded module exposes one unambiguous actor schema; unknown, mismatched, or ambiguous identities are rejected before actor publication.
