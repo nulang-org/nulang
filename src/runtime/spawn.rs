@@ -267,6 +267,7 @@ fn restore_persistent_state(
     if let Some((snapshot, authority)) = snapshot {
         actor.install_authority_manifest(&authority);
         actor.sequence = snapshot.sequence;
+        actor.activation_epoch = snapshot.activation_epoch;
         actor.waiting_signal = snapshot.waiting_signal;
         for (name, value) in snapshot.state {
             let v = value.to_value_on_heap(actor);
