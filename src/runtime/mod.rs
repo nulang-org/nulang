@@ -1163,7 +1163,9 @@ impl Runtime {
         workflow::append_timer_fired(self, actor_id, name)
     }
 
-    /// Append a `SignalReceived` workflow event and checkpoint the actor.
+    /// Append a `SignalReceived` workflow event. Outside an open activation
+    /// this also checkpoints the actor; in-flight workflows keep the last
+    /// completed snapshot unchanged for replay.
     pub fn append_signal_received(
         &mut self,
         actor_id: u64,
