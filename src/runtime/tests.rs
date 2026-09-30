@@ -3973,7 +3973,11 @@ fn test_custom_workflow_replay_consumes_matching_committed_event() {
         .into_iter()
         .filter(|event| matches!(event, WorkflowEvent::Custom { .. }))
         .collect();
-    assert_eq!(custom.len(), 1, "replay must consume the committed event instead of appending a duplicate");
+    assert_eq!(
+        custom.len(),
+        1,
+        "replay must consume the committed event instead of appending a duplicate"
+    );
     assert_eq!(
         rt.actors
             .get(&actor_id)
@@ -4011,7 +4015,11 @@ fn test_custom_workflow_replay_rejects_conflicting_committed_event_identity() {
         .into_iter()
         .filter(|event| matches!(event, WorkflowEvent::Custom { .. }))
         .collect();
-    assert_eq!(custom.len(), 1, "a conflicting replay identity must not mutate durable history");
+    assert_eq!(
+        custom.len(),
+        1,
+        "a conflicting replay identity must not mutate durable history"
+    );
     assert_eq!(
         rt.actors
             .get(&actor_id)
@@ -4122,7 +4130,8 @@ fn test_committed_custom_event_keeps_pre_command_snapshot_safe_for_replay() {
         })
         .collect();
     assert_eq!(
-        matching.len(), 1,
+        matching.len(),
+        1,
         "recovery replay must consume the already-committed custom event without duplicating it"
     );
 }
