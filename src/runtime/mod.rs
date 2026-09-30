@@ -4059,48 +4059,79 @@ impl Runtime {
             }
 
             let mut processed = false;
+            let mut atomic_workflow_turn = false;
             if self.has_native_handler(actor_id, behavior_idx) {
-                // Journal the message before handling so recovery can replay it.
+                // Native user workflow turns are the first RFC 0022 rollout
+                // slice: they cannot suspend or emit bytecode-only intermediate
+                // workflow effects, so command admission and terminal closure
+                // can safely stay on one atomic tail.
                 if self.actor_is_persistent(actor_id) {
-                    let seq = self.next_sequence(actor_id);
                     let payload =
                         self.persist_journal_payload(actor_id, journal_source_actor, &msg.payload);
-                    match self.persistence.append_journal(
-                        actor_id,
-                        JournalEntry {
-                            sequence: seq,
-                            behavior_id: msg.behavior_id,
+                    let use_atomic_workflow_turn = self.actor_is_workflow(actor_id)
+                        && !self.is_internal_behavior(actor_id, behavior_idx);
+                    if use_atomic_workflow_turn {
+                        match workflow::commit_workflow_command(
+                            self,
+                            actor_id,
+                            msg.behavior_id,
                             payload,
-                        },
-                    ) {
-                        Ok(()) => {
-                            if self.actor_is_workflow(actor_id) {
-                                workflow_activation =
-                                    Some(WorkflowActivationId::new(actor_id, seq));
-                                if let Some(actor) = self.actors.get_mut(&actor_id) {
-                                    actor.current_workflow_activation = workflow_activation;
-                                }
+                        ) {
+                            Ok(activation) => {
+                                workflow_activation = Some(activation);
+                                atomic_workflow_turn = true;
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-workflow: refusing command execution after atomic durable admission failed"
+                                );
+                                self.current_actor = None;
+                                return;
                             }
                         }
-                        Err(error) if self.actor_is_workflow(actor_id) => {
-                            tracing::error!(
-                                actor_id,
-                                %error,
-                                "nulang-workflow: refusing command execution after durable admission failed"
-                            );
-                            self.current_actor = None;
-                            return;
+                    } else {
+                        let seq = self.next_sequence(actor_id);
+                        match self.persistence.append_journal(
+                            actor_id,
+                            JournalEntry {
+                                sequence: seq,
+                                behavior_id: msg.behavior_id,
+                                payload,
+                            },
+                        ) {
+                            Ok(()) => {
+                                if self.actor_is_workflow(actor_id) {
+                                    workflow_activation =
+                                        Some(WorkflowActivationId::new(actor_id, seq));
+                                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+                                        actor.current_workflow_activation = workflow_activation;
+                                    }
+                                }
+                            }
+                            Err(error) if self.actor_is_workflow(actor_id) => {
+                                tracing::error!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-workflow: refusing command execution after durable admission failed"
+                                );
+                                self.current_actor = None;
+                                return;
+                            }
+                            Err(_) => {}
                         }
-                        Err(_) => {}
                     }
                 }
                 processed = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload);
-                if processed {
+                if processed && !atomic_workflow_turn {
                     self.checkpoint_actor(actor_id);
                 }
             }
             if !processed && self.has_bytecode_handler(actor_id, behavior_idx) {
-                // Journal before executing bytecode as well.
+                // Compiled workflow turns remain on the legacy path until
+                // custom events, timers/signals, suspension markers, failures,
+                // compensation, and effect replay all share the atomic tail.
                 if self.actor_is_persistent(actor_id) {
                     let seq = self.next_sequence(actor_id);
                     let payload =
@@ -4186,19 +4217,9 @@ impl Runtime {
                 && self.actor_is_workflow(actor_id)
                 && !self.is_internal_behavior(actor_id, behavior_idx)
             {
-                let seq = self.next_sequence(actor_id);
-                let step_name = self.step_name_for(actor_id, behavior_idx);
-                let _ = self.persistence.append_workflow_event(
-                    actor_id,
-                    WorkflowEvent::StepCompleted {
-                        sequence: seq,
-                        activation: workflow_activation,
-                        step_name,
-                    },
-                );
                 // Synthetic parallel steps do not increment step_index in their
                 // bytecode (so signal-waiting branches do not double-increment);
-                // advance it here when the step completes.
+                // advance it before the terminal checkpoint/transition.
                 if self.is_parallel_step(actor_id, behavior_idx) {
                     if let Some(actor) = self.actors.get_mut(&actor_id) {
                         if let Some(n) =
@@ -4208,7 +4229,42 @@ impl Runtime {
                         }
                     }
                 }
-                self.checkpoint_actor(actor_id);
+
+                let step_name = self.step_name_for(actor_id, behavior_idx);
+                if atomic_workflow_turn {
+                    if let Err(error) = workflow::commit_step_completed(
+                        self,
+                        actor_id,
+                        workflow_activation,
+                        step_name,
+                    ) {
+                        tracing::error!(
+                            actor_id,
+                            %error,
+                            "nulang-workflow: terminal durable transition failed; discarding activation"
+                        );
+                        self.actors.remove(&actor_id);
+                        if self.recover_actor(actor_id).is_none() {
+                            tracing::error!(
+                                actor_id,
+                                "nulang-workflow: actor recovery failed after terminal durable transition failure"
+                            );
+                        }
+                        self.current_actor = None;
+                        return;
+                    }
+                } else {
+                    let seq = self.next_sequence(actor_id);
+                    let _ = self.persistence.append_workflow_event(
+                        actor_id,
+                        WorkflowEvent::StepCompleted {
+                            sequence: seq,
+                            activation: workflow_activation,
+                            step_name,
+                        },
+                    );
+                    self.checkpoint_actor(actor_id);
+                }
             }
             let actor = match self.actors.get_mut(&actor_id) {
                 Some(a) => a,
