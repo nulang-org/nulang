@@ -331,6 +331,41 @@ pub(crate) fn compute_recursive(module: &crate::bytecode::CodeModule) -> Vec<boo
 /// The runtime path uses [`find_compilable_region_with_calls`] so direct
 /// non-suspending calls fold into regions.
 #[allow(dead_code)]
+/// Return true when a compiled region contains a branch back to an earlier
+/// instruction within the same region.
+///
+/// A loop region can execute an arbitrarily large amount of native work per
+/// region entry because its back-edge remains inside generated code. Tiering
+/// policy therefore must not treat one loop-region entry as equivalent to one
+/// straight-line region entry.
+pub(crate) fn region_has_internal_back_edge(
+    offset: usize,
+    len: usize,
+    instructions: &[crate::bytecode::Instruction],
+) -> bool {
+    let end = offset.saturating_add(len).min(instructions.len());
+    for (pc, instr) in instructions
+        .iter()
+        .enumerate()
+        .take(end)
+        .skip(offset)
+    {
+        let target = match instr.opcode {
+            crate::bytecode::OpCode::Jmp => {
+                (pc as i64 + instr.simm16() as i64) as usize
+            }
+            crate::bytecode::OpCode::JmpT | crate::bytecode::OpCode::JmpF => {
+                (pc as i64 + instr.offset16() as i64) as usize
+            }
+            _ => continue,
+        };
+        if target >= offset && target < pc {
+            return true;
+        }
+    }
+    false
+}
+
 pub(crate) fn find_compilable_region(
     offset: usize,
     instructions: &[crate::bytecode::Instruction],
