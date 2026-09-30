@@ -198,7 +198,8 @@ pub(crate) fn prepare_workflow_llm_effect(
         EffectBoundary::External,
         DeliverySemantics::AtLeastOnce,
         &request_bytes,
-    )? else {
+    )?
+    else {
         return Ok(WorkflowLlmDurabilityDecision::NotDurable);
     };
 
@@ -207,9 +208,7 @@ pub(crate) fn prepare_workflow_llm_effect(
             let outcome: DurableLlmOutcome = serde_json::from_slice(&bytes).map_err(|error| {
                 durability_storage_error(format!("decode durable LLM receipt: {error}"))
             })?;
-            Ok(WorkflowLlmDurabilityDecision::Replay(
-                outcome.into_result(),
-            ))
+            Ok(WorkflowLlmDurabilityDecision::Replay(outcome.into_result()))
         }
         DurableEffectDispatchDecision::DispatchAtLeastOnce { operation_id }
         | DurableEffectDispatchDecision::DispatchWithDeduplication { operation_id }
@@ -251,9 +250,10 @@ pub(crate) fn complete_workflow_llm_effect(
         &request_bytes,
         result_bytes,
     )?;
-    let durable_outcome: DurableLlmOutcome = serde_json::from_slice(&durable_bytes).map_err(|error| {
-        durability_storage_error(format!("decode completed durable LLM receipt: {error}"))
-    })?;
+    let durable_outcome: DurableLlmOutcome =
+        serde_json::from_slice(&durable_bytes).map_err(|error| {
+            durability_storage_error(format!("decode completed durable LLM receipt: {error}"))
+        })?;
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.llm_durable_effect_id = None;
         actor.llm_durable_request = None;
@@ -280,13 +280,12 @@ pub(crate) fn store_llm_completion(
     rt.llm.inflight_count = rt.llm.inflight_count.saturating_sub(1);
     match result {
         Ok(response) => {
-            let completed = complete_workflow_llm_effect(rt, actor_id, Ok(response)).unwrap_or_else(
-                |error| {
+            let completed = complete_workflow_llm_effect(rt, actor_id, Ok(response))
+                .unwrap_or_else(|error| {
                     Err(LlmError::from_string(format!(
                         "durable LLM completion persistence failed: {error}"
                     )))
-                },
-            );
+                });
             if let Some(actor) = rt.actors.get_mut(&actor_id) {
                 actor.llm_inflight = false;
                 actor.llm_pending_prompt = None;
