@@ -596,11 +596,14 @@ pub(crate) fn append_signal_received(
     rt.persistence
         .append_signal_received(actor_id, seq, name.to_string(), payload)?;
 
-    let activation_open = rt
-        .actors
-        .get(&actor_id)
-        .and_then(|actor| actor.current_workflow_activation)
-        .is_some();
+    let activation_open = rt.actors.get(&actor_id).is_some_and(|actor| {
+        actor.current_workflow_activation.is_some()
+            || actor
+                .suspended_execution
+                .as_ref()
+                .and_then(|suspended| suspended.activation)
+                .is_some()
+    });
     if !activation_open {
         try_checkpoint_actor(rt, actor_id)?;
     }
