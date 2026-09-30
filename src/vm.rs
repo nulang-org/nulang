@@ -355,6 +355,21 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
         PerformAsyncResult::Ready(None)
     }
 
+    /// Execute a generic async effect with compiler-owned semantic site identity.
+    ///
+    /// Old bytecode artifacts have no effect-site sidecar and therefore pass
+    /// `None`. The default preserves existing callback implementations by
+    /// delegating to `perform_async`.
+    fn perform_async_at_site(
+        &mut self,
+        effect_op: &str,
+        constants: &[Constant],
+        args: &[Value],
+        _site_id: Option<[u8; 32]>,
+    ) -> PerformAsyncResult {
+        self.perform_async(effect_op, constants, args)
+    }
+
     /// Try to receive a message from the current actor's mailbox.
     /// Returns `Some((behavior_id, value))` if a message is available,
     /// or `None` if the mailbox is empty. Default returns `None`.
@@ -4348,6 +4363,24 @@ impl VM {
         let effect_op_idx = instr.imm16() as usize;
         let dst_reg = instr.op3 as usize;
         let effect_op = self.module_const_string(module_idx, effect_op_idx);
+        let effect_pc = self.frames[frame_idx].pc.saturating_sub(1);
+        let site_id = match self
+            .modules
+            .get(module_idx)
+            .and_then(|module| module.effect_site_at(effect_pc))
+        {
+            Some(site) if site.effect_operation == effect_op => Some(site.id),
+            Some(site) => {
+                return Err(NuError::VMError {
+                    msg: format!(
+                        "effect-site metadata mismatch at pc {}: metadata={}, opcode={}",
+                        effect_pc, site.effect_operation, effect_op
+                    ),
+                    span: Span::default(),
+                })
+            }
+            None => None,
+        };
         // Pass the full frame register slice and the module's constant pool
         // so the callback can resolve string-id arguments from registers.
         let args = &self.frames[frame_idx].regs;
@@ -4358,7 +4391,7 @@ impl VM {
             .unwrap_or(&[]);
         match self
             .actor_callbacks
-            .perform_async(&effect_op, constants, args)
+            .perform_async_at_site(&effect_op, constants, args, site_id)
         {
             PerformAsyncResult::Ready(result) => {
                 let value = match result {
