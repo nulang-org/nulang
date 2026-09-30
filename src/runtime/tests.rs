@@ -4283,6 +4283,83 @@ fn test_durable_effect_occurrence_is_activation_local_and_request_drift_fails_cl
 }
 
 #[test]
+fn test_completed_durable_effect_replays_recorded_result_without_redispatch() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("EffectReceipt", Box::new(Vec::new), HashMap::new());
+    let activation = WorkflowActivationId::new(actor_id, 100);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(activation);
+
+    let site = crate::semantic_identity::effect_site_id(
+        "effect-receipt-test",
+        crate::semantic_identity::EffectSiteOwnerKind::Behavior,
+        "EffectReceipt.run",
+        "Provider.ask",
+        0,
+    );
+    let request = b"receipt-request";
+    let prepared = workflow::begin_workflow_durable_effect(
+        &mut rt,
+        actor_id,
+        site,
+        "Provider.ask",
+        crate::primitives::EffectBoundary::External,
+        crate::primitives::DeliverySemantics::AtLeastOnce,
+        request,
+    )
+    .unwrap()
+    .unwrap();
+    let effect_id = match prepared {
+        crate::durable_effect_runtime::DurableEffectDispatchDecision::DispatchAtLeastOnce {
+            operation_id,
+        } => operation_id,
+        other => panic!("unexpected durable-effect prepare decision: {other:?}"),
+    };
+
+    let completed = workflow::complete_workflow_durable_effect(
+        &mut rt,
+        actor_id,
+        effect_id,
+        request,
+        b"recorded-result".to_vec(),
+    )
+    .unwrap();
+    assert_eq!(completed, b"recorded-result");
+    let sequence_after_completion = rt.persistence.latest_sequence(actor_id);
+
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.workflow_effect_activation = Some(activation);
+        actor.workflow_effect_occurrences.clear();
+    }
+
+    let replay = workflow::begin_workflow_durable_effect(
+        &mut rt,
+        actor_id,
+        site,
+        "Provider.ask",
+        crate::primitives::EffectBoundary::External,
+        crate::primitives::DeliverySemantics::AtLeastOnce,
+        request,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        replay,
+        crate::durable_effect_runtime::DurableEffectDispatchDecision::ReplayRecordedResult(
+            b"recorded-result".to_vec()
+        )
+    );
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        sequence_after_completion,
+        "completed effect replay must not append another durable transition"
+    );
+}
+
+#[test]
 fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
