@@ -1,4 +1,15 @@
 # Nulang Changelog
+### Actor-aware durable journal payload serialization — 2026-09-30
+- **Legacy persistent message and synchronous native-ask journaling now preserve runtime strings before they reach storage.** String-pool ids resolve against the originating actor module first and the durable target as a fallback; heap-backed strings resolve only after exact live-allocation provenance.
+- **Pointer serialization fails closed by runtime type.** Only live allocations tagged `TypeTag::String` are decoded as UTF-8; raw/FFI/non-string pointers remain `PersistedValue::Nil` instead of being interpreted as C strings.
+- **One canonical `persist_journal_payload` path now feeds the scheduler, AI-memory interceptors, bytecode/native dispatch, and synchronous native-ask journal writers.** The RFC 0022 durable-inbox stack should reuse this serializer when #1002 is replayed.
+
+### Durable journal string replay — 2026-09-30
+- **Persistent actor and virtual-actor journal replay now materialize persisted string payloads on the recovering actor heap.** Previously `PersistedValue::String` passed through the context-free `to_value()` conversion and became `nil`, so post-snapshot commands could replay with different arguments than were durably recorded.
+- **Recovered heap strings remain durable across later checkpoints and a second restart.** Snapshot serialization recognizes exact live actor-heap allocations tagged `TypeTag::String`, while arbitrary pointers still fail closed instead of being interpreted as strings.
+- **Runtime-created persistence models survive ordinary recovery without weakening canonical schema ownership.** The selected compiler-owned `ActorMeta` remains authoritative; only fields already present in a snapshot may infer missing Durable/CRDT classifications from snapshot metadata, and event-journal fields may infer missing EventSourced classification.
+- **Regressions pin the complete boundary.** Tests cover journal encode, replay, post-replay checkpointing, second recovery, sender-owned heap strings, module string ids, and non-string pointer rejection.
+
 ### Stable workflow activation identity — 2026-09-29
 - **Accepted workflow commands now receive a stable activation identity derived from `actor_id + command journal sequence`.** The identity is created only after durable command admission succeeds and is attached to terminal `StepCompleted` / `StepFailed` events.
 - **Suspended workflow execution retains the original activation identity across signal, timer, timed-receive, JIT-yield, and LLM re-suspension paths.** Later resume events therefore close the accepted command rather than inventing identity from a later event sequence.
