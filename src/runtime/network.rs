@@ -36,7 +36,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 #[cfg(feature = "tcp")]
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(feature = "tcp")]
 use std::sync::Mutex;
 use std::sync::{mpsc, Arc};
@@ -1890,11 +1890,20 @@ fn lock_ignore_poison<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 // TcpConnection
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tcp")]
+static NEXT_CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(feature = "tcp")]
+fn next_connection_generation() -> u64 {
+    NEXT_CONNECTION_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
 /// A single TCP connection to a remote node.
 #[cfg(feature = "tcp")]
 pub(crate) struct TcpConnection {
     #[allow(dead_code)]
     pub(crate) node_id: NodeId,
+    pub(crate) generation: u64,
     pub(crate) addr: SocketAddr,
     pub(crate) stream: TransportStream,
     pub(crate) last_activity: Instant,
@@ -2175,8 +2184,10 @@ impl TcpTransport {
             ));
         }
 
+        let generation = next_connection_generation();
         let conn = TcpConnection {
             node_id,
+            generation,
             addr,
             stream,
             last_activity: Instant::now(),
@@ -2198,7 +2209,9 @@ impl TcpTransport {
         let flag = Arc::clone(&self.shutdown_flag);
         let _ = thread::Builder::new()
             .name(format!("nulang-net-reader-out-{}", addr.port()))
-            .spawn(move || connection_read_loop(read_stream, node_id, in_tx, conns, flag));
+            .spawn(move || {
+                connection_read_loop(read_stream, node_id, generation, in_tx, conns, flag)
+            });
         Ok(())
     }
 
@@ -2440,12 +2453,14 @@ fn connection_reader(
     // giving the sender thread windows to interleave writes.
     let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
 
+    let generation = next_connection_generation();
     {
         let mut conns = lock_ignore_poison(&connections);
         conns.insert(
             peer_id,
             TcpConnection {
                 node_id: peer_id,
+                generation,
                 addr,
                 stream: stream.try_clone().expect("try_clone should succeed"),
                 last_activity: Instant::now(),
@@ -2453,7 +2468,14 @@ fn connection_reader(
         );
     }
 
-    connection_read_loop(stream, peer_id, incoming_tx, connections, shutdown_flag);
+    connection_read_loop(
+        stream,
+        peer_id,
+        generation,
+        incoming_tx,
+        connections,
+        shutdown_flag,
+    );
 }
 
 /// Read framed packets from `stream` until disconnect or shutdown, then
@@ -2466,11 +2488,12 @@ fn connection_reader(
 fn connection_read_loop(
     mut stream: TransportStream,
     peer_id: NodeId,
+    generation: u64,
     incoming_tx: mpsc::SyncSender<IncomingPacket>,
     connections: Arc<Mutex<HashMap<NodeId, TcpConnection>>>,
     shutdown_flag: Arc<AtomicBool>,
 ) {
-    loop {
+    'read_loop: loop {
         if shutdown_flag.load(Ordering::Relaxed) {
             break;
         }
@@ -2486,11 +2509,11 @@ fn connection_read_loop(
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
                 }
-                Err(_) => return, // Disconnect or timeout.
+                Err(_) => break 'read_loop, // Disconnect or timeout.
             }
         };
         if len == 0 || len > MAX_PACKET_LEN {
-            return; // Protocol error or DoS.
+            break 'read_loop; // Protocol error or DoS.
         }
 
         // Read payload.
@@ -2502,7 +2525,7 @@ fn connection_read_loop(
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
                 }
-                Err(_) => return,
+                Err(_) => break 'read_loop,
             }
         }
 
@@ -2527,7 +2550,12 @@ fn connection_read_loop(
     }
     {
         let mut conns = lock_ignore_poison(&connections);
-        conns.remove(&peer_id);
+        if conns
+            .get(&peer_id)
+            .is_some_and(|conn| conn.generation == generation)
+        {
+            conns.remove(&peer_id);
+        }
     }
     let _ = stream.shutdown();
 }
@@ -2668,12 +2696,14 @@ fn connect_in_sender(
     }
 
     let read_stream = stream.try_clone()?;
+    let generation = next_connection_generation();
     {
         let mut conns = lock_ignore_poison(connections);
         conns.insert(
             node_id,
             TcpConnection {
                 node_id,
+                generation,
                 addr,
                 stream,
                 last_activity: Instant::now(),
@@ -2685,7 +2715,7 @@ fn connect_in_sender(
     let flag = Arc::clone(shutdown_flag);
     let _ = thread::Builder::new()
         .name(format!("nulang-net-reader-out-{}", addr.port()))
-        .spawn(move || connection_read_loop(read_stream, node_id, in_tx, conns, flag));
+        .spawn(move || connection_read_loop(read_stream, node_id, generation, in_tx, conns, flag));
     Ok(())
 }
 
@@ -3335,7 +3365,134 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 9b. Non-scalar payloads are rejected at send time
+    // 9b. Reader EOF retires the cached connection
+    // ------------------------------------------------------------------
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_connection_read_loop_removes_disconnected_peer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(listen_addr).unwrap();
+        let (server, peer_addr) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let peer_id = NodeId(0xCAFE);
+        let reader = TransportStream::Raw(server);
+        let writer = reader.try_clone().unwrap();
+        let connections = Arc::new(Mutex::new(HashMap::new()));
+        let generation = next_connection_generation();
+        lock_ignore_poison(&connections).insert(
+            peer_id,
+            TcpConnection {
+                node_id: peer_id,
+                generation,
+                addr: peer_addr,
+                stream: writer,
+                last_activity: Instant::now(),
+            },
+        );
+
+        let (incoming_tx, _incoming_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let reader_connections = Arc::clone(&connections);
+        let reader_shutdown = Arc::clone(&shutdown_flag);
+        let handle = thread::spawn(move || {
+            connection_read_loop(
+                reader,
+                peer_id,
+                generation,
+                incoming_tx,
+                reader_connections,
+                reader_shutdown,
+            );
+        });
+
+        // EOF is the normal disconnect path. The reader must retire the
+        // cached writer so the next outbound packet reconnects instead of
+        // consuming itself on a known-dead socket.
+        drop(client);
+        handle.join().unwrap();
+
+        assert!(
+            !lock_ignore_poison(&connections).contains_key(&peer_id),
+            "reader EOF must remove the disconnected peer from the connection pool"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "tcp")]
+    fn test_stale_reader_does_not_remove_replacement_connection() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let old_client = TcpStream::connect(listen_addr).unwrap();
+        let (old_server, old_peer_addr) = listener.accept().unwrap();
+        old_server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let peer_id = NodeId(0xBEEF);
+        let old_reader = TransportStream::Raw(old_server);
+        let old_writer = old_reader.try_clone().unwrap();
+        let old_generation = next_connection_generation();
+        let connections = Arc::new(Mutex::new(HashMap::new()));
+        lock_ignore_poison(&connections).insert(
+            peer_id,
+            TcpConnection {
+                node_id: peer_id,
+                generation: old_generation,
+                addr: old_peer_addr,
+                stream: old_writer,
+                last_activity: Instant::now(),
+            },
+        );
+
+        let (incoming_tx, _incoming_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let reader_connections = Arc::clone(&connections);
+        let reader_shutdown = Arc::clone(&shutdown_flag);
+        let handle = thread::spawn(move || {
+            connection_read_loop(
+                old_reader,
+                peer_id,
+                old_generation,
+                incoming_tx,
+                reader_connections,
+                reader_shutdown,
+            );
+        });
+
+        let new_client = TcpStream::connect(listen_addr).unwrap();
+        let (new_server, new_peer_addr) = listener.accept().unwrap();
+        let new_generation = next_connection_generation();
+        lock_ignore_poison(&connections).insert(
+            peer_id,
+            TcpConnection {
+                node_id: peer_id,
+                generation: new_generation,
+                addr: new_peer_addr,
+                stream: TransportStream::Raw(new_server),
+                last_activity: Instant::now(),
+            },
+        );
+
+        drop(old_client);
+        handle.join().unwrap();
+
+        assert_eq!(
+            lock_ignore_poison(&connections)
+                .get(&peer_id)
+                .map(|conn| conn.generation),
+            Some(new_generation),
+            "an old reader must not evict a replacement connection"
+        );
+
+        drop(new_client);
+    }
+
+    // ------------------------------------------------------------------
+    // 9c. Non-scalar payloads are rejected at send time
     // ------------------------------------------------------------------
     #[test]
     #[cfg(feature = "tcp")]
