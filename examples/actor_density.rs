@@ -125,13 +125,10 @@ fn run_idle(actor_count: usize) {
     black_box(&ids);
     black_box(&runtime);
 
-    let configured_heap_bytes: usize = runtime
+    let actor_heap_used_bytes: usize = runtime
         .actors
         .values()
-        // ActorHeap::used + free_bytes is zero before the lazy first block is
-        // materialized. Keep this metric to prove that idle actors are not
-        // secretly reserving their configured 16 KiB bump blocks.
-        .map(|actor| actor.heap.used() + actor.heap.free_bytes())
+        .map(|actor| actor.heap.used())
         .sum();
 
     println!("mode=idle");
@@ -141,12 +138,10 @@ fn run_idle(actor_count: usize) {
         "scheduler_settle_seconds={:.6}",
         settle_elapsed.as_secs_f64()
     );
+    println!("actor_heap_used_bytes={actor_heap_used_bytes}");
     println!(
-        "materialized_actor_heap_bytes={configured_heap_bytes}"
-    );
-    println!(
-        "materialized_actor_heap_bytes_per_actor={:.1}",
-        configured_heap_bytes as f64 / actor_count as f64
+        "actor_heap_used_bytes_per_actor={:.1}",
+        actor_heap_used_bytes as f64 / actor_count as f64
     );
 
     print_rss("rss_before_bytes", rss_before);
