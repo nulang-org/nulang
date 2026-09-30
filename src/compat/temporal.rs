@@ -205,6 +205,7 @@ impl TemporalWorkflowTaskContext {
         validate_non_empty("timer_id", &timer_id)?;
         Ok(WorkflowEvent::TimerSet {
             sequence: self.transition_sequence,
+            replay_id: None,
             name: timer_id,
             duration_ms,
         })
