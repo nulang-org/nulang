@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Lower idle actor footprint by boxing cold bytecode modules — 2026-09-30
+- **Actors now keep their optional bytecode module behind a `Box` instead of reserving the full `CodeModule` inline in every actor.** Actors without bytecode retain no module allocation, while bytecode-backed actors preserve the same module semantics through explicit boxing/unboxing at ownership boundaries.
+- **The fixed `Actor` layout drops from 2,816 to 2,432 bytes (−13.6%).** In an exact-current-main 10,000-actor release probe on one host, median idle RSS drops from about 4,079 to 3,664 bytes per actor (−10.2%) and median spawn time improves from about 6.29 to 5.79 µs per actor (−7.9%).
+- **Message activation remains healthy.** Across ten release fan-out samples, median one-message-per-actor send+drain improves from about 1.490 to 1.410 µs per actor; the no-default-features runtime suite remains 177/177 green and a native-codegen + AI + TCP feature check passes.
+
 ### Durable actor activation epochs — 2026-09-30
 - **Durable fencing identity now survives checkpoint, recovery, migration, and node-loss takeover.** Live actors own a canonical `activation_epoch`; snapshots persist it, legacy snapshots default explicitly to initial epoch 1, and every restore path hydrates the exact persisted value.
 - **Node-loss recovery no longer duplicates epoch ownership in `respawn_opted`.** The opt-in registry is membership-only; shadow replication and directory announcements derive epochs from the live actor, failover persists the bumped epoch before announcing ownership, and graceful goodbye captures a deterministic actor/epoch manifest before reaping.
