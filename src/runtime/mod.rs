@@ -1308,7 +1308,6 @@ impl Runtime {
             None => return,
         };
         let Some(suspended) = suspended else { return };
-        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
 
         if self.vm.is_none() {
             if let Some(actor) = self.actors.get_mut(&actor_id) {
@@ -1317,6 +1316,7 @@ impl Runtime {
             return;
         }
 
+        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -1630,7 +1630,6 @@ impl Runtime {
             None => return,
         };
         let Some(suspended) = suspended else { return };
-        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
 
         if self.vm.is_none() {
             // No VM available; put the suspension back so a later message
@@ -1641,6 +1640,7 @@ impl Runtime {
             return;
         }
 
+        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
         let behavior_idx = suspended.behavior_idx;
         let step_name = suspended.step_name;
         let self_ptr: *mut Runtime = self;
@@ -4774,7 +4774,6 @@ impl Runtime {
             // Not currently suspended - nothing to resume.
             return;
         };
-        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
         if self.vm.is_none() {
             // VM not available; restore suspension and requeue.
             if let Some(actor) = self.actors.get_mut(&actor_id) {
@@ -4783,6 +4782,7 @@ impl Runtime {
             self.enqueue_actor(actor_id);
             return;
         }
+        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -4868,7 +4868,6 @@ impl Runtime {
             None => return,
         };
         let Some(suspended) = suspended else { return };
-        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
 
         if self.vm.is_none() {
             // No VM available; put the suspension back so a later wake can
@@ -4879,6 +4878,7 @@ impl Runtime {
             return;
         }
 
+        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
