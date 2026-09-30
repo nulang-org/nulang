@@ -98,11 +98,7 @@ fn json_atomic_transition_round_trips_after_reopen() {
     let reopened = JsonFileStore::new(&dir).unwrap();
     assert_eq!(reopened.latest_sequence(ACTOR_ID), 1);
     assert_eq!(
-        reopened
-            .load_snapshot(ACTOR_ID)
-            .unwrap()
-            .state
-            .get("value"),
+        reopened.load_snapshot(ACTOR_ID).unwrap().state.get("value"),
         Some(&PersistedValue::Int(10))
     );
     assert_eq!(reopened.read_journal(ACTOR_ID).len(), 1);
@@ -143,7 +139,9 @@ fn json_durable_effect_recovery_returns_completed_receipt() {
             1,
             0,
             1,
-            Some(DurableEffectPersistenceRecord::from_effect(prepared.clone())),
+            Some(DurableEffectPersistenceRecord::from_effect(
+                prepared.clone(),
+            )),
         ))
         .unwrap();
 
@@ -153,7 +151,9 @@ fn json_durable_effect_recovery_returns_completed_receipt() {
             2,
             1,
             2,
-            Some(DurableEffectPersistenceRecord::from_effect(completed.clone())),
+            Some(DurableEffectPersistenceRecord::from_effect(
+                completed.clone(),
+            )),
         ))
         .unwrap();
     drop(store);
@@ -175,7 +175,9 @@ fn json_atomic_store_recovers_from_torn_final_frame_before_next_commit() {
     store.commit_transition(transition(1, 0, 10, None)).unwrap();
     drop(store);
 
-    let log = dir.join(format!("actor_{ACTOR_ID}")).join("transitions.log");
+    let log = dir
+        .join(format!("actor_{ACTOR_ID}"))
+        .join("transitions.log");
     let committed_len = std::fs::metadata(&log).unwrap().len();
     let mut file = OpenOptions::new().append(true).open(&log).unwrap();
     file.write_all(b"NDT1\0\0\0").unwrap();
