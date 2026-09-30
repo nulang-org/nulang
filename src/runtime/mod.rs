@@ -5391,11 +5391,7 @@ impl Runtime {
         actor.sequence = snapshot.sequence;
         actor.waiting_signal = snapshot.waiting_signal.clone();
         actor.install_authority_manifest(&authority_manifest);
-        Self::restore_state_models_from_snapshot(
-            &mut actor,
-            selected_meta.as_ref(),
-            &snapshot,
-        );
+        Self::restore_state_models_from_snapshot(&mut actor, selected_meta.as_ref(), &snapshot);
         // Restore CRDT state if present in the snapshot.
         if let Some(crdt_snap) = &snapshot.crdt_snapshot {
             if let Some(manager) = &mut self.crdt_manager {
