@@ -3970,9 +3970,7 @@ fn test_three_node_cluster_membership_converges() {
     let mut rt_c = start_distributed_node();
 
     let addr_a = rt_a.distributed.transport.as_ref().unwrap().listen_addr();
-    let addr_a = rt_a.distributed.transport.as_ref().unwrap().listen_addr();
     let addr_b = rt_b.distributed.transport.as_ref().unwrap().listen_addr();
-    let addr_c = rt_c.distributed.transport.as_ref().unwrap().listen_addr();
     let node_a = rt_a.distributed.node_id.unwrap();
     let node_b = rt_b.distributed.node_id.unwrap();
     let node_c = rt_c.distributed.node_id.unwrap();
@@ -4841,7 +4839,9 @@ fn test_three_node_cluster_split_brain_detects_and_heals() {
     let mut rt_b = start_virtual_clock_node();
     let mut rt_c = start_virtual_clock_node();
 
+    let addr_a = rt_a.distributed.transport.as_ref().unwrap().listen_addr();
     let addr_b = rt_b.distributed.transport.as_ref().unwrap().listen_addr();
+    let addr_c = rt_c.distributed.transport.as_ref().unwrap().listen_addr();
     let node_a = rt_a.distributed.node_id.unwrap();
     let node_b = rt_b.distributed.node_id.unwrap();
     let node_c = rt_c.distributed.node_id.unwrap();
