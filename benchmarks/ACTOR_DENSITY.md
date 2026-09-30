@@ -1,7 +1,8 @@
 # Actor Density Measurement
 
 This track measures the runtime property that remains weak in the current
-Criterion snapshot: actor creation and residency. It is deliberately separate
+Criterion snapshot: actor creation and residency. It is measurement-only
+infrastructure and changes no runtime semantics. It is deliberately separate
 from the default `cargo bench` job because 100k-1M actor measurements require
 a fixed, otherwise-idle host and are not useful when repeated on shared CI.
 
