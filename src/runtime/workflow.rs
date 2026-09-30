@@ -10,7 +10,7 @@ use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{
     ActorSnapshot, DurableTransition, EventEntry, JournalEntry, PersistedValue,
-    WorkflowActivationId, WorkflowEvent, DURABLE_TRANSITION_VERSION,
+    WorkflowActivationId, WorkflowEvent, WorkflowReplayEventId, DURABLE_TRANSITION_VERSION,
 };
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
 use crate::vm::{Frame, Value, VM};
@@ -28,6 +28,31 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
         .get(&actor_id)
         .map(|a| matches!(a.role(), Ok(ActorRole::Workflow)))
         .unwrap_or(false)
+}
+
+fn next_custom_event_replay_id(
+    rt: &mut Runtime,
+    actor_id: u64,
+) -> Option<WorkflowReplayEventId> {
+    let actor = rt.actors.get_mut(&actor_id)?;
+    let activation = actor.current_workflow_activation?;
+
+    if actor.workflow_replay_activation != Some(activation) {
+        actor.workflow_replay_activation = Some(activation);
+        actor.workflow_replay_event_ordinal = 0;
+    }
+
+    let ordinal = actor.workflow_replay_event_ordinal;
+    actor.workflow_replay_event_ordinal = ordinal.checked_add(1).unwrap_or_else(|| {
+        tracing::error!(
+            actor_id,
+            activation_sequence = activation.command_sequence,
+            "nulang-workflow: custom event ordinal exhausted within one activation"
+        );
+        u32::MAX
+    });
+
+    Some(WorkflowReplayEventId::new(activation, ordinal))
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +312,9 @@ fn resolve_string_constant(rt: &Runtime, actor_id: u64, value: &Value) -> Option
 /// journal and a checkpoint is forced.
 pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[Value]) {
     let is_workflow = actor_is_workflow(rt, actor_id);
+    let replay_id = is_workflow
+        .then(|| next_custom_event_replay_id(rt, actor_id))
+        .flatten();
     let seq = next_sequence(rt, actor_id);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
         actor.event_log.push((event.to_string(), args.to_vec()));
@@ -362,7 +390,7 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 actor_id,
                 WorkflowEvent::Custom {
                     sequence: seq,
-                    replay_id: None,
+                    replay_id,
                     name: event.to_string(),
                     args: payload,
                 },
