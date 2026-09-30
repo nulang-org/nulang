@@ -3811,6 +3811,74 @@ fn test_atomic_workflow_command_preserves_sender_heap_string_payload() {
 }
 
 #[test]
+fn test_custom_workflow_event_ordinals_are_activation_local_and_deterministic() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("ReplayIdentity", Box::new(Vec::new), HashMap::new());
+
+    let first_activation = WorkflowActivationId::new(actor_id, 10);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(first_activation);
+
+    rt.emit_event(actor_id, "First", &[]);
+    rt.emit_event(actor_id, "Second", &[]);
+
+    let custom: Vec<_> = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::Custom {
+                replay_id: Some(replay_id),
+                name,
+                ..
+            } => Some((name, replay_id)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(custom.len(), 2);
+    assert_eq!(custom[0].0, "First");
+    assert_eq!(
+        custom[0].1,
+        WorkflowReplayEventId::new(first_activation, 0)
+    );
+    assert_eq!(custom[1].0, "Second");
+    assert_eq!(
+        custom[1].1,
+        WorkflowReplayEventId::new(first_activation, 1)
+    );
+
+    let second_activation = WorkflowActivationId::new(actor_id, 20);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(second_activation);
+    rt.emit_event(actor_id, "Third", &[]);
+
+    let third = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .find_map(|event| match event {
+            WorkflowEvent::Custom {
+                replay_id: Some(replay_id),
+                name,
+                ..
+            } if name == "Third" => Some(replay_id),
+            _ => None,
+        })
+        .expect("third custom event must carry replay identity");
+
+    assert_eq!(
+        third,
+        WorkflowReplayEventId::new(second_activation, 0),
+        "a new accepted command activation must restart the deterministic event ordinal"
+    );
+}
+
+#[test]
 fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
