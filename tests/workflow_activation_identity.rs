@@ -51,7 +51,6 @@ fn workflow_activation_identity_round_trips_exact_command_sequence() {
     assert_eq!(decoded, activation);
 }
 
-
 #[test]
 fn custom_workflow_events_carry_replay_stable_activation_ordinal_identity() {
     let activation = WorkflowActivationId::new(42, 7);
