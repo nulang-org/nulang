@@ -11,12 +11,12 @@ use crate::durable_effect_runtime::{
     DurableEffectCoordinator, DurableEffectDispatchDecision, DurableEffectRuntimeError,
 };
 use crate::primitives::{ActorRole, DeliverySemantics, EffectBoundary};
-use crate::semantic_identity::EffectSiteId;
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{
     ActorSnapshot, DurableTransition, EventEntry, JournalEntry, PersistedValue,
     WorkflowActivationId, WorkflowEvent, WorkflowReplayEventId, DURABLE_TRANSITION_VERSION,
 };
+use crate::semantic_identity::EffectSiteId;
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
 use crate::vm::{Frame, Value, VM};
 
@@ -162,12 +162,8 @@ pub(crate) fn begin_workflow_durable_effect(
         "workflow-activation:{}:{}",
         activation.actor_id, activation.command_sequence
     );
-    let effect_id = DurableEffectId::derive_from_site(
-        actor_id,
-        &execution_key,
-        site_id,
-        occurrence,
-    );
+    let effect_id =
+        DurableEffectId::derive_from_site(actor_id, &execution_key, site_id, occurrence);
     let spec = DurableEffectSpec::new(effect_id, effect_operation, boundary, delivery);
     let decision = {
         let mut coordinator =
