@@ -4203,6 +4203,47 @@ fn test_timer_set_replay_consumes_matching_committed_preparation() {
 }
 
 #[test]
+fn test_timer_set_replay_rejects_cross_type_identity_collision() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("ReplayTimerConflict", Box::new(Vec::new), HashMap::new());
+    let activation = WorkflowActivationId::new(actor_id, 91);
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(activation);
+    rt.emit_event(actor_id, "AlreadyCommitted", &[Value::int(1)]);
+
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.current_workflow_activation = Some(activation);
+        actor.workflow_replay_activation = Some(activation);
+        actor.workflow_replay_event_ordinal = 0;
+    }
+
+    let error = rt
+        .schedule_workflow_timer(actor_id, "wake", 250)
+        .expect_err("TimerSet must not reuse a replay id already committed by another event kind");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        rt.persistence.read_timer_events(actor_id).is_empty(),
+        "a replay identity conflict must not append timer history"
+    );
+    assert!(
+        rt.timer_wheel.is_empty(),
+        "a replay identity conflict must not arm a live timer"
+    );
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .workflow_replay_event_ordinal,
+        0,
+        "a conflicting replay identity must not advance the cursor"
+    );
+}
+
+#[test]
 fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
