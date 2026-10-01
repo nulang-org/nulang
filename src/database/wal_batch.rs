@@ -20,6 +20,8 @@ const FRAME_PREFIX_BYTES: usize = 4 + 2 + 4 + 4;
 const FRAME_HEADER_BYTES: usize = FRAME_PREFIX_BYTES + 32;
 const PAYLOAD_CHECKSUM_BYTES: usize = 32;
 const MAX_BATCH_RECORDS: usize = 4096;
+const MAX_MUTATIONS_PER_RECORD: usize = 65_536;
+const MIN_ENCODED_MUTATION_BYTES: usize = 1 + 4;
 const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,7 +187,6 @@ impl BinaryBatchWal {
         let mut latest_epoch = self.latest_ownership_epoch;
         let mut last_sequence = self.last_sequence();
 
-        // No file mutation happens before the complete chain has validated.
         for record in &records {
             validate_chain(record, expected_tablet, latest_epoch, last_sequence, 0)?;
             expected_tablet = Some(record.tablet_id);
@@ -207,9 +208,26 @@ impl BinaryBatchWal {
         self.file.seek(SeekFrom::End(0))?;
         self.poisoned = true;
         self.file.write_all(&header)?;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::BatchWalAfterHeader,
+        )?;
+
         self.file.write_all(&payload)?;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::BatchWalAfterPayload,
+        )?;
+
         self.file.write_all(checksum.as_bytes())?;
+        #[cfg(test)]
+        super::interruption::hit(
+            super::interruption::StorageInterruptionPoint::BatchWalAfterChecksum,
+        )?;
+
         self.file.sync_data()?;
+        #[cfg(test)]
+        super::interruption::hit(super::interruption::StorageInterruptionPoint::BatchWalAfterSync)?;
 
         self.records.extend(records);
         self.tablet_id = expected_tablet;
@@ -280,6 +298,16 @@ fn encode_payload(records: &[RecoveredBatchRecord]) -> Result<Vec<u8>, BatchWalE
         out.extend_from_slice(&record.ownership_epoch.to_le_bytes());
         out.extend_from_slice(&record.sequence.to_le_bytes());
         out.extend_from_slice(&record.expected_previous_sequence.to_le_bytes());
+        if record.mutations.len() > MAX_MUTATIONS_PER_RECORD {
+            return Err(BatchWalError::InvalidRecord {
+                offset: 0,
+                reason: format!(
+                    "mutation count {} exceeds per-record limit {}",
+                    record.mutations.len(),
+                    MAX_MUTATIONS_PER_RECORD
+                ),
+            });
+        }
         let mutation_count =
             u32::try_from(record.mutations.len()).map_err(|_| BatchWalError::InvalidRecord {
                 offset: 0,
@@ -337,6 +365,24 @@ fn decode_payload(
         let sequence = take_u64(payload, &mut cursor, offset)?;
         let expected_previous_sequence = take_u64(payload, &mut cursor, offset)?;
         let mutation_count = take_u32(payload, &mut cursor, offset)? as usize;
+        if mutation_count > MAX_MUTATIONS_PER_RECORD {
+            return Err(BatchWalError::InvalidRecord {
+                offset,
+                reason: format!(
+                    "mutation count {mutation_count} exceeds per-record limit {MAX_MUTATIONS_PER_RECORD}"
+                ),
+            });
+        }
+        let remaining_payload = payload.len().saturating_sub(cursor);
+        let max_mutations_from_remaining = remaining_payload / MIN_ENCODED_MUTATION_BYTES;
+        if mutation_count > max_mutations_from_remaining {
+            return Err(BatchWalError::InvalidRecord {
+                offset,
+                reason: format!(
+                    "mutation count {mutation_count} cannot fit in remaining payload ({remaining_payload} bytes)"
+                ),
+            });
+        }
         let mut mutations = Vec::with_capacity(mutation_count);
         for _ in 0..mutation_count {
             let kind = *payload
@@ -411,18 +457,17 @@ fn take_fixed<const N: usize>(
 
 fn take_bytes(payload: &[u8], cursor: &mut usize, offset: u64) -> Result<Vec<u8>, BatchWalError> {
     let len = take_u32(payload, cursor, offset)? as usize;
-    let end = cursor
-        .checked_add(len)
-        .ok_or_else(|| BatchWalError::InvalidRecord {
+    let remaining_payload = payload.len().saturating_sub(*cursor);
+    if len > remaining_payload {
+        return Err(BatchWalError::InvalidRecord {
             offset,
-            reason: "payload length overflow".into(),
-        })?;
-    let bytes = payload
-        .get(*cursor..end)
-        .ok_or_else(|| BatchWalError::InvalidRecord {
-            offset,
-            reason: "truncated byte field".into(),
-        })?;
+            reason: format!(
+                "byte field length {len} exceeds remaining payload {remaining_payload}"
+            ),
+        });
+    }
+    let end = *cursor + len;
+    let bytes = &payload[*cursor..end];
     *cursor = end;
     Ok(bytes.to_vec())
 }
@@ -556,16 +601,41 @@ impl fmt::Display for BatchWalError {
             Self::UnsupportedFrameVersion { offset, version } => {
                 write!(f, "unsupported batch frame version {version} at {offset}")
             }
-            Self::HeaderChecksumMismatch { offset } => write!(f, "batch header checksum mismatch at {offset}"),
-            Self::PayloadChecksumMismatch { offset } => write!(f, "batch payload checksum mismatch at {offset}"),
-            Self::InvalidRecord { offset, reason } => write!(f, "invalid batch record at {offset}: {reason}"),
+            Self::HeaderChecksumMismatch { offset } => {
+                write!(f, "batch header checksum mismatch at {offset}")
+            }
+            Self::PayloadChecksumMismatch { offset } => {
+                write!(f, "batch payload checksum mismatch at {offset}")
+            }
+            Self::InvalidRecord { offset, reason } => {
+                write!(f, "invalid batch record at {offset}: {reason}")
+            }
             Self::TooManyRecords(count) => write!(f, "batch has too many records ({count})"),
             Self::BatchTooLarge(size) => write!(f, "batch is too large ({size} bytes)"),
-            Self::TabletMismatch { expected, presented } => write!(f, "batch tablet mismatch: expected {}, got {}", expected.get(), presented.get()),
-            Self::StaleOwnershipEpoch { durable, presented } => write!(f, "batch ownership epoch {presented} is stale; durable epoch is {durable}"),
-            Self::SequenceMismatch { committed, expected_previous } => write!(f, "batch predecessor {expected_previous} does not match committed sequence {committed}"),
+            Self::TabletMismatch {
+                expected,
+                presented,
+            } => write!(
+                f,
+                "batch tablet mismatch: expected {}, got {}",
+                expected.get(),
+                presented.get()
+            ),
+            Self::StaleOwnershipEpoch { durable, presented } => write!(
+                f,
+                "batch ownership epoch {presented} is stale; durable epoch is {durable}"
+            ),
+            Self::SequenceMismatch {
+                committed,
+                expected_previous,
+            } => write!(
+                f,
+                "batch predecessor {expected_previous} does not match committed sequence {committed}"
+            ),
             Self::SequenceOverflow => f.write_str("batch WAL sequence overflow"),
-            Self::Poisoned => f.write_str("batch WAL handle is poisoned; reopen before retrying"),
+            Self::Poisoned => {
+                f.write_str("batch WAL handle is poisoned; reopen before retrying")
+            }
         }
     }
 }
