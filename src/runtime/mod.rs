@@ -4442,13 +4442,13 @@ impl Runtime {
         workflow::actor_is_workflow(self, actor_id)
     }
 
-    fn take_workflow_persistence_failure(&mut self, actor_id: u64) -> Option<String> {
+    pub(crate) fn take_workflow_persistence_failure(&mut self, actor_id: u64) -> Option<String> {
         self.actors
             .get_mut(&actor_id)
             .and_then(|actor| actor.workflow_persistence_failure.take())
     }
 
-    fn recover_after_workflow_persistence_failure(
+    pub(crate) fn recover_after_workflow_persistence_failure(
         &mut self,
         actor_id: u64,
         failure: &str,
