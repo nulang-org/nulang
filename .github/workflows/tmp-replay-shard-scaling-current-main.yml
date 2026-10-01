@@ -1,0 +1,71 @@
+name: Replay shard scaling harness on current main
+
+on:
+  push:
+    branches:
+      - perf/shard-scaling-harness-current-main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  replay:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: perf/shard-scaling-harness-current-main
+          fetch-depth: 0
+
+      - name: Replay measurement-only harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=ca3755a1333f5a7348a54e808d2edbda821ea85f
+          head=39330bf7faa711cee5b7e74e1e3d73b605131af3
+          git diff "$base" "$head" -- \
+            Cargo.toml \
+            benchmarks/README.md \
+            src/bin/nulang_shard_bench.rs \
+            .github/workflows/shard-scaling-bench.yml \
+            | git apply --3way --index
+
+      - name: Add current-main changelog entry
+        shell: python
+        run: |
+          from pathlib import Path
+          changelog = Path("CHANGELOG.md")
+          text = changelog.read_text(encoding="utf-8")
+          heading = "# Nulang Changelog\n"
+          title = "### Controlled runtime-shard scaling harness on current main — 2026-10-01\n"
+          assert text.startswith(heading)
+          assert title not in text
+          entry = (
+              title
+              + "- **A diagnostic runner measures fixed total same-shard message work across 1/2/4/8 runtime shards.** Actor/message setup and worker-thread creation are excluded from the timed region; the harness reports throughput, ns/message, speedup, parallel efficiency, and host parallelism.\n"
+              + "- **This establishes a best-case multicore runtime ceiling, not a cross-shard or distributed benchmark.** Publishable scaling claims still require controlled hardware and recorded CPU topology.\n\n"
+          )
+          changelog.write_text(text.replace(heading, heading + entry, 1), encoding="utf-8")
+
+      - name: Format, verify, and test harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/tmp-replay-shard-scaling-current-main.yml
+          cargo fmt --all
+          git add -A
+          git diff --cached --check
+          cargo fmt --all -- --check
+          cargo test --locked --release --no-default-features --features savina-bench --bin nulang-shard-bench
+          cargo run --locked --release --no-default-features --features savina-bench --bin nulang-shard-bench -- --shards 1,2 --messages 20000 --repeat 1 --format jsonl
+
+      - name: Commit current-main replay
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "nulang-maintenance"
+          git config user.email "actions@users.noreply.github.com"
+          git commit -m "perf(bench): replay controlled shard scaling harness on current main"
+          git push origin HEAD:perf/shard-scaling-harness-current-main
