@@ -30,6 +30,23 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// Return whether this actor has already entered RFC 0022 atomic history.
+///
+/// Unsupported backends are intentionally treated as legacy-only. Any other
+/// storage error is propagated so callers do not silently cross persistence
+/// modes after an atomic tail has begun.
+pub(crate) fn workflow_has_atomic_tail(
+    rt: &Runtime,
+    actor_id: u64,
+) -> std::io::Result<bool> {
+    match rt.persistence.load_durable_tail_position(actor_id) {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn current_workflow_replay_id(
     rt: &mut Runtime,
     actor_id: u64,
@@ -211,6 +228,76 @@ fn build_actor_snapshot_at_sequence(
     }))
 }
 
+/// Commit exactly one workflow event as the next RFC 0022 transition.
+///
+/// Intermediate activation records pass `snapshot_state = false` so the last
+/// completed-state snapshot remains replay-safe. Terminal/post-terminal records
+/// that establish a safe state boundary pass `true`.
+fn commit_workflow_event_transition(
+    rt: &mut Runtime,
+    actor_id: u64,
+    snapshot_state: bool,
+    build_event: impl FnOnce(u64) -> WorkflowEvent,
+) -> std::io::Result<()> {
+    let expected_previous_sequence = rt.persistence.latest_sequence(actor_id);
+    let sequence = expected_previous_sequence.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "workflow transition sequence overflow",
+        )
+    })?;
+    let snapshot = if snapshot_state {
+        Some(build_actor_snapshot_at_sequence(rt, actor_id, sequence)?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "workflow transition requires a live persistent actor",
+            )
+        })?)
+    } else {
+        None
+    };
+    let activation_epoch = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.activation_epoch)
+        .or_else(|| {
+            rt.actors
+                .get(&actor_id)
+                .filter(|actor| actor.persistent)
+                .map(|actor| actor.activation_epoch)
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "workflow transition requires a live persistent actor",
+            )
+        })?;
+
+    rt.persistence.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id,
+        activation_epoch,
+        sequence,
+        expected_previous_sequence,
+        command: None,
+        snapshot: snapshot.clone(),
+        workflow_events: vec![build_event(sequence)],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    })?;
+
+    if let Some(snapshot) = snapshot.as_ref() {
+        rt.maybe_shadow_replicate(actor_id, snapshot);
+    }
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.sequence = sequence;
+        if snapshot_state {
+            actor.dirty_fields.clear();
+        }
+    }
+    Ok(())
+}
+
 /// Persist one checkpoint for a durable actor.
 ///
 /// Unlike the compatibility wrapper below, this function is fallible. Callers
@@ -305,46 +392,50 @@ pub(crate) fn commit_step_completed(
     activation: Option<WorkflowActivationId>,
     step_name: String,
 ) -> std::io::Result<()> {
-    let expected_previous_sequence = rt.persistence.latest_sequence(actor_id);
-    let sequence = expected_previous_sequence.checked_add(1).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "workflow terminal transition sequence overflow",
-        )
-    })?;
-    let snapshot = build_actor_snapshot_at_sequence(rt, actor_id, sequence)?.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "workflow terminal transition requires a live persistent actor",
-        )
-    })?;
-    let activation_epoch = snapshot.activation_epoch;
-
-    rt.persistence.commit_transition(DurableTransition {
-        version: DURABLE_TRANSITION_VERSION,
-        actor_id,
-        activation_epoch,
-        sequence,
-        expected_previous_sequence,
-        command: None,
-        snapshot: Some(snapshot.clone()),
-        workflow_events: vec![WorkflowEvent::StepCompleted {
+    commit_workflow_event_transition(rt, actor_id, true, |sequence| {
+        WorkflowEvent::StepCompleted {
             sequence,
             activation,
             step_name,
-        }],
-        domain_events: vec![],
-        durable_effects: vec![],
-        outbox: vec![],
-    })?;
-
-    rt.maybe_shadow_replicate(actor_id, &snapshot);
-    if let Some(actor) = rt.actors.get_mut(&actor_id) {
-        actor.sequence = sequence;
-        actor.dirty_fields.clear();
-    }
-    Ok(())
+        }
+    })
 }
+
+/// Atomically close a failed workflow activation together with the durable
+/// state visible at the failure boundary.
+pub(crate) fn commit_step_failed(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<WorkflowActivationId>,
+    step_name: String,
+    error: String,
+) -> std::io::Result<()> {
+    commit_workflow_event_transition(rt, actor_id, true, |sequence| {
+        WorkflowEvent::StepFailed {
+            sequence,
+            activation,
+            step_name,
+            error,
+        }
+    })
+}
+
+/// Commit a nonterminal workflow event without moving the completed-state
+/// snapshot. Once an atomic tail exists, legacy append APIs are forbidden.
+fn commit_intermediate_workflow_event(
+    rt: &mut Runtime,
+    actor_id: u64,
+    build_event: impl FnOnce(u64) -> WorkflowEvent,
+) -> std::io::Result<()> {
+    if workflow_has_atomic_tail(rt, actor_id)? {
+        commit_workflow_event_transition(rt, actor_id, false, build_event)
+    } else {
+        let sequence = next_sequence(rt, actor_id);
+        rt.persistence
+            .append_workflow_event(actor_id, build_event(sequence))
+    }
+}
+
 
 /// Snapshot the durable and CRDT state of a persistent actor.
 ///
