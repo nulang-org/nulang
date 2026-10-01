@@ -1684,16 +1684,14 @@ impl Runtime {
                             actor.set_state_field("step_index", Value::int(n + 1));
                         }
                     }
-                    let seq = self.next_sequence(actor_id);
-                    let _ = self.persistence.append_workflow_event(
+                    if let Err(error) = workflow::persist_step_completed(
+                        self,
                         actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            activation: suspended.activation,
-                            step_name,
-                        },
-                    );
-                    self.checkpoint_actor(actor_id);
+                        suspended.activation,
+                        step_name,
+                    ) {
+                        tracing::error!(actor_id, %error, "nulang-workflow: signal-resume terminal commit failed");
+                    }
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
@@ -4109,7 +4107,6 @@ impl Runtime {
                             // activation instead of admitting a duplicate
                             // command transition.
                             workflow_activation = Some(activation);
-                            atomic_workflow_turn = true;
                         } else {
                             match workflow::commit_workflow_command(
                                 self,
@@ -4194,7 +4191,6 @@ impl Runtime {
                             ) {
                                 Ok(activation) => {
                                     workflow_activation = Some(activation);
-                                    atomic_workflow_turn = true;
                                 }
                                 Err(error) => {
                                     tracing::error!(
@@ -4850,16 +4846,14 @@ impl Runtime {
                                 actor.set_state_field("step_index", Value::int(n + 1));
                             }
                         }
-                        let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        if let Err(error) = workflow::persist_step_completed(
+                            &mut *self_ptr,
                             actor_id,
-                            crate::runtime::WorkflowEvent::StepCompleted {
-                                sequence: seq,
-                                activation: suspended.activation,
-                                step_name: suspended.step_name.clone(),
-                            },
-                        );
-                        (*self_ptr).checkpoint_actor(actor_id);
+                            suspended.activation,
+                            suspended.step_name.clone(),
+                        ) {
+                            tracing::error!(actor_id, %error, "nulang-workflow: timer-resume terminal commit failed");
+                        }
                     }
                 }
                 Err(crate::types::NuError::Suspended(_)) => {
@@ -4946,16 +4940,14 @@ impl Runtime {
                                 actor.set_state_field("step_index", Value::int(n + 1));
                             }
                         }
-                        let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        if let Err(error) = workflow::persist_step_completed(
+                            &mut *self_ptr,
                             actor_id,
-                            WorkflowEvent::StepCompleted {
-                                sequence: seq,
-                                activation: suspended.activation,
-                                step_name: suspended.step_name,
-                            },
-                        );
-                        (*self_ptr).checkpoint_actor(actor_id);
+                            suspended.activation,
+                            suspended.step_name,
+                        ) {
+                            tracing::error!(actor_id, %error, "nulang-workflow: receive-resume terminal commit failed");
+                        }
                     }
                 }
                 Err(crate::types::NuError::Suspended(VmSuspension::ReceiveWait)) => {
@@ -5080,6 +5072,20 @@ impl Runtime {
     /// last pre-step checkpoint.  A no-op when the actor has no snapshot
     /// yet - without one there is nothing to recover anyway.
     fn persist_suspension_marker(&mut self, actor_id: u64) {
+        // Atomic activations no longer need to mutate the safe snapshot to
+        // advertise suspension: recovery identifies unfinished work from the
+        // admitted command and absence of a terminal transition. Writing the
+        // marker through save_snapshot here would cross back onto a legacy
+        // path after the RFC 0022 tail has begun.
+        match workflow::workflow_has_atomic_tail(self, actor_id) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(actor_id, %error, "nulang-workflow: refusing legacy suspension-marker write after atomic-tail read failed");
+                return;
+            }
+        }
+
         let waiting_signal = match self.actors.get(&actor_id) {
             Some(actor) if actor.persistent => actor.waiting_signal.clone(),
             _ => return,
