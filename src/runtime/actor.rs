@@ -303,7 +303,7 @@ pub struct Actor {
     /// actor as a holder of foreign references.
     cycle_sentinel: Option<*mut OrcaHeader>,
     /// Suspended VM state for a workflow step waiting on a signal.
-    pub suspended_execution: Option<SuspendedExecution>,
+    pub suspended_execution: Option<Box<SuspendedExecution>>,
     /// JIT safepoint counter: decremented per JIT region entry in JIT code.
     /// When it reaches 0, the JIT yields back to the scheduler.
     pub jit_safepoint_counter: u64,
@@ -356,7 +356,7 @@ pub struct Actor {
     /// Records the N most recent messages delivered to this actor.
     pub flight_recorder: FlightRecorder,
     /// Hibernation state: None = active, Some = hibernated with serialized bytes.
-    pub hibernation_state: Option<HibernationState>,
+    pub hibernation_state: Option<Box<HibernationState>>,
     /// Time (in milliseconds) since last activity. Used for hibernation timeout.
     pub idle_ms: u64,
     /// If true, the scheduler-driven dehydration scanner never hibernates this
@@ -497,7 +497,7 @@ impl Actor {
             vm,
             module_hash,
         )?;
-        self.hibernation_state = Some(HibernationState {
+        self.hibernation_state = Some(Box::new(HibernationState {
             continuation_bytes: bytes.clone(),
             module_hash: *module_hash,
             hibernated_at_ms: std::time::SystemTime::now()
@@ -505,7 +505,7 @@ impl Actor {
                 .unwrap()
                 .as_millis() as u64,
             state_fields: self.state_data.clone(),
-        });
+        }));
         Ok(bytes)
     }
 
