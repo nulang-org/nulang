@@ -52,9 +52,9 @@ fn bench_jit_hot_loop(c: &mut Criterion) {
     // plus the one-time JIT compile cost plus the remaining JIT-compiled
     // iterations, all in a single run() call.
     c.bench_function("jit/hot_loop_first_run", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || fresh_vm(&module),
-            |mut vm| black_box(vm.run().unwrap()),
+            |vm| black_box(vm.run().unwrap()),
             BatchSize::SmallInput,
         )
     });
@@ -66,13 +66,13 @@ fn bench_jit_hot_loop(c: &mut Criterion) {
     // second run() with zero compile overhead, isolating steady-state
     // JIT-compiled throughput from the one-time tier-up cost above.
     c.bench_function("jit/hot_loop_warm", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
                 let mut vm = fresh_vm(&module);
                 let _ = vm.run();
                 vm
             },
-            |mut vm| black_box(vm.run().unwrap()),
+            |vm| black_box(vm.run().unwrap()),
             BatchSize::SmallInput,
         )
     });
@@ -89,13 +89,13 @@ fn bench_jit_function_call_loop(c: &mut Criterion) {
     let module = compile(source);
 
     c.bench_function("jit/function_call_loop", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
                 let mut vm = fresh_vm(&module);
                 let _ = vm.run();
                 vm
             },
-            |mut vm| black_box(vm.run().unwrap()),
+            |vm| black_box(vm.run().unwrap()),
             BatchSize::SmallInput,
         )
     });
@@ -103,13 +103,13 @@ fn bench_jit_function_call_loop(c: &mut Criterion) {
     // JIT-disabled interp baseline for the IDENTICAL source, so the bench
     // directly shows whether the JIT helps or hurts call-heavy loops.
     c.bench_function("jit/function_call_loop_interp", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
                 let mut vm = nulang::vm::VM::new_without_jit();
                 vm.load_module(module.clone());
                 vm
             },
-            |mut vm| black_box(vm.run().unwrap()),
+            |vm| black_box(vm.run().unwrap()),
             BatchSize::SmallInput,
         )
     });
@@ -141,22 +141,22 @@ fn bench_jit_tiering_profitability(c: &mut Criterion) {
             BenchmarkId::new("jit_first_run", trips),
             &module,
             |b, module| {
-                b.iter_batched(
+                b.iter_batched_ref(
                     || fresh_vm(module),
-                    |mut vm| black_box(vm.run().unwrap()),
+                    |vm| black_box(vm.run().unwrap()),
                     BatchSize::SmallInput,
                 )
             },
         );
 
         group.bench_with_input(BenchmarkId::new("interp", trips), &module, |b, module| {
-            b.iter_batched(
+            b.iter_batched_ref(
                 || {
                     let mut vm = VM::new_without_jit();
                     vm.load_module(module.clone());
                     vm
                 },
-                |mut vm| black_box(vm.run().unwrap()),
+                |vm| black_box(vm.run().unwrap()),
                 BatchSize::SmallInput,
             )
         });

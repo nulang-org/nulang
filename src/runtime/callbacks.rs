@@ -42,6 +42,16 @@ pub(crate) fn migration_authority_tokens(
     Ok(manifest.canonical_token_set())
 }
 
+/// Allocate the fencing epoch owned by the migration target.
+///
+/// The source remains on `current` until it is reaped; sending `current + 1`
+/// means any stale source activation is rejected once the target publishes a
+/// durable commit. Overflow cannot preserve strict monotonicity, so migration
+/// fails closed instead of reusing the maximum epoch.
+fn next_migration_activation_epoch(current: u64) -> Option<u64> {
+    current.checked_add(1)
+}
+
 pub(crate) fn spawn_with_site_authority(
     rt: &mut Runtime,
     module: &crate::bytecode::CodeModule,
@@ -781,7 +791,15 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
             vm.constant_string(module_idx, string_id)?
         };
         let duration_ms = regs.get(1)?.as_int()? as u64;
-        rt.schedule_workflow_timer(actor_id, &name, duration_ms);
+        if let Err(error) = rt.schedule_workflow_timer(actor_id, &name, duration_ms) {
+            tracing::error!(
+                actor_id,
+                timer = %name,
+                %error,
+                "nulang-workflow: durable timer scheduling failed"
+            );
+            return None;
+        }
         Some(crate::vm::Value::unit())
     }
 
@@ -1592,7 +1610,17 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             let string_id = regs.get(0)?.as_string_id()?;
             let name = vm.constant_string(module_idx, string_id)?;
             let duration_ms = regs.get(1)?.as_int()? as u64;
-            (*self.runtime).schedule_workflow_timer(self.actor_id, &name, duration_ms);
+            if let Err(error) =
+                (*self.runtime).schedule_workflow_timer(self.actor_id, &name, duration_ms)
+            {
+                tracing::error!(
+                    actor_id = self.actor_id,
+                    timer = %name,
+                    %error,
+                    "nulang-workflow: durable timer scheduling failed"
+                );
+                return None;
+            }
             Some(crate::vm::Value::unit())
         }
     }
@@ -2351,25 +2379,7 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                         .unwrap_or(crate::runtime::persistence::StateModel::Local);
                     if model == crate::runtime::persistence::StateModel::Durable || model.is_crdt()
                     {
-                        let persisted = if name == "semantic_memory" || name == "procedural_memory"
-                        {
-                            crate::runtime::workflow::vm_value_to_string_in_actor(
-                                    value, actor,
-                                )
-                                .map(crate::runtime::persistence::PersistedValue::String)
-                                .unwrap_or_else(|| {
-                                    crate::runtime::persistence::PersistedValue::from_value_resolved(
-                                        value,
-                                        actor.bytecode_module.as_ref(),
-                                    )
-                                })
-                        } else {
-                            crate::runtime::persistence::PersistedValue::from_value_resolved(
-                                value,
-                                actor.bytecode_module.as_ref(),
-                            )
-                        };
-                        state.insert(name.clone(), persisted);
+                        state.insert(name.clone(), actor.persist_value(value));
                     }
                 }
 
@@ -2399,13 +2409,37 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
                         return;
                     }
                 };
+                let activation_epoch = match next_migration_activation_epoch(actor.activation_epoch)
+                {
+                    Some(epoch) => epoch,
+                    None => {
+                        tracing::warn!(
+                            actor_id,
+                            epoch = actor.activation_epoch,
+                            "nulang-migrate: refusing migration because activation epoch cannot advance"
+                        );
+                        return;
+                    }
+                };
+                let schema_name = actor
+                    .bytecode_module
+                    .as_ref()
+                    .and_then(|module| {
+                        crate::runtime::schema_identity::canonical_schema_name_for_runtime_actor(
+                            module,
+                            &actor.name,
+                        )
+                    })
+                    .map(str::to_owned);
                 let snapshot = crate::runtime::persistence::ActorSnapshot {
                     actor_id,
                     sequence: actor.sequence,
+                    activation_epoch,
                     state,
                     waiting_signal: actor.waiting_signal.clone(),
                     crdt_snapshot,
                     crdt_field_map,
+                    schema_name,
                     authority_tokens,
                 };
 
@@ -2555,10 +2589,20 @@ impl crate::vm::DistributedVmCallbacks for BytecodeDistributedCallbacks {
 
 #[cfg(test)]
 mod migration_authority_tests {
-    use super::migration_authority_tokens;
+    use super::{migration_authority_tokens, next_migration_activation_epoch};
     use crate::authority::AuthorityManifest;
     use crate::authority_runtime::RuntimeAuthorityError;
     use crate::runtime::Actor;
+
+    #[test]
+    fn explicit_migration_advances_the_fencing_epoch() {
+        assert_eq!(next_migration_activation_epoch(7), Some(8));
+    }
+
+    #[test]
+    fn explicit_migration_refuses_epoch_overflow() {
+        assert_eq!(next_migration_activation_epoch(u64::MAX), None);
+    }
 
     #[test]
     fn migration_sender_preserves_canonical_actor_authority() {
