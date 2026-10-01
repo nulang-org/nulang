@@ -305,6 +305,13 @@ fn commit_workflow_event_transition(
 /// commits, signals, compensation) must use this path so storage failure cannot
 /// be mistaken for a committed transition.
 pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::Result<()> {
+    if actor_is_workflow(rt, actor_id) && workflow_has_atomic_tail(rt, actor_id)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "legacy workflow checkpoint is forbidden after the RFC 0022 atomic tail begins",
+        ));
+    }
+
     let sequence = next_sequence(rt, actor_id);
     let Some(snapshot) = build_actor_snapshot_at_sequence(rt, actor_id, sequence)? else {
         return Ok(());
