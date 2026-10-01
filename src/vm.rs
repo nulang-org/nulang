@@ -244,8 +244,14 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// Write a field on the current actor's state.  Default is a no-op.
     fn set_state_field(&mut self, _field: &str, _value: Value) {}
 
-    /// Emit an event in the current actor.  Default is a no-op.
-    fn emit_event(&mut self, _event: &str, _args: &[Value]) {}
+    /// Emit an event in the current actor.
+    ///
+    /// Returns false when a runtime-backed durable emission failed. The VM
+    /// aborts the current activation immediately in that case so user code
+    /// cannot continue past an uncommitted durable boundary.
+    fn emit_event(&mut self, _event: &str, _args: &[Value]) -> bool {
+        true
+    }
 
     /// Authorize one foreign-function call before any library is loaded or
     /// symbol resolved. Standalone callbacks retain the historic ambient
@@ -5192,7 +5198,12 @@ impl VM {
                 let event = self.module_const_string(module_idx, event_idx);
                 let arg_count = instr.op3 as usize;
                 let args: Vec<Value> = (0..arg_count).map(|i| frame.regs[i]).collect();
-                self.actor_callbacks.emit_event(&event, &args);
+                if !self.actor_callbacks.emit_event(&event, &args) {
+                    return Err(NuError::VMError {
+                        msg: format!("durable event emission failed: {}", event),
+                        span: Span::default(),
+                    });
+                }
             }
             OpCode::SignalWait => {
                 let name_idx = instr.imm16() as usize;
