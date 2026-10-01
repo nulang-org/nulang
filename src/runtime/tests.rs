@@ -4404,6 +4404,64 @@ fn test_recovery_finds_unfinished_atomic_command_below_durable_effect_tail() {
     );
 }
 
+#[cfg(feature = "sqlite")]
+#[test]
+fn test_libsql_recovery_finds_unfinished_atomic_command_below_effect_tail() {
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(LibsqlStore::in_memory().unwrap());
+
+    let actor_id = rt.spawn_workflow_actor(
+        "LibsqlRecoverPastEffectTail",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("run", |_actor, _args| {});
+    let behavior_id = rt
+        .behavior_id_for(actor_id, "run")
+        .expect("registered workflow behavior must have a stable id");
+
+    let activation =
+        workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new()).unwrap();
+    let activation_epoch = rt.actors.get(&actor_id).unwrap().activation_epoch;
+    let effect_id = crate::durable_effect::DurableEffectId::derive(
+        actor_id,
+        &format!("workflow-activation:{}", activation.command_sequence),
+        0,
+        "Inference.ask",
+    );
+    let spec = crate::durable_effect::DurableEffectSpec::new(
+        effect_id,
+        "Inference.ask",
+        crate::primitives::EffectBoundary::External,
+        crate::primitives::DeliverySemantics::AtLeastOnce,
+    );
+    {
+        let mut coordinator = crate::durable_effect_runtime::DurableEffectCoordinator::new(
+            rt.persistence.as_mut(),
+            actor_id,
+            activation_epoch,
+        );
+        coordinator.begin(spec, b"prompt").unwrap();
+    }
+
+    let tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    assert!(tail.sequence > activation.command_sequence);
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(actor.current_workflow_activation, Some(activation));
+    assert_eq!(actor.sequence, activation.command_sequence);
+    assert_eq!(actor.mailbox.len(), 1);
+}
+
 #[test]
 fn test_recovery_finds_unfinished_atomic_command_below_completed_effect_tail() {
     let mut rt = Runtime::new();
