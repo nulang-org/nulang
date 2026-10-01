@@ -4095,12 +4095,11 @@ impl Runtime {
                     let use_atomic_workflow_turn = self.actor_is_workflow(actor_id)
                         && !self.is_internal_behavior(actor_id, behavior_idx);
                     if use_atomic_workflow_turn {
-                        let recovered_activation = self.actors.get(&actor_id).and_then(|actor| {
-                            actor.current_workflow_activation.filter(|activation| {
-                                activation.actor_id == actor_id
-                                    && activation.command_sequence == actor.sequence
-                            })
-                        });
+                        let recovered_activation = self
+                            .actors
+                            .get(&actor_id)
+                            .and_then(|actor| actor.current_workflow_activation)
+                            .filter(|activation| activation.actor_id == actor_id);
                         if let Some(activation) = recovered_activation {
                             // Recovery already proved that this exact command is
                             // the open atomic tail. Execute it under the original
@@ -4174,12 +4173,11 @@ impl Runtime {
                     let use_atomic_workflow_turn = self.actor_is_workflow(actor_id)
                         && !self.is_internal_behavior(actor_id, behavior_idx);
                     if use_atomic_workflow_turn {
-                        let recovered_activation = self.actors.get(&actor_id).and_then(|actor| {
-                            actor.current_workflow_activation.filter(|activation| {
-                                activation.actor_id == actor_id
-                                    && activation.command_sequence == actor.sequence
-                            })
-                        });
+                        let recovered_activation = self
+                            .actors
+                            .get(&actor_id)
+                            .and_then(|actor| actor.current_workflow_activation)
+                            .filter(|activation| activation.actor_id == actor_id);
                         if let Some(activation) = recovered_activation {
                             workflow_activation = Some(activation);
                         } else {
