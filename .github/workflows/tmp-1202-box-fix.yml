@@ -1,0 +1,63 @@
+name: Temporary #1202 Box migration repair
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.event.pull_request.head.ref == 'perf/actor-box-bytecode-module' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: perf/actor-box-bytecode-module
+          fetch-depth: 0
+
+      - name: Apply exact mechanical repairs
+        shell: python
+        run: |
+          from pathlib import Path
+
+          replacements = [
+              (
+                  Path("src/runtime/distributed.rs"),
+                  "actor.bytecode_module = Some(module_b);",
+                  "actor.bytecode_module = Some(Box::new(module_b));",
+              ),
+              (
+                  Path("src/runtime/tests.rs"),
+                  "actor.bytecode_module.as_ref(),",
+                  "actor.bytecode_module.as_deref(),",
+              ),
+          ]
+
+          for path, old, new in replacements:
+              text = path.read_text(encoding="utf-8")
+              assert text.count(old) == 1, f"expected exactly one match in {path}"
+              assert new not in text, f"replacement already present in {path}"
+              path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+      - name: Verify patch scope and formatting
+        run: |
+          git rm .github/workflows/tmp-1202-box-fix.yml
+          git diff --check
+          test "$(git diff --name-only | sort)" = $'.github/workflows/tmp-1202-box-fix.yml\nsrc/runtime/distributed.rs\nsrc/runtime/tests.rs'
+          cargo fmt --all -- --check
+
+      - name: Prove repaired feature profiles compile
+        run: |
+          cargo check --locked --all-features
+          cargo check --locked --no-default-features
+
+      - name: Commit repair
+        run: |
+          git config user.name "nulang-maintenance"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/runtime/distributed.rs src/runtime/tests.rs .github/workflows/tmp-1202-box-fix.yml
+          git commit -m "fix(runtime): complete boxed bytecode module migration"
+          git push origin HEAD:perf/actor-box-bytecode-module
