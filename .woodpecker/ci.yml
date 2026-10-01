@@ -1,0 +1,41 @@
+# Canonical GitHub-independent source verification.
+# GitHub remains the forge/status destination; execution is owned by Woodpecker.
+labels:
+  platform: linux/amd64
+  pool: bootstrap-ci
+
+when:
+  - event: pull_request
+    branch: main
+  - event: push
+    branch: main
+  - event: manual
+    evaluate: 'NULANG_VERIFICATION_LANE == "ci" || NULANG_VERIFICATION_LANE == "all"'
+
+variables:
+  rust-base: &rust-base
+    image: rust:1.95-bookworm
+    volumes:
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+    environment:
+      CARGO_TERM_COLOR: "always"
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+
+steps:
+  - name: CI contract
+    image: alpine:3.20
+    commands:
+      - apk add --no-cache bash grep
+      - bash scripts/ci/check-dagger-contract.sh
+
+  - name: Rust static
+    <<: *rust-base
+    commands:
+      - bash scripts/ci/buildkite-rust-static.sh
+
+  - name: Runtime and workspace tests
+    <<: *rust-base
+    commands:
+      - bash scripts/ci/buildkite-rust-tests.sh

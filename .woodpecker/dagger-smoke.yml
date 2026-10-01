@@ -1,0 +1,22 @@
+# Trusted canary for Nulang's portable Dagger path.
+# Never add pull_request: this step has host container-daemon access.
+labels:
+  platform: linux/amd64
+  pool: bootstrap-ci
+
+when:
+  - event: manual
+    branch: main
+    evaluate: 'NULANG_VERIFICATION_LANE == "dagger-smoke"'
+
+steps:
+  - name: dagger-core-smoke
+    image: alpine:3.20
+    privileged: true
+    environment:
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - /run/user/1000/podman/podman.sock:/var/run/docker.sock
+    commands:
+      - apk add --no-cache bash curl ca-certificates
+      - bash scripts/ci/run-dagger-core.sh

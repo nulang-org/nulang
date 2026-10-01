@@ -1,0 +1,17 @@
+# Portable Dagger Core representation of Nulang's repository-owned CI contract.
+source=$(host | directory "." --gitignore=true)
+
+container |
+  from "rust:1.95-bookworm" |
+  with-directory "/work/nulang" $source |
+  with-workdir "/work/nulang" |
+  with-env-variable "BUILDKITE_BUILD_CHECKOUT_PATH" "/work/nulang" |
+  with-env-variable "CARGO_TERM_COLOR" "always" |
+  with-env-variable "CARGO_INCREMENTAL" "0" |
+  with-env-variable "RUST_BACKTRACE" "1" |
+  with-mounted-cache "/usr/local/cargo/registry" "nulang-cargo-registry" |
+  with-mounted-cache "/usr/local/cargo/git" "nulang-cargo-git" |
+  with-mounted-cache "/work/nulang/target" "nulang-target-rust195" |
+  with-exec -- bash scripts/ci/buildkite-rust-static.sh |
+  with-exec -- bash scripts/ci/buildkite-rust-tests.sh |
+  sync
