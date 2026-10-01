@@ -833,7 +833,10 @@ pub(crate) fn append_signal_received(
     let seq = next_sequence(rt, actor_id);
     rt.persistence
         .append_signal_received(actor_id, seq, name.to_string(), payload)?;
-    try_checkpoint_actor(rt, actor_id)?;
+    // SignalReceived is a durable external input, not a completed workflow
+    // boundary. Advancing the snapshot here can hide the signal from replay
+    // because received_signals is reconstructed from the journal, not stored
+    // in ActorSnapshot.
     Ok(())
 }
 
