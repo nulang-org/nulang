@@ -4589,6 +4589,80 @@ fn test_open_activation_intermediate_events_extend_atomic_tail() {
 }
 
 #[test]
+fn test_compiled_replay_conflict_aborts_and_recovers_without_terminal_snapshot() {
+    use crate::bytecode::{Instruction, OpCode};
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "ReplayConflictAbort",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+
+    let mut module = CodeModule::new("replay-conflict-abort");
+    let event_idx = module.add_constant(Constant::String("Different".to_string()));
+    module.emit(Instruction::new3(
+        OpCode::Emit,
+        ((event_idx >> 8) & 0xFF) as u8,
+        (event_idx & 0xFF) as u8,
+        0,
+    ));
+    module.emit(Instruction::new0(OpCode::Ret));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.layout_workflow_behavior_table(actor_id);
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    let activation = workflow::commit_workflow_command(&mut rt, actor_id, 0, Vec::new()).unwrap();
+    rt.emit_event(actor_id, "Original", &[]);
+    assert!(
+        rt.persistence
+            .read_workflow_events(actor_id)
+            .iter()
+            .any(|event| matches!(
+                event,
+                WorkflowEvent::Custom {
+                    replay_id: Some(id),
+                    name,
+                    ..
+                } if *id == WorkflowReplayEventId::new(activation, 0) && name == "Original"
+            ))
+    );
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    let events = rt.persistence.read_workflow_events(actor_id);
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            WorkflowEvent::StepCompleted { .. } | WorkflowEvent::StepFailed { .. }
+        )),
+        "a replay-identity conflict must abort the activation without snapshotting partial execution as a terminal result"
+    );
+    assert_eq!(
+        rt.persistence.read_journal(actor_id).len(),
+        1,
+        "failed replay must not admit a second command"
+    );
+    let actor = rt
+        .actors
+        .get(&actor_id)
+        .expect("failed durable emit should recover the workflow actor");
+    assert_eq!(actor.current_workflow_activation, Some(activation));
+    assert_eq!(
+        actor.mailbox.len(),
+        1,
+        "recovery must requeue the original unfinished command"
+    );
+}
+
+#[test]
 fn test_recovered_compiled_activation_with_intermediate_event_is_not_readmitted() {
     use crate::bytecode::{Instruction, OpCode};
 
