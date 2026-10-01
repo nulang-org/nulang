@@ -1,8 +1,9 @@
 use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
 use nulang::database::tablet::{
-    KeyRange, MemoryTablet, TabletDescriptor, TabletId, TabletMutation,
+    KeyRange, MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite,
 };
 use nulang::database::wal_batch::BinaryBatchWal;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_BENCH: AtomicU64 = AtomicU64::new(1);
@@ -16,12 +17,52 @@ fn descriptor() -> TabletDescriptor {
     .unwrap()
 }
 
-fn bench_wal_path(batch: usize) -> std::path::PathBuf {
+fn bench_wal_path(batch: usize) -> PathBuf {
     std::env::temp_dir().join(format!(
         "nulang_nudb_wal_bench_{batch}_{}_{}.wal",
         std::process::id(),
         NEXT_BENCH.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+struct BenchCase {
+    path: PathBuf,
+    wal: BinaryBatchWal,
+    writes: Vec<TabletWrite>,
+}
+
+impl BenchCase {
+    fn new(batch_size: usize) -> Self {
+        let path = bench_wal_path(batch_size);
+        let _ = std::fs::remove_file(&path);
+        let wal = BinaryBatchWal::open(&path).unwrap();
+        let mut tablet = MemoryTablet::new(descriptor());
+        let mut writes = Vec::with_capacity(batch_size);
+
+        for i in 0..batch_size {
+            let previous = tablet.current_sequence();
+            let write = tablet
+                .prepare_write(
+                    1,
+                    previous,
+                    vec![TabletMutation::Put {
+                        key: format!("key-{i:08}").into_bytes(),
+                        value: vec![0x5a; 128],
+                    }],
+                )
+                .unwrap();
+            tablet.commit(write.clone()).unwrap();
+            writes.push(write);
+        }
+
+        Self { path, wal, writes }
+    }
+}
+
+impl Drop for BenchCase {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 fn batch_wal(c: &mut Criterion) {
@@ -33,35 +74,9 @@ fn batch_wal(c: &mut Criterion) {
             BenchmarkId::from_parameter(batch_size),
             &batch_size,
             |b, &batch_size| {
-                b.iter_batched(
-                    || {
-                        let path = bench_wal_path(batch_size);
-                        let _ = std::fs::remove_file(&path);
-                        let wal = BinaryBatchWal::open(&path).unwrap();
-                        let tablet = MemoryTablet::new(descriptor());
-                        (path, wal, tablet)
-                    },
-                    |(path, mut wal, mut tablet)| {
-                        let mut writes = Vec::with_capacity(batch_size);
-                        for i in 0..batch_size {
-                            let previous = tablet.current_sequence();
-                            let write = tablet
-                                .prepare_write(
-                                    1,
-                                    previous,
-                                    vec![TabletMutation::Put {
-                                        key: format!("key-{i:08}").into_bytes(),
-                                        value: vec![0x5a; 128],
-                                    }],
-                                )
-                                .unwrap();
-                            tablet.commit(write.clone()).unwrap();
-                            writes.push(write);
-                        }
-                        wal.append_batch(&writes).unwrap();
-                        drop(wal);
-                        let _ = std::fs::remove_file(path);
-                    },
+                b.iter_batched_ref(
+                    || BenchCase::new(batch_size),
+                    |case| case.wal.append_batch(&case.writes).unwrap(),
                     criterion::BatchSize::SmallInput,
                 )
             },
