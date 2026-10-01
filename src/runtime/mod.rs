@@ -4324,6 +4324,18 @@ impl Runtime {
                         processed = false;
                     }
                     Err(e) => {
+                        if let Some(failure) =
+                            self.take_workflow_persistence_failure(actor_id)
+                        {
+                            self.recover_after_workflow_persistence_failure(
+                                actor_id,
+                                &failure,
+                                "bytecode-turn",
+                            );
+                            self.current_actor = None;
+                            return;
+                        }
+
                         if self.actor_is_workflow(actor_id) {
                             let step_name = self.step_name_for(actor_id, behavior_idx);
                             if let Err(error) = workflow::persist_step_failed(
@@ -4428,6 +4440,34 @@ impl Runtime {
 
     fn actor_is_workflow(&self, actor_id: u64) -> bool {
         workflow::actor_is_workflow(self, actor_id)
+    }
+
+    fn take_workflow_persistence_failure(&mut self, actor_id: u64) -> Option<String> {
+        self.actors
+            .get_mut(&actor_id)
+            .and_then(|actor| actor.workflow_persistence_failure.take())
+    }
+
+    fn recover_after_workflow_persistence_failure(
+        &mut self,
+        actor_id: u64,
+        failure: &str,
+        context: &str,
+    ) {
+        tracing::error!(
+            actor_id,
+            failure,
+            context,
+            "nulang-workflow: aborting partial activation after durable persistence failure"
+        );
+        self.actors.remove(&actor_id);
+        if self.recover_actor(actor_id).is_none() {
+            tracing::error!(
+                actor_id,
+                context,
+                "nulang-workflow: actor recovery failed after durable persistence failure"
+            );
+        }
     }
 
     #[cfg(feature = "ai-runtime")]
