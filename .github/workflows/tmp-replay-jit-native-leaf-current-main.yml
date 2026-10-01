@@ -1,0 +1,96 @@
+name: Replay native leaf JIT on current main
+
+on:
+  push:
+    branches:
+      - perf/jit-native-leaf-current-main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  replay:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: perf/jit-native-leaf-current-main
+          fetch-depth: 0
+
+      - name: Merge reviewed native-leaf branch onto exact current main
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate=812f7bd926aa6c53cb026b849fa792b1c4eb2a3e
+          set +e
+          git merge --no-commit --no-ff "$candidate"
+          merge_status=$?
+          set -e
+
+          unmerged="$(git diff --name-only --diff-filter=U || true)"
+          if [ -n "$unmerged" ]; then
+            if [ "$unmerged" = "CHANGELOG.md" ]; then
+              git checkout --ours CHANGELOG.md
+              git add CHANGELOG.md
+            else
+              echo "Native-leaf replay has code conflicts on current main:"
+              printf '%s\n' "$unmerged"
+              exit 1
+            fi
+          elif [ "$merge_status" -ne 0 ]; then
+            echo "Merge failed without explicit unmerged paths"
+            exit "$merge_status"
+          fi
+
+      - name: Refresh changelog and remove replay-only workflow
+        shell: python
+        run: |
+          from pathlib import Path
+
+          changelog = Path("CHANGELOG.md")
+          text = changelog.read_text(encoding="utf-8")
+          heading = "# Nulang Changelog\n"
+          title = "### Native fast path for simple JIT direct calls — 2026-10-01\n"
+          assert text.startswith(heading)
+          assert title not in text
+          entry = (
+              title
+              + "- **Hot direct calls to conservative straight-line, non-suspending, non-recursive leaf functions can execute as native JIT callees instead of re-entering the interpreter.** Unsupported, branchy, recursive, effectful, indirect, heap/actor, and suspending callees retain the existing interpreter fallback.\n"
+              + "- **Native leaf callees use an isolated register buffer and copy back only the return value.** Caller-register preservation and the existing error/fallback semantics remain covered by focused JIT regressions.\n"
+              + "- **This replay is based on the current direct-frame JIT head.** Exact-parent JIT telemetry and repository CI remain the promotion authority; older cross-commit timing claims are not treated as current-main evidence.\n\n"
+          )
+          changelog.write_text(text.replace(heading, heading + entry, 1), encoding="utf-8")
+
+      - name: Format, remove replay helper, and verify patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/tmp-replay-jit-native-leaf-current-main.yml
+          cargo fmt --all
+          git add -A
+          git diff --cached --check
+          cargo fmt --all -- --check
+
+      - name: Compile native JIT profile and run correctness lint
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --no-default-features --features native-codegen
+          cargo clippy --locked --all-targets -- -D clippy::correctness
+
+      - name: Run focused native JIT regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --no-default-features --features native-codegen --lib jit::tests -- --nocapture
+
+      - name: Commit current-main replay
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "nulang-maintenance"
+          git config user.email "actions@users.noreply.github.com"
+          git commit -m "perf(jit): replay native leaf calls on current main"
+          git push origin HEAD:perf/jit-native-leaf-current-main
