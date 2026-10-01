@@ -531,7 +531,12 @@ fn resolve_string_constant(rt: &Runtime, actor_id: u64, value: &Value) -> Option
 /// actors this appends to the durable journal and forces a checkpoint. For
 /// event-sourced (non-workflow) actors the event is persisted to the event
 /// journal and a checkpoint is forced.
-pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[Value]) {
+pub(crate) fn emit_event(
+    rt: &mut Runtime,
+    actor_id: u64,
+    event: &str,
+    args: &[Value],
+) -> std::io::Result<()> {
     let is_workflow = actor_is_workflow(rt, actor_id);
     let seq = next_sequence(rt, actor_id);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
@@ -582,32 +587,23 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
             let parallel_step_name =
                 resolve_string_constant(rt, actor_id, &args[0]).unwrap_or_default();
             let branch_name = resolve_string_constant(rt, actor_id, &args[1]).unwrap_or_default();
-            let atomic_tail = match workflow_has_atomic_tail(rt, actor_id) {
-                Ok(value) => value,
-                Err(error) => {
-                    tracing::error!(actor_id, %error, "nulang-workflow: refusing parallel progress after atomic-tail read failed");
-                    return;
-                }
-            };
-            let committed = commit_intermediate_workflow_event(rt, actor_id, |sequence| {
+            let atomic_tail = workflow_has_atomic_tail(rt, actor_id)?;
+            commit_intermediate_workflow_event(rt, actor_id, |sequence| {
                 WorkflowEvent::ParallelBranchCompleted {
                     sequence,
                     parallel_step_name,
                     branch_name,
                 }
-            })
-            .is_ok();
-            if committed {
-                if let Some(actor) = rt.actors.get_mut(&actor_id) {
-                    let current = actor
-                        .get_state_field("parallel_progress")
-                        .and_then(|v| v.as_int())
-                        .unwrap_or(0);
-                    actor.set_state_field("parallel_progress", Value::int(current + 1));
-                }
-                if !atomic_tail {
-                    checkpoint_actor(rt, actor_id);
-                }
+            })?;
+            if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                let current = actor
+                    .get_state_field("parallel_progress")
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0);
+                actor.set_state_field("parallel_progress", Value::int(current + 1));
+            }
+            if !atomic_tail {
+                try_checkpoint_actor(rt, actor_id)?;
             }
         } else {
             let module = rt
@@ -626,17 +622,19 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                         advance_workflow_replay_id(rt, actor_id, replay_id);
                     }
                     ReplayDisposition::Conflict => {
-                        tracing::error!(
-                            actor_id,
-                            activation_actor_id = replay_id.activation.actor_id,
-                            activation_command_sequence = replay_id.activation.command_sequence,
-                            ordinal = replay_id.ordinal,
-                            event,
-                            "nulang-workflow: replay identity conflicts with committed custom event; refusing durable mutation"
-                        );
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "workflow replay identity conflicts with committed custom event: activation {}:{} ordinal {} event {}",
+                                replay_id.activation.actor_id,
+                                replay_id.activation.command_sequence,
+                                replay_id.ordinal,
+                                event
+                            ),
+                        ));
                     }
                     ReplayDisposition::Append => {
-                        let appended = commit_intermediate_workflow_event(
+                        commit_intermediate_workflow_event(
                             rt,
                             actor_id,
                             |sequence| WorkflowEvent::Custom {
@@ -645,27 +643,18 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                                 name: event.to_string(),
                                 args: payload,
                             },
-                        )
-                        .is_ok();
-                        if appended {
-                            // This event belongs to an open activation. Keep the
-                            // last completed snapshot unchanged so recovery can
-                            // re-execute the command and consume this exact
-                            // replay identity instead of treating partial state
-                            // as completed progress.
-                            advance_workflow_replay_id(rt, actor_id, replay_id);
-                        }
+                        )?;
+                        // This event belongs to an open activation. Keep the
+                        // last completed snapshot unchanged so recovery can
+                        // re-execute the command and consume this exact
+                        // replay identity instead of treating partial state
+                        // as completed progress.
+                        advance_workflow_replay_id(rt, actor_id, replay_id);
                     }
                 }
             } else {
-                let atomic_tail = match workflow_has_atomic_tail(rt, actor_id) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        tracing::error!(actor_id, %error, "nulang-workflow: refusing custom event after atomic-tail read failed");
-                        return;
-                    }
-                };
-                should_checkpoint = commit_intermediate_workflow_event(
+                let atomic_tail = workflow_has_atomic_tail(rt, actor_id)?;
+                commit_intermediate_workflow_event(
                     rt,
                     actor_id,
                     |sequence| WorkflowEvent::Custom {
@@ -674,15 +663,15 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                         name: event.to_string(),
                         args: payload,
                     },
-                )
-                .is_ok()
-                    && !atomic_tail;
+                )?;
+                should_checkpoint = !atomic_tail;
             }
             if should_checkpoint {
-                checkpoint_actor(rt, actor_id);
+                try_checkpoint_actor(rt, actor_id)?;
             }
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
