@@ -22,6 +22,45 @@ fn declare_test_behavior(rt: &mut Runtime, actor_id: u64, name: &str) {
 }
 
 #[test]
+fn test_actor_module_hash_uses_exact_runtime_schema() {
+    let mut module = CodeModule::new("multi-schema-hash");
+    for (name, hash) in [("First", [1u8; 32]), ("Second", [2u8; 32])] {
+        module.add_actor_meta(ActorMeta {
+            name: name.to_string(),
+            persistent: false,
+            state_models: vec![],
+            state_defaults: vec![],
+            behavior_indices: vec![],
+            type_hash: Some(hash),
+            version: 1,
+            migrations: String::new(),
+            is_workflow: false,
+            is_agent: false,
+            is_organization: false,
+            is_virtual: false,
+            tools: vec![],
+            semantic_memory_dimensions: None,
+            procedural_memory_namespace: None,
+            backend: crate::ast::ActorBackendKind::Native,
+            fallback_config: String::new(),
+            retry_config: String::new(),
+        });
+    }
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(Vec::new));
+    let actor = rt.actors.get_mut(&actor_id).expect("actor");
+    actor.name = "Second".to_string();
+    actor.bytecode_module = Some(module);
+
+    assert_eq!(
+        rt.actor_module_hash(actor_id),
+        [2u8; 32],
+        "module/hash identity must come from Second, not the first ActorMeta"
+    );
+}
+
+#[test]
 fn test_authority_snapshot_round_trip_recovery() {
     let mut rt = Runtime::new();
     let actor_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
@@ -1798,7 +1837,6 @@ fn test_trap_exit_converts_to_message() {
         "exit signal should become message"
     );
 }
-
 // ========================================================================
 // VM Opcode Tests
 // ========================================================================
@@ -1964,6 +2002,196 @@ fn test_persistent_string_state_survives_checkpoint_and_recovery() {
     assert!(!restored.is_nil(), "restored string must not be nil");
 }
 #[test]
+fn test_journal_replay_restores_persisted_string_payload_on_actor_heap() {
+    use crate::bytecode::{BehaviorTableEntry, CodeModule, Constant, Instruction, OpCode};
+
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("seen".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_persistent_actor(
+        Box::new(|| vec![("seen".to_string(), Value::nil())]),
+        models,
+    );
+    let sender_id = rt.spawn_actor(Box::new(Vec::new));
+
+    // Behavior "Recorder.set": self.seen = arg0.
+    let mut module = CodeModule::new("journal-string-replay");
+    let field_idx = module.add_constant(Constant::String("seen".to_string()));
+    module.add_behavior(BehaviorTableEntry {
+        name: "Recorder.set".to_string(),
+        param_count: 1,
+        code_offset: 0,
+        local_count: 1,
+        effect_mask: 0,
+        compensate_offset: None,
+        content_hash: None,
+        source_location: None,
+        parallel_branches: None,
+    });
+    module.emit(Instruction::new3(
+        OpCode::StateSet,
+        ((field_idx >> 8) & 0xFF) as u8,
+        (field_idx & 0xFF) as u8,
+        0,
+    ));
+    module.emit(Instruction::new1(OpCode::RetVal, 0));
+
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    // Persist a checkpoint followed by a journal command encoded through the
+    // same actor-aware serializer used by real message delivery. Recovery must
+    // materialize the stored string into the new actor heap before invoking the
+    // behavior, so this pins the full encode -> journal -> decode round trip.
+    rt.checkpoint_actor(actor_id);
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let runtime_string = rt
+        .actors
+        .get_mut(&sender_id)
+        .unwrap()
+        .allocate_string("replayed value");
+    let persisted_payload =
+        rt.persist_journal_payload(actor_id, Some(sender_id), &[runtime_string]);
+    assert_eq!(
+        persisted_payload,
+        vec![PersistedValue::String("replayed value".to_string())],
+        "journal encoding must preserve the sender-owned runtime string before replay"
+    );
+    rt.persistence
+        .append_journal(
+            actor_id,
+            JournalEntry {
+                sequence: snapshot.sequence + 1,
+                behavior_id: 0,
+                payload: persisted_payload,
+            },
+        )
+        .unwrap();
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    let restored = actor.get_state_field("seen").unwrap();
+    assert_eq!(
+        crate::runtime::workflow::vm_value_to_string_in_actor(&restored, actor).as_deref(),
+        Some("replayed value"),
+        "journal replay must preserve persisted string payloads instead of converting them to nil"
+    );
+
+    // A recovered string is now heap-backed. A subsequent checkpoint must
+    // serialize that live heap string semantically, otherwise a second
+    // restart silently turns the durable field back into nil.
+    rt.checkpoint_actor(actor_id);
+    let second_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(
+        second_snapshot.state.get("seen"),
+        Some(&PersistedValue::String("replayed value".to_string())),
+        "checkpoint after replay must persist the recovered heap-backed string"
+    );
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+    let actor = rt.actors.get(&actor_id).unwrap();
+    let restored_again = actor.get_state_field("seen").unwrap();
+    assert_eq!(
+        crate::runtime::workflow::vm_value_to_string_in_actor(&restored_again, actor).as_deref(),
+        Some("replayed value"),
+        "the string must survive replay, checkpoint, and a second recovery"
+    );
+}
+
+#[test]
+fn test_persistent_message_journal_preserves_sender_heap_string_payload() {
+    let mut rt = Runtime::new();
+    let sender_id = rt.spawn_actor(Box::new(Vec::new));
+    let target_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    declare_test_behavior(&mut rt, target_id, "capture");
+
+    let payload = rt
+        .actors
+        .get_mut(&sender_id)
+        .unwrap()
+        .allocate_string("journal me");
+
+    rt.current_actor = Some(sender_id);
+    rt.send_message_by_id(target_id, 0, &[payload]);
+    rt.current_actor = None;
+    run_ready_actor_turn(&mut rt, target_id);
+
+    let journal = rt.persistence.read_journal(target_id);
+    assert_eq!(journal.len(), 1);
+    assert_eq!(
+        journal[0].payload,
+        vec![PersistedValue::String("journal me".to_string())],
+        "normal persistent-message journaling must preserve a live sender-owned heap string"
+    );
+}
+
+#[test]
+fn test_persistent_native_ask_journal_preserves_module_string_id() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    declare_test_behavior(&mut rt, actor_id, "capture");
+
+    let mut module = CodeModule::new("journal-string-id");
+    let string_idx = module.add_constant(Constant::String("pooled value".to_string()));
+    rt.actors.get_mut(&actor_id).unwrap().bytecode_module = Some(module);
+
+    rt.ask_actor_sync(actor_id, 0, &[Value::string(string_idx as u32)])
+        .unwrap();
+
+    let journal = rt.persistence.read_journal(actor_id);
+    assert_eq!(journal.len(), 1);
+    assert_eq!(
+        journal[0].payload,
+        vec![PersistedValue::String("pooled value".to_string())],
+        "synchronous native ask journaling must resolve string-pool ids before persistence"
+    );
+}
+
+#[test]
+fn test_persistent_message_journal_does_not_decode_raw_heap_pointer_as_string() {
+    let mut rt = Runtime::new();
+    let sender_id = rt.spawn_actor(Box::new(Vec::new));
+    let target_id = rt.spawn_persistent_actor(Box::new(Vec::new), HashMap::new());
+    declare_test_behavior(&mut rt, target_id, "capture");
+
+    let raw_ptr = rt
+        .actors
+        .get_mut(&sender_id)
+        .unwrap()
+        .heap
+        .alloc(8, TypeTag::Raw)
+        .unwrap();
+    unsafe {
+        std::ptr::write_bytes(raw_ptr, b'x', 8);
+    }
+    let payload = unsafe {
+        /* SAFETY: the test value points to a live ActorHeap allocation whose provenance remains owned by sender_id. */
+        Value::ptr(raw_ptr)
+    };
+
+    rt.current_actor = Some(sender_id);
+    rt.send_message_by_id(target_id, 0, &[payload]);
+    rt.current_actor = None;
+    run_ready_actor_turn(&mut rt, target_id);
+
+    let journal = rt.persistence.read_journal(target_id);
+    assert_eq!(journal.len(), 1);
+    assert_eq!(
+        journal[0].payload,
+        vec![PersistedValue::Nil],
+        "non-string heap objects must never be interpreted as C strings during journal serialization"
+    );
+}
+
+#[test]
 fn test_local_state_is_not_persisted() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
@@ -2042,10 +2270,12 @@ fn test_memory_store_latest_sequence() {
     let snapshot = ActorSnapshot {
         actor_id: 1,
         sequence: 5,
+        activation_epoch: 1,
         state: HashMap::new(),
         waiting_signal: None,
         crdt_snapshot: None,
         crdt_field_map: None,
+        schema_name: None,
         authority_tokens: Default::default(),
     };
     store.save_snapshot(snapshot).unwrap();
@@ -2071,10 +2301,12 @@ fn test_libsql_store_save_load_snapshot() {
     let snapshot = ActorSnapshot {
         actor_id: 1,
         sequence: 3,
+        activation_epoch: 1,
         state,
         waiting_signal: None,
         crdt_snapshot: None,
         crdt_field_map: None,
+        schema_name: None,
         authority_tokens: Default::default(),
     };
     store.save_snapshot(snapshot).unwrap();
@@ -2125,10 +2357,12 @@ fn test_libsql_store_latest_sequence() {
         .save_snapshot(ActorSnapshot {
             actor_id: 1,
             sequence: 5,
+            activation_epoch: 1,
             state: HashMap::new(),
             waiting_signal: None,
             crdt_snapshot: None,
             crdt_field_map: None,
+            schema_name: None,
             authority_tokens: Default::default(),
         })
         .unwrap();
@@ -2153,10 +2387,12 @@ fn test_libsql_store_clear() {
         .save_snapshot(ActorSnapshot {
             actor_id: 1,
             sequence: 1,
+            activation_epoch: 1,
             state: HashMap::new(),
             waiting_signal: None,
             crdt_snapshot: None,
             crdt_field_map: None,
+            schema_name: None,
             authority_tokens: Default::default(),
         })
         .unwrap();
@@ -2189,10 +2425,12 @@ fn test_libsql_store_persists_to_disk() {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 1,
+                activation_epoch: 1,
                 state,
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -2229,10 +2467,12 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
         .save_snapshot(ActorSnapshot {
             actor_id: 1,
             sequence: 3,
+            activation_epoch: 1,
             state: HashMap::new(),
             waiting_signal: None,
             crdt_snapshot: Some(vec![(7, 1, vec![1, 2, 3]), (8, 2, vec![])]),
             crdt_field_map: None,
+            schema_name: None,
             authority_tokens: Default::default(),
         })
         .unwrap();
@@ -2248,10 +2488,12 @@ fn test_libsql_store_crdt_snapshot_roundtrip() {
         .save_snapshot(ActorSnapshot {
             actor_id: 1,
             sequence: 4,
+            activation_epoch: 1,
             state: HashMap::new(),
             waiting_signal: None,
             crdt_snapshot: None,
             crdt_field_map: None,
+            schema_name: None,
             authority_tokens: Default::default(),
         })
         .unwrap();
@@ -2291,10 +2533,12 @@ fn test_libsql_store_migrates_old_schema_crdt_column() {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 3,
+                activation_epoch: 1,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: Some(vec![(7, 1, vec![1, 2, 3])]),
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -2697,8 +2941,7 @@ fn test_closure_capture_retains_heap_object_across_drop() {
 
 /// Same regression as `test_closure_capture_retains_heap_object_across_drop`,
 /// but for `ArrStore`: storing a heap pointer into an array slot must retain
-/// it too, or a later `Drop` of the value's original binding would free it
-/// out from under the array — a latent use-after-free CapStore was already
+/// it too, or a later `Drop` of the value's original binding would free it/// out from under the array — a latent use-after-free CapStore was already
 /// protected against but ArrStore wasn't.
 #[test]
 fn test_array_store_retains_heap_object_across_drop() {
@@ -3460,6 +3703,436 @@ fn test_workflow_actor_step_event_and_checkpoint() {
         snapshot.state.get("step_index"),
         Some(&PersistedValue::Int(1))
     );
+    assert_eq!(
+        snapshot.sequence,
+        events[1].sequence(),
+        "terminal workflow event and resulting snapshot must share one atomic transition sequence"
+    );
+    assert_eq!(
+        snapshot.activation_epoch,
+        rt.actors
+            .get(&actor_id)
+            .expect("workflow actor must remain live")
+            .activation_epoch,
+        "terminal transition must commit under the actor's canonical fencing epoch"
+    );
+}
+
+#[test]
+fn test_workflow_actor_sequential_steps_extend_atomic_tail() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "CounterWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", |actor, _args| {
+            if let Some(n) = actor.get_state_field("step_index").and_then(|v| v.as_int()) {
+                actor.set_state_field("step_index", Value::int(n + 1));
+            }
+        });
+
+    for _ in 0..2 {
+        rt.send_message(actor_id, "next", &[]);
+        run_ready_actor_turn(&mut rt, actor_id);
+    }
+
+    let actor = rt
+        .actors
+        .get(&actor_id)
+        .expect("workflow actor must remain live across atomic turns");
+    assert_eq!(
+        actor
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
+        Some(2),
+        "the second command must extend the atomic tail instead of being discarded"
+    );
+
+    let completed: Vec<_> = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .filter(|event| matches!(event, WorkflowEvent::StepCompleted { .. }))
+        .collect();
+    assert_eq!(completed.len(), 2);
+
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(snapshot.sequence, completed[1].sequence());
+}
+
+#[test]
+fn test_atomic_workflow_command_preserves_sender_heap_string_payload() {
+    let mut rt = Runtime::new();
+    let sender_id = rt.spawn_actor(Box::new(Vec::new));
+    let actor_id = rt.spawn_workflow_actor("StringWorkflow", Box::new(Vec::new), HashMap::new());
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("capture", |_actor, _args| {});
+
+    let payload = rt
+        .actors
+        .get_mut(&sender_id)
+        .unwrap()
+        .allocate_string("atomic journal");
+
+    rt.current_actor = Some(sender_id);
+    rt.send_message(actor_id, "capture", &[payload]);
+    rt.current_actor = None;
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    let journal = rt.persistence.read_journal(actor_id);
+    assert_eq!(journal.len(), 1);
+    assert_eq!(
+        journal[0].payload,
+        vec![PersistedValue::String("atomic journal".to_string())],
+        "atomic workflow command admission must reuse the actor-aware journal serializer"
+    );
+
+    let completed: Vec<_> = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .filter(|event| matches!(event, WorkflowEvent::StepCompleted { .. }))
+        .collect();
+    assert_eq!(completed.len(), 1);
+    assert!(
+        completed[0].sequence() > journal[0].sequence,
+        "the terminal transition must extend the atomically admitted command"
+    );
+}
+
+#[test]
+fn test_custom_workflow_event_ordinals_are_activation_local_and_deterministic() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("ReplayIdentity", Box::new(Vec::new), HashMap::new());
+
+    let first_activation = WorkflowActivationId::new(actor_id, 10);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(first_activation);
+
+    rt.emit_event(actor_id, "First", &[]);
+    rt.emit_event(actor_id, "Second", &[]);
+
+    let custom: Vec<_> = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::Custom {
+                replay_id: Some(replay_id),
+                name,
+                ..
+            } => Some((name, replay_id)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(custom.len(), 2);
+    assert_eq!(custom[0].0, "First");
+    assert_eq!(custom[0].1, WorkflowReplayEventId::new(first_activation, 0));
+    assert_eq!(custom[1].0, "Second");
+    assert_eq!(custom[1].1, WorkflowReplayEventId::new(first_activation, 1));
+
+    let second_activation = WorkflowActivationId::new(actor_id, 20);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(second_activation);
+    rt.emit_event(actor_id, "Third", &[]);
+
+    let third = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .find_map(|event| match event {
+            WorkflowEvent::Custom {
+                replay_id: Some(replay_id),
+                name,
+                ..
+            } if name == "Third" => Some(replay_id),
+            _ => None,
+        })
+        .expect("third custom event must carry replay identity");
+
+    assert_eq!(
+        third,
+        WorkflowReplayEventId::new(second_activation, 0),
+        "a new accepted command activation must restart the deterministic event ordinal"
+    );
+}
+
+#[test]
+fn test_failed_custom_workflow_event_append_does_not_consume_replay_ordinal() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("ReplayFailure", Box::new(Vec::new), HashMap::new());
+    let activation = WorkflowActivationId::new(actor_id, 30);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(activation);
+
+    let (store, path) = workflow_broken_json_store();
+    rt.persistence = Box::new(store);
+    rt.emit_event(actor_id, "WillFail", &[]);
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(actor.workflow_replay_activation, Some(activation));
+    assert_eq!(
+        actor.workflow_replay_event_ordinal, 0,
+        "an event identity is consumed only after its durable Custom append succeeds"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn test_suspended_workflow_resume_restores_custom_event_replay_cursor() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("ReplayResume", Box::new(Vec::new), HashMap::new());
+    let activation = WorkflowActivationId::new(actor_id, 50);
+
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.current_workflow_activation = None;
+        actor.workflow_replay_activation = Some(activation);
+        actor.workflow_replay_event_ordinal = 2;
+    }
+
+    rt.restore_suspended_workflow_activation(actor_id, Some(activation));
+    rt.emit_event(actor_id, "AfterResume", &[]);
+
+    let replay_id = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .find_map(|event| match event {
+            WorkflowEvent::Custom {
+                replay_id: Some(replay_id),
+                name,
+                ..
+            } if name == "AfterResume" => Some(replay_id),
+            _ => None,
+        })
+        .expect("custom event after resume must retain replay identity");
+
+    assert_eq!(replay_id, WorkflowReplayEventId::new(activation, 2));
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .workflow_replay_event_ordinal,
+        3,
+        "resume must continue the existing activation-local custom-event cursor"
+    );
+}
+
+#[test]
+fn test_parallel_branch_event_does_not_consume_custom_replay_ordinal() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("ReplayParallel", Box::new(Vec::new), HashMap::new());
+    let activation = WorkflowActivationId::new(actor_id, 40);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(activation);
+
+    rt.emit_event(
+        actor_id,
+        "ParallelBranchCompleted",
+        &[Value::unit(), Value::unit()],
+    );
+
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .workflow_replay_event_ordinal,
+        0,
+        "the legacy parallel-branch event has no Custom replay id and must not create an ordinal gap"
+    );
+
+    rt.emit_event(actor_id, "AfterParallel", &[]);
+    let replay_id = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .find_map(|event| match event {
+            WorkflowEvent::Custom {
+                replay_id: Some(replay_id),
+                name,
+                ..
+            } if name == "AfterParallel" => Some(replay_id),
+            _ => None,
+        })
+        .expect("custom event after parallel completion must be replay-identified");
+    assert_eq!(replay_id, WorkflowReplayEventId::new(activation, 0));
+}
+
+#[test]
+fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "ReplayWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", |actor, _args| {
+            if let Some(n) = actor
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int())
+            {
+                actor.set_state_field("step_index", Value::int(n + 1));
+            }
+        });
+
+    let behavior_id = rt
+        .behavior_id_for(actor_id, "next")
+        .expect("registered workflow behavior must have a stable id");
+    let snapshot_before = rt.persistence.load_snapshot(actor_id).unwrap();
+    let activation =
+        workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new()).unwrap();
+    assert!(
+        activation.command_sequence > snapshot_before.sequence,
+        "accepted command must extend the pre-command safe snapshot"
+    );
+
+    // Crash after atomic command admission but before handler entry.
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+
+    // Native test handlers are runtime registrations, so restore the handler
+    // after actor recovery before executing the replayed mailbox command.
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", |actor, _args| {
+            if let Some(n) = actor
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int())
+            {
+                actor.set_state_field("step_index", Value::int(n + 1));
+            }
+        });
+
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    let actor = rt
+        .actors
+        .get(&actor_id)
+        .expect("recovered workflow actor must remain live");
+    assert_eq!(
+        actor
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
+        Some(1),
+        "an atomically admitted but nonterminal command must replay from the last safe snapshot"
+    );
+
+    let completed = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .any(|event| {
+            matches!(
+                event,
+                WorkflowEvent::StepCompleted {
+                    activation: Some(id),
+                    ..
+                } if id == activation
+            )
+        });
+    assert!(
+        completed,
+        "replayed command must close the original accepted activation"
+    );
+    assert_eq!(
+        rt.persistence.read_journal(actor_id).len(),
+        1,
+        "replay must execute the accepted command without admitting a duplicate"
+    );
+}
+
+#[test]
+fn test_recovery_does_not_replay_completed_atomic_native_workflow_activation() {
+    let mut rt = Runtime::new();
+    let mut models = HashMap::new();
+    models.insert("step_index".to_string(), StateModel::Durable);
+    let actor_id = rt.spawn_workflow_actor(
+        "CompletedWorkflow",
+        Box::new(|| vec![("step_index".to_string(), Value::int(0))]),
+        models,
+    );
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", |actor, _args| {
+            if let Some(n) = actor
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int())
+            {
+                actor.set_state_field("step_index", Value::int(n + 1));
+            }
+        });
+
+    rt.send_message(actor_id, "next", &[]);
+    run_ready_actor_turn(&mut rt, actor_id);
+    assert_eq!(rt.persistence.read_journal(actor_id).len(), 1);
+
+    let terminal_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        terminal_snapshot.sequence,
+        "successful atomic terminal commit must advance the safe snapshot to the durable tail"
+    );
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", |actor, _args| {
+            if let Some(n) = actor
+                .get_state_field("step_index")
+                .and_then(|value| value.as_int())
+            {
+                actor.set_state_field("step_index", Value::int(n + 1));
+            }
+        });
+
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(
+        actor
+            .get_state_field("step_index")
+            .and_then(|value| value.as_int()),
+        Some(1),
+        "a terminally committed activation must not replay after recovery"
+    );
+    assert_eq!(
+        rt.persistence.read_journal(actor_id).len(),
+        1,
+        "terminal recovery must not admit or replay a second command"
+    );
 }
 
 #[test]
@@ -4157,7 +4830,7 @@ fn test_actor_migration_between_two_nodes() {
     );
 
     // Build the migration payload manually (same logic as the callback).
-    let (snapshot_json, nbc_bytes) = {
+    let (snapshot_json, nbc_bytes, migrated_epoch) = {
         let actor = rt_a.actors.get(&actor_id).unwrap();
         let mut state = std::collections::HashMap::new();
         for (name, value) in &actor.state_data {
@@ -4187,18 +4860,33 @@ fn test_actor_migration_between_two_nodes() {
                 .map(|((_, name), id)| (name.clone(), id.0))
                 .collect()
         });
+        let migrated_epoch = actor
+            .activation_epoch
+            .checked_add(1)
+            .expect("test migration epoch must advance");
         let snapshot = ActorSnapshot {
             actor_id,
             sequence: actor.sequence,
+            activation_epoch: migrated_epoch,
             state,
             waiting_signal: actor.waiting_signal.clone(),
             crdt_snapshot,
             crdt_field_map,
+            schema_name: actor
+                .bytecode_module
+                .as_ref()
+                .and_then(|module| {
+                    crate::runtime::schema_identity::canonical_schema_name_for_runtime_actor(
+                        module,
+                        &actor.name,
+                    )
+                })
+                .map(str::to_owned),
             authority_tokens: Default::default(),
         };
         let json = serde_json::to_vec(&snapshot).unwrap();
         let nbc = module.to_nbc(None).unwrap();
-        (json, nbc)
+        (json, nbc, migrated_epoch)
     }; // actor borrow released
 
     // Send the migration packet from A to B.
@@ -4235,6 +4923,18 @@ fn test_actor_migration_between_two_nodes() {
     {
         let actor = rt_b.actors.get_mut(&actor_id).unwrap();
         assert!(actor.persistent);
+        assert_eq!(
+            actor.activation_epoch, migrated_epoch,
+            "migration target must activate under a strictly newer fencing epoch"
+        );
+        assert_eq!(
+            rt_b.persistence
+                .load_snapshot(actor_id)
+                .expect("migration target must persist the received snapshot")
+                .activation_epoch,
+            migrated_epoch,
+            "persisted migration state must retain the target fencing epoch"
+        );
         assert_eq!(
             actor.get_state_field("count"),
             Some(Value::int(0)),
@@ -4379,6 +5079,41 @@ fn pump_until_addresses_converge(
         assert!(
             Instant::now() < deadline,
             "cluster addresses did not converge to real listen addresses within the timeout"
+        );
+        sleep(Duration::from_millis(50));
+    }
+}
+
+/// Pump one runtime until its transport has a live connection registered for
+/// `peer`, or fail with connection diagnostics.
+///
+/// Membership and authoritative-address convergence happen on the runtime
+/// thread, while the TCP sender establishes connections asynchronously. A
+/// recovered cluster is not yet ready for a one-shot delivery assertion until
+/// the sender-side transport has completed that reconnect.
+#[cfg(feature = "tcp")]
+fn pump_until_peer_connected(rt: &mut Runtime, peer: NodeId, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        rt.process_network();
+        let connected_addr = rt
+            .distributed
+            .transport
+            .as_ref()
+            .and_then(|transport| transport.connection_addr(peer));
+        if connected_addr.is_some() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "transport did not reconnect to peer {:?} within the timeout; local={:?}, cluster_addr={:?}",
+            peer,
+            rt.distributed.node_id,
+            rt.distributed
+                .cluster
+                .as_ref()
+                .and_then(|cluster| cluster.get_node(peer))
+                .map(|info| info.address),
         );
         sleep(Duration::from_millis(50));
     }
@@ -4749,7 +5484,9 @@ fn test_three_node_cluster_split_brain_detects_and_heals() {
     let mut rt_b = start_virtual_clock_node();
     let mut rt_c = start_virtual_clock_node();
 
+    let addr_a = rt_a.distributed.transport.as_ref().unwrap().listen_addr();
     let addr_b = rt_b.distributed.transport.as_ref().unwrap().listen_addr();
+    let addr_c = rt_c.distributed.transport.as_ref().unwrap().listen_addr();
     let node_a = rt_a.distributed.node_id.unwrap();
     let node_b = rt_b.distributed.node_id.unwrap();
     let node_c = rt_c.distributed.node_id.unwrap();
@@ -4849,6 +5586,19 @@ fn test_three_node_cluster_split_brain_detects_and_heals() {
         healed,
         "cluster did not heal after the partition was lifted"
     );
+
+    // Membership/status recovery can precede transport-address recovery:
+    // gossip may temporarily retain a peer's ephemeral source port. Do not
+    // assert remote delivery until every node has relearned the authoritative
+    // listen addresses. This is the same transport invariant enforced by the
+    // rolling-restart and five-node split-brain recovery tests.
+    let expected_addresses = [(node_a, addr_a), (node_b, addr_b), (node_c, addr_c)];
+    pump_until_addresses_converge(
+        &mut [&mut rt_a, &mut rt_b, &mut rt_c],
+        &expected_addresses,
+        Duration::from_secs(15),
+    );
+    pump_until_peer_connected(&mut rt_c, node_a, Duration::from_secs(15));
 
     // Prove the healed cluster does real cross-boundary work: C sends a
     // remote message to an actor on A, across the former partition line.
@@ -5133,6 +5883,21 @@ fn test_five_node_cluster_split_brain_detects_and_heals() {
     }
     assert!(healed, "5-node cluster did not heal after the split-brain");
 
+    // Membership convergence alone does not guarantee that every peer has
+    // relearned the authoritative listen address after a partition. The
+    // heartbeat/discovery path can temporarily retain an ephemeral source
+    // port, so wait for address convergence before asserting cross-boundary
+    // delivery. The rolling-restart test enforces the same transport
+    // precondition before its post-recovery send.
+    let expected_addresses: Vec<(NodeId, SocketAddr)> =
+        ids.iter().copied().zip(addrs.iter().copied()).collect();
+    pump_until_addresses_converge(
+        &mut nodes.iter_mut().collect::<Vec<_>>(),
+        &expected_addresses,
+        Duration::from_secs(15),
+    );
+    pump_until_peer_connected(&mut nodes[4], ids[0], Duration::from_secs(15));
+
     // Cross-boundary delivery after healing: E (node 4) -> actor on A
     // (node 0).
     let actor_id = nodes[0].spawn_actor(Box::new(|| vec![("received".to_string(), Value::int(0))]));
@@ -5397,8 +6162,7 @@ fn test_three_node_cluster_static_quorum_downs_minority() {
 /// `handle_node_failed`, which (a) invalidates A's `RemoteActorCache`
 /// entry for B's actor and (b) delivers `DOWN`-with-`noconnection`
 /// (payload code 6) to the local watcher. The cross-node registration
-/// is set up on the registry directly because the D8 *send* side
-/// (`perform Actor.monitor` reaching a remote target) is not yet wired —
+/// is set up on the registry directly because the D8 *send* side/// (`perform Actor.monitor` reaching a remote target) is not yet wired —
 /// the receive side (`Packet::Monitor` → `remote_monitors.register`) is
 /// exercised by the packet round-trip test; this test drives the
 /// failure→DOWN half of the chain.
@@ -6888,7 +7652,7 @@ fn test_dst_gc_during_send_seed_sweep() {
 
 #[test]
 fn test_object_store_put_get() {
-    let mut rt = Runtime::new();
+    let rt = Runtime::new();
     let bytes: Box<[u8]> = vec![1, 2, 3, 4, 5].into_boxed_slice();
     let id = rt.object_store.put(bytes);
     let entry = rt.object_store.get(id).unwrap();
@@ -6915,6 +7679,51 @@ fn test_object_ref_send_same_shard_records_hold() {
 }
 
 #[test]
+fn test_object_ref_mailbox_admission_holds_object_before_receive() {
+    let mut rt = Runtime::new();
+    let receiver = rt.spawn_actor(Box::new(|| vec![]));
+    let obj_id = rt.object_store.put(vec![4, 5, 6].into_boxed_slice());
+
+    rt.send_message_by_id(receiver, 0, &[Value::object(obj_id)]);
+
+    // The creator can release immediately after send; the receiver mailbox
+    // admission must already own a hold even though the actor has not run.
+    rt.object_store.drop_ref(obj_id);
+    assert!(
+        rt.object_store.get(obj_id).is_some(),
+        "mailbox admission must keep the shared object alive before receive"
+    );
+
+    rt.exit_actor(receiver, ExitReason::Normal);
+    assert!(rt.object_store.get(obj_id).is_none());
+}
+
+#[test]
+fn test_object_ref_duplicate_deliveries_take_one_actor_hold() {
+    let mut rt = Runtime::new();
+    let receiver = rt.spawn_actor(Box::new(|| vec![]));
+    let obj_id = rt.object_store.put(vec![1, 2, 3].into_boxed_slice());
+
+    rt.send_message_by_id(receiver, 0, &[Value::object(obj_id)]);
+    run_ready_actor_turn(&mut rt, receiver);
+    rt.send_message_by_id(receiver, 0, &[Value::object(obj_id)]);
+    run_ready_actor_turn(&mut rt, receiver);
+
+    assert_eq!(
+        rt.object_store.get(obj_id).unwrap().ref_count(),
+        2,
+        "creator plus one receiver actor hold should remain regardless of duplicate deliveries"
+    );
+
+    rt.object_store.drop_ref(obj_id);
+    rt.exit_actor(receiver, ExitReason::Normal);
+    assert!(
+        rt.object_store.get(obj_id).is_none(),
+        "the actor single hold should release the object exactly once on exit"
+    );
+}
+
+#[test]
 fn test_object_ref_released_on_actor_exit() {
     let mut rt = Runtime::new();
     let receiver = rt.spawn_actor(Box::new(|| vec![]));
@@ -6936,7 +7745,7 @@ fn test_object_ref_released_on_actor_exit() {
 }
 
 #[test]
-fn test_object_ref_cross_shard_copies_bytes() {
+fn test_object_ref_cross_shard_reuses_node_shared_storage() {
     let mut shards = Runtime::new_sharded(2);
 
     // Spawn actors until we have one on each shard with opposite parity.
@@ -6957,9 +7766,17 @@ fn test_object_ref_cross_shard_copies_bytes() {
     assert_eq!(source_shard, 0);
     assert_eq!(target_shard, 1);
 
-    // Put object in the source shard's store and send from a to b.
+    assert!(
+        shards[source_shard]
+            .object_store
+            .shares_storage_with(&shards[target_shard].object_store),
+        "runtime shards should share one node-local object store"
+    );
+
+    // Put object once and send only its ObjectId across the shard channel.
     let bytes: Box<[u8]> = vec![11, 22, 33].into_boxed_slice();
     let obj_id = shards[source_shard].object_store.put(bytes);
+    let source_entry = shards[source_shard].object_store.get(obj_id).unwrap();
     shards[source_shard].current_actor = Some(a);
     shards[source_shard].send_message_by_id(b, 0, &[Value::object(obj_id)]);
 
@@ -6971,8 +7788,6 @@ fn test_object_ref_cross_shard_copies_bytes() {
         1
     );
 
-    // The received object id is local to the target store (ids are per-store
-    // and may coincide by chance, so verify via bytes, not id equality).
     let received_msg = shards[target_shard]
         .actors
         .get_mut(&b)
@@ -6980,15 +7795,212 @@ fn test_object_ref_cross_shard_copies_bytes() {
         .mailbox
         .pop()
         .unwrap();
-    let local_id = received_msg.payload[0].as_object_id().unwrap();
+    let received_id = received_msg.payload[0].as_object_id().unwrap();
     assert_eq!(
-        shards[target_shard]
-            .object_store
-            .get(local_id)
-            .unwrap()
-            .as_bytes(),
-        &[11, 22, 33]
+        received_id, obj_id,
+        "cross-shard send must preserve ObjectId"
     );
+
+    let target_entry = shards[target_shard].object_store.get(received_id).unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&source_entry, &target_entry),
+        "cross-shard send should reference the same immutable allocation"
+    );
+    assert_eq!(target_entry.as_bytes(), &[11, 22, 33]);
+}
+
+#[test]
+fn test_object_ref_cross_shard_in_flight_hold_survives_creator_drop() {
+    let mut shards = Runtime::new_sharded(2);
+
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+
+    let obj_id = shards[0]
+        .object_store
+        .put(vec![21, 34, 55].into_boxed_slice());
+
+    shards[0].send_message_by_id(target, 0, &[Value::object(obj_id)]);
+
+    // A successful cross-shard admission must own an in-flight reference.
+    shards[0].object_store.drop_ref(obj_id);
+    assert!(
+        shards[0].object_store.get(obj_id).is_some(),
+        "the channel envelope must retain ObjectRefs until destination admission"
+    );
+
+    shards[1].drain_cross_shard_messages();
+    assert!(
+        shards[1].object_store.get(obj_id).is_some(),
+        "destination admission must transfer the in-flight reference to the actor"
+    );
+
+    shards[1].exit_actor(target, ExitReason::Normal);
+    assert!(
+        shards[0].object_store.get(obj_id).is_none(),
+        "the final actor-lifetime hold must release on exit"
+    );
+}
+
+#[test]
+fn test_named_cross_shard_rejection_releases_in_flight_object_hold() {
+    fn known_behavior(_actor: &mut Actor, _args: &[Value]) {}
+
+    let mut shards = Runtime::new_sharded(2);
+
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+    shards[1]
+        .actors
+        .get_mut(&target)
+        .unwrap()
+        .register_behavior("known", known_behavior);
+
+    let obj_id = shards[0]
+        .object_store
+        .put(vec![8, 13, 21].into_boxed_slice());
+
+    shards[0].send_message(target, "does_not_exist", &[Value::object(obj_id)]);
+    shards[0].object_store.drop_ref(obj_id);
+    assert!(
+        shards[0].object_store.get(obj_id).is_some(),
+        "named cross-shard messages must retain ObjectRefs while queued"
+    );
+
+    shards[1].drain_cross_shard_messages();
+    assert!(
+        shards[0].object_store.get(obj_id).is_none(),
+        "unknown destination behavior must release the in-flight ObjectRef"
+    );
+}
+
+#[test]
+fn test_disconnected_cross_shard_send_rolls_back_object_hold() {
+    let mut shards = Runtime::new_sharded(2);
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+
+    let survivor_store = shards[0].object_store.clone();
+    let obj_id = survivor_store.put(vec![1, 1, 2, 3, 5].into_boxed_slice());
+    drop(shards.pop().unwrap());
+
+    shards[0].send_message_by_id(target, 0, &[Value::object(obj_id)]);
+
+    assert_eq!(
+        survivor_store.get(obj_id).unwrap().ref_count(),
+        1,
+        "failed channel admission must roll back any temporary ObjectRef hold"
+    );
+    survivor_store.drop_ref(obj_id);
+    assert!(survivor_store.get(obj_id).is_none());
+}
+
+#[test]
+fn test_cross_shard_mailbox_rejection_releases_in_flight_object_hold() {
+    let mut shards = Runtime::new_sharded(2);
+
+    let mut target = shards[1].spawn_actor(Box::new(|| vec![]));
+    while target % 2 != 1 {
+        target = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+
+    shards[1].actors.get_mut(&target).unwrap().mailbox = Mailbox::new(1);
+    let filler = Message {
+        behavior_id: 0,
+        payload: MessagePayload::from_slice(&[]),
+        sender: 0,
+        priority: MessagePriority::Normal,
+        trace_id: None,
+    };
+    shards[1]
+        .actors
+        .get_mut(&target)
+        .unwrap()
+        .mailbox
+        .push_local(filler)
+        .unwrap();
+
+    let obj_id = shards[0]
+        .object_store
+        .put(vec![34, 55, 89].into_boxed_slice());
+    shards[0].send_message_by_id(target, 0, &[Value::object(obj_id)]);
+    shards[0].object_store.drop_ref(obj_id);
+    assert!(
+        shards[0].object_store.get(obj_id).is_some(),
+        "the in-flight envelope must retain the object before destination admission"
+    );
+
+    shards[1].drain_cross_shard_messages();
+
+    assert!(
+        shards[0].object_store.get(obj_id).is_none(),
+        "mailbox rejection must release the in-flight ObjectRef lease"
+    );
+}
+
+#[test]
+fn test_dropping_one_shard_releases_actor_object_holds() {
+    let mut shards = Runtime::new_sharded(2);
+    let survivor_store = shards[0].object_store.clone();
+
+    let mut receiver = shards[1].spawn_actor(Box::new(|| vec![]));
+    while receiver % 2 != 1 {
+        receiver = shards[1].spawn_actor(Box::new(|| vec![]));
+    }
+
+    let obj_id = survivor_store.put(vec![89, 144].into_boxed_slice());
+    shards[1].send_message_by_id(receiver, 0, &[Value::object(obj_id)]);
+    survivor_store.drop_ref(obj_id);
+    assert!(survivor_store.get(obj_id).is_some());
+
+    drop(shards.pop().unwrap());
+
+    assert!(
+        survivor_store.get(obj_id).is_none(),
+        "dropping a shard must release manual ObjectStore holds owned by its actors"
+    );
+}
+
+#[test]
+fn test_hibernated_grain_with_object_holds_is_not_evicted() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+    let grain_id = GrainId::new("ObjectHoldingGrain", "one");
+
+    rt.actor_grain_id.insert(actor_id, grain_id.clone());
+    rt.grain_residents.insert(grain_id.clone(), actor_id);
+
+    let obj_id = rt.object_store.put(vec![2, 3, 5, 7].into_boxed_slice());
+    rt.send_message_by_id(actor_id, 0, &[Value::object(obj_id)]);
+    let _ = rt.actors.get_mut(&actor_id).unwrap().mailbox.pop();
+    rt.object_store.drop_ref(obj_id);
+
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.hibernation_state = Some(HibernationState {
+            continuation_bytes: Vec::new(),
+            module_hash: [0; 32],
+            hibernated_at_ms: 0,
+            state_fields: HashMap::new(),
+        });
+    }
+
+    assert_eq!(
+        rt.evict_hibernated_grains(None),
+        0,
+        "grains with live ObjectRefs must remain resident until durable ObjectRef semantics exist"
+    );
+    assert!(rt.actors.contains_key(&actor_id));
+    assert!(rt.object_store.get(obj_id).is_some());
+
+    rt.exit_actor(actor_id, ExitReason::Normal);
+    assert!(rt.object_store.get(obj_id).is_none());
 }
 
 // ========================================================================
@@ -7368,4 +8380,157 @@ fn p0_cross_shard_named_send_resolves_only_on_owner() {
         Some(1),
         "unknown cross-shard behavior must not execute behavior zero"
     );
+}
+
+fn workflow_broken_json_store() -> (JsonFileStore, std::path::PathBuf) {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "nulang-workflow-fail-{}-{nonce}",
+        std::process::id()
+    ));
+    let store = JsonFileStore::new(&path).unwrap();
+    std::fs::remove_dir_all(&path).unwrap();
+    std::fs::write(&path, b"not a directory").unwrap();
+    (store, path)
+}
+
+#[test]
+fn workflow_command_is_not_executed_when_durable_admission_fails() {
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "fail_closed_command",
+            Box::new(|| vec![("count".to_string(), Value::int(0))]),
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("increment", |actor, _args| {
+            let count = actor
+                .get_state_field("count")
+                .and_then(|value| value.as_int())
+                .unwrap_or(0);
+            actor.set_state_field("count", Value::int(count + 1));
+        });
+
+    let (store, path) = workflow_broken_json_store();
+    rt.persistence = Box::new(store);
+
+    rt.send_message(actor_id, "increment", &[]);
+    rt.run_scheduler();
+
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("count")
+            .and_then(|value| value.as_int()),
+        Some(0),
+        "workflow user code must not execute when command journal admission fails"
+    );
+    assert!(
+        rt.persistence.read_workflow_events(actor_id).is_empty(),
+        "a failed command admission must not create a new terminal workflow event"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn workflow_timer_is_not_armed_when_durable_timer_set_fails() {
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "fail_closed_timer",
+            Box::new(|| vec![]),
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+
+    let (store, path) = workflow_broken_json_store();
+    rt.persistence = Box::new(store);
+
+    assert!(rt
+        .schedule_workflow_timer(actor_id, "payment_timeout", 10)
+        .is_err());
+    assert!(
+        rt.timer_wheel.is_empty(),
+        "a live timer must not be armed when its durable TimerSet fails"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn workflow_signal_is_not_made_visible_when_durable_append_fails() {
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "fail_closed_signal",
+            Box::new(|| vec![]),
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+    rt.actors.get_mut(&actor_id).unwrap().waiting_signal = Some("go".to_string());
+
+    let (store, path) = workflow_broken_json_store();
+    rt.persistence = Box::new(store);
+
+    assert!(rt.signal_workflow(actor_id, "go", None).is_err());
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert!(
+        actor.received_signals.is_empty(),
+        "a signal must not become visible in memory when its durable append fails"
+    );
+    assert_eq!(actor.waiting_signal.as_deref(), Some("go"));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn workflow_timer_fire_is_not_delivered_when_durable_fire_append_fails() {
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "fail_closed_timer_fire",
+            Box::new(|| vec![("fired".to_string(), Value::int(0))]),
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.register_behavior("__timer_fired", |actor, _args| {
+            let current = actor
+                .get_state_field("fired")
+                .and_then(|value| value.as_int())
+                .unwrap_or(0);
+            actor.set_state_field("fired", Value::int(current + 1));
+        });
+    }
+
+    rt.schedule_workflow_timer(actor_id, "payment_timeout", 0)
+        .unwrap();
+    assert_eq!(rt.timer_wheel.len(), 1);
+
+    let (store, path) = workflow_broken_json_store();
+    rt.persistence = Box::new(store);
+    rt.tick_timers_at(std::time::Instant::now() + std::time::Duration::from_secs(1));
+    rt.run_scheduler();
+
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .get_state_field("fired")
+            .and_then(|value| value.as_int()),
+        Some(0),
+        "timer delivery must be suppressed when TimerFired cannot be durably recorded"
+    );
+
+    let _ = std::fs::remove_file(path);
 }

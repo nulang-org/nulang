@@ -46,11 +46,11 @@ pub use compiler::*;
 use native_codegen::{
     CraneliftCodegen, NativeCodegenBackend, NativeCompileKind, NativeCompileRequest,
 };
-use region_planner::RegionPlanner;
 #[cfg(test)]
 use region_planner::{
     compute_may_suspend, compute_recursive, direct_call_target, find_compilable_region,
 };
+use region_planner::{region_has_internal_back_edge, RegionPlanner};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -135,6 +135,9 @@ pub struct JitSession {
     compiled: Vec<Vec<Option<CompiledRegion>>>,
     /// Number of occupied compiled-region slots across all modules.
     compiled_count: usize,
+    /// Aggregate compiler-only telemetry across initial and replacement
+    /// compilations in this session.
+    compile_stats: crate::backends::JitCompileStats,
     /// Per-region execution counters for already-compiled code. When a
     /// region crosses TIER2_THRESHOLD, a more aggressive compilation is
     /// attempted. Reset after each promotion attempt.
@@ -170,6 +173,7 @@ impl JitSession {
             codegen,
             compiled: Vec::new(),
             compiled_count: 0,
+            compile_stats: crate::backends::JitCompileStats::default(),
             hot_counts: Vec::new(),
             typed_regions: FxHashSet::default(),
             region_planner: RegionPlanner::default(),
@@ -226,6 +230,24 @@ impl JitSession {
         }
         if row[offset].is_none() {
             self.compiled_count += 1;
+        }
+        match optimization {
+            CodegenOptimization::Fast => {
+                self.compile_stats.fast_compiles =
+                    self.compile_stats.fast_compiles.saturating_add(1);
+                self.compile_stats.fast_compile_ns = self
+                    .compile_stats
+                    .fast_compile_ns
+                    .saturating_add(compile_time_ns);
+            }
+            CodegenOptimization::Optimized => {
+                self.compile_stats.optimized_compiles =
+                    self.compile_stats.optimized_compiles.saturating_add(1);
+                self.compile_stats.optimized_compile_ns = self
+                    .compile_stats
+                    .optimized_compile_ns
+                    .saturating_add(compile_time_ns);
+            }
         }
         row[offset] = Some(CompiledRegion {
             ptr,
@@ -310,19 +332,33 @@ impl JitSession {
         pc: usize,
         module: &crate::bytecode::CodeModule,
     ) {
+        let Some(region) = self.compiled_entry(module_idx, pc) else {
+            self.tier2_counters.insert((module_idx, pc), 0);
+            return;
+        };
+
+        // A native loop region may execute thousands or millions of back-edge
+        // iterations inside a single region entry. Entry-count-only tiering
+        // therefore strands genuinely hot loops on the fast-compilation
+        // Cranelift tier. Preserve the normal threshold for straight-line code
+        // and terminal/optimized tiers, but promote a first-tier internal loop
+        // on its first compiled re-entry.
+        let promotion_threshold = if region.optimization == CodegenOptimization::Fast
+            && region_has_internal_back_edge(pc, region.len, &module.instructions)
+        {
+            1
+        } else {
+            TIER2_THRESHOLD
+        };
         let should_promote = {
             let count = self.tier2_counters.entry((module_idx, pc)).or_insert(0);
-            *count += 1;
-            *count >= TIER2_THRESHOLD
+            *count = count.saturating_add(1);
+            *count >= promotion_threshold
         };
         if !should_promote {
             return;
         }
 
-        let Some(region) = self.compiled_entry(module_idx, pc) else {
-            self.tier2_counters.insert((module_idx, pc), 0);
-            return;
-        };
         if region.len < 3 {
             self.tier2_counters.insert((module_idx, pc), 0);
             return;
@@ -868,6 +904,10 @@ impl crate::backends::JitBackend for JitSession {
 
     fn typed_compiled_count(&self) -> usize {
         self.typed_regions.len()
+    }
+
+    fn compile_stats(&self) -> crate::backends::JitCompileStats {
+        self.compile_stats
     }
 
     fn reset_hot_counters(&mut self) {
