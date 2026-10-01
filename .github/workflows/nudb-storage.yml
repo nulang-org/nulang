@@ -1,0 +1,39 @@
+name: NulangDB Storage
+
+on:
+  pull_request:
+    paths:
+      - "src/database/**"
+      - "tests/nudb_*.rs"
+      - "benches/database_bench.rs"
+      - "benches/bench_main.rs"
+      - ".github/workflows/nudb-storage.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/database/**"
+      - "tests/nudb_*.rs"
+      - "benches/database_bench.rs"
+      - "benches/bench_main.rs"
+      - ".github/workflows/nudb-storage.yml"
+
+jobs:
+  storage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Batch WAL contract
+        run: cargo test --locked --no-default-features --test nudb_wal_batch
+      - name: Existing NulangDB storage contracts
+        run: |
+          cargo test --locked --no-default-features --test tablet_foundation
+          cargo test --locked --no-default-features --test tablet_mvcc
+          cargo test --locked --no-default-features --test tablet_wal
+          cargo test --locked --no-default-features --test wal_backed_tablet
+          cargo test --locked --no-default-features --test checkpoint_reclamation
+          cargo test --locked --no-default-features --test nudb_crash_recovery
+      - name: Benchmark harness compiles
+        run: cargo bench --locked --no-default-features --bench bench_main --no-run
