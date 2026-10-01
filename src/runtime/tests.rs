@@ -4528,6 +4528,79 @@ fn test_open_activation_intermediate_events_extend_atomic_tail() {
 }
 
 #[test]
+fn test_recovered_compiled_activation_with_intermediate_event_is_not_readmitted() {
+    use crate::bytecode::{Instruction, OpCode};
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "RecoveredCompiledActivation",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+
+    let mut module = CodeModule::new("recovered-compiled-activation");
+    module.emit(Instruction::new0(OpCode::Ret));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.layout_workflow_behavior_table(actor_id);
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    let activation = workflow::commit_workflow_command(&mut rt, actor_id, 0, Vec::new()).unwrap();
+    rt.emit_event(actor_id, "CommittedBeforeCrash", &[Value::int(1)]);
+    let intermediate_tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    assert!(intermediate_tail.sequence > activation.command_sequence);
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .current_workflow_activation,
+        Some(activation)
+    );
+    assert!(
+        rt.actors.get(&actor_id).unwrap().sequence > activation.command_sequence,
+        "workflow-event replay should advance the recovered actor sequence beyond command admission"
+    );
+
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    assert_eq!(
+        rt.persistence.read_journal(actor_id).len(),
+        1,
+        "replaying an unfinished activation must not append a second command admission"
+    );
+    let completions: Vec<_> = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::StepCompleted {
+                activation,
+                sequence,
+                ..
+            } => Some((activation, sequence)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(
+        completions[0].0,
+        Some(activation),
+        "terminal replay must close the original admitted activation"
+    );
+}
+
+#[test]
 fn test_recovery_finds_unfinished_atomic_command_below_durable_effect_tail() {
     let mut rt = Runtime::new();
     let actor_id = rt.spawn_workflow_actor(
