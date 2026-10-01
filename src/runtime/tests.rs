@@ -4544,6 +4544,78 @@ fn test_pending_timer_recovery_pairs_reused_names_by_timer_identity() {
 }
 
 #[test]
+fn test_signal_received_keeps_pre_command_snapshot_safe_for_replay() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("SignalReplay", Box::new(Vec::new), HashMap::new());
+    let activation = WorkflowActivationId::new(actor_id, 130);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(activation);
+
+    let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    rt.signal_workflow(actor_id, "approved", Some("yes".to_string()))
+        .unwrap();
+
+    assert_eq!(
+        rt.persistence.load_snapshot(actor_id).unwrap().sequence,
+        safe_snapshot.sequence,
+        "SignalReceived must not checkpoint partially executed workflow state"
+    );
+    assert!(rt
+        .actors
+        .get(&actor_id)
+        .unwrap()
+        .received_signals
+        .iter()
+        .any(|(name, payload)| name == "approved" && payload.as_deref() == Some("yes")));
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+    assert!(rt
+        .actors
+        .get(&actor_id)
+        .unwrap()
+        .received_signals
+        .iter()
+        .any(|(name, payload)| name == "approved" && payload.as_deref() == Some("yes")));
+}
+
+#[test]
+fn test_recovery_rebuilds_signals_even_when_snapshot_sequence_covers_signal() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("SignalSnapshot", Box::new(Vec::new), HashMap::new());
+
+    rt.signal_workflow(actor_id, "wake", Some("payload".to_string()))
+        .unwrap();
+    rt.checkpoint_actor(actor_id);
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let signal_sequence = rt
+        .persistence
+        .read_signal_events(actor_id)
+        .into_iter()
+        .map(|event| event.sequence())
+        .max()
+        .unwrap();
+    assert!(
+        snapshot.sequence >= signal_sequence,
+        "fixture requires the snapshot to cover the durable signal sequence"
+    );
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+    assert!(rt
+        .actors
+        .get(&actor_id)
+        .unwrap()
+        .received_signals
+        .iter()
+        .any(|(name, payload)| name == "wake" && payload.as_deref() == Some("payload")),
+        "signal availability must be reconstructed from the full durable signal journal"
+    );
+}
+
+#[test]
 fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
