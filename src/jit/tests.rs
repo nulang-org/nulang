@@ -652,6 +652,53 @@ fn test_jit_direct_call_loop_tiers_up() {
 }
 
 #[test]
+fn branchy_hot_loop_compiles_a_native_region() {
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    // Same control-flow shape as the branch_loop JIT telemetry workload, but
+    // short enough for a focused regression test while still exceeding the
+    // first-tier HOT_THRESHOLD.
+    let source = "var sum = 0; var i = 0; while i < 5000 { if i < 2500 then { sum = sum + i } else { sum = sum - 1 }; i = i + 1; }; sum";
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_branch_loop_coverage").expect("codegen");
+    let instructions = module.instructions.clone();
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interpreter branch loop should run");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let actual = jit_vm.run().expect("JIT branch loop should run");
+
+    assert_eq!(
+        actual.as_int(),
+        expected.as_int(),
+        "branch-containing hot loop must preserve interpreter semantics"
+    );
+    assert_eq!(
+        expected.as_int(),
+        Some(3_121_250),
+        "branch-loop result is wrong"
+    );
+    assert!(
+        jit_vm.jit_compiled_count() > 0,
+        "a hot loop with an internal conditional branch should compile at least one native region; instructions={instructions:?}"
+    );
+}
+
+#[test]
 fn test_jit_direct_call_recursion_stays_interpreter() {
     // Recursive calls (fib -> fib) are in a direct-call cycle and must NOT be
     // folded into a compiled region: the re-entrant helper consumes native
@@ -1599,6 +1646,61 @@ fn test_tier2_counters_are_per_session() {
 }
 
 #[test]
+fn test_loop_region_promotes_on_first_compiled_reentry() {
+    let mut module = CodeModule::new("tier2_loop_reentry");
+    module.emit(Instruction::new1(OpCode::Const0, 0));
+    module.emit(Instruction::new1(OpCode::Const1, 1));
+    module.emit(Instruction::new3(OpCode::IAdd, 0, 1, 0));
+    module.emit(Instruction::new3(OpCode::ICmpLt, 0, 1, 2));
+    let back: i16 = -2; // pc4 -> pc2, an internal loop back-edge.
+    module.emit(Instruction::new3(
+        OpCode::JmpT,
+        2,
+        ((back as u16) >> 8) as u8,
+        (back as u16 & 0xFF) as u8,
+    ));
+    module.emit(Instruction::new0(OpCode::Halt));
+    module.entry_point = Some(0);
+
+    let mut jit = make_jit();
+    let start = 2;
+    let len = 3;
+    unsafe {
+        jit.compile_region(
+            0,
+            start,
+            len,
+            &module.instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("loop region should compile");
+
+    assert_eq!(
+        jit.compiled_optimization(0, start),
+        Some(CodegenOptimization::Fast),
+        "first-tier compilation should still minimize startup latency"
+    );
+
+    // One compiled re-entry can represent an arbitrarily large amount of
+    // native loop work because the back-edge remains inside the region.
+    // Requiring 10k region entries therefore leaves hot loops stranded on
+    // the low-optimization Cranelift tier.
+    jit.record_tier2_and_maybe_promote(0, start, &module);
+
+    assert_eq!(
+        jit.compiled_optimization(0, start),
+        Some(CodegenOptimization::Optimized),
+        "an internal-loop region should promote on its first compiled re-entry"
+    );
+    assert_eq!(
+        jit.tier2_counters.get(&(0, start)).copied(),
+        Some(0),
+        "successful loop promotion should reset the tier-2 counter"
+    );
+}
+
+#[test]
 fn test_tier2_replaces_baseline_with_typed_code() {
     let mut module = CodeModule::new("tier2_replace");
     module.emit(Instruction::new1(OpCode::Const0, 0));
@@ -1659,6 +1761,16 @@ fn test_tier2_replaces_baseline_with_typed_code() {
     assert!(
         jit.is_typed_compiled(0, start),
         "promoted region should be recorded as type-directed"
+    );
+    let stats = crate::backends::JitBackend::compile_stats(&jit);
+    assert_eq!(stats.fast_compiles, 1);
+    assert_eq!(stats.optimized_compiles, 1);
+    assert_eq!(stats.total_compiles(), 2);
+    assert_eq!(
+        stats.total_compile_ns(),
+        stats
+            .fast_compile_ns
+            .saturating_add(stats.optimized_compile_ns)
     );
 }
 

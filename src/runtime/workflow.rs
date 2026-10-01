@@ -8,7 +8,10 @@
 use crate::bytecode::Constant;
 use crate::primitives::ActorRole;
 use crate::runtime::actor::Actor;
-use crate::runtime::persistence::{EventEntry, PersistedValue, WorkflowEvent};
+use crate::runtime::persistence::{
+    ActorSnapshot, DurableTransition, EventEntry, JournalEntry, PersistedValue,
+    WorkflowActivationId, WorkflowEvent, WorkflowReplayEventId, DURABLE_TRANSITION_VERSION,
+};
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
 use crate::vm::{Frame, Value, VM};
 
@@ -27,25 +30,65 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
         .unwrap_or(false)
 }
 
+fn current_custom_event_replay_id(
+    rt: &mut Runtime,
+    actor_id: u64,
+) -> Option<WorkflowReplayEventId> {
+    let actor = rt.actors.get_mut(&actor_id)?;
+    let activation = actor.current_workflow_activation?;
+
+    if actor.workflow_replay_activation != Some(activation) {
+        actor.workflow_replay_activation = Some(activation);
+        actor.workflow_replay_event_ordinal = 0;
+    }
+
+    Some(WorkflowReplayEventId::new(
+        activation,
+        actor.workflow_replay_event_ordinal,
+    ))
+}
+
+fn advance_custom_event_replay_id(
+    rt: &mut Runtime,
+    actor_id: u64,
+    committed: WorkflowReplayEventId,
+) {
+    let Some(actor) = rt.actors.get_mut(&actor_id) else {
+        return;
+    };
+    if actor.workflow_replay_activation != Some(committed.activation)
+        || actor.workflow_replay_event_ordinal != committed.ordinal
+    {
+        return;
+    }
+
+    actor.workflow_replay_event_ordinal = committed
+        .ordinal
+        .checked_add(1)
+        .expect("workflow custom-event ordinal exhausted within one activation");
+}
+
 // ---------------------------------------------------------------------------
 // Checkpoint
 // ---------------------------------------------------------------------------
 
-/// Persist one checkpoint for a durable actor.
+/// Build the durable snapshot that belongs to one exact transition sequence.
 ///
-/// Unlike the compatibility wrapper below, this function is fallible. Callers
-/// that gate externally visible durable transitions (workflow creation, timer
-/// commits, signals, compensation) must use this path so storage failure cannot
-/// be mistaken for a committed transition.
-pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::Result<()> {
+/// This is pure staging: callers decide whether the snapshot is committed as a
+/// legacy checkpoint or inside an atomic durable transition.
+fn build_actor_snapshot_at_sequence(
+    rt: &Runtime,
+    actor_id: u64,
+    sequence: u64,
+) -> std::io::Result<Option<ActorSnapshot>> {
     let actor = match rt.actors.get(&actor_id) {
-        Some(a) => a,
-        None => return Ok(()),
+        Some(actor) => actor,
+        None => return Ok(None),
     };
     if !actor.persistent {
-        return Ok(());
+        return Ok(None);
     }
-    let seq = next_sequence(rt, actor_id);
+
     let mut state = std::collections::HashMap::new();
     for (name, value) in &actor.state_data {
         let model = actor
@@ -54,18 +97,10 @@ pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::
             .copied()
             .unwrap_or(StateModel::Local);
         if model == StateModel::Durable || model.is_crdt() {
-            let persisted = if name == "semantic_memory" || name == "procedural_memory" {
-                vm_value_to_string_in_actor(value, actor)
-                    .map(PersistedValue::String)
-                    .unwrap_or_else(|| {
-                        PersistedValue::from_value_resolved(value, actor.bytecode_module.as_ref())
-                    })
-            } else {
-                PersistedValue::from_value_resolved(value, actor.bytecode_module.as_ref())
-            };
-            state.insert(name.clone(), persisted);
+            state.insert(name.clone(), actor.persist_value(value));
         }
     }
+
     let authority_tokens = actor
         .authority_manifest()
         .map_err(|err| {
@@ -75,29 +110,57 @@ pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::
             )
         })?
         .canonical_token_set();
-    // Snapshot the global CRDT state alongside durable actor fields.
-    let crdt_snapshot = rt.crdt_manager.as_ref().map(|m| {
-        m.snapshot()
+    let crdt_snapshot = rt.crdt_manager.as_ref().map(|manager| {
+        manager
+            .snapshot()
             .into_iter()
             .map(|(id, (ty, bytes))| (id.0, ty.to_u8(), bytes))
             .collect()
     });
-    let crdt_field_map = rt.crdt_manager.as_ref().map(|m| {
-        m.field_map
+    let crdt_field_map = rt.crdt_manager.as_ref().map(|manager| {
+        manager
+            .field_map
             .iter()
             .filter(|((aid, _), _)| *aid == actor_id)
             .map(|((_, name), id)| (name.clone(), id.0))
             .collect()
     });
-    let snapshot = crate::runtime::persistence::ActorSnapshot {
+    let schema_name = actor
+        .bytecode_module
+        .as_ref()
+        .and_then(|module| {
+            crate::runtime::schema_identity::canonical_schema_name_for_runtime_actor(
+                module,
+                &actor.name,
+            )
+        })
+        .map(str::to_owned);
+
+    Ok(Some(ActorSnapshot {
         actor_id,
-        sequence: seq,
+        sequence,
+        activation_epoch: actor.activation_epoch,
         state,
         waiting_signal: actor.waiting_signal.clone(),
         crdt_snapshot,
         crdt_field_map,
+        schema_name,
         authority_tokens,
+    }))
+}
+
+/// Persist one checkpoint for a durable actor.
+///
+/// Unlike the compatibility wrapper below, this function is fallible. Callers
+/// that gate externally visible durable transitions (workflow creation, timer
+/// commits, signals, compensation) must use this path so storage failure cannot
+/// be mistaken for a committed transition.
+pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::Result<()> {
+    let sequence = next_sequence(rt, actor_id);
+    let Some(snapshot) = build_actor_snapshot_at_sequence(rt, actor_id, sequence)? else {
+        return Ok(());
     };
+
     // The local persistence store is authoritative. Publish a shadow replica
     // only after the local snapshot commit succeeds; otherwise a failed local
     // checkpoint could leave a remote replica for an actor/transition that was
@@ -105,7 +168,117 @@ pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::
     rt.persistence.save_snapshot(snapshot.clone())?;
     rt.maybe_shadow_replicate(actor_id, &snapshot);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
-        actor.sequence = seq;
+        actor.sequence = sequence;
+        actor.dirty_fields.clear();
+    }
+    Ok(())
+}
+
+/// Atomically admit one workflow command before executing user code.
+///
+/// Command acceptance is itself a durable transition so every later workflow
+/// write can extend one fenced atomic tail. The returned activation identity is
+/// stable across retries and is attached to the terminal event that closes the
+/// command.
+pub(crate) fn commit_workflow_command(
+    rt: &mut Runtime,
+    actor_id: u64,
+    behavior_id: u16,
+    payload: Vec<PersistedValue>,
+) -> std::io::Result<WorkflowActivationId> {
+    let activation_epoch = rt
+        .actors
+        .get(&actor_id)
+        .filter(|actor| actor.persistent)
+        .map(|actor| actor.activation_epoch)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "workflow command admission requires a live persistent actor",
+            )
+        })?;
+    let expected_previous_sequence = rt.persistence.latest_sequence(actor_id);
+    let sequence = expected_previous_sequence.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "workflow command transition sequence overflow",
+        )
+    })?;
+    let activation = WorkflowActivationId::new(actor_id, sequence);
+
+    rt.persistence.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id,
+        activation_epoch,
+        sequence,
+        expected_previous_sequence,
+        command: Some(JournalEntry {
+            sequence,
+            behavior_id,
+            payload,
+        }),
+        snapshot: None,
+        workflow_events: vec![],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    })?;
+
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.sequence = sequence;
+        actor.current_workflow_activation = Some(activation);
+    }
+    Ok(activation)
+}
+
+/// Atomically commit the durable state produced by one successful workflow
+/// step together with its terminal StepCompleted event.
+///
+/// The command has already been atomically admitted by
+/// `commit_workflow_command`; this transition closes the same activation with
+/// one sequence shared by the resulting snapshot and terminal event.
+pub(crate) fn commit_step_completed(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<WorkflowActivationId>,
+    step_name: String,
+) -> std::io::Result<()> {
+    let expected_previous_sequence = rt.persistence.latest_sequence(actor_id);
+    let sequence = expected_previous_sequence.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "workflow terminal transition sequence overflow",
+        )
+    })?;
+    let snapshot = build_actor_snapshot_at_sequence(rt, actor_id, sequence)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "workflow terminal transition requires a live persistent actor",
+        )
+    })?;
+    let activation_epoch = snapshot.activation_epoch;
+
+    rt.persistence.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id,
+        activation_epoch,
+        sequence,
+        expected_previous_sequence,
+        command: None,
+        snapshot: Some(snapshot.clone()),
+        workflow_events: vec![WorkflowEvent::StepCompleted {
+            sequence,
+            activation,
+            step_name,
+        }],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    })?;
+
+    rt.maybe_shadow_replicate(actor_id, &snapshot);
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.sequence = sequence;
         actor.dirty_fields.clear();
     }
     Ok(())
@@ -223,14 +396,24 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 .iter()
                 .map(|v| PersistedValue::from_value_resolved(v, module))
                 .collect();
-            let _ = rt.persistence.append_workflow_event(
-                actor_id,
-                WorkflowEvent::Custom {
-                    sequence: seq,
-                    name: event.to_string(),
-                    args: payload,
-                },
-            );
+            let replay_id = current_custom_event_replay_id(rt, actor_id);
+            let appended = rt
+                .persistence
+                .append_workflow_event(
+                    actor_id,
+                    WorkflowEvent::Custom {
+                        sequence: seq,
+                        replay_id,
+                        name: event.to_string(),
+                        args: payload,
+                    },
+                )
+                .is_ok();
+            if appended {
+                if let Some(replay_id) = replay_id {
+                    advance_custom_event_replay_id(rt, actor_id, replay_id);
+                }
+            }
         }
         checkpoint_actor(rt, actor_id);
     }
@@ -301,8 +484,10 @@ pub(crate) fn signal_workflow(
     actor_id: u64,
     name: &str,
     payload: Option<String>,
-) {
-    let _ = append_signal_received(rt, actor_id, name, payload.clone());
+) -> std::io::Result<()> {
+    // A signal must not become visible in memory or resume execution unless
+    // its durable journal write and checkpoint both succeeded.
+    append_signal_received(rt, actor_id, name, payload.clone())?;
 
     let should_resume = {
         if let Some(actor) = rt.actors.get_mut(&actor_id) {
@@ -320,6 +505,7 @@ pub(crate) fn signal_workflow(
     if should_resume {
         rt.resume_suspended_workflow_step(actor_id);
     }
+    Ok(())
 }
 
 /// Register a read-only query handler on a workflow actor.
@@ -364,11 +550,14 @@ pub(crate) fn schedule_workflow_timer(
     actor_id: u64,
     name: &str,
     duration_ms: u64,
-) {
+) -> std::io::Result<()> {
     if actor_is_workflow(rt, actor_id) {
-        let _ = append_timer_set(rt, actor_id, name, duration_ms);
+        // Never arm a live timer if its durable TimerSet/checkpoint failed.
+        // Recovery can only reason about timers that were durably recorded.
+        append_timer_set(rt, actor_id, name, duration_ms)?;
     }
     rt.rearm_timer(actor_id, name, duration_ms);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

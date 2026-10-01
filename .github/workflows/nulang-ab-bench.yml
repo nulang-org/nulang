@@ -10,7 +10,7 @@ on:
       runs:
         description: Measured runs per variant
         required: false
-        default: '5'
+        default: '8'
       warmup:
         description: Warm-up runs per variant
         required: false
@@ -60,7 +60,7 @@ jobs:
       - name: Run same-host A/B
         env:
           BASE_REF: "${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.base_ref }}"
-          RUNS: "${{ github.event_name == 'pull_request' && '3' || inputs.runs }}"
+          RUNS: "${{ github.event_name == 'pull_request' && '8' || inputs.runs }}"
           WARMUP: "${{ github.event_name == 'pull_request' && '1' || inputs.warmup }}"
           PROFILE: "${{ github.event_name == 'pull_request' && 'core-native' || inputs.profile }}"
         run: |
