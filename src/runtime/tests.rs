@@ -4441,6 +4441,70 @@ fn test_workflow_llm_durable_receipt_replays_without_provider_dispatch() {
     }
 }
 
+#[cfg(feature = "ai-runtime")]
+#[test]
+fn test_workflow_llm_completion_persistence_failure_does_not_resume_with_synthetic_error() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "nulang-llm-completion-fail-{}-{nonce}",
+        std::process::id()
+    ));
+
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(JsonFileStore::new(&path).unwrap());
+    let actor_id = rt.spawn_workflow_actor("LlmFailClosed", Box::new(Vec::new), HashMap::new());
+    let activation = WorkflowActivationId::new(actor_id, 115);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(activation);
+    let site = crate::semantic_identity::effect_site_id(
+        "llm-fail-closed-test",
+        crate::semantic_identity::EffectSiteOwnerKind::Behavior,
+        "LlmFailClosed.run",
+        "Inference.ask",
+        0,
+    );
+    let mut request = nulang_ai::LlmRequest::default();
+    request.model = "test-model".to_string();
+    request.messages.push(nulang_ai::LlmMessage {
+        role: "user".to_string(),
+        content: "hello".to_string(),
+    });
+    assert!(matches!(
+        llm::prepare_workflow_llm_effect(&mut rt, actor_id, site, "Inference.ask", &request)
+            .unwrap(),
+        llm::WorkflowLlmDurabilityDecision::Dispatch
+    ));
+
+    std::fs::remove_dir_all(&path).unwrap();
+    std::fs::write(&path, b"not a directory").unwrap();
+
+    let response = nulang_ai::LlmResponse {
+        content: Some("provider-result".to_string()),
+        tool_calls: Vec::new(),
+        model: "test-model".to_string(),
+        finish_reason: "stop".to_string(),
+        usage: Default::default(),
+    };
+    llm::store_llm_completion(&mut rt, actor_id, Ok(response));
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert!(
+        actor.llm_completed.is_none(),
+        "user bytecode must not observe a synthetic LLM error when Completed persistence failed"
+    );
+    assert!(
+        actor.llm_durable_effect_id.is_some(),
+        "Prepared identity must remain available for recovery/retry"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
     let mut rt = Runtime::new();
