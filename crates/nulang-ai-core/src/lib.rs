@@ -143,6 +143,85 @@ pub struct AgentRef {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Budget {
+    pub max_cost_usd: Option<f64>,
+    pub max_duration_secs: Option<u64>,
+    pub max_model_calls: Option<u32>,
+    pub max_tool_calls: Option<u32>,
+    pub max_parallel_agents: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Artifact {
+    pub id: Uuid,
+    pub goal_id: Uuid,
+    pub task_id: Option<Uuid>,
+    pub artifact_type: String,
+    pub uri: String,
+    pub mime_type: Option<String>,
+    pub digest: Option<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Artifact {
+    pub fn new(
+        goal_id: Uuid,
+        task_id: Option<Uuid>,
+        artifact_type: impl Into<String>,
+        uri: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            goal_id,
+            task_id,
+            artifact_type: artifact_type.into(),
+            uri: uri.into(),
+            mime_type: None,
+            digest: None,
+            metadata: serde_json::json!({}),
+            created_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Evidence {
+    pub id: Uuid,
+    pub goal_id: Uuid,
+    pub task_id: Option<Uuid>,
+    pub artifact_id: Option<Uuid>,
+    pub evidence_type: String,
+    pub summary: String,
+    pub passed: Option<bool>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Evidence {
+    pub fn new(
+        goal_id: Uuid,
+        task_id: Option<Uuid>,
+        evidence_type: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            goal_id,
+            task_id,
+            artifact_id: None,
+            evidence_type: evidence_type.into(),
+            summary: summary.into(),
+            passed: None,
+            metadata: serde_json::json!({}),
+            created_at: Utc::now(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConversationState {
     pub id: Uuid,
@@ -233,6 +312,29 @@ mod tests {
         let json = serde_json::to_string(&goal).unwrap();
         let back: Goal = serde_json::from_str(&json).unwrap();
         assert_eq!(goal.id, back.id);
+    }
+
+    #[test]
+    fn artifact_and_evidence_roundtrip_json() {
+        let goal_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let artifact = Artifact::new(goal_id, Some(task_id), "patch", "file:///tmp/change.diff");
+        let evidence = Evidence::new(goal_id, Some(task_id), "test", "unit tests passed");
+        let budget = Budget {
+            max_cost_usd: Some(10.0),
+            max_duration_secs: Some(1800),
+            max_model_calls: Some(20),
+            max_tool_calls: Some(100),
+            max_parallel_agents: Some(8),
+        };
+
+        let artifact_json = serde_json::to_string(&artifact).unwrap();
+        let evidence_json = serde_json::to_string(&evidence).unwrap();
+        let budget_json = serde_json::to_string(&budget).unwrap();
+
+        assert_eq!(artifact, serde_json::from_str(&artifact_json).unwrap());
+        assert_eq!(evidence, serde_json::from_str(&evidence_json).unwrap());
+        assert_eq!(budget, serde_json::from_str(&budget_json).unwrap());
     }
 
     #[test]
