@@ -4107,6 +4107,7 @@ impl Runtime {
                             // activation instead of admitting a duplicate
                             // command transition.
                             workflow_activation = Some(activation);
+                            atomic_workflow_turn = true;
                         } else {
                             match workflow::commit_workflow_command(
                                 self,
@@ -4181,7 +4182,6 @@ impl Runtime {
                         });
                         if let Some(activation) = recovered_activation {
                             workflow_activation = Some(activation);
-                            atomic_workflow_turn = true;
                         } else {
                             match workflow::commit_workflow_command(
                                 self,
