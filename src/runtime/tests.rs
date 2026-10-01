@@ -4404,6 +4404,166 @@ fn test_recovery_finds_unfinished_atomic_command_below_durable_effect_tail() {
     );
 }
 
+#[cfg(feature = "ai-runtime")]
+#[test]
+fn test_workflow_llm_completed_effect_replays_without_provider_redispatch() {
+    use crate::vm::ActorVmCallbacks;
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "DurableLlmReplay",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("ask", |_actor, _args| {});
+    rt.actors.get_mut(&actor_id).unwrap().bytecode_module =
+        Some(crate::bytecode::CodeModule::new("durable-llm-replay"));
+
+    let behavior_id = rt
+        .behavior_id_for(actor_id, "ask")
+        .expect("registered workflow behavior must have a stable id");
+    let activation =
+        workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new()).unwrap();
+
+    let mock = nulang_ai::MockLlmClient::text("recorded");
+    let calls = mock.clone();
+    rt.set_llm_client(Box::new(mock));
+    rt.suspend_enabled = true;
+
+    let first = {
+        let rt_ptr: *mut Runtime = &mut rt;
+        let mut callbacks = BytecodeRuntimeCallbacks::new(rt_ptr, actor_id);
+        ActorVmCallbacks::llm_ask(&mut callbacks, "", "hello")
+    };
+    assert!(matches!(first, crate::vm::PerformAsyncResult::Pending));
+
+    for _ in 0..200 {
+        rt.poll_llm_completions();
+        if rt.llm.inflight_count == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(rt.llm.inflight_count, 0);
+    assert_eq!(calls.recorded_calls().len(), 1);
+
+    // Simulate process-local state loss before the suspended VM consumes the
+    // completion. Durable history remains, while the activation replays from
+    // its original deterministic effect ordinal.
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.llm_completed = None;
+        actor.llm_inflight = false;
+        actor.llm_pending_prompt = None;
+        actor.current_workflow_activation = Some(activation);
+        actor.workflow_replay_activation = Some(activation);
+        actor.workflow_replay_event_ordinal = 0;
+    }
+
+    let replayed = {
+        let rt_ptr: *mut Runtime = &mut rt;
+        let mut callbacks = BytecodeRuntimeCallbacks::new(rt_ptr, actor_id);
+        ActorVmCallbacks::llm_ask(&mut callbacks, "", "hello")
+    };
+    assert!(matches!(
+        replayed,
+        crate::vm::PerformAsyncResult::Ready(Some(ref content)) if content == "recorded"
+    ));
+    assert_eq!(
+        calls.recorded_calls().len(),
+        1,
+        "a durably completed workflow LLM effect must replay its recorded response without another provider call"
+    );
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .workflow_replay_event_ordinal,
+        1,
+        "durable LLM replay must consume exactly one activation-local effect ordinal"
+    );
+}
+
+#[cfg(feature = "ai-runtime")]
+#[test]
+fn test_workflow_llm_replay_request_mismatch_fails_closed() {
+    use crate::vm::ActorVmCallbacks;
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "DurableLlmMismatch",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("ask", |_actor, _args| {});
+    rt.actors.get_mut(&actor_id).unwrap().bytecode_module =
+        Some(crate::bytecode::CodeModule::new("durable-llm-mismatch"));
+
+    let behavior_id = rt
+        .behavior_id_for(actor_id, "ask")
+        .expect("registered workflow behavior must have a stable id");
+    let activation =
+        workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new()).unwrap();
+
+    let mock = nulang_ai::MockLlmClient::text("recorded");
+    let calls = mock.clone();
+    rt.set_llm_client(Box::new(mock));
+    rt.suspend_enabled = true;
+
+    {
+        let rt_ptr: *mut Runtime = &mut rt;
+        let mut callbacks = BytecodeRuntimeCallbacks::new(rt_ptr, actor_id);
+        assert!(matches!(
+            ActorVmCallbacks::llm_ask(&mut callbacks, "", "first"),
+            crate::vm::PerformAsyncResult::Pending
+        ));
+    }
+    for _ in 0..200 {
+        rt.poll_llm_completions();
+        if rt.llm.inflight_count == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.llm_completed = None;
+        actor.current_workflow_activation = Some(activation);
+        actor.workflow_replay_activation = Some(activation);
+        actor.workflow_replay_event_ordinal = 0;
+    }
+
+    let mismatched = {
+        let rt_ptr: *mut Runtime = &mut rt;
+        let mut callbacks = BytecodeRuntimeCallbacks::new(rt_ptr, actor_id);
+        ActorVmCallbacks::llm_ask(&mut callbacks, "", "different")
+    };
+    assert!(matches!(
+        mismatched,
+        crate::vm::PerformAsyncResult::Ready(None)
+    ));
+    assert_eq!(
+        calls.recorded_calls().len(),
+        1,
+        "request mismatch for an existing durable effect id must fail closed without provider redispatch"
+    );
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .workflow_replay_event_ordinal,
+        0,
+        "a mismatched durable effect must not consume the replay ordinal"
+    );
+}
+
 #[test]
 fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
     let mut rt = Runtime::new();
