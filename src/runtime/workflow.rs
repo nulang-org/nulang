@@ -865,7 +865,9 @@ pub(crate) fn signal_workflow(
     payload: Option<String>,
 ) -> std::io::Result<()> {
     // A signal must not become visible in memory or resume execution unless
-    // its durable journal write and checkpoint both succeeded.
+    // its durable journal write succeeded. It intentionally does not advance
+    // the completed-state snapshot; recovery rebuilds signal availability from
+    // the full durable signal journal.
     append_signal_received(rt, actor_id, name, payload.clone())?;
 
     let should_resume = {
