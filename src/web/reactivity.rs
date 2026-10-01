@@ -9,11 +9,11 @@
 //! by `nula build --web` and `nula dev`. It is intentionally conservative:
 //! it only reports dependencies that are statically visible in the same module.
 
-use crate::ast::{AstModule, Decl, Expr, Literal};
+use crate::ast::{AstModule, Decl, Expr, FunctionAnnotation, Literal};
 use crate::effect_checker::EffectChecker;
-use crate::types::{Effect, EffectRow, Span};
+use crate::types::{infer_web_placement, Placement, Span};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// Compile-time placement decision for an action handler.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -55,6 +55,357 @@ impl SignalGraph {
     /// Return a compact JSON representation.
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
+/// One statically discovered web component and its intrinsic execution
+/// environment. Child components stay separate so they can become islands
+/// instead of forcing the parent into the child's placement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentNode {
+    pub name: String,
+    pub placement: Option<Placement>,
+    pub children: Vec<String>,
+}
+
+/// Compile-time component call graph.
+///
+/// This is deliberately separate from `SignalGraph`: signal/action metadata is
+/// already a runtime-facing artifact, while component placement is compiler
+/// planning metadata that will feed island partitioning in a later pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ComponentGraph {
+    pub components: Vec<ComponentNode>,
+}
+
+/// Client/server execution boundary selected by the component planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IslandPlacement {
+    Client,
+    Server,
+}
+
+/// A child component that must execute outside its parent's environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IslandBoundary {
+    pub parent: String,
+    pub component: String,
+    pub placement: IslandPlacement,
+}
+
+/// Select the minimal client/server island boundaries from a component graph.
+///
+/// Static children never require a runtime boundary. Client and server-like
+/// children become islands only when their parent is not already executing in
+/// the same environment, which naturally coalesces nested components that share
+/// a placement into one island.
+pub fn plan_component_islands(graph: &ComponentGraph) -> Vec<IslandBoundary> {
+    let by_name: BTreeMap<&str, &ComponentNode> = graph
+        .components
+        .iter()
+        .map(|component| (component.name.as_str(), component))
+        .collect();
+    let mut islands = Vec::new();
+
+    for parent in &graph.components {
+        let parent_placement = runtime_island_placement(parent.placement);
+        for child_name in &parent.children {
+            let Some(child) = by_name.get(child_name.as_str()) else {
+                continue;
+            };
+            let child_placement = runtime_island_placement(child.placement);
+            let Some(placement) = child_placement else {
+                continue;
+            };
+            if parent_placement == Some(placement) {
+                continue;
+            }
+            islands.push(IslandBoundary {
+                parent: parent.name.clone(),
+                component: child.name.clone(),
+                placement,
+            });
+        }
+    }
+
+    islands.sort_by(|a, b| (&a.parent, &a.component).cmp(&(&b.parent, &b.component)));
+    islands
+}
+
+fn runtime_island_placement(placement: Option<Placement>) -> Option<IslandPlacement> {
+    match placement {
+        Some(Placement::Client) => Some(IslandPlacement::Client),
+        Some(Placement::Server | Placement::Edge | Placement::Actor | Placement::Workflow) => {
+            Some(IslandPlacement::Server)
+        }
+        Some(Placement::Static) | None => None,
+    }
+}
+
+/// Build a deterministic component call graph from a parsed module.
+///
+/// Components are functions produced by the `component` declaration surface.
+/// Placement uses explicit `@placement`
+/// annotations first, then the effect checker's row, then a declared row as a
+/// fallback. In component context an otherwise-pure component is static by
+/// default; child placement is represented by graph edges rather than promoted
+/// into the parent.
+pub fn analyze_component_graph(
+    module: &AstModule,
+    checker: Option<&EffectChecker>,
+) -> ComponentGraph {
+    let mut component_names = BTreeSet::new();
+    collect_component_names(&module.decls, &mut component_names);
+    let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    collect_component_edges(&module.decls, &component_names, &mut edges);
+
+    let mut components = Vec::new();
+    collect_component_nodes(
+        &module.decls,
+        checker,
+        &component_names,
+        &edges,
+        &mut components,
+    );
+    components.sort_by(|a, b| a.name.cmp(&b.name));
+
+    ComponentGraph { components }
+}
+
+fn collect_component_names(decls: &[Decl], out: &mut BTreeSet<String>) {
+    for decl in decls {
+        match decl {
+            Decl::Function {
+                name, annotations, ..
+            } if annotations
+                .iter()
+                .any(|annotation| matches!(annotation, FunctionAnnotation::Component)) =>
+            {
+                out.insert(name.clone());
+            }
+            Decl::Module { decls, .. } => collect_component_names(decls, out),
+            _ => {}
+        }
+    }
+}
+
+fn collect_component_edges(
+    decls: &[Decl],
+    component_names: &BTreeSet<String>,
+    edges: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    for decl in decls {
+        match decl {
+            Decl::Function { name, body, .. } if component_names.contains(name) => {
+                let mut calls = BTreeSet::new();
+                collect_component_calls(body, component_names, &mut calls);
+                if !calls.is_empty() {
+                    edges.entry(name.clone()).or_default().extend(calls);
+                }
+            }
+            Decl::Module { decls, .. } => {
+                collect_component_edges(decls, component_names, edges);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_component_nodes(
+    decls: &[Decl],
+    checker: Option<&EffectChecker>,
+    component_names: &BTreeSet<String>,
+    edges: &BTreeMap<String, BTreeSet<String>>,
+    out: &mut Vec<ComponentNode>,
+) {
+    for decl in decls {
+        match decl {
+            Decl::Function {
+                name,
+                effect,
+                annotations,
+                ..
+            } if component_names.contains(name) => {
+                let explicit = annotations.iter().find_map(|annotation| match annotation {
+                    FunctionAnnotation::Placement(placement) => Some(*placement),
+                    _ => None,
+                });
+                let inferred = checker
+                    .and_then(|checker| checker.function_row(name))
+                    .or(effect.as_ref())
+                    .and_then(infer_web_placement);
+                let children = edges
+                    .get(name)
+                    .map(|children| children.iter().cloned().collect())
+                    .unwrap_or_default();
+
+                out.push(ComponentNode {
+                    name: name.clone(),
+                    placement: Some(explicit.or(inferred).unwrap_or(Placement::Static)),
+                    children,
+                });
+            }
+            Decl::Module { decls, .. } => {
+                collect_component_nodes(decls, checker, component_names, edges, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_component_calls(
+    expr: &Expr,
+    component_names: &BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    if let Expr::App { func, .. } = expr {
+        if let Some(name) = component_name(func) {
+            if component_names.contains(&name) {
+                out.insert(name);
+            }
+        }
+    }
+
+    match expr {
+        Expr::Lambda { body, .. } => collect_component_calls(body, component_names, out),
+        Expr::App { func, args, .. } => {
+            collect_component_calls(func, component_names, out);
+            for arg in args {
+                collect_component_calls(arg, component_names, out);
+            }
+        }
+        Expr::Let { value, body, .. } | Expr::LetRec { value, body, .. } => {
+            collect_component_calls(value, component_names, out);
+            collect_component_calls(body, component_names, out);
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_component_calls(cond, component_names, out);
+            collect_component_calls(then_branch, component_names, out);
+            if let Some(else_branch) = else_branch {
+                collect_component_calls(else_branch, component_names, out);
+            }
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_component_calls(scrutinee, component_names, out);
+            for (_, guard, body) in arms {
+                if let Some(guard) = guard {
+                    collect_component_calls(guard, component_names, out);
+                }
+                collect_component_calls(body, component_names, out);
+            }
+        }
+        Expr::Block { exprs, .. }
+        | Expr::Par { exprs, .. }
+        | Expr::Tuple(exprs, ..)
+        | Expr::Array(exprs, ..)
+        | Expr::FString(exprs, ..) => {
+            for expr in exprs {
+                collect_component_calls(expr, component_names, out);
+            }
+        }
+        Expr::Record(fields, ..) | Expr::RecordUpdate { fields, .. } => {
+            for (_, expr) in fields {
+                collect_component_calls(expr, component_names, out);
+            }
+        }
+        Expr::FieldAccess { expr, .. }
+        | Expr::Unary { expr, .. }
+        | Expr::Consume { expr, .. }
+        | Expr::CapAnnotate { expr, .. }
+        | Expr::TypeAnnotate { expr, .. } => collect_component_calls(expr, component_names, out),
+        Expr::Index { arr, idx, .. } => {
+            collect_component_calls(arr, component_names, out);
+            collect_component_calls(idx, component_names, out);
+        }
+        Expr::Binary { left, right, .. } | Expr::Pipe { left, right, .. } => {
+            collect_component_calls(left, component_names, out);
+            collect_component_calls(right, component_names, out);
+        }
+        Expr::Assign { target, value, .. } => {
+            collect_component_calls(target, component_names, out);
+            collect_component_calls(value, component_names, out);
+        }
+        Expr::For { iterable, body, .. } => {
+            collect_component_calls(iterable, component_names, out);
+            collect_component_calls(body, component_names, out);
+        }
+        Expr::While { cond, body, .. } => {
+            collect_component_calls(cond, component_names, out);
+            collect_component_calls(body, component_names, out);
+        }
+        Expr::Return(value, ..) | Expr::Break(value, ..) => {
+            if let Some(value) = value {
+                collect_component_calls(value, component_names, out);
+            }
+        }
+        Expr::Recover { body, .. } | Expr::Hide { body, .. } | Expr::Seal { body, .. } => {
+            collect_component_calls(body, component_names, out);
+        }
+        Expr::Defer { expr, .. } => collect_component_calls(expr, component_names, out),
+        Expr::Handle { body, handlers, .. } => {
+            collect_component_calls(body, component_names, out);
+            for handler in handlers {
+                collect_component_calls(&handler.body, component_names, out);
+            }
+        }
+        Expr::Perform { args, .. } | Expr::Emit { args, .. } => {
+            for arg in args {
+                collect_component_calls(arg, component_names, out);
+            }
+        }
+        Expr::Spawn {
+            actor_type,
+            init,
+            positional_args,
+            target_node,
+            ..
+        } => {
+            collect_component_calls(actor_type, component_names, out);
+            for (_, expr) in init {
+                collect_component_calls(expr, component_names, out);
+            }
+            if let Some(args) = positional_args {
+                for arg in args {
+                    collect_component_calls(arg, component_names, out);
+                }
+            }
+            if let Some(target) = target_node {
+                collect_component_calls(target, component_names, out);
+            }
+        }
+        Expr::Send { actor, args, .. } | Expr::Ask { actor, args, .. } => {
+            collect_component_calls(actor, component_names, out);
+            for arg in args {
+                collect_component_calls(arg, component_names, out);
+            }
+        }
+        Expr::Receive { arms, after, .. } => {
+            for (_, _, guard, body) in arms {
+                if let Some(guard) = guard {
+                    collect_component_calls(guard, component_names, out);
+                }
+                collect_component_calls(body, component_names, out);
+            }
+            if let Some((timeout, body)) = after {
+                collect_component_calls(timeout, component_names, out);
+                collect_component_calls(body, component_names, out);
+            }
+        }
+        Expr::GrainRef { key, .. } => collect_component_calls(key, component_names, out),
+        Expr::Resume { value, .. } => collect_component_calls(value, component_names, out),
+        Expr::Migrate { actor, node, .. } => {
+            collect_component_calls(actor, component_names, out);
+            collect_component_calls(node, component_names, out);
+        }
+        _ => {}
     }
 }
 
@@ -311,28 +662,12 @@ fn classify_action(handler: &str, checker: Option<&EffectChecker>) -> ActionPlac
     let Some(row) = checker.function_row(handler) else {
         return ActionPlacement::Client;
     };
-    let effects: Vec<_> = match row {
-        EffectRow::Closed(effs) | EffectRow::Open(effs, _) => effs.clone(),
-    };
-    let server_effects = [
-        Effect::Request,
-        Effect::Respond,
-        Effect::DB,
-        Effect::Spawn,
-        Effect::Send,
-        Effect::Receive,
-        Effect::Net,
-        Effect::Realtime,
-        Effect::Migrate,
-        Effect::Python,
-        Effect::Process,
-        Effect::System,
-        Effect::FFI,
-    ];
-    if effects.iter().any(|e| server_effects.contains(e)) {
-        ActionPlacement::Server
-    } else {
-        ActionPlacement::Client
+
+    match infer_web_placement(row) {
+        Some(Placement::Server | Placement::Edge | Placement::Actor | Placement::Workflow) => {
+            ActionPlacement::Server
+        }
+        Some(Placement::Static | Placement::Client) | None => ActionPlacement::Client,
     }
 }
 
@@ -986,5 +1321,134 @@ fn card() -> Html {
             signal: "count".to_string(),
             path: "div > span".to_string(),
         }));
+    }
+
+    #[test]
+    fn test_component_graph_tracks_calls_and_inferred_placements() {
+        let module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+component StaticCard() {
+    <span>Static</span>
+}
+
+component ServerPanel() {
+    perform DB.query("select 1")
+}
+
+component Dashboard() {
+    <div>
+        <StaticCard />
+        <ServerPanel />
+    </div>
+}
+"#,
+        );
+        let mut checker = crate::effect_checker::EffectChecker::new();
+        checker.check_module(&module.decls).unwrap();
+
+        let graph = analyze_component_graph(&module, Some(&checker));
+        let dashboard = graph
+            .components
+            .iter()
+            .find(|component| component.name == "Dashboard")
+            .expect("Dashboard component");
+        let static_card = graph
+            .components
+            .iter()
+            .find(|component| component.name == "StaticCard")
+            .expect("StaticCard component");
+        let server_panel = graph
+            .components
+            .iter()
+            .find(|component| component.name == "ServerPanel")
+            .expect("ServerPanel component");
+
+        assert_eq!(
+            dashboard.children,
+            vec!["ServerPanel".to_string(), "StaticCard".to_string()]
+        );
+        // A server child is an island boundary; it must not force the static
+        // shell itself onto the server.
+        assert_eq!(dashboard.placement, Some(Placement::Static));
+        assert_eq!(static_card.placement, Some(Placement::Static));
+        assert_eq!(server_panel.placement, Some(Placement::Server));
+    }
+
+    #[test]
+    fn test_island_plan_splits_static_shell_from_client_and_server_children() {
+        let module = parse(
+            r#"
+import stdlib::web::html
+import stdlib::web::types
+
+component StaticLogo() {
+    <strong>Logo</strong>
+}
+
+@placement(client)
+component ClientCounter() {
+    <button>Count</button>
+}
+
+component ServerPanel() {
+    perform DB.query("select 1")
+}
+
+component Dashboard() {
+    <main>
+        <StaticLogo />
+        <ClientCounter />
+        <ServerPanel />
+    </main>
+}
+"#,
+        );
+        let mut checker = crate::effect_checker::EffectChecker::new();
+        checker.check_module(&module.decls).unwrap();
+
+        let graph = analyze_component_graph(&module, Some(&checker));
+        let islands = plan_component_islands(&graph);
+
+        assert_eq!(
+            islands,
+            vec![
+                IslandBoundary {
+                    parent: "Dashboard".to_string(),
+                    component: "ClientCounter".to_string(),
+                    placement: IslandPlacement::Client,
+                },
+                IslandBoundary {
+                    parent: "Dashboard".to_string(),
+                    component: "ServerPanel".to_string(),
+                    placement: IslandPlacement::Server,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_capitalized_function_is_not_a_component() {
+        let module = parse(
+            r#"
+fn Helper() {
+    1
+}
+
+fn main() {
+    Helper()
+}
+"#,
+        );
+        let mut checker = crate::effect_checker::EffectChecker::new();
+        checker.check_module(&module.decls).unwrap();
+
+        let graph = analyze_component_graph(&module, Some(&checker));
+        assert!(
+            graph.components.is_empty(),
+            "capitalization alone must not create web component semantics"
+        );
     }
 }

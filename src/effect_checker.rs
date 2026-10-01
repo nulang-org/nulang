@@ -479,6 +479,11 @@ pub struct EffectChecker {
     /// so that a direct call site (`Expr::App` on a `Var`) propagates the
     /// callee's declared or inferred row (SPEC2 §4.9).
     fn_rows: FxHashMap<String, EffectRow>,
+    /// Functions declared through the web `component` surface. A direct
+    /// component call evaluates its prop/slot arguments in the parent but does
+    /// not merge the child's own effects into the parent effect row: that
+    /// boundary is executed according to the component's placement.
+    component_names: FxHashSet<String>,
     /// Names currently bound by local constructs (let bindings, lambda
     /// parameters, pattern variables, ...). A locally-bound name shadows a
     /// same-named module function, so calls through it are not charged the
@@ -509,6 +514,7 @@ impl EffectChecker {
         EffectChecker {
             diagnostics: Vec::new(),
             fn_rows: FxHashMap::default(),
+            component_names: FxHashSet::default(),
             shadowed: Vec::new(),
             resource_grants: None,
         }
@@ -586,7 +592,7 @@ impl EffectChecker {
                     row = effect_row_union(&row, &self.infer_effects(ctx, arg)?);
                 }
                 if let Expr::Var(name, _) = func.as_ref() {
-                    if !self.shadowed.contains(name) {
+                    if !self.shadowed.contains(name) && !self.component_names.contains(name) {
                         if let Some(callee_row) = self.fn_rows.get(name) {
                             row = effect_row_union(&row, callee_row);
                         }
@@ -1028,9 +1034,20 @@ impl EffectChecker {
     pub fn register_function_rows(&mut self, decls: &[&Decl]) -> NuResult<()> {
         let ctx = EffectContext::empty();
         for decl in decls {
-            if let Decl::Function { name, effect, .. } = decl {
+            if let Decl::Function {
+                name,
+                effect,
+                annotations,
+                ..
+            } = decl
+            {
                 let row = effect.clone().unwrap_or_else(EffectRow::empty);
                 self.fn_rows.insert(name.clone(), row);
+                if annotations.iter().any(|annotation| {
+                    matches!(annotation, crate::ast::FunctionAnnotation::Component)
+                }) {
+                    self.component_names.insert(name.clone());
+                }
             }
         }
         for _ in 0..self.fn_rows.len() {
@@ -1217,28 +1234,47 @@ impl EffectChecker {
                     .cloned()
                     .unwrap_or_else(EffectRow::empty),
             };
-            let effects: Vec<_> = match &row {
-                EffectRow::Closed(effs) => effs.clone(),
-                EffectRow::Open(effs, _) => effs.clone(),
-            };
-            let has_request = effects.iter().any(|e| *e == Effect::Request);
-            let only_render_or_web = effects
+            let is_component = annotations
                 .iter()
-                .all(|e| *e == Effect::Render || *e == Effect::Web)
-                && !effects.is_empty();
-            if has_request {
-                self.diagnostics.push(format!(
-                    "warning: function '{}' has no @placement; inferred placement: server (because it performs Request)",
+                .any(|annotation| matches!(annotation, crate::ast::FunctionAnnotation::Component));
+            if !is_component && !Self::effect_row_contains_web_effect(&row) {
+                continue;
+            }
+
+            match infer_web_placement(&row) {
+                Some(Placement::Server) => self.diagnostics.push(format!(
+                    "warning: function '{}' has no @placement; inferred placement: server",
                     name
-                ));
-            } else if only_render_or_web {
-                self.diagnostics.push(format!(
-                    "warning: function '{}' has no @placement; inferred placement: static (because it only performs Render or Web)",
+                )),
+                Some(Placement::Static) => self.diagnostics.push(format!(
+                    "warning: function '{}' has no @placement; inferred placement: static",
                     name
-                ));
+                )),
+                Some(Placement::Client) => self.diagnostics.push(format!(
+                    "warning: function '{}' has no @placement; inferred placement: client",
+                    name
+                )),
+                _ => {}
             }
             let _ = body_span; // reserved for future line/column diagnostics
         }
+    }
+
+    fn effect_row_contains_web_effect(row: &EffectRow) -> bool {
+        let effects = match row {
+            EffectRow::Closed(effects) | EffectRow::Open(effects, _) => effects,
+        };
+        effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Render
+                    | Effect::Request
+                    | Effect::Respond
+                    | Effect::Realtime
+                    | Effect::Client
+                    | Effect::Web
+            )
+        })
     }
 
     /// Emit a deprecation warning for a single declaration if it uses language
@@ -4998,5 +5034,55 @@ mod tests {
         let mut checker = EffectChecker::new();
         assert!(checker.check_module(&ast.decls).is_ok());
         assert!(checker.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_component_call_is_an_effect_boundary() {
+        let ast = parse_module(
+            r#"
+component ServerPanel() {
+    perform DB.query("select 1")
+}
+
+fn Dashboard() ! {} {
+    <ServerPanel />
+}
+"#,
+        );
+        let mut checker = EffectChecker::new();
+        checker
+            .check_module(&ast.decls)
+            .expect("component child effects must not escape into the parent shell");
+
+        assert!(checker.fn_rows["ServerPanel"].contains(&Effect::DB));
+        assert!(
+            checker.fn_rows["Dashboard"].effects().is_empty(),
+            "static parent must not inherit child component effects"
+        );
+    }
+
+    #[test]
+    fn test_placement_warnings_ignore_non_web_effects() {
+        let ast = parse_module(
+            r#"
+fn do_io() ! {IO} {
+    perform IO.print("hello")
+}
+
+fn caller() ! {IO} {
+    do_io()
+}
+"#,
+        );
+        let mut checker = EffectChecker::new();
+        checker.check_module(&ast.decls).unwrap();
+        assert!(
+            checker
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.contains("@placement")),
+            "ordinary non-web effects must not emit web placement warnings: {:?}",
+            checker.diagnostics
+        );
     }
 }

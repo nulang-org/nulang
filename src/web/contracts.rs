@@ -14,7 +14,7 @@ use crate::ast::{
 };
 use crate::lexer::Lexer;
 use crate::parser::Parser;
-use crate::types::EffectRow;
+use crate::types::{infer_web_placement, EffectRow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -122,10 +122,13 @@ impl FunctionMeta {
             .map(|(_, _, classes)| classes.len())
             .sum();
 
-        let placement = annotations.iter().find_map(|annotation| match annotation {
-            FunctionAnnotation::Placement(p) => Some(p.to_string()),
+        let explicit_placement = annotations.iter().find_map(|annotation| match annotation {
+            FunctionAnnotation::Placement(p) => Some(*p),
             _ => None,
         });
+        let placement = explicit_placement
+            .or_else(|| effect.as_ref().and_then(infer_web_placement))
+            .map(|placement| placement.to_string());
         let request_bindings = annotations
             .iter()
             .filter_map(|annotation| match annotation {
@@ -817,5 +820,46 @@ fn web_main() {
         assert_eq!(compiled.diagnostics.len(), 1);
         assert!(compiled.diagnostics[0].contains("typeclass dictionary"));
         assert!(compiled.routes.is_empty());
+    }
+
+    #[test]
+    fn route_contract_infers_placement_from_handler_effects() {
+        let module = parse(
+            r#"
+fn static_page() -> String ! {Render, Web} {
+    "ok"
+}
+
+fn dynamic_page() -> String ! {DB} {
+    "ok"
+}
+
+fn web_main() {
+    perform Web.route("GET", "/static", static_page)
+    perform Web.route("GET", "/dynamic", dynamic_page)
+}
+"#,
+        );
+
+        let compiled = compile_module_contracts(&module);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+
+        let static_route = compiled
+            .routes
+            .iter()
+            .find(|route| route.path == "/static")
+            .expect("static route");
+        assert_eq!(static_route.placement.as_deref(), Some("static"));
+
+        let dynamic_route = compiled
+            .routes
+            .iter()
+            .find(|route| route.path == "/dynamic")
+            .expect("dynamic route");
+        assert_eq!(dynamic_route.placement.as_deref(), Some("server"));
     }
 }

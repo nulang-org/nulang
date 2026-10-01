@@ -26,6 +26,11 @@ pub fn element(name: String, attrs, children: [Html]) -> Html ! {Web, Render} {
     perform Web.html(name, attrs, children)
 }
 
+/// Concatenate child fragments without adding wrapper markup.
+pub fn fragment(children: [Html]) -> Html ! {Web, Render} {
+    perform Web.fragment(children)
+}
+
 /// Escape a string and wrap it as an `Html` text node.
 pub fn text(s: String) -> Html ! {Web, Render} {
     perform Web.text(s)

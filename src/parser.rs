@@ -124,6 +124,10 @@ pub struct Parser {
     imported_type_cache: FxHashMap<String, (Vec<TypeVar>, Type)>,
     /// Module-level named handler registry.
     handler_registry: FxHashMap<String, Vec<EffectHandler>>,
+    /// Web components declared earlier in the module, mapped to their named
+    /// prop order. JSX uses this to lower named props to ordinary call
+    /// arguments while keeping the component call itself compiler-visible.
+    component_params: FxHashMap<String, Vec<String>>,
 }
 
 /// Parsed app block; kept private to the parser and desugared into
@@ -151,6 +155,7 @@ impl Parser {
             local_type_params: FxHashMap::default(),
             imported_type_cache: FxHashMap::default(),
             handler_registry: FxHashMap::default(),
+            component_params: FxHashMap::default(),
             diagnostics: Vec::new(),
             warnings: Vec::new(),
         }
@@ -215,9 +220,80 @@ impl Parser {
         }
     }
 
+    /// Pre-register component names and prop order before parsing bodies so
+    /// JSX resolution is independent of declaration order. This intentionally
+    /// scans only the shallow component header; the normal parser remains the
+    /// source of truth for types and diagnostics.
+    fn prescan_component_params(&mut self) {
+        let mut i = 0;
+        while i + 2 < self.tokens.len() {
+            let is_component =
+                matches!(&self.tokens[i].kind, TokenKind::Ident(name) if name == "component");
+            if !is_component {
+                i += 1;
+                continue;
+            }
+
+            let name = match &self.tokens[i + 1].kind {
+                TokenKind::Ident(name) | TokenKind::UpperIdent(name) => name.clone(),
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            if self.tokens[i + 2].kind != TokenKind::LParen {
+                i += 1;
+                continue;
+            }
+
+            let mut params = Vec::new();
+            let mut j = i + 3;
+            let mut paren_depth = 1usize;
+            let mut bracket_depth = 0usize;
+            let mut brace_depth = 0usize;
+            let mut expect_param = true;
+
+            while j < self.tokens.len() && paren_depth > 0 {
+                match &self.tokens[j].kind {
+                    TokenKind::LParen => paren_depth += 1,
+                    TokenKind::RParen => {
+                        paren_depth -= 1;
+                        if paren_depth == 0 {
+                            break;
+                        }
+                    }
+                    TokenKind::LBracket => bracket_depth += 1,
+                    TokenKind::RBracket => bracket_depth = bracket_depth.saturating_sub(1),
+                    TokenKind::LBrace => brace_depth += 1,
+                    TokenKind::RBrace => brace_depth = brace_depth.saturating_sub(1),
+                    TokenKind::Comma
+                        if paren_depth == 1 && bracket_depth == 0 && brace_depth == 0 =>
+                    {
+                        expect_param = true;
+                    }
+                    TokenKind::Ident(param) | TokenKind::UpperIdent(param)
+                        if expect_param
+                            && paren_depth == 1
+                            && bracket_depth == 0
+                            && brace_depth == 0 =>
+                    {
+                        params.push(param.clone());
+                        expect_param = false;
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+
+            self.component_params.entry(name).or_insert(params);
+            i = j.saturating_add(1);
+        }
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
     pub fn parse_module(&mut self) -> NuResult<AstModule> {
         self.diagnostics.clear();
+        self.prescan_component_params();
         let mut decls = Vec::new();
         let mut pending_lets: Vec<Decl> = Vec::new();
         let mut app_decls: Vec<ParsedApp> = Vec::new();
@@ -749,6 +825,9 @@ impl Parser {
         self.skip_newlines();
         match self.peek_kind() {
             TokenKind::Fn => self.parse_function(public, annotations),
+            TokenKind::Ident(name) if name == "component" => {
+                self.parse_component(public, annotations)
+            }
             TokenKind::Actor
             | TokenKind::Persistent
             | TokenKind::Entity
@@ -928,6 +1007,54 @@ impl Parser {
             }
         }
         Ok(annotations)
+    }
+
+    fn parse_component(
+        &mut self,
+        public: bool,
+        mut annotations: Vec<FunctionAnnotation>,
+    ) -> NuResult<Decl> {
+        let span = self.current_span();
+        self.advance(); // contextual `component`
+        let name = self.expect_ident("component name")?;
+        self.expect(TokenKind::LParen)?;
+        let mut params = self.parse_params()?;
+        self.expect(TokenKind::RParen)?;
+
+        if params.iter().any(|param| param.name == "__component_slot") {
+            return Err(NuError::parse_error(
+                "'__component_slot' is reserved for component children".to_string(),
+                span,
+            ));
+        }
+
+        self.component_params.insert(
+            name.clone(),
+            params.iter().map(|param| param.name.clone()).collect(),
+        );
+        params.push(crate::ast::Param::new("__component_slot", None));
+        let default_values = vec![None; params.len()];
+        annotations.push(FunctionAnnotation::Component);
+        let body = self.parse_expr()?;
+
+        Ok(Decl::Function {
+            name,
+            type_params: vec![],
+            type_param_constraints: vec![],
+            params,
+            default_values,
+            using_params: vec![],
+            ret_type: None,
+            error_type: None,
+            effect: None,
+            cap: None,
+            requires: vec![],
+            ensures: vec![],
+            body,
+            annotations,
+            public,
+            span,
+        })
     }
 
     fn parse_function(
@@ -4416,26 +4543,32 @@ impl Parser {
     }
 
     /// Parse a JSX/HTML element: `<tag attrs>children</tag>` or `<tag attrs />`.
-    /// Desugars to `el("tag", attrs, children)` where `attrs` and `children`
-    /// are arrays. Text children are wrapped in `text("...")` calls.
+    /// Lowercase/intrinsic tags desugar to `el("tag", attrs, children)`.
+    /// A tag matching a declared component lowers to a direct call whose
+    /// arguments follow the component's declared prop order plus one synthetic
+    /// slot argument. Keeping that call visible is what lets placement analysis
+    /// treat component execution as an island boundary.
     fn parse_html_expr(&mut self) -> NuResult<Expr> {
         let span = self.current_span();
         self.expect(TokenKind::Lt)?; // consume '<'
         let tag = self.expect_html_ident("HTML tag name")?;
+        let component_props = self.component_params.get(&tag).cloned();
 
-        let mut attrs: Vec<Expr> = Vec::new();
+        let mut attrs: Vec<(String, Expr)> = Vec::new();
         loop {
             self.skip_newlines();
             if self.consume_if(&TokenKind::Slash) {
                 self.expect(TokenKind::Gt)?;
-                return Ok(self.html_el(&tag, attrs, Vec::new(), span));
+                return self.html_el(&tag, component_props.as_deref(), attrs, Vec::new(), span);
             }
             if self.consume_if(&TokenKind::Gt) {
                 let children = self.parse_html_children(&tag, span)?;
-                return Ok(self.html_el(&tag, attrs, children, span));
+                return self.html_el(&tag, component_props.as_deref(), attrs, children, span);
             }
 
-            // Attribute: name="value" or name={expr} or boolean name
+            // Attribute: name="value" or name={expr} or boolean name.
+            // Component string/boolean props keep their source value type;
+            // intrinsic HTML attrs continue to use escaped Html values.
             let attr_name = self.expect_html_ident("HTML attribute name")?;
             let attr_val = if self.consume_if(&TokenKind::Assign) {
                 if self.consume_if(&TokenKind::LBrace) {
@@ -4444,20 +4577,79 @@ impl Parser {
                     expr
                 } else {
                     let s = self.expect_string("HTML attribute value")?;
-                    self.html_text(&s, span)
+                    if component_props.is_some() {
+                        Expr::Literal(Literal::String(s), span)
+                    } else {
+                        self.html_text(&s, span)
+                    }
                 }
+            } else if component_props.is_some() {
+                Expr::Literal(Literal::Bool(true), span)
             } else {
                 self.html_text(&attr_name, span)
             };
-            attrs.push(Expr::Tuple(
-                vec![Expr::Literal(Literal::String(attr_name), span), attr_val],
-                span,
-            ));
+            attrs.push((attr_name, attr_val));
         }
     }
 
-    fn html_el(&self, tag: &str, attrs: Vec<Expr>, children: Vec<Expr>, span: Span) -> Expr {
-        Expr::App {
+    fn html_el(
+        &self,
+        tag: &str,
+        component_props: Option<&[String]>,
+        attrs: Vec<(String, Expr)>,
+        children: Vec<Expr>,
+        span: Span,
+    ) -> NuResult<Expr> {
+        if tag == "slot" {
+            if !attrs.is_empty() || !children.is_empty() {
+                return Err(NuError::parse_error(
+                    "<slot> does not accept attributes or children".to_string(),
+                    span,
+                ));
+            }
+            return Ok(Expr::Var("__component_slot".to_string(), span));
+        }
+
+        if let Some(props) = component_props {
+            let mut values: FxHashMap<String, Expr> = attrs.into_iter().collect();
+            let mut args = Vec::with_capacity(props.len() + 1);
+            for prop in props {
+                let Some(value) = values.remove(prop) else {
+                    return Err(NuError::parse_error(
+                        format!("Missing required prop '{}' for component <{}>", prop, tag),
+                        span,
+                    ));
+                };
+                args.push(value);
+            }
+            if let Some((unknown, _)) = values.into_iter().next() {
+                return Err(NuError::parse_error(
+                    format!("Unknown prop '{}' for component <{}>", unknown, tag),
+                    span,
+                ));
+            }
+            args.push(Expr::App {
+                func: Box::new(Expr::Var("fragment".to_string(), span)),
+                args: vec![Expr::Array(children, span)],
+                span,
+            });
+            return Ok(Expr::App {
+                func: Box::new(Expr::Var(tag.to_string(), span)),
+                args,
+                span,
+            });
+        }
+
+        let attrs = attrs
+            .into_iter()
+            .map(|(name, value)| {
+                Expr::Tuple(
+                    vec![Expr::Literal(Literal::String(name), span), value],
+                    span,
+                )
+            })
+            .collect();
+        Ok(Expr::App {
             func: Box::new(Expr::Var("el".to_string(), span)),
             args: vec![
                 Expr::Literal(Literal::String(tag.to_string()), span),
@@ -4465,7 +4657,7 @@ impl Parser {
                 Expr::Array(children, span),
             ],
             span,
-        }
+        })
     }
 
     fn html_text(&self, s: &str, span: Span) -> Expr {
@@ -4518,9 +4710,15 @@ impl Parser {
                 break;
             }
 
-            // Text node: consume the next token as literal text
-            let text = self.html_token_text()?;
-            children.push(self.html_text(&text, span));
+            // Text node: preserve the original source slice across all
+            // contiguous tokens. The lexer intentionally discards horizontal
+            // whitespace, so reconstructing text one token at a time would
+            // turn "Hello from slot" into "Hellofromslot" and reject
+            // punctuation tokens such as '.'.
+            let text = self.parse_html_text_run()?;
+            if !text.is_empty() {
+                children.push(self.html_text(&text, span));
+            }
         }
         Err(NuError::parse_error(
             format!("Unclosed HTML tag <{}>", close_tag),
@@ -4528,46 +4726,53 @@ impl Parser {
         ))
     }
 
-    fn html_token_text(&mut self) -> NuResult<String> {
-        let span = self.current_span();
-        match self.peek_kind().clone() {
-            TokenKind::Ident(s) | TokenKind::UpperIdent(s) => {
-                self.advance();
-                Ok(s)
-            }
-            other if Self::is_keyword_token(&other) => {
-                self.advance();
-                Ok(other.to_string())
-            }
-            TokenKind::IntLit(n) => {
-                self.advance();
-                Ok(n.to_string())
-            }
-            TokenKind::FloatLit(n) => {
-                self.advance();
-                Ok(n.to_string())
-            }
-            TokenKind::StringLit(s) => {
-                self.advance();
-                Ok(s)
-            }
-            TokenKind::BoolLit(b) => {
-                self.advance();
-                Ok(b.to_string())
-            }
-            TokenKind::NilLit => {
-                self.advance();
-                Ok("nil".to_string())
-            }
-            TokenKind::UnitLit => {
-                self.advance();
-                Ok("unit".to_string())
-            }
-            other => Err(NuError::parse_error(
-                format!("Unexpected token in HTML text: {}", other),
-                span,
-            )),
+    fn parse_html_text_run(&mut self) -> NuResult<String> {
+        let first_span = self.current_span();
+        let first_start = first_span.start as usize;
+        let previous_end = self
+            .pos
+            .checked_sub(1)
+            .and_then(|index| self.tokens.get(index))
+            .map(|token| token.span.end as usize)
+            .unwrap_or(first_start);
+
+        let mut end = first_start;
+        while !self.is_at_end()
+            && !matches!(
+                self.peek_kind(),
+                TokenKind::Lt | TokenKind::LBrace | TokenKind::Newline
+            )
+        {
+            end = self.advance_token().span.end as usize;
         }
+
+        if end <= first_start {
+            return Err(NuError::parse_error(
+                "Expected HTML text".to_string(),
+                first_span,
+            ));
+        }
+
+        if let Some(source) = crate::types::current_source_text() {
+            let include_gap = previous_end <= first_start
+                && source
+                    .get(previous_end..first_start)
+                    .map(|gap| !gap.contains('\n') && !gap.contains('\r'))
+                    .unwrap_or(false);
+            let start = if include_gap {
+                previous_end
+            } else {
+                first_start
+            };
+            if let Some(text) = source.get(start..end) {
+                return Ok(text.to_string());
+            }
+        }
+
+        Err(NuError::parse_error(
+            "Unable to recover HTML text from source span".to_string(),
+            first_span,
+        ))
     }
 
     // === Helper Methods ===
@@ -8992,5 +9197,139 @@ mod tests {
     fn test_parse_par_requires_brace() {
         let result = parse_expr("par");
         assert!(result.is_err(), "bare 'par' must be a parse error");
+    }
+
+    #[test]
+    fn test_component_declaration_and_jsx_call_preserve_boundary() {
+        let ast = parse(
+            r#"
+component Card(title: String) {
+    <div><h2>{title}</h2><slot /></div>
+}
+
+fn main() {
+    <Card title="Components"><p>Hello</p></Card>
+}
+"#,
+        )
+        .unwrap();
+
+        let card = ast
+            .decls
+            .iter()
+            .find(|decl| matches!(decl, Decl::Function { name, .. } if name == "Card"))
+            .expect("component desugars to a marked function");
+        let Decl::Function {
+            params,
+            annotations,
+            ..
+        } = card
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            params
+                .iter()
+                .map(|param| param.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["title", "__component_slot"]
+        );
+        assert!(annotations
+            .iter()
+            .any(|annotation| matches!(annotation, FunctionAnnotation::Component)));
+
+        let main = ast
+            .decls
+            .iter()
+            .find(|decl| matches!(decl, Decl::Function { name, .. } if name == "main"))
+            .expect("main function");
+        let Decl::Function { body, .. } = main else {
+            unreachable!()
+        };
+        let Expr::Block { exprs, .. } = body else {
+            panic!("main body should remain a block");
+        };
+        let Expr::App { func, args, .. } = &exprs[0] else {
+            panic!("component JSX should lower to a direct component call");
+        };
+        assert!(matches!(func.as_ref(), Expr::Var(name, _) if name == "Card"));
+        assert_eq!(args.len(), 2, "named prop plus synthetic slot");
+        assert!(matches!(
+            &args[1],
+            Expr::App { func, .. }
+                if matches!(func.as_ref(), Expr::Var(name, _) if name == "fragment")
+        ));
+    }
+
+    #[test]
+    fn test_html_text_preserves_spaces_and_punctuation() {
+        let ast = parse(
+            r#"
+fn main() {
+    <p>Hello from slot. Welcome, Nulang Web!</p>
+}
+"#,
+        )
+        .unwrap();
+        let main = ast
+            .decls
+            .iter()
+            .find(|decl| matches!(decl, Decl::Function { name, .. } if name == "main"))
+            .unwrap();
+        let Decl::Function { body, .. } = main else {
+            unreachable!()
+        };
+        let Expr::Block { exprs, .. } = body else {
+            panic!("main body");
+        };
+        let Expr::App { args, .. } = &exprs[0] else {
+            panic!("html element");
+        };
+        let Expr::Array(children, _) = &args[2] else {
+            panic!("html children");
+        };
+        assert_eq!(children.len(), 1, "contiguous text should stay one node");
+        assert!(matches!(
+            &children[0],
+            Expr::App { args, .. }
+                if matches!(&args[0], Expr::Literal(Literal::String(text), _) if text == "Hello from slot. Welcome, Nulang Web!")
+        ));
+    }
+
+    #[test]
+    fn test_component_jsx_resolves_later_declaration() {
+        let ast = parse(
+            r#"
+component Dashboard() {
+    <ServerPanel message="hello" />
+}
+
+component ServerPanel(message: String) {
+    <section>{message}</section>
+}
+"#,
+        )
+        .unwrap();
+
+        let dashboard = ast
+            .decls
+            .iter()
+            .find(|decl| matches!(decl, Decl::Function { name, .. } if name == "Dashboard"))
+            .unwrap();
+        let Decl::Function { body, .. } = dashboard else {
+            unreachable!()
+        };
+        let Expr::Block { exprs, .. } = body else {
+            panic!("component body");
+        };
+        let Expr::App { func, args, .. } = &exprs[0] else {
+            panic!("forward component JSX must lower to a direct call");
+        };
+        assert!(matches!(func.as_ref(), Expr::Var(name, _) if name == "ServerPanel"));
+        assert_eq!(args.len(), 2, "prop plus synthetic slot");
+        assert!(matches!(
+            &args[0],
+            Expr::Literal(Literal::String(value), _) if value == "hello"
+        ));
     }
 }

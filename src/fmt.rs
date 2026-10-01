@@ -108,10 +108,44 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             ret_type,
             body,
             effect,
+            annotations,
             ..
         } => {
-            out.push_str(&format!("{}fn {}(", sp, name));
-            for (i, p) in params.iter().enumerate() {
+            let is_component = annotations
+                .iter()
+                .any(|annotation| matches!(annotation, crate::ast::FunctionAnnotation::Component));
+            for annotation in annotations {
+                if let crate::ast::FunctionAnnotation::Placement(placement) = annotation {
+                    out.push_str(&format!(
+                        "{}@placement({})\n",
+                        sp,
+                        match placement {
+                            crate::types::Placement::Static => "static",
+                            crate::types::Placement::Server => "server",
+                            crate::types::Placement::Edge => "edge",
+                            crate::types::Placement::Client => "client",
+                            crate::types::Placement::Actor => "actor",
+                            crate::types::Placement::Workflow => "workflow",
+                        }
+                    ));
+                }
+            }
+            let visible_params: Vec<_> = if is_component {
+                params
+                    .iter()
+                    .filter(|param| param.name != "__component_slot")
+                    .collect()
+            } else {
+                params.iter().collect()
+            };
+
+            out.push_str(&format!(
+                "{}{} {}(",
+                sp,
+                if is_component { "component" } else { "fn" },
+                name
+            ));
+            for (i, p) in visible_params.iter().enumerate() {
                 let pn = &p.name;
                 let pty = &p.ty;
                 if i > 0 {
@@ -123,11 +157,13 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
                 }
             }
             out.push(')');
-            if let Some(r) = ret_type {
-                out.push_str(&format!(" -> {}", fmt_type(r)));
-            }
-            if let Some(e) = effect {
-                out.push_str(&format!(" ! {}", e));
+            if !is_component {
+                if let Some(r) = ret_type {
+                    out.push_str(&format!(" -> {}", fmt_type(r)));
+                }
+                if let Some(e) = effect {
+                    out.push_str(&format!(" ! {}", e));
+                }
             }
             out.push_str(" {\n");
             fmt_block_body(out, body, indent + 4, had_unhandled);
@@ -1394,6 +1430,43 @@ fn main() {
         assert!(out.contains("spawn Greeter()"), "got: {out}");
         assert!(out.contains("receive {"), "got: {out}");
         assert!(out.contains("emit Event(1)"), "got: {out}");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_component_preserves_placement_annotation() {
+        let src = r#"
+@placement(client)
+component Counter() {
+    <button>Count</button>
+}
+"#;
+        let out = format_source(src).expect("placed component formats");
+        assert!(
+            out.contains("@placement(client)\ncomponent Counter()"),
+            "component placement annotation was dropped: {out}"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_component_preserves_component_surface() {
+        let src = r#"
+component Card(title: String) {
+    <div><h2>{title}</h2><slot /></div>
+}
+
+fn main() {
+    <Card title="Components"><p>Hello from slot</p></Card>
+}
+"#;
+        let out = format_source(src).expect("component formats");
+        assert!(out.contains("component Card(title: String)"), "got: {out}");
+        assert!(
+            !out.contains("component Card(title: String, __component_slot)"),
+            "synthetic slot leaked into component signature: {out}"
+        );
+        assert!(!out.contains("fn Card("), "component degraded to fn: {out}");
         assert_idempotent(src);
     }
 }
