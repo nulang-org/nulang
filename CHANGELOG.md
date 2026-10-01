@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Box cold actor suspension and hibernation state — 2026-09-30
+- **Dormant actors no longer reserve inline storage for suspended VM execution or hibernation snapshots.** `suspended_execution` and `hibernation_state` remain optional but now allocate their 128-byte and 112-byte payloads only while those cold states are actually active.
+- **Stacked on the bytecode-module boxing change, the fixed `Actor` layout drops from 2,432 to 2,176 bytes (−10.5%).** In the same 10,000-actor release probe, median idle RSS drops from about 3,664 to 3,360 bytes per actor (−8.3%) and median spawn time drops from about 5.79 to 5.20 µs per actor (−10.2%).
+- **The cold-state indirection does not penalize ordinary delivery in the measured workload.** Ten alternating base/candidate fan-out pairs show a median candidate/base latency ratio of 0.938 (~6.2% faster); the 177-test runtime suite remains green and native-codegen + AI + TCP compile coverage passes.
+
 ### Lower idle actor footprint by boxing cold bytecode modules — 2026-09-30
 - **Actors now keep their optional bytecode module behind a `Box` instead of reserving the full `CodeModule` inline in every actor.** Actors without bytecode retain no module allocation, while bytecode-backed actors preserve the same module semantics through explicit boxing/unboxing at ownership boundaries.
 - **The fixed `Actor` layout drops from 2,816 to 2,432 bytes (−13.6%).** In an exact-current-main 10,000-actor release probe on one host, median idle RSS drops from about 4,079 to 3,664 bytes per actor (−10.2%) and median spawn time improves from about 6.29 to 5.79 µs per actor (−7.9%).
