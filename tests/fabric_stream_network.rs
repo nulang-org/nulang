@@ -1937,3 +1937,121 @@ fn installed_policy_ignores_unrelated_cluster_growth_during_quorum_commit() {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+#[test]
+fn first_replica_bootstraps_carried_policy_after_follower_membership_drift() {
+    let bus: Bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let addr_a: SocketAddr = "127.0.0.1:35601".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:35602".parse().unwrap();
+    let node_a = NodeId::new(&addr_a);
+    let node_b = NodeId::new(&addr_b);
+
+    let mut nodes = vec![runtime(addr_a, bus.clone()), runtime(addr_b, bus)];
+    nodes[0]
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_b, addr_b);
+    nodes[1]
+        .distributed
+        .cluster
+        .as_mut()
+        .unwrap()
+        .handle_heartbeat(node_a, addr_a);
+
+    let initial = nodes[0]
+        .fabric_stream_placement("policy-bootstrap-network", 0, 2)
+        .unwrap();
+    assert_eq!(
+        initial,
+        nodes[1]
+            .fabric_stream_placement("policy-bootstrap-network", 0, 2)
+            .unwrap()
+    );
+    let leader = if initial.leader == node_a { 0 } else { 1 };
+    let follower = 1 - leader;
+
+    let roots = vec![
+        temp_dir("policy-bootstrap-network-a"),
+        temp_dir("policy-bootstrap-network-b"),
+    ];
+    for (node, root) in nodes.iter_mut().zip(&roots) {
+        node.fabric_stream_open(root).unwrap();
+    }
+    nodes[leader]
+        .fabric_stream_create("policy-bootstrap-network", FabricStreamConfig::default())
+        .unwrap();
+
+    // Dispatch the first replica append while both nodes still agree on the
+    // initial placement. The follower deliberately does not process it yet.
+    let append = nodes[leader]
+        .fabric_stream_replicated_append("policy-bootstrap-network", 0, 2, b"first-contact")
+        .unwrap();
+    assert_eq!(append.dispatch.dispatched, 1);
+    assert_eq!(
+        nodes[follower]
+            .fabric_stream_epoch("policy-bootstrap-network")
+            .unwrap(),
+        None
+    );
+
+    // Drift only the follower's cluster view before it receives first contact.
+    let mut dynamic_changed = false;
+    for port in 35610..35700 {
+        let address: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let node_id = NodeId::new(&address);
+        if node_id == node_a || node_id == node_b {
+            continue;
+        }
+        nodes[follower]
+            .distributed
+            .cluster
+            .as_mut()
+            .unwrap()
+            .handle_heartbeat(node_id, address);
+        let dynamic = nodes[follower]
+            .fabric_stream_placement("policy-bootstrap-network", 0, 2)
+            .unwrap();
+        if dynamic.replicas != initial.replicas
+            || dynamic.membership_fingerprint != initial.membership_fingerprint
+        {
+            dynamic_changed = true;
+            break;
+        }
+    }
+    assert!(
+        dynamic_changed,
+        "test must make follower rendezvous differ before queued first contact"
+    );
+
+    // The queued append carries the complete ordered policy, so first contact
+    // no longer depends on the follower's now-different global membership.
+    nodes[follower].process_network();
+    assert_eq!(
+        nodes[follower]
+            .fabric_stream_epoch("policy-bootstrap-network")
+            .unwrap(),
+        Some(1)
+    );
+
+    nodes[leader].process_network();
+    nodes[follower].process_network();
+
+    for node in &mut nodes {
+        assert_eq!(
+            node.fabric_stream_committed_sequence("policy-bootstrap-network")
+                .unwrap(),
+            1
+        );
+        let committed = node
+            .fabric_stream_read_committed("policy-bootstrap-network", 1, 10)
+            .unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].payload, b"first-contact");
+    }
+
+    for root in roots {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

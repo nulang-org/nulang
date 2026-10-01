@@ -546,16 +546,25 @@ compatibility with the immediately preceding experimental stream stack. Epoch 0
 is always invalid.
 
 A follower may bootstrap a missing policy only for epoch 1 and only when the
-local stream has no durable history. During that first bootstrap only, the
-follower still computes current rendezvous placement to authenticate the
-incoming leader/replica assignment. After policy establishment, membership
-growth no longer changes the active placement.
+local stream has no durable history. New replica-append envelopes carry the
+complete ordered replica set from the leader's durable policy. On first contact,
+the follower validates:
 
-This leaves one deliberate bootstrap race: a never-bootstrapped follower can
-reject its first replica append if cluster membership changes between leader
-policy creation and that follower's first policy establishment. A future policy
-bootstrap message should carry the complete ordered replica policy so first
-contact does not depend on the follower's contemporaneous global membership.
+- epoch is exactly 1,
+- replica count matches the advertised replication factor,
+- the leader is the first ordered replica,
+- replica IDs are unique,
+- the local node belongs to the carried replica set.
+
+The follower then persists that exact carried policy before applying the record.
+First contact therefore no longer depends on the follower's contemporaneous
+global membership view; membership can change between leader policy creation
+and first follower delivery without rebinding the stream.
+
+The ordered replica field is additive. An older experimental envelope that does
+not contain it still decodes with an empty replica list and uses the legacy
+rendezvous bootstrap path for compatibility. Once a policy exists, any non-empty
+carried replica list must exactly equal the installed ordered policy.
 
 A stream with existing records but no policy is rejected and requires explicit
 migration; ownership is never inferred retroactively from today's membership.
