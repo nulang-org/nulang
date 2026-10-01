@@ -1703,6 +1703,8 @@ impl Runtime {
             actor.waiting_signal = None;
         }
 
+        let mut persistence_failure: Option<String> = None;
+
         match result {
             Ok(_) => {
                 if self.actor_is_workflow(actor_id) {
@@ -1719,7 +1721,7 @@ impl Runtime {
                         suspended.activation,
                         step_name,
                     ) {
-                        tracing::error!(actor_id, %error, "nulang-workflow: signal-resume terminal commit failed");
+                        persistence_failure = Some(error.to_string());
                     }
                 }
             }
@@ -1761,10 +1763,21 @@ impl Runtime {
                     self.maybe_schedule_receive_wait(actor_id, receive_timeout);
                 }
             }
-            Err(_) => {
-                // Step failed after resumption: run saga compensations.
-                if self.actor_is_workflow(actor_id) {
-                    self.run_saga_compensation(actor_id, behavior_idx);
+            Err(error) => {
+                if let Some(failure) = self.take_workflow_persistence_failure(actor_id) {
+                    persistence_failure = Some(failure);
+                } else if self.actor_is_workflow(actor_id) {
+                    if let Err(commit_error) = workflow::persist_step_failed(
+                        self,
+                        actor_id,
+                        suspended.activation,
+                        step_name,
+                        error.to_string(),
+                    ) {
+                        persistence_failure = Some(commit_error.to_string());
+                    } else {
+                        self.run_saga_compensation(actor_id, behavior_idx);
+                    }
                 }
             }
         }
@@ -1774,6 +1787,16 @@ impl Runtime {
         // bytecode whose own begin/end must stay inside this window. Runs
         // on every path so wakes of other actors are not lost.
         self.vm_exec_end();
+        if let Some(failure) = persistence_failure
+            .or_else(|| self.take_workflow_persistence_failure(actor_id))
+        {
+            self.recover_after_workflow_persistence_failure(
+                actor_id,
+                &failure,
+                "signal-resume",
+            );
+            return;
+        }
         // The suspension resolved (completed or failed): drain any mail
         // that queued up while the step was suspended.
         self.requeue_if_mail_pending(actor_id);
