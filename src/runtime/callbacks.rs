@@ -2111,11 +2111,7 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                 let dispatch_error = nulang_ai::LlmError::from_string(
                     "LLM worker dispatch unavailable before provider execution",
                 );
-                let _ = llm::complete_workflow_llm_effect(
-                    rt,
-                    actor_id,
-                    Err(dispatch_error),
-                );
+                let _ = llm::complete_workflow_llm_effect(rt, actor_id, Err(dispatch_error));
                 if let Some(actor) = rt.actors.get_mut(&actor_id) {
                     actor.llm_inflight = false;
                     actor.llm_pending_prompt = None;
