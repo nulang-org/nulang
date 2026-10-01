@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use nulang::database::store::WalBackedTablet;
-use nulang::database::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation};
+use nulang::database::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation, TabletWrite};
 
 static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
 
@@ -119,6 +119,33 @@ fn crash_fixture_child() {
             let committed = tablet.commit(write).unwrap();
             format!("ACK COMMIT {committed}")
         }
+        "commit-batch" => {
+            let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+            let first = TabletWrite::prepare(
+                &descriptor(),
+                5,
+                0,
+                0,
+                vec![TabletMutation::Put {
+                    key: b"k1".to_vec(),
+                    value: b"value-1".to_vec(),
+                }],
+            )
+            .unwrap();
+            let second = TabletWrite::prepare(
+                &descriptor(),
+                5,
+                1,
+                1,
+                vec![TabletMutation::Put {
+                    key: b"k2".to_vec(),
+                    value: b"value-2".to_vec(),
+                }],
+            )
+            .unwrap();
+            let committed = tablet.commit_batch(vec![first, second]).unwrap();
+            format!("ACK BATCH {committed}")
+        }
         "publish-checkpoint" => {
             let tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
             let sequence = tablet.current_sequence();
@@ -161,6 +188,22 @@ fn acknowledged_commit_survives_immediate_process_kill() {
     let tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
     assert_eq!(tablet.current_sequence(), 1);
     assert_eq!(tablet.read_latest(b"k"), Some(&b"value"[..]));
+
+    cleanup(&wal_path);
+}
+
+#[test]
+fn acknowledged_group_commit_survives_immediate_process_kill() {
+    let wal_path = temp_wal("group_commit_ack");
+    cleanup(&wal_path);
+
+    let ack = run_until_ack_then_kill(&wal_path, "commit-batch");
+    assert_eq!(ack.trim(), "ACK BATCH 2");
+
+    let tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+    assert_eq!(tablet.current_sequence(), 2);
+    assert_eq!(tablet.read_latest(b"k1"), Some(&b"value-1"[..]));
+    assert_eq!(tablet.read_latest(b"k2"), Some(&b"value-2"[..]));
 
     cleanup(&wal_path);
 }
