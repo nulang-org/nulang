@@ -327,6 +327,34 @@ pub(crate) fn compute_recursive(module: &crate::bytecode::CodeModule) -> Vec<boo
     (0..n).map(|i| reach[i][i]).collect()
 }
 
+/// Return true when a compiled region contains a branch back to an earlier
+/// instruction within the same region.
+///
+/// A loop region can execute an arbitrarily large amount of native work per
+/// region entry because its back-edge remains inside generated code. Tiering
+/// policy therefore must not treat one loop-region entry as equivalent to one
+/// straight-line region entry.
+pub(crate) fn region_has_internal_back_edge(
+    offset: usize,
+    len: usize,
+    instructions: &[crate::bytecode::Instruction],
+) -> bool {
+    let end = offset.saturating_add(len).min(instructions.len());
+    for (pc, instr) in instructions.iter().enumerate().take(end).skip(offset) {
+        let target = match instr.opcode {
+            crate::bytecode::OpCode::Jmp => (pc as i64 + instr.simm16() as i64) as usize,
+            crate::bytecode::OpCode::JmpT | crate::bytecode::OpCode::JmpF => {
+                (pc as i64 + instr.offset16() as i64) as usize
+            }
+            _ => continue,
+        };
+        if target >= offset && target < pc {
+            return true;
+        }
+    }
+    false
+}
+
 /// Region-length scanner WITHOUT direct-call folding; used by the unit tests.
 /// The runtime path uses [`find_compilable_region_with_calls`] so direct
 /// non-suspending calls fold into regions.
@@ -338,21 +366,33 @@ pub(crate) fn find_compilable_region(
     let mut len = 0;
     let mut first_branch: Option<usize> = None;
     let mut has_back_edge = false;
+    let mut max_forward_target = offset;
+
     for i in offset..instructions.len().min(offset + 500) {
         if !compiler::is_opcode_compilable(instructions[i].opcode) {
             break;
         }
         let op = instructions[i].opcode;
-        // Stop *before* return/halt instructions so the VM still executes the
-        // return (frame pop) / halt itself after the JIT region.
-        if matches!(
-            op,
-            crate::bytecode::OpCode::Ret
-                | crate::bytecode::OpCode::RetVal
-                | crate::bytecode::OpCode::Halt
-        ) {
+
+        // Halt is always a hard boundary. Returns are normally boundaries too,
+        // except when an earlier in-region branch targets bytecode beyond the
+        // return. MIR can lay an early-exit block (Ret/RetVal) lexically before
+        // sibling loop blocks; in that shape the return is an internal CFG exit
+        // and the scanner must cross it to discover the loop back-edge.
+        if op == crate::bytecode::OpCode::Halt {
             break;
         }
+        if matches!(
+            op,
+            crate::bytecode::OpCode::Ret | crate::bytecode::OpCode::RetVal
+        ) {
+            if max_forward_target <= i {
+                break;
+            }
+            len += 1;
+            continue;
+        }
+
         let is_branch = matches!(
             op,
             crate::bytecode::OpCode::Jmp
@@ -369,6 +409,9 @@ pub(crate) fn find_compilable_region(
                 }
                 _ => (i as i64 + instructions[i].offset16() as i64) as usize,
             };
+            if target > i {
+                max_forward_target = max_forward_target.max(target);
+            }
             // A genuine loop back-edge lands WITHIN the region (target >= offset):
             // the loop head is the region start or an earlier in-region pc, and
             // re-entering it continues the loop. A backward jump to BEFORE the
@@ -379,7 +422,15 @@ pub(crate) fn find_compilable_region(
             }
         }
         len += 1;
+
+        // Once a back-edge closes the CFG frontier there is no reason to pull
+        // unrelated lexical bytecode (for example the top-level wrapper Call)
+        // into the native region. A fallthrough exit resumes at offset + len.
+        if has_back_edge && i >= max_forward_target {
+            break;
+        }
     }
+
     if has_back_edge {
         // A genuine loop loops INTERNALLY in the compiled code, so the JIT
         // enter/exit + probe cost is amortized across all its iterations —
@@ -466,6 +517,8 @@ pub(crate) fn find_compilable_region_with_calls(
     let mut len = 0;
     let mut first_branch: Option<usize> = None;
     let mut has_back_edge = false;
+    let mut max_forward_target = offset;
+
     for i in offset..instructions.len().min(offset + 500) {
         let op = instructions[i].opcode;
         if op == crate::bytecode::OpCode::Call {
@@ -478,16 +531,21 @@ pub(crate) fn find_compilable_region_with_calls(
         } else if !compiler::is_opcode_compilable(op) {
             break;
         }
-        // Stop *before* return/halt so the VM still executes the return (frame
-        // pop) / halt itself after the JIT region.
-        if matches!(
-            op,
-            crate::bytecode::OpCode::Ret
-                | crate::bytecode::OpCode::RetVal
-                | crate::bytecode::OpCode::Halt
-        ) {
+
+        if op == crate::bytecode::OpCode::Halt {
             break;
         }
+        if matches!(
+            op,
+            crate::bytecode::OpCode::Ret | crate::bytecode::OpCode::RetVal
+        ) {
+            if max_forward_target <= i {
+                break;
+            }
+            len += 1;
+            continue;
+        }
+
         let is_branch = matches!(
             op,
             crate::bytecode::OpCode::Jmp
@@ -504,12 +562,20 @@ pub(crate) fn find_compilable_region_with_calls(
                 }
                 _ => (i as i64 + instructions[i].offset16() as i64) as usize,
             };
+            if target > i {
+                max_forward_target = max_forward_target.max(target);
+            }
             if target >= offset && target < i {
                 has_back_edge = true;
             }
         }
+
         len += 1;
+        if has_back_edge && i >= max_forward_target {
+            break;
+        }
     }
+
     if !has_back_edge && first_branch.unwrap_or(len) < STRAIGHT_LINE_MIN {
         (0, std::collections::HashMap::new())
     } else {

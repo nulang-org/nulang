@@ -170,7 +170,7 @@ wasm-encoder = { version = "0.220", optional = true }
 # Borsh serialization for the WASM component boundary (optional, see [features])
 borsh = { version = "1.5", optional = true, features = ["derive"] }
 # WASM runtime using Wasmtime (optional, see [features])
-wasmtime = { version = "46", optional = true, default-features = false, features = ["cranelift", "runtime", "std", "anyhow", "component-model", "wat"] }
+wasmtime = { version = "48.0.3", optional = true, default-features = false, features = ["cranelift", "runtime", "std", "anyhow", "component-model", "wat"] }
 wat = { version = "1.254", optional = true }
 blake3 = "1.8"
 rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12", "ring", "logging"] }
@@ -196,6 +196,11 @@ path = "src/main.rs"
 name = "nula_difffuzz"
 path = "src/bin/nula_difffuzz.rs"
 required-features = ["difffuzz"]
+
+[[bin]]
+name = "nulang-jit-bench"
+path = "src/bin/nulang_jit_bench.rs"
+required-features = ["native-codegen"]
 
 [[bin]]
 name = "nulang-savina"
