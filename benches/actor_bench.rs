@@ -119,17 +119,19 @@ fn bench_spawn_send_receive(c: &mut Criterion) {
 
 /// Local mailbox admission/enqueue cost for a batch of primitive messages.
 ///
-/// Runtime construction, actor creation, and behavior registration are setup
-/// and therefore excluded from the timed body.
+/// Runtime construction, actor creation, behavior registration, and teardown are
+/// excluded from the timed body. `iter_batched_ref` keeps `Runtime::drop` and
+/// queued-message destruction out of the enqueue latency signal.
 fn bench_message_enqueue(c: &mut Criterion) {
     let mut group = c.benchmark_group("actor/message_enqueue");
     group.throughput(Throughput::Elements(MESSAGE_BATCH as u64));
 
     // Preserve the existing benchmark name for rolling-history continuity.
     group.bench_function("100", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             runtime_with_consumer,
-            |(mut rt, actor_id)| {
+            |(rt, actor_id)| {
+                let actor_id = *actor_id;
                 let msg = Value::int(1);
                 for _ in 0..MESSAGE_BATCH {
                     rt.send_message(actor_id, "handle", &[msg]);
@@ -144,9 +146,10 @@ fn bench_message_enqueue(c: &mut Criterion) {
     // separate signal for the scheduler/mailbox hot path without behavior-name
     // lookup so ready-token dedup is measurable independently.
     group.bench_function("by_id_100", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             runtime_with_consumer,
-            |(mut rt, actor_id)| {
+            |(rt, actor_id)| {
+                let actor_id = *actor_id;
                 let msg = Value::int(1);
                 for _ in 0..MESSAGE_BATCH {
                     rt.send_message_by_id(actor_id, 0, &[msg]);
@@ -158,9 +161,10 @@ fn bench_message_enqueue(c: &mut Criterion) {
     });
 
     group.bench_function("by_id_shared_5arg_100", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             runtime_with_consumer,
-            |(mut rt, actor_id)| {
+            |(rt, actor_id)| {
+                let actor_id = *actor_id;
                 let args = [
                     Value::int(1),
                     Value::int(2),
@@ -190,7 +194,7 @@ fn bench_message_drain(c: &mut Criterion) {
     group.throughput(Throughput::Elements(MESSAGE_BATCH as u64));
 
     group.bench_function("100", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
                 let (mut rt, actor_id) = runtime_with_consumer();
                 let msg = Value::int(1);
@@ -199,7 +203,7 @@ fn bench_message_drain(c: &mut Criterion) {
                 }
                 rt
             },
-            |mut rt| {
+            |rt| {
                 rt.run_scheduler();
                 black_box(rt);
             },
@@ -241,9 +245,9 @@ fn bench_selective_receive(c: &mut Criterion) {
     let mut group = c.benchmark_group("actor/selective_receive_depth");
     for depth in [64usize, 1024, 16_384] {
         group.bench_with_input(BenchmarkId::from_parameter(depth), &depth, |b, &depth| {
-            b.iter_batched(
+            b.iter_batched_ref(
                 || selective_receive_mailbox(depth, HIT),
-                |mut mailbox| black_box(mailbox.receive_match(black_box(&[HIT]))),
+                |mailbox| black_box(mailbox.receive_match(black_box(&[HIT]))),
                 BatchSize::SmallInput,
             )
         });
@@ -258,11 +262,9 @@ fn bench_selective_receive(c: &mut Criterion) {
             BenchmarkId::from_parameter(arm_count),
             &arm_count,
             |b, _| {
-                b.iter_batched(
+                b.iter_batched_ref(
                     || selective_receive_mailbox(4096, HIT),
-                    |mut mailbox| {
-                        black_box(mailbox.receive_match(black_box(behavior_ids.as_slice())))
-                    },
+                    |mailbox| black_box(mailbox.receive_match(black_box(behavior_ids.as_slice()))),
                     BatchSize::SmallInput,
                 )
             },
@@ -272,7 +274,7 @@ fn bench_selective_receive(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("actor/selective_receive_guard_retry");
     group.bench_function("32_rejections", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
                 let mut mailbox = Mailbox::new(0);
                 for sender in 0..32u64 {
@@ -288,7 +290,7 @@ fn bench_selective_receive(c: &mut Criterion) {
                 }
                 mailbox
             },
-            |mut mailbox| {
+            |mailbox| {
                 for _ in 0..32 {
                     black_box(mailbox.receive_match(black_box(&[HIT])));
                 }

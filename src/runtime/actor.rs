@@ -2,7 +2,7 @@
 
 use super::gc::OrcaGc;
 use super::*;
-use crate::runtime::object_store::ObjectId;
+use crate::runtime::object_store::{ObjectId, ObjectStore};
 use crate::vm::Value;
 use std::collections::{HashMap, HashSet};
 
@@ -281,6 +281,24 @@ pub struct Actor {
     turn_reductions: u32,     // Messages handled in the current scheduling turn
     pub max_reductions: u32,  // Max reductions per turn before yield (preemption)
     pub sequence: u64,        // Last persisted sequence number
+    /// Monotonic fencing epoch for durable ownership of this logical actor.
+    ///
+    /// This is the canonical live source of truth used by snapshots,
+    /// failover directory announcements, and atomic durable transitions.
+    pub activation_epoch: u64,
+    /// Accepted workflow command currently executing on this actor.
+    ///
+    /// Set after the command is durably journaled and cleared when the direct
+    /// turn ends. If execution suspends, the identity is copied into
+    /// `SuspendedExecution` so later resumes close the same activation.
+    pub current_workflow_activation: Option<WorkflowActivationId>,
+    /// Activation whose intermediate custom-event ordinal is currently tracked.
+    ///
+    /// This is execution-local replay state, not durable state. A later replay
+    /// slice will restore/consume it from committed event history.
+    pub workflow_replay_activation: Option<WorkflowActivationId>,
+    /// Next deterministic custom-event ordinal within `workflow_replay_activation`.
+    pub workflow_replay_event_ordinal: u32,
     /// Sentinel heap object used by the cycle detector to represent this
     /// actor as a holder of foreign references.
     cycle_sentinel: Option<*mut OrcaHeader>,
@@ -351,6 +369,9 @@ pub struct Actor {
     /// Object-store ids held by this actor.  Populated when a message carrying
     /// an object ref is delivered.  Dropped on actor exit.
     pub held_objects: HashSet<ObjectId>,
+    /// Store handle paired with held_objects so actor destruction releases
+    /// manual ObjectStore refcounts even when removal bypasses Runtime reaping.
+    pub(crate) held_object_store: Option<ObjectStore>,
 }
 
 /// State of an actor's in-flight timed selective receive.
@@ -373,6 +394,8 @@ pub struct ReceiveWaitState {
 pub struct SuspendedExecution {
     pub vm_state: crate::vm::SuspendedVmState,
     pub behavior_idx: usize,
+    /// Stable identity of the accepted workflow command being resumed.
+    pub activation: Option<WorkflowActivationId>,
     pub step_name: String,
 }
 
@@ -428,6 +451,10 @@ impl Actor {
             turn_reductions: 0,
             max_reductions: 1000,
             sequence: 0,
+            activation_epoch: crate::runtime::persistence::INITIAL_ACTIVATION_EPOCH,
+            current_workflow_activation: None,
+            workflow_replay_activation: None,
+            workflow_replay_event_ordinal: 0,
             cycle_sentinel: None,
             suspended_execution: None,
             waiting_signal: None,
@@ -452,6 +479,7 @@ impl Actor {
             idle_ms: 0,
             pinned: false,
             held_objects: HashSet::new(),
+            held_object_store: None,
         }
     }
 
@@ -636,6 +664,55 @@ impl Actor {
         self.turn_reductions += count;
     }
 
+    /// Convert one actor-owned runtime value into its durable representation.
+    ///
+    /// Constant-pool strings resolve through the actor module. Heap-backed
+    /// strings are accepted only when the pointer exactly matches a live
+    /// allocation tagged `TypeTag::String`; arbitrary pointers fail closed
+    /// through `from_value_resolved` instead of being interpreted as C strings.
+    pub(crate) fn persist_value(&self, value: &Value) -> PersistedValue {
+        if let Some(ptr) = value.as_ptr() {
+            if ptr.is_null() {
+                return PersistedValue::Nil;
+            }
+
+            let mut resolved = None;
+            self.heap.iter_live_objects(|header, payload, _| {
+                if resolved.is_some() || payload != ptr {
+                    return;
+                }
+
+                // SAFETY: iter_live_objects yields headers for live allocations
+                // in this actor heap. Equality with ptr proves exact allocation
+                // provenance before metadata or payload bytes are inspected.
+                let header = unsafe { &*header };
+                if header.type_tag != TypeTag::String || header.payload_size == 0 {
+                    return;
+                }
+
+                // SAFETY: payload_size is the requested size of this live
+                // allocation, so the slice stays within the object. Runtime
+                // strings are UTF-8 bytes followed by a trailing NUL.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(payload as *const u8, header.payload_size)
+                };
+                let Some(nul) = bytes.iter().position(|byte| *byte == 0) else {
+                    return;
+                };
+                let Ok(text) = std::str::from_utf8(&bytes[..nul]) else {
+                    return;
+                };
+                resolved = Some(PersistedValue::String(text.to_owned()));
+            });
+
+            return resolved.unwrap_or_else(|| {
+                PersistedValue::from_value_resolved(value, self.bytecode_module.as_ref())
+            });
+        }
+
+        PersistedValue::from_value_resolved(value, self.bytecode_module.as_ref())
+    }
+
     /// Allocate a null-terminated string on the actor heap and return a pointer
     /// value. Returns nil if allocation fails.
     pub fn allocate_string(&mut self, s: &str) -> Value {
@@ -798,5 +875,15 @@ mod tests {
         assert!(recorder.is_empty());
         assert_eq!(recorder.entries.capacity(), 0);
         assert_eq!(recorder.next_seq, 0);
+    }
+}
+
+impl Drop for Actor {
+    fn drop(&mut self) {
+        let Some(store) = self.held_object_store.take() else {
+            return;
+        };
+        let held = std::mem::take(&mut self.held_objects);
+        store.drop_refs(&held);
     }
 }
