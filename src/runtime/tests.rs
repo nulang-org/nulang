@@ -4321,6 +4321,119 @@ fn test_signal_received_during_open_activation_keeps_safe_snapshot() {
 }
 
 #[test]
+fn test_compiled_workflow_turn_closes_on_atomic_tail() {
+    use crate::bytecode::{Instruction, OpCode};
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "CompiledAtomicTail",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+
+    let mut module = CodeModule::new("compiled-atomic-tail");
+    module.emit(Instruction::new0(OpCode::Ret));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.layout_workflow_behavior_table(actor_id);
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    rt.send_message_by_id(actor_id, 0, &[]);
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    let tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .expect("compiled workflow command and completion must use RFC 0022 transitions");
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let journal = rt.persistence.read_journal(actor_id);
+    let completed = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .find_map(|event| match event {
+            WorkflowEvent::StepCompleted {
+                sequence,
+                activation,
+                ..
+            } => Some((sequence, activation)),
+            _ => None,
+        })
+        .expect("compiled workflow turn must record StepCompleted");
+
+    assert_eq!(journal.len(), 1);
+    let activation = WorkflowActivationId::new(actor_id, journal[0].sequence);
+    assert_eq!(completed.1, Some(activation));
+    assert_eq!(completed.0, tail.sequence);
+    assert_eq!(snapshot.sequence, tail.sequence);
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        tail.sequence,
+        "compiled workflow completion must not leave any legacy-only sequence beyond the atomic tail"
+    );
+}
+
+#[test]
+fn test_open_activation_intermediate_events_extend_atomic_tail() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "AtomicIntermediateEvents",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    declare_test_behavior(&mut rt, actor_id, "run");
+    let behavior_id = rt.behavior_id_for(actor_id, "run").unwrap();
+    let activation =
+        workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new()).unwrap();
+
+    let command_tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(command_tail.sequence, activation.command_sequence);
+
+    rt.emit_event(actor_id, "Custom", &[Value::int(1)]);
+    let custom_tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(custom_tail.sequence, command_tail.sequence + 1);
+    assert_eq!(rt.persistence.latest_sequence(actor_id), custom_tail.sequence);
+
+    assert!(rt.append_timer_set(actor_id, "wake", 250).unwrap());
+    let timer_tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(timer_tail.sequence, custom_tail.sequence + 1);
+    assert_eq!(rt.persistence.latest_sequence(actor_id), timer_tail.sequence);
+
+    rt.append_signal_received(actor_id, "go", Some("payload".to_string()))
+        .unwrap();
+    let signal_tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(signal_tail.sequence, timer_tail.sequence + 1);
+    assert_eq!(rt.persistence.latest_sequence(actor_id), signal_tail.sequence);
+
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert!(
+        snapshot.sequence < activation.command_sequence,
+        "intermediate activation events must keep the last completed-state snapshot at the pre-command boundary"
+    );
+}
+
+#[test]
 fn test_recovery_finds_unfinished_atomic_command_below_durable_effect_tail() {
     let mut rt = Runtime::new();
     let actor_id = rt.spawn_workflow_actor(
