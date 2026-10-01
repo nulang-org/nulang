@@ -29,6 +29,11 @@ jobs:
         run: |
           cargo test --locked --no-default-features --test nudb_wal_batch
           cargo test --locked --no-default-features --test nudb_wal_batch_recovery
+          cargo test --locked --no-default-features --test nudb_wal_batch_decoder_hardening
+      - name: Group commit contract
+        run: cargo test --locked --no-default-features --test nudb_group_commit
+      - name: Storage interruption matrix
+        run: cargo test --locked --no-default-features --lib database::interruption::tests
       - name: Existing NulangDB storage contracts
         run: |
           cargo test --locked --no-default-features --test tablet_foundation
