@@ -1161,7 +1161,7 @@ impl Runtime {
         workflow::append_timer_fired(self, actor_id, name)
     }
 
-    /// Append a `SignalReceived` workflow event and checkpoint the actor.
+    /// Append a durable `SignalReceived` workflow input without advancing the completed snapshot.
     pub fn append_signal_received(
         &mut self,
         actor_id: u64,
