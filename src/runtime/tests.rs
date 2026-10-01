@@ -4534,6 +4534,76 @@ fn test_recovery_refuses_terminal_event_ahead_of_safe_snapshot_outside_atomic_ta
 }
 
 #[test]
+fn test_recovery_refuses_legacy_workflow_event_beyond_atomic_tail() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "RefuseMixedIntermediate",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("run", |_actor, _args| {});
+    let behavior_id = rt
+        .behavior_id_for(actor_id, "run")
+        .expect("registered workflow behavior must have a stable id");
+
+    let activation =
+        workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new()).unwrap();
+    let activation_epoch = rt.actors.get(&actor_id).unwrap().activation_epoch;
+    let effect_id = crate::durable_effect::DurableEffectId::derive(
+        actor_id,
+        &format!("workflow-activation:{}", activation.command_sequence),
+        0,
+        "Inference.ask",
+    );
+    let spec = crate::durable_effect::DurableEffectSpec::new(
+        effect_id,
+        "Inference.ask",
+        crate::primitives::EffectBoundary::External,
+        crate::primitives::DeliverySemantics::AtLeastOnce,
+    );
+    {
+        let mut coordinator = crate::durable_effect_runtime::DurableEffectCoordinator::new(
+            rt.persistence.as_mut(),
+            actor_id,
+            activation_epoch,
+        );
+        coordinator.begin(spec, b"prompt").unwrap();
+    }
+
+    let tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    rt.persistence
+        .append_workflow_event(
+            actor_id,
+            WorkflowEvent::Custom {
+                sequence: tail.sequence + 1,
+                replay_id: Some(WorkflowReplayEventId::new(activation, 1)),
+                name: "legacy-after-atomic".to_string(),
+                args: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    assert!(
+        rt.persistence.latest_sequence(actor_id) > tail.sequence,
+        "fixture must contain a legacy-only record beyond the atomic tail"
+    );
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(
+        rt.recover_actor(actor_id),
+        None,
+        "recovery must fail closed when any legacy workflow record advances beyond the RFC 0022 tail"
+    );
+}
+
+#[test]
 fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
