@@ -4321,6 +4321,90 @@ fn test_signal_received_during_open_activation_keeps_safe_snapshot() {
 }
 
 #[test]
+fn test_recovery_finds_unfinished_atomic_command_below_durable_effect_tail() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "RecoverPastEffectTail",
+        Box::new(|| vec![("count".to_string(), Value::int(0))]),
+        HashMap::new(),
+    );
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("increment", |_actor, _args| {});
+    let behavior_id = rt
+        .behavior_id_for(actor_id, "increment")
+        .expect("registered workflow behavior must have a stable id");
+
+    let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let activation =
+        workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new()).unwrap();
+    let activation_epoch = rt.actors.get(&actor_id).unwrap().activation_epoch;
+
+    let effect_id = crate::durable_effect::DurableEffectId::derive(
+        actor_id,
+        &format!("workflow-activation:{}", activation.command_sequence),
+        0,
+        "Inference.ask",
+    );
+    let spec = crate::durable_effect::DurableEffectSpec::new(
+        effect_id,
+        "Inference.ask",
+        crate::primitives::EffectBoundary::External,
+        crate::primitives::DeliverySemantics::AtLeastOnce,
+    );
+    {
+        let mut coordinator = crate::durable_effect_runtime::DurableEffectCoordinator::new(
+            rt.persistence.as_mut(),
+            actor_id,
+            activation_epoch,
+        );
+        let decision = coordinator.begin(spec, b"prompt").unwrap();
+        assert!(matches!(
+            decision,
+            crate::durable_effect_runtime::DurableEffectDispatchDecision::DispatchAtLeastOnce {
+                operation_id
+            } if operation_id == effect_id
+        ));
+    }
+
+    let tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        tail.sequence > activation.command_sequence,
+        "Prepared must advance the RFC 0022 tail past command admission"
+    );
+    assert_eq!(
+        rt.persistence.load_snapshot(actor_id).unwrap().sequence,
+        safe_snapshot.sequence,
+        "Prepared must not advance the completed-state snapshot"
+    );
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(
+        actor.current_workflow_activation,
+        Some(activation),
+        "recovery must derive the open activation from the admitted command below the intermediate durable tail"
+    );
+    assert_eq!(
+        actor.sequence,
+        activation.command_sequence,
+        "re-execution starts from the admitted command identity, not the later effect transition sequence"
+    );
+    assert_eq!(
+        actor.mailbox.len(),
+        1,
+        "the unfinished command must be re-enqueued exactly once"
+    );
+}
+
+#[test]
 fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
