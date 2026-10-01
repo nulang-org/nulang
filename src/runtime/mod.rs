@@ -5458,15 +5458,15 @@ impl Runtime {
             .map(|meta| meta.is_agent)
             .unwrap_or(false);
 
-        // RFC 0022 Phase B: classify only the narrow crash window already
-        // covered by atomic native workflow turns. If the committed atomic tail
-        // is ahead of the last safe snapshot and the record at that exact tail
-        // is a command, the process died after admission but before a later
-        // atomic transition could close or advance the activation.
+        // RFC 0022 activation recovery: an intermediate atomic transition
+        // (for example durable-effect Prepared/Completed) may advance the
+        // committed tail beyond the accepted command while the completed-state
+        // snapshot intentionally remains at the pre-command boundary.
         //
-        // Do not generalize this to commands below the atomic tail: a later
-        // tail may represent an intermediate event/effect that requires the
-        // broader activation replay contract tracked by #836.
+        // The activation identity therefore comes from the newest admitted
+        // command between the safe snapshot and the atomic tail, not from the
+        // tail sequence itself. A terminal event for that command closes the
+        // activation; otherwise recovery re-enqueues the original command.
         let pending_atomic_workflow_replay = if is_workflow {
             match self.persistence.load_durable_tail_position(actor_id) {
                 Ok(Some(tail)) if tail.sequence > snapshot.sequence => {
@@ -5478,29 +5478,32 @@ impl Runtime {
                         return None;
                     }
 
-                    let activation = WorkflowActivationId::new(actor_id, tail.sequence);
-                    let terminal_recorded = workflow_events.iter().any(|event| {
-                        matches!(
-                            event,
-                            WorkflowEvent::StepCompleted {
-                                activation: Some(id),
-                                ..
-                            } | WorkflowEvent::StepFailed {
-                                activation: Some(id),
-                                ..
-                            } if *id == activation
-                        )
-                    });
+                    let candidate = self
+                        .persistence
+                        .read_journal(actor_id)
+                        .into_iter()
+                        .rev()
+                        .find(|entry| {
+                            entry.sequence > snapshot.sequence && entry.sequence <= tail.sequence
+                        });
 
-                    if terminal_recorded {
-                        None
-                    } else {
-                        self.persistence
-                            .read_journal(actor_id)
-                            .into_iter()
-                            .find(|entry| entry.sequence == tail.sequence)
-                            .map(|entry| (activation, entry))
-                    }
+                    candidate.and_then(|entry| {
+                        let activation = WorkflowActivationId::new(actor_id, entry.sequence);
+                        let terminal_recorded = workflow_events.iter().any(|event| {
+                            matches!(
+                                event,
+                                WorkflowEvent::StepCompleted {
+                                    activation: Some(id),
+                                    ..
+                                } | WorkflowEvent::StepFailed {
+                                    activation: Some(id),
+                                    ..
+                                } if *id == activation
+                            )
+                        });
+
+                        (!terminal_recorded).then_some((activation, entry))
+                    })
                 }
                 Ok(_) => None,
                 Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
