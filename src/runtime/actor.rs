@@ -299,6 +299,11 @@ pub struct Actor {
     pub workflow_replay_activation: Option<WorkflowActivationId>,
     /// Next deterministic custom-event ordinal within `workflow_replay_activation`.
     pub workflow_replay_event_ordinal: u32,
+    /// Persistence failure raised by a fallible workflow VM callback during
+    /// the current activation. The scheduler consumes this marker to abort
+    /// partial in-memory execution and recover from committed history instead
+    /// of turning a failed intermediate commit into a terminal snapshot.
+    pub workflow_persistence_failure: Option<String>,
     /// Sentinel heap object used by the cycle detector to represent this
     /// actor as a holder of foreign references.
     cycle_sentinel: Option<*mut OrcaHeader>,
@@ -451,6 +456,7 @@ impl Actor {
             current_workflow_activation: None,
             workflow_replay_activation: None,
             workflow_replay_event_ordinal: 0,
+            workflow_persistence_failure: None,
             cycle_sentinel: None,
             suspended_execution: None,
             waiting_signal: None,
