@@ -1000,10 +1000,12 @@ mod tests {
         match ctx.timer_started("retry", 1_500).unwrap() {
             WorkflowEvent::TimerSet {
                 sequence,
+                replay_id,
                 name,
                 duration_ms,
             } => {
                 assert_eq!(sequence, 9);
+                assert_eq!(replay_id, None);
                 assert_eq!(name, "retry");
                 assert_eq!(duration_ms, 1_500);
             }
