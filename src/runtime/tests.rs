@@ -4379,6 +4379,67 @@ fn test_compiled_workflow_turn_closes_on_atomic_tail() {
 }
 
 #[test]
+fn test_compiled_workflow_failure_closes_on_atomic_tail() {
+    use crate::bytecode::{Instruction, OpCode};
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "CompiledAtomicFailure",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+
+    let mut module = CodeModule::new("compiled-atomic-failure");
+    let message = module.add_constant(Constant::String("boom".to_string()));
+    module.emit(Instruction::new3(
+        OpCode::ConstU,
+        ((message >> 8) & 0xFF) as u8,
+        (message & 0xFF) as u8,
+        0,
+    ));
+    module.emit(Instruction::new0(OpCode::Panic));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.layout_workflow_behavior_table(actor_id);
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    rt.send_message_by_id(actor_id, 0, &[]);
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    let journal = rt.persistence.read_journal(actor_id);
+    assert_eq!(journal.len(), 1);
+    let activation = WorkflowActivationId::new(actor_id, journal[0].sequence);
+    let failed = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .find_map(|event| match event {
+            WorkflowEvent::StepFailed {
+                sequence,
+                activation,
+                ..
+            } => Some((sequence, activation)),
+            _ => None,
+        })
+        .expect("failing compiled workflow must record StepFailed");
+
+    let tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(failed.1, Some(activation));
+    assert_eq!(failed.0, tail.sequence);
+    assert_eq!(snapshot.sequence, tail.sequence);
+    assert_eq!(rt.persistence.latest_sequence(actor_id), tail.sequence);
+}
+
+#[test]
 fn test_compiled_workflow_keeps_legacy_path_on_store_without_atomic_transitions() {
     use crate::bytecode::{Instruction, OpCode};
 
