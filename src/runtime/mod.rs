@@ -11,6 +11,7 @@ use std::time::Instant;
 use tracing::warn;
 
 mod actor;
+mod behavior_ownership;
 mod blocking_executor;
 pub mod cache;
 pub mod cache_cluster;
@@ -26,6 +27,7 @@ pub mod heap;
 pub(crate) mod heap_serialize;
 mod mailbox;
 mod scheduler;
+mod schema_identity;
 pub use heap_serialize::*;
 mod cluster;
 mod distributed;
@@ -395,10 +397,11 @@ pub struct Runtime {
     /// garbage-collected after `MIGRATED_ACTOR_TTL` seconds.
     pub migrated_actors: HashMap<u64, (NodeId, Instant)>,
 
-    /// Durable actors opted into `RespawnOnNodeLoss` (RFC 0014): actor id →
-    /// current activation epoch. Enables shadow replication at checkpoint
-    /// time and directory announcement.
-    pub(crate) respawn_opted: HashMap<u64, u64>,
+    /// Durable actors opted into `RespawnOnNodeLoss` (RFC 0014).
+    ///
+    /// Epoch ownership lives on the Actor itself; this set records only
+    /// participation in node-loss shadow replication and directory gossip.
+    pub(crate) respawn_opted: HashSet<u64>,
     /// Shadow replicas this node holds (RFC 0014 §3): actor id → replica,
     /// received via `Packet::ShadowReplicate` from the actor's home node.
     /// Consumed by the re-spawn driver when the home node is confirmed gone.
@@ -485,6 +488,10 @@ pub struct Runtime {
     // compensation_offsets).
     pub(crate) recovery_modules:
         HashMap<u64, (crate::bytecode::CodeModule, Vec<usize>, Vec<Option<usize>>)>,
+    /// Canonical ActorMeta.name retained after actor reaping so migration
+    /// forwarding and recovery can translate runtime-local behavior ids
+    /// without guessing schema ownership.
+    pub(crate) recovery_schema_names: HashMap<u64, String>,
     /// Content-addressed bytecode cache for fetch-on-demand.
     /// When a node receives a message for an unknown content hash, it can
     /// request the bytecode from the sender and cache it here keyed by hash.
@@ -646,7 +653,7 @@ impl Runtime {
             remote_links: supervision::RemoteLinkRegistry::new(),
             remote_monitors: supervision::RemoteMonitorRegistry::new(),
             migrated_actors: HashMap::new(),
-            respawn_opted: HashMap::new(),
+            respawn_opted: HashSet::new(),
             shadow_replicas: HashMap::new(),
             // Standalone runtimes use node id 0; `enable_distribution` swaps
             // this for a real node-id manager. Initialized eagerly so
@@ -676,6 +683,7 @@ impl Runtime {
             draining_receive_wakes: false,
             idle_callback: None,
             recovery_modules: HashMap::new(),
+            recovery_schema_names: HashMap::new(),
             #[cfg(feature = "ai-runtime")]
             ai: AiRuntimeRegistry::new(),
             #[cfg(feature = "ai-runtime")]
@@ -1177,7 +1185,12 @@ impl Runtime {
     /// The signal is appended to the durable workflow journal and, if the actor
     /// is currently suspended waiting for this signal, its execution is resumed.
     /// Deliver a signal to a workflow actor. Delegates to workflow subsystem.
-    pub fn signal_workflow(&mut self, actor_id: u64, name: &str, payload: Option<String>) {
+    pub fn signal_workflow(
+        &mut self,
+        actor_id: u64,
+        name: &str,
+        payload: Option<String>,
+    ) -> std::io::Result<()> {
         workflow::signal_workflow(self, actor_id, name, payload)
     }
 
@@ -1263,6 +1276,26 @@ impl Runtime {
         }
     }
 
+    /// Restore the accepted workflow activation before resuming suspended bytecode.
+    /// The actor already owns the activation-local custom-event cursor, so a
+    /// resume of the same activation must not reset its next ordinal.
+    fn restore_suspended_workflow_activation(
+        &mut self,
+        actor_id: u64,
+        activation: Option<WorkflowActivationId>,
+    ) {
+        let Some(actor) = self.actors.get_mut(&actor_id) else {
+            return;
+        };
+        actor.current_workflow_activation = activation;
+        if let Some(activation) = activation {
+            if actor.workflow_replay_activation != Some(activation) {
+                actor.workflow_replay_activation = Some(activation);
+                actor.workflow_replay_event_ordinal = 0;
+            }
+        }
+    }
+
     /// Resume an actor that yielded at a JIT safepoint.
     ///
     /// Mirrors the structure of `resume_suspended_llm_step` but without
@@ -1283,6 +1316,7 @@ impl Runtime {
             return;
         }
 
+        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -1311,6 +1345,7 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
+                                    activation: suspended.activation,
                                     step_name: suspended.step_name.clone(),
                                 });
                             actor.jit_yield_pending = true;
@@ -1336,6 +1371,7 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
+                                    activation: suspended.activation,
                                     step_name: suspended.step_name,
                                 });
                         }
@@ -1604,6 +1640,7 @@ impl Runtime {
             return;
         }
 
+        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
         let behavior_idx = suspended.behavior_idx;
         let step_name = suspended.step_name;
         let self_ptr: *mut Runtime = self;
@@ -1648,6 +1685,7 @@ impl Runtime {
                         actor_id,
                         WorkflowEvent::StepCompleted {
                             sequence: seq,
+                            activation: suspended.activation,
                             step_name,
                         },
                     );
@@ -1683,6 +1721,7 @@ impl Runtime {
                             Some(crate::runtime::actor::SuspendedExecution {
                                 vm_state,
                                 behavior_idx,
+                                activation: suspended.activation,
                                 step_name,
                             });
                     }
@@ -1784,10 +1823,133 @@ impl Runtime {
             }
         }
         let module = actor.bytecode_module.as_ref()?;
-        module
-            .behaviors
-            .get(behavior_id as usize)
-            .map(|b| b.name.clone())
+        if module.actor_metadata.is_empty() {
+            return module
+                .behaviors
+                .get(behavior_id as usize)
+                .map(|behavior| behavior.name.clone());
+        }
+        behavior_ownership::behavior_name_for_runtime_id(module, &actor.name, behavior_id as usize)
+            .map(str::to_owned)
+    }
+
+    /// Resolve a runtime-visible behavior id for an actor that is no longer
+    /// resident but still has retained recovery metadata.
+    fn recovery_behavior_wire_name_for(&self, actor_id: u64, behavior_id: u16) -> Option<String> {
+        let (module, _, _) = self.recovery_modules.get(&actor_id)?;
+        if let Some(schema_name) = self.recovery_schema_names.get(&actor_id) {
+            return behavior_ownership::behavior_name_for_runtime_id(
+                module,
+                schema_name,
+                behavior_id as usize,
+            )
+            .map(str::to_owned);
+        }
+        if module.actor_metadata.is_empty() {
+            return module
+                .behaviors
+                .get(behavior_id as usize)
+                .map(|behavior| behavior.name.clone());
+        }
+        None
+    }
+
+    /// Resolve a pointer-tagged value only when it is the exact payload
+    /// address of a live ActorHeap string allocation.
+    fn live_heap_string(heap: &ActorHeap, ptr: *mut u8) -> Option<String> {
+        let mut resolved = None;
+        heap.iter_live_objects(|header, payload, _| {
+            if resolved.is_some() || payload != ptr {
+                return;
+            }
+            // SAFETY: iter_live_objects yields live allocations owned by this
+            // heap, and payload equality proves exact provenance.
+            let header = unsafe { &*header };
+            if header.type_tag != TypeTag::String || header.payload_size == 0 {
+                return;
+            }
+            // SAFETY: payload_size comes from the validated live allocation.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(payload as *const u8, header.payload_size) };
+            let Some(nul) = bytes.iter().position(|byte| *byte == 0) else {
+                return;
+            };
+            let Ok(text) = std::str::from_utf8(&bytes[..nul]) else {
+                return;
+            };
+            resolved = Some(text.to_owned());
+        });
+        resolved
+    }
+
+    fn resolve_live_heap_string(&self, ptr: *mut u8) -> Option<String> {
+        if let Some(text) = Self::live_heap_string(&self.main_heap, ptr) {
+            return Some(text);
+        }
+        for actor in self.actors.values() {
+            if let Some(text) = Self::live_heap_string(&actor.heap, ptr) {
+                return Some(text);
+            }
+        }
+        for heap in &self.retired_heaps {
+            if let Some(text) = Self::live_heap_string(heap, ptr) {
+                return Some(text);
+            }
+        }
+        None
+    }
+
+    fn resolve_actor_module_string(&self, actor_id: u64, id: u32) -> Option<String> {
+        self.actors
+            .get(&actor_id)
+            .and_then(|actor| actor.bytecode_module.as_ref())
+            .and_then(|module| module.constants.get(id as usize))
+            .and_then(|constant| match constant {
+                crate::bytecode::Constant::String(text) => Some(text.clone()),
+                _ => None,
+            })
+    }
+
+    /// Canonical serializer for payloads crossing the durable journal
+    /// boundary. Module string ids resolve against the sender first, then the
+    /// target. Heap strings require exact live allocation provenance and
+    /// TypeTag::String; arbitrary pointers fail closed to Nil.
+    pub(crate) fn persist_journal_payload(
+        &self,
+        target_actor_id: u64,
+        source_actor_id: Option<u64>,
+        values: &[Value],
+    ) -> Vec<PersistedValue> {
+        values
+            .iter()
+            .map(|value| {
+                if let Some(id) = value.as_string_id() {
+                    if let Some(source_actor_id) = source_actor_id {
+                        if let Some(text) = self.resolve_actor_module_string(source_actor_id, id) {
+                            return PersistedValue::String(text);
+                        }
+                    }
+                    if source_actor_id != Some(target_actor_id) {
+                        if let Some(text) = self.resolve_actor_module_string(target_actor_id, id) {
+                            return PersistedValue::String(text);
+                        }
+                    }
+                    return PersistedValue::Nil;
+                }
+
+                if let Some(ptr) = value.as_ptr() {
+                    if ptr.is_null() {
+                        return PersistedValue::Nil;
+                    }
+                    return self
+                        .resolve_live_heap_string(ptr)
+                        .map(PersistedValue::String)
+                        .unwrap_or(PersistedValue::Nil);
+                }
+
+                PersistedValue::from_value(value)
+            })
+            .collect()
     }
 
     /// Synchronously run a single behavior on an actor and return its result.
@@ -1984,10 +2146,11 @@ impl Runtime {
             .map(|e| !e.name.is_empty())
             .unwrap_or(false);
         if is_native {
+            let journal_source_actor = self.current_actor;
             self.current_actor = Some(actor_id);
             if self.actor_is_persistent(actor_id) {
                 let seq = self.next_sequence(actor_id);
-                let payload = args.iter().map(PersistedValue::from_value).collect();
+                let payload = self.persist_journal_payload(actor_id, journal_source_actor, args);
                 let _ = self.persistence.append_journal(
                     actor_id,
                     JournalEntry {
@@ -2064,9 +2227,10 @@ impl Runtime {
         }
     }
 
-    /// Return whether `behavior_id` names a real native or bytecode handler on
-    /// `target_id`. Behavior id 0 is valid only when the target actually
-    /// declares handler 0; invalid ids are never aliases for it.
+    /// Return whether `behavior_id` names a real native or executable
+    /// bytecode handler on `target_id`. Bytecode execution is schema-scoped
+    /// by `has_bytecode_handler`; numeric mailbox transport itself remains a
+    /// low-level primitive and may carry inert/unknown ids.
     fn actor_has_behavior_id(&self, target_id: u64, behavior_id: u16) -> bool {
         let behavior_idx = behavior_id as usize;
         let has_native = self
@@ -2079,31 +2243,31 @@ impl Runtime {
 
     pub fn behavior_id_for(&self, target_id: u64, behavior: &str) -> Option<u16> {
         let actor = self.actors.get(&target_id)?;
-        // Allocation-free match: `entry.name == behavior`, or
-        // `entry.name` ends with `.<behavior>` (qualified name).
         let matches = |name: &str| {
             name == behavior
                 || name
                     .strip_suffix(behavior)
                     .is_some_and(|prefix| prefix.ends_with('.'))
         };
-        // Search the per-actor behavior table first (native handlers).
         if let Some(idx) = actor
             .behavior_table
             .iter()
             .position(|entry| matches(&entry.name))
         {
-            return Some(idx as u16);
+            return u16::try_from(idx).ok();
         }
-        // Fall back to the module-level behavior table (bytecode handlers).
-        // Returns the GLOBAL index into module.behaviors, which matches
-        // what bytecode_offsets expects.
+
         let module = actor.bytecode_module.as_ref()?;
-        module
-            .behaviors
-            .iter()
-            .position(|b| matches(&b.name))
-            .map(|idx| idx as u16)
+        if module.actor_metadata.is_empty() {
+            return module
+                .behaviors
+                .iter()
+                .position(|entry| matches(&entry.name))
+                .and_then(|idx| u16::try_from(idx).ok());
+        }
+
+        behavior_ownership::runtime_behavior_id_for_actor_name(module, &actor.name, behavior)
+            .and_then(|idx| u16::try_from(idx).ok())
     }
 
     /// Resolve a public name-based delivery without reintroducing the old
@@ -2146,13 +2310,12 @@ impl Runtime {
     /// target actor has been hydrated on the local shard.
     fn resolve_grain_behavior_id(&self, grain_id: &GrainId, behavior_name: &str) -> Option<u16> {
         let grain_type = self.grain_registry.get(&grain_id.grain_type)?;
-        let suffix = format!(".{}", behavior_name);
-        grain_type
-            .module
-            .behaviors
-            .iter()
-            .position(|b| b.name == behavior_name || b.name.ends_with(&suffix))
-            .map(|idx| idx as u16)
+        behavior_ownership::runtime_behavior_id_for_name(
+            &grain_type.module,
+            &grain_id.grain_type,
+            behavior_name,
+        )
+        .and_then(|idx| u16::try_from(idx).ok())
     }
 
     /// Send a message to an actor owned by another shard. Validates that the
@@ -2459,17 +2622,14 @@ impl Runtime {
         // Forwarding for migrated actors: if this actor has been relocated
         // to another node, route the message there instead of bouncing it.
         if let Some(&(target_node, _migrated_at)) = self.migrated_actors.get(&target_id) {
-            // Look up the behavior name from the recovery module.
-            let behavior_name = self
-                .recovery_modules
-                .get(&target_id)
-                .and_then(|(module, _, _)| {
-                    module
-                        .behaviors
-                        .get(behavior_id as usize)
-                        .map(|b| b.name.clone())
-                })
-                .unwrap_or_else(|| format!("behavior_{}", behavior_id));
+            let Some(behavior_name) = self.recovery_behavior_wire_name_for(target_id, behavior_id)
+            else {
+                warn!(
+                    "nulang-net: refusing migrated forwarding for actor {} behavior {}: missing canonical schema ownership",
+                    target_id, behavior_id
+                );
+                return;
+            };
             let target = ActorAddress::remote(target_node, target_id);
             self.send_distributed(target, &behavior_name, args);
             return;
@@ -3204,8 +3364,10 @@ impl Runtime {
     fn actor_module_hash(&self, actor_id: u64) -> [u8; 32] {
         self.actors
             .get(&actor_id)
-            .and_then(|a| a.bytecode_module.as_ref())
-            .and_then(|m| m.actor_metadata.iter().find_map(|m| m.type_hash))
+            .and_then(|actor| {
+                let module = actor.bytecode_module.as_ref()?;
+                behavior_ownership::actor_meta_for_runtime_name(module, &actor.name)?.type_hash
+            })
             .unwrap_or([0u8; 32])
     }
 
@@ -3213,7 +3375,7 @@ impl Runtime {
     /// updating the actor's own sequence/dirty tracking.
     fn build_actor_snapshot(&self, actor_id: u64) -> Option<ActorSnapshot> {
         let mut state = std::collections::HashMap::new();
-        let (waiting_signal, authority_tokens) = {
+        let (waiting_signal, activation_epoch, schema_name, authority_tokens) = {
             let actor = self.actors.get(&actor_id)?;
             for (name, value) in &actor.state_data {
                 let model = actor
@@ -3222,29 +3384,7 @@ impl Runtime {
                     .copied()
                     .unwrap_or(StateModel::Local);
                 if model == StateModel::Durable || model.is_crdt() {
-                    let persisted = if name == "semantic_memory" || name == "procedural_memory" {
-                        #[cfg(feature = "ai-runtime")]
-                        {
-                            self.vm_value_to_string_in_actor(value, actor)
-                                .map(PersistedValue::String)
-                                .unwrap_or_else(|| {
-                                    PersistedValue::from_value_resolved(
-                                        value,
-                                        actor.bytecode_module.as_ref(),
-                                    )
-                                })
-                        }
-                        #[cfg(not(feature = "ai-runtime"))]
-                        {
-                            PersistedValue::from_value_resolved(
-                                value,
-                                actor.bytecode_module.as_ref(),
-                            )
-                        }
-                    } else {
-                        PersistedValue::from_value_resolved(value, actor.bytecode_module.as_ref())
-                    };
-                    state.insert(name.clone(), persisted);
+                    state.insert(name.clone(), actor.persist_value(value));
                 }
             }
             let authority_tokens = match actor.authority_manifest() {
@@ -3257,7 +3397,21 @@ impl Runtime {
                     return None;
                 }
             };
-            (actor.waiting_signal.clone(), authority_tokens)
+            (
+                actor.waiting_signal.clone(),
+                actor.activation_epoch,
+                actor
+                    .bytecode_module
+                    .as_ref()
+                    .and_then(|module| {
+                        schema_identity::canonical_schema_name_for_runtime_actor(
+                            module,
+                            &actor.name,
+                        )
+                    })
+                    .map(str::to_owned),
+                authority_tokens,
+            )
         };
         let sequence = self.next_sequence(actor_id);
         let crdt_snapshot = self.crdt_manager.as_ref().map(|m| {
@@ -3276,10 +3430,12 @@ impl Runtime {
         Some(ActorSnapshot {
             actor_id,
             sequence,
+            activation_epoch,
             state,
             waiting_signal,
             crdt_snapshot,
             crdt_field_map,
+            schema_name,
             authority_tokens,
         })
     }
@@ -3680,6 +3836,7 @@ impl Runtime {
                 actor.idle_ms = 0;
             }
             let behavior_idx = msg.behavior_id as usize;
+            let journal_source_actor = (msg.sender != 0).then_some(msg.sender);
 
             // ORCA receiver protocol: hold every heap pointer in the
             // received payload so the owning objects (and any retired
@@ -3701,6 +3858,7 @@ impl Runtime {
             };
             self.current_trace = Some(trace_ctx);
             let _span_guard = trace_ctx.enter_dispatch_span(actor_id, behavior_idx);
+            let mut workflow_activation = None;
             // Intercept semantic-memory behaviors generated by compile_agent.
             // They are bytecode behaviors but are implemented directly by the
             // runtime against the durable `semantic_memory` state field.
@@ -3710,15 +3868,36 @@ impl Runtime {
             if self.actor_is_agent(actor_id) && self.is_semantic_memory_behavior(&behavior_name) {
                 if self.actor_is_persistent(actor_id) {
                     let seq = self.next_sequence(actor_id);
-                    let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                    let _ = self.persistence.append_journal(
+                    let payload =
+                        self.persist_journal_payload(actor_id, journal_source_actor, &msg.payload);
+                    match self.persistence.append_journal(
                         actor_id,
                         JournalEntry {
                             sequence: seq,
                             behavior_id: msg.behavior_id,
                             payload,
                         },
-                    );
+                    ) {
+                        Ok(()) => {
+                            if self.actor_is_workflow(actor_id) {
+                                workflow_activation =
+                                    Some(WorkflowActivationId::new(actor_id, seq));
+                                if let Some(actor) = self.actors.get_mut(&actor_id) {
+                                    actor.current_workflow_activation = workflow_activation;
+                                }
+                            }
+                        }
+                        Err(error) if self.actor_is_workflow(actor_id) => {
+                            tracing::error!(
+                                actor_id,
+                                %error,
+                                "nulang-workflow: refusing command execution after durable admission failed"
+                            );
+                            self.current_actor = None;
+                            return;
+                        }
+                        Err(_) => {}
+                    }
                 }
                 let content = msg
                     .payload
@@ -3746,15 +3925,36 @@ impl Runtime {
             if self.actor_is_agent(actor_id) && self.is_procedural_memory_behavior(&behavior_name) {
                 if self.actor_is_persistent(actor_id) {
                     let seq = self.next_sequence(actor_id);
-                    let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                    let _ = self.persistence.append_journal(
+                    let payload =
+                        self.persist_journal_payload(actor_id, journal_source_actor, &msg.payload);
+                    match self.persistence.append_journal(
                         actor_id,
                         JournalEntry {
                             sequence: seq,
                             behavior_id: msg.behavior_id,
                             payload,
                         },
-                    );
+                    ) {
+                        Ok(()) => {
+                            if self.actor_is_workflow(actor_id) {
+                                workflow_activation =
+                                    Some(WorkflowActivationId::new(actor_id, seq));
+                                if let Some(actor) = self.actors.get_mut(&actor_id) {
+                                    actor.current_workflow_activation = workflow_activation;
+                                }
+                            }
+                        }
+                        Err(error) if self.actor_is_workflow(actor_id) => {
+                            tracing::error!(
+                                actor_id,
+                                %error,
+                                "nulang-workflow: refusing command execution after durable admission failed"
+                            );
+                            self.current_actor = None;
+                            return;
+                        }
+                        Err(_) => {}
+                    }
                 }
                 match behavior_name.as_str() {
                     "store_pattern" => {
@@ -3881,38 +4081,126 @@ impl Runtime {
             }
 
             let mut processed = false;
+            let mut atomic_workflow_turn = false;
             if self.has_native_handler(actor_id, behavior_idx) {
-                // Journal the message before handling so recovery can replay it.
+                // Native user workflow turns are the first RFC 0022 rollout
+                // slice: they cannot suspend or emit bytecode-only intermediate
+                // workflow effects, so command admission and terminal closure
+                // can safely stay on one atomic tail.
                 if self.actor_is_persistent(actor_id) {
-                    let seq = self.next_sequence(actor_id);
-                    let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                    let _ = self.persistence.append_journal(
-                        actor_id,
-                        JournalEntry {
-                            sequence: seq,
-                            behavior_id: msg.behavior_id,
-                            payload,
-                        },
-                    );
+                    let payload =
+                        self.persist_journal_payload(actor_id, journal_source_actor, &msg.payload);
+                    let use_atomic_workflow_turn = self.actor_is_workflow(actor_id)
+                        && !self.is_internal_behavior(actor_id, behavior_idx);
+                    if use_atomic_workflow_turn {
+                        let recovered_activation = self.actors.get(&actor_id).and_then(|actor| {
+                            actor.current_workflow_activation.filter(|activation| {
+                                activation.actor_id == actor_id
+                                    && activation.command_sequence == actor.sequence
+                            })
+                        });
+                        if let Some(activation) = recovered_activation {
+                            // Recovery already proved that this exact command is
+                            // the open atomic tail. Execute it under the original
+                            // activation instead of admitting a duplicate
+                            // command transition.
+                            workflow_activation = Some(activation);
+                            atomic_workflow_turn = true;
+                        } else {
+                            match workflow::commit_workflow_command(
+                                self,
+                                actor_id,
+                                msg.behavior_id,
+                                payload,
+                            ) {
+                                Ok(activation) => {
+                                    workflow_activation = Some(activation);
+                                    atomic_workflow_turn = true;
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        actor_id,
+                                        %error,
+                                        "nulang-workflow: refusing command execution after atomic durable admission failed"
+                                    );
+                                    self.current_actor = None;
+                                    return;
+                                }
+                            }
+                        }
+                    } else {
+                        let seq = self.next_sequence(actor_id);
+                        match self.persistence.append_journal(
+                            actor_id,
+                            JournalEntry {
+                                sequence: seq,
+                                behavior_id: msg.behavior_id,
+                                payload,
+                            },
+                        ) {
+                            Ok(()) => {
+                                if self.actor_is_workflow(actor_id) {
+                                    workflow_activation =
+                                        Some(WorkflowActivationId::new(actor_id, seq));
+                                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+                                        actor.current_workflow_activation = workflow_activation;
+                                    }
+                                }
+                            }
+                            Err(error) if self.actor_is_workflow(actor_id) => {
+                                tracing::error!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-workflow: refusing command execution after durable admission failed"
+                                );
+                                self.current_actor = None;
+                                return;
+                            }
+                            Err(_) => {}
+                        }
+                    }
                 }
                 processed = self.dispatch_native_handler(actor_id, behavior_idx, &msg.payload);
-                if processed {
+                if processed && !atomic_workflow_turn {
                     self.checkpoint_actor(actor_id);
                 }
             }
             if !processed && self.has_bytecode_handler(actor_id, behavior_idx) {
-                // Journal before executing bytecode as well.
+                // Compiled workflow turns remain on the legacy path until
+                // custom events, timers/signals, suspension markers, failures,
+                // compensation, and effect replay all share the atomic tail.
                 if self.actor_is_persistent(actor_id) {
                     let seq = self.next_sequence(actor_id);
-                    let payload = msg.payload.iter().map(PersistedValue::from_value).collect();
-                    let _ = self.persistence.append_journal(
+                    let payload =
+                        self.persist_journal_payload(actor_id, journal_source_actor, &msg.payload);
+                    match self.persistence.append_journal(
                         actor_id,
                         JournalEntry {
                             sequence: seq,
                             behavior_id: msg.behavior_id,
                             payload,
                         },
-                    );
+                    ) {
+                        Ok(()) => {
+                            if self.actor_is_workflow(actor_id) {
+                                workflow_activation =
+                                    Some(WorkflowActivationId::new(actor_id, seq));
+                                if let Some(actor) = self.actors.get_mut(&actor_id) {
+                                    actor.current_workflow_activation = workflow_activation;
+                                }
+                            }
+                        }
+                        Err(error) if self.actor_is_workflow(actor_id) => {
+                            tracing::error!(
+                                actor_id,
+                                %error,
+                                "nulang-workflow: refusing command execution after durable admission failed"
+                            );
+                            self.current_actor = None;
+                            return;
+                        }
+                        Err(_) => {}
+                    }
                 }
                 let payload = msg.payload.clone();
                 // Enable non-blocking LLM suspension for this
@@ -3951,6 +4239,7 @@ impl Runtime {
                                 actor_id,
                                 WorkflowEvent::StepFailed {
                                     sequence: seq,
+                                    activation: workflow_activation,
                                     step_name,
                                     error: format!("{}", e),
                                 },
@@ -3965,18 +4254,9 @@ impl Runtime {
                 && self.actor_is_workflow(actor_id)
                 && !self.is_internal_behavior(actor_id, behavior_idx)
             {
-                let seq = self.next_sequence(actor_id);
-                let step_name = self.step_name_for(actor_id, behavior_idx);
-                let _ = self.persistence.append_workflow_event(
-                    actor_id,
-                    WorkflowEvent::StepCompleted {
-                        sequence: seq,
-                        step_name,
-                    },
-                );
                 // Synthetic parallel steps do not increment step_index in their
                 // bytecode (so signal-waiting branches do not double-increment);
-                // advance it here when the step completes.
+                // advance it before the terminal checkpoint/transition.
                 if self.is_parallel_step(actor_id, behavior_idx) {
                     if let Some(actor) = self.actors.get_mut(&actor_id) {
                         if let Some(n) =
@@ -3986,7 +4266,42 @@ impl Runtime {
                         }
                     }
                 }
-                self.checkpoint_actor(actor_id);
+
+                let step_name = self.step_name_for(actor_id, behavior_idx);
+                if atomic_workflow_turn {
+                    if let Err(error) = workflow::commit_step_completed(
+                        self,
+                        actor_id,
+                        workflow_activation,
+                        step_name,
+                    ) {
+                        tracing::error!(
+                            actor_id,
+                            %error,
+                            "nulang-workflow: terminal durable transition failed; discarding activation"
+                        );
+                        self.actors.remove(&actor_id);
+                        if self.recover_actor(actor_id).is_none() {
+                            tracing::error!(
+                                actor_id,
+                                "nulang-workflow: actor recovery failed after terminal durable transition failure"
+                            );
+                        }
+                        self.current_actor = None;
+                        return;
+                    }
+                } else {
+                    let seq = self.next_sequence(actor_id);
+                    let _ = self.persistence.append_workflow_event(
+                        actor_id,
+                        WorkflowEvent::StepCompleted {
+                            sequence: seq,
+                            activation: workflow_activation,
+                            step_name,
+                        },
+                    );
+                    self.checkpoint_actor(actor_id);
+                }
             }
             let actor = match self.actors.get_mut(&actor_id) {
                 Some(a) => a,
@@ -3995,6 +4310,7 @@ impl Runtime {
                     return;
                 }
             };
+            actor.current_workflow_activation = None;
             actor.increment_reductions(1);
             // Turn ownership now lives in finish_actor_turn. Keep reductions
             // live across the whole batch so should_yield observes cumulative
@@ -4275,10 +4591,20 @@ impl Runtime {
     }
 
     fn has_bytecode_handler(&self, actor_id: u64, behavior_idx: usize) -> bool {
-        self.actors
-            .get(&actor_id)
-            .map(|a| a.bytecode_module.is_some() && behavior_idx < a.bytecode_offsets.len())
-            .unwrap_or(false)
+        let Some(actor) = self.actors.get(&actor_id) else {
+            return false;
+        };
+        let Some(module) = actor.bytecode_module.as_ref() else {
+            return false;
+        };
+        if behavior_idx >= actor.bytecode_offsets.len() {
+            return false;
+        }
+        if module.actor_metadata.is_empty() {
+            return true;
+        }
+        behavior_ownership::module_behavior_index_for_actor(module, &actor.name, behavior_idx)
+            .is_some()
     }
 
     fn next_sequence(&self, actor_id: u64) -> u64 {
@@ -4290,7 +4616,12 @@ impl Runtime {
     /// Appends a `TimerSet` event, checkpoints state, and arms the runtime's
     /// timer wheel. When the timer fires the runtime will append a
     /// `TimerFired` event and deliver a `__timer_fired` message to the actor.
-    pub fn schedule_workflow_timer(&mut self, actor_id: u64, name: &str, duration_ms: u64) {
+    pub fn schedule_workflow_timer(
+        &mut self,
+        actor_id: u64,
+        name: &str,
+        duration_ms: u64,
+    ) -> std::io::Result<()> {
         workflow::schedule_workflow_timer(self, actor_id, name, duration_ms)
     }
 
@@ -4451,6 +4782,7 @@ impl Runtime {
             self.enqueue_actor(actor_id);
             return;
         }
+        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -4488,6 +4820,7 @@ impl Runtime {
                             actor_id,
                             crate::runtime::WorkflowEvent::StepCompleted {
                                 sequence: seq,
+                                activation: suspended.activation,
                                 step_name: suspended.step_name.clone(),
                             },
                         );
@@ -4503,6 +4836,7 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
+                                    activation: suspended.activation,
                                     step_name: suspended.step_name.clone(),
                                 });
                         }
@@ -4544,6 +4878,7 @@ impl Runtime {
             return;
         }
 
+        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -4581,6 +4916,7 @@ impl Runtime {
                             actor_id,
                             WorkflowEvent::StepCompleted {
                                 sequence: seq,
+                                activation: suspended.activation,
                                 step_name: suspended.step_name,
                             },
                         );
@@ -4600,6 +4936,7 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
+                                    activation: suspended.activation,
                                     step_name: suspended.step_name,
                                 });
                         }
@@ -4621,6 +4958,7 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: suspended.behavior_idx,
+                                    activation: suspended.activation,
                                     step_name: suspended.step_name,
                                 });
                         }
@@ -4653,7 +4991,15 @@ impl Runtime {
                     context,
                 } => {
                     if self.actor_is_workflow(target_actor) {
-                        let _ = self.append_timer_fired(target_actor, &context);
+                        if let Err(error) = self.append_timer_fired(target_actor, &context) {
+                            tracing::error!(
+                                actor_id = target_actor,
+                                timer = %context,
+                                %error,
+                                "nulang-workflow: refusing to deliver timer after durable TimerFired commit failed"
+                            );
+                            continue;
+                        }
                     }
                     self.send_message_by_id(target_actor, behavior_id, &payload);
                 }
@@ -4867,6 +5213,7 @@ impl Runtime {
                                 Some(crate::runtime::actor::SuspendedExecution {
                                     vm_state,
                                     behavior_idx: 0,
+                                    activation: actor.current_workflow_activation,
                                     step_name: String::new(),
                                 });
                             actor.jit_yield_pending = true;
@@ -4892,6 +5239,7 @@ impl Runtime {
                             Some(crate::runtime::actor::SuspendedExecution {
                                 vm_state,
                                 behavior_idx: 0,
+                                activation: actor.current_workflow_activation,
                                 step_name: String::new(),
                             });
                     }
@@ -5045,6 +5393,46 @@ impl Runtime {
     /// any other state captured in workflow events.
     pub fn recover_actor(&mut self, actor_id: u64) -> Option<u64> {
         let snapshot = self.persistence.load_snapshot(actor_id)?;
+        if snapshot.activation_epoch == 0 {
+            warn!(
+                "nulang-recover: refusing actor {} with invalid activation epoch 0",
+                actor_id
+            );
+            return None;
+        }
+        if snapshot.schema_name.is_some() && !self.recovery_modules.contains_key(&actor_id) {
+            warn!(
+                "nulang-recover: refusing actor {}: persisted schema identity has no registered compiler module",
+                actor_id
+            );
+            return None;
+        }
+        let selected_meta = if let Some((module, _, _)) = self.recovery_modules.get(&actor_id) {
+            if module.actor_metadata.is_empty() && snapshot.schema_name.is_none() {
+                None
+            } else {
+                match schema_identity::resolve_snapshot_actor_meta(
+                    module,
+                    snapshot.schema_name.as_deref(),
+                ) {
+                    Ok(meta) => Some(meta.clone()),
+                    Err(err) => {
+                        warn!(
+                            "nulang-recover: refusing actor {} with invalid schema identity: {}",
+                            actor_id, err
+                        );
+                        return None;
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        let recovery_schema_name = selected_meta
+            .as_ref()
+            .map(|meta| meta.name.clone())
+            .or_else(|| snapshot.schema_name.clone());
+
         let authority_manifest =
             match crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens) {
                 Ok(manifest) => manifest,
@@ -5057,24 +5445,132 @@ impl Runtime {
                 }
             };
         let workflow_events = self.persistence.read_workflow_events(actor_id);
-        let is_workflow = self
-            .recovery_modules
-            .get(&actor_id)
-            .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_workflow))
+        let is_workflow = selected_meta
+            .as_ref()
+            .map(|meta| meta.is_workflow)
             .unwrap_or(!workflow_events.is_empty());
-        let is_agent = self
-            .recovery_modules
-            .get(&actor_id)
-            .map(|(m, _, _)| m.actor_metadata.iter().any(|meta| meta.is_agent))
+        let is_agent = selected_meta
+            .as_ref()
+            .map(|meta| meta.is_agent)
             .unwrap_or(false);
 
-        let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
+        // RFC 0022 Phase B: classify only the narrow crash window already
+        // covered by atomic native workflow turns. If the committed atomic tail
+        // is ahead of the last safe snapshot and the record at that exact tail
+        // is a command, the process died after admission but before a later
+        // atomic transition could close or advance the activation.
+        //
+        // Do not generalize this to commands below the atomic tail: a later
+        // tail may represent an intermediate event/effect that requires the
+        // broader activation replay contract tracked by #836.
+        let pending_atomic_workflow_replay = if is_workflow {
+            match self.persistence.load_durable_tail_position(actor_id) {
+                Ok(Some(tail)) if tail.sequence > snapshot.sequence => {
+                    if tail.activation_epoch != snapshot.activation_epoch {
+                        warn!(
+                            "nulang-recover: refusing workflow actor {}: atomic tail epoch {} does not match safe snapshot epoch {}",
+                            actor_id, tail.activation_epoch, snapshot.activation_epoch
+                        );
+                        return None;
+                    }
+
+                    let activation = WorkflowActivationId::new(actor_id, tail.sequence);
+                    let terminal_recorded = workflow_events.iter().any(|event| {
+                        matches!(
+                            event,
+                            WorkflowEvent::StepCompleted {
+                                activation: Some(id),
+                                ..
+                            } | WorkflowEvent::StepFailed {
+                                activation: Some(id),
+                                ..
+                            } if *id == activation
+                        )
+                    });
+
+                    if terminal_recorded {
+                        None
+                    } else {
+                        self.persistence
+                            .read_journal(actor_id)
+                            .into_iter()
+                            .find(|entry| entry.sequence == tail.sequence)
+                            .map(|entry| (activation, entry))
+                    }
+                }
+                Ok(_) => None,
+                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
+                Err(error) => {
+                    warn!(
+                        "nulang-recover: refusing workflow actor {} after atomic tail read failed: {}",
+                        actor_id, error
+                    );
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+
+        let journal_to_replay: Vec<JournalEntry> = if is_workflow {
+            Vec::new()
+        } else {
+            self.persistence
+                .read_journal(actor_id)
+                .into_iter()
+                .filter(|entry| entry.sequence > snapshot.sequence)
+                .collect()
+        };
+        if let (Some(meta), Some((module, _, _))) =
+            (selected_meta.as_ref(), self.recovery_modules.get(&actor_id))
+        {
+            for entry in &journal_to_replay {
+                if behavior_ownership::module_behavior_index_for_runtime_id(
+                    module,
+                    &meta.name,
+                    entry.behavior_id as usize,
+                )
+                .is_none()
+                {
+                    warn!(
+                        "nulang-recover: refusing actor {}: journal behavior id {} is not owned by schema '{}'",
+                        actor_id, entry.behavior_id, meta.name
+                    );
+                    return None;
+                }
+            }
+            if let Some((_, entry)) = &pending_atomic_workflow_replay {
+                if behavior_ownership::module_behavior_index_for_runtime_id(
+                    module,
+                    &meta.name,
+                    entry.behavior_id as usize,
+                )
+                .is_none()
+                {
+                    warn!(
+                        "nulang-recover: refusing workflow actor {}: unfinished atomic command behavior id {} is not owned by schema '{}'",
+                        actor_id, entry.behavior_id, meta.name
+                    );
+                    return None;
+                }
+            }
+        }
+
+        let mut actor = Actor::new(
+            actor_id,
+            recovery_schema_name
+                .clone()
+                .unwrap_or_else(|| format!("actor_{}", actor_id)),
+            0,
+        );
         actor.persistent = true;
         actor.is_workflow = is_workflow;
         actor.is_agent = is_agent;
         actor.sequence = snapshot.sequence;
-        actor.waiting_signal = snapshot.waiting_signal;
+        actor.activation_epoch = snapshot.activation_epoch;
+        actor.waiting_signal = snapshot.waiting_signal.clone();
         actor.install_authority_manifest(&authority_manifest);
+        Self::restore_state_models_from_snapshot(&mut actor, selected_meta.as_ref(), &snapshot);
         // Restore CRDT state if present in the snapshot.
         if let Some(crdt_snap) = &snapshot.crdt_snapshot {
             if let Some(manager) = &mut self.crdt_manager {
@@ -5115,17 +5611,13 @@ impl Runtime {
         }
         // Parse cached retry/fallback configs from restored state for agents.
         if is_agent {
-            if let Some(module) = actor
-                .bytecode_module
-                .as_ref()
-                .or_else(|| self.recovery_modules.get(&actor_id).map(|(m, _, _)| m))
-            {
-                for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
-                    if let crate::bytecode::Constant::String(json) = c {
+            if let Some(meta) = selected_meta.as_ref() {
+                for (name, constant) in &meta.state_defaults {
+                    if let crate::bytecode::Constant::String(json) = constant {
                         if name == "retry_config" {
-                            actor.retry_config = serde_json::from_str(&json).ok();
+                            actor.retry_config = serde_json::from_str(json).ok();
                         } else if name == "fallback_config" {
-                            actor.fallback_config = serde_json::from_str(&json).unwrap_or_default();
+                            actor.fallback_config = serde_json::from_str(json).unwrap_or_default();
                         }
                     }
                 }
@@ -5139,6 +5631,12 @@ impl Runtime {
         // which validates this behavior.
         let events = self.persistence.read_events(actor_id);
         if !events.is_empty() {
+            for entry in &events {
+                actor
+                    .state_models
+                    .entry(entry.field_name.clone())
+                    .or_insert(StateModel::EventSourced);
+            }
             for entry in &events {
                 let v = entry.value.to_value_on_heap(&mut actor);
                 actor.set_state_field(&entry.field_name, v);
@@ -5168,8 +5666,12 @@ impl Runtime {
         // persisted events legitimately has no value yet either, but
         // that's a separate, pre-existing question this fix doesn't
         // change.
-        if let Some(module) = self.recovery_modules.get(&actor_id).map(|(m, _, _)| m) {
-            for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
+        if self.recovery_modules.contains_key(&actor_id) {
+            let defaults = selected_meta
+                .as_ref()
+                .map(|meta| meta.state_defaults.as_slice())
+                .unwrap_or(&[]);
+            for (name, c) in defaults {
                 if actor.get_state_field(name).is_some() {
                     continue;
                 }
@@ -5185,29 +5687,39 @@ impl Runtime {
             actor.bytecode_module = Some(module.clone());
             actor.bytecode_offsets = offsets.clone();
             actor.compensation_offsets = comp_offsets.clone();
-            // Restore per-field state-model tracking (Local/Durable/
-            // EventSourced/Crdt), lost when `Actor::new` built a bare
-            // actor above. Without this, `checkpoint_actor`'s
-            // Durable/Crdt snapshot filter and `emit_event`'s
-            // EventSourced "+1" bump both silently fall back to
-            // treating every field as `Local` (via their
-            // `unwrap_or(StateModel::Local)`), breaking persistence for
-            // any field mutated after this recovery: a second crash
-            // would drop Durable fields from the snapshot entirely, and
-            // EventSourced fields would stop accumulating via emitted
-            // events.
-            actor.state_models = module
-                .actor_metadata
-                .iter()
-                .flat_map(|m| &m.state_models)
-                .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
-                .collect();
         }
+        if let Some((activation, entry)) = &pending_atomic_workflow_replay {
+            let payload = entry
+                .payload
+                .iter()
+                .map(|value| value.to_value_on_heap(&mut actor))
+                .collect();
+            actor.current_workflow_activation = Some(*activation);
+            actor.sequence = entry.sequence;
+            if actor
+                .mailbox
+                .push_local(Message {
+                    behavior_id: entry.behavior_id,
+                    payload: MessagePayload::from_vec(payload),
+                    sender: 0,
+                    priority: MessagePriority::Normal,
+                    trace_id: None,
+                })
+                .is_err()
+            {
+                warn!(
+                    "nulang-recover: refusing workflow actor {}: recovered atomic command could not enter empty mailbox",
+                    actor_id
+                );
+                return None;
+            }
+        }
+        if let Some(schema_name) = recovery_schema_name {
+            self.recovery_schema_names.insert(actor_id, schema_name);
+        }
+        self.actors.insert(actor_id, actor);
         if is_workflow {
-            self.actors.insert(actor_id, actor);
             self.layout_workflow_behavior_table(actor_id);
-        } else {
-            self.actors.insert(actor_id, actor);
         }
         // Ensure CRDT-backed fields are registered (or re-registered after
         // recovery). `register_actor_fields` is idempotent, so declared fields
@@ -5288,16 +5800,17 @@ impl Runtime {
                 }
             }
         } else {
-            // Replay journal entries that arrived after the snapshot.
-            let journal = self.persistence.read_journal(actor_id);
-            let entries_to_replay: Vec<_> = journal
-                .iter()
-                .filter(|e| e.sequence > snapshot.sequence)
-                .cloned()
-                .collect();
-            for entry in entries_to_replay {
+            // Replay entries that were schema-validated before actor publication.
+            for entry in journal_to_replay {
                 let behavior_idx = entry.behavior_id as usize;
-                let payload: Vec<Value> = entry.payload.iter().map(|p| p.to_value()).collect();
+                let payload: Vec<Value> = {
+                    let actor = self.actors.get_mut(&actor_id)?;
+                    entry
+                        .payload
+                        .iter()
+                        .map(|value| value.to_value_on_heap(actor))
+                        .collect()
+                };
                 if self.has_native_handler(actor_id, behavior_idx) {
                     let _ = self.dispatch_native_handler(actor_id, behavior_idx, &payload);
                     if let Some(actor) = self.actors.get_mut(&actor_id) {
@@ -5324,62 +5837,141 @@ impl Runtime {
     /// Restores persistent flags, state models, durable fields, and default
     /// values.  Does NOT register the recovery module, restore CRDT state,
     /// insert into `self.actors`, or enqueue - callers do those.
+    fn restore_state_models_from_snapshot(
+        actor: &mut Actor,
+        meta: Option<&crate::bytecode::ActorMeta>,
+        snapshot: &ActorSnapshot,
+    ) {
+        actor.state_models = meta
+            .into_iter()
+            .flat_map(|meta| &meta.state_models)
+            .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
+            .collect();
+
+        // Snapshot state contains only Durable or CRDT fields. Infer only
+        // runtime-created models absent from the selected compiler-owned
+        // schema; never flatten metadata across sibling actor schemas.
+        for name in snapshot.state.keys() {
+            if actor.state_models.contains_key(name) {
+                continue;
+            }
+
+            let crdt_model = snapshot
+                .crdt_field_map
+                .as_ref()
+                .and_then(|field_map| field_map.get(name))
+                .and_then(|crdt_id| {
+                    snapshot.crdt_snapshot.as_ref().and_then(|entries| {
+                        entries
+                            .iter()
+                            .find(|(id, _, _)| id == crdt_id)
+                            .and_then(|(_, ty, _)| crate::ast::CrdtType::from_u8(*ty))
+                    })
+                })
+                .map(StateModel::Crdt);
+
+            actor
+                .state_models
+                .insert(name.clone(), crdt_model.unwrap_or(StateModel::Durable));
+        }
+    }
+
     fn restore_actor_from_snapshot(
         actor_id: u64,
         module: &crate::bytecode::CodeModule,
         snapshot: &ActorSnapshot,
-        is_workflow: bool,
-        is_agent: bool,
-    ) -> Result<Actor, crate::authority_runtime::RuntimeAuthorityError> {
-        let authority_manifest =
-            crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens)?;
-        let offsets: Vec<usize> = crate::runtime::spawn::bytecode_offsets_for(module, is_workflow);
-        let compensation_offsets: Vec<Option<usize>> = if is_workflow {
-            module
-                .actor_metadata
+        expected_schema_name: Option<&str>,
+        runtime_name: Option<String>,
+    ) -> Result<Actor, String> {
+        if snapshot.activation_epoch == 0 {
+            return Err(format!(
+                "actor {} snapshot has invalid activation epoch 0",
+                actor_id
+            ));
+        }
+        if module.actor_metadata.is_empty()
+            && snapshot.schema_name.is_none()
+            && expected_schema_name.is_none()
+        {
+            let authority_manifest =
+                crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens)
+                    .map_err(|err| err.to_string())?;
+            let mut actor = Actor::new(
+                actor_id,
+                runtime_name.unwrap_or_else(|| format!("actor_{}", actor_id)),
+                0,
+            );
+            actor.persistent = true;
+            actor.sequence = snapshot.sequence;
+            actor.activation_epoch = snapshot.activation_epoch;
+            actor.waiting_signal = snapshot.waiting_signal.clone();
+            actor.install_authority_manifest(&authority_manifest);
+            actor.bytecode_module = Some(module.clone());
+            actor.bytecode_offsets = module
+                .behaviors
                 .iter()
-                .find(|m| m.is_workflow)
-                .map(|meta| {
-                    meta.behavior_indices
-                        .iter()
-                        .map(|&i| module.behaviors[i].compensate_offset.map(|o| o as usize))
-                        .collect()
-                })
-                .unwrap_or_else(|| {
-                    module
-                        .behaviors
-                        .iter()
-                        .map(|b| b.compensate_offset.map(|o| o as usize))
-                        .collect()
-                })
+                .map(|behavior| behavior.code_offset as usize)
+                .collect();
+            actor.compensation_offsets = module
+                .behaviors
+                .iter()
+                .map(|behavior| behavior.compensate_offset)
+                .collect();
+            Self::restore_state_models_from_snapshot(&mut actor, None, snapshot);
+            for (name, value) in &snapshot.state {
+                let value = value.to_value_on_heap(&mut actor);
+                actor.set_state_field(name, value);
+            }
+            return Ok(actor);
+        }
+
+        let meta = match expected_schema_name {
+            Some(expected) => schema_identity::resolve_expected_snapshot_actor_meta(
+                module,
+                snapshot.schema_name.as_deref(),
+                expected,
+            ),
+            None => schema_identity::resolve_snapshot_actor_meta(
+                module,
+                snapshot.schema_name.as_deref(),
+            ),
+        }
+        .map_err(|err| err.to_string())?;
+        let role = meta.role().map_err(|err| err.to_string())?;
+        let authority_manifest =
+            crate::authority::AuthorityManifest::from_token_set(&snapshot.authority_tokens)
+                .map_err(|err| err.to_string())?;
+        let offsets = crate::runtime::spawn::bytecode_offsets_for_role(module, role);
+        let compensation_offsets: Vec<Option<usize>> = if meta.is_workflow {
+            meta.behavior_indices
+                .iter()
+                .map(|&i| module.behaviors[i].compensate_offset)
+                .collect()
         } else {
             module
                 .behaviors
                 .iter()
-                .map(|b| b.compensate_offset.map(|o| o as usize))
+                .map(|behavior| behavior.compensate_offset)
                 .collect()
         };
 
-        let mut actor = Actor::new(actor_id, format!("actor_{}", actor_id), 0);
+        let mut actor = Actor::new(
+            actor_id,
+            runtime_name.unwrap_or_else(|| meta.name.clone()),
+            0,
+        );
         actor.persistent = true;
-        actor.is_workflow = is_workflow;
-        actor.is_agent = is_agent;
+        actor.is_workflow = meta.is_workflow;
+        actor.is_agent = meta.is_agent;
         actor.sequence = snapshot.sequence;
+        actor.activation_epoch = snapshot.activation_epoch;
         actor.waiting_signal = snapshot.waiting_signal.clone();
         actor.install_authority_manifest(&authority_manifest);
         actor.bytecode_module = Some(module.clone());
         actor.bytecode_offsets = offsets;
         actor.compensation_offsets = compensation_offsets;
+        Self::restore_state_models_from_snapshot(&mut actor, Some(meta), snapshot);
 
-        // Restore per-field state-model tracking.
-        actor.state_models = module
-            .actor_metadata
-            .iter()
-            .flat_map(|m| &m.state_models)
-            .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
-            .collect();
-
-        // Restore durable state fields from the snapshot.
         for (name, value) in &snapshot.state {
             if name == "semantic_memory" || name == "procedural_memory" {
                 if let PersistedValue::String(json) = value {
@@ -5388,20 +5980,31 @@ impl Runtime {
                     continue;
                 }
             }
-            let v = value.to_value_on_heap(&mut actor);
-            actor.set_state_field(name, v);
+            let value = value.to_value_on_heap(&mut actor);
+            actor.set_state_field(name, value);
         }
 
-        // Fill in declared initial values for fields not touched above.
-        for (name, c) in module.actor_metadata.iter().flat_map(|m| &m.state_defaults) {
+        for (name, constant) in &meta.state_defaults {
             if actor.get_state_field(name).is_some() {
                 continue;
             }
-            let v = match c {
-                crate::bytecode::Constant::String(s) => actor.allocate_string(s),
+            let value = match constant {
+                crate::bytecode::Constant::String(value) => actor.allocate_string(value),
                 other => crate::vm::constant_to_value(other),
             };
-            actor.set_state_field(name, v);
+            actor.set_state_field(name, value);
+        }
+
+        if meta.is_agent {
+            for (name, constant) in &meta.state_defaults {
+                if let crate::bytecode::Constant::String(json) = constant {
+                    if name == "retry_config" {
+                        actor.retry_config = serde_json::from_str(json).ok();
+                    } else if name == "fallback_config" {
+                        actor.fallback_config = serde_json::from_str(json).unwrap_or_default();
+                    }
+                }
+            }
         }
 
         Ok(actor)
@@ -5443,12 +6046,12 @@ impl Runtime {
                 stable_actor_id,
                 &grain_type.module,
                 snap,
-                false,
-                false,
+                Some(&grain_id.grain_type),
+                Some(grain_id.actor_name()),
             )
             .map_err(|err| NuError::RuntimeError {
                 msg: format!(
-                    "invalid authority snapshot for virtual actor {}: {}",
+                    "invalid durable snapshot for virtual actor {}: {}",
                     grain_id.actor_name(),
                     err
                 ),
@@ -5465,13 +6068,11 @@ impl Runtime {
                 .iter()
                 .map(|(name, model)| (name.clone(), *model))
                 .collect();
-            // Fill declared initial values.
-            for (name, c) in grain_type
-                .module
-                .actor_metadata
-                .iter()
-                .flat_map(|m| &m.state_defaults)
-            {
+            // Fill declared initial values only from the requested grain schema.
+            let grain_meta =
+                behavior_ownership::actor_meta_for_schema(&grain_type.module, &grain_id.grain_type)
+                    .expect("registered grain type must retain its ActorMeta");
+            for (name, c) in &grain_meta.state_defaults {
                 let v = match c {
                     crate::bytecode::Constant::String(s) => actor.allocate_string(&s),
                     other => crate::vm::constant_to_value(&other),
@@ -5481,7 +6082,9 @@ impl Runtime {
             actor
         };
 
-        // Track the grain identity.
+        // Track canonical schema and grain identity.
+        self.recovery_schema_names
+            .insert(stable_actor_id, grain_id.grain_type.clone());
         self.actors.insert(stable_actor_id, actor);
         self.grain_residents
             .insert(grain_id.clone(), stable_actor_id);
@@ -5494,7 +6097,22 @@ impl Runtime {
             let journal = self.persistence.read_journal(stable_actor_id);
             for entry in journal.iter().filter(|e| e.sequence > snap.sequence) {
                 let behavior_idx = entry.behavior_id as usize;
-                let payload: Vec<Value> = entry.payload.iter().map(|p| p.to_value()).collect();
+                let payload: Vec<Value> = {
+                    let actor = self.actors.get_mut(&stable_actor_id).ok_or_else(|| {
+                        NuError::RuntimeError {
+                            msg: format!(
+                                "virtual actor {} disappeared during journal replay",
+                                stable_actor_id
+                            ),
+                            span: Span::new(0, 0),
+                        }
+                    })?;
+                    entry
+                        .payload
+                        .iter()
+                        .map(|value| value.to_value_on_heap(actor))
+                        .collect()
+                };
                 if self.has_native_handler(stable_actor_id, behavior_idx) {
                     // Native handlers cannot be resolved until the actor is in
                     // `self.actors`, so we only support bytecode grains here.
@@ -5559,52 +6177,54 @@ impl Runtime {
             }
         };
 
-        let is_workflow = module.actor_metadata.iter().any(|m| m.is_workflow);
-        let is_agent = module.actor_metadata.iter().any(|m| m.is_agent);
-
-        let actor = match Self::restore_actor_from_snapshot(
-            actor_id,
-            &module,
-            &snapshot,
-            is_workflow,
-            is_agent,
-        ) {
-            Ok(actor) => actor,
-            Err(err) => {
-                warn!(
-                    "nulang-migrate: invalid authority manifest for actor {}: {}",
-                    actor_id, err
-                );
-                return false;
+        let schema_meta = if module.actor_metadata.is_empty() && snapshot.schema_name.is_none() {
+            None
+        } else {
+            match schema_identity::resolve_snapshot_actor_meta(
+                &module,
+                snapshot.schema_name.as_deref(),
+            ) {
+                Ok(meta) => Some(meta.clone()),
+                Err(err) => {
+                    warn!(
+                        "nulang-migrate: invalid schema identity for actor {}: {}",
+                        actor_id, err
+                    );
+                    return false;
+                }
             }
         };
+        let is_workflow = schema_meta.as_ref().is_some_and(|meta| meta.is_workflow);
 
-        // Register the recovery module.
-        let offsets: Vec<usize> = module
-            .behaviors
-            .iter()
-            .map(|b| b.code_offset as usize)
-            .collect();
-        // Filter compensation_offsets to this actor's own behaviors using
-        // behavior_indices from the first workflow ActorMeta (a migrated
-        // actor module carries its own metadata).
-        let compensation_offsets: Vec<Option<usize>> = module
-            .actor_metadata
-            .iter()
-            .find(|m| m.is_workflow)
-            .map(|meta| {
-                meta.behavior_indices
-                    .iter()
-                    .map(|&i| module.behaviors[i].compensate_offset.map(|o| o as usize))
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                module
-                    .behaviors
-                    .iter()
-                    .map(|b| b.compensate_offset.map(|o| o as usize))
-                    .collect()
-            });
+        let actor =
+            match Self::restore_actor_from_snapshot(actor_id, &module, &snapshot, None, None) {
+                Ok(actor) => actor,
+                Err(err) => {
+                    warn!(
+                        "nulang-migrate: invalid durable snapshot for actor {}: {}",
+                        actor_id, err
+                    );
+                    return false;
+                }
+            };
+
+        // The target must own a durable local copy before the actor becomes
+        // runnable. Without this, a crash immediately after migration/failover
+        // would lose the received state and, critically, its fencing epoch.
+        if let Err(error) = self.persistence.save_snapshot(snapshot.clone()) {
+            warn!(
+                "nulang-migrate: refusing actor {} because the received snapshot could not be persisted locally: {}",
+                actor_id, error
+            );
+            return false;
+        }
+
+        let offsets = actor.bytecode_offsets.clone();
+        let compensation_offsets = actor.compensation_offsets.clone();
+        if let Some(schema_meta) = &schema_meta {
+            self.recovery_schema_names
+                .insert(actor_id, schema_meta.name.clone());
+        }
         self.recovery_modules
             .insert(actor_id, (module, offsets, compensation_offsets));
 
@@ -5631,10 +6251,10 @@ impl Runtime {
             }
         }
 
+        self.actors.insert(actor_id, actor);
         if is_workflow {
             self.layout_workflow_behavior_table(actor_id);
         }
-        self.actors.insert(actor_id, actor);
         if let Some(ref mut mgr) = self.crdt_manager {
             if let Some(actor) = self.actors.get(&actor_id) {
                 mgr.register_actor_fields(actor_id, actor);
@@ -6332,13 +6952,18 @@ impl Runtime {
                 .map(|a| a.persistent)
                 .unwrap_or(false)
         {
-            self.respawn_opted.entry(child_id).or_insert(1);
+            self.respawn_opted.insert(child_id);
+            let epoch = self
+                .actors
+                .get(&child_id)
+                .map(|actor| actor.activation_epoch)
+                .unwrap_or(crate::runtime::persistence::INITIAL_ACTIVATION_EPOCH);
             if let Some(cluster) = self.distributed.cluster.as_mut() {
                 let node = self.distributed.node_id.unwrap_or(NodeId::LOCAL);
                 cluster.announce_directory(DurableDirectoryEntry {
                     actor_id: child_id,
                     node_id: node,
-                    epoch: 1,
+                    epoch,
                 });
             }
         }
@@ -6736,7 +7361,14 @@ impl Runtime {
         actor_id: u64,
         snapshot: &crate::runtime::persistence::ActorSnapshot,
     ) {
-        let Some(&epoch) = self.respawn_opted.get(&actor_id) else {
+        if !self.respawn_opted.contains(&actor_id) {
+            return;
+        }
+        let Some(epoch) = self
+            .actors
+            .get(&actor_id)
+            .map(|actor| actor.activation_epoch)
+        else {
             return;
         };
         let Some(cluster) = self.distributed.cluster.as_ref() else {
@@ -6800,9 +7432,10 @@ impl Runtime {
             .map(|c| {
                 self.respawn_opted
                     .iter()
-                    .filter_map(|(actor_id, epoch)| {
+                    .filter_map(|actor_id| {
+                        let epoch = self.actors.get(actor_id)?.activation_epoch;
                         c.directory_entry(*actor_id)
-                            .filter(|entry| entry.epoch > *epoch)
+                            .filter(|entry| entry.epoch > epoch)
                             .map(|entry| (*actor_id, entry.node_id))
                     })
                     .collect()
@@ -6833,26 +7466,27 @@ impl Runtime {
     /// replicates the final snapshot to its shadow) and then terminate the
     /// local copy. A goodbye that merely lists the manifest without
     /// terminating would leave two live copies once the shadow re-spawns.
-    pub(crate) fn goodbye_self(&mut self) {
-        let opted: Vec<u64> = self.respawn_opted.keys().copied().collect();
-        for actor_id in opted {
-            // Skip non-durable entries (they cannot be checkpointed and are
-            // not in the directory's re-spawn set anyway).
-            if !self
-                .actors
-                .get(&actor_id)
-                .map(|a| a.persistent)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            self.checkpoint_actor(actor_id);
+    pub(crate) fn goodbye_self(&mut self) -> Vec<(u64, u64)> {
+        let mut opted: Vec<(u64, u64)> = self
+            .respawn_opted
+            .iter()
+            .filter_map(|actor_id| {
+                self.actors
+                    .get(actor_id)
+                    .filter(|actor| actor.persistent)
+                    .map(|actor| (*actor_id, actor.activation_epoch))
+            })
+            .collect();
+        opted.sort_unstable_by_key(|(actor_id, _)| *actor_id);
+        for (actor_id, _) in &opted {
+            self.checkpoint_actor(*actor_id);
             crate::runtime::exit::reap_living_actor(
                 self,
-                actor_id,
+                *actor_id,
                 crate::types::ExitReason::Normal,
             );
         }
+        opted
     }
 }
 

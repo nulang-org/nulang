@@ -3349,6 +3349,145 @@ mod tests {
         transport_b.shutdown();
     }
 
+    // -- 17b. Cross-node duplicate behavior names stay target-schema scoped --
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_remote_send_duplicate_behavior_name_uses_target_schema() {
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        use crate::typechecker::TypeChecker;
+        use std::time::{Duration, Instant};
+
+        let source = r#"
+            actor First {
+                state marker: Int = 0
+                behavior hit() { self.marker = 1 }
+            }
+
+            actor Second {
+                state marker: Int = 0
+                behavior hit() { self.marker = 2 }
+            }
+        "#;
+        let tokens = Lexer::new(source).lex().expect("lex");
+        let ast = Parser::new(tokens).parse_module().expect("parse");
+        let mut typechecker = TypeChecker::new();
+        typechecker.check_module(&ast).expect("typecheck");
+        let hir = crate::hir_lower::lower_module(&ast, &typechecker.inferred_decl_types);
+        let mut mir = crate::mir_lower::lower_module(&hir).expect("MIR lowering");
+        let module =
+            crate::mir_codegen::compile_mir(&mut mir, "remote_nominal_behavior").expect("codegen");
+
+        let second_hit = *module
+            .actor_metadata
+            .iter()
+            .find(|meta| meta.name == "Second")
+            .and_then(|meta| meta.behavior_indices.first())
+            .expect("Second.hit index");
+
+        let mut runtime_b = Runtime::new();
+        let actor_b = runtime_b
+            .spawn_from_module(&module, second_hit, vec![])
+            .as_actor_id()
+            .expect("spawn Second");
+        assert_eq!(runtime_b.actors[&actor_b].name, "Second");
+
+        let mut transport_a = crate::runtime::network::TcpTransport::bind(
+            addr(0),
+            crate::runtime::network::TlsConfig::PlaintextInsecure,
+        )
+        .unwrap();
+        let mut transport_b = crate::runtime::network::TcpTransport::bind(
+            addr(0),
+            crate::runtime::network::TlsConfig::PlaintextInsecure,
+        )
+        .unwrap();
+        let node_b = transport_b.node_id();
+        let addr_b = transport_b.listen_addr();
+
+        let mut cluster_a = ClusterState::new(transport_a.node_id(), transport_a.listen_addr());
+        cluster_a.handle_heartbeat(node_b, addr_b);
+        let mut resolver_a = AddressResolver::new(transport_a.node_id());
+        let mut runtime_a = Runtime::new();
+        let mut cluster_b = ClusterState::new(node_b, addr_b);
+        let mut resolver_b = AddressResolver::new(node_b);
+        let target = ActorAddress::remote(node_b, actor_b);
+
+        let deliver = |runtime_b: &mut Runtime,
+                       transport_b: &mut dyn NetworkTransport,
+                       cluster_b: &mut ClusterState,
+                       resolver_b: &mut AddressResolver| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                process_network_packets(runtime_b, transport_b, cluster_b, resolver_b);
+                if runtime_b
+                    .actors
+                    .get(&actor_b)
+                    .is_some_and(|actor| !actor.mailbox.is_empty())
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        };
+
+        send_distributed(
+            &mut runtime_a,
+            &mut transport_a,
+            &cluster_a,
+            &mut resolver_a,
+            target,
+            "hit",
+            &[],
+        );
+        deliver(
+            &mut runtime_b,
+            &mut transport_b,
+            &mut cluster_b,
+            &mut resolver_b,
+        );
+        assert_eq!(runtime_b.claim_next_ready_actor(), Some(actor_b));
+        runtime_b.step_actor(actor_b);
+        runtime_b.finish_actor_turn(actor_b);
+        assert_eq!(
+            runtime_b.actors[&actor_b]
+                .get_state_field("marker")
+                .and_then(|value| value.as_int()),
+            Some(2),
+            "remote short-name dispatch to Second must execute Second.hit, never First.hit"
+        );
+
+        send_distributed(
+            &mut runtime_a,
+            &mut transport_a,
+            &cluster_a,
+            &mut resolver_a,
+            target,
+            "First.hit",
+            &[],
+        );
+        deliver(
+            &mut runtime_b,
+            &mut transport_b,
+            &mut cluster_b,
+            &mut resolver_b,
+        );
+        assert!(
+            runtime_b.claim_next_ready_actor().is_none(),
+            "remote delivery must reject a qualified behavior owned by another actor schema"
+        );
+        assert_eq!(
+            runtime_b.actors[&actor_b]
+                .get_state_field("marker")
+                .and_then(|value| value.as_int()),
+            Some(2)
+        );
+
+        transport_a.shutdown();
+        transport_b.shutdown();
+    }
+
     // -- 18. Cross-node string payloads --------------------------------------
 
     #[test]
