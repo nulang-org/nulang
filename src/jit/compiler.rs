@@ -733,6 +733,16 @@ pub fn compile_bytecode_region(
             }
 
             OpCode::Ret | OpCode::RetVal => {
+                // A return can appear lexically inside a wider loop CFG when
+                // MIR lays an early-exit block before sibling loop blocks.
+                // Resume the interpreter at the return instruction so it owns
+                // frame-pop / return-value semantics exactly as before.
+                emit_yield_pc(
+                    &mut builder,
+                    helpers[&RuntimeHelper::SetBranchExit],
+                    start_offset,
+                    pc,
+                );
                 builder.ins().jump(return_block, &[]);
             }
             OpCode::DbgPrint => {}

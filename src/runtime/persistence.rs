@@ -126,12 +126,27 @@ impl PersistedValue {
     }
 }
 
+/// Initial fencing epoch for a newly activated durable actor.
+///
+/// Epoch zero is reserved as invalid by the atomic persistence contract.
+pub const INITIAL_ACTIVATION_EPOCH: u64 = 1;
+
+fn initial_activation_epoch() -> u64 {
+    INITIAL_ACTIVATION_EPOCH
+}
+
 /// A serializable snapshot of an actor's durable state.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ActorSnapshot {
     pub actor_id: u64,
     pub sequence: u64,
+    /// Monotonic fencing epoch for this logical actor activation.
+    ///
+    /// Legacy snapshots predate epoch fencing and therefore deserialize as
+    /// the initial epoch rather than zero.
+    #[serde(default = "initial_activation_epoch")]
+    pub activation_epoch: u64,
     pub state: HashMap<String, PersistedValue>,
     /// For workflow actors, the name of the signal the current step is
     /// suspended waiting for, if any.  This is part of the snapshot so that
@@ -146,12 +161,33 @@ pub struct ActorSnapshot {
     /// and `perform Crdt.*` keeps working after a restart.
     #[serde(default)]
     pub crdt_field_map: Option<HashMap<String, u64>>,
+    /// Canonical declared actor schema represented by this snapshot. Legacy
+    /// snapshots omit it and are accepted only when the loaded module has one
+    /// unambiguous actor schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_name: Option<String>,
     /// Canonical external-authority tokens held by the actor at the time
     /// of the snapshot. Missing on pre-authority snapshots means empty
     /// authority (deny by default). Values are reparsed as a complete
     /// typed manifest before any recovered actor becomes observable.
     #[serde(default)]
     pub authority_tokens: BTreeSet<String>,
+}
+
+impl Default for ActorSnapshot {
+    fn default() -> Self {
+        Self {
+            actor_id: 0,
+            sequence: 0,
+            activation_epoch: INITIAL_ACTIVATION_EPOCH,
+            state: HashMap::new(),
+            waiting_signal: None,
+            crdt_snapshot: None,
+            crdt_field_map: None,
+            schema_name: None,
+            authority_tokens: BTreeSet::new(),
+        }
+    }
 }
 
 /// A journal entry records a message delivered to an actor.
@@ -185,6 +221,46 @@ fn default_event_value() -> PersistedValue {
     PersistedValue::Int(1)
 }
 
+/// Stable identity of one accepted workflow command activation.
+///
+/// The command journal sequence is allocated before user code executes and
+/// remains stable across suspension, replay, and terminal workflow events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowActivationId {
+    pub actor_id: u64,
+    pub command_sequence: u64,
+}
+
+impl WorkflowActivationId {
+    pub const fn new(actor_id: u64, command_sequence: u64) -> Self {
+        Self {
+            actor_id,
+            command_sequence,
+        }
+    }
+}
+
+/// Stable replay identity for one deterministic intermediate workflow event.
+///
+/// The ordinal is local to the accepted command activation. Re-executing the
+/// same activation from its safe boundary must derive the same ordinal for the
+/// same logical event, allowing recovery to consume committed history instead
+/// of appending the event again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowReplayEventId {
+    pub activation: WorkflowActivationId,
+    pub ordinal: u32,
+}
+
+impl WorkflowReplayEventId {
+    pub const fn new(activation: WorkflowActivationId, ordinal: u32) -> Self {
+        Self {
+            activation,
+            ordinal,
+        }
+    }
+}
+
 /// A workflow event records a durable, replayable step in a workflow actor.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "tag", content = "value")]
@@ -196,7 +272,15 @@ pub enum WorkflowEvent {
         state: Vec<PersistedValue>,
     },
     /// A workflow step completed successfully.
-    StepCompleted { sequence: u64, step_name: String },
+    StepCompleted {
+        sequence: u64,
+        /// Stable identity of the accepted command this terminal event closes.
+        /// Missing on legacy journal records written before activation identity
+        /// was persisted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activation: Option<WorkflowActivationId>,
+        step_name: String,
+    },
     /// A timer was set for a workflow.
     TimerSet {
         sequence: u64,
@@ -225,12 +309,22 @@ pub enum WorkflowEvent {
     /// silent — exit 0, no diagnostic).
     StepFailed {
         sequence: u64,
+        /// Stable identity of the accepted command this terminal event closes.
+        /// Missing on legacy journal records written before activation identity
+        /// was persisted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activation: Option<WorkflowActivationId>,
         step_name: String,
         error: String,
     },
     /// Any other event emitted by a workflow handler.
     Custom {
         sequence: u64,
+        /// Replay-stable identity for deterministic intermediate events.
+        ///
+        /// Legacy records omit this field and remain readable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replay_id: Option<WorkflowReplayEventId>,
         name: String,
         args: Vec<PersistedValue>,
     },
@@ -249,6 +343,29 @@ impl WorkflowEvent {
             | WorkflowEvent::ParallelBranchCompleted { sequence, .. }
             | WorkflowEvent::StepFailed { sequence, .. }
             | WorkflowEvent::Custom { sequence, .. } => *sequence,
+        }
+    }
+
+    /// Return the accepted command activation closed by a terminal event.
+    ///
+    /// Legacy events return `None` and remain readable for compatibility.
+    pub fn activation_id(&self) -> Option<WorkflowActivationId> {
+        match self {
+            WorkflowEvent::StepCompleted { activation, .. }
+            | WorkflowEvent::StepFailed { activation, .. } => *activation,
+            _ => None,
+        }
+    }
+
+    /// Return the deterministic replay identity of an intermediate event.
+    ///
+    /// Only custom events use this identity today. Other replay-sensitive
+    /// workflow records will adopt the same activation-local ordinal model in
+    /// later #836 slices.
+    pub fn replay_id(&self) -> Option<WorkflowReplayEventId> {
+        match self {
+            WorkflowEvent::Custom { replay_id, .. } => *replay_id,
+            _ => None,
         }
     }
 }
@@ -287,6 +404,17 @@ pub struct DurableTail {
     pub activation_epoch: u64,
     pub sequence: u64,
     pub digest: [u8; 32],
+}
+
+/// Minimal committed-tail metadata needed to classify crash recovery.
+///
+/// Recovery intentionally does not need the transition digest; it only needs
+/// the fencing epoch and exact committed sequence to distinguish atomic
+/// command admission from legacy journal history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableTailPosition {
+    pub activation_epoch: u64,
+    pub sequence: u64,
 }
 
 /// Result of a successfully committed durable transition.
@@ -361,6 +489,12 @@ impl DurableTransition {
                     "durable transition snapshot sequence does not match transition sequence",
                 ));
             }
+            if snapshot.activation_epoch != self.activation_epoch {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "durable transition snapshot activation epoch does not match transition epoch",
+                ));
+            }
         }
         if self
             .workflow_events
@@ -371,6 +505,24 @@ impl DurableTransition {
                 io::ErrorKind::InvalidInput,
                 "durable transition workflow event sequence does not match transition sequence",
             ));
+        }
+        for event in &self.workflow_events {
+            if let Some(activation) = event.activation_id() {
+                if activation.actor_id != self.actor_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "durable transition workflow activation actor does not match transition actor",
+                    ));
+                }
+                if let Some(command) = &self.command {
+                    if activation.command_sequence != command.sequence {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "durable transition workflow activation command sequence does not match accepted command",
+                        ));
+                    }
+                }
+            }
         }
         if self
             .domain_events
@@ -480,6 +632,21 @@ pub trait PersistenceStore: Send + Sync {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "atomic durable transitions are not supported by this persistence backend",
+        ))
+    }
+
+    /// Load the committed atomic tail position for recovery classification.
+    ///
+    /// Backends that do not implement atomic durable transitions must return
+    /// `Unsupported`; callers use that to keep legacy recovery behavior
+    /// unchanged instead of inferring atomic history from ordinary journals.
+    fn load_durable_tail_position(
+        &self,
+        _actor_id: u64,
+    ) -> io::Result<Option<DurableTailPosition>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic durable tail reads are not supported by this persistence backend",
         ))
     }
 
@@ -680,6 +847,16 @@ impl MemoryStore {
 }
 
 impl PersistenceStore for MemoryStore {
+    fn load_durable_tail_position(&self, actor_id: u64) -> io::Result<Option<DurableTailPosition>> {
+        Ok(self
+            .durable_tails
+            .get(&actor_id)
+            .map(|tail| DurableTailPosition {
+                activation_epoch: tail.activation_epoch,
+                sequence: tail.sequence,
+            }))
+    }
+
     fn load_durable_effect(
         &self,
         actor_id: u64,
@@ -1260,16 +1437,26 @@ impl LibsqlStore {
                 "CREATE TABLE IF NOT EXISTS snapshots (
                     actor_id INTEGER PRIMARY KEY,
                     sequence INTEGER NOT NULL,
+                    activation_epoch INTEGER NOT NULL DEFAULT 1,
                     state TEXT NOT NULL,
                     waiting_signal TEXT,
                     crdt_snapshot TEXT,
                     crdt_field_map TEXT,
+                    schema_name TEXT,
                     authority_tokens TEXT
                 )",
                 (),
             )
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            // Durable activation fencing was added after the original snapshot schema.
+            // Legacy rows represent the initial activation and therefore default to 1.
+            let _ = conn
+                .execute(
+                    "ALTER TABLE snapshots ADD COLUMN activation_epoch INTEGER NOT NULL DEFAULT 1",
+                    (),
+                )
+                .await;
             // Migrate databases created before the waiting_signal column existed.
             let _ = conn
                 .execute("ALTER TABLE snapshots ADD COLUMN waiting_signal TEXT", ())
@@ -1281,6 +1468,11 @@ impl LibsqlStore {
             // Migrate databases created before the crdt_field_map column existed.
             let _ = conn
                 .execute("ALTER TABLE snapshots ADD COLUMN crdt_field_map TEXT", ())
+                .await;
+            // Durable schema identity was added after the original persistence
+            // schema. Legacy rows remain NULL and follow the explicit legacy policy.
+            let _ = conn
+                .execute("ALTER TABLE snapshots ADD COLUMN schema_name TEXT", ())
                 .await;
             // Authority was added after the original persistence schema. Old rows
             // remain NULL and therefore restore with empty (deny-by-default) authority.
@@ -1468,6 +1660,41 @@ impl LibsqlStore {
 
 #[cfg(feature = "sqlite")]
 impl PersistenceStore for LibsqlStore {
+    fn load_durable_tail_position(&self, actor_id: u64) -> io::Result<Option<DurableTailPosition>> {
+        let conn = self.conn();
+        self.rt.block_on(async {
+            let mut rows = conn
+                .query(
+                    "SELECT activation_epoch, sequence
+                     FROM durable_tails
+                     WHERE actor_id = ?1",
+                    libsql::params![actor_id as i64],
+                )
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+
+            match rows
+                .next()
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?
+            {
+                Some(row) => {
+                    let activation_epoch: i64 = row.get(0).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?;
+                    let sequence: i64 = row.get(1).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?;
+                    Ok(Some(DurableTailPosition {
+                        activation_epoch: activation_epoch as u64,
+                        sequence: sequence as u64,
+                    }))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
     fn load_durable_effect(
         &self,
         actor_id: u64,
@@ -1522,6 +1749,7 @@ impl PersistenceStore for LibsqlStore {
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
                     serde_json::to_string(&snapshot.crdt_field_map)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                    snapshot.schema_name.clone(),
                     serde_json::to_string(&snapshot.authority_tokens)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
                 ))
@@ -1691,27 +1919,33 @@ impl PersistenceStore for LibsqlStore {
                 }
             }
 
-            if let (Some(snapshot), Some((state_json, crdt_json, crdt_field_map_json, authority_json))) =
-                (&transition.snapshot, &snapshot_data)
+            if let (
+                Some(snapshot),
+                Some((state_json, crdt_json, crdt_field_map_json, schema_name, authority_json)),
+            ) = (&transition.snapshot, &snapshot_data)
             {
                 tx.execute(
                     "INSERT INTO snapshots
-                     (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     (actor_id, sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                      ON CONFLICT(actor_id) DO UPDATE SET
                        sequence=excluded.sequence,
+                       activation_epoch=excluded.activation_epoch,
                        state=excluded.state,
                        waiting_signal=excluded.waiting_signal,
                        crdt_snapshot=excluded.crdt_snapshot,
                        crdt_field_map=excluded.crdt_field_map,
+                       schema_name=excluded.schema_name,
                        authority_tokens=excluded.authority_tokens",
                     libsql::params![
                         snapshot.actor_id as i64,
                         snapshot.sequence as i64,
+                        snapshot.activation_epoch as i64,
                         state_json.as_str(),
                         snapshot.waiting_signal.as_deref(),
                         crdt_json.as_str(),
                         crdt_field_map_json.as_str(),
+                        schema_name.as_deref(),
                         authority_json.as_str()
                     ],
                 )
@@ -1881,9 +2115,9 @@ impl PersistenceStore for LibsqlStore {
         let conn = self.conn();
         self.rt.block_on(async {
             conn.execute(
-                "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, authority_tokens=excluded.authority_tokens",
-                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), authority_json.as_str()],
+                "INSERT INTO snapshots (actor_id, sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(actor_id) DO UPDATE SET sequence=excluded.sequence, activation_epoch=excluded.activation_epoch, state=excluded.state, waiting_signal=excluded.waiting_signal, crdt_snapshot=excluded.crdt_snapshot, crdt_field_map=excluded.crdt_field_map, schema_name=excluded.schema_name, authority_tokens=excluded.authority_tokens",
+                libsql::params![snapshot.actor_id as i64, snapshot.sequence as i64, snapshot.activation_epoch as i64, state_json, snapshot.waiting_signal.as_deref(), crdt_json.as_str(), crdt_field_map_json.as_str(), snapshot.schema_name.as_deref(), authority_json.as_str()],
             ).await.map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
         })
     }
@@ -1893,18 +2127,20 @@ impl PersistenceStore for LibsqlStore {
         self.rt.block_on(async {
             let mut rows = conn
                 .query(
-                    "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens FROM snapshots WHERE actor_id = ?1",
+                    "SELECT sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens FROM snapshots WHERE actor_id = ?1",
                     libsql::params![actor_id as i64],
                 )
                 .await
                 .ok()?;
             let row = rows.next().await.ok()??;
             let sequence: i64 = row.get(0).ok()?;
-            let state_json: String = row.get(1).ok()?;
-            let waiting_signal: Option<String> = row.get(2).ok()?;
-            let crdt_json: Option<String> = row.get(3).ok()?;
-            let crdt_field_map_json: Option<String> = row.get(4).ok()?;
-            let authority_json: Option<String> = row.get(5).ok()?;
+            let activation_epoch: i64 = row.get(1).ok()?;
+            let state_json: String = row.get(2).ok()?;
+            let waiting_signal: Option<String> = row.get(3).ok()?;
+            let crdt_json: Option<String> = row.get(4).ok()?;
+            let crdt_field_map_json: Option<String> = row.get(5).ok()?;
+            let schema_name: Option<String> = row.get(6).ok()?;
+            let authority_json: Option<String> = row.get(7).ok()?;
             let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> = match crdt_json {
                 Some(j) => serde_json::from_str(&j).ok()?,
                 None => None,
@@ -1930,10 +2166,12 @@ impl PersistenceStore for LibsqlStore {
             Some(ActorSnapshot {
                 actor_id,
                 sequence: sequence as u64,
+                activation_epoch: activation_epoch as u64,
                 state,
                 waiting_signal,
                 crdt_snapshot,
                 crdt_field_map,
+                schema_name,
                 authority_tokens,
             })
         })
@@ -2556,12 +2794,24 @@ impl PostgresStore {
             "CREATE TABLE IF NOT EXISTS snapshots (
                 actor_id BIGINT PRIMARY KEY,
                 sequence BIGINT NOT NULL,
+                activation_epoch BIGINT NOT NULL DEFAULT 1,
                 state TEXT NOT NULL,
                 waiting_signal TEXT,
                 crdt_snapshot TEXT,
                 crdt_field_map TEXT,
+                schema_name TEXT,
                 authority_tokens TEXT
             )",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS activation_epoch BIGINT NOT NULL DEFAULT 1",
+            &[],
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        conn.execute(
+            "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS schema_name TEXT",
             &[],
         )
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -2621,22 +2871,26 @@ impl PersistenceStore for PostgresStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO snapshots (actor_id, sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "INSERT INTO snapshots (actor_id, sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT (actor_id) DO UPDATE SET
                sequence = EXCLUDED.sequence,
+               activation_epoch = EXCLUDED.activation_epoch,
                state = EXCLUDED.state,
                waiting_signal = EXCLUDED.waiting_signal,
                crdt_snapshot = EXCLUDED.crdt_snapshot,
                crdt_field_map = EXCLUDED.crdt_field_map,
+               schema_name = EXCLUDED.schema_name,
                authority_tokens = EXCLUDED.authority_tokens",
             &[
                 &(snapshot.actor_id as i64),
                 &(snapshot.sequence as i64),
+                &(snapshot.activation_epoch as i64),
                 &state_json,
                 &snapshot.waiting_signal.as_deref(),
                 &crdt_json.as_str(),
                 &crdt_field_map_json.as_str(),
+                &snapshot.schema_name.as_deref(),
                 &authority_json.as_str(),
             ],
         )
@@ -2648,17 +2902,19 @@ impl PersistenceStore for PostgresStore {
         let mut conn = self.conn.lock().unwrap();
         let row = conn
             .query_one(
-                "SELECT sequence, state, waiting_signal, crdt_snapshot, crdt_field_map, authority_tokens
+                "SELECT sequence, activation_epoch, state, waiting_signal, crdt_snapshot, crdt_field_map, schema_name, authority_tokens
                  FROM snapshots WHERE actor_id = $1",
                 &[&(actor_id as i64)],
             )
             .ok()?;
         let sequence: i64 = row.get(0);
-        let state_json: String = row.get(1);
-        let waiting_signal: Option<String> = row.get(2);
-        let crdt_json: Option<String> = row.get(3);
-        let crdt_field_map_json: Option<String> = row.get(4);
-        let authority_json: Option<String> = row.get(5);
+        let activation_epoch: i64 = row.get(1);
+        let state_json: String = row.get(2);
+        let waiting_signal: Option<String> = row.get(3);
+        let crdt_json: Option<String> = row.get(4);
+        let crdt_field_map_json: Option<String> = row.get(5);
+        let schema_name: Option<String> = row.get(6);
+        let authority_json: Option<String> = row.get(7);
         let crdt_snapshot: Option<Vec<(u64, u8, Vec<u8>)>> =
             crdt_json.and_then(|j| serde_json::from_str(&j).ok());
         let crdt_field_map: Option<HashMap<String, u64>> =
@@ -2680,10 +2936,12 @@ impl PersistenceStore for PostgresStore {
         Some(ActorSnapshot {
             actor_id,
             sequence: sequence as u64,
+            activation_epoch: activation_epoch as u64,
             state,
             waiting_signal,
             crdt_snapshot,
             crdt_field_map,
+            schema_name,
             authority_tokens,
         })
     }
@@ -2973,10 +3231,12 @@ mod json_file_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 3,
+                activation_epoch: INITIAL_ACTIVATION_EPOCH,
                 state,
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -3035,10 +3295,12 @@ mod json_file_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 5,
+                activation_epoch: INITIAL_ACTIVATION_EPOCH,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -3064,10 +3326,12 @@ mod json_file_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 1,
+                activation_epoch: INITIAL_ACTIVATION_EPOCH,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -3100,10 +3364,12 @@ mod json_file_store_tests {
                 .save_snapshot(ActorSnapshot {
                     actor_id: 1,
                     sequence: 1,
+                    activation_epoch: INITIAL_ACTIVATION_EPOCH,
                     state,
                     waiting_signal: None,
                     crdt_snapshot: None,
                     crdt_field_map: None,
+                    schema_name: None,
                     authority_tokens: Default::default(),
                 })
                 .unwrap();
@@ -3139,10 +3405,12 @@ mod json_file_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 9,
+                activation_epoch: INITIAL_ACTIVATION_EPOCH,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -3260,10 +3528,12 @@ mod rocksdb_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 3,
+                activation_epoch: INITIAL_ACTIVATION_EPOCH,
                 state,
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -3316,10 +3586,12 @@ mod rocksdb_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 5,
+                activation_epoch: INITIAL_ACTIVATION_EPOCH,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -3345,10 +3617,12 @@ mod rocksdb_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id: 1,
                 sequence: 1,
+                activation_epoch: INITIAL_ACTIVATION_EPOCH,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -3381,10 +3655,12 @@ mod rocksdb_store_tests {
                 .save_snapshot(ActorSnapshot {
                     actor_id: 1,
                     sequence: 1,
+                    activation_epoch: INITIAL_ACTIVATION_EPOCH,
                     state,
                     waiting_signal: None,
                     crdt_snapshot: None,
                     crdt_field_map: None,
+                    schema_name: None,
                     authority_tokens: Default::default(),
                 })
                 .unwrap();
@@ -3452,10 +3728,12 @@ mod postgres_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id,
                 sequence: 3,
+                activation_epoch: INITIAL_ACTIVATION_EPOCH,
                 state,
                 waiting_signal: Some("signal".to_string()),
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -3517,10 +3795,12 @@ mod postgres_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id,
                 sequence: 5,
+                activation_epoch: INITIAL_ACTIVATION_EPOCH,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -3550,10 +3830,12 @@ mod postgres_store_tests {
             .save_snapshot(ActorSnapshot {
                 actor_id,
                 sequence: 1,
+                activation_epoch: INITIAL_ACTIVATION_EPOCH,
                 state: HashMap::new(),
                 waiting_signal: None,
                 crdt_snapshot: None,
                 crdt_field_map: None,
+                schema_name: None,
                 authority_tokens: Default::default(),
             })
             .unwrap();
@@ -3658,9 +3940,13 @@ mod durable_transition_tests {
                 behavior_id: 7,
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }),
-            snapshot: Some(snapshot(actor_id, sequence, &[("count", sequence as i64)])),
+            snapshot: Some(ActorSnapshot {
+                activation_epoch: epoch,
+                ..snapshot(actor_id, sequence, &[("count", sequence as i64)])
+            }),
             workflow_events: vec![WorkflowEvent::StepCompleted {
                 sequence,
+                activation: Some(WorkflowActivationId::new(actor_id, sequence)),
                 step_name: format!("step-{sequence}"),
             }],
             domain_events: vec![EventEntry {
@@ -3678,6 +3964,52 @@ mod durable_transition_tests {
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }],
         }
+    }
+
+    #[test]
+    fn legacy_terminal_event_serialization_omits_absent_activation() {
+        let event = WorkflowEvent::StepCompleted {
+            sequence: 1,
+            activation: None,
+            step_name: "legacy".to_string(),
+        };
+
+        let encoded = serde_json::to_value(event).unwrap();
+        let value = encoded
+            .get("value")
+            .and_then(serde_json::Value::as_object)
+            .expect("StepCompleted content object");
+
+        assert!(
+            !value.contains_key("activation"),
+            "legacy serialization must not add activation:null and change durable digests"
+        );
+    }
+
+    #[test]
+    fn durable_transition_rejects_terminal_activation_for_wrong_actor() {
+        let mut candidate = transition(10, 1, 1);
+        candidate.workflow_events = vec![WorkflowEvent::StepCompleted {
+            sequence: 1,
+            activation: Some(WorkflowActivationId::new(11, 1)),
+            step_name: "step-1".to_string(),
+        }];
+
+        let error = candidate.digest().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn durable_transition_rejects_terminal_activation_for_wrong_command_sequence() {
+        let mut candidate = transition(10, 1, 1);
+        candidate.workflow_events = vec![WorkflowEvent::StepCompleted {
+            sequence: 1,
+            activation: Some(WorkflowActivationId::new(10, 99)),
+            step_name: "step-1".to_string(),
+        }];
+
+        let error = candidate.digest().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -3700,6 +4032,13 @@ mod durable_transition_tests {
                 activation_epoch: 1,
                 sequence: 1,
                 digest: committed.digest,
+            })
+        );
+        assert_eq!(
+            store.load_durable_tail_position(10).unwrap(),
+            Some(DurableTailPosition {
+                activation_epoch: 1,
+                sequence: 1,
             })
         );
     }
@@ -3819,14 +4158,19 @@ mod libsql_atomic_transition_tests {
                 behavior_id: 3,
                 payload: vec![PersistedValue::Int(sequence as i64)],
             }),
-            snapshot: Some(snapshot(actor_id, sequence, sequence as i64)),
+            snapshot: Some(ActorSnapshot {
+                activation_epoch: epoch,
+                ..snapshot(actor_id, sequence, sequence as i64)
+            }),
             workflow_events: vec![
                 WorkflowEvent::StepCompleted {
                     sequence,
+                    activation: Some(WorkflowActivationId::new(actor_id, sequence)),
                     step_name: "persist".to_string(),
                 },
                 WorkflowEvent::Custom {
                     sequence,
+                    replay_id: None,
                     name: "audit".to_string(),
                     args: vec![PersistedValue::Int(sequence as i64)],
                 },
@@ -4007,6 +4351,13 @@ mod libsql_atomic_transition_tests {
                 )
                 .unwrap();
             assert_eq!(rows, vec!["[4,1]".to_string()]);
+            assert_eq!(
+                store.load_durable_tail_position(77).unwrap(),
+                Some(DurableTailPosition {
+                    activation_epoch: 4,
+                    sequence: 1,
+                })
+            );
         }
 
         let _ = std::fs::remove_file(&path);
