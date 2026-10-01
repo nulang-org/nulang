@@ -4187,10 +4187,45 @@ impl Runtime {
                                 self,
                                 actor_id,
                                 msg.behavior_id,
-                                payload,
+                                payload.clone(),
                             ) {
                                 Ok(activation) => {
                                     workflow_activation = Some(activation);
+                                }
+                                Err(error)
+                                    if error.kind() == std::io::ErrorKind::Unsupported =>
+                                {
+                                    // Atomic history has not begun and this
+                                    // backend explicitly cannot provide RFC
+                                    // 0022 transactions. Preserve the existing
+                                    // compiled-workflow compatibility path.
+                                    let seq = self.next_sequence(actor_id);
+                                    match self.persistence.append_journal(
+                                        actor_id,
+                                        JournalEntry {
+                                            sequence: seq,
+                                            behavior_id: msg.behavior_id,
+                                            payload,
+                                        },
+                                    ) {
+                                        Ok(()) => {
+                                            workflow_activation =
+                                                Some(WorkflowActivationId::new(actor_id, seq));
+                                            if let Some(actor) = self.actors.get_mut(&actor_id) {
+                                                actor.current_workflow_activation =
+                                                    workflow_activation;
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                actor_id,
+                                                %error,
+                                                "nulang-workflow: refusing compiled command execution after legacy durable admission failed"
+                                            );
+                                            self.current_actor = None;
+                                            return;
+                                        }
+                                    }
                                 }
                                 Err(error) => {
                                     tracing::error!(
