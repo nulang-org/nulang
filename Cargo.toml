@@ -36,7 +36,11 @@ autobenches = false
 language-version = "1.0.0-frozen"
 
 [features]
-default = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
+# Keep the historical batteries-included default during the stabilization
+# window, but give it an explicit name so release/CI consumers can pin the
+# compatibility profile before the default is eventually minimized.
+default = ["full"]
+full = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
 # Cranelift-backed tiered JIT plus the current native/AOT backend.
 native-codegen = [
     "dep:cranelift",
@@ -50,6 +54,8 @@ native-codegen = [
 # Marker profile for embedded mobile runtimes. Intentionally empty: the
 # bytecode interpreter and pre-registered host callbacks need no JIT.
 mobile-runtime = []
+# Enables the standalone Savina-style actor benchmark runner without pulling optional subsystems.
+savina-bench = []
 python = ["dep:pyo3"]
 sqlite = ["dep:libsql"]
 lsp = ["dep:tower-lsp", "dep:tokio", "dep:futures", "dep:tower-service"]
@@ -164,7 +170,7 @@ wasm-encoder = { version = "0.220", optional = true }
 # Borsh serialization for the WASM component boundary (optional, see [features])
 borsh = { version = "1.5", optional = true, features = ["derive"] }
 # WASM runtime using Wasmtime (optional, see [features])
-wasmtime = { version = "46", optional = true, default-features = false, features = ["cranelift", "runtime", "std", "anyhow", "component-model", "wat"] }
+wasmtime = { version = "48.0.3", optional = true, default-features = false, features = ["cranelift", "runtime", "std", "anyhow", "component-model", "wat"] }
 wat = { version = "1.254", optional = true }
 blake3 = "1.8"
 rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12", "ring", "logging"] }
@@ -191,10 +197,28 @@ name = "nula_difffuzz"
 path = "src/bin/nula_difffuzz.rs"
 required-features = ["difffuzz"]
 
+[[bin]]
+name = "nulang-jit-bench"
+path = "src/bin/nulang_jit_bench.rs"
+required-features = ["native-codegen"]
+
+[[bin]]
+name = "nulang-savina"
+path = "src/bin/nulang_savina.rs"
+required-features = ["savina-bench"]
+
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
+
+# Fast optimized profile for standalone Savina actor benchmarks. Keep this separate
+# from [profile.bench] so Criterion history remains comparable.
+[profile.savina]
+inherits = "release"
+lto = false
+codegen-units = 8
+debug = false
 
 [profile.dev]
 opt-level = 0

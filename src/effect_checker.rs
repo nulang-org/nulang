@@ -2828,7 +2828,9 @@ fn stmt_is_single_shot(stmt: &crate::hir::Stmt) -> bool {
         crate::hir::Stmt::Let { value, .. } | crate::hir::Stmt::Assign { value, .. } => {
             rvalue_is_single_shot(value)
         }
-        crate::hir::Stmt::StateSet { .. } | crate::hir::Stmt::Emit { .. } => true,
+        crate::hir::Stmt::StateSet { .. }
+        | crate::hir::Stmt::Emit { .. }
+        | crate::hir::Stmt::ParallelMarker { .. } => true,
     }
 }
 

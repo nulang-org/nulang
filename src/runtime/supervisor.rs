@@ -345,6 +345,7 @@ impl Supervisor {
                 }
             }
             new_actor.sequence = snap.sequence;
+            new_actor.activation_epoch = snap.activation_epoch;
             new_actor.waiting_signal = snap.waiting_signal.clone();
         } else {
             for (name, value) in &template.state_data {
@@ -430,7 +431,7 @@ impl Supervisor {
             runtime.supervisors.insert(new_id, new_sup);
         }
 
-        runtime.scheduler.enqueue(new_id);
+        runtime.enqueue_actor(new_id);
         Some(new_id)
     }
 

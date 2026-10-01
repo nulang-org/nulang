@@ -4050,7 +4050,9 @@ match { a: 2, b: 9 } with {
         );
 
         // Send the signal. The runtime appends SignalReceived and resumes the step.
-        rt2.borrow_mut().signal_workflow(actor_id, "go", None);
+        rt2.borrow_mut()
+            .signal_workflow(actor_id, "go", None)
+            .unwrap();
 
         assert_eq!(
             rt2.borrow()
@@ -4122,7 +4124,9 @@ match { a: 2, b: 9 } with {
 
         // First signal arrives: the step resumes, then suspends again on the
         // second signal. The chained suspension must be re-captured.
-        rt.borrow_mut().signal_workflow(actor_id, "first", None);
+        rt.borrow_mut()
+            .signal_workflow(actor_id, "first", None)
+            .unwrap();
         {
             let rt = rt.borrow();
             let actor = rt.actors.get(&actor_id).unwrap();
@@ -4143,7 +4147,9 @@ match { a: 2, b: 9 } with {
         }
 
         // Second signal arrives: the step completes and the workflow advances.
-        rt.borrow_mut().signal_workflow(actor_id, "second", None);
+        rt.borrow_mut()
+            .signal_workflow(actor_id, "second", None)
+            .unwrap();
         {
             let rt = rt.borrow();
             let actor = rt.actors.get(&actor_id).unwrap();
@@ -4757,7 +4763,9 @@ match { a: 2, b: 9 } with {
         );
 
         // Deliver the signal so branch b can finish.
-        rt2.borrow_mut().signal_workflow(actor_id, "continue", None);
+        rt2.borrow_mut()
+            .signal_workflow(actor_id, "continue", None)
+            .unwrap();
         rt2.borrow_mut().run_scheduler();
 
         assert_eq!(
@@ -5566,10 +5574,17 @@ match { a: 2, b: 9 } with {
         let child_id = value.as_actor_id().expect("spawn returns an actor id");
 
         let rt_ref = rt.borrow();
+        assert!(
+            rt_ref.respawn_opted.contains(&child_id),
+            "policy 3 must opt the persistent child into RespawnOnNodeLoss"
+        );
+        let child = rt_ref
+            .actors
+            .get(&child_id)
+            .expect("the opted-in persistent child must remain live");
         assert_eq!(
-            rt_ref.respawn_opted.get(&child_id),
-            Some(&1),
-            "policy 3 must opt the persistent child into RespawnOnNodeLoss (epoch 1)"
+            child.activation_epoch, 1,
+            "initial RespawnOnNodeLoss opt-in must preserve the actor's canonical epoch"
         );
     }
 
@@ -7884,9 +7899,12 @@ match { a: 2, b: 9 } with {
         // response sits untouched in the channel no matter how long the
         // worker takes.
         loop {
-            let next = rt.borrow_mut().scheduler.dequeue();
+            let next = rt.borrow_mut().claim_next_ready_actor();
             match next {
-                Some(actor_id) => rt.borrow_mut().step_actor(actor_id),
+                Some(actor_id) => {
+                    rt.borrow_mut().step_actor(actor_id);
+                    rt.borrow_mut().finish_actor_turn(actor_id);
+                }
                 None => break,
             }
         }
@@ -8301,7 +8319,9 @@ match { a: 2, b: 9 } with {
         // The signal arrives: the step resumes, consumes it, and suspends
         // again on the background LLM call.  The suspension must be
         // re-captured with the Inference.ask marker — NOT treated as a step failure.
-        rt.borrow_mut().signal_workflow(actor_id, "go", None);
+        rt.borrow_mut()
+            .signal_workflow(actor_id, "go", None)
+            .unwrap();
         {
             let rt_ref = rt.borrow();
             let actor = rt_ref.actors.get(&actor_id).unwrap();
@@ -8425,7 +8445,9 @@ match { a: 2, b: 9 } with {
         assert_eq!(client.recorded_calls().len(), 1, "exactly one LLM call");
 
         // The signal arrives: the step runs to completion.
-        rt.borrow_mut().signal_workflow(actor_id, "go", None);
+        rt.borrow_mut()
+            .signal_workflow(actor_id, "go", None)
+            .unwrap();
         {
             let rt_ref = rt.borrow();
             let actor = rt_ref.actors.get(&actor_id).unwrap();

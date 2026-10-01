@@ -18,6 +18,7 @@ pub mod authority_host;
 mod authority_runtime;
 pub use authority_runtime::RuntimeAuthorityError;
 pub mod backends;
+pub mod behavior_manifest;
 #[cfg(test)]
 pub mod benchmarks;
 pub mod bytecode;
@@ -27,12 +28,14 @@ pub mod cir;
 pub mod cir_analysis;
 #[cfg(feature = "wasmfx-backend")]
 pub mod cir_lower;
+pub mod compat;
 pub mod compiler_identity;
 pub mod content_identity;
 pub mod core_vm;
 #[cfg(feature = "native-codegen")]
 pub mod cranelift_utils;
 pub mod dap;
+pub mod database;
 pub mod diagnostic;
 #[cfg(feature = "native-codegen")]
 pub mod difffuzz;
@@ -40,6 +43,7 @@ pub mod docgen;
 pub mod dst;
 pub mod durable_effect;
 pub mod durable_effect_persistence;
+pub mod durable_effect_runtime;
 pub mod effect_checker;
 pub mod ffi;
 pub mod fmt;
@@ -66,9 +70,13 @@ pub mod mir_lower;
 pub mod mir_wasm;
 #[cfg(feature = "wasm-backend")]
 pub mod mir_wasm_simd;
+#[cfg(feature = "native-codegen")]
+pub mod native_abi;
 #[cfg(feature = "otel")]
 pub mod observability;
 pub mod package;
+pub mod parallel_analysis;
+pub mod parallel_marker;
 pub mod parser;
 pub mod prelude_source;
 pub mod primitives;

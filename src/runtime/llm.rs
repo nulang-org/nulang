@@ -477,6 +477,7 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                         actor_id,
                         WorkflowEvent::StepCompleted {
                             sequence: seq,
+                            activation: suspended.activation,
                             step_name: suspended.step_name,
                         },
                     );
@@ -497,6 +498,7 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                             Some(crate::runtime::actor::SuspendedExecution {
                                 vm_state,
                                 behavior_idx: suspended.behavior_idx,
+                                activation: suspended.activation,
                                 step_name: suspended.step_name,
                             });
                     }

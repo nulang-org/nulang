@@ -32,6 +32,45 @@ fn compile_err(msg: impl Into<String>, span: Span) -> NuError {
     }
 }
 
+/// Serialize the replay-relevant shape of RFC 0008 migration contracts into
+/// actor metadata. Migration bodies remain compiler IR, but runtime/tooling
+/// must at least retain the version topology and event surface instead of
+/// silently dropping every contract at the HIR -> MIR boundary.
+fn serialize_migration_metadata(migrations: &[crate::ast::MigrationDecl]) -> String {
+    let mut ordered: Vec<_> = migrations.iter().collect();
+    ordered.sort_by_key(|migration| migration.from_version);
+
+    let metadata: Vec<_> = ordered
+        .into_iter()
+        .map(|migration| {
+            let mut event_handlers: Vec<_> = migration
+                .event_migrations
+                .iter()
+                .map(|(name, params, _body)| (name.as_str(), params.len()))
+                .collect();
+            event_handlers.sort_unstable();
+
+            let events: Vec<_> = event_handlers
+                .into_iter()
+                .map(|(name, arity)| {
+                    serde_json::json!({
+                        "name": name,
+                        "arity": arity,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "from": migration.from_version,
+                "to": migration.to_version,
+                "state": migration.state_body.is_some(),
+                "events": events,
+            })
+        })
+        .collect();
+
+    serde_json::to_string(&metadata).expect("migration metadata is JSON-serializable")
+}
+
 pub fn lower_module(hir: &hir::Module) -> NuResult<mir::Module> {
     let mut ctx = ModuleCtx::new(&hir.name);
 
@@ -149,7 +188,7 @@ fn reserve_decl(ctx: &mut ModuleCtx, decl: &hir::Decl) -> NuResult<()> {
                 retry_config: a.retry_config.clone(),
                 type_hash: None,
                 version: a.version,
-                migrations: String::new(),
+                migrations: serialize_migration_metadata(&a.migrations),
             });
         }
         hir::Decl::Workflow { name, .. } => {
@@ -331,21 +370,62 @@ impl ModuleCtx {
             .unwrap_or(self.behaviors.len())
     }
 
-    /// Resolve `send`/`ask actor behavior(...)` to a behavior-table index by
-    /// name. Mirrors the stable compiler's `behavior_table_index`: an exact
-    /// "ActorName.behavior" match first, falling back to any behavior with a
-    /// matching suffix if the receiver expression isn't a bare actor-typed
-    /// variable name (a known ambiguity inherited from the stable compiler,
-    /// not introduced here).
-    fn send_behavior_idx(&self, actor_name_hint: &str, behavior: &str) -> usize {
-        let full_name = format!("{}.{}", actor_name_hint, behavior);
-        if let Some(idx) = self.behavior_names.iter().position(|n| *n == full_name) {
-            return idx;
+    /// Resolve `send`/`ask actor behavior(...)` to a behavior-table index.
+    ///
+    /// Exact qualified identities always win. A unique short-name suffix is
+    /// retained only as a compatibility path for genuinely opaque/dynamic
+    /// actor references; an ambiguous suffix must fail closed instead of
+    /// selecting code owned by a different actor schema.
+    fn send_behavior_idx(&self, actor_name_hint: &str, behavior: &str) -> NuResult<usize> {
+        if let Some(idx) = self.behavior_names.iter().position(|name| name == behavior) {
+            return Ok(idx);
         }
+
+        if !actor_name_hint.is_empty() {
+            let full_name = format!("{}.{}", actor_name_hint, behavior);
+            if let Some(idx) = self
+                .behavior_names
+                .iter()
+                .position(|name| *name == full_name)
+            {
+                return Ok(idx);
+            }
+        }
+
+        let suffix = format!(".{}", behavior);
+        let candidates: Vec<(usize, &str)> = self
+            .behavior_names
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, name)| name.ends_with(&suffix).then_some((idx, name.as_str())))
+            .collect();
+
+        match candidates.as_slice() {
+            [] => Ok(self.behaviors.len()),
+            [(idx, _)] => Ok(*idx),
+            _ => Err(compile_err(
+                format!(
+                    "ambiguous actor behavior '{}'; candidates: {}. \
+                     The receiver's nominal actor identity must be preserved before MIR lowering",
+                    behavior,
+                    candidates
+                        .iter()
+                        .map(|(_, name)| *name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Span::default(),
+            )),
+        }
+    }
+
+    /// Selective receive still resolves against the current actor's local arm
+    /// names; keep that legacy resolver separate from send/ask nominal identity.
+    fn receive_behavior_idx(&self, behavior: &str) -> usize {
         let suffix = format!(".{}", behavior);
         self.behavior_names
             .iter()
-            .position(|n| n.ends_with(&suffix))
+            .position(|name| name == behavior || name.ends_with(&suffix))
             .unwrap_or(self.behaviors.len())
     }
 
@@ -640,7 +720,8 @@ impl<'c> FnLowerer<'c> {
             hir::Stmt::Let { span, .. }
             | hir::Stmt::Assign { span, .. }
             | hir::Stmt::StateSet { span, .. }
-            | hir::Stmt::Emit { span, .. } => span.line(),
+            | hir::Stmt::Emit { span, .. }
+            | hir::Stmt::ParallelMarker { span, .. } => span.line(),
         } as u32;
         if line != 0 {
             self.b.set_line(line);
@@ -672,6 +753,10 @@ impl<'c> FnLowerer<'c> {
                     event: event.clone(),
                     args: ids,
                 });
+                Ok(())
+            }
+            hir::Stmt::ParallelMarker { marker, .. } => {
+                self.b.emit(mir::Stmt::ParallelMarker { marker: *marker });
                 Ok(())
             }
         }
@@ -1424,7 +1509,7 @@ impl<'c> FnLowerer<'c> {
                 ..
             } => {
                 let actor_hint = operand_name_hint(actor);
-                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior);
+                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior)?;
                 let actor_id = self.lower_operand(actor)?;
                 let mut arg_ids = Vec::with_capacity(args.len());
                 for a in args {
@@ -1450,7 +1535,7 @@ impl<'c> FnLowerer<'c> {
                 ..
             } => {
                 let actor_hint = operand_name_hint(actor);
-                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior);
+                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior)?;
                 let actor_id = self.lower_operand(actor)?;
                 let mut arg_ids = Vec::with_capacity(args.len());
                 for a in args {
@@ -1646,7 +1731,7 @@ impl<'c> FnLowerer<'c> {
         }
         let behavior_ids: Vec<u16> = arms
             .iter()
-            .map(|(name, _, _, _)| self.ctx.send_behavior_idx("", name) as u16)
+            .map(|(name, _, _, _)| self.ctx.receive_behavior_idx(name) as u16)
             .collect();
         let max_params = arms.iter().map(|(_, p, _, _)| p.len()).max().unwrap_or(0);
         let timeout = match after {
@@ -2519,7 +2604,9 @@ fn count_local_uses(func: &mir::Function) -> Vec<usize> {
                     used.push(*idx);
                     used.push(*src);
                 }
-                mir::Stmt::EnterHandle { .. } | mir::Stmt::PopHandler => {}
+                mir::Stmt::EnterHandle { .. }
+                | mir::Stmt::PopHandler
+                | mir::Stmt::ParallelMarker { .. } => {}
                 mir::Stmt::Emit { args, .. } => used.extend(args.iter().copied()),
                 mir::Stmt::StateSet { src, .. } => used.push(*src),
             }
@@ -2629,6 +2716,7 @@ fn walk_hir_body(body: &hir::Body, acc: &mut HashSet<String>) {
                     walk_hir_operand(a, acc);
                 }
             }
+            hir::Stmt::ParallelMarker { .. } => {}
         }
     }
     match &body.terminator {
@@ -2851,6 +2939,48 @@ mod tests {
         assert_eq!(mir_module.name, "test");
     }
 
+    #[test]
+    fn known_receiver_uses_nominal_behavior_identity_when_short_names_collide() {
+        let module = lower_source(
+            r#"
+            actor First {
+                state n: Int = 0
+                behavior hit() { self.n = self.n + 100 }
+                behavior get() { self.n }
+            }
+            actor Second {
+                state n: Int = 0
+                behavior get() { self.n }
+                behavior hit() { self.n = self.n + 1 }
+            }
+            fn main() {
+                let s = spawn Second {}
+                send s hit()
+                ask s get()
+            }
+            "#,
+        )
+        .expect("known receiver identity should disambiguate colliding behavior names");
+        let main = find_fn(&module, "main");
+
+        let mut send_idx = None;
+        let mut ask_idx = None;
+        for block in &main.blocks {
+            for stmt in &block.stmts {
+                if let mir::Stmt::Assign { op, .. } = stmt {
+                    match op {
+                        mir::RValue::Send { behavior_idx, .. } => send_idx = Some(*behavior_idx),
+                        mir::RValue::Ask { behavior_idx, .. } => ask_idx = Some(*behavior_idx),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        assert_eq!(send_idx, Some(3), "send must resolve to Second.hit");
+        assert_eq!(ask_idx, Some(2), "ask must resolve to Second.get");
+    }
+
     // -----------------------------------------------------------------------
     // Peephole: temp/Load fusion (keeps codegen's drop planning effective)
     // -----------------------------------------------------------------------
@@ -2870,6 +3000,64 @@ mod tests {
             .iter()
             .find(|f| f.name == name)
             .unwrap_or_else(|| panic!("function '{}' not lowered", name))
+    }
+
+    #[test]
+    fn test_entity_migration_metadata_survives_into_mir() {
+        let module = lower_source(
+            r#"
+            entity Counter {
+                version: 2
+                state count: Int = 0
+                behavior get() { self.count }
+                migration from 1 to 2 {
+                    state => { 0 }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let meta = module
+            .actor_metadata
+            .iter()
+            .find(|meta| meta.name == "Counter")
+            .expect("Counter actor metadata");
+        assert_eq!(meta.version, 2);
+
+        let migrations: serde_json::Value =
+            serde_json::from_str(&meta.migrations).expect("migration metadata JSON");
+        let steps = migrations.as_array().expect("migration metadata array");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0]["from"].as_u64(), Some(1));
+        assert_eq!(steps[0]["to"].as_u64(), Some(2));
+        assert_eq!(steps[0]["state"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_par_region_markers_survive_into_mir() {
+        let module = lower_source("par { 1; 2; 3 }").unwrap();
+        let main = find_fn(&module, "__main");
+        let markers: Vec<crate::parallel_marker::ParallelRegionMarker> = main
+            .blocks
+            .iter()
+            .flat_map(|b| b.stmts.iter())
+            .filter_map(|stmt| match stmt {
+                mir::Stmt::ParallelMarker { marker } => Some(*marker),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            markers,
+            vec![
+                crate::parallel_marker::ParallelRegionMarker::Begin { branches: 3 },
+                crate::parallel_marker::ParallelRegionMarker::Branch { index: 0 },
+                crate::parallel_marker::ParallelRegionMarker::Branch { index: 1 },
+                crate::parallel_marker::ParallelRegionMarker::Branch { index: 2 },
+                crate::parallel_marker::ParallelRegionMarker::End,
+            ]
+        );
     }
 
     #[test]

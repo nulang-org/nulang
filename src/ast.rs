@@ -126,12 +126,12 @@ pub enum Expr {
         exprs: Vec<Expr>,
         span: Span,
     },
-    /// `par { e1; e2; ... }` — an independence annotation (adopted from
-    /// nanolang): the sub-expressions are declared to have no data
-    /// dependencies on each other. Semantics are identical to a `Block`
-    /// (evaluated in order); the node is kept distinct so later passes can
-    /// use the independence information (e.g. parallel codegen or parallel
-    /// lowering).
+    /// `par { e1; e2; ... }` — an independence annotation and the source
+    /// surface reserved for scoped concurrency (RFC 0024). The current
+    /// implementation still evaluates branches in order, so keeping this AST
+    /// node distinct is semantically important: later lowering can introduce
+    /// structured concurrency only after capture, effect, cancellation, and
+    /// join invariants are enforced.
     Par {
         exprs: Vec<Expr>,
         span: Span,

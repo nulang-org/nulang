@@ -1,6 +1,6 @@
 ---
-// Language-feature card grid, styled to match nulang.cloud's card pattern
-// (rounded surface card, icon chip in an orange-tinted square).
+// Dense capability matrix for the homepage. Stable surfaces use the core blue
+// identity; experimental surfaces use the secondary orange accent.
 const features = [
 	{
 		id: 'actors',
@@ -64,28 +64,137 @@ const features = [
 
 
 <style>
-	.feature-heading {
+	.feature-grid {
+		display: grid;
+		grid-template-columns: 1fr;
+		gap: 1px;
+		margin: 2.5rem 0 0;
+		overflow: hidden;
+		border: 1px solid var(--nu-border);
+		border-radius: 1rem;
+		background: var(--nu-border);
+	}
+
+	.feature-card {
+		position: relative;
 		display: flex;
-		flex-wrap: wrap;
-		align-items: center;
-		gap: 0.65rem;
+		min-height: 18rem;
+		flex-direction: column;
+		padding: 1.6rem;
+		border: 0;
+		border-radius: 0;
+		background: var(--nu-surface);
+		box-shadow: none;
+		transition: background 0.18s ease;
+	}
+
+	.feature-card::before {
+		content: '';
+		position: absolute;
+		inset: 0 auto auto 0;
+		width: 100%;
+		height: 2px;
+		background: var(--nu-blue);
+		opacity: 0.82;
+	}
+
+	.feature-card:nth-child(n + 5)::before {
+		background: var(--nu-accent-high);
+		opacity: 0.7;
+	}
+
+	.feature-card:hover {
+		transform: none;
+		border-color: transparent;
+		background: color-mix(in srgb, var(--nu-blue) 3.5%, var(--nu-surface));
+		box-shadow: none;
+	}
+
+	.feature-icon-chip {
+		width: 2.5rem;
+		height: 2.5rem;
+		margin-bottom: 1.5rem;
+		border: 1px solid color-mix(in srgb, var(--nu-blue) 18%, var(--nu-border));
+		border-radius: 0.55rem;
+		background: color-mix(in srgb, var(--nu-blue) 6%, transparent);
+	}
+
+	.feature-card:nth-child(n + 5) .feature-icon-chip {
+		border-color: color-mix(in srgb, var(--nu-accent-high) 18%, var(--nu-border));
+		background: color-mix(in srgb, var(--nu-accent-high) 6%, transparent);
+	}
+
+	.feature-card:hover .feature-icon-chip {
+		transform: none;
+		background: color-mix(in srgb, var(--nu-blue) 9%, transparent);
+	}
+
+	.feature-card:nth-child(n + 5):hover .feature-icon-chip {
+		background: color-mix(in srgb, var(--nu-accent-high) 9%, transparent);
+	}
+
+	.feature-card:hover .feature-icon {
+		transform: none;
+		color: var(--nu-blue);
+	}
+
+	.feature-card:nth-child(n + 5) .feature-icon,
+	.feature-card:nth-child(n + 5):hover .feature-icon {
+		color: var(--nu-accent-high);
+	}
+
+	.feature-heading {
+		display: grid;
+		gap: 0.55rem;
 	}
 
 	.feature-heading h3 {
 		margin: 0;
+		color: var(--nu-text);
+		font-size: 1.05rem;
+		letter-spacing: -0.015em;
 	}
 
 	.feature-status {
+		justify-self: start;
 		display: inline-flex;
 		align-items: center;
-		min-height: 1.5rem;
-		padding: 0.2rem 0.5rem;
-		border: 1px solid var(--nu-border);
-		border-radius: 999px;
-		background: var(--nu-surface-elevated);
-		color: var(--nu-text-secondary);
-		font-size: 0.68rem;
-		font-weight: 600;
+		min-height: 1.4rem;
+		padding: 0.18rem 0.45rem;
+		border: 1px solid color-mix(in srgb, var(--nu-blue) 20%, var(--nu-border));
+		border-radius: 0.35rem;
+		background: color-mix(in srgb, var(--nu-blue) 5%, transparent);
+		color: var(--nu-blue);
+		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+		font-size: 0.61rem;
+		font-weight: 700;
 		line-height: 1.2;
+		letter-spacing: 0.025em;
+	}
+
+	.feature-card:nth-child(n + 5) .feature-status {
+		border-color: color-mix(in srgb, var(--nu-accent-high) 22%, var(--nu-border));
+		background: color-mix(in srgb, var(--nu-accent-high) 6%, transparent);
+		color: var(--nu-accent-high);
+	}
+
+	.feature-card p {
+		margin-top: auto;
+		padding-top: 1.5rem;
+		color: var(--nu-text-secondary);
+		font-size: 0.86rem;
+		line-height: 1.68;
+	}
+
+	@media (min-width: 40rem) {
+		.feature-grid {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+		}
+	}
+
+	@media (min-width: 64rem) {
+		.feature-grid {
+			grid-template-columns: repeat(3, minmax(0, 1fr));
+		}
 	}
 </style>

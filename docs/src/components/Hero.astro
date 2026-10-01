@@ -15,12 +15,14 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 		<div class="hero-copy-inner">
 			<div class="hero-status" aria-label="Project status">
 				<span class="hero-status-dot" aria-hidden="true"></span>
-				Alpha software
-				<span class="hero-status-separator" aria-hidden="true">·</span>
-				Open source
+				<span>Alpha software</span>
+				<span class="hero-status-separator" aria-hidden="true">/</span>
+				<a href="https://github.com/nulang-org/nulang" target="_blank" rel="noopener noreferrer">Apache 2.0</a>
 			</div>
+
 			<h1 id={PAGE_TITLE_ID} data-page-title set:html={title} />
 			{tagline && <div class="tagline" set:html={tagline} />}
+
 			{actions.length > 0 && (
 				<div class="actions">
 					{actions.map(({ text, link, icon, variant }) => (
@@ -36,32 +38,84 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 					))}
 				</div>
 			)}
-			<div class="hero-proof">
-				<span>HM inference</span>
-				<span>Algebraic effects</span>
-				<span>Actors + supervision</span>
+
+			<div class="hero-proof-grid" aria-label="Core Nulang capabilities">
+				<div>
+					<span>Type system</span>
+					<strong>HM + rows</strong>
+				</div>
+				<div>
+					<span>Effects</span>
+					<strong>Typed + algebraic</strong>
+				</div>
+				<div>
+					<span>Runtime</span>
+					<strong>Actors + supervision</strong>
+				</div>
 			</div>
 		</div>
 	</div>
 
-	<div class="hero-playground" data-hero-playground>
-		<div class="hero-playground-head">
-			<div>
-				<span class="playground-kicker">CoreVM browser demo</span>
-				<strong>Run real Nulang here.</strong>
+	<div class="hero-workbench" data-hero-playground>
+		<div class="workbench-chrome">
+			<div class="window-controls" aria-hidden="true">
+				<span></span><span></span><span></span>
 			</div>
-			<a href="/playground/">Full playground ↗</a>
+			<div class="workbench-tab">
+				<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+					<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+					<path d="M14 2v6h6"/>
+				</svg>
+				<span>scratch.nula</span>
+			</div>
+			<a href="/playground/" class="workbench-open">Open playground ↗</a>
 		</div>
+
+		<div class="workbench-context">
+			<div>
+				<span class="playground-kicker">CoreVM / browser</span>
+				<strong>Edit. Run. Inspect.</strong>
+			</div>
+			<span class="workbench-local">
+				<span class="local-dot" aria-hidden="true"></span>
+				Local WASM
+			</span>
+		</div>
+
 		<label class="sr-only" for="hero-source">Nulang source code</label>
 		<textarea id="hero-source" class="hero-source" spellcheck="false">{starter}</textarea>
+
 		<div class="hero-playground-footer">
 			<button class="hero-run" type="button">
-				<span class="run-label">Run</span>
 				<span aria-hidden="true">▶</span>
+				<span class="run-label">Run program</span>
 			</button>
-			<span class="hero-runtime-note">Runs locally in WebAssembly</span>
+			<span class="hero-runtime-note">Ctrl / ⌘ + Enter</span>
 		</div>
-		<pre class="hero-output" aria-live="polite">Compiler loads on first run.</pre>
+
+		<div class="output-shell">
+			<span class="output-label">output</span>
+			<pre class="hero-output" aria-live="polite">Compiler loads on first run.</pre>
+		</div>
+	</div>
+
+	<div class="hero-runtime-flow" aria-label="Nulang resilience model">
+		<div class="flow-stage">
+			<span>01 / Source</span>
+			<strong>Typed program</strong>
+		</div>
+		<div class="flow-stage">
+			<span>02 / Effects</span>
+			<strong>Capabilities visible</strong>
+		</div>
+		<div class="flow-stage">
+			<span>03 / Actors</span>
+			<strong>Failure isolated</strong>
+		</div>
+		<div class="flow-stage">
+			<span>04 / Recovery</span>
+			<strong>State hydrated</strong>
+		</div>
 	</div>
 </div>
 
@@ -178,24 +232,34 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 			display: inline-flex;
 			align-items: center;
 			align-self: flex-start;
-			gap: 0.5rem;
-			margin-bottom: 1.25rem;
-			padding: 0.4rem 0.7rem;
-			border: 1px solid var(--nu-border);
-			border-radius: 999px;
+			gap: 0.55rem;
+			margin-bottom: 1.4rem;
+			padding: 0.4rem 0.65rem;
+			border: 1px solid color-mix(in srgb, var(--nu-blue) 18%, var(--nu-border));
+			border-radius: 0.5rem;
 			background: color-mix(in srgb, var(--nu-surface) 88%, transparent);
 			color: var(--nu-text-secondary);
-			font-size: 0.75rem;
+			font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+			font-size: 0.69rem;
 			font-weight: 650;
-			letter-spacing: 0.02em;
+			letter-spacing: 0.025em;
+		}
+
+		.hero-status a {
+			color: inherit;
+			text-decoration: none;
+		}
+
+		.hero-status a:hover {
+			color: var(--nu-blue);
 		}
 
 		.hero-status-dot {
-			width: 0.5rem;
-			height: 0.5rem;
+			width: 0.46rem;
+			height: 0.46rem;
 			border-radius: 999px;
 			background: var(--nu-accent-high);
-			box-shadow: 0 0 0 3px color-mix(in srgb, var(--nu-accent-high) 14%, transparent);
+			box-shadow: 0 0 0 3px color-mix(in srgb, var(--nu-accent-high) 13%, transparent);
 		}
 
 		.hero-status-separator {
@@ -203,102 +267,191 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 		}
 
 		h1 {
-			max-width: 11ch;
-			font-size: clamp(3rem, 7vw, 4.75rem);
-			line-height: 0.98;
-			font-weight: 750;
-			letter-spacing: -0.055em;
+			max-width: 10ch;
+			font-size: clamp(3.15rem, 7.2vw, 5rem);
+			line-height: 0.96;
+			font-weight: 760;
+			letter-spacing: -0.06em;
 			color: var(--nu-text);
+			text-wrap: balance;
 		}
 
 		.tagline {
-			margin-top: 1.5rem;
-			font-size: clamp(1rem, 1.7vw, 1.2rem);
+			margin-top: 1.55rem;
+			max-width: 40rem;
 			color: var(--nu-text-secondary);
-			max-width: 39rem;
-			line-height: 1.65;
+			font-size: clamp(1rem, 1.6vw, 1.16rem);
+			line-height: 1.7;
 		}
 
 		.actions {
-			margin-top: 2rem;
 			display: flex;
 			flex-wrap: wrap;
-			gap: 0.875rem;
+			gap: 0.8rem;
+			margin-top: 2rem;
 		}
 
-		.hero-proof {
-			display: flex;
-			flex-wrap: wrap;
-			gap: 0.6rem 1rem;
-			margin-top: 1.4rem;
+		.hero-proof-grid {
+			display: grid;
+			grid-template-columns: repeat(3, minmax(0, 1fr));
+			margin-top: 2.25rem;
+			border-top: 1px solid var(--nu-border);
+			border-bottom: 1px solid var(--nu-border);
+		}
+
+		.hero-proof-grid > div {
+			min-width: 0;
+			padding: 0.95rem 0.9rem 0.95rem 0;
+		}
+
+		.hero-proof-grid > div + div {
+			padding-left: 0.9rem;
+			border-left: 1px solid var(--nu-border);
+		}
+
+		.hero-proof-grid span,
+		.hero-proof-grid strong {
+			display: block;
+		}
+
+		.hero-proof-grid span {
 			color: var(--nu-text-tertiary);
 			font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-			font-size: 0.72rem;
+			font-size: 0.62rem;
+			font-weight: 700;
+			letter-spacing: 0.07em;
+			text-transform: uppercase;
 		}
 
-		.hero-proof span {
-			position: relative;
-			padding-left: 0.85rem;
-		}
-
-		.hero-proof span::before {
-			content: '';
-			position: absolute;
-			left: 0;
-			top: 0.45em;
-			width: 0.35rem;
-			height: 0.35rem;
-			border-radius: 50%;
-			background: var(--nu-blue);
+		.hero-proof-grid strong {
+			margin-top: 0.28rem;
+			color: var(--nu-text);
+			font-size: 0.78rem;
+			line-height: 1.35;
 		}
 	}
 
-	.hero-playground {
+	.hero-workbench {
+		position: relative;
 		overflow: hidden;
-		border: 1px solid color-mix(in srgb, var(--nu-blue) 20%, var(--nu-border));
-		border-radius: 1.15rem;
-		background: #0d1117;
-		box-shadow: 0 28px 70px rgba(15, 23, 42, 0.2);
+		border: 1px solid rgba(148, 163, 184, 0.22);
+		border-radius: 1rem;
+		background: #090d14;
+		box-shadow:
+			0 28px 80px rgba(15, 23, 42, 0.22),
+			0 0 0 1px rgba(255, 255, 255, 0.025) inset;
 	}
 
-	.hero-playground-head {
-		display: flex;
-		align-items: flex-start;
-		justify-content: space-between;
-		gap: 1rem;
-		padding: 1rem 1.1rem;
-		border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-		background: #121821;
+	.hero-workbench::before {
+		content: '';
+		position: absolute;
+		inset: 0 auto 0 0;
+		width: 2px;
+		background: linear-gradient(180deg, #60a5fa, #fb923c);
+		opacity: 0.9;
+		pointer-events: none;
 	}
 
-	.hero-playground-head div {
+	.workbench-chrome {
 		display: grid;
-		gap: 0.2rem;
+		grid-template-columns: auto minmax(0, 1fr) auto;
+		align-items: center;
+		gap: 0.9rem;
+		min-height: 2.85rem;
+		padding: 0 0.9rem;
+		border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+		background: #0e141d;
 	}
 
-	.playground-kicker {
-		color: #93c5fd;
-		font-size: 0.66rem;
-		font-weight: 750;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
+	.window-controls {
+		display: flex;
+		gap: 0.35rem;
 	}
 
-	.hero-playground-head strong {
-		color: #f8fafc;
-		font-size: 0.88rem;
+	.window-controls span {
+		width: 0.55rem;
+		height: 0.55rem;
+		border-radius: 999px;
+		background: #334155;
 	}
 
-	.hero-playground-head a {
+	.window-controls span:first-child { background: #fb7185; }
+	.window-controls span:nth-child(2) { background: #fbbf24; }
+	.window-controls span:nth-child(3) { background: #4ade80; }
+
+	.workbench-tab {
+		display: inline-flex;
+		align-items: center;
+		justify-self: start;
+		gap: 0.45rem;
+		min-width: 0;
 		color: #cbd5e1;
-		font-size: 0.72rem;
+		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+		font-size: 0.69rem;
+	}
+
+	.workbench-tab svg {
+		width: 0.85rem;
+		height: 0.85rem;
+		color: #60a5fa;
+		flex: 0 0 auto;
+	}
+
+	.workbench-open {
+		color: #94a3b8;
+		font-size: 0.68rem;
 		font-weight: 650;
 		text-decoration: none;
 		white-space: nowrap;
 	}
 
-	.hero-playground-head a:hover {
-		color: #fff;
+	.workbench-open:hover {
+		color: #f8fafc;
+	}
+
+	.workbench-context {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 1rem;
+		padding: 1rem 1.1rem 0.25rem;
+	}
+
+	.workbench-context > div {
+		display: grid;
+		gap: 0.18rem;
+	}
+
+	.playground-kicker {
+		color: #60a5fa;
+		font-size: 0.61rem;
+		font-weight: 800;
+		letter-spacing: 0.09em;
+		text-transform: uppercase;
+	}
+
+	.workbench-context strong {
+		color: #f8fafc;
+		font-size: 0.88rem;
+		letter-spacing: -0.01em;
+	}
+
+	.workbench-local {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+		color: #94a3b8;
+		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+		font-size: 0.62rem;
+		white-space: nowrap;
+	}
+
+	.local-dot {
+		width: 0.42rem;
+		height: 0.42rem;
+		border-radius: 999px;
+		background: #4ade80;
+		box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.1);
 	}
 
 	.hero-source,
@@ -306,22 +459,23 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 		width: 100%;
 		margin: 0;
 		border: 0;
-		background: #0d1117;
-		color: #e2e8f0;
+		background: #090d14;
 		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-		font-size: 0.8rem;
-		line-height: 1.6;
+		font-size: 0.79rem;
+		line-height: 1.65;
 	}
 
 	.hero-source {
-		min-height: 15rem;
-		padding: 1.15rem;
+		min-height: 14rem;
+		padding: 1rem 1.15rem 1.1rem;
 		resize: vertical;
 		outline: none;
+		color: #e2e8f0;
+		caret-color: #93c5fd;
 	}
 
 	.hero-source:focus {
-		box-shadow: inset 0 0 0 2px #60a5fa;
+		box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.62);
 	}
 
 	.hero-playground-footer {
@@ -329,26 +483,31 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 		align-items: center;
 		justify-content: space-between;
 		gap: 1rem;
-		padding: 0.75rem 1rem;
+		padding: 0.7rem 0.9rem;
 		border-top: 1px solid rgba(255, 255, 255, 0.08);
-		border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-		background: #121821;
+		background: #0e141d;
 	}
 
 	.hero-run {
 		display: inline-flex;
 		align-items: center;
 		gap: 0.5rem;
-		min-height: 2.35rem;
-		padding: 0.45rem 0.8rem;
-		border: 1px solid var(--nu-accent-high);
-		border-radius: 0.6rem;
-		background: var(--nu-accent-high);
+		min-height: 2.25rem;
+		padding: 0.42rem 0.75rem;
+		border: 1px solid #2563eb;
+		border-radius: 0.48rem;
+		background: #2563eb;
 		color: #fff;
 		font: inherit;
-		font-size: 0.78rem;
+		font-size: 0.72rem;
 		font-weight: 750;
 		cursor: pointer;
+		box-shadow: 0 4px 16px rgba(37, 99, 235, 0.2);
+	}
+
+	.hero-run:hover:not(:disabled) {
+		background: #1d4ed8;
+		border-color: #1d4ed8;
 	}
 
 	.hero-run:disabled {
@@ -357,19 +516,94 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 	}
 
 	.hero-runtime-note {
-		color: #94a3b8;
-		font-size: 0.68rem;
+		color: #64748b;
+		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+		font-size: 0.61rem;
+	}
+
+	.output-shell {
+		position: relative;
+		border-top: 1px solid rgba(255, 255, 255, 0.07);
+	}
+
+	.output-label {
+		position: absolute;
+		top: 0.55rem;
+		right: 0.8rem;
+		z-index: 1;
+		color: #475569;
+		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+		font-size: 0.56rem;
+		font-weight: 750;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
 	}
 
 	.hero-output {
-		min-height: 4.25rem;
-		padding: 0.85rem 1.1rem;
+		min-height: 4.2rem;
+		padding: 0.75rem 1.1rem;
 		white-space: pre-wrap;
 		color: #86efac;
 	}
 
 	.hero-output.is-error {
 		color: #fca5a5;
+	}
+
+	.hero-runtime-flow {
+		grid-column: 1 / -1;
+		display: grid;
+		grid-template-columns: repeat(4, minmax(0, 1fr));
+		margin-top: 0.25rem;
+		border: 1px solid var(--nu-border);
+		border-radius: 0.8rem;
+		background: color-mix(in srgb, var(--nu-surface) 74%, transparent);
+		overflow: hidden;
+	}
+
+	.flow-stage {
+		position: relative;
+		min-width: 0;
+		padding: 0.8rem 1rem;
+	}
+
+	.flow-stage + .flow-stage {
+		border-left: 1px solid var(--nu-border);
+	}
+
+	.flow-stage + .flow-stage::before {
+		content: '→';
+		position: absolute;
+		left: -0.42rem;
+		top: 50%;
+		transform: translateY(-50%);
+		display: grid;
+		place-items: center;
+		width: 0.82rem;
+		height: 1.2rem;
+		background: var(--nu-bg);
+		color: var(--nu-blue);
+		font-size: 0.65rem;
+	}
+
+	.flow-stage span,
+	.flow-stage strong {
+		display: block;
+	}
+
+	.flow-stage span {
+		color: var(--nu-text-tertiary);
+		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+		font-size: 0.58rem;
+		font-weight: 750;
+		letter-spacing: 0.065em;
+		text-transform: uppercase;
+	}
+
+	.flow-stage strong {
+		margin-top: 0.18rem;
+		color: var(--nu-text);
+		font-size: 0.73rem;
 	}
 
 	.sr-only {
@@ -384,15 +618,63 @@ perform IO.print("double(21) = " + perform Int.to_string(answer))`;
 		border: 0;
 	}
 
-	@media (max-width: 40rem) {
-		.hero-playground-head,
+	@media (max-width: 63.9375rem) {
+		.hero-runtime-flow {
+			margin-top: 0;
+		}
+	}
+
+	@media (max-width: 42rem) {
+		.hero-proof-grid {
+			grid-template-columns: 1fr;
+		}
+
+		.hero-proof-grid > div,
+		.hero-proof-grid > div + div {
+			padding: 0.75rem 0;
+			border-left: 0;
+		}
+
+		.hero-proof-grid > div + div {
+			border-top: 1px solid var(--nu-border);
+		}
+
+		.hero-runtime-flow {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+		}
+
+		.flow-stage:nth-child(3) {
+			border-left: 0;
+			border-top: 1px solid var(--nu-border);
+		}
+
+		.flow-stage:nth-child(4) {
+			border-top: 1px solid var(--nu-border);
+		}
+
+		.flow-stage:nth-child(3)::before {
+			display: none;
+		}
+
+		.workbench-chrome {
+			grid-template-columns: auto 1fr;
+		}
+
+		.workbench-open {
+			display: none;
+		}
+
+		.workbench-context {
+			flex-direction: column;
+		}
+
 		.hero-playground-footer {
 			align-items: flex-start;
 			flex-direction: column;
 		}
 
 		.hero-source {
-			min-height: 13rem;
+			min-height: 12rem;
 		}
 	}
 </style>

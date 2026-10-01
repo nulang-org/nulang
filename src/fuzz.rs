@@ -1,7 +1,8 @@
 //! Nulang compiler/runtime fuzzer: mutation-based fuzzing of the frontend
 //! (lex -> parse -> typecheck -> HIR -> MIR -> bytecode) plus differential
-//! execution fuzzing across the interpreter, JIT, and (when a mutant
-//! compiles under it) the AOT native backend.
+//! execution fuzzing across the interpreter, JIT, and restricted compiled
+//! backends (AOT native and, with `wasm-backend`, WASM) when they accept
+//! the generated program.
 //!
 //! Generates mutants from a seed corpus of valid programs. Two independent
 //! properties are checked:
@@ -752,22 +753,30 @@ pub(crate) fn differential_fuzz_one(source: &str) -> Result<DiffOutcome, String>
                 Err(_) => return Err(format!("WASM run panicked on {:?}", source)),
                 Ok(Err(e)) => {
                     let err_str = e.to_string();
+                    // Once the compiler has emitted bytes, validation,
+                    // instantiation, and required-export failures are backend
+                    // correctness failures, not "unsupported program" skips.
+                    // Restricted-profile rejection belongs at compile time in
+                    // validate_default_wasm_semantics().
                     if err_str.contains("failed to compile")
                         || err_str.contains("failed to parse WebAssembly module")
                         || err_str.contains("failed to find function export `nulang_init`")
                     {
-                        false
-                    } else {
-                        let wasm_key: Result<String, String> =
-                            Err(normalize_error(&format!("runtime error: {}", err_str)));
-                        if wasm_key != cold_key {
-                            return Err(format!(
-                                "interpreter/WASM divergence on {:?}: interp={:?} wasm={:?}",
-                                source, cold_key, wasm_key
-                            ));
-                        }
-                        true
+                        return Err(format!(
+                            "WASM emitted bytes but the runtime rejected them on {:?}: {}",
+                            source, err_str
+                        ));
                     }
+
+                    let wasm_key: Result<String, String> =
+                        Err(normalize_error(&format!("runtime error: {}", err_str)));
+                    if wasm_key != cold_key {
+                        return Err(format!(
+                            "interpreter/WASM divergence on {:?}: interp={:?} wasm={:?}",
+                            source, cold_key, wasm_key
+                        ));
+                    }
+                    true
                 }
                 Ok(Ok(wasm_value)) => {
                     if !is_safely_comparable(wasm_value) {
@@ -784,7 +793,19 @@ pub(crate) fn differential_fuzz_one(source: &str) -> Result<DiffOutcome, String>
                     }
                 }
             },
-            Err(_) => false,
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("WASM backend restricted profile")
+                    || err_str.contains("WASM backend does not support")
+                {
+                    false
+                } else {
+                    return Err(format!(
+                        "unexpected WASM compile failure on {:?}: {}",
+                        source, err_str
+                    ));
+                }
+            }
         }
     };
     #[cfg(not(feature = "wasm-backend"))]
@@ -880,6 +901,29 @@ mod tests {
                  Phase 1 kill criteria",
                 divergences.len()
             );
+        }
+    }
+
+    /// The WASM-enabled CI lane must prove that the restricted backend
+    /// actually participates in the differential oracle. This catches a
+    /// regression where every program is silently classified as unsupported
+    /// and the job stays green without executing WASM at all.
+    #[cfg(feature = "wasm-backend")]
+    #[test]
+    fn differential_wasm_supported_profile_has_coverage() {
+        for source in [
+            "42",
+            "1 + 2",
+            "if true then 1 else 2",
+            "let x = 10; let y = x * 2; y + x",
+        ] {
+            match differential_fuzz_one(source) {
+                Ok(DiffOutcome::Agreed { wasm: true, .. }) => {}
+                other => panic!(
+                    "WASM differential oracle did not execute supported source {:?}: {:?}",
+                    source, other
+                ),
+            }
         }
     }
 

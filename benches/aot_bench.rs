@@ -22,9 +22,8 @@ use nulang::lexer::Lexer;
 use nulang::parser::Parser;
 use nulang::typechecker::TypeChecker;
 
-/// Compile `source` through the full frontend → MIR → Cranelift AOT pipeline
-/// and return the compiled module. Panics on compile failure.
-fn compile(source: &str) -> AotModule {
+/// Lower source through the full frontend to MIR. Panics on failure.
+fn lower(source: &str) -> nulang::mir::Module {
     let mut lexer = Lexer::new(source);
     let tokens = lexer.lex().expect("lex failed");
     let mut parser = Parser::new(tokens);
@@ -48,8 +47,12 @@ fn compile(source: &str) -> AotModule {
         }
     }
     let hir = nulang::hir_lower::lower_module(&ast, &type_checker.inferred_decl_types);
-    let mir = nulang::mir_lower::lower_module(&hir).expect("mir lower failed");
-    AotModule::compile(&mir).expect("aot compile failed")
+    nulang::mir_lower::lower_module(&hir).expect("mir lower failed")
+}
+
+/// Compile `source` through MIR → Cranelift AOT.
+fn compile(source: &str) -> AotModule {
+    AotModule::compile(&lower(source)).expect("aot compile failed")
 }
 
 fn bench_aot_int_loop(c: &mut Criterion) {
@@ -89,6 +92,64 @@ fn bench_aot_record_loop(c: &mut Criterion) {
     });
 }
 
+fn bench_aot_actor_direct_dispatch(c: &mut Criterion) {
+    let source = r#"
+        actor Counter {
+            state total: Int = 0
+            behavior Add1(a: Int) { self.total = self.total + a }
+            behavior Add5(a: Int, b: Int, c: Int, d: Int, e: Int) {
+                self.total = self.total + a + b + c + d + e
+            }
+        }
+        fn main() { 0 }
+    "#;
+    let mut mir = lower(source);
+    let aot = AotModule::compile(&mir).expect("aot actor compile failed");
+    let code = nulang::mir_codegen::compile_mir(&mut mir, "aot_actor_bench")
+        .expect("actor bytecode companion compile failed");
+
+    let mut rt = nulang::runtime::Runtime::new();
+    rt.register_aot_module(aot);
+    let actor_id = rt
+        .spawn_from_module(&code, 0, Vec::new())
+        .as_actor_id()
+        .expect("actor spawn failed");
+    let add1 = rt.actors[&actor_id].aot_targets[0].expect("Add1 AOT target");
+    let add5 = rt.actors[&actor_id].aot_targets[1].expect("Add5 AOT target");
+    let one = [nulang::vm::Value::int(1)];
+    let five = [
+        nulang::vm::Value::int(1),
+        nulang::vm::Value::int(2),
+        nulang::vm::Value::int(3),
+        nulang::vm::Value::int(4),
+        nulang::vm::Value::int(5),
+    ];
+
+    c.bench_function("aot/actor_direct_dispatch_1arg", |b| {
+        b.iter(|| {
+            let runtime = &mut rt as *mut nulang::runtime::Runtime;
+            black_box(nulang::aot::dispatch_aot_runtime_behavior(
+                add1,
+                runtime,
+                actor_id,
+                black_box(&one),
+            ))
+        })
+    });
+
+    c.bench_function("aot/actor_direct_dispatch_5arg", |b| {
+        b.iter(|| {
+            let runtime = &mut rt as *mut nulang::runtime::Runtime;
+            black_box(nulang::aot::dispatch_aot_runtime_behavior(
+                add5,
+                runtime,
+                actor_id,
+                black_box(&five),
+            ))
+        })
+    });
+}
+
 fn bench_aot_hot_loop(c: &mut Criterion) {
     let source =
         "var sum = 0; var i = 0; while i < 100000 { sum = sum + i * 3 - i / 7; i = i + 1; }; sum";
@@ -109,5 +170,6 @@ criterion_group!(
     bench_aot_int_loop,
     bench_aot_function_call,
     bench_aot_record_loop,
+    bench_aot_actor_direct_dispatch,
     bench_aot_hot_loop,
 );
