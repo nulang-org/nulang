@@ -244,12 +244,18 @@ pub trait ActorVmCallbacks: std::any::Any + std::fmt::Debug {
     /// Write a field on the current actor's state.  Default is a no-op.
     fn set_state_field(&mut self, _field: &str, _value: Value) {}
 
-    /// Emit an event in the current actor.
+    /// Emit an event in the current actor. Default is a no-op.
     ///
-    /// Returns false when a runtime-backed durable emission failed. The VM
-    /// aborts the current activation immediately in that case so user code
-    /// cannot continue past an uncommitted durable boundary.
-    fn emit_event(&mut self, _event: &str, _args: &[Value]) -> bool {
+    /// Kept for source compatibility with existing callback implementations.
+    fn emit_event(&mut self, _event: &str, _args: &[Value]) {}
+
+    /// Fallible event-emission hook used by the interpreter.
+    ///
+    /// Existing callback implementations inherit the legacy behavior: call
+    /// `emit_event` and report success. Runtime-backed durable callbacks
+    /// override this to fail closed when persistence rejects the event.
+    fn try_emit_event(&mut self, event: &str, args: &[Value]) -> bool {
+        self.emit_event(event, args);
         true
     }
 
@@ -5198,7 +5204,7 @@ impl VM {
                 let event = self.module_const_string(module_idx, event_idx);
                 let arg_count = instr.op3 as usize;
                 let args: Vec<Value> = (0..arg_count).map(|i| frame.regs[i]).collect();
-                if !self.actor_callbacks.emit_event(&event, &args) {
+                if !self.actor_callbacks.try_emit_event(&event, &args) {
                     return Err(NuError::VMError {
                         msg: format!("durable event emission failed: {}", event),
                         span: Span::default(),
