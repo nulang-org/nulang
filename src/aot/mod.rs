@@ -1462,7 +1462,11 @@ impl crate::vm::ActorVmCallbacks for AotRuntimeCallbacks {
         bc.perform_async(effect_op, constants, args)
     }
 
-    fn emit_event(&mut self, event: &str, args: &[crate::vm::Value]) -> bool {
+    fn emit_event(&mut self, event: &str, args: &[crate::vm::Value]) {
+        let _ = self.try_emit_event(event, args);
+    }
+
+    fn try_emit_event(&mut self, event: &str, args: &[crate::vm::Value]) -> bool {
         // SAFETY: as above.
         unsafe {
             let rt = &mut *self.runtime;
