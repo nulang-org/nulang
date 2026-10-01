@@ -420,6 +420,54 @@ pub(crate) fn commit_step_failed(
     })
 }
 
+/// Persist successful workflow completion without crossing persistence modes.
+pub(crate) fn persist_step_completed(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<WorkflowActivationId>,
+    step_name: String,
+) -> std::io::Result<()> {
+    if workflow_has_atomic_tail(rt, actor_id)? {
+        return commit_step_completed(rt, actor_id, activation, step_name);
+    }
+
+    let sequence = next_sequence(rt, actor_id);
+    rt.persistence.append_workflow_event(
+        actor_id,
+        WorkflowEvent::StepCompleted {
+            sequence,
+            activation,
+            step_name,
+        },
+    )?;
+    try_checkpoint_actor(rt, actor_id)
+}
+
+/// Persist failed workflow completion without crossing persistence modes.
+pub(crate) fn persist_step_failed(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<WorkflowActivationId>,
+    step_name: String,
+    error: String,
+) -> std::io::Result<()> {
+    if workflow_has_atomic_tail(rt, actor_id)? {
+        return commit_step_failed(rt, actor_id, activation, step_name, error);
+    }
+
+    let sequence = next_sequence(rt, actor_id);
+    rt.persistence.append_workflow_event(
+        actor_id,
+        WorkflowEvent::StepFailed {
+            sequence,
+            activation,
+            step_name,
+            error,
+        },
+    )?;
+    try_checkpoint_actor(rt, actor_id)
+}
+
 /// Commit a nonterminal workflow event without moving the completed-state
 /// snapshot. Once an atomic tail exists, legacy append APIs are forbidden.
 fn commit_intermediate_workflow_event(
