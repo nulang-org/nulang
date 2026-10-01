@@ -14,7 +14,8 @@ use crate::primitives::{ActorRole, DeliverySemantics, EffectBoundary};
 use crate::runtime::actor::Actor;
 use crate::runtime::persistence::{
     ActorSnapshot, DurableTransition, EventEntry, JournalEntry, PersistedValue,
-    WorkflowActivationId, WorkflowEvent, WorkflowReplayEventId, DURABLE_TRANSITION_VERSION,
+    WorkflowActivationId, WorkflowEvent, WorkflowReplayEventId, WorkflowTimerId,
+    DURABLE_TRANSITION_VERSION,
 };
 use crate::semantic_identity::EffectSiteId;
 use crate::runtime::{BytecodeDistributedCallbacks, BytecodeRuntimeCallbacks, Runtime, StateModel};
@@ -71,6 +72,173 @@ fn advance_custom_event_replay_id(
         .ordinal
         .checked_add(1)
         .expect("workflow custom-event ordinal exhausted within one activation");
+}
+
+fn current_workflow_timer_id(rt: &mut Runtime, actor_id: u64) -> Option<WorkflowTimerId> {
+    let actor = rt.actors.get_mut(&actor_id)?;
+    let activation = actor.current_workflow_activation?;
+    if actor.workflow_timer_activation != Some(activation) {
+        actor.workflow_timer_activation = Some(activation);
+        actor.workflow_timer_ordinal = 0;
+    }
+    Some(WorkflowTimerId::new(
+        activation,
+        actor.workflow_timer_ordinal,
+    ))
+}
+
+fn advance_workflow_timer_id(rt: &mut Runtime, actor_id: u64, committed: WorkflowTimerId) {
+    let Some(actor) = rt.actors.get_mut(&actor_id) else {
+        return;
+    };
+    if actor.workflow_timer_activation != Some(committed.activation)
+        || actor.workflow_timer_ordinal != committed.ordinal
+    {
+        return;
+    }
+    actor.workflow_timer_ordinal = committed
+        .ordinal
+        .checked_add(1)
+        .expect("workflow timer ordinal exhausted within one activation");
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerReplayDisposition {
+    Append,
+    Consume,
+    Conflict,
+}
+
+fn timer_replay_disposition(
+    rt: &Runtime,
+    actor_id: u64,
+    timer_id: WorkflowTimerId,
+    name: &str,
+    duration_ms: u64,
+) -> TimerReplayDisposition {
+    let mut committed: Option<(String, u64)> = None;
+    for event in rt.persistence.read_workflow_events(actor_id) {
+        let WorkflowEvent::TimerSet {
+            timer_id: Some(existing_id),
+            name,
+            duration_ms,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if existing_id != timer_id {
+            continue;
+        }
+        if committed.is_some() {
+            return TimerReplayDisposition::Conflict;
+        }
+        committed = Some((name, duration_ms));
+    }
+    match committed {
+        None => TimerReplayDisposition::Append,
+        Some((existing_name, existing_duration))
+            if existing_name == name && existing_duration == duration_ms =>
+        {
+            TimerReplayDisposition::Consume
+        }
+        Some(_) => TimerReplayDisposition::Conflict,
+    }
+}
+
+/// Return durable timer instances that are still pending.
+///
+/// New records pair by WorkflowTimerId, so a reused human-readable timer name
+/// cannot be suppressed by an older fired timer. Legacy records without IDs
+/// preserve the historical name-based fallback.
+pub(crate) fn pending_workflow_timers(
+    events: &[WorkflowEvent],
+) -> Vec<(Option<WorkflowTimerId>, String, u64)> {
+    let mut fired_ids = std::collections::HashSet::new();
+    let mut legacy_fired_names = std::collections::HashSet::new();
+    for event in events {
+        match event {
+            WorkflowEvent::TimerFired {
+                timer_id: Some(timer_id),
+                ..
+            } => {
+                fired_ids.insert(*timer_id);
+            }
+            WorkflowEvent::TimerFired {
+                timer_id: None,
+                name,
+                ..
+            } => {
+                legacy_fired_names.insert(name.clone());
+            }
+            _ => {}
+        }
+    }
+
+    events
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::TimerSet {
+                timer_id: Some(timer_id),
+                name,
+                duration_ms,
+                ..
+            } if !fired_ids.contains(timer_id) => {
+                Some((Some(*timer_id), name.clone(), *duration_ms))
+            }
+            WorkflowEvent::TimerSet {
+                timer_id: None,
+                name,
+                duration_ms,
+                ..
+            } if !legacy_fired_names.contains(name) => Some((None, name.clone(), *duration_ms)),
+            _ => None,
+        })
+        .collect()
+}
+
+pub(crate) fn encode_workflow_timer_context(
+    name: &str,
+    timer_id: Option<WorkflowTimerId>,
+) -> String {
+    match timer_id {
+        Some(timer_id) => format!(
+            "nulang-timer-v1|{}|{}|{}|{}",
+            timer_id.activation.actor_id,
+            timer_id.activation.command_sequence,
+            timer_id.ordinal,
+            name
+        ),
+        None => name.to_string(),
+    }
+}
+
+pub(crate) fn decode_workflow_timer_context(
+    context: &str,
+) -> (String, Option<WorkflowTimerId>) {
+    let mut parts = context.splitn(5, '|');
+    if parts.next() != Some("nulang-timer-v1") {
+        return (context.to_string(), None);
+    }
+    let Some(actor_id) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
+        return (context.to_string(), None);
+    };
+    let Some(command_sequence) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
+        return (context.to_string(), None);
+    };
+    let Some(ordinal) = parts.next().and_then(|part| part.parse::<u32>().ok()) else {
+        return (context.to_string(), None);
+    };
+    let Some(name) = parts.next() else {
+        return (context.to_string(), None);
+    };
+    (
+        name.to_string(),
+        Some(WorkflowTimerId::new(
+            WorkflowActivationId::new(actor_id, command_sequence),
+            ordinal,
+        )),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -629,11 +797,31 @@ pub(crate) fn append_timer_fired(
     actor_id: u64,
     name: &str,
 ) -> std::io::Result<()> {
+    append_timer_fired_identified(rt, actor_id, name, None)
+}
+
+pub(crate) fn append_timer_fired_identified(
+    rt: &mut Runtime,
+    actor_id: u64,
+    name: &str,
+    timer_id: Option<WorkflowTimerId>,
+) -> std::io::Result<()> {
     let seq = next_sequence(rt, actor_id);
-    rt.persistence
-        .append_timer_fired(actor_id, seq, name.to_string())?;
-    try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+    if let Some(timer_id) = timer_id {
+        rt.persistence.append_workflow_event(
+            actor_id,
+            WorkflowEvent::TimerFired {
+                sequence: seq,
+                timer_id: Some(timer_id),
+                name: name.to_string(),
+            },
+        )?;
+        Ok(())
+    } else {
+        rt.persistence
+            .append_timer_fired(actor_id, seq, name.to_string())?;
+        try_checkpoint_actor(rt, actor_id)
+    }
 }
 
 pub(crate) fn append_signal_received(
@@ -739,13 +927,45 @@ pub(crate) fn schedule_workflow_timer(
     name: &str,
     duration_ms: u64,
 ) -> std::io::Result<()> {
-    if actor_is_workflow(rt, actor_id) {
-        // Never arm a live timer if its durable TimerSet/checkpoint failed.
-        // Recovery can only reason about timers that were durably recorded.
-        append_timer_set(rt, actor_id, name, duration_ms)?;
+    if !actor_is_workflow(rt, actor_id) {
+        rt.rearm_timer(actor_id, name, duration_ms);
+        return Ok(());
     }
-    rt.rearm_timer(actor_id, name, duration_ms);
-    Ok(())
+
+    let Some(timer_id) = current_workflow_timer_id(rt, actor_id) else {
+        append_timer_set(rt, actor_id, name, duration_ms)?;
+        rt.rearm_timer(actor_id, name, duration_ms);
+        return Ok(());
+    };
+
+    match timer_replay_disposition(rt, actor_id, timer_id, name, duration_ms) {
+        TimerReplayDisposition::Consume => {
+            advance_workflow_timer_id(rt, actor_id, timer_id);
+            Ok(())
+        }
+        TimerReplayDisposition::Conflict => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "workflow timer replay identity conflict for actor {} activation {} ordinal {}",
+                actor_id, timer_id.activation.command_sequence, timer_id.ordinal
+            ),
+        )),
+        TimerReplayDisposition::Append => {
+            let seq = next_sequence(rt, actor_id);
+            rt.persistence.append_workflow_event(
+                actor_id,
+                WorkflowEvent::TimerSet {
+                    sequence: seq,
+                    timer_id: Some(timer_id),
+                    name: name.to_string(),
+                    duration_ms,
+                },
+            )?;
+            advance_workflow_timer_id(rt, actor_id, timer_id);
+            rt.rearm_timer_with_id(actor_id, name, duration_ms, Some(timer_id));
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
