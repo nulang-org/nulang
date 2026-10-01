@@ -4391,14 +4391,9 @@ fn test_workflow_llm_durable_receipt_replays_without_provider_dispatch() {
         content: "hello".to_string(),
     });
 
-    let first = llm::prepare_workflow_llm_effect(
-        &mut rt,
-        actor_id,
-        site,
-        "Inference.ask",
-        &request,
-    )
-    .unwrap();
+    let first =
+        llm::prepare_workflow_llm_effect(&mut rt, actor_id, site, "Inference.ask", &request)
+            .unwrap();
     assert!(
         matches!(first, llm::WorkflowLlmDurabilityDecision::Dispatch),
         "first execution must persist Prepared before provider dispatch"
@@ -4421,13 +4416,12 @@ fn test_workflow_llm_durable_receipt_replays_without_provider_dispatch() {
     };
     llm::complete_workflow_llm_effect(&mut rt, actor_id, Ok(response))
         .expect("successful provider result must become a durable Completed receipt");
-    assert!(
-        rt.actors
-            .get(&actor_id)
-            .unwrap()
-            .llm_durable_effect_id
-            .is_none()
-    );
+    assert!(rt
+        .actors
+        .get(&actor_id)
+        .unwrap()
+        .llm_durable_effect_id
+        .is_none());
 
     {
         let actor = rt.actors.get_mut(&actor_id).unwrap();
@@ -4435,14 +4429,9 @@ fn test_workflow_llm_durable_receipt_replays_without_provider_dispatch() {
         actor.workflow_effect_occurrences.clear();
     }
 
-    let replay = llm::prepare_workflow_llm_effect(
-        &mut rt,
-        actor_id,
-        site,
-        "Inference.ask",
-        &request,
-    )
-    .unwrap();
+    let replay =
+        llm::prepare_workflow_llm_effect(&mut rt, actor_id, site, "Inference.ask", &request)
+            .unwrap();
     match replay {
         llm::WorkflowLlmDurabilityDecision::Replay(Ok(response)) => {
             assert_eq!(response.content.as_deref(), Some("recorded"));
