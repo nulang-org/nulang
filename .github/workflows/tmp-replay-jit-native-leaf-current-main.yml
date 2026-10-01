@@ -36,19 +36,159 @@ jobs:
           set -e
 
           unmerged="$(git diff --name-only --diff-filter=U || true)"
+          expected=$'CHANGELOG.md\nsrc/jit/mod.rs'
           if [ -n "$unmerged" ]; then
-            if [ "$unmerged" = "CHANGELOG.md" ]; then
-              git checkout --ours CHANGELOG.md
-              git add CHANGELOG.md
-            else
-              echo "Native-leaf replay has code conflicts on current main:"
+            if [ "$unmerged" != "$expected" ]; then
+              echo "Unexpected native-leaf replay conflicts:"
               printf '%s\n' "$unmerged"
               exit 1
             fi
+            # Keep current-main JIT control flow and changelog. The leaf-call
+            # delta is ported explicitly in the next step so the direct-frame
+            # register safety changes from PR #996 remain authoritative.
+            git checkout --ours CHANGELOG.md src/jit/mod.rs
+            git add CHANGELOG.md src/jit/mod.rs
           elif [ "$merge_status" -ne 0 ]; then
             echo "Merge failed without explicit unmerged paths"
             exit "$merge_status"
           fi
+
+      - name: Port native-leaf session hooks into current JIT
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("src/jit/mod.rs")
+          text = path.read_text(encoding="utf-8")
+
+          def replace_once(old: str, new: str) -> None:
+              global text
+              assert text.count(old) == 1, f"expected one anchor, got {text.count(old)}: {old[:80]!r}"
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              "use region_planner::{region_has_internal_back_edge, RegionPlanner};",
+              "use region_planner::{native_leaf_plan, region_has_internal_back_edge, RegionPlanner};",
+          )
+
+          marker = "// ---------------------------------------------------------------------------\n// JIT Session\n// ---------------------------------------------------------------------------\n"
+          leaf_struct = """#[derive(Debug, Clone, Copy)]
+struct NativeLeafCall {
+    ptr: *const u8,
+    return_reg: u8,
+    required_args: usize,
+}
+
+"""
+          assert leaf_struct not in text
+          replace_once(marker, leaf_struct + marker)
+
+          field_anchor = "    /// Monotonic suffix for replacement compilations. Cranelift keeps prior\n"
+          field = """    /// Straight-line direct callees compiled specifically for calls from
+    /// native regions. These are not ordinary hot-entry regions: they execute
+    /// against an isolated register buffer owned by the direct-call helper.
+    native_leaf_calls: FxHashMap<(usize, usize), NativeLeafCall>,
+"""
+          assert field not in text
+          replace_once(field_anchor, field + field_anchor)
+
+          replace_once(
+              "            region_planner: RegionPlanner::default(),\n            tier2_counters: FxHashMap::default(),",
+              "            region_planner: RegionPlanner::default(),\n            tier2_counters: FxHashMap::default(),\n            native_leaf_calls: FxHashMap::default(),",
+          )
+
+          reset_anchor = """    pub fn reset_tier2_counters(&mut self) {
+        self.tier2_counters.clear();
+    }
+
+"""
+          ensure_leaf = """    fn ensure_native_leaf_call(
+        &mut self,
+        module_idx: usize,
+        func_idx: usize,
+        module: &crate::bytecode::CodeModule,
+    ) -> Option<NativeLeafCall> {
+        if let Some(call) = self.native_leaf_calls.get(&(module_idx, func_idx)).copied() {
+            return Some(call);
+        }
+
+        let plan = native_leaf_plan(module, func_idx)?;
+        let symbol = format!("nulang_jit_leaf_{module_idx}_{func_idx}");
+        let native_calls = std::collections::HashMap::new();
+        let started = std::time::Instant::now();
+        let ptr = self
+            .codegen
+            .compile(NativeCompileRequest {
+                symbol: &symbol,
+                start_offset: plan.start,
+                num_instrs: plan.len,
+                instructions: &module.instructions,
+                optimization: CodegenOptimization::Fast,
+                kind: NativeCompileKind::Scalar {
+                    native_calls: &native_calls,
+                },
+            })
+            .ok()?;
+        let compile_time_ns = Self::elapsed_ns(started);
+        self.compile_stats.fast_compiles = self.compile_stats.fast_compiles.saturating_add(1);
+        self.compile_stats.fast_compile_ns = self
+            .compile_stats
+            .fast_compile_ns
+            .saturating_add(compile_time_ns);
+
+        let call = NativeLeafCall {
+            ptr,
+            return_reg: plan.return_reg,
+            required_args: plan.required_args,
+        };
+        self.native_leaf_calls.insert((module_idx, func_idx), call);
+        Some(call)
+    }
+
+"""
+          assert ensure_leaf not in text
+          replace_once(reset_anchor, reset_anchor + ensure_leaf)
+
+          plan_anchor = "        let plan = self.region_planner.plan(module_idx, pc, module);\n        if plan.len >= 3 {"
+          plan_with_leaf = """        let plan = self.region_planner.plan(module_idx, pc, module);
+        if !plan.native_calls.is_empty() {
+            let callees: FxHashSet<usize> = plan.native_calls.values().copied().collect();
+            for func_idx in callees {
+                let _ = self.ensure_native_leaf_call(module_idx, func_idx, module);
+            }
+        }
+        if plan.len >= 3 {"""
+          replace_once(plan_anchor, plan_with_leaf)
+
+          execute_anchor = """        let Some(func) = (unsafe { self.get_compiled(module_idx, pc) }) else {
+            return crate::backends::TieredAction::Interpret;
+        };
+        func(regs.as_mut_ptr(), constants.as_ptr());
+        crate::backends::TieredAction::RanJit
+"""
+          execute_leaf = """        let Some(func) = (unsafe { self.get_compiled(module_idx, pc) }) else {
+            return crate::backends::TieredAction::Interpret;
+        };
+        let leaf_calls: Vec<(usize, *const u8, u8, usize)> = self
+            .native_leaf_calls
+            .iter()
+            .filter_map(|(&(leaf_module, func_idx), call)| {
+                (leaf_module == module_idx).then_some((
+                    func_idx,
+                    call.ptr,
+                    call.return_reg,
+                    call.required_args,
+                ))
+            })
+            .collect();
+        crate::jit::runtime::set_jit_leaf_calls(&leaf_calls, constants.as_ptr());
+        func(regs.as_mut_ptr(), constants.as_ptr());
+        crate::jit::runtime::clear_jit_leaf_calls();
+        crate::backends::TieredAction::RanJit
+"""
+          replace_once(execute_anchor, execute_leaf)
+
+          path.write_text(text, encoding="utf-8")
 
       - name: Refresh changelog and remove replay-only workflow
         shell: python
@@ -65,7 +205,7 @@ jobs:
               title
               + "- **Hot direct calls to conservative straight-line, non-suspending, non-recursive leaf functions can execute as native JIT callees instead of re-entering the interpreter.** Unsupported, branchy, recursive, effectful, indirect, heap/actor, and suspending callees retain the existing interpreter fallback.\n"
               + "- **Native leaf callees use an isolated register buffer and copy back only the return value.** Caller-register preservation and the existing error/fallback semantics remain covered by focused JIT regressions.\n"
-              + "- **This replay is based on the current direct-frame JIT head.** Exact-parent JIT telemetry and repository CI remain the promotion authority; older cross-commit timing claims are not treated as current-main evidence.\n\n"
+              + "- **This replay preserves the current direct-frame JIT safety boundary.** Regions that contain a direct-call helper remain conservatively marked re-entrant for register-storage selection; exact-parent JIT telemetry and repository CI remain the promotion authority.\n\n"
           )
           changelog.write_text(text.replace(heading, heading + entry, 1), encoding="utf-8")
 
