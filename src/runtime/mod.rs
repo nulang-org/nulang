@@ -5069,6 +5069,11 @@ impl Runtime {
         }
 
         self.restore_suspended_workflow_activation(actor_id, suspended.activation);
+        let behavior_idx = suspended.behavior_idx;
+        let activation = suspended.activation;
+        let step_name = suspended.step_name.clone();
+        let mut persistence_failure: Option<String> = None;
+        let mut resume_error: Option<String> = None;
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -5104,10 +5109,10 @@ impl Runtime {
                         if let Err(error) = workflow::persist_step_completed(
                             &mut *self_ptr,
                             actor_id,
-                            suspended.activation,
-                            suspended.step_name,
+                            activation,
+                            step_name.clone(),
                         ) {
-                            tracing::error!(actor_id, %error, "nulang-workflow: receive-resume terminal commit failed");
+                            persistence_failure = Some(error.to_string());
                         }
                     }
                 }
@@ -5152,9 +5157,10 @@ impl Runtime {
                         }
                     }
                 }
-                // Other errors: the wait is over; the send-path result is
-                // discarded anyway, matching step_actor semantics.
-                Err(_) => (*self_ptr).clear_receive_wait(actor_id),
+                Err(error) => {
+                    (*self_ptr).clear_receive_wait(actor_id);
+                    resume_error = Some(error.to_string());
+                }
             }
             // End the VM-execution window only after any suspend-state
             // re-capture above: draining deferred wakes runs other actors
@@ -5163,6 +5169,38 @@ impl Runtime {
             // wakes of other actors are not lost when THIS one suspends.
             (*self_ptr).vm_exec_end();
         }
+
+        if let Some(failure) = persistence_failure
+            .or_else(|| self.take_workflow_persistence_failure(actor_id))
+        {
+            self.recover_after_workflow_persistence_failure(
+                actor_id,
+                &failure,
+                "receive-resume",
+            );
+            return;
+        }
+
+        if let Some(error) = resume_error {
+            if self.actor_is_workflow(actor_id) {
+                if let Err(commit_error) = workflow::persist_step_failed(
+                    self,
+                    actor_id,
+                    activation,
+                    step_name,
+                    error,
+                ) {
+                    self.recover_after_workflow_persistence_failure(
+                        actor_id,
+                        &commit_error.to_string(),
+                        "receive-resume-failure",
+                    );
+                    return;
+                }
+                self.run_saga_compensation(actor_id, behavior_idx);
+            }
+        }
+
         // The suspension resolved (completed or failed): if messages queued
         // up while the behavior was suspended, schedule the actor to drain
         // them - step_actor leaves mail untouched while a suspension is live.
