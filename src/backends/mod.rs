@@ -67,6 +67,30 @@ pub enum TieredAction {
     CompiledSimdAndRan,
 }
 
+/// Aggregate native compilation telemetry exposed uniformly by JIT backends.
+///
+/// These counters measure compiler wall time only. They deliberately exclude
+/// interpretation before tier-up and execution of generated code so benchmark
+/// tooling can report compile latency separately from runtime payoff.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JitCompileStats {
+    pub fast_compiles: u64,
+    pub fast_compile_ns: u64,
+    pub optimized_compiles: u64,
+    pub optimized_compile_ns: u64,
+}
+
+impl JitCompileStats {
+    pub fn total_compiles(self) -> u64 {
+        self.fast_compiles + self.optimized_compiles
+    }
+
+    pub fn total_compile_ns(self) -> u64 {
+        self.fast_compile_ns
+            .saturating_add(self.optimized_compile_ns)
+    }
+}
+
 /// A JIT backend compiles hot bytecode regions into native code for faster
 /// execution. The default implementation uses Cranelift (`src/jit/`). A future
 /// runtime could implement this trait with LLVM, GCC JIT, or whatever
@@ -113,6 +137,12 @@ pub trait JitBackend {
 
     /// Number of regions compiled through the type-directed path.
     fn typed_compiled_count(&self) -> usize;
+
+    /// Aggregate compiler-only latency telemetry. Backends that do not expose
+    /// compiler timing may keep the zero-valued default.
+    fn compile_stats(&self) -> JitCompileStats {
+        JitCompileStats::default()
+    }
 
     /// Reset hot counters.
     fn reset_hot_counters(&mut self);

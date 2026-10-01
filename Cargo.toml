@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/nulang-ai", "crates/nulang-ai-core", "crates/nulang-ai-protocol", "crates/nulang-ai-local", "crates/nulang-ai-director", "crates/nulang-ai-manager", "crates/nulang-ai-worker", "crates/nulang-ai-mcp", "crates/nulang-capacity", "crates/nulang-cloud-control", "crates/nulang-ui-protocol"]
+members = ["crates/nulang-ai", "crates/nulang-ai-core", "crates/nulang-ai-protocol", "crates/nulang-ai-local", "crates/nulang-ai-director", "crates/nulang-ai-manager", "crates/nulang-ai-worker", "crates/nulang-ai-mcp", "crates/nulang-capacity", "crates/nulang-ui-protocol"]
 # The browser-playground crate re-uses compiler sources via #[path] includes
 # and builds only for wasm32-unknown-unknown; it is intentionally standalone
 # (its own lockfile, minimal pure-Rust dep set) and excluded from workspace
@@ -36,7 +36,11 @@ autobenches = false
 language-version = "1.0.0-frozen"
 
 [features]
-default = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
+# Keep the historical batteries-included default during the stabilization
+# window, but give it an explicit name so release/CI consumers can pin the
+# compatibility profile before the default is eventually minimized.
+default = ["full"]
+full = ["native-codegen", "python", "sqlite", "lsp", "ai-runtime", "tls", "ffi", "tcp", "ureq"]
 # Cranelift-backed tiered JIT plus the current native/AOT backend.
 native-codegen = [
     "dep:cranelift",
@@ -166,7 +170,7 @@ wasm-encoder = { version = "0.220", optional = true }
 # Borsh serialization for the WASM component boundary (optional, see [features])
 borsh = { version = "1.5", optional = true, features = ["derive"] }
 # WASM runtime using Wasmtime (optional, see [features])
-wasmtime = { version = "46", optional = true, default-features = false, features = ["cranelift", "runtime", "std", "anyhow", "component-model", "wat"] }
+wasmtime = { version = "48.0.3", optional = true, default-features = false, features = ["cranelift", "runtime", "std", "anyhow", "component-model", "wat"] }
 wat = { version = "1.254", optional = true }
 blake3 = "1.8"
 rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12", "ring", "logging"] }
@@ -192,6 +196,11 @@ path = "src/main.rs"
 name = "nula_difffuzz"
 path = "src/bin/nula_difffuzz.rs"
 required-features = ["difffuzz"]
+
+[[bin]]
+name = "nulang-jit-bench"
+path = "src/bin/nulang_jit_bench.rs"
+required-features = ["native-codegen"]
 
 [[bin]]
 name = "nulang-savina"

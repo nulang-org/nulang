@@ -48,7 +48,8 @@ fn compile(source: &str) -> CodeModule {
 
 /// Fresh interpreter-only VM loaded with a clone of `module`. Each timed
 /// iteration gets a fresh VM over a cheap `CodeModule` clone (compiled once
-/// per benchmark). The JIT session is absent, so nothing can tier up mid-run.
+/// per benchmark). `iter_batched_ref` keeps VM destruction outside the timed
+/// routine. The JIT session is absent, so nothing can tier up mid-run.
 fn fresh_interp_vm(module: &CodeModule) -> VM {
     let mut vm = VM::new_without_jit();
     vm.load_module(module.clone());
@@ -60,9 +61,9 @@ fn bench_interp_int_loop(c: &mut Criterion) {
         "var sum = 0; var i = 0; while i < 1000 { sum = sum + i * 2 - i / 3; i = i + 1; }; sum";
     let module = compile(source);
     c.bench_function("interp/int_loop", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || fresh_interp_vm(&module),
-            |mut vm| black_box(vm.run().unwrap()),
+            |vm| black_box(vm.run().unwrap()),
             BatchSize::SmallInput,
         )
     });
@@ -72,9 +73,9 @@ fn bench_interp_float_loop(c: &mut Criterion) {
     let source = "var sum = 0.0; var i = 0; while i < 500 { sum = sum + perform Int.to_float(i) * 2.5 - perform Int.to_float(i) / 3.0; i = i + 1; }; sum";
     let module = compile(source);
     c.bench_function("interp/float_loop", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || fresh_interp_vm(&module),
-            |mut vm| black_box(vm.run().unwrap()),
+            |vm| black_box(vm.run().unwrap()),
             BatchSize::SmallInput,
         )
     });
@@ -84,9 +85,9 @@ fn bench_interp_function_call(c: &mut Criterion) {
     let source = "fn add(x: Int, y: Int) -> Int { x + y }; var sum = 0; var i = 0; while i < 500 { sum = add(sum, i); i = i + 1; }; sum";
     let module = compile(source);
     c.bench_function("interp/function_call", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || fresh_interp_vm(&module),
-            |mut vm| black_box(vm.run().unwrap()),
+            |vm| black_box(vm.run().unwrap()),
             BatchSize::SmallInput,
         )
     });
@@ -96,9 +97,9 @@ fn bench_interp_record_loop(c: &mut Criterion) {
     let source = "let r = { x: 1, y: 2, z: 3 }; var sum = 0; var i = 0; while i < 1000 { sum = sum + r.x + r.y + r.z; i = i + 1; }; sum";
     let module = compile(source);
     c.bench_function("interp/record_loop", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || fresh_interp_vm(&module),
-            |mut vm| black_box(vm.run().unwrap()),
+            |vm| black_box(vm.run().unwrap()),
             BatchSize::SmallInput,
         )
     });
@@ -116,22 +117,22 @@ fn bench_interp_cold_jit_probe(c: &mut Criterion) {
 
     // Baseline: JIT disabled — pure interpreter dispatch, no probes.
     c.bench_function("interp/cold_jit_off", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || fresh_interp_vm(&module),
-            |mut vm| black_box(vm.run().unwrap()),
+            |vm| black_box(vm.run().unwrap()),
             BatchSize::SmallInput,
         )
     });
 
     // JIT enabled but nothing hot: only candidate region-entry PCs probe.
     c.bench_function("interp/cold_jit_on", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
                 let mut vm = VM::new(); // JIT enabled (default)
                 vm.load_module(module.clone());
                 vm
             },
-            |mut vm| black_box(vm.run().unwrap()),
+            |vm| black_box(vm.run().unwrap()),
             BatchSize::SmallInput,
         )
     });
