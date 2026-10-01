@@ -4939,6 +4939,11 @@ impl Runtime {
             return;
         }
         self.restore_suspended_workflow_activation(actor_id, suspended.activation);
+        let behavior_idx = suspended.behavior_idx;
+        let activation = suspended.activation;
+        let step_name = suspended.step_name.clone();
+        let mut persistence_failure: Option<String> = None;
+        let mut resume_error: Option<String> = None;
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -4974,10 +4979,10 @@ impl Runtime {
                         if let Err(error) = workflow::persist_step_completed(
                             &mut *self_ptr,
                             actor_id,
-                            suspended.activation,
-                            suspended.step_name.clone(),
+                            activation,
+                            step_name.clone(),
                         ) {
-                            tracing::error!(actor_id, %error, "nulang-workflow: timer-resume terminal commit failed");
+                            persistence_failure = Some(error.to_string());
                         }
                     }
                 }
@@ -4996,9 +5001,8 @@ impl Runtime {
                         }
                     }
                 }
-                Err(e) => {
-                    // VM error during resume - log and clean up.
-                    tracing::warn!("Timer.sleep resume error for actor {}: {:?}", actor_id, e);
+                Err(error) => {
+                    resume_error = Some(error.to_string());
                     if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                         actor.suspended_execution = None;
                     }
@@ -5006,6 +5010,38 @@ impl Runtime {
             }
             (*self_ptr).vm_exec_end();
         }
+
+        if let Some(failure) = persistence_failure
+            .or_else(|| self.take_workflow_persistence_failure(actor_id))
+        {
+            self.recover_after_workflow_persistence_failure(
+                actor_id,
+                &failure,
+                "timer-resume",
+            );
+            return;
+        }
+
+        if let Some(error) = resume_error {
+            if self.actor_is_workflow(actor_id) {
+                if let Err(commit_error) = workflow::persist_step_failed(
+                    self,
+                    actor_id,
+                    activation,
+                    step_name,
+                    error,
+                ) {
+                    self.recover_after_workflow_persistence_failure(
+                        actor_id,
+                        &commit_error.to_string(),
+                        "timer-resume-failure",
+                    );
+                    return;
+                }
+                self.run_saga_compensation(actor_id, behavior_idx);
+            }
+        }
+
         // Re-enqueue so the scheduler can continue processing the actor.
         self.enqueue_actor(actor_id);
     }
