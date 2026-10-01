@@ -1142,7 +1142,36 @@ impl Runtime {
     }
 
     /// Record an emitted event on an actor. Delegates to the workflow subsystem.
-    pub fn emit_event(&mut self, actor_id: u64, event: &str, args: &[crate::vm::Value]) {
+    ///
+    /// The public embedding API keeps its best-effort shape and reports
+    /// success as a boolean. Runtime VM callbacks use the fallible sibling so
+    /// durable workflow failures abort execution immediately.
+    pub fn emit_event(
+        &mut self,
+        actor_id: u64,
+        event: &str,
+        args: &[crate::vm::Value],
+    ) -> bool {
+        match workflow::emit_event(self, actor_id, event, args) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::error!(
+                    actor_id,
+                    event,
+                    %error,
+                    "nulang-workflow: durable event emission failed"
+                );
+                false
+            }
+        }
+    }
+
+    pub(crate) fn try_emit_event(
+        &mut self,
+        actor_id: u64,
+        event: &str,
+        args: &[crate::vm::Value],
+    ) -> std::io::Result<()> {
         workflow::emit_event(self, actor_id, event, args)
     }
 
