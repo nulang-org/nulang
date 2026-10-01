@@ -5478,6 +5478,15 @@ impl Runtime {
                         return None;
                     }
 
+                    let observed_sequence = self.persistence.latest_sequence(actor_id);
+                    if observed_sequence > tail.sequence {
+                        warn!(
+                            "nulang-recover: refusing workflow actor {}: persisted sequence {} extends beyond atomic tail {}; mixed legacy/atomic history is not recoverable",
+                            actor_id, observed_sequence, tail.sequence
+                        );
+                        return None;
+                    }
+
                     let mut candidates: Vec<_> = self
                         .persistence
                         .read_journal(actor_id)
