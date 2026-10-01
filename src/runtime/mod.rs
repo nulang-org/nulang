@@ -5771,6 +5771,20 @@ impl Runtime {
             {
                 self.rearm_timer_with_id(actor_id, &name, duration_ms, timer_id);
             }
+
+            // Signal availability is not part of ActorSnapshot. Rebuild it from
+            // the full signal journal even when a later completed snapshot has a
+            // sequence at or beyond a SignalReceived record.
+            let signal_events = self.persistence.read_signal_events(actor_id);
+            if let Some(actor) = self.actors.get_mut(&actor_id) {
+                actor.received_signals.clear();
+                for event in &signal_events {
+                    if let WorkflowEvent::SignalReceived { name, payload, .. } = event {
+                        actor.received_signals.push((name.clone(), payload.clone()));
+                    }
+                }
+            }
+
             // If the workflow was in the middle of a step waiting on a signal,
             // re-trigger that step so it can resume from replayed events. We
             // use step_index as the behavior id because each step is compiled
