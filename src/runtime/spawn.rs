@@ -42,6 +42,26 @@ pub(crate) fn try_spawn_actor_with_models(
     workflow: Option<&str>,
     initial_authority: Option<&AuthorityManifest>,
 ) -> std::io::Result<u64> {
+    try_spawn_actor_with_models_for_schema(
+        rt,
+        init,
+        state_models,
+        persistent,
+        workflow,
+        initial_authority,
+        None,
+    )
+}
+
+fn try_spawn_actor_with_models_for_schema(
+    rt: &mut Runtime,
+    init: Box<dyn FnOnce() -> Vec<(String, Value)>>,
+    state_models: HashMap<String, StateModel>,
+    persistent: bool,
+    workflow: Option<&str>,
+    initial_authority: Option<&AuthorityManifest>,
+    expected_schema: Option<(&crate::bytecode::CodeModule, &str)>,
+) -> std::io::Result<u64> {
     try_spawn_actor_with_id(
         rt,
         fresh_actor_id(),
@@ -50,24 +70,45 @@ pub(crate) fn try_spawn_actor_with_models(
         persistent,
         workflow,
         initial_authority,
+        expected_schema,
     )
 }
 
-/// Load and validate legacy restart snapshot authority before actor initialization.
+/// Load and validate a legacy restart snapshot before actor initialization.
 ///
-/// A malformed persisted manifest aborts activation before the init closure,
-/// CRDT registration, actor insertion, or scheduler enqueue. Pre-authority
-/// snapshots deserialize with an empty token set and therefore remain
-/// deny-by-default.
+/// A malformed authority manifest or mismatched durable schema aborts activation
+/// before the init closure, CRDT registration, actor insertion, or scheduler
+/// enqueue. Pre-schema snapshots remain compatible only when ownership is
+/// unambiguous.
 fn preflight_persistent_snapshot(
     rt: &Runtime,
     actor_id: u64,
-) -> Result<Option<(ActorSnapshot, AuthorityManifest)>, RuntimeAuthorityError> {
+    expected_schema: Option<(&crate::bytecode::CodeModule, &str)>,
+) -> Result<Option<(ActorSnapshot, AuthorityManifest)>, String> {
     let Some(snapshot) = rt.persistence.load_snapshot(actor_id) else {
         return Ok(None);
     };
     let manifest =
-        AuthorityManifest::from_tokens(snapshot.authority_tokens.iter().map(String::as_str))?;
+        AuthorityManifest::from_tokens(snapshot.authority_tokens.iter().map(String::as_str))
+            .map_err(|error| error.to_string())?;
+
+    if let Some((module, expected_schema_name)) = expected_schema {
+        super::schema_identity::resolve_expected_snapshot_actor_meta(
+            module,
+            snapshot.schema_name.as_deref(),
+            expected_schema_name,
+        )
+        .map_err(|error| error.to_string())?;
+    } else if let Some(schema_name) = snapshot
+        .schema_name
+        .as_deref()
+        .filter(|schema_name| !schema_name.is_empty())
+    {
+        return Err(format!(
+            "persisted actor schema '{schema_name}' cannot be activated without compiler-owned schema context"
+        ));
+    }
+
     Ok(Some((snapshot, manifest)))
 }
 
@@ -82,7 +123,7 @@ pub(crate) fn spawn_actor_with_id(
     persistent: bool,
     workflow: Option<&str>,
 ) -> u64 {
-    match try_spawn_actor_with_id(rt, id, init, state_models, persistent, workflow, None) {
+    match try_spawn_actor_with_id(rt, id, init, state_models, persistent, workflow, None, None) {
         Ok(id) => id,
         Err(error) => {
             tracing::warn!(actor_id = id, %error, "actor spawn failed before publication");
@@ -99,15 +140,16 @@ fn try_spawn_actor_with_id(
     persistent: bool,
     workflow: Option<&str>,
     initial_authority: Option<&AuthorityManifest>,
+    expected_schema: Option<(&crate::bytecode::CodeModule, &str)>,
 ) -> std::io::Result<u64> {
     let restart_snapshot = if persistent && workflow.is_none() {
-        match preflight_persistent_snapshot(rt, id) {
+        match preflight_persistent_snapshot(rt, id, expected_schema) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 tracing::warn!(
                     actor_id = id,
                     %error,
-                    "refusing to activate persistent actor with invalid authority snapshot"
+                    "refusing to activate persistent actor with invalid durable snapshot"
                 );
                 return Ok(id);
             }
@@ -225,6 +267,7 @@ fn restore_persistent_state(
     if let Some((snapshot, authority)) = snapshot {
         actor.install_authority_manifest(&authority);
         actor.sequence = snapshot.sequence;
+        actor.activation_epoch = snapshot.activation_epoch;
         actor.waiting_signal = snapshot.waiting_signal;
         for (name, value) in snapshot.state {
             let v = value.to_value_on_heap(actor);
@@ -328,7 +371,7 @@ fn try_spawn_from_module(
             .map(|(name, model)| (name.clone(), map_ast_state_model(*model)))
             .collect();
         let defaults = meta.state_defaults.clone();
-        try_spawn_actor_with_models(
+        try_spawn_actor_with_models_for_schema(
             rt,
             Box::new(move || {
                 let mut fields: Vec<(String, Value)> = defaults
@@ -346,6 +389,7 @@ fn try_spawn_from_module(
                 None
             },
             initial_authority,
+            Some((module, meta.name.as_str())),
         )?
     } else {
         try_spawn_actor_with_models(
@@ -357,6 +401,9 @@ fn try_spawn_from_module(
             initial_authority,
         )?
     };
+    if !rt.actors.contains_key(&id) {
+        return Ok(Value::nil());
+    }
     let offsets: Vec<usize> = bytecode_offsets_for_role(module, role);
     // compensation_offsets filtered to this actor's own behaviors so
     // step-local indices in run_saga_compensation match.
@@ -377,6 +424,11 @@ fn try_spawn_from_module(
         actor.bytecode_offsets = offsets.clone();
         actor.compensation_offsets = compensation_offsets.clone();
         if let Some(meta) = meta {
+            // Preserve the compiler-owned schema identity that owns this
+            // actor's behavior table. Plain module actors previously kept only
+            // actor_<id>, which made runtime ownership checks guess globally.
+            // Manual/native actors still retain their synthetic instance name.
+            actor.name = meta.name.clone();
             if matches!(role, ActorRole::Agent) {
                 // Legacy storage flag retained until the serialized role enum
                 // replaces the compatibility booleans.
@@ -536,6 +588,20 @@ pub(crate) fn register_recovery_module(
     offsets: Vec<usize>,
     compensation_offsets: Vec<Option<usize>>,
 ) {
+    if let Some(actor) = rt.actors.get(&actor_id) {
+        let schema_name =
+            super::schema_identity::canonical_schema_name_for_runtime_actor(&module, &actor.name)
+                .map(str::to_owned)
+                .or_else(|| {
+                    super::schema_identity::resolve_snapshot_actor_meta(&module, None)
+                        .ok()
+                        .map(|meta| meta.name.clone())
+                });
+        if let Some(schema_name) = schema_name {
+            rt.recovery_schema_names.insert(actor_id, schema_name);
+        }
+    }
+
     rt.recovery_modules
         .insert(actor_id, (module, offsets, compensation_offsets));
 }

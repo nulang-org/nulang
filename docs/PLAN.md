@@ -1449,11 +1449,10 @@ remain open.
     conformance cases (`conformance/behavior/crdt_gcounter.nula`,
     `crdt_pncounter.nula`, `crdt_gcounter_opset.nula`). The standalone
     runtime now initializes `crdt_manager` eagerly, so `state crdt` fields
-    register and `Crdt.*` works without distribution enabled. **Known gap
-    (docs-truthed 2026-08-15):** `recover_actor` does not rebuild
-    `CrdtManager.field_map`, so `Crdt.*` is a silent nil no-op on a
-    recovered actor (the materialized `state_data` value survives) — pinned
-    by `test_crdt_field_survives_recovery`.
+    register and `Crdt.*` works without distribution enabled. **Recovery gap fixed:** snapshots now persist the actor's
+    CRDT field-to-`CrdtId` mapping; `recover_actor` restores both forward and
+    reverse mappings before idempotently re-registering declared CRDT fields,
+    so `Crdt.*` remains operational after restart.
 13. **Op-based CRDT replication (CmRDT).** ✅ **landed (Phase 3 bullet 6
     satisfied by reference).** `Packet::CrdtOp` (`network.rs:595`),
     `CrdtManager::apply_op` (`crdt_manager.rs:511`).
@@ -1588,9 +1587,10 @@ miscounts.
 - **Governance discipline.** Every Frozen/Stable change is an RFC.
   Every RFC has a Lean update if the theorems touch. Every accepted
   RFC has a conformance case.
-- **Security.** `cargo audit` runs in CI (already scheduled). Add
-  fuzzing corpus artifacts to CI (persist failing seeds). Publish a
-  security policy (`SECURITY.md`) with a disclosure email.
+- **Security.** `cargo audit` runs in CI and `SECURITY.md` documents the
+  private-disclosure path plus the scope of accepted-risk audit suppressions.
+  Remaining: persist failing fuzzing corpus artifacts in CI and continue
+  eliminating suppressed advisories as upstream dependency paths unblock.
 - **Dependency governance.** Every new direct dep requires a PR
   comment justifying it against the small-binary principle.
 - **Docs stay live.** `scripts/verify_doc_examples.sh` runs on every

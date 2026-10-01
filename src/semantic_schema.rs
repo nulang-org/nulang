@@ -25,7 +25,7 @@ use crate::types::{Capability, Effect, EffectRow, PrimitiveType, Region, Type, T
 const TYPED_PROGRAM_SEMANTIC_VERSION: &[u8] = b"nulang.typed-program-semantic.v1\0";
 const TYPED_ACTOR_DEFINITION_SEMANTIC_VERSION: &[u8] =
     b"nulang.typed-actor-definition-semantic.v1\0";
-const ACTOR_SCHEMA_CANONICAL_VERSION: &[u8] = b"nulang.actor-state-schema.v1\0";
+const ACTOR_SCHEMA_CANONICAL_VERSION: &[u8] = b"nulang.actor-state-schema.v2\0";
 
 /// Canonical compiler-owned state schema for one actor/entity/workflow/agent.
 ///
@@ -36,7 +36,27 @@ const ACTOR_SCHEMA_CANONICAL_VERSION: &[u8] = b"nulang.actor-state-schema.v1\0";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorStateSchema {
     pub actor_name: String,
+    /// Declared durable entity schema version (RFC 0008). Normal actors,
+    /// workflows, and agents use version 1 unless their HIR says otherwise.
+    pub version: u32,
+    /// Replay-relevant migration topology. Bodies remain compiler IR, while
+    /// this canonical surface makes version evolution part of semantic identity.
+    pub migrations: Vec<ActorMigrationSchema>,
     pub fields: Vec<ActorStateField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorMigrationSchema {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub has_state_migration: bool,
+    pub event_handlers: Vec<ActorMigrationEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ActorMigrationEvent {
+    pub name: String,
+    pub arity: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +97,24 @@ fn collect_decl_schemas(
                 };
                 out.push(ActorStateSchema {
                     actor_name,
+                    version: actor.version,
+                    migrations: actor
+                        .migrations
+                        .iter()
+                        .map(|migration| ActorMigrationSchema {
+                            from_version: migration.from_version,
+                            to_version: migration.to_version,
+                            has_state_migration: migration.state_body.is_some(),
+                            event_handlers: migration
+                                .event_migrations
+                                .iter()
+                                .map(|(name, params, _body)| ActorMigrationEvent {
+                                    name: name.clone(),
+                                    arity: params.len(),
+                                })
+                                .collect(),
+                        })
+                        .collect(),
                     fields: actor
                         .state_fields
                         .iter()
@@ -108,6 +146,24 @@ pub fn canonical_actor_state_schema_bytes(schemas: &[ActorStateSchema]) -> Vec<u
     encoder.len(schemas.len());
     for schema in schemas {
         encoder.string(&schema.actor_name);
+        encoder.u32(schema.version);
+
+        let mut migrations: Vec<_> = schema.migrations.iter().collect();
+        migrations.sort_by_key(|migration| (migration.from_version, migration.to_version));
+        encoder.len(migrations.len());
+        for migration in migrations {
+            encoder.u32(migration.from_version);
+            encoder.u32(migration.to_version);
+            encoder.byte(u8::from(migration.has_state_migration));
+
+            let mut event_handlers: Vec<_> = migration.event_handlers.iter().collect();
+            event_handlers.sort();
+            encoder.len(event_handlers.len());
+            for event in event_handlers {
+                encoder.string(&event.name);
+                encoder.len(event.arity);
+            }
+        }
 
         let mut fields: Vec<_> = schema.fields.iter().collect();
         fields.sort_by(|left, right| left.name.cmp(&right.name));
@@ -602,6 +658,8 @@ mod tests {
     fn schema(field_ty: Type) -> ActorStateSchema {
         ActorStateSchema {
             actor_name: "Counter".to_string(),
+            version: 1,
+            migrations: Vec::new(),
             fields: vec![ActorStateField {
                 name: "value".to_string(),
                 ty: field_ty,
@@ -643,6 +701,8 @@ mod tests {
     fn actor_schema_field_order_is_canonical() {
         let left = ActorStateSchema {
             actor_name: "Pair".to_string(),
+            version: 1,
+            migrations: Vec::new(),
             fields: vec![
                 ActorStateField {
                     name: "b".to_string(),
@@ -656,8 +716,71 @@ mod tests {
         };
         let right = ActorStateSchema {
             actor_name: "Pair".to_string(),
+            version: 1,
+            migrations: Vec::new(),
             fields: vec![left.fields[1].clone(), left.fields[0].clone()],
         };
+
+        assert_eq!(
+            canonical_actor_state_schema_bytes(&[left]),
+            canonical_actor_state_schema_bytes(&[right])
+        );
+    }
+
+    #[test]
+    fn entity_version_and_migration_topology_change_semantic_identity() {
+        let mir = mir::Module::new("schema-version-test");
+        let base = schema(primitive(PrimitiveType::Int));
+
+        let mut evolved = base.clone();
+        evolved.version = 2;
+        evolved.migrations = vec![ActorMigrationSchema {
+            from_version: 1,
+            to_version: 2,
+            has_state_migration: true,
+            event_handlers: vec![ActorMigrationEvent {
+                name: "Deposited".to_string(),
+                arity: 1,
+            }],
+        }];
+
+        let base_id = semantic_id_for_mir_with_actor_schemas(&mir, &[base], []).unwrap();
+        let evolved_id = semantic_id_for_mir_with_actor_schemas(&mir, &[evolved], []).unwrap();
+
+        assert_ne!(base_id, evolved_id);
+    }
+
+    #[test]
+    fn migration_metadata_order_is_canonical() {
+        let mut left = schema(primitive(PrimitiveType::Int));
+        left.version = 3;
+        left.migrations = vec![
+            ActorMigrationSchema {
+                from_version: 2,
+                to_version: 3,
+                has_state_migration: false,
+                event_handlers: vec![
+                    ActorMigrationEvent {
+                        name: "Zed".to_string(),
+                        arity: 0,
+                    },
+                    ActorMigrationEvent {
+                        name: "Alpha".to_string(),
+                        arity: 2,
+                    },
+                ],
+            },
+            ActorMigrationSchema {
+                from_version: 1,
+                to_version: 2,
+                has_state_migration: true,
+                event_handlers: vec![],
+            },
+        ];
+
+        let mut right = left.clone();
+        right.migrations.reverse();
+        right.migrations[1].event_handlers.reverse();
 
         assert_eq!(
             canonical_actor_state_schema_bytes(&[left]),

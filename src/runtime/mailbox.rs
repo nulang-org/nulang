@@ -14,17 +14,124 @@
 
 use crate::vm::Value;
 use crossbeam::queue::SegQueue;
+use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+const INLINE_PAYLOAD_VALUES: usize = 4;
+
+/// Actor-message payload optimized for the common small-message case.
+///
+/// Up to four NaN-boxed Values live directly in the envelope. Larger payloads
+/// retain shared Arc<Vec<Value>> storage so cloning a large message stays cheap.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MessagePayload {
+    Inline {
+        len: u8,
+        values: [Value; INLINE_PAYLOAD_VALUES],
+    },
+    Shared(Arc<Vec<Value>>),
+}
+
+impl MessagePayload {
+    #[inline]
+    pub fn from_slice(values: &[Value]) -> Self {
+        if values.len() <= INLINE_PAYLOAD_VALUES {
+            let mut inline = [Value::nil(); INLINE_PAYLOAD_VALUES];
+            inline[..values.len()].copy_from_slice(values);
+            Self::Inline {
+                len: values.len() as u8,
+                values: inline,
+            }
+        } else {
+            Self::Shared(Arc::new(values.to_vec()))
+        }
+    }
+
+    #[inline]
+    pub fn from_vec(values: Vec<Value>) -> Self {
+        if values.len() <= INLINE_PAYLOAD_VALUES {
+            let len = values.len();
+            let mut inline = [Value::nil(); INLINE_PAYLOAD_VALUES];
+            inline[..len].copy_from_slice(&values);
+            Self::Inline {
+                len: len as u8,
+                values: inline,
+            }
+        } else {
+            Self::Shared(Arc::new(values))
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[Value] {
+        match self {
+            Self::Inline { len, values } => &values[..*len as usize],
+            Self::Shared(values) => values.as_slice(),
+        }
+    }
+
+    #[inline]
+    pub fn to_vec(&self) -> Vec<Value> {
+        self.as_slice().to_vec()
+    }
+
+    /// Materialize shared ownership only when an API genuinely needs payload
+    /// lifetime independent of the message envelope (selective receive).
+    #[inline]
+    pub fn to_shared(&self) -> Arc<Vec<Value>> {
+        match self {
+            Self::Inline { .. } => Arc::new(self.as_slice().to_vec()),
+            Self::Shared(values) => Arc::clone(values),
+        }
+    }
+
+    #[inline]
+    pub fn is_inline(&self) -> bool {
+        matches!(self, Self::Inline { .. })
+    }
+}
+
+impl Deref for MessagePayload {
+    type Target = [Value];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[Value]> for MessagePayload {
+    #[inline]
+    fn as_ref(&self) -> &[Value] {
+        self.as_slice()
+    }
+}
+
+impl From<Vec<Value>> for MessagePayload {
+    fn from(values: Vec<Value>) -> Self {
+        Self::from_vec(values)
+    }
+}
+
+impl From<Arc<Vec<Value>>> for MessagePayload {
+    fn from(values: Arc<Vec<Value>>) -> Self {
+        if values.len() <= INLINE_PAYLOAD_VALUES {
+            Self::from_slice(values.as_slice())
+        } else {
+            Self::Shared(values)
+        }
+    }
+}
 
 /// Message sent between actors.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
     pub behavior_id: u16,
-    /// Payload values, shared via `Arc` to avoid cloning on every
-    /// `receive_match` scan. The VM never mutates incoming payloads.
-    pub payload: Arc<Vec<Value>>,
+    /// Payload values: 0–4 inline, larger payloads Arc-backed.
+    pub payload: MessagePayload,
     pub sender: u64,
     pub priority: MessagePriority,
     /// W3C traceparent for distributed tracing.
@@ -51,6 +158,107 @@ enum MatchLane {
     Normal,
 }
 
+/// Lazy positional index for one staged selective-receive lane.
+///
+/// Positions remain stable while a receive transaction only appends arrivals
+/// and rejects guards. A successful commit or ordinary pop shifts VecDeque
+/// positions and invalidates the index, which is rebuilt lazily.
+#[derive(Debug)]
+struct ReceiveLaneIndex {
+    positions: FxHashMap<u16, Vec<usize>>,
+    cursors: FxHashMap<u16, usize>,
+    valid: bool,
+}
+
+impl ReceiveLaneIndex {
+    fn new() -> Self {
+        Self {
+            positions: FxHashMap::default(),
+            cursors: FxHashMap::default(),
+            valid: true,
+        }
+    }
+
+    #[inline]
+    fn append(&mut self, behavior_id: u16, index: usize) {
+        if self.valid {
+            self.positions.entry(behavior_id).or_default().push(index);
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.positions.clear();
+        self.cursors.clear();
+        self.valid = false;
+    }
+
+    fn reset_cursors(&mut self) {
+        self.cursors.clear();
+    }
+
+    fn ensure(&mut self, buffer: &VecDeque<(Message, bool)>) {
+        if self.valid {
+            return;
+        }
+        self.positions.clear();
+        for (idx, (msg, _)) in buffer.iter().enumerate() {
+            self.positions.entry(msg.behavior_id).or_default().push(idx);
+        }
+        self.cursors.clear();
+        self.valid = true;
+    }
+
+    fn next_candidate(
+        &mut self,
+        buffer: &VecDeque<(Message, bool)>,
+        behavior_ids: &[u16],
+    ) -> Option<(usize, usize)> {
+        self.ensure(buffer);
+
+        let mut best: Option<(usize, usize)> = None;
+        for (arm_pos, &behavior_id) in behavior_ids.iter().enumerate() {
+            let Some(positions) = self.positions.get(&behavior_id) else {
+                continue;
+            };
+            let cursor = self.cursors.entry(behavior_id).or_insert(0);
+            while *cursor < positions.len() {
+                let idx = positions[*cursor];
+                match buffer.get(idx) {
+                    Some((_, false)) => break,
+                    Some((_, true)) | None => *cursor += 1,
+                }
+            }
+            if *cursor >= positions.len() {
+                continue;
+            }
+            let idx = positions[*cursor];
+            match best {
+                None => best = Some((arm_pos, idx)),
+                Some((_, best_idx)) if idx < best_idx => best = Some((arm_pos, idx)),
+                _ => {}
+            }
+        }
+        best
+    }
+}
+
+#[derive(Debug)]
+struct ReceiveIndexes {
+    system: ReceiveLaneIndex,
+    local: ReceiveLaneIndex,
+    normal: ReceiveLaneIndex,
+}
+
+impl ReceiveIndexes {
+    fn new() -> Self {
+        Self {
+            system: ReceiveLaneIndex::new(),
+            local: ReceiveLaneIndex::new(),
+            normal: ReceiveLaneIndex::new(),
+        }
+    }
+}
+
 /// MPSC mailbox with priority bands and optional capacity.
 ///
 /// Concurrent producers may call [`Mailbox::push`] through shared references;
@@ -74,10 +282,13 @@ pub struct Mailbox {
     local_skip_buffer: VecDeque<(Message, bool)>,
     /// Normal messages staged by selective receive.
     skip_buffer: VecDeque<(Message, bool)>,
+    /// Selective-receive indexes are allocated lazily so actors that only use
+    /// ordinary FIFO receive do not carry three hash maps in every mailbox.
+    receive_indexes: Option<Box<ReceiveIndexes>>,
     /// The most recently returned candidate. A second `receive_match` call
     /// means the previous candidate's guard rejected it; only this active
     /// candidate may be consumed by `commit_receive_match`.
-    active_match: Option<(MatchLane, usize)>,
+    active_match: Option<(MatchLane, usize, Arc<Vec<Value>>)>,
 }
 
 impl Mailbox {
@@ -95,6 +306,7 @@ impl Mailbox {
             system_skip_buffer: VecDeque::new(),
             local_skip_buffer: VecDeque::new(),
             skip_buffer: VecDeque::new(),
+            receive_indexes: None,
             active_match: None,
         }
     }
@@ -105,12 +317,17 @@ impl Mailbox {
     /// Bounded normal/bulk traffic uses CAS so concurrent producers cannot all
     /// observe the same free slot and overfill the mailbox.
     fn reserve_slot(&self, system: bool) -> bool {
+        // queued_count is capacity/accounting state only; SegQueue owns
+        // publication and synchronization for the message itself. Atomic
+        // modification order is sufficient to keep bounded producers from
+        // over-reserving slots, so acquire/release fences add no ordering
+        // guarantee that the mailbox relies on.
         if system || self.capacity == 0 {
-            self.queued_count.fetch_add(1, Ordering::AcqRel);
+            self.queued_count.fetch_add(1, Ordering::Relaxed);
             return true;
         }
 
-        let mut current = self.queued_count.load(Ordering::Acquire);
+        let mut current = self.queued_count.load(Ordering::Relaxed);
         loop {
             if current >= self.capacity {
                 return false;
@@ -118,8 +335,8 @@ impl Mailbox {
             match self.queued_count.compare_exchange_weak(
                 current,
                 current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => return true,
                 Err(observed) => current = observed,
@@ -128,7 +345,7 @@ impl Mailbox {
     }
 
     fn release_slot(&self) {
-        let previous = self.queued_count.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.queued_count.fetch_sub(1, Ordering::Relaxed);
         debug_assert!(previous > 0, "mailbox logical count underflow");
     }
 
@@ -172,43 +389,61 @@ impl Mailbox {
             .or_else(|| self.normal_queue.pop());
         if result.is_some() {
             self.active_match = None;
+            self.invalidate_receive_indexes();
             self.release_slot();
         }
         result
     }
 
+    fn stage_message(
+        buffer: &mut VecDeque<(Message, bool)>,
+        index: &mut ReceiveLaneIndex,
+        msg: Message,
+    ) {
+        let position = buffer.len();
+        let behavior_id = msg.behavior_id;
+        buffer.push_back((msg, false));
+        index.append(behavior_id, position);
+    }
+
+    fn ensure_receive_indexes(&mut self) {
+        if self.receive_indexes.is_none() {
+            self.receive_indexes = Some(Box::new(ReceiveIndexes::new()));
+        }
+    }
+
     fn stage_arrivals(&mut self) {
+        let indexes = self
+            .receive_indexes
+            .as_mut()
+            .expect("selective receive indexes must be initialized");
+
         // Scheduler-local system messages join the system lane; other local
         // traffic stays in its own lane so its FIFO position is stable.
         while let Some(msg) = self.local_queue.pop_front() {
             if msg.priority == MessagePriority::System {
-                self.system_skip_buffer.push_back((msg, false));
+                Self::stage_message(&mut self.system_skip_buffer, &mut indexes.system, msg);
             } else {
-                self.local_skip_buffer.push_back((msg, false));
+                Self::stage_message(&mut self.local_skip_buffer, &mut indexes.local, msg);
             }
         }
         while let Some(msg) = self.system_queue.pop() {
-            self.system_skip_buffer.push_back((msg, false));
+            Self::stage_message(&mut self.system_skip_buffer, &mut indexes.system, msg);
         }
         while let Some(msg) = self.normal_queue.pop() {
-            self.skip_buffer.push_back((msg, false));
+            Self::stage_message(&mut self.skip_buffer, &mut indexes.normal, msg);
         }
     }
 
-    fn scan_staged(
+    fn scan_indexed(
         buffer: &mut VecDeque<(Message, bool)>,
+        index: &mut ReceiveLaneIndex,
         behavior_ids: &[u16],
     ) -> Option<(usize, usize, Arc<Vec<Value>>)> {
-        for (idx, (msg, tried)) in buffer.iter_mut().enumerate() {
-            if *tried {
-                continue;
-            }
-            if let Some(pos) = behavior_ids.iter().position(|&id| id == msg.behavior_id) {
-                *tried = true;
-                return Some((pos, idx, Arc::clone(&msg.payload)));
-            }
-        }
-        None
+        let (arm_pos, message_idx) = index.next_candidate(buffer, behavior_ids)?;
+        let (message, tried) = buffer.get_mut(message_idx)?;
+        *tried = true;
+        Some((arm_pos, message_idx, message.payload.to_shared()))
     }
 
     /// Selective receive is transactional: returning a candidate only marks it
@@ -220,22 +455,34 @@ impl Mailbox {
         // candidate was rejected by its pattern/guard. It remains `tried` for
         // this receive expression but is no longer the commit target.
         self.active_match = None;
+        self.ensure_receive_indexes();
         self.stage_arrivals();
 
-        if let Some((pos, idx, payload)) =
-            Self::scan_staged(&mut self.system_skip_buffer, behavior_ids)
-        {
-            self.active_match = Some((MatchLane::System, idx));
+        let indexes = self
+            .receive_indexes
+            .as_mut()
+            .expect("selective receive indexes must be initialized");
+
+        if let Some((pos, idx, payload)) = Self::scan_indexed(
+            &mut self.system_skip_buffer,
+            &mut indexes.system,
+            behavior_ids,
+        ) {
+            self.active_match = Some((MatchLane::System, idx, Arc::clone(&payload)));
+            return Some((pos, payload));
+        }
+        if let Some((pos, idx, payload)) = Self::scan_indexed(
+            &mut self.local_skip_buffer,
+            &mut indexes.local,
+            behavior_ids,
+        ) {
+            self.active_match = Some((MatchLane::Local, idx, Arc::clone(&payload)));
             return Some((pos, payload));
         }
         if let Some((pos, idx, payload)) =
-            Self::scan_staged(&mut self.local_skip_buffer, behavior_ids)
+            Self::scan_indexed(&mut self.skip_buffer, &mut indexes.normal, behavior_ids)
         {
-            self.active_match = Some((MatchLane::Local, idx));
-            return Some((pos, payload));
-        }
-        if let Some((pos, idx, payload)) = Self::scan_staged(&mut self.skip_buffer, behavior_ids) {
-            self.active_match = Some((MatchLane::Normal, idx));
+            self.active_match = Some((MatchLane::Normal, idx, Arc::clone(&payload)));
             return Some((pos, payload));
         }
         None
@@ -243,7 +490,7 @@ impl Mailbox {
 
     /// Total logical message count. Safe to query concurrently.
     pub fn len(&self) -> usize {
-        self.queued_count.load(Ordering::Acquire)
+        self.queued_count.load(Ordering::Relaxed)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -302,21 +549,35 @@ impl Mailbox {
         for (_, tried) in self.skip_buffer.iter_mut() {
             *tried = false;
         }
+        if let Some(indexes) = self.receive_indexes.as_mut() {
+            indexes.system.reset_cursors();
+            indexes.local.reset_cursors();
+            indexes.normal.reset_cursors();
+        }
+    }
+
+    fn invalidate_receive_indexes(&mut self) {
+        if let Some(indexes) = self.receive_indexes.as_mut() {
+            indexes.system.invalidate();
+            indexes.local.invalidate();
+            indexes.normal.invalidate();
+        }
     }
 
     /// Commit exactly the most recently returned candidate and return its
     /// payload so the runtime can establish receiver-side ORCA ownership only
     /// after the pattern+guard succeeds.
     pub fn commit_receive_match(&mut self) -> Option<Arc<Vec<Value>>> {
-        let (lane, idx) = self.active_match.take()?;
-        let removed = match lane {
+        let (lane, idx, payload) = self.active_match.take()?;
+        let _removed = match lane {
             MatchLane::System => self.system_skip_buffer.remove(idx),
             MatchLane::Local => self.local_skip_buffer.remove(idx),
             MatchLane::Normal => self.skip_buffer.remove(idx),
         }?;
         self.release_slot();
+        self.invalidate_receive_indexes();
         self.clear_tried_flags();
-        Some(removed.0.payload)
+        Some(payload)
     }
 
     /// Abort a selective-receive scan. No message is consumed and ownership
@@ -335,11 +596,30 @@ mod tests {
     fn make_msg(behavior_id: u16, sender: u64) -> Message {
         Message {
             behavior_id,
-            payload: Arc::new(vec![Value::int(42)]),
+            payload: MessagePayload::from_slice(&[Value::int(42)]),
             sender,
             priority: MessagePriority::Normal,
             trace_id: None,
         }
+    }
+
+    #[test]
+    fn small_payloads_inline_and_large_payloads_spill() {
+        let four = [Value::int(1), Value::int(2), Value::int(3), Value::int(4)];
+        let inline = MessagePayload::from_slice(&four);
+        assert!(inline.is_inline());
+        assert_eq!(inline.as_slice(), &four);
+
+        let five = [
+            Value::int(1),
+            Value::int(2),
+            Value::int(3),
+            Value::int(4),
+            Value::int(5),
+        ];
+        let shared = MessagePayload::from_slice(&five);
+        assert!(!shared.is_inline());
+        assert_eq!(shared.as_slice(), &five);
     }
 
     #[test]
@@ -354,7 +634,7 @@ mod tests {
         let popped = mb.pop().unwrap();
         assert_eq!(popped.behavior_id, 1);
         assert_eq!(popped.sender, 100);
-        assert_eq!(*popped.payload, vec![Value::int(42)]);
+        assert_eq!(popped.payload.as_slice(), &[Value::int(42)]);
         assert!(mb.is_empty());
         assert_eq!(mb.pop(), None);
     }
@@ -402,7 +682,7 @@ mod tests {
         for i in 0..1000 {
             mb.push(Message {
                 behavior_id: 0,
-                payload: Arc::new(vec![Value::int(i)]),
+                payload: MessagePayload::from_slice(&[Value::int(i)]),
                 sender: i as u64,
                 priority: MessagePriority::System,
                 trace_id: None,
@@ -500,7 +780,7 @@ mod transactional_receive_tests {
     fn msg(behavior_id: u16, sender: u64, priority: MessagePriority) -> Message {
         Message {
             behavior_id,
-            payload: Arc::new(vec![Value::int(sender as i64)]),
+            payload: MessagePayload::from_slice(&[Value::int(sender as i64)]),
             sender,
             priority,
             trace_id: None,
@@ -588,5 +868,77 @@ mod transactional_receive_tests {
         assert_eq!(mb.pop().unwrap().sender, 1);
         assert_eq!(mb.pop().unwrap().sender, 2);
         assert_eq!(mb.pop().unwrap().sender, 3);
+    }
+    #[test]
+    fn indexed_receive_preserves_fifo_across_arm_order() {
+        let mut mb = Mailbox::new(8);
+        mb.push_local(msg(20, 1, MessagePriority::Normal)).unwrap();
+        mb.push_local(msg(10, 2, MessagePriority::Normal)).unwrap();
+
+        let (arm, payload) = mb.receive_match(&[10, 20]).expect("candidate");
+        assert_eq!(arm, 1, "oldest matching message wins before arm order");
+        assert_eq!(payload[0].as_int(), Some(1));
+    }
+
+    #[test]
+    fn indexed_receive_duplicate_behavior_uses_first_arm() {
+        let mut mb = Mailbox::new(4);
+        mb.push_local(msg(7, 11, MessagePriority::Normal)).unwrap();
+
+        let (arm, payload) = mb.receive_match(&[7, 7]).expect("candidate");
+        assert_eq!(arm, 0);
+        assert_eq!(payload[0].as_int(), Some(11));
+    }
+
+    #[test]
+    fn indexed_receive_rebuilds_after_middle_commit() {
+        let mut mb = Mailbox::new(8);
+        mb.push_local(msg(1, 1, MessagePriority::Normal)).unwrap();
+        mb.push_local(msg(2, 2, MessagePriority::Normal)).unwrap();
+        mb.push_local(msg(3, 3, MessagePriority::Normal)).unwrap();
+
+        let first = mb.receive_match(&[2]).expect("middle candidate");
+        assert_eq!(first.1[0].as_int(), Some(2));
+        mb.commit_receive_match().expect("commit middle");
+
+        let next = mb.receive_match(&[3]).expect("candidate after reindex");
+        assert_eq!(next.1[0].as_int(), Some(3));
+        mb.commit_receive_match().expect("commit tail");
+
+        assert_eq!(mb.pop().unwrap().sender, 1);
+        assert!(mb.is_empty());
+    }
+
+    #[test]
+    fn indexed_receive_sees_arrival_after_initial_miss() {
+        let mut mb = Mailbox::new(8);
+        mb.push_local(msg(1, 1, MessagePriority::Normal)).unwrap();
+        assert!(mb.receive_match(&[9]).is_none());
+
+        mb.push_local(msg(9, 2, MessagePriority::Normal)).unwrap();
+        let found = mb.receive_match(&[9]).expect("new indexed arrival");
+        assert_eq!(found.1[0].as_int(), Some(2));
+    }
+
+    #[test]
+    fn indexed_receive_reset_rewinds_behavior_cursor() {
+        let mut mb = Mailbox::new(8);
+        mb.push_local(msg(7, 11, MessagePriority::Normal)).unwrap();
+        mb.push_local(msg(7, 22, MessagePriority::Normal)).unwrap();
+
+        let first = mb.receive_match(&[7]).expect("first candidate");
+        assert_eq!(first.1[0].as_int(), Some(11));
+
+        let second = mb.receive_match(&[7]).expect("guard-retry candidate");
+        assert_eq!(second.1[0].as_int(), Some(22));
+
+        mb.reset_receive_match();
+
+        let retried = mb.receive_match(&[7]).expect("candidate after reset");
+        assert_eq!(
+            retried.1[0].as_int(),
+            Some(11),
+            "reset must rewind indexed cursors and clear tried state"
+        );
     }
 }

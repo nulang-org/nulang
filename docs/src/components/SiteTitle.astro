@@ -28,32 +28,62 @@ const { siteTitleHref } = Astro.locals.starlightRoute;
 			</>
 		)
 	}
-	<span class:list={{ 'sr-only': config.logo?.replacesTitle }} translate="no">
+	<span class:list={['wordmark', { 'sr-only': config.logo?.replacesTitle }]} translate="no">
 		<span class="nu-blue">Nu</span><span>lang</span>
 	</span>
+	<span class="site-kind" aria-hidden="true">language</span>
 </a>
 
 <style>
 	@layer starlight.core {
 		.site-title {
 			align-items: center;
-			gap: var(--sl-nav-gap);
-			font-size: var(--sl-text-h4);
-			font-weight: 600;
-			color: var(--sl-color-text-accent);
+			gap: 0.55rem;
+			color: var(--nu-text);
 			text-decoration: none;
 			white-space: nowrap;
 			min-width: 0;
 		}
-		span {
+
+		.wordmark {
 			overflow: hidden;
+			font-size: 1rem;
+			font-weight: 760;
+			letter-spacing: -0.035em;
 		}
+
+		.nu-blue {
+			color: var(--nu-blue);
+		}
+
+		.site-kind {
+			padding-left: 0.55rem;
+			border-left: 1px solid var(--nu-border);
+			color: var(--nu-text-tertiary);
+			font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+			font-size: 0.58rem;
+			font-weight: 720;
+			letter-spacing: 0.08em;
+			text-transform: uppercase;
+		}
+
 		img {
-			height: calc(var(--sl-nav-height) - 2 * var(--sl-nav-pad-y));
-			width: auto;
-			max-width: 100%;
+			width: 1.75rem;
+			height: 1.75rem;
+			max-width: none;
 			object-fit: contain;
-			object-position: 0 50%;
+			object-position: center;
+		}
+
+		@media (max-width: 34rem) {
+			.site-kind {
+				display: none;
+			}
+
+			img {
+				width: 1.6rem;
+				height: 1.6rem;
+			}
 		}
 	}
 </style>

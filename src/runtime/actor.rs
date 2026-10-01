@@ -2,7 +2,7 @@
 
 use super::gc::OrcaGc;
 use super::*;
-use crate::runtime::object_store::ObjectId;
+use crate::runtime::object_store::{ObjectId, ObjectStore};
 use crate::vm::Value;
 use std::collections::{HashMap, HashSet};
 
@@ -19,8 +19,9 @@ pub enum ActorState {
 /// Scheduling priority of an actor (Erlang-style process priority).
 ///
 /// The scheduler dequeues ready High-priority actors before Normal, and
-/// Normal before Low (strict per-level preference, FIFO within a level —
-/// see `Scheduler::enqueue_with_priority`). Priority affects scheduling
+/// Normal before Low (strict per-level preference). Ordering within one
+/// priority level is unspecified because work-stealing queues may reorder
+/// equal-priority ready tokens. Priority affects scheduling
 /// order only; it does not touch message delivery order
 /// (`Mailbox::receive_match` stays FIFO and ignores `Message::priority`).
 /// Set from Nulang via `perform Actor.set_priority(0|1|2)`.
@@ -44,6 +45,19 @@ pub enum ActorPriority {
     #[default]
     Normal,
     Low,
+}
+
+/// Scheduler ownership state for an actor.
+///
+/// The owning runtime shard is the only writer. A queued/running actor already
+/// has scheduler ownership, so repeated sends only append mailbox work instead
+/// of injecting duplicate ready tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActorRunState {
+    #[default]
+    Idle,
+    Queued,
+    Running,
 }
 
 // -- Flight recorder (deterministic replay support) ---------------------
@@ -79,29 +93,69 @@ pub struct FlightRecorder {
     max_entries: usize,
 }
 
+fn runtime_flight_recorder_enabled() -> bool {
+    use std::sync::OnceLock;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NULANG_FLIGHT_RECORDER")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
 impl FlightRecorder {
-    /// Create a new flight recorder retaining up to `max_entries` messages.
+    /// Create an enabled flight recorder retaining up to `max_entries` messages.
+    ///
+    /// Storage is allocated lazily on the first recorded message rather than
+    /// reserving the whole ring for every actor at spawn time.
     pub fn new(max_entries: usize) -> Self {
         FlightRecorder {
-            entries: Vec::with_capacity(max_entries),
+            entries: Vec::new(),
             cursor: 0,
             next_seq: 0,
             max_entries,
         }
     }
 
+    /// Create the runtime-default flight recorder.
+    ///
+    /// Per-actor flight recording is intentionally opt-in in production
+    /// because payload summarization formats values and the ring can grow to a
+    /// meaningful amount of memory across large actor populations. Set
+    /// `NULANG_FLIGHT_RECORDER=1` (or `true`) to enable it for actors
+    /// created by the runtime. Direct callers of `FlightRecorder::new` retain
+    /// the historical always-enabled behavior.
+    pub fn runtime_default(max_entries: usize) -> Self {
+        if cfg!(test) || runtime_flight_recorder_enabled() {
+            Self::new(max_entries)
+        } else {
+            Self::new(0)
+        }
+    }
+
     /// Record a message delivery.
     pub fn record(&mut self, sender: u64, behavior_id: u16, payload: &[Value]) {
+        if self.max_entries == 0 {
+            return;
+        }
+
         let seq = self.next_seq;
         self.next_seq += 1;
 
         let payload_len = payload.len();
-        let payload_summary = payload
-            .iter()
-            .take(3)
-            .map(|v| v.to_string_repr())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let mut payload_summary = String::new();
+        for (idx, value) in payload.iter().take(3).enumerate() {
+            if idx != 0 {
+                payload_summary.push_str(", ");
+            }
+            payload_summary.push_str(&value.to_string_repr());
+        }
 
         let entry = TraceEntry {
             seq,
@@ -221,10 +275,30 @@ pub struct Actor {
     pub trap_exits: bool,    // If true, exit signals become messages instead of killing this actor
     /// Scheduling priority, consulted by the scheduler on every enqueue.
     pub priority: ActorPriority,
+    /// Idle/queued/running ownership used to deduplicate ready-queue entries.
+    pub run_state: ActorRunState,
     pub reduction_count: u32, // Lifetime messages handled (monotonic progress metric)
     turn_reductions: u32,     // Messages handled in the current scheduling turn
     pub max_reductions: u32,  // Max reductions per turn before yield (preemption)
     pub sequence: u64,        // Last persisted sequence number
+    /// Monotonic fencing epoch for durable ownership of this logical actor.
+    ///
+    /// This is the canonical live source of truth used by snapshots,
+    /// failover directory announcements, and atomic durable transitions.
+    pub activation_epoch: u64,
+    /// Accepted workflow command currently executing on this actor.
+    ///
+    /// Set after the command is durably journaled and cleared when the direct
+    /// turn ends. If execution suspends, the identity is copied into
+    /// `SuspendedExecution` so later resumes close the same activation.
+    pub current_workflow_activation: Option<WorkflowActivationId>,
+    /// Activation whose intermediate custom-event ordinal is currently tracked.
+    ///
+    /// This is execution-local replay state, not durable state. A later replay
+    /// slice will restore/consume it from committed event history.
+    pub workflow_replay_activation: Option<WorkflowActivationId>,
+    /// Next deterministic custom-event ordinal within `workflow_replay_activation`.
+    pub workflow_replay_event_ordinal: u32,
     /// Sentinel heap object used by the cycle detector to represent this
     /// actor as a holder of foreign references.
     cycle_sentinel: Option<*mut OrcaHeader>,
@@ -295,6 +369,9 @@ pub struct Actor {
     /// Object-store ids held by this actor.  Populated when a message carrying
     /// an object ref is delivered.  Dropped on actor exit.
     pub held_objects: HashSet<ObjectId>,
+    /// Store handle paired with held_objects so actor destruction releases
+    /// manual ObjectStore refcounts even when removal bypasses Runtime reaping.
+    pub(crate) held_object_store: Option<ObjectStore>,
 }
 
 /// State of an actor's in-flight timed selective receive.
@@ -317,6 +394,8 @@ pub struct ReceiveWaitState {
 pub struct SuspendedExecution {
     pub vm_state: crate::vm::SuspendedVmState,
     pub behavior_idx: usize,
+    /// Stable identity of the accepted workflow command being resumed.
+    pub activation: Option<WorkflowActivationId>,
     pub step_name: String,
 }
 
@@ -334,7 +413,7 @@ impl Actor {
             state: ActorState::Created,
             mailbox: Mailbox::new(mailbox_cap),
             heap: {
-                let mut heap = ActorHeap::new(16 * 1024); // 16KB initial heap (density: ~64k actors/GB)
+                let mut heap = ActorHeap::new(16 * 1024); // 16 KiB first-block capacity, allocated on demand
                 heap.set_actor_id(id);
                 heap
             },
@@ -361,12 +440,17 @@ impl Actor {
             links: Vec::new(),
             trap_exits: false,
             priority: ActorPriority::Normal,
+            run_state: ActorRunState::Idle,
             jit_safepoint_counter: crate::backends::JIT_SAFEPOINT_BUDGET,
             jit_yield_pending: false,
             reduction_count: 0,
             turn_reductions: 0,
             max_reductions: 1000,
             sequence: 0,
+            activation_epoch: crate::runtime::persistence::INITIAL_ACTIVATION_EPOCH,
+            current_workflow_activation: None,
+            workflow_replay_activation: None,
+            workflow_replay_event_ordinal: 0,
             cycle_sentinel: None,
             suspended_execution: None,
             waiting_signal: None,
@@ -385,12 +469,13 @@ impl Actor {
             receive_wait: None,
             timer_sleep_fired: false,
             retry_config: None,
-            flight_recorder: FlightRecorder::new(1000),
+            flight_recorder: FlightRecorder::runtime_default(1000),
             fallback_config: Vec::new(),
             hibernation_state: None,
             idle_ms: 0,
             pinned: false,
             held_objects: HashSet::new(),
+            held_object_store: None,
         }
     }
 
@@ -575,6 +660,55 @@ impl Actor {
         self.turn_reductions += count;
     }
 
+    /// Convert one actor-owned runtime value into its durable representation.
+    ///
+    /// Constant-pool strings resolve through the actor module. Heap-backed
+    /// strings are accepted only when the pointer exactly matches a live
+    /// allocation tagged `TypeTag::String`; arbitrary pointers fail closed
+    /// through `from_value_resolved` instead of being interpreted as C strings.
+    pub(crate) fn persist_value(&self, value: &Value) -> PersistedValue {
+        if let Some(ptr) = value.as_ptr() {
+            if ptr.is_null() {
+                return PersistedValue::Nil;
+            }
+
+            let mut resolved = None;
+            self.heap.iter_live_objects(|header, payload, _| {
+                if resolved.is_some() || payload != ptr {
+                    return;
+                }
+
+                // SAFETY: iter_live_objects yields headers for live allocations
+                // in this actor heap. Equality with ptr proves exact allocation
+                // provenance before metadata or payload bytes are inspected.
+                let header = unsafe { &*header };
+                if header.type_tag != TypeTag::String || header.payload_size == 0 {
+                    return;
+                }
+
+                // SAFETY: payload_size is the requested size of this live
+                // allocation, so the slice stays within the object. Runtime
+                // strings are UTF-8 bytes followed by a trailing NUL.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(payload as *const u8, header.payload_size)
+                };
+                let Some(nul) = bytes.iter().position(|byte| *byte == 0) else {
+                    return;
+                };
+                let Ok(text) = std::str::from_utf8(&bytes[..nul]) else {
+                    return;
+                };
+                resolved = Some(PersistedValue::String(text.to_owned()));
+            });
+
+            return resolved.unwrap_or_else(|| {
+                PersistedValue::from_value_resolved(value, self.bytecode_module.as_ref())
+            });
+        }
+
+        PersistedValue::from_value_resolved(value, self.bytecode_module.as_ref())
+    }
+
     /// Allocate a null-terminated string on the actor heap and return a pointer
     /// value. Returns nil if allocation fails.
     pub fn allocate_string(&mut self, s: &str) -> Value {
@@ -702,7 +836,7 @@ mod tests {
         let mut actor = Actor::new(1, "test", 0);
         let msg = Message {
             behavior_id: 1,
-            payload: Arc::new(vec![Value::int(42)]),
+            payload: MessagePayload::from_slice(&[Value::int(42)]),
             sender: 99,
             priority: MessagePriority::Normal,
             trace_id: None,
@@ -711,6 +845,41 @@ mod tests {
         let received = actor.receive().expect("should receive a message");
         assert_eq!(received.behavior_id, 1);
         assert_eq!(received.sender, 99);
-        assert_eq!(*received.payload, vec![Value::int(42)]);
+        assert_eq!(received.payload.as_slice(), &[Value::int(42)]);
+    }
+
+    #[test]
+    fn flight_recorder_storage_is_lazy() {
+        let mut recorder = FlightRecorder::new(4);
+        assert_eq!(recorder.entries.capacity(), 0);
+        assert!(recorder.is_empty());
+
+        recorder.record(7, 3, &[Value::int(42)]);
+
+        assert_eq!(recorder.len(), 1);
+        assert!(recorder.entries.capacity() > 0);
+        assert_eq!(recorder.entries()[0].sender, 7);
+        assert_eq!(recorder.entries()[0].behavior_id, 3);
+        assert_eq!(recorder.entries()[0].payload_summary, "42");
+    }
+
+    #[test]
+    fn zero_capacity_flight_recorder_is_noop() {
+        let mut recorder = FlightRecorder::new(0);
+        recorder.record(7, 3, &[Value::int(42)]);
+
+        assert!(recorder.is_empty());
+        assert_eq!(recorder.entries.capacity(), 0);
+        assert_eq!(recorder.next_seq, 0);
+    }
+}
+
+impl Drop for Actor {
+    fn drop(&mut self) {
+        let Some(store) = self.held_object_store.take() else {
+            return;
+        };
+        let held = std::mem::take(&mut self.held_objects);
+        store.drop_refs(&held);
     }
 }

@@ -6,8 +6,8 @@
 //! programs from a typed grammar subset, deterministically from a `u64`
 //! seed. Every generated program is fed through the cross-backend oracle
 //! `fuzz::differential_fuzz_one` (bytecode VM cold, VM with forced JIT
-//! tier-up, and AOT native compilation when the program is within AOT's
-//! supported subset); any disagreement is a real bug.
+//! tier-up, AOT native compilation when supported, and WASM when the
+//! `wasm-backend` feature is enabled); any disagreement is a real bug.
 //!
 //! Grammar coverage:
 //!   * int arithmetic incl. 48-bit boundary values (±2^47±1), div/mod with
@@ -804,6 +804,8 @@ pub struct CampaignStats {
     pub agreed: usize,
     /// Subset of `agreed` where AOT also compiled and agreed.
     pub aot_agreed: usize,
+    /// Subset of `agreed` where WASM also compiled, executed, and agreed.
+    pub wasm_agreed: usize,
     /// Result type not comparable across independent runs (closure/actor).
     pub uncomparable: usize,
     /// Generated program failed to compile — a generator or frontend bug
@@ -869,10 +871,13 @@ pub fn run_campaign(
                 stats.compile_failures.push((seed, source));
             }
             Ok(DiffOutcome::Uncomparable) => stats.uncomparable += 1,
-            Ok(DiffOutcome::Agreed { aot, .. }) => {
+            Ok(DiffOutcome::Agreed { aot, wasm }) => {
                 stats.agreed += 1;
                 if aot {
                     stats.aot_agreed += 1;
+                }
+                if wasm {
+                    stats.wasm_agreed += 1;
                 }
             }
             Err(message) => {
@@ -970,10 +975,11 @@ mod tests {
     fn differential_smoke_50_seeds() {
         let stats = run_campaign(0xD1FF_0000, 50, None, None, false);
         eprintln!(
-            "difffuzz smoke: {} generated, {} agreed ({} with AOT), {} uncomparable, {} compile failures, {} known-overflow, {} divergences",
+            "difffuzz smoke: {} generated, {} agreed ({} with AOT, {} with WASM), {} uncomparable, {} compile failures, {} known-overflow, {} divergences",
             stats.generated,
             stats.agreed,
             stats.aot_agreed,
+            stats.wasm_agreed,
             stats.uncomparable,
             stats.compile_failures.len(),
             stats.known_overflow.len(),
@@ -999,5 +1005,10 @@ mod tests {
         );
         // Sanity: the smoke run must actually compare something.
         assert!(stats.agreed > 25, "suspiciously low agreement count");
+        #[cfg(feature = "wasm-backend")]
+        assert!(
+            stats.wasm_agreed > 0,
+            "WASM-enabled differential smoke executed zero WASM programs"
+        );
     }
 }
