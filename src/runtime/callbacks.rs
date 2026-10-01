@@ -764,7 +764,11 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         }
     }
 
-    fn emit_event(&mut self, event: &str, args: &[crate::vm::Value]) -> bool {
+    fn emit_event(&mut self, event: &str, args: &[crate::vm::Value]) {
+        let _ = self.try_emit_event(event, args);
+    }
+
+    fn try_emit_event(&mut self, event: &str, args: &[crate::vm::Value]) -> bool {
         let mut rt = self.runtime.borrow_mut();
         let Some(actor_id) = rt.current_actor else {
             return true;
@@ -1589,7 +1593,11 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         }
     }
 
-    fn emit_event(&mut self, event: &str, args: &[crate::vm::Value]) -> bool {
+    fn emit_event(&mut self, event: &str, args: &[crate::vm::Value]) {
+        let _ = self.try_emit_event(event, args);
+    }
+
+    fn try_emit_event(&mut self, event: &str, args: &[crate::vm::Value]) -> bool {
         unsafe {
             let rt = &mut *self.runtime;
             match rt.try_emit_event(self.actor_id, event, args) {
