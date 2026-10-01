@@ -1,5 +1,7 @@
 use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
-use nulang::database::tablet::{KeyRange, MemoryTablet, TabletDescriptor, TabletId, TabletMutation};
+use nulang::database::tablet::{
+    KeyRange, MemoryTablet, TabletDescriptor, TabletId, TabletMutation,
+};
 use nulang::database::wal_batch::BinaryBatchWal;
 use std::sync::atomic::{AtomicU64, Ordering};
 

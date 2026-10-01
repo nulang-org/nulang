@@ -123,7 +123,9 @@ impl BinaryBatchWal {
                 break;
             }
             if checksum != *blake3::hash(&payload).as_bytes() {
-                return Err(BatchWalError::PayloadChecksumMismatch { offset: frame_start });
+                return Err(BatchWalError::PayloadChecksumMismatch {
+                    offset: frame_start,
+                });
             }
 
             let decoded = decode_payload(&payload, record_count, frame_start)?;
@@ -278,8 +280,11 @@ fn encode_payload(records: &[RecoveredBatchRecord]) -> Result<Vec<u8>, BatchWalE
         out.extend_from_slice(&record.ownership_epoch.to_le_bytes());
         out.extend_from_slice(&record.sequence.to_le_bytes());
         out.extend_from_slice(&record.expected_previous_sequence.to_le_bytes());
-        let mutation_count = u32::try_from(record.mutations.len())
-            .map_err(|_| BatchWalError::InvalidRecord { offset: 0, reason: "too many mutations".into() })?;
+        let mutation_count =
+            u32::try_from(record.mutations.len()).map_err(|_| BatchWalError::InvalidRecord {
+                offset: 0,
+                reason: "too many mutations".into(),
+            })?;
         out.extend_from_slice(&mutation_count.to_le_bytes());
 
         for mutation in &record.mutations {
@@ -334,10 +339,12 @@ fn decode_payload(
         let mutation_count = take_u32(payload, &mut cursor, offset)? as usize;
         let mut mutations = Vec::with_capacity(mutation_count);
         for _ in 0..mutation_count {
-            let kind = *payload.get(cursor).ok_or_else(|| BatchWalError::InvalidRecord {
-                offset,
-                reason: "truncated mutation kind".into(),
-            })?;
+            let kind = *payload
+                .get(cursor)
+                .ok_or_else(|| BatchWalError::InvalidRecord {
+                    offset,
+                    reason: "truncated mutation kind".into(),
+                })?;
             cursor += 1;
             let key = take_bytes(payload, &mut cursor, offset)?;
             match kind {
@@ -386,28 +393,36 @@ fn take_fixed<const N: usize>(
     cursor: &mut usize,
     offset: u64,
 ) -> Result<[u8; N], BatchWalError> {
-    let end = cursor.checked_add(N).ok_or_else(|| BatchWalError::InvalidRecord {
-        offset,
-        reason: "payload offset overflow".into(),
-    })?;
-    let slice = payload.get(*cursor..end).ok_or_else(|| BatchWalError::InvalidRecord {
-        offset,
-        reason: "truncated batch payload".into(),
-    })?;
+    let end = cursor
+        .checked_add(N)
+        .ok_or_else(|| BatchWalError::InvalidRecord {
+            offset,
+            reason: "payload offset overflow".into(),
+        })?;
+    let slice = payload
+        .get(*cursor..end)
+        .ok_or_else(|| BatchWalError::InvalidRecord {
+            offset,
+            reason: "truncated batch payload".into(),
+        })?;
     *cursor = end;
     Ok(slice.try_into().unwrap())
 }
 
 fn take_bytes(payload: &[u8], cursor: &mut usize, offset: u64) -> Result<Vec<u8>, BatchWalError> {
     let len = take_u32(payload, cursor, offset)? as usize;
-    let end = cursor.checked_add(len).ok_or_else(|| BatchWalError::InvalidRecord {
-        offset,
-        reason: "payload length overflow".into(),
-    })?;
-    let bytes = payload.get(*cursor..end).ok_or_else(|| BatchWalError::InvalidRecord {
-        offset,
-        reason: "truncated byte field".into(),
-    })?;
+    let end = cursor
+        .checked_add(len)
+        .ok_or_else(|| BatchWalError::InvalidRecord {
+            offset,
+            reason: "payload length overflow".into(),
+        })?;
+    let bytes = payload
+        .get(*cursor..end)
+        .ok_or_else(|| BatchWalError::InvalidRecord {
+            offset,
+            reason: "truncated byte field".into(),
+        })?;
     *cursor = end;
     Ok(bytes.to_vec())
 }
@@ -483,18 +498,42 @@ fn sync_parent_directory(path: &Path) -> io::Result<()> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchWalError {
-    Io { kind: io::ErrorKind, message: String },
+    Io {
+        kind: io::ErrorKind,
+        message: String,
+    },
     InvalidFileHeader,
-    InvalidFrameHeader { offset: u64 },
-    UnsupportedFrameVersion { offset: u64, version: u16 },
-    HeaderChecksumMismatch { offset: u64 },
-    PayloadChecksumMismatch { offset: u64 },
-    InvalidRecord { offset: u64, reason: String },
+    InvalidFrameHeader {
+        offset: u64,
+    },
+    UnsupportedFrameVersion {
+        offset: u64,
+        version: u16,
+    },
+    HeaderChecksumMismatch {
+        offset: u64,
+    },
+    PayloadChecksumMismatch {
+        offset: u64,
+    },
+    InvalidRecord {
+        offset: u64,
+        reason: String,
+    },
     TooManyRecords(usize),
     BatchTooLarge(usize),
-    TabletMismatch { expected: TabletId, presented: TabletId },
-    StaleOwnershipEpoch { durable: u64, presented: u64 },
-    SequenceMismatch { committed: u64, expected_previous: u64 },
+    TabletMismatch {
+        expected: TabletId,
+        presented: TabletId,
+    },
+    StaleOwnershipEpoch {
+        durable: u64,
+        presented: u64,
+    },
+    SequenceMismatch {
+        committed: u64,
+        expected_previous: u64,
+    },
     SequenceOverflow,
     Poisoned,
 }

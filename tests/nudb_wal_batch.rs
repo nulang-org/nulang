@@ -1,4 +1,6 @@
-use nulang::database::tablet::{KeyRange, MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite};
+use nulang::database::tablet::{
+    KeyRange, MemoryTablet, TabletDescriptor, TabletId, TabletMutation, TabletWrite,
+};
 use nulang::database::wal_batch::BinaryBatchWal;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -56,10 +58,13 @@ fn append_batch_persists_multiple_consecutive_writes_with_one_batch_boundary() {
     let reopened = BinaryBatchWal::open(&path).unwrap();
     assert_eq!(reopened.last_sequence(), 2);
     assert_eq!(reopened.records().len(), 2);
-    assert_eq!(reopened.records()[0].mutations()[0], TabletMutation::Put {
-        key: b"a".to_vec(),
-        value: b"1".to_vec(),
-    });
+    assert_eq!(
+        reopened.records()[0].mutations()[0],
+        TabletMutation::Put {
+            key: b"a".to_vec(),
+            value: b"1".to_vec(),
+        }
+    );
 
     let _ = std::fs::remove_file(&path);
 }
