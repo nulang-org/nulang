@@ -1462,9 +1462,22 @@ impl crate::vm::ActorVmCallbacks for AotRuntimeCallbacks {
         bc.perform_async(effect_op, constants, args)
     }
 
-    fn emit_event(&mut self, event: &str, args: &[crate::vm::Value]) {
+    fn emit_event(&mut self, event: &str, args: &[crate::vm::Value]) -> bool {
         // SAFETY: as above.
-        unsafe { (*self.runtime).emit_event(self.actor_id, event, args) };
+        unsafe {
+            let rt = &mut *self.runtime;
+            match rt.try_emit_event(self.actor_id, event, args) {
+                Ok(()) => true,
+                Err(error) => {
+                    if rt.actor_is_workflow(self.actor_id) {
+                        if let Some(actor) = rt.actors.get_mut(&self.actor_id) {
+                            actor.workflow_persistence_failure = Some(error.to_string());
+                        }
+                    }
+                    false
+                }
+            }
+        }
     }
 
     fn try_receive(&mut self) -> Option<(u16, crate::vm::Value)> {
