@@ -357,6 +357,19 @@ impl MemoryTablet {
     /// Validate a prepared write against the tablet's current ownership and
     /// committed tail without mutating state.
     pub(crate) fn validate_write(&self, write: &TabletWrite) -> Result<(), TabletError> {
+        self.validate_write_at_sequence(write, self.current_sequence)
+    }
+
+    /// Validate a prepared write against a projected committed sequence.
+    ///
+    /// Group commit uses this to validate a complete consecutive batch before
+    /// any WAL bytes are emitted. The tablet itself is not mutated until the
+    /// entire batch has crossed its durability boundary.
+    pub(crate) fn validate_write_at_sequence(
+        &self,
+        write: &TabletWrite,
+        committed_sequence: u64,
+    ) -> Result<(), TabletError> {
         if write.tablet_id != self.descriptor.id {
             return Err(TabletError::WrongTablet {
                 expected: self.descriptor.id,
@@ -375,9 +388,9 @@ impl MemoryTablet {
                 presented: write.ownership_epoch,
             });
         }
-        if write.expected_previous_sequence != self.current_sequence {
+        if write.expected_previous_sequence != committed_sequence {
             return Err(TabletError::SequenceMismatch {
-                committed: self.current_sequence,
+                committed: committed_sequence,
                 expected_previous: write.expected_previous_sequence,
             });
         }
@@ -389,13 +402,12 @@ impl MemoryTablet {
             return Err(TabletError::KeyOutsideTabletRange);
         }
 
-        let next_sequence = self
-            .current_sequence
+        let next_sequence = committed_sequence
             .checked_add(1)
             .ok_or(TabletError::SequenceOverflow)?;
         if write.sequence != next_sequence {
             return Err(TabletError::SequenceMismatch {
-                committed: self.current_sequence,
+                committed: committed_sequence,
                 expected_previous: write.expected_previous_sequence,
             });
         }
