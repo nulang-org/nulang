@@ -4589,6 +4589,30 @@ fn test_open_activation_intermediate_events_extend_atomic_tail() {
 }
 
 #[test]
+fn test_terminal_activation_cleanup_resets_replay_cursor() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "TerminalActivationCleanup",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    let activation = WorkflowActivationId::new(actor_id, 41);
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.current_workflow_activation = Some(activation);
+        actor.workflow_replay_activation = Some(activation);
+        actor.workflow_replay_event_ordinal = 3;
+    }
+
+    rt.clear_terminal_workflow_activation(actor_id, Some(activation));
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(actor.current_workflow_activation, None);
+    assert_eq!(actor.workflow_replay_activation, None);
+    assert_eq!(actor.workflow_replay_event_ordinal, 0);
+}
+
+#[test]
 fn test_compiled_replay_conflict_aborts_and_recovers_without_terminal_snapshot() {
     use crate::bytecode::{Instruction, OpCode};
 
