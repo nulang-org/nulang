@@ -26,7 +26,10 @@ pub fn format_source(source: &str) -> Result<String, String> {
             out.push('\n');
         }
         first = false;
-        fmt_decl(&mut out, decl, 0, &mut had_unhandled);
+        let is_public = decl.export_name().map_or(false, |name| {
+            ast.exports.iter().any(|export| export == name)
+        });
+        fmt_decl(&mut out, decl, 0, is_public, &mut had_unhandled);
     }
     if had_unhandled {
         return Err("file contains constructs not yet supported by the formatter (e.g. workflow, agent, let-binding, class, impl). The file was not modified.".to_string());
@@ -99,7 +102,25 @@ fn walk_format(dir: &Path, check_only: bool) -> NuResult<()> {
     Ok(())
 }
 
-fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bool) {
+fn fmt_decl(
+    out: &mut String,
+    decl: &Decl,
+    indent: usize,
+    is_public: bool,
+    had_unhandled: &mut bool,
+) {
+    if is_public {
+        let mut rendered = String::new();
+        fmt_decl_inner(&mut rendered, decl, indent, had_unhandled);
+        let insert_at = indent.min(rendered.len());
+        rendered.insert_str(insert_at, "pub ");
+        out.push_str(&rendered);
+    } else {
+        fmt_decl_inner(out, decl, indent, had_unhandled);
+    }
+}
+
+fn fmt_decl_inner(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bool) {
     let sp = " ".repeat(indent);
     match decl {
         Decl::Function {
@@ -233,11 +254,11 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             ..
         } => {
             out.push_str(&format!("{}module {} {{\n", sp, name));
-            if !exports.is_empty() {
-                out.push_str(&format!("{}    export {}\n", sp, exports.join(", ")));
-            }
             for d in decls {
-                fmt_decl(out, d, indent + 4, had_unhandled);
+                let is_public = d
+                    .export_name()
+                    .map_or(false, |name| exports.iter().any(|export| export == name));
+                fmt_decl(out, d, indent + 4, is_public, had_unhandled);
             }
             out.push_str(&format!("{}}}\n", sp));
         }
@@ -604,7 +625,6 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             name,
             type_params,
             fields,
-            public,
             ..
         } => {
             out.push_str(&format!("{}type {}", sp, name));
@@ -615,11 +635,7 @@ fn fmt_decl(out: &mut String, decl: &Decl, indent: usize, had_unhandled: &mut bo
             for (fname, fty) in fields {
                 out.push_str(&format!("{}    {}: {},\n", sp, fname, fmt_type(fty)));
             }
-            out.push_str(&format!("{}}}", sp));
-            if *public {
-                out.push_str(" // public");
-            }
-            out.push('\n');
+            out.push_str(&format!("{}}}\n", sp));
         }
     }
 }
@@ -1394,6 +1410,21 @@ fn main() {
         assert!(out.contains("spawn Greeter()"), "got: {out}");
         assert!(out.contains("receive {"), "got: {out}");
         assert!(out.contains("emit Event(1)"), "got: {out}");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn test_fmt_preserves_pub_on_actor_effect_and_nested_module_members() {
+        let src = r#"pub actor Worker { behavior run() { unit } }
+pub effect Trace { write: String -> Unit }
+module Api {
+    pub actor Child { behavior run() { unit } }
+}
+"#;
+        let out = format_source(src).expect("public declarations format");
+        assert!(out.contains("pub actor Worker"));
+        assert!(out.contains("pub effect Trace"));
+        assert!(out.contains("    pub actor Child"));
         assert_idempotent(src);
     }
 }
