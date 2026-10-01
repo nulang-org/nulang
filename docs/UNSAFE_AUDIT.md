@@ -20,7 +20,7 @@ classified as:
 | `src/runtime/heap.rs` | 64 | mostly sound-with-proof-comment | intrusive free/live lists, header arithmetic; `unsafe fn free`/`header_of` carry proper contracts |
 | `src/vm.rs` | 53 | mixed — **suspicious** | `Value::from_raw`/`from_bits` safe constructors; `Value::ptr` 48-bit truncation; `CStr::from_ptr` on heap strings |
 | `src/runtime/gc.rs` | 75 | sound-with-proof-comment | ORCA barriers; pointer methods are `unsafe fn` with contracts |
-| `src/runtime/callbacks.rs` | 49 | sound-by-convention | `BytecodeRuntimeCallbacks` Send/Sync now documented; `RuntimeVmCallbacks` derefs rely on VM-owned pointers |
+| `src/runtime/callbacks.rs` | 49 | sound-by-convention | bytecode callback bridges are thread-confined and constructed through unsafe `from_raw`; `RuntimeVmCallbacks` derefs rely on VM-owned pointers |
 | `src/jit/runtime.rs` | 91 | sound-by-convention | fat-pointer transmutes, `'static` constant pool, extern "C" helpers trusting raw u64 values |
 | `src/runtime/orca_cycle.rs` | 35 | sound-with-proof-comment | `ForeignRefNode::is_alive` relies on free-notification protocol |
 | `src/ffi/c_api.rs` | 24 | sound-with-proof-comment | null checks present on all entry points |
@@ -104,19 +104,20 @@ stable; for FFI, this is inherent to dynamic loading — the library allowlist
 (`ffi/native.rs::is_lib_allowed`) is the real mitigation.
 
 ### F6 — MEDIUM — `unsafe impl Send/Sync` on raw-pointer callback/graph types
-`src/runtime/callbacks.rs:807-808` (`BytecodeRuntimeCallbacks`, wraps
-`*mut Runtime`), `src/runtime/orca_cycle.rs:131-132` (`ForeignEdge`),
-`185` (`ForeignRefNode`), `src/ffi/native.rs:75-78` (`NativeFunction`),
-`src/runtime/heap.rs:306` (`ActorHeap`).
-All are sound only under the single-scheduler-thread-per-runtime
-convention; `BytecodeRuntimeCallbacks: Sync` is the most fragile (a shared
-reference allows cross-thread `&mut Runtime` aliasing if the value is ever
-shared). These impls previously had **no** SAFETY comment for
-`BytecodeRuntimeCallbacks`.
-**Fix applied:** SAFETY comments added stating the convention.
-**Recommended fix (future):** remove `Sync` for `BytecodeRuntimeCallbacks`
-if no consumer requires it, or wrap the runtime pointer in a type that only
-yields `&mut Runtime` from `&mut self`.
+The runtime callback portion is now resolved: `BytecodeRuntimeCallbacks` and
+`BytecodeDistributedCallbacks` no longer manually implement `Send` or
+`Sync`. Their `*mut Runtime` fields therefore keep them thread-confined by
+default, raw-pointer construction goes through an `unsafe fn from_raw` with
+an explicit live/exclusive scheduler-ownership contract, and the repository
+verifier rejects any future reintroduction of those auto-trait impls.
+
+Remaining sites are `src/runtime/orca_cycle.rs` (`ForeignEdge`,
+`ForeignRefNode`), `src/ffi/native.rs` (`NativeFunction`), and
+`src/runtime/heap.rs` (`ActorHeap`). Those still require separate proofs or
+representation changes; this hardening does not broaden their guarantees.
+**Recommended next fix:** audit the ORCA graph wrappers first, because removing
+unnecessary auto-trait overrides there can shrink the same class of cross-thread
+aliasing assumptions without changing actor semantics.
 
 ### F7 — LOW — heap serializer trusts recorded payload sizes
 `src/runtime/heap_serialize.rs:342`, `431`, `692`, `706`:
@@ -152,8 +153,9 @@ assertions enforce the ownership invariant in test/debug builds.
 3. `src/jit/runtime.rs` — new bounded `heap_string_payload()` helper replaces
    both bare `CStr::from_ptr` derefs; `alloc_string_value` gained a
    `debug_assert!` against 48-bit truncation; missing SAFETY comments added.
-4. `src/runtime/callbacks.rs` — SAFETY comments for the
-   `BytecodeRuntimeCallbacks` Send/Sync impls.
+4. `src/runtime/callbacks.rs` — bytecode runtime/distributed callback bridges
+   no longer override `Send`/`Sync`; raw-pointer construction is explicit and
+   gated by unsafe `from_raw` constructors plus CI invariants.
 5. `src/runtime/heap.rs` — `debug_assert!` on out-of-range size class in
    `free()`.
 

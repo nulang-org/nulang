@@ -201,6 +201,49 @@ def verify_files():
         print("Error: Cycle detector intra-node restriction is not wired in Runtime.")
         return False
 
+    # 9. Runtime-owned bytecode callback bridges must remain thread-confined.
+    # They wrap transient raw Runtime pointers and are installed only while the
+    # scheduler owns the Runtime mutably. Manually asserting Send/Sync would let
+    # safe code move/share those pointer-bearing callbacks across threads and
+    # turn the scheduler convention into an unenforced unsafe invariant.
+    callbacks_path = "src/runtime/callbacks.rs"
+    if not os.path.exists(callbacks_path):
+        print(f"Error: {callbacks_path} does not exist.")
+        return False
+    with open(callbacks_path, "r", encoding="utf-8") as f:
+        callbacks_content = f.read()
+
+    callback_types = ("BytecodeRuntimeCallbacks", "BytecodeDistributedCallbacks")
+    for callback_type in callback_types:
+        for auto_trait in ("Send", "Sync"):
+            forbidden = f"unsafe impl {auto_trait} for {callback_type}"
+            if forbidden in callbacks_content:
+                print(
+                    "Error: runtime callback bridge manually implements "
+                    f"{auto_trait}: {callback_type}. Keep raw Runtime callbacks "
+                    "thread-confined instead of overriding Rust auto-traits."
+                )
+                return False
+
+    required_constructors = (
+        "pub(crate) unsafe fn from_raw(runtime: *mut Runtime, actor_id: u64)",
+        "pub(crate) unsafe fn from_raw(runtime: *mut Runtime) -> Self",
+    )
+    for constructor in required_constructors:
+        if constructor not in callbacks_content:
+            print(
+                "Error: raw Runtime callback construction is not fully gated by "
+                f"unsafe from_raw constructors; missing: {constructor}"
+            )
+            return False
+
+    if "pub(crate) runtime: *mut Runtime" in callbacks_content:
+        print(
+            "Error: distributed callback exposes its raw Runtime pointer crate-wide; "
+            "keep the field private so call sites must use unsafe from_raw."
+        )
+        return False
+
     if not check_stdlib_manifest():
         return False
 
