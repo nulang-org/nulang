@@ -675,6 +675,18 @@ pub(crate) fn append_timer_set(
         }
     }
 
+    if workflow_has_atomic_tail(rt, actor_id)? {
+        commit_workflow_event_transition(rt, actor_id, false, |sequence| {
+            WorkflowEvent::TimerSet {
+                sequence,
+                replay_id: None,
+                name: name.to_string(),
+                duration_ms,
+            }
+        })?;
+        return Ok(true);
+    }
+
     let seq = next_sequence(rt, actor_id);
     rt.persistence
         .append_timer_set(actor_id, seq, name.to_string(), duration_ms)?;
@@ -687,6 +699,15 @@ pub(crate) fn append_timer_fired(
     actor_id: u64,
     name: &str,
 ) -> std::io::Result<()> {
+    if workflow_has_atomic_tail(rt, actor_id)? {
+        return commit_workflow_event_transition(rt, actor_id, false, |sequence| {
+            WorkflowEvent::TimerFired {
+                sequence,
+                name: name.to_string(),
+            }
+        });
+    }
+
     let seq = next_sequence(rt, actor_id);
     rt.persistence
         .append_timer_fired(actor_id, seq, name.to_string())?;
@@ -700,6 +721,19 @@ pub(crate) fn append_signal_received(
     name: &str,
     payload: Option<String>,
 ) -> std::io::Result<()> {
+    if workflow_has_atomic_tail(rt, actor_id)? {
+        // SignalReceived is replay history, not a completed-state boundary.
+        // The suspended activation will either resume and close atomically or
+        // recover from the prior safe snapshot and consume the signal event.
+        return commit_workflow_event_transition(rt, actor_id, false, |sequence| {
+            WorkflowEvent::SignalReceived {
+                sequence,
+                name: name.to_string(),
+                payload,
+            }
+        });
+    }
+
     let seq = next_sequence(rt, actor_id);
     rt.persistence
         .append_signal_received(actor_id, seq, name.to_string(), payload)?;
@@ -727,6 +761,18 @@ pub(crate) fn append_saga_compensated(
     actor_id: u64,
     step_name: &str,
 ) -> std::io::Result<()> {
+    if workflow_has_atomic_tail(rt, actor_id)? {
+        // Compensation runs after the failed activation is terminal. Its state
+        // mutation and SagaCompensated marker therefore form a new safe
+        // post-terminal boundary and may advance the snapshot atomically.
+        return commit_workflow_event_transition(rt, actor_id, true, |sequence| {
+            WorkflowEvent::SagaCompensated {
+                sequence,
+                step_name: step_name.to_string(),
+            }
+        });
+    }
+
     let seq = next_sequence(rt, actor_id);
     rt.persistence
         .append_saga_compensated(actor_id, seq, step_name.to_string())?;
