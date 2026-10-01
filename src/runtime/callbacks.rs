@@ -764,10 +764,27 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         }
     }
 
-    fn emit_event(&mut self, event: &str, args: &[crate::vm::Value]) {
+    fn emit_event(&mut self, event: &str, args: &[crate::vm::Value]) -> bool {
         let mut rt = self.runtime.borrow_mut();
-        if let Some(actor_id) = rt.current_actor {
-            rt.emit_event(actor_id, event, args);
+        let Some(actor_id) = rt.current_actor else {
+            return true;
+        };
+        match rt.try_emit_event(actor_id, event, args) {
+            Ok(()) => true,
+            Err(error) => {
+                if rt.actor_is_workflow(actor_id) {
+                    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                        actor.workflow_persistence_failure = Some(error.to_string());
+                    }
+                }
+                tracing::error!(
+                    actor_id,
+                    event,
+                    %error,
+                    "nulang-workflow: VM durable event emission failed"
+                );
+                false
+            }
         }
     }
 
@@ -1569,9 +1586,26 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
         }
     }
 
-    fn emit_event(&mut self, event: &str, args: &[crate::vm::Value]) {
+    fn emit_event(&mut self, event: &str, args: &[crate::vm::Value]) -> bool {
         unsafe {
-            (*self.runtime).emit_event(self.actor_id, event, args);
+            let rt = &mut *self.runtime;
+            match rt.try_emit_event(self.actor_id, event, args) {
+                Ok(()) => true,
+                Err(error) => {
+                    if rt.actor_is_workflow(self.actor_id) {
+                        if let Some(actor) = rt.actors.get_mut(&self.actor_id) {
+                            actor.workflow_persistence_failure = Some(error.to_string());
+                        }
+                    }
+                    tracing::error!(
+                        actor_id = self.actor_id,
+                        event,
+                        %error,
+                        "nulang-workflow: VM durable event emission failed"
+                    );
+                    false
+                }
+            }
         }
     }
 
