@@ -809,6 +809,9 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
         };
         let duration_ms = regs.get(1)?.as_int()? as u64;
         if let Err(error) = rt.schedule_workflow_timer(actor_id, &name, duration_ms) {
+            if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                actor.workflow_persistence_failure = Some(error.to_string());
+            }
             tracing::error!(
                 actor_id,
                 timer = %name,
@@ -1647,6 +1650,9 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             if let Err(error) =
                 (*self.runtime).schedule_workflow_timer(self.actor_id, &name, duration_ms)
             {
+                if let Some(actor) = (*self.runtime).actors.get_mut(&self.actor_id) {
+                    actor.workflow_persistence_failure = Some(error.to_string());
+                }
                 tracing::error!(
                     actor_id = self.actor_id,
                     timer = %name,
