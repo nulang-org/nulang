@@ -10,6 +10,7 @@ use crate::runtime::WebRoute;
 use crate::vm::VM;
 use crate::web::bindings::{compile_route_bindings, RouteBindingContract, RouteBindingSource};
 use crate::web::contracts::{ContractCompilation, RouteContract};
+use crate::web::response::{response_contract, ResponseContract};
 use std::collections::HashMap;
 
 /// One precompiled route-pattern segment.
@@ -31,6 +32,8 @@ pub struct RuntimeRoutePlan {
     pub segments: Vec<RuntimeRouteSegment>,
     pub bindings: Vec<RouteBindingContract>,
     pub handler_param_count: usize,
+    /// Compiler-owned response/media semantics for this route, when explicit.
+    pub response: Option<ResponseContract>,
     /// True when every declared handler parameter is supplied directly from a
     /// route input and every path parameter has a direct binding. Legacy routes
     /// that still rely on ambient `Web.param` access keep this false.
@@ -120,6 +123,7 @@ pub fn compile_runtime_route_plan(
         segments,
         bindings: binding_compilation.bindings,
         handler_param_count: contract.handler_params.len(),
+        response: response_contract(contract.response_type.as_deref()),
         direct_call,
     })
 }
