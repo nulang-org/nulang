@@ -43,9 +43,6 @@ jobs:
               printf '%s\n' "$unmerged"
               exit 1
             fi
-            # Keep current-main JIT control flow and changelog. The leaf-call
-            # delta is ported explicitly in the next step so the direct-frame
-            # register safety changes from PR #996 remain authoritative.
             git checkout --ours CHANGELOG.md src/jit/mod.rs
             git add CHANGELOG.md src/jit/mod.rs
           elif [ "$merge_status" -ne 0 ]; then
@@ -63,7 +60,8 @@ jobs:
 
           def replace_once(old: str, new: str) -> None:
               global text
-              assert text.count(old) == 1, f"expected one anchor, got {text.count(old)}: {old[:80]!r}"
+              count = text.count(old)
+              assert count == 1, f"expected one anchor, got {count}: {old[:80]!r}"
               text = text.replace(old, new, 1)
 
           replace_once(
@@ -72,23 +70,12 @@ jobs:
           )
 
           marker = "// ---------------------------------------------------------------------------\n// JIT Session\n// ---------------------------------------------------------------------------\n"
-          leaf_struct = """#[derive(Debug, Clone, Copy)]
-struct NativeLeafCall {
-    ptr: *const u8,
-    return_reg: u8,
-    required_args: usize,
-}
-
-"""
+          leaf_struct = "#[derive(Debug, Clone, Copy)]\nstruct NativeLeafCall {\n    ptr: *const u8,\n    return_reg: u8,\n    required_args: usize,\n}\n\n"
           assert leaf_struct not in text
           replace_once(marker, leaf_struct + marker)
 
           field_anchor = "    /// Monotonic suffix for replacement compilations. Cranelift keeps prior\n"
-          field = """    /// Straight-line direct callees compiled specifically for calls from
-    /// native regions. These are not ordinary hot-entry regions: they execute
-    /// against an isolated register buffer owned by the direct-call helper.
-    native_leaf_calls: FxHashMap<(usize, usize), NativeLeafCall>,
-"""
+          field = "    /// Straight-line direct callees compiled specifically for calls from\n    /// native regions. These are not ordinary hot-entry regions: they execute\n    /// against an isolated register buffer owned by the direct-call helper.\n    native_leaf_calls: FxHashMap<(usize, usize), NativeLeafCall>,\n"
           assert field not in text
           replace_once(field_anchor, field + field_anchor)
 
@@ -97,95 +84,17 @@ struct NativeLeafCall {
               "            region_planner: RegionPlanner::default(),\n            tier2_counters: FxHashMap::default(),\n            native_leaf_calls: FxHashMap::default(),",
           )
 
-          reset_anchor = """    pub fn reset_tier2_counters(&mut self) {
-        self.tier2_counters.clear();
-    }
-
-"""
-          ensure_leaf = """    fn ensure_native_leaf_call(
-        &mut self,
-        module_idx: usize,
-        func_idx: usize,
-        module: &crate::bytecode::CodeModule,
-    ) -> Option<NativeLeafCall> {
-        if let Some(call) = self.native_leaf_calls.get(&(module_idx, func_idx)).copied() {
-            return Some(call);
-        }
-
-        let plan = native_leaf_plan(module, func_idx)?;
-        let symbol = format!("nulang_jit_leaf_{module_idx}_{func_idx}");
-        let native_calls = std::collections::HashMap::new();
-        let started = std::time::Instant::now();
-        let ptr = self
-            .codegen
-            .compile(NativeCompileRequest {
-                symbol: &symbol,
-                start_offset: plan.start,
-                num_instrs: plan.len,
-                instructions: &module.instructions,
-                optimization: CodegenOptimization::Fast,
-                kind: NativeCompileKind::Scalar {
-                    native_calls: &native_calls,
-                },
-            })
-            .ok()?;
-        let compile_time_ns = Self::elapsed_ns(started);
-        self.compile_stats.fast_compiles = self.compile_stats.fast_compiles.saturating_add(1);
-        self.compile_stats.fast_compile_ns = self
-            .compile_stats
-            .fast_compile_ns
-            .saturating_add(compile_time_ns);
-
-        let call = NativeLeafCall {
-            ptr,
-            return_reg: plan.return_reg,
-            required_args: plan.required_args,
-        };
-        self.native_leaf_calls.insert((module_idx, func_idx), call);
-        Some(call)
-    }
-
-"""
+          reset_anchor = "    pub fn reset_tier2_counters(&mut self) {\n        self.tier2_counters.clear();\n    }\n\n"
+          ensure_leaf = "    fn ensure_native_leaf_call(\n        &mut self,\n        module_idx: usize,\n        func_idx: usize,\n        module: &crate::bytecode::CodeModule,\n    ) -> Option<NativeLeafCall> {\n        if let Some(call) = self.native_leaf_calls.get(&(module_idx, func_idx)).copied() {\n            return Some(call);\n        }\n\n        let plan = native_leaf_plan(module, func_idx)?;\n        let symbol = format!(\"nulang_jit_leaf_{module_idx}_{func_idx}\");\n        let native_calls = std::collections::HashMap::new();\n        let started = std::time::Instant::now();\n        let ptr = self\n            .codegen\n            .compile(NativeCompileRequest {\n                symbol: &symbol,\n                start_offset: plan.start,\n                num_instrs: plan.len,\n                instructions: &module.instructions,\n                optimization: CodegenOptimization::Fast,\n                kind: NativeCompileKind::Scalar {\n                    native_calls: &native_calls,\n                },\n            })\n            .ok()?;\n        let compile_time_ns = Self::elapsed_ns(started);\n        self.compile_stats.fast_compiles = self.compile_stats.fast_compiles.saturating_add(1);\n        self.compile_stats.fast_compile_ns = self\n            .compile_stats\n            .fast_compile_ns\n            .saturating_add(compile_time_ns);\n\n        let call = NativeLeafCall {\n            ptr,\n            return_reg: plan.return_reg,\n            required_args: plan.required_args,\n        };\n        self.native_leaf_calls.insert((module_idx, func_idx), call);\n        Some(call)\n    }\n\n"
           assert ensure_leaf not in text
           replace_once(reset_anchor, reset_anchor + ensure_leaf)
 
           plan_anchor = "        let plan = self.region_planner.plan(module_idx, pc, module);\n        if plan.len >= 3 {"
-          plan_with_leaf = """        let plan = self.region_planner.plan(module_idx, pc, module);
-        if !plan.native_calls.is_empty() {
-            let callees: FxHashSet<usize> = plan.native_calls.values().copied().collect();
-            for func_idx in callees {
-                let _ = self.ensure_native_leaf_call(module_idx, func_idx, module);
-            }
-        }
-        if plan.len >= 3 {"""
+          plan_with_leaf = "        let plan = self.region_planner.plan(module_idx, pc, module);\n        if !plan.native_calls.is_empty() {\n            let callees: FxHashSet<usize> = plan.native_calls.values().copied().collect();\n            for func_idx in callees {\n                let _ = self.ensure_native_leaf_call(module_idx, func_idx, module);\n            }\n        }\n        if plan.len >= 3 {"
           replace_once(plan_anchor, plan_with_leaf)
 
-          execute_anchor = """        let Some(func) = (unsafe { self.get_compiled(module_idx, pc) }) else {
-            return crate::backends::TieredAction::Interpret;
-        };
-        func(regs.as_mut_ptr(), constants.as_ptr());
-        crate::backends::TieredAction::RanJit
-"""
-          execute_leaf = """        let Some(func) = (unsafe { self.get_compiled(module_idx, pc) }) else {
-            return crate::backends::TieredAction::Interpret;
-        };
-        let leaf_calls: Vec<(usize, *const u8, u8, usize)> = self
-            .native_leaf_calls
-            .iter()
-            .filter_map(|(&(leaf_module, func_idx), call)| {
-                (leaf_module == module_idx).then_some((
-                    func_idx,
-                    call.ptr,
-                    call.return_reg,
-                    call.required_args,
-                ))
-            })
-            .collect();
-        crate::jit::runtime::set_jit_leaf_calls(&leaf_calls, constants.as_ptr());
-        func(regs.as_mut_ptr(), constants.as_ptr());
-        crate::jit::runtime::clear_jit_leaf_calls();
-        crate::backends::TieredAction::RanJit
-"""
+          execute_anchor = "        let Some(func) = (unsafe { self.get_compiled(module_idx, pc) }) else {\n            return crate::backends::TieredAction::Interpret;\n        };\n        func(regs.as_mut_ptr(), constants.as_ptr());\n        crate::backends::TieredAction::RanJit\n"
+          execute_leaf = "        let Some(func) = (unsafe { self.get_compiled(module_idx, pc) }) else {\n            return crate::backends::TieredAction::Interpret;\n        };\n        let leaf_calls: Vec<(usize, *const u8, u8, usize)> = self\n            .native_leaf_calls\n            .iter()\n            .filter_map(|(&(leaf_module, func_idx), call)| {\n                (leaf_module == module_idx).then_some((\n                    func_idx,\n                    call.ptr,\n                    call.return_reg,\n                    call.required_args,\n                ))\n            })\n            .collect();\n        crate::jit::runtime::set_jit_leaf_calls(&leaf_calls, constants.as_ptr());\n        func(regs.as_mut_ptr(), constants.as_ptr());\n        crate::jit::runtime::clear_jit_leaf_calls();\n        crate::backends::TieredAction::RanJit\n"
           replace_once(execute_anchor, execute_leaf)
 
           path.write_text(text, encoding="utf-8")
