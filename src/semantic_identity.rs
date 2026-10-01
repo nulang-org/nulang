@@ -36,6 +36,11 @@ const EFFECT_SITE_CANONICAL_VERSION: &[u8] = b"nulang.effect-site.v1\0";
 pub struct EffectSiteId(SemanticId);
 
 impl EffectSiteId {
+    /// Reconstruct an effect-site identity from bytecode artifact metadata.
+    pub(crate) const fn from_digest(digest: [u8; 32]) -> Self {
+        Self(SemanticId::from_digest(digest))
+    }
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         self.0.as_bytes()
     }

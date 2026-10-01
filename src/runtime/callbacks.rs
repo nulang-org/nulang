@@ -1383,6 +1383,8 @@ fn id_arg(constants: &[crate::bytecode::Constant], args: &[crate::vm::Value], id
 pub(crate) struct BytecodeRuntimeCallbacks {
     runtime: *mut Runtime,
     actor_id: u64,
+    current_effect_site_id: Option<[u8; 32]>,
+    current_effect_operation: Option<String>,
 }
 
 // SAFETY: `runtime` is a transient borrow of the executing `Runtime` that
@@ -1399,7 +1401,12 @@ unsafe impl Sync for BytecodeRuntimeCallbacks {}
 
 impl BytecodeRuntimeCallbacks {
     pub(crate) fn new(runtime: *mut Runtime, actor_id: u64) -> Self {
-        BytecodeRuntimeCallbacks { runtime, actor_id }
+        BytecodeRuntimeCallbacks {
+            runtime,
+            actor_id,
+            current_effect_site_id: None,
+            current_effect_operation: None,
+        }
     }
 
     fn authority_actor_id(&self) -> Option<u64> {
@@ -2063,17 +2070,82 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
             let Some(request) = request else {
                 return PerformAsyncResult::Ready(None);
             };
+
+            if let Some(site_digest) = self.current_effect_site_id {
+                let site_id = crate::semantic_identity::EffectSiteId::from_digest(site_digest);
+                let effect_operation = self
+                    .current_effect_operation
+                    .as_deref()
+                    .unwrap_or("Inference.ask");
+                match llm::prepare_workflow_llm_effect(
+                    rt,
+                    actor_id,
+                    site_id,
+                    effect_operation,
+                    &request,
+                ) {
+                    Ok(llm::WorkflowLlmDurabilityDecision::Replay(result)) => {
+                        if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                            actor.llm_completed = Some(result);
+                        }
+                        return self.llm_ask(model, prompt);
+                    }
+                    Ok(llm::WorkflowLlmDurabilityDecision::Dispatch)
+                    | Ok(llm::WorkflowLlmDurabilityDecision::NotDurable) => {}
+                    Err(error) => {
+                        tracing::error!(
+                            actor_id,
+                            %error,
+                            "nulang-workflow: durable LLM prepare failed; refusing provider dispatch"
+                        );
+                        return PerformAsyncResult::Ready(None);
+                    }
+                }
+            }
+
             if !(*rt).dispatch_llm_request(actor_id, request, prompt) {
-                // Dispatch failed: fall back to a nil response.
+                // Dispatch failed before any provider request became observable.
+                // If this was a durable workflow effect, close the Prepared
+                // record with the same terminal error that this path exposes.
                 rt.llm.inflight_count = rt.llm.inflight_count.saturating_sub(1);
+                let dispatch_error = nulang_ai::LlmError::from_string(
+                    "LLM worker dispatch unavailable before provider execution",
+                );
+                let durable_completion =
+                    llm::complete_workflow_llm_effect(rt, actor_id, Err(dispatch_error));
                 if let Some(actor) = rt.actors.get_mut(&actor_id) {
                     actor.llm_inflight = false;
                     actor.llm_pending_prompt = None;
+                }
+                if let Err(error) = durable_completion {
+                    tracing::error!(
+                        actor_id,
+                        %error,
+                        "nulang-workflow: durable LLM dispatch-failure receipt was not committed; suspending for recovery"
+                    );
+                    return PerformAsyncResult::Pending;
                 }
                 return PerformAsyncResult::Ready(None);
             }
             PerformAsyncResult::Pending
         }
+    }
+
+    fn perform_async_at_site(
+        &mut self,
+        effect_op: &str,
+        constants: &[crate::bytecode::Constant],
+        args: &[crate::vm::Value],
+        site_id: Option<[u8; 32]>,
+    ) -> crate::vm::PerformAsyncResult {
+        let previous_site = self.current_effect_site_id;
+        let previous_operation = self.current_effect_operation.take();
+        self.current_effect_site_id = site_id;
+        self.current_effect_operation = Some(effect_op.to_string());
+        let result = self.perform_async(effect_op, constants, args);
+        self.current_effect_site_id = previous_site;
+        self.current_effect_operation = previous_operation;
+        result
     }
 
     #[cfg_attr(not(feature = "ai-runtime"), allow(unused_variables))]
