@@ -4438,7 +4438,7 @@ impl Runtime {
             .unwrap_or(false)
     }
 
-    fn actor_is_workflow(&self, actor_id: u64) -> bool {
+    pub(crate) fn actor_is_workflow(&self, actor_id: u64) -> bool {
         workflow::actor_is_workflow(self, actor_id)
     }
 
