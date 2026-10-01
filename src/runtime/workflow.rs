@@ -527,20 +527,33 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
             let parallel_step_name =
                 resolve_string_constant(rt, actor_id, &args[0]).unwrap_or_default();
             let branch_name = resolve_string_constant(rt, actor_id, &args[1]).unwrap_or_default();
-            let _ = rt.persistence.append_parallel_branch_completed(
-                actor_id,
-                seq,
-                parallel_step_name,
-                branch_name,
-            );
-            if let Some(actor) = rt.actors.get_mut(&actor_id) {
-                let current = actor
-                    .get_state_field("parallel_progress")
-                    .and_then(|v| v.as_int())
-                    .unwrap_or(0);
-                actor.set_state_field("parallel_progress", Value::int(current + 1));
+            let atomic_tail = match workflow_has_atomic_tail(rt, actor_id) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::error!(actor_id, %error, "nulang-workflow: refusing parallel progress after atomic-tail read failed");
+                    return;
+                }
+            };
+            let committed = commit_intermediate_workflow_event(rt, actor_id, |sequence| {
+                WorkflowEvent::ParallelBranchCompleted {
+                    sequence,
+                    parallel_step_name,
+                    branch_name,
+                }
+            })
+            .is_ok();
+            if committed {
+                if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                    let current = actor
+                        .get_state_field("parallel_progress")
+                        .and_then(|v| v.as_int())
+                        .unwrap_or(0);
+                    actor.set_state_field("parallel_progress", Value::int(current + 1));
+                }
+                if !atomic_tail {
+                    checkpoint_actor(rt, actor_id);
+                }
             }
-            checkpoint_actor(rt, actor_id);
         } else {
             let module = rt
                 .actors
@@ -568,18 +581,17 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                         );
                     }
                     ReplayDisposition::Append => {
-                        let appended = rt
-                            .persistence
-                            .append_workflow_event(
-                                actor_id,
-                                WorkflowEvent::Custom {
-                                    sequence: seq,
-                                    replay_id: Some(replay_id),
-                                    name: event.to_string(),
-                                    args: payload,
-                                },
-                            )
-                            .is_ok();
+                        let appended = commit_intermediate_workflow_event(
+                            rt,
+                            actor_id,
+                            |sequence| WorkflowEvent::Custom {
+                                sequence,
+                                replay_id: Some(replay_id),
+                                name: event.to_string(),
+                                args: payload,
+                            },
+                        )
+                        .is_ok();
                         if appended {
                             // This event belongs to an open activation. Keep the
                             // last completed snapshot unchanged so recovery can
@@ -591,18 +603,25 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                     }
                 }
             } else {
-                should_checkpoint = rt
-                    .persistence
-                    .append_workflow_event(
-                        actor_id,
-                        WorkflowEvent::Custom {
-                            sequence: seq,
-                            replay_id: None,
-                            name: event.to_string(),
-                            args: payload,
-                        },
-                    )
-                    .is_ok();
+                let atomic_tail = match workflow_has_atomic_tail(rt, actor_id) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::error!(actor_id, %error, "nulang-workflow: refusing custom event after atomic-tail read failed");
+                        return;
+                    }
+                };
+                should_checkpoint = commit_intermediate_workflow_event(
+                    rt,
+                    actor_id,
+                    |sequence| WorkflowEvent::Custom {
+                        sequence,
+                        replay_id: None,
+                        name: event.to_string(),
+                        args: payload,
+                    },
+                )
+                .is_ok()
+                    && !atomic_tail;
             }
             if should_checkpoint {
                 checkpoint_actor(rt, actor_id);
@@ -639,16 +658,14 @@ pub(crate) fn append_timer_set(
                 ));
             }
             ReplayDisposition::Append => {
-                let seq = next_sequence(rt, actor_id);
-                rt.persistence.append_workflow_event(
-                    actor_id,
+                commit_intermediate_workflow_event(rt, actor_id, |sequence| {
                     WorkflowEvent::TimerSet {
-                        sequence: seq,
+                        sequence,
                         replay_id: Some(replay_id),
                         name: name.to_string(),
                         duration_ms,
-                    },
-                )?;
+                    }
+                })?;
                 // TimerSet is an intermediate record for an open activation.
                 // Keep the last completed snapshot unchanged so crash recovery
                 // re-executes the command and consumes this exact identity.
