@@ -280,12 +280,21 @@ pub(crate) fn store_llm_completion(
     rt.llm.inflight_count = rt.llm.inflight_count.saturating_sub(1);
     match result {
         Ok(response) => {
-            let completed = complete_workflow_llm_effect(rt, actor_id, Ok(response))
-                .unwrap_or_else(|error| {
-                    Err(LlmError::from_string(format!(
-                        "durable LLM completion persistence failed: {error}"
-                    )))
-                });
+            let completed = match complete_workflow_llm_effect(rt, actor_id, Ok(response)) {
+                Ok(completed) => completed,
+                Err(error) => {
+                    tracing::error!(
+                        actor_id,
+                        %error,
+                        "nulang-workflow: refusing to expose LLM result before durable Completed receipt"
+                    );
+                    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                        actor.llm_inflight = false;
+                        actor.llm_pending_prompt = None;
+                    }
+                    return;
+                }
+            };
             if let Some(actor) = rt.actors.get_mut(&actor_id) {
                 actor.llm_inflight = false;
                 actor.llm_pending_prompt = None;
@@ -318,13 +327,21 @@ pub(crate) fn handle_llm_error(rt: &mut Runtime, actor_id: u64, error: LlmError)
         // Non-agent actors (including workflow actors) treat provider errors as
         // terminal outcomes. Persist the durable receipt before making the
         // result visible to suspended bytecode.
-        let completed = complete_workflow_llm_effect(rt, actor_id, Err(error)).unwrap_or_else(
-            |durability_error| {
-                Err(LlmError::from_string(format!(
-                    "durable LLM error receipt persistence failed: {durability_error}"
-                )))
-            },
-        );
+        let completed = match complete_workflow_llm_effect(rt, actor_id, Err(error)) {
+            Ok(completed) => completed,
+            Err(durability_error) => {
+                tracing::error!(
+                    actor_id,
+                    %durability_error,
+                    "nulang-workflow: refusing to expose LLM error before durable Completed receipt"
+                );
+                if let Some(actor) = rt.actors.get_mut(&actor_id) {
+                    actor.llm_inflight = false;
+                    actor.llm_pending_prompt = None;
+                }
+                return;
+            }
+        };
         let should_resume = if let Some(actor) = rt.actors.get_mut(&actor_id) {
             actor.llm_inflight = false;
             actor.llm_pending_prompt = None;
