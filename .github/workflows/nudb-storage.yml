@@ -38,6 +38,10 @@ jobs:
         run: |
           cargo test --locked --no-default-features --lib database::owner::tests
           cargo test --locked --no-default-features --test tablet_owner_admission
+      - name: Memtable rotation contract
+        run: |
+          cargo test --locked --no-default-features --lib memtable_rotation_tests
+          cargo test --locked --no-default-features --test nudb_memtable_rotation
       - name: Storage interruption matrix
         run: cargo test --locked --no-default-features --lib database::interruption::tests
       - name: Existing NulangDB storage contracts

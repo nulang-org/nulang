@@ -263,6 +263,60 @@ pub(crate) struct TabletSnapshotState {
     pub(crate) rows: Vec<TabletSnapshotRow>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct Memtable {
+    rows: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
+    estimated_bytes: usize,
+}
+
+impl Memtable {
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        self.estimated_bytes
+    }
+
+    fn push_version(&mut self, key: Vec<u8>, version: VersionedValue) {
+        self.estimated_bytes = self
+            .estimated_bytes
+            .saturating_add(estimated_version_bytes(&key, &version));
+        self.rows.entry(key).or_default().push(version);
+    }
+
+    fn version_at(&self, key: &[u8], snapshot: u64) -> Option<&VersionedValue> {
+        self.rows.get(key).and_then(|versions| {
+            versions
+                .iter()
+                .rev()
+                .find(|version| version.sequence <= snapshot)
+        })
+    }
+
+    fn from_rows(rows: BTreeMap<Vec<u8>, Vec<VersionedValue>>) -> Self {
+        let estimated_bytes = rows.iter().fold(0usize, |total, (key, versions)| {
+            versions.iter().fold(total, |subtotal, version| {
+                subtotal.saturating_add(estimated_version_bytes(key, version))
+            })
+        });
+        Self {
+            rows,
+            estimated_bytes,
+        }
+    }
+}
+
+fn estimated_version_bytes(key: &[u8], version: &VersionedValue) -> usize {
+    let value_bytes = version.value.as_ref().map_or(0, Vec::len);
+    8usize
+        .saturating_add(1)
+        .saturating_add(4)
+        .saturating_add(key.len())
+        .saturating_add(4)
+        .saturating_add(value_bytes)
+}
+
 /// Minimal single-node MVCC tablet used to prove transaction semantics before
 /// introducing WAL and replication.
 ///
@@ -273,7 +327,9 @@ pub(crate) struct TabletSnapshotState {
 pub struct MemoryTablet {
     descriptor: TabletDescriptor,
     current_sequence: u64,
-    rows: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
+    mutable: Memtable,
+    /// Frozen generations ordered from oldest to newest.
+    immutables: Vec<Memtable>,
 }
 
 impl MemoryTablet {
@@ -281,7 +337,8 @@ impl MemoryTablet {
         Self {
             descriptor,
             current_sequence: 0,
-            rows: BTreeMap::new(),
+            mutable: Memtable::default(),
+            immutables: Vec::new(),
         }
     }
 
@@ -293,16 +350,41 @@ impl MemoryTablet {
         self.current_sequence
     }
 
+    /// Estimated logical bytes currently held in the mutable generation.
+    /// This is an admission/rotation metric, not allocator accounting.
+    pub fn mutable_memtable_bytes(&self) -> usize {
+        self.mutable.estimated_bytes()
+    }
+
+    pub fn immutable_memtable_count(&self) -> usize {
+        self.immutables.len()
+    }
+
+    /// Freeze the mutable generation when it reaches the configured byte target.
+    /// Empty generations are never emitted. A zero threshold behaves as one byte.
+    pub fn rotate_memtable_if_bytes_at_least(&mut self, min_bytes: usize) -> bool {
+        if self.mutable.is_empty() || self.mutable.estimated_bytes() < min_bytes.max(1) {
+            return false;
+        }
+        let frozen = std::mem::take(&mut self.mutable);
+        self.immutables.push(frozen);
+        true
+    }
+
     pub(crate) fn snapshot_state(&self) -> TabletSnapshotState {
+        let mut rows: BTreeMap<Vec<u8>, Vec<VersionedValue>> = BTreeMap::new();
+        for memtable in self.immutables.iter().chain(std::iter::once(&self.mutable)) {
+            for (key, versions) in &memtable.rows {
+                rows.entry(key.clone())
+                    .or_default()
+                    .extend(versions.clone());
+            }
+        }
         TabletSnapshotState {
             current_sequence: self.current_sequence,
-            rows: self
-                .rows
-                .iter()
-                .map(|(key, versions)| TabletSnapshotRow {
-                    key: key.clone(),
-                    versions: versions.clone(),
-                })
+            rows: rows
+                .into_iter()
+                .map(|(key, versions)| TabletSnapshotRow { key, versions })
                 .collect(),
         }
     }
@@ -332,10 +414,16 @@ impl MemoryTablet {
             }
         }
 
+        let immutables = if rows.is_empty() {
+            Vec::new()
+        } else {
+            vec![Memtable::from_rows(rows)]
+        };
         Ok(Self {
             descriptor,
             current_sequence: state.current_sequence,
-            rows,
+            mutable: Memtable::default(),
+            immutables,
         })
     }
 
@@ -478,16 +566,22 @@ impl MemoryTablet {
         for mutation in mutations {
             match mutation {
                 TabletMutation::Put { key, value } => {
-                    self.rows.entry(key).or_default().push(VersionedValue {
-                        sequence,
-                        value: Some(value),
-                    });
+                    self.mutable.push_version(
+                        key,
+                        VersionedValue {
+                            sequence,
+                            value: Some(value),
+                        },
+                    );
                 }
                 TabletMutation::Delete { key } => {
-                    self.rows.entry(key).or_default().push(VersionedValue {
-                        sequence,
-                        value: None,
-                    });
+                    self.mutable.push_version(
+                        key,
+                        VersionedValue {
+                            sequence,
+                            value: None,
+                        },
+                    );
                 }
             }
         }
@@ -506,13 +600,13 @@ impl MemoryTablet {
             return Err(TabletError::KeyOutsideTabletRange);
         }
 
-        Ok(self.rows.get(key).and_then(|versions| {
-            versions
+        let version = self.mutable.version_at(key, snapshot).or_else(|| {
+            self.immutables
                 .iter()
                 .rev()
-                .find(|version| version.sequence <= snapshot)
-                .and_then(|version| version.value.as_deref())
-        }))
+                .find_map(|memtable| memtable.version_at(key, snapshot))
+        });
+        Ok(version.and_then(|version| version.value.as_deref()))
     }
 
     /// Read the newest committed value. Out-of-range keys route as absent;
@@ -623,6 +717,95 @@ impl fmt::Display for TabletError {
                 f.write_str("tablet mutation key falls outside the owned key range")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod memtable_rotation_tests {
+    use super::*;
+
+    fn descriptor() -> TabletDescriptor {
+        TabletDescriptor::new(
+            TabletId::new(901).unwrap(),
+            KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+            1,
+        )
+        .unwrap()
+    }
+
+    fn put(key: &[u8], value: &[u8]) -> TabletMutation {
+        TabletMutation::Put {
+            key: key.to_vec(),
+            value: value.to_vec(),
+        }
+    }
+
+    #[test]
+    fn rotation_preserves_latest_and_historical_reads() {
+        let mut tablet = MemoryTablet::new(descriptor());
+        let w1 = tablet.prepare_write(1, 0, vec![put(b"k", b"v1")]).unwrap();
+        tablet.commit(w1).unwrap();
+        let bytes = tablet.mutable_memtable_bytes();
+        assert!(bytes > 0);
+        assert!(tablet.rotate_memtable_if_bytes_at_least(bytes));
+        let w2 = tablet.prepare_write(1, 1, vec![put(b"k", b"v2")]).unwrap();
+        tablet.commit(w2).unwrap();
+
+        assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
+        assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
+        assert_eq!(tablet.immutable_memtable_count(), 1);
+    }
+
+    #[test]
+    fn byte_rotation_threshold_is_deterministic_and_empty_rotation_is_noop() {
+        let mut tablet = MemoryTablet::new(descriptor());
+        assert!(!tablet.rotate_memtable_if_bytes_at_least(1));
+        let w1 = tablet.prepare_write(1, 0, vec![put(b"a", b"1")]).unwrap();
+        tablet.commit(w1).unwrap();
+        let bytes = tablet.mutable_memtable_bytes();
+        assert!(bytes > 0);
+        assert!(!tablet.rotate_memtable_if_bytes_at_least(bytes + 1));
+        assert!(tablet.rotate_memtable_if_bytes_at_least(bytes));
+        assert!(!tablet.rotate_memtable_if_bytes_at_least(1));
+    }
+
+    #[test]
+    fn snapshot_flattens_mutable_and_immutable_generations_without_semantic_drift() {
+        let mut tablet = MemoryTablet::new(descriptor());
+        let w1 = tablet.prepare_write(1, 0, vec![put(b"k", b"v1")]).unwrap();
+        tablet.commit(w1).unwrap();
+        let bytes = tablet.mutable_memtable_bytes();
+        tablet.rotate_memtable_if_bytes_at_least(bytes);
+        let w2 = tablet.prepare_write(1, 1, vec![put(b"k", b"v2")]).unwrap();
+        tablet.commit(w2).unwrap();
+
+        let state = tablet.snapshot_state();
+        assert_eq!(state.current_sequence, 2);
+        assert_eq!(state.rows.len(), 1);
+        assert_eq!(
+            state.rows[0]
+                .versions
+                .iter()
+                .map(|v| v.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn tombstone_in_mutable_hides_immutable_value_but_old_snapshot_still_reads_it() {
+        let mut tablet = MemoryTablet::new(descriptor());
+        let w1 = tablet.prepare_write(1, 0, vec![put(b"k", b"v1")]).unwrap();
+        tablet.commit(w1).unwrap();
+        let bytes = tablet.mutable_memtable_bytes();
+        tablet.rotate_memtable_if_bytes_at_least(bytes);
+        let delete = tablet
+            .prepare_write(1, 1, vec![TabletMutation::Delete { key: b"k".to_vec() }])
+            .unwrap();
+        tablet.commit(delete).unwrap();
+
+        assert_eq!(tablet.read_latest(b"k"), None);
+        assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
     }
 }
 
