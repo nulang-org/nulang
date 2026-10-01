@@ -5478,32 +5478,60 @@ impl Runtime {
                         return None;
                     }
 
-                    let candidate = self
+                    let mut candidates: Vec<_> = self
                         .persistence
                         .read_journal(actor_id)
                         .into_iter()
-                        .rev()
-                        .find(|entry| {
+                        .filter(|entry| {
                             entry.sequence > snapshot.sequence && entry.sequence <= tail.sequence
-                        });
+                        })
+                        .collect();
 
-                    candidate.and_then(|entry| {
-                        let activation = WorkflowActivationId::new(actor_id, entry.sequence);
-                        let terminal_recorded = workflow_events.iter().any(|event| {
-                            matches!(
-                                event,
-                                WorkflowEvent::StepCompleted {
-                                    activation: Some(id),
-                                    ..
-                                } | WorkflowEvent::StepFailed {
-                                    activation: Some(id),
-                                    ..
-                                } if *id == activation
-                            )
-                        });
+                    if candidates.len() > 1 {
+                        warn!(
+                            "nulang-recover: refusing workflow actor {}: {} admitted commands exist between safe snapshot {} and atomic tail {}",
+                            actor_id,
+                            candidates.len(),
+                            snapshot.sequence,
+                            tail.sequence
+                        );
+                        return None;
+                    }
 
-                        (!terminal_recorded).then_some((activation, entry))
-                    })
+                    let Some(entry) = candidates.pop() else {
+                        return None;
+                    };
+                    let activation = WorkflowActivationId::new(actor_id, entry.sequence);
+                    let terminal_recorded = workflow_events.iter().any(|event| {
+                        matches!(
+                            event,
+                            WorkflowEvent::StepCompleted {
+                                activation: Some(id),
+                                ..
+                            } | WorkflowEvent::StepFailed {
+                                activation: Some(id),
+                                ..
+                            } if *id == activation
+                        )
+                    });
+
+                    if terminal_recorded {
+                        // A terminal marker without a terminal snapshot means
+                        // the actor crossed back onto a legacy write path after
+                        // the atomic tail began. Replaying would duplicate a
+                        // terminal command; accepting the stale snapshot would
+                        // lose its state mutations. Refuse both outcomes.
+                        warn!(
+                            "nulang-recover: refusing workflow actor {}: activation {} is terminal but safe snapshot {} still trails atomic tail {}",
+                            actor_id,
+                            activation.command_sequence,
+                            snapshot.sequence,
+                            tail.sequence
+                        );
+                        return None;
+                    }
+
+                    Some((activation, entry))
                 }
                 Ok(_) => None,
                 Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
