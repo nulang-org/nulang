@@ -4170,40 +4170,73 @@ impl Runtime {
                 }
             }
             if !processed && self.has_bytecode_handler(actor_id, behavior_idx) {
-                // Compiled workflow turns remain on the legacy path until
-                // custom events, timers/signals, suspension markers, failures,
-                // compensation, and effect replay all share the atomic tail.
                 if self.actor_is_persistent(actor_id) {
-                    let seq = self.next_sequence(actor_id);
                     let payload =
                         self.persist_journal_payload(actor_id, journal_source_actor, &msg.payload);
-                    match self.persistence.append_journal(
-                        actor_id,
-                        JournalEntry {
-                            sequence: seq,
-                            behavior_id: msg.behavior_id,
-                            payload,
-                        },
-                    ) {
-                        Ok(()) => {
-                            if self.actor_is_workflow(actor_id) {
-                                workflow_activation =
-                                    Some(WorkflowActivationId::new(actor_id, seq));
-                                if let Some(actor) = self.actors.get_mut(&actor_id) {
-                                    actor.current_workflow_activation = workflow_activation;
+                    let use_atomic_workflow_turn = self.actor_is_workflow(actor_id)
+                        && !self.is_internal_behavior(actor_id, behavior_idx);
+                    if use_atomic_workflow_turn {
+                        let recovered_activation = self.actors.get(&actor_id).and_then(|actor| {
+                            actor.current_workflow_activation.filter(|activation| {
+                                activation.actor_id == actor_id
+                                    && activation.command_sequence == actor.sequence
+                            })
+                        });
+                        if let Some(activation) = recovered_activation {
+                            workflow_activation = Some(activation);
+                            atomic_workflow_turn = true;
+                        } else {
+                            match workflow::commit_workflow_command(
+                                self,
+                                actor_id,
+                                msg.behavior_id,
+                                payload,
+                            ) {
+                                Ok(activation) => {
+                                    workflow_activation = Some(activation);
+                                    atomic_workflow_turn = true;
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        actor_id,
+                                        %error,
+                                        "nulang-workflow: refusing compiled command execution after atomic durable admission failed"
+                                    );
+                                    self.current_actor = None;
+                                    return;
                                 }
                             }
                         }
-                        Err(error) if self.actor_is_workflow(actor_id) => {
-                            tracing::error!(
-                                actor_id,
-                                %error,
-                                "nulang-workflow: refusing command execution after durable admission failed"
-                            );
-                            self.current_actor = None;
-                            return;
+                    } else {
+                        let seq = self.next_sequence(actor_id);
+                        match self.persistence.append_journal(
+                            actor_id,
+                            JournalEntry {
+                                sequence: seq,
+                                behavior_id: msg.behavior_id,
+                                payload,
+                            },
+                        ) {
+                            Ok(()) => {
+                                if self.actor_is_workflow(actor_id) {
+                                    workflow_activation =
+                                        Some(WorkflowActivationId::new(actor_id, seq));
+                                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+                                        actor.current_workflow_activation = workflow_activation;
+                                    }
+                                }
+                            }
+                            Err(error) if self.actor_is_workflow(actor_id) => {
+                                tracing::error!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-workflow: refusing command execution after durable admission failed"
+                                );
+                                self.current_actor = None;
+                                return;
+                            }
+                            Err(_) => {}
                         }
-                        Err(_) => {}
                     }
                 }
                 let payload = msg.payload.clone();
@@ -4216,39 +4249,50 @@ impl Runtime {
                 self.suspend_enabled = saved_suspend;
                 match result {
                     Ok(_) => {
-                        self.checkpoint_actor(actor_id);
+                        if !self.actor_is_workflow(actor_id) {
+                            self.checkpoint_actor(actor_id);
+                        }
                         processed = true;
                     }
                     Err(crate::types::NuError::Suspended(_)) => {
                         // The step yielded waiting for a signal or a
                         // background LLM call. Do not mark it completed, do
                         // not run compensations, and do not checkpoint the
-                        // partially-mutated durable state: persist only the
-                        // suspension marker so recovery can re-drive the
-                        // step from its last pre-suspend checkpoint.
+                        // partially-mutated durable state. Atomic workflows
+                        // recover unfinished activation identity from the
+                        // command/terminal history; legacy workflows keep the
+                        // compatibility suspension marker.
                         self.persist_suspension_marker(actor_id);
                         processed = false;
                     }
                     Err(e) => {
-                        self.checkpoint_actor(actor_id);
-                        // A workflow step failed: record the failure (durable
-                        // StepFailed event — SPEC2 §10 known-issue #5: step
-                        // failures were silent, exit 0, no diagnostic), then
-                        // run saga compensations for previously completed
-                        // steps in reverse order.
                         if self.actor_is_workflow(actor_id) {
-                            let seq = self.next_sequence(actor_id);
                             let step_name = self.step_name_for(actor_id, behavior_idx);
-                            let _ = self.persistence.append_workflow_event(
+                            if let Err(error) = workflow::persist_step_failed(
+                                self,
                                 actor_id,
-                                WorkflowEvent::StepFailed {
-                                    sequence: seq,
-                                    activation: workflow_activation,
-                                    step_name,
-                                    error: format!("{}", e),
-                                },
-                            );
+                                workflow_activation,
+                                step_name,
+                                format!("{}", e),
+                            ) {
+                                tracing::error!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-workflow: terminal failure transition failed; discarding activation"
+                                );
+                                self.actors.remove(&actor_id);
+                                if self.recover_actor(actor_id).is_none() {
+                                    tracing::error!(
+                                        actor_id,
+                                        "nulang-workflow: actor recovery failed after terminal failure transition failure"
+                                    );
+                                }
+                                self.current_actor = None;
+                                return;
+                            }
                             self.run_saga_compensation(actor_id, behavior_idx);
+                        } else {
+                            self.checkpoint_actor(actor_id);
                         }
                         processed = false;
                     }
@@ -4272,39 +4316,26 @@ impl Runtime {
                 }
 
                 let step_name = self.step_name_for(actor_id, behavior_idx);
-                if atomic_workflow_turn {
-                    if let Err(error) = workflow::commit_step_completed(
-                        self,
+                if let Err(error) = workflow::persist_step_completed(
+                    self,
+                    actor_id,
+                    workflow_activation,
+                    step_name,
+                ) {
+                    tracing::error!(
                         actor_id,
-                        workflow_activation,
-                        step_name,
-                    ) {
+                        %error,
+                        "nulang-workflow: terminal durable transition failed; discarding activation"
+                    );
+                    self.actors.remove(&actor_id);
+                    if self.recover_actor(actor_id).is_none() {
                         tracing::error!(
                             actor_id,
-                            %error,
-                            "nulang-workflow: terminal durable transition failed; discarding activation"
+                            "nulang-workflow: actor recovery failed after terminal durable transition failure"
                         );
-                        self.actors.remove(&actor_id);
-                        if self.recover_actor(actor_id).is_none() {
-                            tracing::error!(
-                                actor_id,
-                                "nulang-workflow: actor recovery failed after terminal durable transition failure"
-                            );
-                        }
-                        self.current_actor = None;
-                        return;
                     }
-                } else {
-                    let seq = self.next_sequence(actor_id);
-                    let _ = self.persistence.append_workflow_event(
-                        actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            activation: workflow_activation,
-                            step_name,
-                        },
-                    );
-                    self.checkpoint_actor(actor_id);
+                    self.current_actor = None;
+                    return;
                 }
             }
             let actor = match self.actors.get_mut(&actor_id) {
