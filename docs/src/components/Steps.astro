@@ -2,26 +2,26 @@
 const steps = [
 	{
 		step: '01',
-		title: 'Clone',
-		description: 'Get the compiler and runtime source.',
-		command: 'git clone https://github.com/nulang-org/nulang',
+		title: 'Browser',
+		description: 'Try the compiler + CoreVM with no install.',
+		command: 'nulang.org/playground/',
 	},
 	{
 		step: '02',
-		title: 'Build',
-		description: 'Compile the release binary.',
-		command: 'cargo build --release',
+		title: 'Release',
+		description: 'Download a checksummed native binary.',
+		command: 'github.com/nulang-org/nulang/releases',
 	},
 	{
 		step: '03',
-		title: 'Run',
-		description: 'Start the REPL or execute a .nula file.',
-		command: 'cargo run -- --repl',
+		title: 'Source',
+		description: 'Build locally when contributing or customizing.',
+		command: 'cargo build --release',
 	},
 ];
 ---
 
-<div class="steps-flow" aria-label="Install Nulang in three steps">
+<div class="steps-flow" aria-label="Three ways to try Nulang">
 	{steps.map((step) => (
 		<div class="step">
 			<div class="step-index">{step.step}</div>

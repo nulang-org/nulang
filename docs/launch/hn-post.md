@@ -129,6 +129,8 @@ supervision library, and would rather have the compiler check it.
 **10. "1.0.0-frozen but alpha? Windows? Editor support?"**
 `1.0.0-frozen` is a *language* version for the frozen core (bytecode format,
 wire protocol, Nulang Core) — the implementation is alpha; see GOVERNANCE.md.
-Windows isn't supported yet (use WSL); it's on the roadmap. There's a VS Code
-extension in `editors/vscode/` (syntax + LSP) and `nulang --lsp` implements
+The tagged release matrix includes Windows x86_64 alongside Linux
+x86_64/aarch64 and macOS aarch64; other platform/architecture combinations
+are not release-tested yet. There's a VS Code extension in `editors/vscode/`
+(syntax + LSP), and `nulang --lsp` implements
 hover/goto-def/rename/completion/diagnostics.
