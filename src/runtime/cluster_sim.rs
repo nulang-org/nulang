@@ -21,17 +21,17 @@
 //!   delivers probes through `handle_heartbeat` on the target.
 //! - A downed node (`ClusterState::is_down`) has had its transport shut
 //!   down in the real runtime; the fabric drops all deliveries to it.
-//! - `pick_gossip_targets` uses `OsRng` internally, so gossip target
-//!   choice is not bit-reproducible; the asserted invariants (down /
-//!   stay-up / rejoin convergence) do not depend on which targets gossip
-//!   picks, only on heartbeat staleness, the resolver, and probes.
-//!   (For bit-reproducible gossip, the full-runtime
-//!   `cluster_dst::DeterministicCluster` seeds every node's `ClusterState`
-//!   via `set_rng` — this ClusterState-only harness predates that.)
+//! - Every simulated `ClusterState` receives a stable per-node
+//!   `DeterministicRng`. Gossip-target and active-view repair choices are
+//!   therefore reproducible as well as the virtual clock and message fabric.
+//!   Restarted nodes reuse their node-index seed so the same scenario has the
+//!   same random stream shape on every run.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::time::Duration;
+
+use crate::dst::DeterministicRng;
 
 use super::cluster::{ClusterAction, ClusterConfig, ClusterState, NodeId, NodeStatus};
 use super::timer::VirtualClock;
@@ -40,6 +40,17 @@ use super::GOSSIP_PAYLOAD_MAX_ENTRIES;
 /// Wall-clock step per simulated round (the real runtime ticks cluster
 /// maintenance roughly every 100 ms).
 const ROUND_STEP: Duration = Duration::from_millis(100);
+
+/// Stable seed family for the ClusterState-only simulation harness.
+///
+/// Each node gets a distinct stream derived from its index. A restarted node
+/// reuses the same index and therefore the same stream, which makes failures
+/// reproducible instead of depending on `OsRng`.
+const SIM_RNG_SEED_BASE: u64 = 0xC1A5_7EED_5EED_0000;
+
+fn deterministic_node_rng(index: usize) -> DeterministicRng {
+    DeterministicRng::new(SIM_RNG_SEED_BASE.wrapping_add(index as u64))
+}
 
 /// A deterministic simulation of N cluster nodes.
 pub struct SimCluster {
@@ -73,10 +84,11 @@ impl SimCluster {
         let base = VirtualClock::new();
         let mut nodes = Vec::with_capacity(addrs.len());
         let mut clocks = Vec::with_capacity(addrs.len());
-        for addr in addrs {
+        for (index, addr) in addrs.iter().enumerate() {
             let mut cs = ClusterState::new(NodeId::new(addr), *addr);
             let clock = base.clone();
             cs.set_clock(clock.clone());
+            cs.set_rng(Box::new(deterministic_node_rng(index)));
             assert!(cs.apply_config(config), "config must apply");
             nodes.push(cs);
             clocks.push(clock);
@@ -633,6 +645,7 @@ mod tests {
         let clock0 = sim.clocks[0].clone();
         let mut fresh = ClusterState::new(NodeId::new(&addr0), addr0);
         fresh.set_clock(clock0.clone());
+        fresh.set_rng(Box::new(deterministic_node_rng(0)));
         assert!(fresh.apply_config(&static_quorum(5)));
         // Join using the existing majority as seeds. Use handle_heartbeat
         // instead of join_cluster so last_heartbeat is set via the virtual

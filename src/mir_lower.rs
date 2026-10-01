@@ -370,21 +370,62 @@ impl ModuleCtx {
             .unwrap_or(self.behaviors.len())
     }
 
-    /// Resolve `send`/`ask actor behavior(...)` to a behavior-table index by
-    /// name. Mirrors the stable compiler's `behavior_table_index`: an exact
-    /// "ActorName.behavior" match first, falling back to any behavior with a
-    /// matching suffix if the receiver expression isn't a bare actor-typed
-    /// variable name (a known ambiguity inherited from the stable compiler,
-    /// not introduced here).
-    fn send_behavior_idx(&self, actor_name_hint: &str, behavior: &str) -> usize {
-        let full_name = format!("{}.{}", actor_name_hint, behavior);
-        if let Some(idx) = self.behavior_names.iter().position(|n| *n == full_name) {
-            return idx;
+    /// Resolve `send`/`ask actor behavior(...)` to a behavior-table index.
+    ///
+    /// Exact qualified identities always win. A unique short-name suffix is
+    /// retained only as a compatibility path for genuinely opaque/dynamic
+    /// actor references; an ambiguous suffix must fail closed instead of
+    /// selecting code owned by a different actor schema.
+    fn send_behavior_idx(&self, actor_name_hint: &str, behavior: &str) -> NuResult<usize> {
+        if let Some(idx) = self.behavior_names.iter().position(|name| name == behavior) {
+            return Ok(idx);
         }
+
+        if !actor_name_hint.is_empty() {
+            let full_name = format!("{}.{}", actor_name_hint, behavior);
+            if let Some(idx) = self
+                .behavior_names
+                .iter()
+                .position(|name| *name == full_name)
+            {
+                return Ok(idx);
+            }
+        }
+
+        let suffix = format!(".{}", behavior);
+        let candidates: Vec<(usize, &str)> = self
+            .behavior_names
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, name)| name.ends_with(&suffix).then_some((idx, name.as_str())))
+            .collect();
+
+        match candidates.as_slice() {
+            [] => Ok(self.behaviors.len()),
+            [(idx, _)] => Ok(*idx),
+            _ => Err(compile_err(
+                format!(
+                    "ambiguous actor behavior '{}'; candidates: {}. \
+                     The receiver's nominal actor identity must be preserved before MIR lowering",
+                    behavior,
+                    candidates
+                        .iter()
+                        .map(|(_, name)| *name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Span::default(),
+            )),
+        }
+    }
+
+    /// Selective receive still resolves against the current actor's local arm
+    /// names; keep that legacy resolver separate from send/ask nominal identity.
+    fn receive_behavior_idx(&self, behavior: &str) -> usize {
         let suffix = format!(".{}", behavior);
         self.behavior_names
             .iter()
-            .position(|n| n.ends_with(&suffix))
+            .position(|name| name == behavior || name.ends_with(&suffix))
             .unwrap_or(self.behaviors.len())
     }
 
@@ -1468,7 +1509,7 @@ impl<'c> FnLowerer<'c> {
                 ..
             } => {
                 let actor_hint = operand_name_hint(actor);
-                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior);
+                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior)?;
                 let actor_id = self.lower_operand(actor)?;
                 let mut arg_ids = Vec::with_capacity(args.len());
                 for a in args {
@@ -1494,7 +1535,7 @@ impl<'c> FnLowerer<'c> {
                 ..
             } => {
                 let actor_hint = operand_name_hint(actor);
-                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior);
+                let idx = self.ctx.send_behavior_idx(&actor_hint, behavior)?;
                 let actor_id = self.lower_operand(actor)?;
                 let mut arg_ids = Vec::with_capacity(args.len());
                 for a in args {
@@ -1690,7 +1731,7 @@ impl<'c> FnLowerer<'c> {
         }
         let behavior_ids: Vec<u16> = arms
             .iter()
-            .map(|(name, _, _, _)| self.ctx.send_behavior_idx("", name) as u16)
+            .map(|(name, _, _, _)| self.ctx.receive_behavior_idx(name) as u16)
             .collect();
         let max_params = arms.iter().map(|(_, p, _, _)| p.len()).max().unwrap_or(0);
         let timeout = match after {
@@ -2896,6 +2937,48 @@ mod tests {
         let hir_module = hir::Module::new("test");
         let mir_module = lower_module(&hir_module).unwrap();
         assert_eq!(mir_module.name, "test");
+    }
+
+    #[test]
+    fn known_receiver_uses_nominal_behavior_identity_when_short_names_collide() {
+        let module = lower_source(
+            r#"
+            actor First {
+                state n: Int = 0
+                behavior hit() { self.n = self.n + 100 }
+                behavior get() { self.n }
+            }
+            actor Second {
+                state n: Int = 0
+                behavior get() { self.n }
+                behavior hit() { self.n = self.n + 1 }
+            }
+            fn main() {
+                let s = spawn Second {}
+                send s hit()
+                ask s get()
+            }
+            "#,
+        )
+        .expect("known receiver identity should disambiguate colliding behavior names");
+        let main = find_fn(&module, "main");
+
+        let mut send_idx = None;
+        let mut ask_idx = None;
+        for block in &main.blocks {
+            for stmt in &block.stmts {
+                if let mir::Stmt::Assign { op, .. } = stmt {
+                    match op {
+                        mir::RValue::Send { behavior_idx, .. } => send_idx = Some(*behavior_idx),
+                        mir::RValue::Ask { behavior_idx, .. } => ask_idx = Some(*behavior_idx),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        assert_eq!(send_idx, Some(3), "send must resolve to Second.hit");
+        assert_eq!(ask_idx, Some(2), "ask must resolve to Second.get");
     }
 
     // -----------------------------------------------------------------------

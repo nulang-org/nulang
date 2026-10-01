@@ -1,4 +1,94 @@
 # Nulang Changelog
+### Faster tier-2 promotion for native loop regions — 2026-09-30
+- **JIT-compiled regions with an internal back-edge now promote from the low-latency Cranelift tier on their first compiled re-entry.** A single native loop entry can perform arbitrarily many back-edge iterations, so the previous 10,000-entry tier-2 counter could leave genuinely hot loops on first-tier code indefinitely.
+- **Straight-line and already-optimized regions retain the existing tier-2 threshold.** The policy change is limited to first-tier internal loops so cold or call-heavy code does not pay unnecessary optimized-compilation latency.
+
+### Durable actor activation epochs — 2026-09-30
+- **Durable fencing identity now survives checkpoint, recovery, migration, and node-loss takeover.** Live actors own a canonical `activation_epoch`; snapshots persist it, legacy snapshots default explicitly to initial epoch 1, and every restore path hydrates the exact persisted value.
+- **Node-loss recovery no longer duplicates epoch ownership in `respawn_opted`.** The opt-in registry is membership-only; shadow replication and directory announcements derive epochs from the live actor, failover persists the bumped epoch before announcing ownership, and graceful goodbye captures a deterministic actor/epoch manifest before reaping.
+- **Migration closes its immediate-crash durability window.** A receiving node persists the validated incoming snapshot locally before publishing or enqueueing the migrated actor, so recovered state and fencing identity are not lost if the target dies immediately after takeover.
+
+### Actor-aware durable journal payload serialization — 2026-09-30
+- **Legacy persistent message and synchronous native-ask journaling now preserve runtime strings before they reach storage.** String-pool ids resolve against the originating actor module first and the durable target as a fallback; heap-backed strings resolve only after exact live-allocation provenance.
+- **Pointer serialization fails closed by runtime type.** Only live allocations tagged `TypeTag::String` are decoded as UTF-8; raw/FFI/non-string pointers remain `PersistedValue::Nil` instead of being interpreted as C strings.
+- **One canonical `persist_journal_payload` path now feeds the scheduler, AI-memory interceptors, bytecode/native dispatch, and synchronous native-ask journal writers.** The RFC 0022 durable-inbox stack should reuse this serializer when #1002 is replayed.
+
+### Durable journal string replay — 2026-09-30
+- **Persistent actor and virtual-actor journal replay now materialize persisted string payloads on the recovering actor heap.** Previously `PersistedValue::String` passed through the context-free `to_value()` conversion and became `nil`, so post-snapshot commands could replay with different arguments than were durably recorded.
+- **Recovered heap strings remain durable across later checkpoints and a second restart.** Snapshot serialization recognizes exact live actor-heap allocations tagged `TypeTag::String`, while arbitrary pointers still fail closed instead of being interpreted as strings.
+- **Runtime-created persistence models survive ordinary recovery without weakening canonical schema ownership.** The selected compiler-owned `ActorMeta` remains authoritative; only fields already present in a snapshot may infer missing Durable/CRDT classifications from snapshot metadata, and event-journal fields may infer missing EventSourced classification.
+- **Regressions pin the complete boundary.** Tests cover journal encode, replay, post-replay checkpointing, second recovery, sender-owned heap strings, module string ids, and non-string pointer rejection.
+
+### Stable workflow activation identity — 2026-09-29
+- **Accepted workflow commands now receive a stable activation identity derived from `actor_id + command journal sequence`.** The identity is created only after durable command admission succeeds and is attached to terminal `StepCompleted` / `StepFailed` events.
+- **Suspended workflow execution retains the original activation identity across signal, timer, timed-receive, JIT-yield, and LLM re-suspension paths.** Later resume events therefore close the accepted command rather than inventing identity from a later event sequence.
+- **Legacy terminal workflow events remain digest-compatible.** Their activation field is optional on deserialization and omitted when absent on serialization.
+- **Atomic durable transitions reject foreign or mismatched terminal activation identities.** Activation actor and accepted command sequence must match the transition before commit.
+
+### Workflow durability fail-closed boundary — 2026-09-29
+- **Durable workflow timers no longer become live after a failed persistence write.** `schedule_workflow_timer` now returns the storage error and arms the timer wheel only after `TimerSet` plus the current checkpoint succeed; VM timer effects stop rather than continuing after that failure.
+- **Workflow signals no longer resume or enter in-memory signal state after a failed durable append/checkpoint.** `signal_workflow` now returns `io::Result` and mutates/resumes only after persistence succeeds.
+- **Timer expiry is fail-closed.** If `TimerFired` cannot be durably recorded, the runtime suppresses the corresponding actor message instead of executing an event that recovery cannot prove happened.
+- This deliberately preserves the current two-write event/checkpoint path until activation replay identity can move the workflow path onto RFC 0022 atomic transitions.
+
+### Durable actor schema identity — 2026-09-29
+- **Durable snapshots now preserve the canonical actor schema that owns their state and behavior history.** Recovery, migration, restart preflight, and virtual-actor hydration resolve exactly that `ActorMeta.name` instead of flattening metadata across a multi-actor module.
+- **Legacy compatibility is explicit and fail-closed.** Snapshots without schema identity remain readable only when the loaded module exposes one unambiguous actor schema; unknown, mismatched, or ambiguous identities are rejected before actor publication.
+- **Durable behavior ownership survives replay boundaries.** Journal behavior IDs are validated against the recovered schema, workflow-local behavior layouts remain actor-local after migration/recovery, and relational/libSQL snapshot paths carry the same schema field.
+
+### Runtime behavior ownership enforcement — 2026-09-29
+- **Bytecode behavior names and numeric IDs are now scoped to the target actor schema.** Foreign-schema IDs cannot execute another actor type's bytecode; workflow-local IDs translate through their own `ActorMeta.behavior_indices`, and virtual actor instances resolve only their declared grain schema.
+- **Anonymous low-level runtime actors keep their compatibility path.** Raw numeric mailbox transport may carry inert IDs, while executable bytecode dispatch remains schema-gated.
+
+### Runtime actor schema identity — 2026-09-29
+- **Actors spawned from compiler-produced module metadata now retain their canonical `ActorMeta.name`.** Module actors no longer discard their owning schema in favor of only `actor_<id>`; manually spawned/native actors keep their synthetic runtime instance names. This is the prerequisite for target-schema behavior ownership and durable recovery checks.
+
+### Nominal actor behavior identity — 2026-09-29
+- **Statically-known actor receivers now preserve their nominal schema through HIR/MIR behavior resolution.** Colliding short behavior names such as `First.hit` and `Second.hit` no longer select another actor schema by global suffix order; qualified identities win, while ambiguous dynamic short-name fallback fails closed.
+
+### Paired Criterion regression confirmation — 2026-09-29
+- **Historical benchmark alerts now emit a machine-readable regression manifest and trigger an exact-parent Criterion A/B confirmation instead of re-running only the candidate.** Base and candidate builds use isolated Cargo targets, measured runs alternate order on one host, and the benchmark process is pinned to one logical CPU by default.
+- **A historical alert blocks only when the paired median latency regression exceeds that benchmark's own historical threshold and its bootstrap 95% ratio interval remains above 1.0.** Shared-runner drift can still be recorded and investigated without being misattributed to the latest commit.
+- **Focused Python tests pin the manifest schema, reject malformed/non-finite thresholds, enforce balanced four-round ordering, preserve report shape for empty manifests, distinguish harness failures from confirmed regressions, and cover regex-safe Criterion filtering plus confirmation statistics.**
+
+### Criterion teardown isolation for runtime benchmarks — 2026-09-29
+- **Actor, interpreter, bytecode VM, and JIT Criterion fixtures now use `iter_batched_ref` so destruction of prepared runtimes, VMs, mailboxes, and queued messages occurs outside the measured routine.** This removes teardown cost from operation latency signals while keeping setup outside timing.
+- **A benchmark-timing contract test prevents owned `iter_batched` from returning to these fixture families,** and the main benchmark job runs that contract before collecting longitudinal results.
+
+### Wasmtime security update — 2026-09-29
+- **Upgrade the optional Wasmtime runtime from 46.x to 48.0.3 to clear RUSTSEC-2026-0316,** which affects dynamic record lifting under hostcall fuel limits. The WASM backend remains feature-gated and retains the same configured runtime feature set.
+
+### Capability-scoped forge gateway for AI agents — 2026-09-28
+- **AI agents now use a provider-neutral forge contract with exact repository and operation grants instead of ambient forge credentials.** The initial MCP surface covers repository reads, branch creation, file commits, change creation/review/merge, and check reads while keeping merge authority distinct from coding authority.
+- **Forge authority is host-managed and fails closed.** MCP callers cannot inject sessions, grants, operations, expiry, or subject fields; hosted execution can delegate policy, approvals, credentials, and audit to Dev Plane while standalone hosts retain the provider-neutral backend boundary.
+
+### Backend-neutral JIT compile telemetry — 2026-09-28
+- **JIT backends now expose aggregate Fast and Optimized compilation counts and compiler-only wall time through `JitCompileStats`.** The counters exclude interpreter warm-up and generated-code execution so tiering decisions can separate compile cost from runtime payoff.
+- **`VM::jit_compile_stats` exposes the telemetry without leaking Cranelift-specific APIs**, and the tier-promotion regression requires one Fast plus one Optimized compile across the tested promotion.
+- **A dedicated `nulang-jit-bench` runner reports timed interpreter, first-run JIT, warmed JIT, and compiler-only deltas** across dense numeric crossover points (1k–100k loop trips) plus call-heavy and branch-heavy controls, in human or JSONL form.
+- **Threshold changes remain separate from measurement.** This PR adds the evidence needed to evaluate tiering policy without changing `HOT_THRESHOLD` or `TIER2_THRESHOLD` in the same patch.
+
+### NulangDB checkpoint and WAL reclamation — 2026-09-28
+- **Single-node tablets can now publish checksummed atomic MVCC checkpoints before reclaiming durable WAL history.** Recovery accepts both safe crash states: a checkpoint plus the original full WAL, or a checkpoint plus a compacted WAL whose header persists the checkpoint base sequence.
+- **Compacted WALs retain sequence, tablet, and ownership fencing metadata.** Reclamation is tail-only in this first slice, so a checkpoint at sequence N rewrites the WAL to an empty log based at N and the next durable write must prove predecessor N before sequence N+1 is accepted.
+
+### NuDB single-node tablet and WAL foundation — 2026-09-27
+- **NuDB now has an experimental single-node range-tablet kernel with ownership-epoch and predecessor-sequence fencing, MVCC snapshot reads, tombstones, deterministic split plans, and WAL-before-visibility commits.** Database hot loops remain ordinary local computation; actors are reserved for future tablet ownership, placement, migration, and distributed coordination.
+- **The prototype WAL fails closed on corrupt framing and payloads and requires recovery after ambiguous append failures.** `NUDBWAL2` protects record metadata and payload bytes independently, truncates only genuinely incomplete crash tails, poisons a live WAL handle after post-emission I/O failure, and fsyncs new WAL directory entries on Unix.
+
+### Node-shared immutable object store — 2026-09-27
+- **Immutable object-store payloads are now shared across runtime shards without copying their bytes.** `TAG_OBJECT` handles keep a single node-local allocation while actor-lifetime holds protect queued and delivered messages; duplicate deliveries no longer over-increment object references.
+- **Cross-node object transport remains explicit and compatible.** Remote sends still serialize object bytes and intern a fresh local object on the receiving node, while actor heaps and ORCA ownership remain shard-confined.
+
+### Warm JIT transition A/B controls — 2026-09-25
+- **The same-host A/B harness now includes warmed 100k-iteration JIT execution probes for a non-reentrant arithmetic loop and a call-heavy re-entrant control.** Both compile once before timing, assert interpreter-equivalent results, and require a real JIT region so register-transition optimizations can be measured on their actual hot path instead of inferred from unrelated actor enqueue benchmarks.
+- **The benchmark helper now shares frontend-to-bytecode compilation across JIT A/B probes,** keeping the crossover and warmed-execution fixtures on one compilation path without changing timed work.
+
+### Round-paired performance A/B statistics — 2026-09-25
+- **Same-host A/B reports now compare base and candidate samples from the same measurement round before taking the median**, rather than relying only on a ratio of two independent medians. The existing alternating execution order is preserved, so pairing better cancels monotonic host-load and thermal drift.
+- **Performance reports now include a deterministic bootstrap 95% interval for median paired speedup** alongside paired throughput and latency deltas. The historical ratio-of-medians output remains for compatibility, while JSON report schema 2 records the paired result explicitly.
+- **Focused Python regressions pin sample alignment and operation-count invariants**, preventing a benchmark from silently producing a paired comparison across mismatched runs.
+
 
 ### Finite-domain pattern coverage diagnostics — 2026-09-26
 - **The typechecker now emits semantic coverage warnings for finite top-level matches.** `W0201` reports missing witnesses and `W0202` reports provably redundant arms for declared variants and `Bool`; guarded arms never count as exhaustive.
