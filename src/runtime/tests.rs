@@ -4608,6 +4608,142 @@ fn test_workflow_llm_completion_persistence_failure_does_not_resume_with_synthet
 }
 
 #[test]
+fn test_signal_received_keeps_pre_command_snapshot_safe_for_replay() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("SignalReplay", Box::new(Vec::new), HashMap::new());
+    let activation = WorkflowActivationId::new(actor_id, 130);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(activation);
+
+    let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    rt.signal_workflow(actor_id, "approved", Some("yes".to_string()))
+        .unwrap();
+
+    assert_eq!(
+        rt.persistence.load_snapshot(actor_id).unwrap().sequence,
+        safe_snapshot.sequence,
+        "SignalReceived must not checkpoint partially executed workflow state"
+    );
+    assert!(rt
+        .actors
+        .get(&actor_id)
+        .unwrap()
+        .received_signals
+        .iter()
+        .any(|(name, payload)| name == "approved" && payload.as_deref() == Some("yes")));
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+    assert!(rt
+        .actors
+        .get(&actor_id)
+        .unwrap()
+        .received_signals
+        .iter()
+        .any(|(name, payload)| name == "approved" && payload.as_deref() == Some("yes")));
+}
+
+#[test]
+fn test_recovery_rebuilds_signals_even_when_snapshot_sequence_covers_signal() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("SignalSnapshot", Box::new(Vec::new), HashMap::new());
+
+    rt.signal_workflow(actor_id, "wake", Some("payload".to_string()))
+        .unwrap();
+    rt.checkpoint_actor(actor_id);
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let signal_sequence = rt
+        .persistence
+        .read_signal_events(actor_id)
+        .into_iter()
+        .map(|event| event.sequence())
+        .max()
+        .unwrap();
+    assert!(
+        snapshot.sequence >= signal_sequence,
+        "fixture requires the snapshot to cover the durable signal sequence"
+    );
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+    assert!(rt
+        .actors
+        .get(&actor_id)
+        .unwrap()
+        .received_signals
+        .iter()
+        .any(|(name, payload)| name == "wake" && payload.as_deref() == Some("payload")),
+        "signal availability must be reconstructed from the full durable signal journal"
+    );
+}
+
+#[cfg(feature = "ai-runtime")]
+#[test]
+fn test_workflow_llm_completion_persistence_failure_does_not_resume_with_synthetic_error() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "nulang-llm-completion-fail-{}-{nonce}",
+        std::process::id()
+    ));
+
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(JsonFileStore::new(&path).unwrap());
+    let actor_id = rt.spawn_workflow_actor("LlmFailClosed", Box::new(Vec::new), HashMap::new());
+    let activation = WorkflowActivationId::new(actor_id, 115);
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(activation);
+    let site = crate::semantic_identity::effect_site_id(
+        "llm-fail-closed-test",
+        crate::semantic_identity::EffectSiteOwnerKind::Behavior,
+        "LlmFailClosed.run",
+        "Inference.ask",
+        0,
+    );
+    let mut request = nulang_ai::LlmRequest::default();
+    request.model = "test-model".to_string();
+    request.messages.push(nulang_ai::LlmMessage {
+        role: "user".to_string(),
+        content: "hello".to_string(),
+    });
+    assert!(matches!(
+        llm::prepare_workflow_llm_effect(&mut rt, actor_id, site, "Inference.ask", &request)
+            .unwrap(),
+        llm::WorkflowLlmDurabilityDecision::Dispatch
+    ));
+
+    std::fs::remove_dir_all(&path).unwrap();
+    std::fs::write(&path, b"not a directory").unwrap();
+
+    let response = nulang_ai::LlmResponse {
+        content: Some("provider-result".to_string()),
+        tool_calls: Vec::new(),
+        model: "test-model".to_string(),
+        finish_reason: "stop".to_string(),
+        usage: Default::default(),
+    };
+    llm::store_llm_completion(&mut rt, actor_id, Ok(response));
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert!(
+        actor.llm_completed.is_none(),
+        "user bytecode must not observe a synthetic LLM error when Completed persistence failed"
+    );
+    assert!(
+        actor.llm_durable_effect_id.is_some(),
+        "Prepared identity must remain available for recovery/retry"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
