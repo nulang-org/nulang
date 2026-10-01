@@ -4,7 +4,17 @@ description: Workflow declarations with steps, parallel branches, event emission
 ---
 ## Workflows
 
-A workflow is a persistent actor with checkpointed state that progresses through named steps. Workflows survive node restarts: each step completion is journaled, so a crashed workflow resumes from its last completed step rather than restarting from scratch.
+A workflow is a persistent actor with checkpointed state that progresses through named steps. On the reference bytecode runtime, workflows survive node restarts: each step completion is journaled, so a crashed workflow resumes from its last completed step rather than restarting from scratch.
+
+> **Backend status:** durable workflow semantics are currently implemented by the
+> reference bytecode/runtime path, but the canonical portable/cloud WASM backend
+> deliberately rejects `workflow` declarations. WASM admission fails closed until
+> it can preserve the same step journal, signal/timer suspension and resume, crash
+> recovery, and saga-compensation semantics. This prevents a partially lowered
+> workflow from being mistaken for a durable Cloud workload. For today's portable
+> Cloud path, model the durable unit as an actor and use the supported durable
+> state/effect contracts; do not assume local bytecode workflow behavior implies
+> WASM deployment parity.
 
 ## Declaring a Workflow
 

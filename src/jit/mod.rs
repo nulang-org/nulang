@@ -46,11 +46,11 @@ pub use compiler::*;
 use native_codegen::{
     CraneliftCodegen, NativeCodegenBackend, NativeCompileKind, NativeCompileRequest,
 };
-use region_planner::RegionPlanner;
 #[cfg(test)]
 use region_planner::{
     compute_may_suspend, compute_recursive, direct_call_target, find_compilable_region,
 };
+use region_planner::{region_has_internal_back_edge, RegionPlanner};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -332,19 +332,33 @@ impl JitSession {
         pc: usize,
         module: &crate::bytecode::CodeModule,
     ) {
+        let Some(region) = self.compiled_entry(module_idx, pc) else {
+            self.tier2_counters.insert((module_idx, pc), 0);
+            return;
+        };
+
+        // A native loop region may execute thousands or millions of back-edge
+        // iterations inside a single region entry. Entry-count-only tiering
+        // therefore strands genuinely hot loops on the fast-compilation
+        // Cranelift tier. Preserve the normal threshold for straight-line code
+        // and terminal/optimized tiers, but promote a first-tier internal loop
+        // on its first compiled re-entry.
+        let promotion_threshold = if region.optimization == CodegenOptimization::Fast
+            && region_has_internal_back_edge(pc, region.len, &module.instructions)
+        {
+            1
+        } else {
+            TIER2_THRESHOLD
+        };
         let should_promote = {
             let count = self.tier2_counters.entry((module_idx, pc)).or_insert(0);
-            *count += 1;
-            *count >= TIER2_THRESHOLD
+            *count = count.saturating_add(1);
+            *count >= promotion_threshold
         };
         if !should_promote {
             return;
         }
 
-        let Some(region) = self.compiled_entry(module_idx, pc) else {
-            self.tier2_counters.insert((module_idx, pc), 0);
-            return;
-        };
         if region.len < 3 {
             self.tier2_counters.insert((module_idx, pc), 0);
             return;
