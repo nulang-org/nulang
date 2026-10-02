@@ -71,12 +71,14 @@ impl ExecutionSiteMap {
 
         let mut sites = Vec::with_capacity(module.effect_sites.len());
         for site in &module.effect_sites {
-            let instruction = module.instructions.get(site.pc).ok_or(
-                ExecutionSiteMapError::InvalidSitePc {
-                    pc: site.pc,
-                    instruction_count: module.instructions.len(),
-                },
-            )?;
+            let instruction =
+                module
+                    .instructions
+                    .get(site.pc)
+                    .ok_or(ExecutionSiteMapError::InvalidSitePc {
+                        pc: site.pc,
+                        instruction_count: module.instructions.len(),
+                    })?;
             if !matches!(
                 instruction.opcode,
                 OpCode::Perform | OpCode::PerformDirect | OpCode::PerformAsync
@@ -251,7 +253,10 @@ impl fmt::Display for ExecutionSiteMapError {
                 "execution site pc {pc} is outside artifact instruction count {instruction_count}"
             ),
             Self::InvalidEffectOpcode { pc } => {
-                write!(f, "execution site pc {pc} does not point at an effect opcode")
+                write!(
+                    f,
+                    "execution site pc {pc} does not point at an effect opcode"
+                )
             }
             Self::InvalidEffectOperation { pc } => {
                 write!(f, "execution site pc {pc} has an empty effect operation")
@@ -328,8 +333,9 @@ mod tests {
 
     #[test]
     fn rejects_metadata_that_points_at_a_non_effect_opcode() {
-        let error = ExecutionSiteMap::from_code_module(&code_module(OpCode::Move), &artifact(), None)
-            .expect_err("invalid site metadata must fail closed");
+        let error =
+            ExecutionSiteMap::from_code_module(&code_module(OpCode::Move), &artifact(), None)
+                .expect_err("invalid site metadata must fail closed");
 
         assert_eq!(error, ExecutionSiteMapError::InvalidEffectOpcode { pc: 2 });
     }
