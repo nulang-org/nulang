@@ -1,0 +1,95 @@
+name: Shard counterbalance TDD
+
+on:
+  push:
+    branches:
+      - perf/shard-scaling-counterbalanced-order-current-main
+    paths:
+      - .github/workflows/tmp-shard-counterbalance-tdd.yml
+
+permissions:
+  contents: write
+
+jobs:
+  tdd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: perf/shard-scaling-counterbalanced-order-current-main
+          fetch-depth: 0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: RED - require counterbalanced measurement order
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/bin/nulang_shard_bench.rs')
+          text = path.read_text()
+          anchor = '''    #[test]\n    fn two_shards_process_the_exact_fixed_workload() {\n'''
+          test = '''    #[test]\n    fn counterbalances_measurement_order_across_forward_reverse_pairs() {\n        let shards = [1, 2, 4, 8];\n        assert_eq!(super::measurement_order(&shards, 1), vec![1, 2, 4, 8]);\n        assert_eq!(super::measurement_order(&shards, 2), vec![8, 4, 2, 1]);\n        assert_eq!(super::measurement_order(&shards, 3), vec![2, 4, 8, 1]);\n        assert_eq!(super::measurement_order(&shards, 4), vec![4, 2, 1, 8]);\n        assert_eq!(super::measurement_order(&shards, 7), vec![8, 1, 2, 4]);\n        assert_eq!(super::measurement_order(&shards, 8), vec![1, 8, 4, 2]);\n    }\n\n'''
+          assert anchor in text
+          path.write_text(text.replace(anchor, test + anchor, 1))
+          PY
+          set +e
+          cargo test --locked --release --no-default-features --features savina-bench \
+            --bin nulang-shard-bench counterbalances_measurement_order_across_forward_reverse_pairs \
+            > /tmp/red.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/red.log
+          test "$status" -ne 0
+          grep -q 'measurement_order' /tmp/red.log
+      - name: GREEN - use counterbalanced order in the real runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/bin/nulang_shard_bench.rs')
+          text = path.read_text()
+          anchor = '''fn spawn_counter_for_shard(runtime: &mut Runtime, shard_index: usize, shard_count: usize) -> u64 {\n'''
+          helper = '''fn measurement_order(shard_counts: &[usize], iteration: u32) -> Vec<usize> {\n    debug_assert!(!shard_counts.is_empty());\n    debug_assert!(iteration >= 1);\n\n    let pair = ((iteration - 1) / 2) as usize % shard_counts.len();\n    let mut order = shard_counts.to_vec();\n    if iteration % 2 == 0 {\n        order.reverse();\n    }\n    order.rotate_left(pair);\n    order\n}\n\n'''
+          assert anchor in text
+          text = text.replace(anchor, helper + anchor, 1)
+          old = '''    for iteration in 1..=config.repeat {\n        let measurements: Vec<Measurement> = config\n            .shard_counts\n            .iter()\n            .map(|&shards| run_independent(shards, config.messages))\n            .collect();\n'''
+          new = '''    for iteration in 1..=config.repeat {\n        let order = measurement_order(&config.shard_counts, iteration);\n        let measurements: Vec<Measurement> = order\n            .into_iter()\n            .map(|shards| run_independent(shards, config.messages))\n            .collect();\n'''
+          assert old in text
+          path.write_text(text.replace(old, new, 1))
+          PY
+      - name: Validate source and unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          git diff --check
+          cargo check --locked --no-default-features --features savina-bench --bin nulang-shard-bench
+          cargo test --locked --release --no-default-features --features savina-bench --bin nulang-shard-bench
+      - name: Prove actual emitted order is counterbalanced
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --locked --release --no-default-features --features savina-bench \
+            --bin nulang-shard-bench -- \
+            --shards 1,2 --messages 2048 --repeat 4 --format jsonl \
+            > /tmp/shard-order.jsonl
+          python3 - <<'PY'
+          import json
+          rows = [json.loads(line) for line in open('/tmp/shard-order.jsonl') if line.strip().startswith('{')]
+          observed = [row['shards'] for row in rows]
+          expected = [1, 2, 2, 1, 2, 1, 1, 2]
+          assert observed == expected, (observed, expected)
+          assert all(row['messages'] == 2048 for row in rows)
+          PY
+      - name: Commit validated source change
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "nulang-maintenance"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/bin/nulang_shard_bench.rs
+          git commit -m "perf(bench): counterbalance shard measurement order"
+          git push origin HEAD:perf/shard-scaling-counterbalanced-order-current-main
