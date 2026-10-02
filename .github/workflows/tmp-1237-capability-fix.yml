@@ -29,26 +29,20 @@ jobs:
 
           path = Path('src/package/commands.rs')
           old = path.read_text(encoding='utf-8')
-          before = '''    eprintln!("Building {} (WASM AOT)...", name);
-          eprintln!("  Compiling {} to WASM...", entry.display());
-          nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;
-          println!("WASM AOT build succeeded.");
-          '''
-          after = '''    eprintln!("Building {} (WASM AOT)...", name);
-          eprintln!("  Compiling {} to WASM...", entry.display());
-          let caps = capability_args();
-          let cap_refs: Vec<&str> = caps.iter().map(|s| s.as_str()).collect();
-          nulang_exe(
-              &[
-                  &["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str],
-                  &cap_refs[..],
-              ]
-              .concat(),
-          )?;
-          println!("WASM AOT build succeeded.");
-          '''
-          assert old.count(before) == 1, 'expected exactly one current-main build-wasm invocation'
-          path.write_text(old.replace(before, after, 1), encoding='utf-8')
+          target = '    nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;\n'
+          replacement = (
+              '    let caps = capability_args();\n'
+              '    let cap_refs: Vec<&str> = caps.iter().map(|s| s.as_str()).collect();\n'
+              '    nulang_exe(\n'
+              '        &[\n'
+              '            &["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str],\n'
+              '            &cap_refs[..],\n'
+              '        ]\n'
+              '        .concat(),\n'
+              '    )?;\n'
+          )
+          assert old.count(target) == 1, 'expected exactly one current-main build-wasm invocation'
+          path.write_text(old.replace(target, replacement, 1), encoding='utf-8')
 
       - name: Add changelog entry
         shell: python
