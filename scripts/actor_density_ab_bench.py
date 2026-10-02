@@ -295,7 +295,10 @@ def comparisons(samples: dict[str, dict[str, list[dict[str, float | int | None |
         base_rss = [row["rss_bytes_per_actor"] for row in base_rows]
         candidate_rss = [row["rss_bytes_per_actor"] for row in candidate_rows]
         rss = None
-        if all(value is not None for value in base_rss + candidate_rss):
+        if all(
+            value is not None and float(value) > 0
+            for value in base_rss + candidate_rss
+        ):
             rss = paired_lower_is_better(
                 [float(value) for value in base_rss if value is not None],
                 [float(value) for value in candidate_rss if value is not None],
