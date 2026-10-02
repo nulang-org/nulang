@@ -1,4 +1,4 @@
-name: Apply timer crash replay proof
+name: Validate sqlite feature and timer restart proof
 
 on:
   push:
@@ -9,7 +9,42 @@ permissions:
   contents: write
 
 jobs:
-  test-and-publish:
+  sqlite-feature:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/sqlite-feature-tokio-20261002
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Make sqlite feature self-contained
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('Cargo.toml')
+          text = p.read_text()
+          old = 'sqlite = ["dep:libsql"]'
+          new = 'sqlite = ["dep:libsql", "dep:tokio"]'
+          assert text.count(old) == 1, text.count(old)
+          p.write_text(text.replace(old, new))
+          PY
+          git diff --check
+      - name: Prove minimal sqlite build
+        run: cargo check --locked --no-default-features --features sqlite --all-targets
+      - name: Run sqlite-enabled lib tests
+        run: cargo test --locked --no-default-features --features sqlite --lib
+      - name: Publish feature fix
+        shell: bash
+        run: |
+          git config user.name 'nlc-ci'
+          git config user.email 'nlc-ci@users.noreply.github.com'
+          git add Cargo.toml
+          git diff --cached --check
+          git commit -m 'fix(build): make sqlite feature enable Tokio (#1221)'
+          git push origin HEAD:fix/sqlite-feature-tokio-20261002
+
+  timer-restart:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -115,10 +150,10 @@ jobs:
           PY
           cargo fmt --all
           git diff --check
-      - name: Run focused RED/GREEN gate
-        run: cargo test --locked --no-default-features --features sqlite --lib test_timer_set_replay_survives_process_restart_without_duplicate_preparation_or_rearm -- --nocapture
+      - name: Run focused restart proof
+        run: cargo test --locked --lib test_timer_set_replay_survives_process_restart_without_duplicate_preparation_or_rearm -- --nocapture
       - name: Run timer replay regressions
-        run: cargo test --locked --no-default-features --features sqlite --lib timer_set_replay -- --nocapture
+        run: cargo test --locked --lib timer_set_replay -- --nocapture
       - name: Publish test slice
         shell: bash
         run: |
