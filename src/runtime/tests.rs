@@ -5102,6 +5102,65 @@ fn test_recovery_refuses_legacy_workflow_event_beyond_atomic_tail() {
     );
 }
 
+#[cfg(feature = "sqlite")]
+#[test]
+fn test_signal_journal_survives_process_restart_when_snapshot_covers_signal() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "nulang-workflow-signal-covered-restart-{}-{nonce}",
+        std::process::id()
+    ));
+    let db_path = dir.join("workflow.db");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(LibsqlStore::new(&db_path).unwrap());
+    let actor_id =
+        rt.spawn_workflow_actor("SignalCoveredRestart", Box::new(Vec::new), HashMap::new());
+
+    rt.signal_workflow(actor_id, "wake", Some("payload".to_string()))
+        .unwrap();
+    let signal_sequence = rt
+        .persistence
+        .read_signal_events(actor_id)
+        .into_iter()
+        .map(|event| event.sequence())
+        .max()
+        .unwrap();
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert!(
+        snapshot.sequence >= signal_sequence,
+        "fixture requires the completed snapshot to cover the durable signal"
+    );
+
+    drop(rt);
+
+    let mut recovered = Runtime::new();
+    recovered.persistence = Box::new(LibsqlStore::new(&db_path).unwrap());
+    assert_eq!(recovered.recover_actor(actor_id), Some(actor_id));
+    assert_eq!(
+        recovered
+            .actors
+            .get(&actor_id)
+            .unwrap()
+            .received_signals
+            .iter()
+            .filter(|(name, payload)| {
+                name == "wake" && payload.as_deref() == Some("payload")
+            })
+            .count(),
+        1,
+        "restart must rebuild signal availability from the full durable signal journal even when the snapshot sequence already covers it"
+    );
+
+    drop(recovered);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
     let mut rt = Runtime::new();
