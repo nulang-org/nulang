@@ -1,0 +1,67 @@
+name: Shard scaling benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      messages:
+        description: Fixed total messages per shard-count measurement
+        required: false
+        default: '200000'
+      repeat:
+        description: Measured repetitions
+        required: false
+        default: '5'
+  pull_request:
+    paths:
+      - '.github/workflows/shard-scaling-bench.yml'
+      - 'src/bin/nulang_shard_bench.rs'
+      - 'src/runtime/**'
+      - 'Cargo.toml'
+
+concurrency:
+  group: shard-scaling-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate shard scaling harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run harness tests
+        run: |
+          cargo test --locked --release \
+            --no-default-features \
+            --features savina-bench \
+            --bin nulang-shard-bench
+
+      - name: Run diagnostic scaling sweep
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          MESSAGES: "${{ inputs.messages || '200000' }}"
+          REPEAT: "${{ inputs.repeat || '5' }}"
+        run: |
+          cargo run --locked --profile savina \
+            --no-default-features \
+            --features savina-bench \
+            --bin nulang-shard-bench -- \
+            --shards 1,2,4,8 \
+            --messages "$MESSAGES" \
+            --repeat "$REPEAT" \
+            --format jsonl | tee shard-scaling-results.jsonl
+
+      - name: Upload scaling results
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: shard-scaling-results-${{ github.sha }}
+          path: shard-scaling-results.jsonl
+          if-no-files-found: error
