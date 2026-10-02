@@ -1,0 +1,42 @@
+name: Add sqlite feature changelog entry
+
+on:
+  push:
+    branches:
+      - automation/fix-sqlite-changelog-20261002
+
+permissions:
+  contents: write
+
+jobs:
+  update-changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/sqlite-feature-tokio-20261002
+          fetch-depth: 0
+      - name: Add focused changelog entry
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('CHANGELOG.md')
+          text = p.read_text()
+          heading = '### Standalone SQLite feature dependency closure — 2026-10-02'
+          assert heading not in text
+          marker = '# Nulang Changelog\n'
+          assert text.startswith(marker)
+          entry = '''# Nulang Changelog
+### Standalone SQLite feature dependency closure — 2026-10-02
+- **The standalone `sqlite` feature now enables Tokio directly because `LibsqlStore` owns a Tokio runtime.** Minimal `--no-default-features --features sqlite` builds no longer rely on unrelated default-profile features to supply that direct dependency.
+
+'''
+          p.write_text(entry + text[len(marker):])
+          PY
+          git diff --check
+          git config user.name 'nlc-ci'
+          git config user.email 'nlc-ci@users.noreply.github.com'
+          git add CHANGELOG.md
+          git commit -m 'docs(changelog): note standalone sqlite dependency fix'
+          git push origin HEAD:fix/sqlite-feature-tokio-20261002
