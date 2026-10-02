@@ -1942,6 +1942,37 @@ pub struct OutgoingPacket {
     pub packet: Packet,
 }
 
+/// Observable outcome for an ordinary remote send that the transport could
+/// not confirm. Ordinary actor delivery is at-most-once: failures are surfaced
+/// to the sender, but packets are never retried after an ambiguous write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryFailureKind {
+    Connect,
+    WriteAmbiguous,
+    SenderStopped,
+    InvalidPayload,
+}
+
+impl DeliveryFailureKind {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Connect => "transport connect failed",
+            Self::WriteAmbiguous => "transport write failed",
+            Self::SenderStopped => "transport sender stopped",
+            Self::InvalidPayload => "transport payload invalid",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeliveryFailure {
+    pub to_node: NodeId,
+    pub to_addr: SocketAddr,
+    pub packet: Packet,
+    pub kind: DeliveryFailureKind,
+    pub error: String,
+}
+
 // ---------------------------------------------------------------------------
 // NetworkTransport
 // ---------------------------------------------------------------------------
@@ -1958,6 +1989,9 @@ pub trait NetworkTransport: Send {
     fn connect(&mut self, node_id: NodeId, addr: std::net::SocketAddr) -> std::io::Result<()>;
     fn send(&mut self, to_node: NodeId, to_addr: std::net::SocketAddr, packet: Packet);
     fn receive(&self) -> Vec<IncomingPacket>;
+    fn take_delivery_failures(&self) -> Vec<DeliveryFailure> {
+        Vec::new()
+    }
     fn node_id(&self) -> NodeId;
     fn listen_addr(&self) -> std::net::SocketAddr;
     fn disconnect(&mut self, node_id: NodeId);
@@ -1992,6 +2026,9 @@ impl NetworkTransport for Box<dyn NetworkTransport> {
     }
     fn receive(&self) -> Vec<IncomingPacket> {
         (**self).receive()
+    }
+    fn take_delivery_failures(&self) -> Vec<DeliveryFailure> {
+        (**self).take_delivery_failures()
     }
     fn node_id(&self) -> NodeId {
         (**self).node_id()
@@ -2034,6 +2071,9 @@ pub struct TcpTransport {
     incoming_tx: mpsc::SyncSender<IncomingPacket>,
     /// Channel endpoint used to enqueue packets for transmission.
     outgoing_tx: mpsc::SyncSender<OutgoingPacket>,
+    /// Asynchronous failures produced by the sender thread.
+    failure_tx: mpsc::Sender<DeliveryFailure>,
+    failure_rx: mpsc::Receiver<DeliveryFailure>,
     /// Background thread handles.
     threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
     /// Flag used to ask background threads to shut down.
@@ -2073,6 +2113,7 @@ impl TcpTransport {
         // Bounded channels.
         let (incoming_tx, incoming_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let (outgoing_tx, outgoing_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let (failure_tx, failure_rx) = mpsc::channel();
 
         let connections: Arc<Mutex<HashMap<NodeId, TcpConnection>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -2105,10 +2146,11 @@ impl TcpTransport {
             let local_id = node_id;
             let in_tx = incoming_tx.clone();
             let tls = tls_config.clone();
+            let failures = failure_tx.clone();
             let handle = thread::Builder::new()
                 .name("nulang-net-sender".into())
                 .spawn(move || {
-                    sender_thread(outgoing_rx, conns, flag, local_id, in_tx, tls);
+                    sender_thread(outgoing_rx, conns, flag, local_id, in_tx, tls, failures);
                 })?;
             handles.push(handle);
         }
@@ -2120,6 +2162,8 @@ impl TcpTransport {
             incoming_rx,
             incoming_tx,
             outgoing_tx,
+            failure_tx,
+            failure_rx,
             threads: Arc::new(Mutex::new(handles)),
             shutdown_flag,
             tls_config,
@@ -2238,6 +2282,13 @@ impl TcpTransport {
                 "nulang-net: dropping packet to node {:?} (addr {}): payload value cannot cross the wire (heap pointer, nil, or string without content)",
                 to_node, to_addr
             );
+            let _ = self.failure_tx.send(DeliveryFailure {
+                to_node,
+                to_addr,
+                packet,
+                kind: DeliveryFailureKind::InvalidPayload,
+                error: "payload cannot cross the wire losslessly".to_string(),
+            });
             return;
         }
         // Simulated partition: silently drop the packet exactly like a
@@ -2254,12 +2305,32 @@ impl TcpTransport {
         // Blocks on a full channel (backpressure). An error means the sender
         // thread has shut down and the packet cannot be delivered — log it
         // rather than dropping silently.
-        if self.outgoing_tx.send(outgoing).is_err() {
+        if let Err(err) = self.outgoing_tx.send(outgoing) {
             warn!(
                 "nulang-net: dropping packet to node {:?} (addr {}): sender thread shut down",
                 to_node, to_addr
             );
+            let outgoing = err.0;
+            let _ = self.failure_tx.send(DeliveryFailure {
+                to_node: outgoing.to_node,
+                to_addr: outgoing.to_addr,
+                packet: outgoing.packet,
+                kind: DeliveryFailureKind::SenderStopped,
+                error: "sender thread shut down".to_string(),
+            });
         }
+    }
+
+    /// Drain asynchronous delivery failures (non-blocking).
+    pub fn take_delivery_failures(&self) -> Vec<DeliveryFailure> {
+        let mut failures = Vec::new();
+        loop {
+            match self.failure_rx.try_recv() {
+                Ok(failure) => failures.push(failure),
+                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        failures
     }
 
     /// Receive incoming packets (non-blocking).
@@ -2572,6 +2643,7 @@ fn sender_thread(
     local_node_id: NodeId,
     incoming_tx: mpsc::SyncSender<IncomingPacket>,
     tls_config: TlsConfig,
+    failure_tx: mpsc::Sender<DeliveryFailure>,
 ) {
     // We keep a local sequence counter so we can embed it into the bytes.
     let mut next_seq: u64 = 1;
@@ -2611,6 +2683,14 @@ fn sender_thread(
                     "[nulang-net] Failed to connect to {:?} at {}: {}",
                     outgoing.to_node, outgoing.to_addr, e
                 );
+                let _ = failure_tx.send(DeliveryFailure {
+                    to_node: outgoing.to_node,
+                    to_addr: outgoing.to_addr,
+                    packet: outgoing.packet,
+                    kind: DeliveryFailureKind::Connect,
+                    error: e.to_string(),
+                });
+                continue;
             }
         }
 
@@ -2636,6 +2716,13 @@ fn sender_thread(
                 "[nulang-net] Send to {:?} failed: {}; removing connection",
                 outgoing.to_node, e
             );
+            let _ = failure_tx.send(DeliveryFailure {
+                to_node: outgoing.to_node,
+                to_addr: outgoing.to_addr,
+                packet: outgoing.packet,
+                kind: DeliveryFailureKind::WriteAmbiguous,
+                error: e.to_string(),
+            });
             let mut conns = lock_ignore_poison(&connections);
             if let Some(conn) = conns.remove(&outgoing.to_node) {
                 let _ = conn.stream.shutdown();
@@ -2750,6 +2837,47 @@ mod tests {
             "different addresses must produce different NodeId"
         );
         assert_ne!(id1.0, 0, "NodeId must not be zero");
+    }
+
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn test_tcp_connect_failure_is_observable_and_not_retried() {
+        let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let unreachable = reservation.local_addr().expect("reserved address");
+        drop(reservation);
+
+        let mut transport =
+            TcpTransport::bind("127.0.0.1:0".parse().unwrap(), TlsConfig::PlaintextInsecure)
+                .expect("bind transport");
+        let peer = NodeId::new(&unreachable);
+        transport.send(
+            peer,
+            unreachable,
+            Packet::Heartbeat {
+                node_id: transport.node_id(),
+                timestamp: 1,
+            },
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let failure = loop {
+            if let Some(failure) = transport.take_delivery_failures().into_iter().next() {
+                break failure;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "connect failure was not surfaced"
+            );
+            sleep(Duration::from_millis(10));
+        };
+        assert_eq!(failure.kind, DeliveryFailureKind::Connect);
+        assert_eq!(failure.to_node, peer);
+        sleep(Duration::from_millis(100));
+        assert!(
+            transport.take_delivery_failures().is_empty(),
+            "failed send must not be retried"
+        );
+        transport.shutdown();
     }
 
     // ------------------------------------------------------------------
@@ -3965,6 +4093,9 @@ impl NetworkTransport for TcpTransport {
     }
     fn receive(&self) -> Vec<IncomingPacket> {
         self.receive()
+    }
+    fn take_delivery_failures(&self) -> Vec<DeliveryFailure> {
+        self.take_delivery_failures()
     }
     fn node_id(&self) -> NodeId {
         self.node_id()
