@@ -106,10 +106,8 @@ fn scatter_runs_real_work_concurrently_and_preserves_input_order() {
 fn scarce_named_resource_limits_parallelism_even_with_free_workers() {
     let goal_id = Uuid::new_v4();
     let worker = ProbeWorker::new(20);
-    let scheduler = SwarmScheduler::new(
-        ResourceVector::new().with("worker", 4).with("browser", 1),
-    )
-    .unwrap();
+    let scheduler =
+        SwarmScheduler::new(ResourceVector::new().with("worker", 4).with("browser", 1)).unwrap();
     let items = vec![
         WorkItem::new(task(goal_id, "browser-a")).require("browser", 1),
         WorkItem::new(task(goal_id, "browser-b")).require("browser", 1),
