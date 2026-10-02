@@ -9,9 +9,7 @@ fn noop(_actor: &mut Actor, _args: &[Value]) {}
 
 fn runtime_with_behaviors(names: &[&str]) -> (Rc<RefCell<Runtime>>, u64) {
     let runtime = Rc::new(RefCell::new(Runtime::new()));
-    let actor_id = runtime
-        .borrow_mut()
-        .spawn_actor(Box::new(|| Vec::new()));
+    let actor_id = runtime.borrow_mut().spawn_actor(Box::new(|| Vec::new()));
 
     {
         let mut rt = runtime.borrow_mut();
@@ -64,7 +62,10 @@ fn timer_after_unknown_callback_does_not_alias_behavior_zero() {
 #[test]
 fn timer_after_still_schedules_nonzero_callback() {
     let (runtime, actor_id) = runtime_with_behaviors(&["first", "second"]);
-    assert_eq!(runtime.borrow().behavior_id_for(actor_id, "second"), Some(1));
+    assert_eq!(
+        runtime.borrow().behavior_id_for(actor_id, "second"),
+        Some(1)
+    );
 
     schedule_after(runtime.clone(), "second");
 
