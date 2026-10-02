@@ -5102,6 +5102,105 @@ fn test_recovery_refuses_legacy_workflow_event_beyond_atomic_tail() {
     );
 }
 
+#[cfg(feature = "sqlite")]
+#[test]
+fn test_signal_received_survives_process_restart_from_libsql_journal() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "nulang-workflow-signal-restart-{}-{nonce}",
+        std::process::id()
+    ));
+    let db_path = dir.join("workflow.db");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(LibsqlStore::new(&db_path).unwrap());
+    let actor_id =
+        rt.spawn_workflow_actor("SignalProcessRestart", Box::new(Vec::new), HashMap::new());
+    declare_test_behavior(&mut rt, actor_id, "next");
+    let behavior_id = rt.behavior_id_for(actor_id, "next").unwrap();
+    let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let activation =
+        workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new())
+            .unwrap();
+
+    rt.signal_workflow(actor_id, "approved", Some("yes".to_string()))
+        .unwrap();
+
+    assert_eq!(
+        rt.persistence.load_snapshot(actor_id).unwrap().sequence,
+        safe_snapshot.sequence,
+        "durable external signal must not advance the completed-state snapshot"
+    );
+    assert_eq!(
+        rt.persistence
+            .read_signal_events(actor_id)
+            .into_iter()
+            .filter(|event| matches!(
+                event,
+                WorkflowEvent::SignalReceived { name, payload, .. }
+                    if name == "approved" && payload.as_deref() == Some("yes")
+            ))
+            .count(),
+        1
+    );
+
+    drop(rt);
+
+    let mut recovered = Runtime::new();
+    recovered.persistence = Box::new(LibsqlStore::new(&db_path).unwrap());
+    assert_eq!(recovered.recover_actor(actor_id), Some(actor_id));
+    assert_eq!(
+        recovered
+            .actors
+            .get(&actor_id)
+            .unwrap()
+            .current_workflow_activation,
+        Some(activation),
+        "restart must preserve the unfinished accepted activation"
+    );
+    assert_eq!(
+        recovered.persistence.load_snapshot(actor_id).unwrap().sequence,
+        safe_snapshot.sequence,
+        "restart must still recover from the last completed snapshot"
+    );
+    assert_eq!(
+        recovered
+            .actors
+            .get(&actor_id)
+            .unwrap()
+            .received_signals
+            .iter()
+            .filter(|(name, payload)| {
+                name == "approved" && payload.as_deref() == Some("yes")
+            })
+            .count(),
+        1,
+        "full process restart must reconstruct exactly one available signal from durable history"
+    );
+    assert_eq!(
+        recovered
+            .persistence
+            .read_signal_events(actor_id)
+            .into_iter()
+            .filter(|event| matches!(
+                event,
+                WorkflowEvent::SignalReceived { name, payload, .. }
+                    if name == "approved" && payload.as_deref() == Some("yes")
+            ))
+            .count(),
+        1,
+        "recovery must not append or duplicate the external signal"
+    );
+
+    drop(recovered);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
     let mut rt = Runtime::new();
