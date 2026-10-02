@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Deterministic custom workflow event replay — 2026-10-02
+- **Workflow replay now consumes an already-committed custom event when its activation-local replay identity, event name, and payload match exactly.** Re-execution advances the replay cursor without appending duplicate durable history.
+- **Replay identity conflicts fail closed.** Duplicate committed events under one replay identity or mismatched name/payload do not mutate durable history and do not advance the cursor.
+
 ### Controlled runtime-shard scaling harness on current main — 2026-10-01
 - **A diagnostic runner measures fixed total same-shard message work across 1/2/4/8 runtime shards.** Actor/message setup and worker-thread creation are excluded from the timed region; the harness reports throughput, ns/message, speedup, parallel efficiency, and host parallelism.
 - **This establishes a best-case multicore runtime ceiling, not a cross-shard or distributed benchmark.** Publishable scaling claims still require controlled hardware and recorded CPU topology.
