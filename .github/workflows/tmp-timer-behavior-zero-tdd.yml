@@ -1,0 +1,314 @@
+name: Timer behavior-zero TDD
+
+on:
+  push:
+    branches:
+      - fix/timer-behavior-zero-20261002
+    paths:
+      - .github/workflows/tmp-timer-behavior-zero-tdd.yml
+
+permissions:
+  contents: write
+
+jobs:
+  tdd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/timer-behavior-zero-20261002
+          fetch-depth: 0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: RED - add sentinel regressions and prove intended failures
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          callbacks = Path('src/runtime/callbacks.rs')
+          text = callbacks.read_text()
+          marker = 'fn runtime_timer_callback_accepts_valid_behavior_zero()'
+          assert marker not in text
+          text += r'''
+
+#[cfg(test)]
+#[test]
+fn runtime_timer_callback_accepts_valid_behavior_zero() {
+    use crate::runtime::{Actor, Runtime};
+    use crate::vm::{ActorVmCallbacks, Value};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn noop(_actor: &mut Actor, _args: &[Value]) {}
+
+    let runtime = Rc::new(RefCell::new(Runtime::new()));
+    let actor_id = 800_008;
+    {
+        let mut rt = runtime.borrow_mut();
+        let mut actor = Actor::new(actor_id, "timer-callback-zero", 8);
+        actor.register_behavior("fire", noop);
+        rt.actors.insert(actor_id, actor);
+        rt.current_actor = Some(actor_id);
+    }
+
+    let mut module = crate::bytecode::CodeModule::new("timer-callback-zero");
+    module.add_constant(crate::bytecode::Constant::String("fire".into()));
+    let mut callbacks = RuntimeVmCallbacks::new(runtime.clone());
+    let result = callbacks.perform_builtin_effect_in_module(
+        "Timer",
+        Some("after"),
+        &module,
+        &[Value::int(10), Value::string(0)],
+    );
+
+    assert_eq!(result, Some(Value::unit()));
+    assert_eq!(
+        runtime.borrow().timer_wheel.len(),
+        1,
+        "valid behavior id zero must schedule Timer.after",
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn runtime_timer_callback_rejects_unknown_behavior_without_sentinel_alias() {
+    use crate::runtime::{Actor, Runtime};
+    use crate::vm::{ActorVmCallbacks, Value};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn noop(_actor: &mut Actor, _args: &[Value]) {}
+
+    let runtime = Rc::new(RefCell::new(Runtime::new()));
+    let actor_id = 800_009;
+    {
+        let mut rt = runtime.borrow_mut();
+        let mut actor = Actor::new(actor_id, "timer-callback-unknown", 8);
+        actor.register_behavior("first", noop);
+        rt.actors.insert(actor_id, actor);
+        rt.current_actor = Some(actor_id);
+    }
+
+    let mut module = crate::bytecode::CodeModule::new("timer-callback-unknown");
+    module.add_constant(crate::bytecode::Constant::String("missing".into()));
+    let mut callbacks = RuntimeVmCallbacks::new(runtime.clone());
+    let result = callbacks.perform_builtin_effect_in_module(
+        "Timer",
+        Some("after"),
+        &module,
+        &[Value::int(10), Value::string(0)],
+    );
+
+    assert_eq!(result, Some(Value::unit()));
+    assert!(
+        runtime.borrow().timer_wheel.is_empty(),
+        "unknown callback must not alias behavior id zero",
+    );
+}
+'''
+          callbacks.write_text(text)
+
+          runtime_tests = Path('src/runtime/tests.rs')
+          text = runtime_tests.read_text()
+          marker = 'fn workflow_timer_rearm_accepts_valid_behavior_zero()'
+          assert marker not in text
+          text += r'''
+
+#[test]
+fn workflow_timer_rearm_accepts_valid_behavior_zero() {
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "timer_zero",
+            Box::new(|| vec![]),
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+
+    assert_eq!(rt.behavior_id_for(actor_id, "__timer_fired"), Some(0));
+    rt.rearm_timer(actor_id, "wake", 10);
+
+    assert_eq!(
+        rt.timer_wheel.len(),
+        1,
+        "valid __timer_fired behavior id zero must be re-armed",
+    );
+}
+
+#[test]
+fn workflow_timer_rearm_rejects_missing_handler_without_aliasing_behavior_zero() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("first", |_actor, _args| {});
+
+    assert_eq!(rt.behavior_id_for(actor_id, "first"), Some(0));
+    assert_eq!(rt.behavior_id_for(actor_id, "__timer_fired"), None);
+
+    rt.rearm_timer(actor_id, "wake", 10);
+
+    assert!(
+        rt.timer_wheel.is_empty(),
+        "missing __timer_fired must not alias behavior zero",
+    );
+}
+'''
+          runtime_tests.write_text(text)
+          PY
+
+          set +e
+          cargo test --locked --no-default-features --lib runtime_timer_callback -- --nocapture \
+            > /tmp/timer-callback-red.log 2>&1
+          callback_status=$?
+          set -e
+          cat /tmp/timer-callback-red.log
+          test "$callback_status" -ne 0
+          grep -Fq 'valid behavior id zero must schedule Timer.after' /tmp/timer-callback-red.log
+
+          set +e
+          cargo test --locked --no-default-features --lib workflow_timer_rearm -- --nocapture \
+            > /tmp/timer-rearm-red.log 2>&1
+          rearm_status=$?
+          set -e
+          cat /tmp/timer-rearm-red.log
+          test "$rearm_status" -ne 0
+          grep -Fq 'missing __timer_fired must not alias behavior zero' /tmp/timer-rearm-red.log
+
+      - name: GREEN - preserve behavior zero and fail closed on missing timer handlers
+        shell: python
+        run: |
+          from pathlib import Path
+
+          callbacks = Path('src/runtime/callbacks.rs')
+          source = callbacks.read_text()
+
+          old_runtime = '''                if let Some(callback_name) = callback_name {
+                    let rt = self.runtime.borrow_mut();
+                    let actor_id = rt.current_actor.unwrap_or(0);
+                    let behavior_id = rt.behavior_id_for(actor_id, &callback_name).unwrap_or(0);
+                    if behavior_id > 0 {
+                        rt.timer_wheel.send_after(
+                            std::time::Duration::from_millis(ms as u64),
+                            actor_id,
+                            behavior_id,
+                            vec![],
+                        );
+                    }
+                }
+'''
+          new_runtime = '''                if let Some(callback_name) = callback_name {
+                    let rt = self.runtime.borrow_mut();
+                    let actor_id = rt.current_actor.unwrap_or(0);
+                    if let Some(behavior_id) = rt.behavior_id_for(actor_id, &callback_name) {
+                        rt.timer_wheel.send_after(
+                            std::time::Duration::from_millis(ms as u64),
+                            actor_id,
+                            behavior_id,
+                            vec![],
+                        );
+                    }
+                }
+'''
+          assert source.count(old_runtime) == 1
+          source = source.replace(old_runtime, new_runtime, 1)
+
+          old_bytecode = '''                    if let Some(callback_name) = callback_name {
+                        let behavior_id = (*self.runtime)
+                            .behavior_id_for(self.actor_id, &callback_name)
+                            .unwrap_or(0);
+                        if behavior_id > 0 {
+                            (*self.runtime).timer_wheel.send_after(
+                                std::time::Duration::from_millis(ms as u64),
+                                self.actor_id,
+                                behavior_id,
+                                vec![],
+                            );
+                        }
+                    }
+'''
+          new_bytecode = '''                    if let Some(callback_name) = callback_name {
+                        if let Some(behavior_id) =
+                            (*self.runtime).behavior_id_for(self.actor_id, &callback_name)
+                        {
+                            (*self.runtime).timer_wheel.send_after(
+                                std::time::Duration::from_millis(ms as u64),
+                                self.actor_id,
+                                behavior_id,
+                                vec![],
+                            );
+                        }
+                    }
+'''
+          assert source.count(old_bytecode) == 1
+          callbacks.write_text(source.replace(old_bytecode, new_bytecode, 1))
+
+          runtime_mod = Path('src/runtime/mod.rs')
+          source = runtime_mod.read_text()
+          old_rearm = '''    pub(crate) fn rearm_timer(&mut self, actor_id: u64, name: &str, duration_ms: u64) {
+        let behavior_id = self.behavior_id_for(actor_id, "__timer_fired").unwrap_or(0);
+        self.timer_wheel.send_after_with_context(
+            std::time::Duration::from_millis(duration_ms),
+            actor_id,
+            behavior_id,
+            vec![],
+            name.to_string(),
+        );
+    }
+'''
+          new_rearm = '''    pub(crate) fn rearm_timer(&mut self, actor_id: u64, name: &str, duration_ms: u64) {
+        let Some(behavior_id) = self.behavior_id_for(actor_id, "__timer_fired") else {
+            tracing::warn!(
+                actor_id,
+                timer_name = name,
+                "refusing to re-arm workflow timer without __timer_fired behavior"
+            );
+            return;
+        };
+        self.timer_wheel.send_after_with_context(
+            std::time::Duration::from_millis(duration_ms),
+            actor_id,
+            behavior_id,
+            vec![],
+            name.to_string(),
+        );
+    }
+'''
+          assert source.count(old_rearm) == 1
+          runtime_mod.write_text(source.replace(old_rearm, new_rearm, 1))
+
+          changelog = Path('CHANGELOG.md')
+          text = changelog.read_text()
+          entry = '''### Timer behavior-id zero correctness — 2026-10-02
+- **`Timer.after` now preserves valid zero-based behavior ids instead of treating behavior `0` as missing.** Unknown callback names remain unscheduled rather than being collapsed into the first behavior slot.
+- **Durable workflow timer recovery now fails closed when `__timer_fired` is absent.** Recovery no longer aliases a missing timer handler to behavior id `0` and executes an unrelated first behavior.
+
+'''
+          anchor = '# Nulang Changelog\n'
+          assert text.startswith(anchor)
+          changelog.write_text(anchor + entry + text[len(anchor):])
+
+      - name: Validate focused regressions and repository gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --no-default-features --lib runtime_timer_callback -- --nocapture
+          cargo test --locked --no-default-features --lib workflow_timer_rearm -- --nocapture
+          cargo fmt --all -- --check
+          git diff --check
+          cargo check --locked --no-default-features
+
+      - name: Commit validated timer sentinel fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "nulang-maintenance"
+          git config user.email "actions@users.noreply.github.com"
+          git add CHANGELOG.md src/runtime/callbacks.rs src/runtime/mod.rs src/runtime/tests.rs
+          git commit -m "fix(runtime): preserve behavior zero in timer paths"
+          git push origin HEAD:fix/timer-behavior-zero-20261002
