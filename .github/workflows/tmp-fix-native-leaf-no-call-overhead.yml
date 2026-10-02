@@ -1,0 +1,94 @@
+name: Fix native-leaf call-free overhead
+
+on:
+  push:
+    branches:
+      - perf/jit-native-leaf-no-call-fastpath
+    paths:
+      - .github/workflows/tmp-fix-native-leaf-no-call-overhead.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: perf/jit-native-leaf-no-call-fastpath
+          fetch-depth: 0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt,clippy
+      - name: Add failing call-free leaf-table regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          runtime = Path('src/jit/runtime.rs')
+          text = runtime.read_text()
+          anchor = 'use std::cell::{Cell, UnsafeCell};\n'
+          assert anchor in text
+          text = text.replace(anchor, anchor + '#[cfg(test)]\nuse std::sync::atomic::{AtomicUsize, Ordering};\n', 1)
+          marker = 'thread_local! {'
+          idx = text.index(marker)
+          instrumentation = '''#[cfg(test)]\nstatic JIT_LEAF_TABLE_INSTALLS: AtomicUsize = AtomicUsize::new(0);\n\n#[cfg(test)]\npub(crate) fn reset_jit_leaf_table_installs_for_test() {\n    JIT_LEAF_TABLE_INSTALLS.store(0, Ordering::Relaxed);\n}\n\n#[cfg(test)]\npub(crate) fn jit_leaf_table_installs_for_test() -> usize {\n    JIT_LEAF_TABLE_INSTALLS.load(Ordering::Relaxed)\n}\n\n'''
+          text = text[:idx] + instrumentation + text[idx:]
+          setter = 'pub(crate) fn set_jit_leaf_calls(calls: &[(usize, *const u8, u8, usize)], constants: *const u64) {\n'
+          assert setter in text
+          text = text.replace(setter, setter + '    #[cfg(test)]\n    JIT_LEAF_TABLE_INSTALLS.fetch_add(1, Ordering::Relaxed);\n', 1)
+          runtime.write_text(text)
+
+          tests = Path('src/jit/tests.rs')
+          text = tests.read_text()
+          anchor = 'fn make_jit() -> JitSession {\n'
+          assert anchor in text
+          test = '''extern "C" fn noop_jit_region(_regs: *mut u64, _constants: *const u64) {}\n\n#[test]\nfn call_free_compiled_execution_skips_leaf_table_install() {\n    let mut jit = make_jit();\n    jit.store_compiled(0, 0, noop_jit_region as *const u8, 1);\n    crate::jit::runtime::reset_jit_leaf_table_installs_for_test();\n    let mut regs = [0u64; 256];\n    let action = crate::backends::JitBackend::execute_compiled(\n        &mut jit, 0, 0, &mut regs, &[],\n    );\n    assert_eq!(action, crate::backends::TieredAction::RanJit);\n    assert_eq!(\n        crate::jit::runtime::jit_leaf_table_installs_for_test(),\n        0,\n        "call-free compiled regions must not install or allocate native-leaf dispatch state"\n    );\n}\n\n'''
+          tests.write_text(text.replace(anchor, test + anchor, 1))
+          PY
+          cargo fmt --all
+          set +e
+          cargo test --locked --no-default-features --features native-codegen --lib \
+            jit::tests::call_free_compiled_execution_skips_leaf_table_install -- --exact \
+            > /tmp/red.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/red.log
+          test "$status" -ne 0
+          grep -q 'call-free compiled regions must not install' /tmp/red.log
+      - name: Bypass leaf dispatch setup for call-free compiled regions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/jit/mod.rs')
+          text = path.read_text()
+          old = '''        let Some(func) = (unsafe { self.get_compiled(module_idx, pc) }) else {\n            return crate::backends::TieredAction::Interpret;\n        };\n        let leaf_calls: Vec<(usize, *const u8, u8, usize)> = self\n'''
+          new = '''        let Some(region) = self.compiled_entry(module_idx, pc) else {\n            return crate::backends::TieredAction::Interpret;\n        };\n        let func: JitFunctionPtr = unsafe { std::mem::transmute(region.ptr) };\n\n        // Ordinary typed/SIMD/scalar regions cannot invoke a direct-call helper.\n        // Keep their hot path identical to the pre-native-leaf execution path:\n        // no map scan, temporary Vec allocation, or leaf-dispatch TLS setup.\n        if !region.requires_vm_reentry {\n            func(regs.as_mut_ptr(), constants.as_ptr());\n            return crate::backends::TieredAction::RanJit;\n        }\n\n        let leaf_calls: Vec<(usize, *const u8, u8, usize)> = self\n'''
+          assert old in text
+          path.write_text(text.replace(old, new, 1))
+          PY
+      - name: Validate fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          git diff --check
+          cargo check --locked --no-default-features --features native-codegen
+          cargo test --locked --no-default-features --features native-codegen --lib jit::tests -- --test-threads=1
+          cargo clippy --locked --all-targets -- -D clippy::correctness
+      - name: Commit source changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "nulang-maintenance"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/jit/mod.rs src/jit/runtime.rs src/jit/tests.rs
+          git commit -m "perf(jit): skip leaf dispatch setup for call-free regions"
+          git push origin HEAD:perf/jit-native-leaf-no-call-fastpath
