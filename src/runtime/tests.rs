@@ -4073,6 +4073,70 @@ fn test_parallel_branch_event_does_not_consume_custom_replay_ordinal() {
 }
 
 #[test]
+fn test_committed_custom_event_keeps_pre_command_snapshot_safe_for_replay() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor("ReplayAfterCustom", Box::new(Vec::new), HashMap::new());
+
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("next", |_actor, _args| {});
+    let behavior_id = rt
+        .behavior_id_for(actor_id, "next")
+        .expect("registered workflow behavior must have a stable id");
+
+    let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let activation =
+        workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new()).unwrap();
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .current_workflow_activation = Some(activation);
+
+    rt.emit_event(actor_id, "CommittedBeforeCrash", &[Value::int(9)]);
+
+    let after_event_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(
+        after_event_snapshot.sequence, safe_snapshot.sequence,
+        "an intermediate replay-identified event must not advance the safe completed snapshot"
+    );
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .current_workflow_activation,
+        Some(activation),
+        "recovery must still classify the accepted command as unfinished after an intermediate event"
+    );
+
+    rt.emit_event(actor_id, "CommittedBeforeCrash", &[Value::int(9)]);
+    let matching: Vec<_> = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                WorkflowEvent::Custom {
+                    replay_id: Some(id),
+                    name,
+                    ..
+                } if *id == WorkflowReplayEventId::new(activation, 0)
+                    && name == "CommittedBeforeCrash"
+            )
+        })
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "recovery replay must consume the already-committed custom event without duplicating it"
+    );
+}
+
+#[test]
 fn test_recovery_replays_unfinished_atomic_native_workflow_activation() {
     let mut rt = Runtime::new();
     let mut models = HashMap::new();
