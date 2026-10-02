@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Scalar local-send fast path on current main — 2026-10-01
+- **Primitive resident local sends combine mailbox admission, readiness transition, priority capture, and receive-wait inspection under one target-actor borrow.** Pointer/object payloads retain the existing ORCA/object-store reference-tracked path.
+- **This is the measured #1162 optimization replayed without the later routing shortcut.** Existing current-main local-send layer probes and the exact-parent A/B workflow remain the promotion authority.
+
 ### Faster tier-2 promotion for native loop regions — 2026-09-30
 - **JIT-compiled regions with an internal back-edge now promote from the low-latency Cranelift tier on their first compiled re-entry.** A single native loop entry can perform arbitrarily many back-edge iterations, so the previous 10,000-entry tier-2 counter could leave genuinely hot loops on first-tier code indefinitely.
 - **Straight-line and already-optimized regions retain the existing tier-2 threshold.** The policy change is limited to first-tier internal loops so cold or call-heavy code does not pay unnecessary optimized-compilation latency.
