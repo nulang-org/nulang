@@ -45,6 +45,19 @@ fn invalid_dependency_graphs_fail_closed() {
 }
 
 #[test]
+fn task_graph_rejects_foreign_goal_and_duplicate_ids() {
+    let mut graph = graph_with_dependency();
+    graph.tasks[0].goal_id = Goal::new("other", "other goal", 1.0).id;
+    let err = graph.validate_task_graph().unwrap_err();
+    assert!(err.contains("belongs to goal"));
+
+    let mut graph = graph_with_dependency();
+    graph.tasks[1].id = graph.tasks[0].id;
+    let err = graph.validate_task_graph().unwrap_err();
+    assert!(err.contains("Duplicate task id"));
+}
+
+#[test]
 fn progress_ledger_requests_replan_after_consecutive_stalls() {
     let graph = graph_with_dependency();
     let mut progress = ProgressLedger::new(graph.goal.id, 2);
