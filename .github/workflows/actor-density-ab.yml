@@ -46,9 +46,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
+      # Deliberately no actions/cache or uploaded artifact here. This job is
+      # diagnostic measurement infrastructure and should not consume Actions
+      # storage while account storage is constrained.
       - name: Test density comparator
         run: python3 -m unittest scripts/tests/test_actor_density_ab_bench.py
 
