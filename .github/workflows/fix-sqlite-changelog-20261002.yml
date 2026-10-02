@@ -19,21 +19,16 @@ jobs:
       - name: Add focused changelog entry
         shell: bash
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('CHANGELOG.md')
-          text = p.read_text()
-          heading = '### Standalone SQLite feature dependency closure — 2026-10-02'
-          assert heading not in text
-          marker = '# Nulang Changelog\n'
-          assert text.startswith(marker)
-          entry = '''# Nulang Changelog
-### Standalone SQLite feature dependency closure — 2026-10-02
-- **The standalone `sqlite` feature now enables Tokio directly because `LibsqlStore` owns a Tokio runtime.** Minimal `--no-default-features --features sqlite` builds no longer rely on unrelated default-profile features to supply that direct dependency.
-
-'''
-          p.write_text(entry + text[len(marker):])
-          PY
+          set -euo pipefail
+          ! grep -Fq '### Standalone SQLite feature dependency closure — 2026-10-02' CHANGELOG.md
+          {
+            printf '%s\n' '# Nulang Changelog'
+            printf '%s\n' '### Standalone SQLite feature dependency closure — 2026-10-02'
+            printf '%s\n' '- **The standalone `sqlite` feature now enables Tokio directly because `LibsqlStore` owns a Tokio runtime.** Minimal `--no-default-features --features sqlite` builds no longer rely on unrelated default-profile features to supply that direct dependency.'
+            printf '\n'
+            tail -n +2 CHANGELOG.md
+          } > CHANGELOG.md.new
+          mv CHANGELOG.md.new CHANGELOG.md
           git diff --check
           git config user.name 'nlc-ci'
           git config user.email 'nlc-ci@users.noreply.github.com'
