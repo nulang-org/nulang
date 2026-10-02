@@ -39,10 +39,42 @@ impl WalBackedTablet {
         let manifest_path = wal_path.with_extension("manifest");
         let sstable_dir = wal_path.with_extension("sstables");
         let wal = FileWal::open(wal_path)?;
-        let mut tablet = match checkpoint::load_checkpoint(&checkpoint_path, descriptor.clone())? {
-            Some(tablet) => tablet,
-            None => wal.recover_memory_tablet(descriptor)?,
-        };
+        let mut tablet = checkpoint::load_checkpoint(&checkpoint_path, descriptor.clone())?
+            .unwrap_or_else(|| MemoryTablet::new(descriptor.clone()));
+
+        let manifest = Manifest::load_or_empty(&manifest_path, descriptor.id().get())?;
+        for entry in manifest.entries() {
+            let path = sstable_dir.join(&entry.file_name);
+            let table = sstable::Sstable::open(&path)?;
+            let metadata = table.metadata();
+            if metadata.tablet_id != entry.tablet_id
+                || metadata.ownership_epoch != entry.ownership_epoch
+                || metadata.min_sequence != entry.min_sequence
+                || metadata.max_sequence != entry.max_sequence
+                || metadata.row_count != entry.row_count
+                || metadata.min_key != entry.min_key
+                || metadata.max_key != entry.max_key
+                || metadata.checksum != entry.checksum
+                || metadata.file_name != entry.file_name
+            {
+                return Err(WalBackedError::ManifestSstableMismatch(
+                    entry.file_name.clone(),
+                ));
+            }
+            if metadata.tablet_id != descriptor.id().get()
+                || metadata.ownership_epoch > descriptor.ownership_epoch()
+            {
+                return Err(WalBackedError::ManifestSstableMismatch(
+                    entry.file_name.clone(),
+                ));
+            }
+            if metadata.max_sequence > tablet.current_sequence()
+                && !table.has_contiguous_sequence_coverage_after(tablet.current_sequence())
+            {
+                continue;
+            }
+            tablet.install_recovered_sstable_rows(table.rows(), metadata.max_sequence)?;
+        }
         wal.replay_after_checkpoint(&mut tablet)?;
         Ok(Self {
             tablet,
@@ -243,6 +275,7 @@ pub enum WalBackedError {
     Sstable(SstableError),
     NoImmutableMemtable,
     FlushIdentity(String),
+    ManifestSstableMismatch(String),
 }
 
 impl From<TabletError> for WalBackedError {
@@ -285,6 +318,9 @@ impl fmt::Display for WalBackedError {
             Self::Sstable(error) => write!(f, "tablet SSTable failure: {error}"),
             Self::NoImmutableMemtable => f.write_str("no immutable memtable is available to flush"),
             Self::FlushIdentity(message) => write!(f, "failed to derive flush identity: {message}"),
+            Self::ManifestSstableMismatch(file) => {
+                write!(f, "manifest metadata does not match SSTable {file}")
+            }
         }
     }
 }

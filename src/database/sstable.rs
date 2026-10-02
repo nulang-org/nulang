@@ -101,6 +101,42 @@ impl Sstable {
         &self.metadata
     }
 
+    pub(crate) fn rows(&self) -> &[TabletSnapshotRow] {
+        &self.rows
+    }
+
+    pub(crate) fn has_contiguous_sequence_coverage_after(&self, floor: u64) -> bool {
+        if self.metadata.max_sequence <= floor {
+            return true;
+        }
+
+        let mut sequences = std::collections::BTreeSet::new();
+        for row in &self.rows {
+            for version in &row.versions {
+                if version.sequence > floor {
+                    sequences.insert(version.sequence);
+                }
+            }
+        }
+
+        let Some(mut expected) = floor.checked_add(1) else {
+            return false;
+        };
+        for sequence in sequences {
+            if sequence != expected {
+                return false;
+            }
+            if sequence == self.metadata.max_sequence {
+                return true;
+            }
+            let Some(next) = expected.checked_add(1) else {
+                return false;
+            };
+            expected = next;
+        }
+        false
+    }
+
     pub(crate) fn get_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, SstableError> {
         let Ok(index) = self
             .rows
