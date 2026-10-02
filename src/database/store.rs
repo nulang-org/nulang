@@ -14,6 +14,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::checkpoint::{self, CheckpointError};
+use super::manifest::{Manifest, ManifestEntry, ManifestError};
+use super::sstable::{self, SstableError};
 use super::tablet::{MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite};
 use super::wal::{FileWal, WalError};
 
@@ -22,6 +24,8 @@ pub struct WalBackedTablet {
     tablet: MemoryTablet,
     wal: FileWal,
     checkpoint_path: PathBuf,
+    manifest_path: PathBuf,
+    sstable_dir: PathBuf,
 }
 
 impl WalBackedTablet {
@@ -32,6 +36,8 @@ impl WalBackedTablet {
     ) -> Result<Self, WalBackedError> {
         let wal_path = wal_path.as_ref();
         let checkpoint_path = checkpoint::checkpoint_path_for_wal(wal_path);
+        let manifest_path = wal_path.with_extension("manifest");
+        let sstable_dir = wal_path.with_extension("sstables");
         let wal = FileWal::open(wal_path)?;
         let mut tablet = match checkpoint::load_checkpoint(&checkpoint_path, descriptor.clone())? {
             Some(tablet) => tablet,
@@ -42,6 +48,8 @@ impl WalBackedTablet {
             tablet,
             wal,
             checkpoint_path,
+            manifest_path,
+            sstable_dir,
         })
     }
 
@@ -67,6 +75,92 @@ impl WalBackedTablet {
     /// Rotation is in-memory only; persistence and WAL reclamation are unchanged.
     pub fn rotate_memtable_if_bytes_at_least(&mut self, min_bytes: usize) -> bool {
         self.tablet.rotate_memtable_if_bytes_at_least(min_bytes)
+    }
+
+    /// Durably flush the oldest frozen memtable to an immutable SSTable and
+    /// publish a manifest entry. The in-memory generation remains resident and
+    /// the WAL remains unreclaimed until SSTable-backed recovery is promoted.
+    pub fn flush_oldest_immutable_to_sstable(&mut self) -> Result<bool, WalBackedError> {
+        let rows = self
+            .tablet
+            .oldest_immutable_rows()
+            .ok_or(WalBackedError::NoImmutableMemtable)?;
+        let min_sequence = rows
+            .iter()
+            .flat_map(|row| row.versions.iter())
+            .map(|version| version.sequence)
+            .min()
+            .ok_or(WalBackedError::NoImmutableMemtable)?;
+        let max_sequence = rows
+            .iter()
+            .flat_map(|row| row.versions.iter())
+            .map(|version| version.sequence)
+            .max()
+            .ok_or(WalBackedError::NoImmutableMemtable)?;
+        let identity = serde_json::to_vec(&rows)
+            .map_err(|error| WalBackedError::FlushIdentity(error.to_string()))?;
+        let digest = blake3::hash(&identity).to_hex();
+        let file_name = format!(
+            "tablet-{}-{}-{}-{}.sst",
+            self.tablet.descriptor().id().get(),
+            min_sequence,
+            max_sequence,
+            &digest.as_str()[..16]
+        );
+
+        let mut manifest =
+            Manifest::load_or_empty(&self.manifest_path, self.tablet.descriptor().id().get())?;
+        if manifest
+            .entries()
+            .iter()
+            .any(|entry| entry.file_name == file_name)
+        {
+            return Ok(false);
+        }
+
+        let path = self.sstable_dir.join(&file_name);
+        let expected = sstable::expected_metadata(
+            file_name.clone(),
+            self.tablet.descriptor().id().get(),
+            self.tablet.descriptor().ownership_epoch(),
+            &rows,
+        )?;
+        let metadata = if path.exists() {
+            let existing = sstable::Sstable::open(&path)?;
+            if existing.metadata() != &expected {
+                return Err(WalBackedError::Sstable(SstableError::ExistingFileMismatch(
+                    file_name.clone(),
+                )));
+            }
+            existing.metadata().clone()
+        } else {
+            sstable::write_sstable(
+                &path,
+                self.tablet.descriptor().id().get(),
+                self.tablet.descriptor().ownership_epoch(),
+                &rows,
+            )?
+        };
+        let entry = ManifestEntry {
+            file_name: metadata.file_name,
+            tablet_id: metadata.tablet_id,
+            ownership_epoch: metadata.ownership_epoch,
+            min_sequence: metadata.min_sequence,
+            max_sequence: metadata.max_sequence,
+            row_count: metadata.row_count,
+            min_key: metadata.min_key,
+            max_key: metadata.max_key,
+            checksum: metadata.checksum,
+        };
+        let inserted = manifest.register(entry)?;
+        manifest.publish(&self.manifest_path)?;
+        Ok(inserted)
+    }
+
+    pub fn durable_sstable_count(&self) -> Result<usize, WalBackedError> {
+        let manifest =
+            Manifest::load_or_empty(&self.manifest_path, self.tablet.descriptor().id().get())?;
+        Ok(manifest.entries().len())
     }
 
     pub fn prepare_write(
@@ -145,6 +239,10 @@ pub enum WalBackedError {
     Tablet(TabletError),
     Wal(WalError),
     Checkpoint(CheckpointError),
+    Manifest(ManifestError),
+    Sstable(SstableError),
+    NoImmutableMemtable,
+    FlushIdentity(String),
 }
 
 impl From<TabletError> for WalBackedError {
@@ -165,12 +263,28 @@ impl From<CheckpointError> for WalBackedError {
     }
 }
 
+impl From<ManifestError> for WalBackedError {
+    fn from(error: ManifestError) -> Self {
+        Self::Manifest(error)
+    }
+}
+
+impl From<SstableError> for WalBackedError {
+    fn from(error: SstableError) -> Self {
+        Self::Sstable(error)
+    }
+}
+
 impl fmt::Display for WalBackedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Tablet(error) => write!(f, "tablet commit rejected: {error}"),
             Self::Wal(error) => write!(f, "tablet WAL failure: {error}"),
             Self::Checkpoint(error) => write!(f, "tablet checkpoint failure: {error}"),
+            Self::Manifest(error) => write!(f, "tablet manifest failure: {error}"),
+            Self::Sstable(error) => write!(f, "tablet SSTable failure: {error}"),
+            Self::NoImmutableMemtable => f.write_str("no immutable memtable is available to flush"),
+            Self::FlushIdentity(message) => write!(f, "failed to derive flush identity: {message}"),
         }
     }
 }
