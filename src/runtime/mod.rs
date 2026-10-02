@@ -1146,12 +1146,7 @@ impl Runtime {
     /// The public embedding API keeps its best-effort shape and reports
     /// success as a boolean. Runtime VM callbacks use the fallible sibling so
     /// durable workflow failures abort execution immediately.
-    pub fn emit_event(
-        &mut self,
-        actor_id: u64,
-        event: &str,
-        args: &[crate::vm::Value],
-    ) -> bool {
+    pub fn emit_event(&mut self, actor_id: u64, event: &str, args: &[crate::vm::Value]) -> bool {
         match workflow::emit_event(self, actor_id, event, args) {
             Ok(()) => true,
             Err(error) => {
@@ -1326,6 +1321,27 @@ impl Runtime {
                 actor.workflow_replay_activation = Some(activation);
                 actor.workflow_replay_event_ordinal = 0;
             }
+        }
+    }
+
+    /// Clear replay state only after the matching workflow activation reaches a
+    /// durable terminal boundary. A persistence failure must leave the replay
+    /// identity intact so recovery can resume from committed history.
+    pub(crate) fn clear_terminal_workflow_activation(
+        &mut self,
+        actor_id: u64,
+        activation: Option<WorkflowActivationId>,
+    ) {
+        let Some(actor) = self.actors.get_mut(&actor_id) else {
+            return;
+        };
+
+        if actor.current_workflow_activation == activation {
+            actor.current_workflow_activation = None;
+        }
+        if actor.workflow_replay_activation == activation {
+            actor.workflow_replay_activation = None;
+            actor.workflow_replay_event_ordinal = 0;
         }
     }
 
@@ -1787,14 +1803,10 @@ impl Runtime {
         // bytecode whose own begin/end must stay inside this window. Runs
         // on every path so wakes of other actors are not lost.
         self.vm_exec_end();
-        if let Some(failure) = persistence_failure
-            .or_else(|| self.take_workflow_persistence_failure(actor_id))
+        if let Some(failure) =
+            persistence_failure.or_else(|| self.take_workflow_persistence_failure(actor_id))
         {
-            self.recover_after_workflow_persistence_failure(
-                actor_id,
-                &failure,
-                "signal-resume",
-            );
+            self.recover_after_workflow_persistence_failure(actor_id, &failure, "signal-resume");
             return;
         }
         // The suspension resolved (completed or failed): drain any mail
@@ -4242,9 +4254,7 @@ impl Runtime {
                                 Ok(activation) => {
                                     workflow_activation = Some(activation);
                                 }
-                                Err(error)
-                                    if error.kind() == std::io::ErrorKind::Unsupported =>
-                                {
+                                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
                                     // Atomic history has not begun and this
                                     // backend explicitly cannot provide RFC
                                     // 0022 transactions. Preserve the existing
@@ -4347,9 +4357,7 @@ impl Runtime {
                         processed = false;
                     }
                     Err(e) => {
-                        if let Some(failure) =
-                            self.take_workflow_persistence_failure(actor_id)
-                        {
+                        if let Some(failure) = self.take_workflow_persistence_failure(actor_id) {
                             self.recover_after_workflow_persistence_failure(
                                 actor_id,
                                 &failure,
@@ -4409,12 +4417,9 @@ impl Runtime {
                 }
 
                 let step_name = self.step_name_for(actor_id, behavior_idx);
-                if let Err(error) = workflow::persist_step_completed(
-                    self,
-                    actor_id,
-                    workflow_activation,
-                    step_name,
-                ) {
+                if let Err(error) =
+                    workflow::persist_step_completed(self, actor_id, workflow_activation, step_name)
+                {
                     tracing::error!(
                         actor_id,
                         %error,
@@ -5011,26 +5016,18 @@ impl Runtime {
             (*self_ptr).vm_exec_end();
         }
 
-        if let Some(failure) = persistence_failure
-            .or_else(|| self.take_workflow_persistence_failure(actor_id))
+        if let Some(failure) =
+            persistence_failure.or_else(|| self.take_workflow_persistence_failure(actor_id))
         {
-            self.recover_after_workflow_persistence_failure(
-                actor_id,
-                &failure,
-                "timer-resume",
-            );
+            self.recover_after_workflow_persistence_failure(actor_id, &failure, "timer-resume");
             return;
         }
 
         if let Some(error) = resume_error {
             if self.actor_is_workflow(actor_id) {
-                if let Err(commit_error) = workflow::persist_step_failed(
-                    self,
-                    actor_id,
-                    activation,
-                    step_name,
-                    error,
-                ) {
+                if let Err(commit_error) =
+                    workflow::persist_step_failed(self, actor_id, activation, step_name, error)
+                {
                     self.recover_after_workflow_persistence_failure(
                         actor_id,
                         &commit_error.to_string(),
@@ -5170,26 +5167,18 @@ impl Runtime {
             (*self_ptr).vm_exec_end();
         }
 
-        if let Some(failure) = persistence_failure
-            .or_else(|| self.take_workflow_persistence_failure(actor_id))
+        if let Some(failure) =
+            persistence_failure.or_else(|| self.take_workflow_persistence_failure(actor_id))
         {
-            self.recover_after_workflow_persistence_failure(
-                actor_id,
-                &failure,
-                "receive-resume",
-            );
+            self.recover_after_workflow_persistence_failure(actor_id, &failure, "receive-resume");
             return;
         }
 
         if let Some(error) = resume_error {
             if self.actor_is_workflow(actor_id) {
-                if let Err(commit_error) = workflow::persist_step_failed(
-                    self,
-                    actor_id,
-                    activation,
-                    step_name,
-                    error,
-                ) {
+                if let Err(commit_error) =
+                    workflow::persist_step_failed(self, actor_id, activation, step_name, error)
+                {
                     self.recover_after_workflow_persistence_failure(
                         actor_id,
                         &commit_error.to_string(),

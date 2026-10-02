@@ -35,10 +35,7 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
 /// Unsupported backends are intentionally treated as legacy-only. Any other
 /// storage error is propagated so callers do not silently cross persistence
 /// modes after an atomic tail has begun.
-pub(crate) fn workflow_has_atomic_tail(
-    rt: &Runtime,
-    actor_id: u64,
-) -> std::io::Result<bool> {
+pub(crate) fn workflow_has_atomic_tail(rt: &Runtime, actor_id: u64) -> std::io::Result<bool> {
     match rt.persistence.load_durable_tail_position(actor_id) {
         Ok(Some(_)) => Ok(true),
         Ok(None) => Ok(false),
@@ -47,10 +44,7 @@ pub(crate) fn workflow_has_atomic_tail(
     }
 }
 
-fn current_workflow_replay_id(
-    rt: &mut Runtime,
-    actor_id: u64,
-) -> Option<WorkflowReplayEventId> {
+fn current_workflow_replay_id(rt: &mut Runtime, actor_id: u64) -> Option<WorkflowReplayEventId> {
     let actor = rt.actors.get_mut(&actor_id)?;
     let activation = actor.current_workflow_activation?;
 
@@ -65,11 +59,7 @@ fn current_workflow_replay_id(
     ))
 }
 
-fn advance_workflow_replay_id(
-    rt: &mut Runtime,
-    actor_id: u64,
-    committed: WorkflowReplayEventId,
-) {
+fn advance_workflow_replay_id(rt: &mut Runtime, actor_id: u64, committed: WorkflowReplayEventId) {
     let Some(actor) = rt.actors.get_mut(&actor_id) else {
         return;
     };
@@ -247,12 +237,14 @@ fn commit_workflow_event_transition(
         )
     })?;
     let snapshot = if snapshot_state {
-        Some(build_actor_snapshot_at_sequence(rt, actor_id, sequence)?.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "workflow transition requires a live persistent actor",
-            )
-        })?)
+        Some(
+            build_actor_snapshot_at_sequence(rt, actor_id, sequence)?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "workflow transition requires a live persistent actor",
+                )
+            })?,
+        )
     } else {
         None
     };
@@ -417,13 +409,11 @@ pub(crate) fn commit_step_failed(
     step_name: String,
     error: String,
 ) -> std::io::Result<()> {
-    commit_workflow_event_transition(rt, actor_id, true, |sequence| {
-        WorkflowEvent::StepFailed {
-            sequence,
-            activation,
-            step_name,
-            error,
-        }
+    commit_workflow_event_transition(rt, actor_id, true, |sequence| WorkflowEvent::StepFailed {
+        sequence,
+        activation,
+        step_name,
+        error,
     })
 }
 
@@ -435,7 +425,9 @@ pub(crate) fn persist_step_completed(
     step_name: String,
 ) -> std::io::Result<()> {
     if workflow_has_atomic_tail(rt, actor_id)? {
-        return commit_step_completed(rt, actor_id, activation, step_name);
+        commit_step_completed(rt, actor_id, activation, step_name)?;
+        rt.clear_terminal_workflow_activation(actor_id, activation);
+        return Ok(());
     }
 
     let sequence = next_sequence(rt, actor_id);
@@ -447,7 +439,9 @@ pub(crate) fn persist_step_completed(
             step_name,
         },
     )?;
-    try_checkpoint_actor(rt, actor_id)
+    try_checkpoint_actor(rt, actor_id)?;
+    rt.clear_terminal_workflow_activation(actor_id, activation);
+    Ok(())
 }
 
 /// Persist failed workflow completion without crossing persistence modes.
@@ -459,7 +453,9 @@ pub(crate) fn persist_step_failed(
     error: String,
 ) -> std::io::Result<()> {
     if workflow_has_atomic_tail(rt, actor_id)? {
-        return commit_step_failed(rt, actor_id, activation, step_name, error);
+        commit_step_failed(rt, actor_id, activation, step_name, error)?;
+        rt.clear_terminal_workflow_activation(actor_id, activation);
+        return Ok(());
     }
 
     let sequence = next_sequence(rt, actor_id);
@@ -472,7 +468,9 @@ pub(crate) fn persist_step_failed(
             error,
         },
     )?;
-    try_checkpoint_actor(rt, actor_id)
+    try_checkpoint_actor(rt, actor_id)?;
+    rt.clear_terminal_workflow_activation(actor_id, activation);
+    Ok(())
 }
 
 /// Commit a nonterminal workflow event without moving the completed-state
@@ -490,7 +488,6 @@ fn commit_intermediate_workflow_event(
             .append_workflow_event(actor_id, build_event(sequence))
     }
 }
-
 
 /// Snapshot the durable and CRDT state of a persistent actor.
 ///
@@ -634,16 +631,14 @@ pub(crate) fn emit_event(
                         ));
                     }
                     ReplayDisposition::Append => {
-                        commit_intermediate_workflow_event(
-                            rt,
-                            actor_id,
-                            |sequence| WorkflowEvent::Custom {
+                        commit_intermediate_workflow_event(rt, actor_id, |sequence| {
+                            WorkflowEvent::Custom {
                                 sequence,
                                 replay_id: Some(replay_id),
                                 name: event.to_string(),
                                 args: payload,
-                            },
-                        )?;
+                            }
+                        })?;
                         // This event belongs to an open activation. Keep the
                         // last completed snapshot unchanged so recovery can
                         // re-execute the command and consume this exact
@@ -654,16 +649,14 @@ pub(crate) fn emit_event(
                 }
             } else {
                 let atomic_tail = workflow_has_atomic_tail(rt, actor_id)?;
-                commit_intermediate_workflow_event(
-                    rt,
-                    actor_id,
-                    |sequence| WorkflowEvent::Custom {
+                commit_intermediate_workflow_event(rt, actor_id, |sequence| {
+                    WorkflowEvent::Custom {
                         sequence,
                         replay_id: None,
                         name: event.to_string(),
                         args: payload,
-                    },
-                )?;
+                    }
+                })?;
                 should_checkpoint = !atomic_tail;
             }
             if should_checkpoint {

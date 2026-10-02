@@ -522,8 +522,8 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         (*self_ptr).vm_exec_end();
     }
 
-    if let Some(failure) = persistence_failure
-        .or_else(|| rt.take_workflow_persistence_failure(actor_id))
+    if let Some(failure) =
+        persistence_failure.or_else(|| rt.take_workflow_persistence_failure(actor_id))
     {
         rt.recover_after_workflow_persistence_failure(actor_id, &failure, "llm-resume");
         return;
@@ -531,13 +531,9 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
 
     if let Some(error) = resume_error {
         if rt.actor_is_workflow(actor_id) {
-            if let Err(commit_error) = super::workflow::persist_step_failed(
-                rt,
-                actor_id,
-                activation,
-                step_name,
-                error,
-            ) {
+            if let Err(commit_error) =
+                super::workflow::persist_step_failed(rt, actor_id, activation, step_name, error)
+            {
                 rt.recover_after_workflow_persistence_failure(
                     actor_id,
                     &commit_error.to_string(),

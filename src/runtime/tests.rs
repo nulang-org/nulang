@@ -3973,7 +3973,11 @@ fn test_custom_workflow_replay_consumes_matching_committed_event() {
         .into_iter()
         .filter(|event| matches!(event, WorkflowEvent::Custom { .. }))
         .collect();
-    assert_eq!(custom.len(), 1, "replay must consume the committed event instead of appending a duplicate");
+    assert_eq!(
+        custom.len(),
+        1,
+        "replay must consume the committed event instead of appending a duplicate"
+    );
     assert_eq!(
         rt.actors
             .get(&actor_id)
@@ -4011,7 +4015,11 @@ fn test_custom_workflow_replay_rejects_conflicting_committed_event_identity() {
         .into_iter()
         .filter(|event| matches!(event, WorkflowEvent::Custom { .. }))
         .collect();
-    assert_eq!(custom.len(), 1, "a conflicting replay identity must not mutate durable history");
+    assert_eq!(
+        custom.len(),
+        1,
+        "a conflicting replay identity must not mutate durable history"
+    );
     assert_eq!(
         rt.actors
             .get(&actor_id)
@@ -4122,7 +4130,8 @@ fn test_committed_custom_event_keeps_pre_command_snapshot_safe_for_replay() {
         })
         .collect();
     assert_eq!(
-        matching.len(), 1,
+        matching.len(),
+        1,
         "recovery replay must consume the already-committed custom event without duplicating it"
     );
 }
@@ -4205,7 +4214,8 @@ fn test_timer_set_replay_consumes_matching_committed_preparation() {
 #[test]
 fn test_timer_set_replay_rejects_cross_type_identity_collision() {
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_workflow_actor("ReplayTimerConflict", Box::new(Vec::new), HashMap::new());
+    let actor_id =
+        rt.spawn_workflow_actor("ReplayTimerConflict", Box::new(Vec::new), HashMap::new());
     let activation = WorkflowActivationId::new(actor_id, 91);
 
     rt.actors
@@ -4308,7 +4318,9 @@ fn test_signal_received_during_open_activation_keeps_safe_snapshot() {
         "recovery must keep the interrupted command activation open"
     );
     assert_eq!(
-        actor.get_state_field("count").and_then(|value| value.as_int()),
+        actor
+            .get_state_field("count")
+            .and_then(|value| value.as_int()),
         Some(0),
         "recovery must restart from the last completed state"
     );
@@ -4325,11 +4337,8 @@ fn test_compiled_workflow_turn_closes_on_atomic_tail() {
     use crate::bytecode::{Instruction, OpCode};
 
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_workflow_actor(
-        "CompiledAtomicTail",
-        Box::new(Vec::new),
-        HashMap::new(),
-    );
+    let actor_id =
+        rt.spawn_workflow_actor("CompiledAtomicTail", Box::new(Vec::new), HashMap::new());
 
     let mut module = CodeModule::new("compiled-atomic-tail");
     module.emit(Instruction::new0(OpCode::Ret));
@@ -4383,11 +4392,8 @@ fn test_compiled_workflow_failure_closes_on_atomic_tail() {
     use crate::bytecode::{Instruction, OpCode};
 
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_workflow_actor(
-        "CompiledAtomicFailure",
-        Box::new(Vec::new),
-        HashMap::new(),
-    );
+    let actor_id =
+        rt.spawn_workflow_actor("CompiledAtomicFailure", Box::new(Vec::new), HashMap::new());
 
     let mut module = CodeModule::new("compiled-atomic-failure");
     let message = module.add_constant(Constant::String("boom".to_string()));
@@ -4455,11 +4461,8 @@ fn test_compiled_workflow_keeps_legacy_path_on_store_without_atomic_transitions(
 
     let mut rt = Runtime::new();
     rt.persistence = Box::new(JsonFileStore::new(&path).unwrap());
-    let actor_id = rt.spawn_workflow_actor(
-        "CompiledLegacyFallback",
-        Box::new(Vec::new),
-        HashMap::new(),
-    );
+    let actor_id =
+        rt.spawn_workflow_actor("CompiledLegacyFallback", Box::new(Vec::new), HashMap::new());
 
     let mut module = CodeModule::new("compiled-legacy-fallback");
     module.emit(Instruction::new0(OpCode::Ret));
@@ -4496,11 +4499,8 @@ fn test_compiled_workflow_keeps_legacy_path_on_store_without_atomic_transitions(
 #[test]
 fn test_legacy_checkpoint_is_rejected_after_atomic_workflow_tail_begins() {
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_workflow_actor(
-        "RejectLegacyCheckpoint",
-        Box::new(Vec::new),
-        HashMap::new(),
-    );
+    let actor_id =
+        rt.spawn_workflow_actor("RejectLegacyCheckpoint", Box::new(Vec::new), HashMap::new());
     declare_test_behavior(&mut rt, actor_id, "run");
     let behavior_id = rt.behavior_id_for(actor_id, "run").unwrap();
     let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
@@ -4560,16 +4560,22 @@ fn test_open_activation_intermediate_events_extend_atomic_tail() {
         .unwrap()
         .unwrap();
     assert_eq!(custom_tail.sequence, command_tail.sequence + 1);
-    assert_eq!(rt.persistence.latest_sequence(actor_id), custom_tail.sequence);
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        custom_tail.sequence
+    );
 
-    assert!(rt.append_timer_set(actor_id, "wake", 250).unwrap());
+    rt.append_timer_set(actor_id, "wake", 250).unwrap();
     let timer_tail = rt
         .persistence
         .load_durable_tail_position(actor_id)
         .unwrap()
         .unwrap();
     assert_eq!(timer_tail.sequence, custom_tail.sequence + 1);
-    assert_eq!(rt.persistence.latest_sequence(actor_id), timer_tail.sequence);
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        timer_tail.sequence
+    );
 
     rt.append_signal_received(actor_id, "go", Some("payload".to_string()))
         .unwrap();
@@ -4579,7 +4585,10 @@ fn test_open_activation_intermediate_events_extend_atomic_tail() {
         .unwrap()
         .unwrap();
     assert_eq!(signal_tail.sequence, timer_tail.sequence + 1);
-    assert_eq!(rt.persistence.latest_sequence(actor_id), signal_tail.sequence);
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        signal_tail.sequence
+    );
 
     let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
     assert!(
@@ -4617,11 +4626,8 @@ fn test_compiled_replay_conflict_aborts_and_recovers_without_terminal_snapshot()
     use crate::bytecode::{Instruction, OpCode};
 
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_workflow_actor(
-        "ReplayConflictAbort",
-        Box::new(Vec::new),
-        HashMap::new(),
-    );
+    let actor_id =
+        rt.spawn_workflow_actor("ReplayConflictAbort", Box::new(Vec::new), HashMap::new());
 
     let mut module = CodeModule::new("replay-conflict-abort");
     let event_idx = module.add_constant(Constant::String("Different".to_string()));
@@ -4643,19 +4649,18 @@ fn test_compiled_replay_conflict_aborts_and_recovers_without_terminal_snapshot()
 
     let activation = workflow::commit_workflow_command(&mut rt, actor_id, 0, Vec::new()).unwrap();
     rt.emit_event(actor_id, "Original", &[]);
-    assert!(
-        rt.persistence
-            .read_workflow_events(actor_id)
-            .iter()
-            .any(|event| matches!(
-                event,
-                WorkflowEvent::Custom {
-                    replay_id: Some(id),
-                    name,
-                    ..
-                } if *id == WorkflowReplayEventId::new(activation, 0) && name == "Original"
-            ))
-    );
+    assert!(rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .iter()
+        .any(|event| matches!(
+            event,
+            WorkflowEvent::Custom {
+                replay_id: Some(id),
+                name,
+                ..
+            } if *id == WorkflowReplayEventId::new(activation, 0) && name == "Original"
+        )));
 
     rt.actors.remove(&actor_id);
     assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
@@ -4973,11 +4978,8 @@ fn test_recovery_finds_unfinished_atomic_command_below_completed_effect_tail() {
 #[test]
 fn test_recovery_refuses_terminal_event_ahead_of_safe_snapshot_outside_atomic_tail() {
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_workflow_actor(
-        "RefuseMixedTerminal",
-        Box::new(Vec::new),
-        HashMap::new(),
-    );
+    let actor_id =
+        rt.spawn_workflow_actor("RefuseMixedTerminal", Box::new(Vec::new), HashMap::new());
     rt.actors
         .get_mut(&actor_id)
         .unwrap()
