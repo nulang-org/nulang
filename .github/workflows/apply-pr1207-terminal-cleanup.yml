@@ -1,0 +1,205 @@
+name: Apply PR 1207 terminal cleanup
+
+on:
+  push:
+    branches:
+      - automation/apply-pr1207-terminal-cleanup
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/compiled-workflow-atomic-tail-20260930
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Apply verified source changes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          tests = Path('src/runtime/tests.rs')
+          text = tests.read_text()
+          old = '    assert!(rt.append_timer_set(actor_id, "wake", 250).unwrap());\n'
+          new = '    rt.append_timer_set(actor_id, "wake", 250).unwrap();\n'
+          assert text.count(old) == 1, text.count(old)
+          tests.write_text(text.replace(old, new))
+
+          mod = Path('src/runtime/mod.rs')
+          text = mod.read_text()
+          anchor = '''    fn restore_suspended_workflow_activation(
+              &mut self,
+              actor_id: u64,
+              activation: Option<WorkflowActivationId>,
+          ) {
+              let Some(actor) = self.actors.get_mut(&actor_id) else {
+                  return;
+              };
+              actor.current_workflow_activation = activation;
+              if let Some(activation) = activation {
+                  if actor.workflow_replay_activation != Some(activation) {
+                      actor.workflow_replay_activation = Some(activation);
+                      actor.workflow_replay_event_ordinal = 0;
+                  }
+              }
+          }
+          '''
+          replacement = anchor + '''
+              /// Clear replay state only after the matching workflow activation reaches a
+              /// durable terminal boundary. A persistence failure must leave the replay
+              /// identity intact so recovery can resume from committed history.
+              pub(crate) fn clear_terminal_workflow_activation(
+                  &mut self,
+                  actor_id: u64,
+                  activation: Option<WorkflowActivationId>,
+              ) {
+                  let Some(actor) = self.actors.get_mut(&actor_id) else {
+                      return;
+                  };
+
+                  if actor.current_workflow_activation == activation {
+                      actor.current_workflow_activation = None;
+                  }
+                  if actor.workflow_replay_activation == activation {
+                      actor.workflow_replay_activation = None;
+                      actor.workflow_replay_event_ordinal = 0;
+                  }
+              }
+          '''
+          assert text.count(anchor) == 1, text.count(anchor)
+          mod.write_text(text.replace(anchor, replacement))
+
+          workflow = Path('src/runtime/workflow.rs')
+          text = workflow.read_text()
+          old_completed = '''pub(crate) fn persist_step_completed(
+              rt: &mut Runtime,
+              actor_id: u64,
+              activation: Option<WorkflowActivationId>,
+              step_name: String,
+          ) -> std::io::Result<()> {
+              if workflow_has_atomic_tail(rt, actor_id)? {
+                  return commit_step_completed(rt, actor_id, activation, step_name);
+              }
+
+              let sequence = next_sequence(rt, actor_id);
+              rt.persistence.append_workflow_event(
+                  actor_id,
+                  WorkflowEvent::StepCompleted {
+                      sequence,
+                      activation,
+                      step_name,
+                  },
+              )?;
+              try_checkpoint_actor(rt, actor_id)
+          }
+          '''
+          new_completed = '''pub(crate) fn persist_step_completed(
+              rt: &mut Runtime,
+              actor_id: u64,
+              activation: Option<WorkflowActivationId>,
+              step_name: String,
+          ) -> std::io::Result<()> {
+              if workflow_has_atomic_tail(rt, actor_id)? {
+                  commit_step_completed(rt, actor_id, activation, step_name)?;
+              } else {
+                  let sequence = next_sequence(rt, actor_id);
+                  rt.persistence.append_workflow_event(
+                      actor_id,
+                      WorkflowEvent::StepCompleted {
+                          sequence,
+                          activation,
+                          step_name,
+                      },
+                  )?;
+                  try_checkpoint_actor(rt, actor_id)?;
+              }
+
+              rt.clear_terminal_workflow_activation(actor_id, activation);
+              Ok(())
+          }
+          '''
+          assert text.count(old_completed) == 1, text.count(old_completed)
+          text = text.replace(old_completed, new_completed)
+
+          old_failed = '''pub(crate) fn persist_step_failed(
+              rt: &mut Runtime,
+              actor_id: u64,
+              activation: Option<WorkflowActivationId>,
+              step_name: String,
+              error: String,
+          ) -> std::io::Result<()> {
+              if workflow_has_atomic_tail(rt, actor_id)? {
+                  return commit_step_failed(rt, actor_id, activation, step_name, error);
+              }
+
+              let sequence = next_sequence(rt, actor_id);
+              rt.persistence.append_workflow_event(
+                  actor_id,
+                  WorkflowEvent::StepFailed {
+                      sequence,
+                      activation,
+                      step_name,
+                      error,
+                  },
+              )?;
+              try_checkpoint_actor(rt, actor_id)
+          }
+          '''
+          new_failed = '''pub(crate) fn persist_step_failed(
+              rt: &mut Runtime,
+              actor_id: u64,
+              activation: Option<WorkflowActivationId>,
+              step_name: String,
+              error: String,
+          ) -> std::io::Result<()> {
+              if workflow_has_atomic_tail(rt, actor_id)? {
+                  commit_step_failed(rt, actor_id, activation, step_name, error)?;
+              } else {
+                  let sequence = next_sequence(rt, actor_id);
+                  rt.persistence.append_workflow_event(
+                      actor_id,
+                      WorkflowEvent::StepFailed {
+                          sequence,
+                          activation,
+                          step_name,
+                          error,
+                      },
+                  )?;
+                  try_checkpoint_actor(rt, actor_id)?;
+              }
+
+              rt.clear_terminal_workflow_activation(actor_id, activation);
+              Ok(())
+          }
+          '''
+          assert text.count(old_failed) == 1, text.count(old_failed)
+          workflow.write_text(text.replace(old_failed, new_failed))
+          PY
+
+          cargo fmt --all
+          git diff --check
+
+      - name: Verify focused regression gates
+        shell: bash
+        run: |
+          cargo test --locked --no-default-features --lib test_terminal_activation_cleanup_resets_replay_cursor
+          cargo test --locked --no-default-features --lib compiled_workflow
+          cargo test --locked --no-default-features --lib open_activation_intermediate_events_extend_atomic_tail
+          cargo build --locked --all-targets --no-default-features
+
+      - name: Commit source fix to PR branch
+        shell: bash
+        run: |
+          git config user.name 'nlc-ci'
+          git config user.email 'nlc-ci@users.noreply.github.com'
+          git add src/runtime/llm.rs src/runtime/mod.rs src/runtime/persistence.rs src/runtime/tests.rs src/runtime/workflow.rs
+          git diff --cached --check
+          git commit -m 'fix(workflow): clear terminal replay state after durable commit'
+          git push origin HEAD:fix/compiled-workflow-atomic-tail-20260930
