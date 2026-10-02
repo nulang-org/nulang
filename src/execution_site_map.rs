@@ -1,18 +1,20 @@
 //! Compiler-owned source links for semantic effect sites.
 //!
 //! Nulang already gives every effect operation a backend-independent semantic
-//! site identity and records the exact bytecode PC plus source-line table in
-//! `CodeModule`. This module turns that existing metadata into a small,
-//! versioned sidecar contract for Cloud/editor tooling. It deliberately does
-//! not invent a second identity scheme and does not make source locations part
-//! of semantic identity.
+//! site identity, and MIR retains source-line metadata independently of the
+//! eventual bytecode/WASM/native backend. This module turns those compiler-
+//! owned facts into a small versioned sidecar contract for Cloud/editor tooling.
+//! Source locations are presentation metadata only and never participate in
+//! semantic-site identity.
 
 use crate::artifact_identity::ArtifactIdentityManifest;
-use crate::bytecode::{CodeModule, OpCode};
 use crate::content_identity::{ArtifactId, SemanticId, SourceId};
+use crate::mir::{self, BlockId, RValue, Stmt};
+use crate::semantic_identity::{effect_sites_for_mir, EffectSiteOwnerKind as SemanticOwnerKind};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::{Component, Path};
 use std::str::FromStr;
 
 pub const EXECUTION_SITE_MAP_SCHEMA: &str = "nulang.execution-sites/v0alpha1";
@@ -33,27 +35,33 @@ pub struct ExecutionSiteMap {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionSite {
-    /// Artifact-local bytecode program counter. This is lookup metadata only;
-    /// it does not participate in semantic-site identity.
-    pub pc: usize,
-    /// Compiler-owned semantic effect-site digest, encoded as 64 lowercase
-    /// hexadecimal characters.
+    /// Compiler-owned backend-independent semantic effect-site digest.
     pub semantic_site_id: String,
+    pub owner_kind: ExecutionSiteOwnerKind,
+    pub owner_name: String,
     pub effect_operation: String,
-    /// One-indexed source line when debug/source metadata is available.
+    /// Zero-based occurrence among the same qualified operation in this owner.
+    pub operation_ordinal: u32,
+    /// One-indexed source line when MIR source metadata is available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionSiteOwnerKind {
+    Function,
+    Behavior,
+}
+
 impl ExecutionSiteMap {
-    /// Build a source-link map from compiler-owned artifact metadata.
+    /// Build a portable source-link map directly from backend-neutral MIR.
     ///
-    /// The semantic site ID is copied from `CodeModule::effect_sites`; source
-    /// lines are presentation metadata looked up through `CodeModule::line_at`.
-    /// The constructor fails closed if an effect-site entry points outside the
-    /// artifact or at a non-effect opcode.
-    pub fn from_code_module(
-        module: &CodeModule,
+    /// Semantic identities come exclusively from `effect_sites_for_mir`; this
+    /// module performs a parallel source-location walk only to attach line
+    /// metadata. Any disagreement between the two traversals fails closed.
+    pub fn from_mir_module(
+        module: &mir::Module,
         artifact: &ArtifactIdentityManifest,
         source_path: Option<String>,
     ) -> Result<Self, ExecutionSiteMapError> {
@@ -62,35 +70,40 @@ impl ExecutionSiteMap {
                 "module name must not be empty".to_string(),
             ));
         }
-        if source_path
-            .as_deref()
-            .is_some_and(|path| path.trim().is_empty())
-        {
-            return Err(ExecutionSiteMapError::InvalidSourcePath);
+        if let Some(path) = source_path.as_deref() {
+            validate_source_path(path)?;
         }
 
-        let mut sites = Vec::with_capacity(module.effect_sites.len());
-        for site in &module.effect_sites {
-            let instruction =
-                module
-                    .instructions
-                    .get(site.pc)
-                    .ok_or(ExecutionSiteMapError::InvalidSitePc {
-                        pc: site.pc,
-                        instruction_count: module.instructions.len(),
-                    })?;
-            if !matches!(
-                instruction.opcode,
-                OpCode::Perform | OpCode::PerformDirect | OpCode::PerformAsync
-            ) {
-                return Err(ExecutionSiteMapError::InvalidEffectOpcode { pc: site.pc });
+        let semantic_sites = effect_sites_for_mir(module);
+        let source_sites = source_sites_for_mir(module);
+        if semantic_sites.len() != source_sites.len() {
+            return Err(ExecutionSiteMapError::SiteMetadataCountMismatch {
+                semantic_sites: semantic_sites.len(),
+                source_sites: source_sites.len(),
+            });
+        }
+
+        let mut sites = Vec::with_capacity(semantic_sites.len());
+        for (index, (semantic, source)) in semantic_sites
+            .into_iter()
+            .zip(source_sites.into_iter())
+            .enumerate()
+        {
+            let owner_kind = owner_kind(semantic.owner_kind);
+            if owner_kind != source.owner_kind
+                || semantic.owner_name != source.owner_name
+                || semantic.effect_operation != source.effect_operation
+            {
+                return Err(ExecutionSiteMapError::SiteMetadataMismatch { index });
             }
 
             sites.push(ExecutionSite {
-                pc: site.pc,
-                semantic_site_id: hex::encode(site.id),
-                effect_operation: site.effect_operation.clone(),
-                line: module.line_at(site.pc),
+                semantic_site_id: semantic.id.to_hex(),
+                owner_kind,
+                owner_name: semantic.owner_name,
+                effect_operation: semantic.effect_operation,
+                operation_ordinal: semantic.operation_ordinal,
+                line: source.line,
             });
         }
 
@@ -108,7 +121,7 @@ impl ExecutionSiteMap {
         Ok(map)
     }
 
-    /// Serialize canonical human-readable JSON for sidecar/tooling use.
+    /// Serialize deterministic human-readable JSON for sidecar/tooling use.
     pub fn to_json(&self) -> Result<Vec<u8>, ExecutionSiteMapError> {
         let mut normalized = self.clone();
         normalized.normalize();
@@ -117,7 +130,8 @@ impl ExecutionSiteMap {
     }
 
     /// Parse untrusted site-map JSON and fail closed on malformed identities,
-    /// duplicate sites, invalid source locations, or an unsupported schema.
+    /// duplicate sites, unsafe source paths, invalid source locations, or an
+    /// unsupported schema.
     pub fn from_json(bytes: &[u8]) -> Result<Self, ExecutionSiteMapError> {
         let mut map: Self = serde_json::from_slice(bytes).map_err(ExecutionSiteMapError::from)?;
         map.normalize();
@@ -129,7 +143,8 @@ impl ExecutionSiteMap {
         for site in &mut self.sites {
             site.semantic_site_id.make_ascii_lowercase();
         }
-        self.sites.sort_by_key(|site| site.pc);
+        self.sites
+            .sort_by(|left, right| left.semantic_site_id.cmp(&right.semantic_site_id));
     }
 
     fn validate(&self) -> Result<(), ExecutionSiteMapError> {
@@ -149,28 +164,27 @@ impl ExecutionSiteMap {
                 "module name must not be empty".to_string(),
             ));
         }
-        if self
-            .source_path
-            .as_deref()
-            .is_some_and(|path| path.trim().is_empty())
-        {
-            return Err(ExecutionSiteMapError::InvalidSourcePath);
+        if let Some(path) = self.source_path.as_deref() {
+            validate_source_path(path)?;
         }
 
-        let mut pcs = BTreeSet::new();
         let mut ids = BTreeSet::new();
         for site in &self.sites {
-            if !pcs.insert(site.pc) {
-                return Err(ExecutionSiteMapError::DuplicatePc(site.pc));
-            }
             validate_site_id(&site.semantic_site_id)?;
             if !ids.insert(site.semantic_site_id.clone()) {
                 return Err(ExecutionSiteMapError::DuplicateSiteId(
                     site.semantic_site_id.clone(),
                 ));
             }
+            if site.owner_name.trim().is_empty() {
+                return Err(ExecutionSiteMapError::InvalidOwnerName(
+                    site.semantic_site_id.clone(),
+                ));
+            }
             if site.effect_operation.trim().is_empty() {
-                return Err(ExecutionSiteMapError::InvalidEffectOperation { pc: site.pc });
+                return Err(ExecutionSiteMapError::InvalidEffectOperation(
+                    site.semantic_site_id.clone(),
+                ));
             }
             if let Some(line) = site.line {
                 if line == 0 {
@@ -181,6 +195,86 @@ impl ExecutionSiteMap {
 
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceSite {
+    owner_kind: ExecutionSiteOwnerKind,
+    owner_name: String,
+    effect_operation: String,
+    line: Option<u32>,
+}
+
+fn source_sites_for_mir(module: &mir::Module) -> Vec<SourceSite> {
+    let mut sites = Vec::new();
+    for function in &module.functions {
+        collect_source_sites(
+            &mut sites,
+            ExecutionSiteOwnerKind::Function,
+            function,
+        );
+    }
+    for behavior in &module.behaviors {
+        collect_source_sites(
+            &mut sites,
+            ExecutionSiteOwnerKind::Behavior,
+            behavior,
+        );
+    }
+    sites
+}
+
+fn collect_source_sites(
+    out: &mut Vec<SourceSite>,
+    owner_kind: ExecutionSiteOwnerKind,
+    function: &mir::Function,
+) {
+    let line_table: BTreeMap<(BlockId, usize), u32> =
+        function.line_table.iter().copied().collect();
+
+    for block in &function.blocks {
+        for (stmt_index, stmt) in block.stmts.iter().enumerate() {
+            let Stmt::Assign { op, .. } = stmt else {
+                continue;
+            };
+            let effect_operation = match op {
+                RValue::Perform { effect, op, .. } => format!("{effect}.{op}"),
+                RValue::PerformAsync { effect_op, .. } => effect_op.clone(),
+                _ => continue,
+            };
+            out.push(SourceSite {
+                owner_kind,
+                owner_name: function.name.clone(),
+                effect_operation,
+                line: line_table.get(&(block.id, stmt_index)).copied(),
+            });
+        }
+    }
+}
+
+fn owner_kind(kind: SemanticOwnerKind) -> ExecutionSiteOwnerKind {
+    match kind {
+        SemanticOwnerKind::Function => ExecutionSiteOwnerKind::Function,
+        SemanticOwnerKind::Behavior => ExecutionSiteOwnerKind::Behavior,
+    }
+}
+
+fn validate_source_path(value: &str) -> Result<(), ExecutionSiteMapError> {
+    if value.trim().is_empty() {
+        return Err(ExecutionSiteMapError::InvalidSourcePath(value.to_string()));
+    }
+    let path = Path::new(value);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ExecutionSiteMapError::InvalidSourcePath(value.to_string()));
+    }
+    Ok(())
 }
 
 fn parse_identity<T>(field: &'static str, value: &str) -> Result<T, ExecutionSiteMapError>
@@ -216,19 +310,17 @@ pub enum ExecutionSiteMapError {
         message: String,
     },
     InvalidModule(String),
-    InvalidSourcePath,
-    InvalidSitePc {
-        pc: usize,
-        instruction_count: usize,
+    InvalidSourcePath(String),
+    SiteMetadataCountMismatch {
+        semantic_sites: usize,
+        source_sites: usize,
     },
-    InvalidEffectOpcode {
-        pc: usize,
+    SiteMetadataMismatch {
+        index: usize,
     },
-    InvalidEffectOperation {
-        pc: usize,
-    },
+    InvalidOwnerName(String),
+    InvalidEffectOperation(String),
     InvalidSiteId(String),
-    DuplicatePc(usize),
     DuplicateSiteId(String),
     InvalidLine(u32),
 }
@@ -244,25 +336,24 @@ impl fmt::Display for ExecutionSiteMapError {
                 write!(f, "invalid {field} in execution-site map: {message}")
             }
             Self::InvalidModule(message) => write!(f, "invalid module: {message}"),
-            Self::InvalidSourcePath => write!(f, "source path must not be empty"),
-            Self::InvalidSitePc {
-                pc,
-                instruction_count,
+            Self::InvalidSourcePath(path) => {
+                write!(f, "source path must be safe and package-relative: {path}")
+            }
+            Self::SiteMetadataCountMismatch {
+                semantic_sites,
+                source_sites,
             } => write!(
                 f,
-                "execution site pc {pc} is outside artifact instruction count {instruction_count}"
+                "semantic/source effect-site counts differ: {semantic_sites} vs {source_sites}"
             ),
-            Self::InvalidEffectOpcode { pc } => {
-                write!(
-                    f,
-                    "execution site pc {pc} does not point at an effect opcode"
-                )
+            Self::SiteMetadataMismatch { index } => {
+                write!(f, "semantic/source effect-site metadata differs at index {index}")
             }
-            Self::InvalidEffectOperation { pc } => {
-                write!(f, "execution site pc {pc} has an empty effect operation")
+            Self::InvalidOwnerName(id) => write!(f, "execution site {id} has an empty owner name"),
+            Self::InvalidEffectOperation(id) => {
+                write!(f, "execution site {id} has an empty effect operation")
             }
             Self::InvalidSiteId(id) => write!(f, "invalid semantic execution-site id {id}"),
-            Self::DuplicatePc(pc) => write!(f, "duplicate execution site pc {pc}"),
             Self::DuplicateSiteId(id) => write!(f, "duplicate semantic execution-site id {id}"),
             Self::InvalidLine(line) => write!(f, "source lines are one-indexed; got {line}"),
         }
@@ -281,41 +372,48 @@ impl From<serde_json::Error> for ExecutionSiteMapError {
 mod tests {
     use super::*;
     use crate::artifact_identity::ArtifactIdentityManifest;
-    use crate::bytecode::{EffectSiteMetadata, Instruction, OpCode};
     use crate::content_identity::{SemanticId, SourceId};
+    use crate::mir::{FunctionBuilder, Module, RValue, Terminator};
+    use crate::semantic_identity::effect_sites_for_mir;
+    use crate::types::Type;
 
     fn artifact() -> ArtifactIdentityManifest {
         ArtifactIdentityManifest::new(
             Some(SourceId::from_bytes(b"perform Payments.charge(amount)")),
             SemanticId::from_canonical_bytes(b"orders-semantic", []),
             "nulang-test",
-            "test-target",
+            "wasm32-wasip2",
             "abi-v1",
-            "bytecode",
+            "wasm",
             std::iter::empty::<&str>(),
         )
     }
 
-    fn code_module(opcode: OpCode) -> CodeModule {
-        let mut module = CodeModule::new("orders");
-        module.instructions = vec![
-            Instruction::new0(OpCode::Move),
-            Instruction::new0(OpCode::Move),
-            Instruction::new0(opcode),
-        ];
-        module.line_table = vec![(0, 10), (2, 12)];
-        module.effect_sites = vec![EffectSiteMetadata {
-            pc: 2,
-            id: [0xab; 32],
-            effect_operation: "Payments.charge".to_string(),
-        }];
+    fn mir_module(line: u32) -> Module {
+        let mut function = FunctionBuilder::new("checkout", None);
+        let dst = function.add_temp(Type::int());
+        function.set_line(line);
+        function.assign(
+            dst,
+            RValue::PerformAsync {
+                effect_op: "Payments.charge".to_string(),
+                args: Vec::new(),
+                resolved_handler: None,
+            },
+        );
+        function.terminate(Terminator::Return(None));
+
+        let mut module = Module::new("orders");
+        module.functions.push(function.build());
         module
     }
 
     #[test]
-    fn maps_existing_semantic_effect_site_to_source_line() {
-        let map = ExecutionSiteMap::from_code_module(
-            &code_module(OpCode::PerformAsync),
+    fn maps_backend_independent_semantic_site_to_source_line() {
+        let module = mir_module(12);
+        let expected_id = effect_sites_for_mir(&module)[0].id.to_hex();
+        let map = ExecutionSiteMap::from_mir_module(
+            &module,
             &artifact(),
             Some("src/orders.nula".to_string()),
         )
@@ -325,35 +423,48 @@ mod tests {
         assert_eq!(map.module, "orders");
         assert_eq!(map.source_path.as_deref(), Some("src/orders.nula"));
         assert_eq!(map.sites.len(), 1);
-        assert_eq!(map.sites[0].pc, 2);
+        assert_eq!(map.sites[0].semantic_site_id, expected_id);
+        assert_eq!(map.sites[0].owner_kind, ExecutionSiteOwnerKind::Function);
+        assert_eq!(map.sites[0].owner_name, "checkout");
         assert_eq!(map.sites[0].effect_operation, "Payments.charge");
+        assert_eq!(map.sites[0].operation_ordinal, 0);
         assert_eq!(map.sites[0].line, Some(12));
-        assert_eq!(map.sites[0].semantic_site_id, "ab".repeat(32));
     }
 
     #[test]
-    fn rejects_metadata_that_points_at_a_non_effect_opcode() {
-        let error =
-            ExecutionSiteMap::from_code_module(&code_module(OpCode::Move), &artifact(), None)
-                .expect_err("invalid site metadata must fail closed");
+    fn source_line_changes_do_not_change_semantic_site_identity() {
+        let first = ExecutionSiteMap::from_mir_module(&mir_module(12), &artifact(), None).unwrap();
+        let second = ExecutionSiteMap::from_mir_module(&mir_module(99), &artifact(), None).unwrap();
 
-        assert_eq!(error, ExecutionSiteMapError::InvalidEffectOpcode { pc: 2 });
+        assert_eq!(first.sites[0].semantic_site_id, second.sites[0].semantic_site_id);
+        assert_eq!(first.sites[0].line, Some(12));
+        assert_eq!(second.sites[0].line, Some(99));
     }
 
     #[test]
-    fn legacy_artifact_without_effect_sites_produces_empty_map() {
-        let mut module = CodeModule::new("legacy");
-        module.instructions.push(Instruction::new0(OpCode::Ret));
-
-        let map = ExecutionSiteMap::from_code_module(&module, &artifact(), None)
-            .expect("missing additive metadata is backward compatible");
+    fn module_without_effect_sites_produces_empty_map() {
+        let module = Module::new("legacy");
+        let map = ExecutionSiteMap::from_mir_module(&module, &artifact(), None)
+            .expect("no effect sites is a valid map");
         assert!(map.sites.is_empty());
     }
 
     #[test]
+    fn rejects_parent_traversal_source_path() {
+        let error = ExecutionSiteMap::from_mir_module(
+            &mir_module(12),
+            &artifact(),
+            Some("../orders.nula".to_string()),
+        )
+        .expect_err("source paths must be package-relative");
+
+        assert!(matches!(error, ExecutionSiteMapError::InvalidSourcePath(_)));
+    }
+
+    #[test]
     fn json_roundtrip_is_deterministic() {
-        let map = ExecutionSiteMap::from_code_module(
-            &code_module(OpCode::PerformAsync),
+        let map = ExecutionSiteMap::from_mir_module(
+            &mir_module(12),
             &artifact(),
             Some("src/orders.nula".to_string()),
         )
@@ -369,14 +480,10 @@ mod tests {
 
     #[test]
     fn json_parser_rejects_duplicate_semantic_site_ids() {
-        let mut map = ExecutionSiteMap::from_code_module(
-            &code_module(OpCode::PerformAsync),
-            &artifact(),
-            None,
-        )
-        .unwrap();
+        let mut map =
+            ExecutionSiteMap::from_mir_module(&mir_module(12), &artifact(), None).unwrap();
         let mut duplicate = map.sites[0].clone();
-        duplicate.pc = 1;
+        duplicate.owner_name = "other".to_string();
         map.sites.push(duplicate);
         let bytes = serde_json::to_vec(&map).unwrap();
 
@@ -388,16 +495,31 @@ mod tests {
 
     #[test]
     fn parser_normalizes_uppercase_site_ids() {
-        let map = ExecutionSiteMap::from_code_module(
-            &code_module(OpCode::PerformAsync),
-            &artifact(),
-            None,
-        )
-        .unwrap();
+        let map = ExecutionSiteMap::from_mir_module(&mir_module(12), &artifact(), None).unwrap();
         let mut value = serde_json::to_value(map).unwrap();
-        value["sites"][0]["semantic_site_id"] = serde_json::Value::String("AB".repeat(32));
+        let id = value["sites"][0]["semantic_site_id"]
+            .as_str()
+            .unwrap()
+            .to_ascii_uppercase();
+        value["sites"][0]["semantic_site_id"] = serde_json::Value::String(id);
 
         let parsed = ExecutionSiteMap::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
-        assert_eq!(parsed.sites[0].semantic_site_id, "ab".repeat(32));
+        assert!(parsed.sites[0]
+            .semantic_site_id
+            .bytes()
+            .all(|byte| !byte.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn parser_rejects_malformed_site_id() {
+        let map = ExecutionSiteMap::from_mir_module(&mir_module(12), &artifact(), None).unwrap();
+        let mut value = serde_json::to_value(map).unwrap();
+        value["sites"][0]["semantic_site_id"] =
+            serde_json::Value::String("not-a-site-id".to_string());
+
+        assert!(matches!(
+            ExecutionSiteMap::from_json(&serde_json::to_vec(&value).unwrap()),
+            Err(ExecutionSiteMapError::InvalidSiteId(_))
+        ));
     }
 }
