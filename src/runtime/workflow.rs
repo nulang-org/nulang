@@ -30,10 +30,21 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
         .unwrap_or(false)
 }
 
-fn current_workflow_replay_id(
-    rt: &mut Runtime,
-    actor_id: u64,
-) -> Option<WorkflowReplayEventId> {
+/// Return whether this actor has already entered RFC 0022 atomic history.
+///
+/// Unsupported backends are intentionally treated as legacy-only. Any other
+/// storage error is propagated so callers do not silently cross persistence
+/// modes after an atomic tail has begun.
+pub(crate) fn workflow_has_atomic_tail(rt: &Runtime, actor_id: u64) -> std::io::Result<bool> {
+    match rt.persistence.load_durable_tail_position(actor_id) {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn current_workflow_replay_id(rt: &mut Runtime, actor_id: u64) -> Option<WorkflowReplayEventId> {
     let actor = rt.actors.get_mut(&actor_id)?;
     let activation = actor.current_workflow_activation?;
 
@@ -48,11 +59,7 @@ fn current_workflow_replay_id(
     ))
 }
 
-fn advance_workflow_replay_id(
-    rt: &mut Runtime,
-    actor_id: u64,
-    committed: WorkflowReplayEventId,
-) {
+fn advance_workflow_replay_id(rt: &mut Runtime, actor_id: u64, committed: WorkflowReplayEventId) {
     let Some(actor) = rt.actors.get_mut(&actor_id) else {
         return;
     };
@@ -211,6 +218,78 @@ fn build_actor_snapshot_at_sequence(
     }))
 }
 
+/// Commit exactly one workflow event as the next RFC 0022 transition.
+///
+/// Intermediate activation records pass `snapshot_state = false` so the last
+/// completed-state snapshot remains replay-safe. Terminal/post-terminal records
+/// that establish a safe state boundary pass `true`.
+fn commit_workflow_event_transition(
+    rt: &mut Runtime,
+    actor_id: u64,
+    snapshot_state: bool,
+    build_event: impl FnOnce(u64) -> WorkflowEvent,
+) -> std::io::Result<()> {
+    let expected_previous_sequence = rt.persistence.latest_sequence(actor_id);
+    let sequence = expected_previous_sequence.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "workflow transition sequence overflow",
+        )
+    })?;
+    let snapshot = if snapshot_state {
+        Some(
+            build_actor_snapshot_at_sequence(rt, actor_id, sequence)?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "workflow transition requires a live persistent actor",
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+    let activation_epoch = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.activation_epoch)
+        .or_else(|| {
+            rt.actors
+                .get(&actor_id)
+                .filter(|actor| actor.persistent)
+                .map(|actor| actor.activation_epoch)
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "workflow transition requires a live persistent actor",
+            )
+        })?;
+
+    rt.persistence.commit_transition(DurableTransition {
+        version: DURABLE_TRANSITION_VERSION,
+        actor_id,
+        activation_epoch,
+        sequence,
+        expected_previous_sequence,
+        command: None,
+        snapshot: snapshot.clone(),
+        workflow_events: vec![build_event(sequence)],
+        domain_events: vec![],
+        durable_effects: vec![],
+        outbox: vec![],
+    })?;
+
+    if let Some(snapshot) = snapshot.as_ref() {
+        rt.maybe_shadow_replicate(actor_id, snapshot);
+    }
+    if let Some(actor) = rt.actors.get_mut(&actor_id) {
+        actor.sequence = sequence;
+        if snapshot_state {
+            actor.dirty_fields.clear();
+        }
+    }
+    Ok(())
+}
+
 /// Persist one checkpoint for a durable actor.
 ///
 /// Unlike the compatibility wrapper below, this function is fallible. Callers
@@ -218,6 +297,13 @@ fn build_actor_snapshot_at_sequence(
 /// commits, signals, compensation) must use this path so storage failure cannot
 /// be mistaken for a committed transition.
 pub(crate) fn try_checkpoint_actor(rt: &mut Runtime, actor_id: u64) -> std::io::Result<()> {
+    if actor_is_workflow(rt, actor_id) && workflow_has_atomic_tail(rt, actor_id)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "legacy workflow checkpoint is forbidden after the RFC 0022 atomic tail begins",
+        ));
+    }
+
     let sequence = next_sequence(rt, actor_id);
     let Some(snapshot) = build_actor_snapshot_at_sequence(rt, actor_id, sequence)? else {
         return Ok(());
@@ -305,45 +391,102 @@ pub(crate) fn commit_step_completed(
     activation: Option<WorkflowActivationId>,
     step_name: String,
 ) -> std::io::Result<()> {
-    let expected_previous_sequence = rt.persistence.latest_sequence(actor_id);
-    let sequence = expected_previous_sequence.checked_add(1).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "workflow terminal transition sequence overflow",
-        )
-    })?;
-    let snapshot = build_actor_snapshot_at_sequence(rt, actor_id, sequence)?.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "workflow terminal transition requires a live persistent actor",
-        )
-    })?;
-    let activation_epoch = snapshot.activation_epoch;
-
-    rt.persistence.commit_transition(DurableTransition {
-        version: DURABLE_TRANSITION_VERSION,
-        actor_id,
-        activation_epoch,
-        sequence,
-        expected_previous_sequence,
-        command: None,
-        snapshot: Some(snapshot.clone()),
-        workflow_events: vec![WorkflowEvent::StepCompleted {
+    commit_workflow_event_transition(rt, actor_id, true, |sequence| {
+        WorkflowEvent::StepCompleted {
             sequence,
             activation,
             step_name,
-        }],
-        domain_events: vec![],
-        durable_effects: vec![],
-        outbox: vec![],
-    })?;
+        }
+    })
+}
 
-    rt.maybe_shadow_replicate(actor_id, &snapshot);
-    if let Some(actor) = rt.actors.get_mut(&actor_id) {
-        actor.sequence = sequence;
-        actor.dirty_fields.clear();
+/// Atomically close a failed workflow activation together with the durable
+/// state visible at the failure boundary.
+pub(crate) fn commit_step_failed(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<WorkflowActivationId>,
+    step_name: String,
+    error: String,
+) -> std::io::Result<()> {
+    commit_workflow_event_transition(rt, actor_id, true, |sequence| WorkflowEvent::StepFailed {
+        sequence,
+        activation,
+        step_name,
+        error,
+    })
+}
+
+/// Persist successful workflow completion without crossing persistence modes.
+pub(crate) fn persist_step_completed(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<WorkflowActivationId>,
+    step_name: String,
+) -> std::io::Result<()> {
+    if workflow_has_atomic_tail(rt, actor_id)? {
+        commit_step_completed(rt, actor_id, activation, step_name)?;
+        rt.clear_terminal_workflow_activation(actor_id, activation);
+        return Ok(());
     }
+
+    let sequence = next_sequence(rt, actor_id);
+    rt.persistence.append_workflow_event(
+        actor_id,
+        WorkflowEvent::StepCompleted {
+            sequence,
+            activation,
+            step_name,
+        },
+    )?;
+    try_checkpoint_actor(rt, actor_id)?;
+    rt.clear_terminal_workflow_activation(actor_id, activation);
     Ok(())
+}
+
+/// Persist failed workflow completion without crossing persistence modes.
+pub(crate) fn persist_step_failed(
+    rt: &mut Runtime,
+    actor_id: u64,
+    activation: Option<WorkflowActivationId>,
+    step_name: String,
+    error: String,
+) -> std::io::Result<()> {
+    if workflow_has_atomic_tail(rt, actor_id)? {
+        commit_step_failed(rt, actor_id, activation, step_name, error)?;
+        rt.clear_terminal_workflow_activation(actor_id, activation);
+        return Ok(());
+    }
+
+    let sequence = next_sequence(rt, actor_id);
+    rt.persistence.append_workflow_event(
+        actor_id,
+        WorkflowEvent::StepFailed {
+            sequence,
+            activation,
+            step_name,
+            error,
+        },
+    )?;
+    try_checkpoint_actor(rt, actor_id)?;
+    rt.clear_terminal_workflow_activation(actor_id, activation);
+    Ok(())
+}
+
+/// Commit a nonterminal workflow event without moving the completed-state
+/// snapshot. Once an atomic tail exists, legacy append APIs are forbidden.
+fn commit_intermediate_workflow_event(
+    rt: &mut Runtime,
+    actor_id: u64,
+    build_event: impl FnOnce(u64) -> WorkflowEvent,
+) -> std::io::Result<()> {
+    if workflow_has_atomic_tail(rt, actor_id)? {
+        commit_workflow_event_transition(rt, actor_id, false, build_event)
+    } else {
+        let sequence = next_sequence(rt, actor_id);
+        rt.persistence
+            .append_workflow_event(actor_id, build_event(sequence))
+    }
 }
 
 /// Snapshot the durable and CRDT state of a persistent actor.
@@ -385,7 +528,12 @@ fn resolve_string_constant(rt: &Runtime, actor_id: u64, value: &Value) -> Option
 /// actors this appends to the durable journal and forces a checkpoint. For
 /// event-sourced (non-workflow) actors the event is persisted to the event
 /// journal and a checkpoint is forced.
-pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[Value]) {
+pub(crate) fn emit_event(
+    rt: &mut Runtime,
+    actor_id: u64,
+    event: &str,
+    args: &[Value],
+) -> std::io::Result<()> {
     let is_workflow = actor_is_workflow(rt, actor_id);
     let seq = next_sequence(rt, actor_id);
     if let Some(actor) = rt.actors.get_mut(&actor_id) {
@@ -436,12 +584,14 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
             let parallel_step_name =
                 resolve_string_constant(rt, actor_id, &args[0]).unwrap_or_default();
             let branch_name = resolve_string_constant(rt, actor_id, &args[1]).unwrap_or_default();
-            let _ = rt.persistence.append_parallel_branch_completed(
-                actor_id,
-                seq,
-                parallel_step_name,
-                branch_name,
-            );
+            let atomic_tail = workflow_has_atomic_tail(rt, actor_id)?;
+            commit_intermediate_workflow_event(rt, actor_id, |sequence| {
+                WorkflowEvent::ParallelBranchCompleted {
+                    sequence,
+                    parallel_step_name,
+                    branch_name,
+                }
+            })?;
             if let Some(actor) = rt.actors.get_mut(&actor_id) {
                 let current = actor
                     .get_state_field("parallel_progress")
@@ -449,7 +599,9 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                     .unwrap_or(0);
                 actor.set_state_field("parallel_progress", Value::int(current + 1));
             }
-            checkpoint_actor(rt, actor_id);
+            if !atomic_tail {
+                try_checkpoint_actor(rt, actor_id)?;
+            }
         } else {
             let module = rt
                 .actors
@@ -467,57 +619,52 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                         advance_workflow_replay_id(rt, actor_id, replay_id);
                     }
                     ReplayDisposition::Conflict => {
-                        tracing::error!(
-                            actor_id,
-                            activation_actor_id = replay_id.activation.actor_id,
-                            activation_command_sequence = replay_id.activation.command_sequence,
-                            ordinal = replay_id.ordinal,
-                            event,
-                            "nulang-workflow: replay identity conflicts with committed custom event; refusing durable mutation"
-                        );
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "workflow replay identity conflicts with committed custom event: activation {}:{} ordinal {} event {}",
+                                replay_id.activation.actor_id,
+                                replay_id.activation.command_sequence,
+                                replay_id.ordinal,
+                                event
+                            ),
+                        ));
                     }
                     ReplayDisposition::Append => {
-                        let appended = rt
-                            .persistence
-                            .append_workflow_event(
-                                actor_id,
-                                WorkflowEvent::Custom {
-                                    sequence: seq,
-                                    replay_id: Some(replay_id),
-                                    name: event.to_string(),
-                                    args: payload,
-                                },
-                            )
-                            .is_ok();
-                        if appended {
-                            // This event belongs to an open activation. Keep the
-                            // last completed snapshot unchanged so recovery can
-                            // re-execute the command and consume this exact
-                            // replay identity instead of treating partial state
-                            // as completed progress.
-                            advance_workflow_replay_id(rt, actor_id, replay_id);
-                        }
+                        commit_intermediate_workflow_event(rt, actor_id, |sequence| {
+                            WorkflowEvent::Custom {
+                                sequence,
+                                replay_id: Some(replay_id),
+                                name: event.to_string(),
+                                args: payload,
+                            }
+                        })?;
+                        // This event belongs to an open activation. Keep the
+                        // last completed snapshot unchanged so recovery can
+                        // re-execute the command and consume this exact
+                        // replay identity instead of treating partial state
+                        // as completed progress.
+                        advance_workflow_replay_id(rt, actor_id, replay_id);
                     }
                 }
             } else {
-                should_checkpoint = rt
-                    .persistence
-                    .append_workflow_event(
-                        actor_id,
-                        WorkflowEvent::Custom {
-                            sequence: seq,
-                            replay_id: None,
-                            name: event.to_string(),
-                            args: payload,
-                        },
-                    )
-                    .is_ok();
+                let atomic_tail = workflow_has_atomic_tail(rt, actor_id)?;
+                commit_intermediate_workflow_event(rt, actor_id, |sequence| {
+                    WorkflowEvent::Custom {
+                        sequence,
+                        replay_id: None,
+                        name: event.to_string(),
+                        args: payload,
+                    }
+                })?;
+                should_checkpoint = !atomic_tail;
             }
             if should_checkpoint {
-                checkpoint_actor(rt, actor_id);
+                try_checkpoint_actor(rt, actor_id)?;
             }
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -548,16 +695,14 @@ pub(crate) fn append_timer_set(
                 ));
             }
             ReplayDisposition::Append => {
-                let seq = next_sequence(rt, actor_id);
-                rt.persistence.append_workflow_event(
-                    actor_id,
+                commit_intermediate_workflow_event(rt, actor_id, |sequence| {
                     WorkflowEvent::TimerSet {
-                        sequence: seq,
+                        sequence,
                         replay_id: Some(replay_id),
                         name: name.to_string(),
                         duration_ms,
-                    },
-                )?;
+                    }
+                })?;
                 // TimerSet is an intermediate record for an open activation.
                 // Keep the last completed snapshot unchanged so crash recovery
                 // re-executes the command and consumes this exact identity.
@@ -565,6 +710,18 @@ pub(crate) fn append_timer_set(
                 return Ok(true);
             }
         }
+    }
+
+    if workflow_has_atomic_tail(rt, actor_id)? {
+        commit_workflow_event_transition(rt, actor_id, false, |sequence| {
+            WorkflowEvent::TimerSet {
+                sequence,
+                replay_id: None,
+                name: name.to_string(),
+                duration_ms,
+            }
+        })?;
+        return Ok(true);
     }
 
     let seq = next_sequence(rt, actor_id);
@@ -579,6 +736,15 @@ pub(crate) fn append_timer_fired(
     actor_id: u64,
     name: &str,
 ) -> std::io::Result<()> {
+    if workflow_has_atomic_tail(rt, actor_id)? {
+        return commit_workflow_event_transition(rt, actor_id, false, |sequence| {
+            WorkflowEvent::TimerFired {
+                sequence,
+                name: name.to_string(),
+            }
+        });
+    }
+
     let seq = next_sequence(rt, actor_id);
     rt.persistence
         .append_timer_fired(actor_id, seq, name.to_string())?;
@@ -592,6 +758,19 @@ pub(crate) fn append_signal_received(
     name: &str,
     payload: Option<String>,
 ) -> std::io::Result<()> {
+    if workflow_has_atomic_tail(rt, actor_id)? {
+        // SignalReceived is replay history, not a completed-state boundary.
+        // The suspended activation will either resume and close atomically or
+        // recover from the prior safe snapshot and consume the signal event.
+        return commit_workflow_event_transition(rt, actor_id, false, |sequence| {
+            WorkflowEvent::SignalReceived {
+                sequence,
+                name: name.to_string(),
+                payload,
+            }
+        });
+    }
+
     let seq = next_sequence(rt, actor_id);
     rt.persistence
         .append_signal_received(actor_id, seq, name.to_string(), payload)?;
@@ -619,6 +798,18 @@ pub(crate) fn append_saga_compensated(
     actor_id: u64,
     step_name: &str,
 ) -> std::io::Result<()> {
+    if workflow_has_atomic_tail(rt, actor_id)? {
+        // Compensation runs after the failed activation is terminal. Its state
+        // mutation and SagaCompensated marker therefore form a new safe
+        // post-terminal boundary and may advance the snapshot atomically.
+        return commit_workflow_event_transition(rt, actor_id, true, |sequence| {
+            WorkflowEvent::SagaCompensated {
+                sequence,
+                step_name: step_name.to_string(),
+            }
+        });
+    }
+
     let seq = next_sequence(rt, actor_id);
     rt.persistence
         .append_saga_compensated(actor_id, seq, step_name.to_string())?;

@@ -3973,7 +3973,11 @@ fn test_custom_workflow_replay_consumes_matching_committed_event() {
         .into_iter()
         .filter(|event| matches!(event, WorkflowEvent::Custom { .. }))
         .collect();
-    assert_eq!(custom.len(), 1, "replay must consume the committed event instead of appending a duplicate");
+    assert_eq!(
+        custom.len(),
+        1,
+        "replay must consume the committed event instead of appending a duplicate"
+    );
     assert_eq!(
         rt.actors
             .get(&actor_id)
@@ -4011,7 +4015,11 @@ fn test_custom_workflow_replay_rejects_conflicting_committed_event_identity() {
         .into_iter()
         .filter(|event| matches!(event, WorkflowEvent::Custom { .. }))
         .collect();
-    assert_eq!(custom.len(), 1, "a conflicting replay identity must not mutate durable history");
+    assert_eq!(
+        custom.len(),
+        1,
+        "a conflicting replay identity must not mutate durable history"
+    );
     assert_eq!(
         rt.actors
             .get(&actor_id)
@@ -4122,7 +4130,8 @@ fn test_committed_custom_event_keeps_pre_command_snapshot_safe_for_replay() {
         })
         .collect();
     assert_eq!(
-        matching.len(), 1,
+        matching.len(),
+        1,
         "recovery replay must consume the already-committed custom event without duplicating it"
     );
 }
@@ -4205,7 +4214,8 @@ fn test_timer_set_replay_consumes_matching_committed_preparation() {
 #[test]
 fn test_timer_set_replay_rejects_cross_type_identity_collision() {
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_workflow_actor("ReplayTimerConflict", Box::new(Vec::new), HashMap::new());
+    let actor_id =
+        rt.spawn_workflow_actor("ReplayTimerConflict", Box::new(Vec::new), HashMap::new());
     let activation = WorkflowActivationId::new(actor_id, 91);
 
     rt.actors
@@ -4308,7 +4318,9 @@ fn test_signal_received_during_open_activation_keeps_safe_snapshot() {
         "recovery must keep the interrupted command activation open"
     );
     assert_eq!(
-        actor.get_state_field("count").and_then(|value| value.as_int()),
+        actor
+            .get_state_field("count")
+            .and_then(|value| value.as_int()),
         Some(0),
         "recovery must restart from the last completed state"
     );
@@ -4317,6 +4329,438 @@ fn test_signal_received_during_open_activation_keeps_safe_snapshot() {
             name == "go" && payload.as_deref() == Some("resume")
         }),
         "the durable SignalReceived event must replay even though the safe snapshot stays unchanged"
+    );
+}
+
+#[test]
+fn test_compiled_workflow_turn_closes_on_atomic_tail() {
+    use crate::bytecode::{Instruction, OpCode};
+
+    let mut rt = Runtime::new();
+    let actor_id =
+        rt.spawn_workflow_actor("CompiledAtomicTail", Box::new(Vec::new), HashMap::new());
+
+    let mut module = CodeModule::new("compiled-atomic-tail");
+    module.emit(Instruction::new0(OpCode::Ret));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.layout_workflow_behavior_table(actor_id);
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    rt.send_message_by_id(actor_id, 0, &[]);
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    let tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .expect("compiled workflow command and completion must use RFC 0022 transitions");
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    let journal = rt.persistence.read_journal(actor_id);
+    let completed = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .find_map(|event| match event {
+            WorkflowEvent::StepCompleted {
+                sequence,
+                activation,
+                ..
+            } => Some((sequence, activation)),
+            _ => None,
+        })
+        .expect("compiled workflow turn must record StepCompleted");
+
+    assert_eq!(journal.len(), 1);
+    let activation = WorkflowActivationId::new(actor_id, journal[0].sequence);
+    assert_eq!(completed.1, Some(activation));
+    assert_eq!(completed.0, tail.sequence);
+    assert_eq!(snapshot.sequence, tail.sequence);
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        tail.sequence,
+        "compiled workflow completion must not leave any legacy-only sequence beyond the atomic tail"
+    );
+}
+
+#[test]
+fn test_compiled_workflow_failure_closes_on_atomic_tail() {
+    use crate::bytecode::{Instruction, OpCode};
+
+    let mut rt = Runtime::new();
+    let actor_id =
+        rt.spawn_workflow_actor("CompiledAtomicFailure", Box::new(Vec::new), HashMap::new());
+
+    let mut module = CodeModule::new("compiled-atomic-failure");
+    let message = module.add_constant(Constant::String("boom".to_string()));
+    module.emit(Instruction::new3(
+        OpCode::ConstU,
+        ((message >> 8) & 0xFF) as u8,
+        (message & 0xFF) as u8,
+        0,
+    ));
+    module.emit(Instruction::new0(OpCode::Panic));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.layout_workflow_behavior_table(actor_id);
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    rt.send_message_by_id(actor_id, 0, &[]);
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    let journal = rt.persistence.read_journal(actor_id);
+    assert_eq!(journal.len(), 1);
+    let activation = WorkflowActivationId::new(actor_id, journal[0].sequence);
+    let failed = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .find_map(|event| match event {
+            WorkflowEvent::StepFailed {
+                sequence,
+                activation,
+                ..
+            } => Some((sequence, activation)),
+            _ => None,
+        })
+        .expect("failing compiled workflow must record StepFailed");
+
+    let tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert_eq!(failed.1, Some(activation));
+    assert_eq!(failed.0, tail.sequence);
+    assert_eq!(snapshot.sequence, tail.sequence);
+    assert_eq!(rt.persistence.latest_sequence(actor_id), tail.sequence);
+}
+
+#[test]
+fn test_compiled_workflow_keeps_legacy_path_on_store_without_atomic_transitions() {
+    use crate::bytecode::{Instruction, OpCode};
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "nulang-compiled-workflow-legacy-{}-{nonce}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&path);
+
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(JsonFileStore::new(&path).unwrap());
+    let actor_id =
+        rt.spawn_workflow_actor("CompiledLegacyFallback", Box::new(Vec::new), HashMap::new());
+
+    let mut module = CodeModule::new("compiled-legacy-fallback");
+    module.emit(Instruction::new0(OpCode::Ret));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.layout_workflow_behavior_table(actor_id);
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    rt.send_message_by_id(actor_id, 0, &[]);
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    assert!(
+        rt.persistence
+            .load_durable_tail_position(actor_id)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::Unsupported),
+        "JSON persistence must remain explicitly legacy-only"
+    );
+    assert_eq!(rt.persistence.read_journal(actor_id).len(), 1);
+    assert!(
+        rt.persistence
+            .read_workflow_events(actor_id)
+            .iter()
+            .any(|event| matches!(event, WorkflowEvent::StepCompleted { .. })),
+        "compiled workflow must still complete through the pre-atomic compatibility path"
+    );
+
+    let _ = std::fs::remove_dir_all(path);
+}
+
+#[test]
+fn test_legacy_checkpoint_is_rejected_after_atomic_workflow_tail_begins() {
+    let mut rt = Runtime::new();
+    let actor_id =
+        rt.spawn_workflow_actor("RejectLegacyCheckpoint", Box::new(Vec::new), HashMap::new());
+    declare_test_behavior(&mut rt, actor_id, "run");
+    let behavior_id = rt.behavior_id_for(actor_id, "run").unwrap();
+    let safe_snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+
+    let activation =
+        workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new()).unwrap();
+    let tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(tail.sequence, activation.command_sequence);
+
+    let error = workflow::try_checkpoint_actor(&mut rt, actor_id)
+        .expect_err("legacy checkpoint must be fenced once RFC 0022 history begins");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        rt.persistence.load_snapshot(actor_id).unwrap().sequence,
+        safe_snapshot.sequence,
+        "rejected legacy checkpoint must leave the last completed-state snapshot unchanged"
+    );
+    assert_eq!(
+        rt.persistence
+            .load_durable_tail_position(actor_id)
+            .unwrap()
+            .unwrap()
+            .sequence,
+        tail.sequence,
+        "rejected legacy checkpoint must not disturb the atomic tail"
+    );
+}
+
+#[test]
+fn test_open_activation_intermediate_events_extend_atomic_tail() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "AtomicIntermediateEvents",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    declare_test_behavior(&mut rt, actor_id, "run");
+    let behavior_id = rt.behavior_id_for(actor_id, "run").unwrap();
+    let activation =
+        workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new()).unwrap();
+
+    let command_tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(command_tail.sequence, activation.command_sequence);
+
+    rt.emit_event(actor_id, "Custom", &[Value::int(1)]);
+    let custom_tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(custom_tail.sequence, command_tail.sequence + 1);
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        custom_tail.sequence
+    );
+
+    rt.append_timer_set(actor_id, "wake", 250).unwrap();
+    let timer_tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(timer_tail.sequence, custom_tail.sequence + 1);
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        timer_tail.sequence
+    );
+
+    rt.append_signal_received(actor_id, "go", Some("payload".to_string()))
+        .unwrap();
+    let signal_tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(signal_tail.sequence, timer_tail.sequence + 1);
+    assert_eq!(
+        rt.persistence.latest_sequence(actor_id),
+        signal_tail.sequence
+    );
+
+    let snapshot = rt.persistence.load_snapshot(actor_id).unwrap();
+    assert!(
+        snapshot.sequence < activation.command_sequence,
+        "intermediate activation events must keep the last completed-state snapshot at the pre-command boundary"
+    );
+}
+
+#[test]
+fn test_terminal_activation_cleanup_resets_replay_cursor() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "TerminalActivationCleanup",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+    let activation = WorkflowActivationId::new(actor_id, 41);
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.current_workflow_activation = Some(activation);
+        actor.workflow_replay_activation = Some(activation);
+        actor.workflow_replay_event_ordinal = 3;
+    }
+
+    rt.clear_terminal_workflow_activation(actor_id, Some(activation));
+
+    let actor = rt.actors.get(&actor_id).unwrap();
+    assert_eq!(actor.current_workflow_activation, None);
+    assert_eq!(actor.workflow_replay_activation, None);
+    assert_eq!(actor.workflow_replay_event_ordinal, 0);
+}
+
+#[test]
+fn test_compiled_replay_conflict_aborts_and_recovers_without_terminal_snapshot() {
+    use crate::bytecode::{Instruction, OpCode};
+
+    let mut rt = Runtime::new();
+    let actor_id =
+        rt.spawn_workflow_actor("ReplayConflictAbort", Box::new(Vec::new), HashMap::new());
+
+    let mut module = CodeModule::new("replay-conflict-abort");
+    let event_idx = module.add_constant(Constant::String("Different".to_string()));
+    module.emit(Instruction::new3(
+        OpCode::Emit,
+        ((event_idx >> 8) & 0xFF) as u8,
+        (event_idx & 0xFF) as u8,
+        0,
+    ));
+    module.emit(Instruction::new0(OpCode::Ret));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.layout_workflow_behavior_table(actor_id);
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    let activation = workflow::commit_workflow_command(&mut rt, actor_id, 0, Vec::new()).unwrap();
+    rt.emit_event(actor_id, "Original", &[]);
+    assert!(rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .iter()
+        .any(|event| matches!(
+            event,
+            WorkflowEvent::Custom {
+                replay_id: Some(id),
+                name,
+                ..
+            } if *id == WorkflowReplayEventId::new(activation, 0) && name == "Original"
+        )));
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    let events = rt.persistence.read_workflow_events(actor_id);
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            WorkflowEvent::StepCompleted { .. } | WorkflowEvent::StepFailed { .. }
+        )),
+        "a replay-identity conflict must abort the activation without snapshotting partial execution as a terminal result"
+    );
+    assert_eq!(
+        rt.persistence.read_journal(actor_id).len(),
+        1,
+        "failed replay must not admit a second command"
+    );
+    let actor = rt
+        .actors
+        .get(&actor_id)
+        .expect("failed durable emit should recover the workflow actor");
+    assert_eq!(actor.current_workflow_activation, Some(activation));
+    assert_eq!(
+        actor.mailbox.len(),
+        1,
+        "recovery must requeue the original unfinished command"
+    );
+}
+
+#[test]
+fn test_recovered_compiled_activation_with_intermediate_event_is_not_readmitted() {
+    use crate::bytecode::{Instruction, OpCode};
+
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_workflow_actor(
+        "RecoveredCompiledActivation",
+        Box::new(Vec::new),
+        HashMap::new(),
+    );
+
+    let mut module = CodeModule::new("recovered-compiled-activation");
+    module.emit(Instruction::new0(OpCode::Ret));
+    {
+        let actor = rt.actors.get_mut(&actor_id).unwrap();
+        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_offsets = vec![0];
+        actor.compensation_offsets = vec![None];
+    }
+    rt.layout_workflow_behavior_table(actor_id);
+    rt.register_recovery_module(actor_id, module, vec![0], vec![None]);
+
+    let activation = workflow::commit_workflow_command(&mut rt, actor_id, 0, Vec::new()).unwrap();
+    rt.emit_event(actor_id, "CommittedBeforeCrash", &[Value::int(1)]);
+    let intermediate_tail = rt
+        .persistence
+        .load_durable_tail_position(actor_id)
+        .unwrap()
+        .unwrap();
+    assert!(intermediate_tail.sequence > activation.command_sequence);
+
+    rt.actors.remove(&actor_id);
+    assert_eq!(rt.recover_actor(actor_id), Some(actor_id));
+    assert_eq!(
+        rt.actors
+            .get(&actor_id)
+            .unwrap()
+            .current_workflow_activation,
+        Some(activation)
+    );
+    assert!(
+        rt.actors.get(&actor_id).unwrap().sequence > activation.command_sequence,
+        "workflow-event replay should advance the recovered actor sequence beyond command admission"
+    );
+
+    run_ready_actor_turn(&mut rt, actor_id);
+
+    assert_eq!(
+        rt.persistence.read_journal(actor_id).len(),
+        1,
+        "replaying an unfinished activation must not append a second command admission"
+    );
+    let completions: Vec<_> = rt
+        .persistence
+        .read_workflow_events(actor_id)
+        .into_iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::StepCompleted {
+                activation,
+                sequence,
+                ..
+            } => Some((activation, sequence)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(
+        completions[0].0,
+        Some(activation),
+        "terminal replay must close the original admitted activation"
     );
 }
 
@@ -4534,11 +4978,8 @@ fn test_recovery_finds_unfinished_atomic_command_below_completed_effect_tail() {
 #[test]
 fn test_recovery_refuses_terminal_event_ahead_of_safe_snapshot_outside_atomic_tail() {
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_workflow_actor(
-        "RefuseMixedTerminal",
-        Box::new(Vec::new),
-        HashMap::new(),
-    );
+    let actor_id =
+        rt.spawn_workflow_actor("RefuseMixedTerminal", Box::new(Vec::new), HashMap::new());
     rt.actors
         .get_mut(&actor_id)
         .unwrap()

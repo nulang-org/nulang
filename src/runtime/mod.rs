@@ -1142,7 +1142,31 @@ impl Runtime {
     }
 
     /// Record an emitted event on an actor. Delegates to the workflow subsystem.
-    pub fn emit_event(&mut self, actor_id: u64, event: &str, args: &[crate::vm::Value]) {
+    ///
+    /// The public embedding API keeps its best-effort shape and reports
+    /// success as a boolean. Runtime VM callbacks use the fallible sibling so
+    /// durable workflow failures abort execution immediately.
+    pub fn emit_event(&mut self, actor_id: u64, event: &str, args: &[crate::vm::Value]) -> bool {
+        match workflow::emit_event(self, actor_id, event, args) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::error!(
+                    actor_id,
+                    event,
+                    %error,
+                    "nulang-workflow: durable event emission failed"
+                );
+                false
+            }
+        }
+    }
+
+    pub(crate) fn try_emit_event(
+        &mut self,
+        actor_id: u64,
+        event: &str,
+        args: &[crate::vm::Value],
+    ) -> std::io::Result<()> {
         workflow::emit_event(self, actor_id, event, args)
     }
 
@@ -1297,6 +1321,27 @@ impl Runtime {
                 actor.workflow_replay_activation = Some(activation);
                 actor.workflow_replay_event_ordinal = 0;
             }
+        }
+    }
+
+    /// Clear replay state only after the matching workflow activation reaches a
+    /// durable terminal boundary. A persistence failure must leave the replay
+    /// identity intact so recovery can resume from committed history.
+    pub(crate) fn clear_terminal_workflow_activation(
+        &mut self,
+        actor_id: u64,
+        activation: Option<WorkflowActivationId>,
+    ) {
+        let Some(actor) = self.actors.get_mut(&actor_id) else {
+            return;
+        };
+
+        if actor.current_workflow_activation == activation {
+            actor.current_workflow_activation = None;
+        }
+        if actor.workflow_replay_activation == activation {
+            actor.workflow_replay_activation = None;
+            actor.workflow_replay_event_ordinal = 0;
         }
     }
 
@@ -1674,6 +1719,8 @@ impl Runtime {
             actor.waiting_signal = None;
         }
 
+        let mut persistence_failure: Option<String> = None;
+
         match result {
             Ok(_) => {
                 if self.actor_is_workflow(actor_id) {
@@ -1684,16 +1731,14 @@ impl Runtime {
                             actor.set_state_field("step_index", Value::int(n + 1));
                         }
                     }
-                    let seq = self.next_sequence(actor_id);
-                    let _ = self.persistence.append_workflow_event(
+                    if let Err(error) = workflow::persist_step_completed(
+                        self,
                         actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            activation: suspended.activation,
-                            step_name,
-                        },
-                    );
-                    self.checkpoint_actor(actor_id);
+                        suspended.activation,
+                        step_name,
+                    ) {
+                        persistence_failure = Some(error.to_string());
+                    }
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
@@ -1734,10 +1779,21 @@ impl Runtime {
                     self.maybe_schedule_receive_wait(actor_id, receive_timeout);
                 }
             }
-            Err(_) => {
-                // Step failed after resumption: run saga compensations.
-                if self.actor_is_workflow(actor_id) {
-                    self.run_saga_compensation(actor_id, behavior_idx);
+            Err(error) => {
+                if let Some(failure) = self.take_workflow_persistence_failure(actor_id) {
+                    persistence_failure = Some(failure);
+                } else if self.actor_is_workflow(actor_id) {
+                    if let Err(commit_error) = workflow::persist_step_failed(
+                        self,
+                        actor_id,
+                        suspended.activation,
+                        step_name,
+                        error.to_string(),
+                    ) {
+                        persistence_failure = Some(commit_error.to_string());
+                    } else {
+                        self.run_saga_compensation(actor_id, behavior_idx);
+                    }
                 }
             }
         }
@@ -1747,6 +1803,12 @@ impl Runtime {
         // bytecode whose own begin/end must stay inside this window. Runs
         // on every path so wakes of other actors are not lost.
         self.vm_exec_end();
+        if let Some(failure) =
+            persistence_failure.or_else(|| self.take_workflow_persistence_failure(actor_id))
+        {
+            self.recover_after_workflow_persistence_failure(actor_id, &failure, "signal-resume");
+            return;
+        }
         // The suspension resolved (completed or failed): drain any mail
         // that queued up while the step was suspended.
         self.requeue_if_mail_pending(actor_id);
@@ -4097,12 +4159,11 @@ impl Runtime {
                     let use_atomic_workflow_turn = self.actor_is_workflow(actor_id)
                         && !self.is_internal_behavior(actor_id, behavior_idx);
                     if use_atomic_workflow_turn {
-                        let recovered_activation = self.actors.get(&actor_id).and_then(|actor| {
-                            actor.current_workflow_activation.filter(|activation| {
-                                activation.actor_id == actor_id
-                                    && activation.command_sequence == actor.sequence
-                            })
-                        });
+                        let recovered_activation = self
+                            .actors
+                            .get(&actor_id)
+                            .and_then(|actor| actor.current_workflow_activation)
+                            .filter(|activation| activation.actor_id == actor_id);
                         if let Some(activation) = recovered_activation {
                             // Recovery already proved that this exact command is
                             // the open atomic tail. Execute it under the original
@@ -4170,40 +4231,103 @@ impl Runtime {
                 }
             }
             if !processed && self.has_bytecode_handler(actor_id, behavior_idx) {
-                // Compiled workflow turns remain on the legacy path until
-                // custom events, timers/signals, suspension markers, failures,
-                // compensation, and effect replay all share the atomic tail.
                 if self.actor_is_persistent(actor_id) {
-                    let seq = self.next_sequence(actor_id);
                     let payload =
                         self.persist_journal_payload(actor_id, journal_source_actor, &msg.payload);
-                    match self.persistence.append_journal(
-                        actor_id,
-                        JournalEntry {
-                            sequence: seq,
-                            behavior_id: msg.behavior_id,
-                            payload,
-                        },
-                    ) {
-                        Ok(()) => {
-                            if self.actor_is_workflow(actor_id) {
-                                workflow_activation =
-                                    Some(WorkflowActivationId::new(actor_id, seq));
-                                if let Some(actor) = self.actors.get_mut(&actor_id) {
-                                    actor.current_workflow_activation = workflow_activation;
+                    let use_atomic_workflow_turn = self.actor_is_workflow(actor_id)
+                        && !self.is_internal_behavior(actor_id, behavior_idx);
+                    if use_atomic_workflow_turn {
+                        let recovered_activation = self
+                            .actors
+                            .get(&actor_id)
+                            .and_then(|actor| actor.current_workflow_activation)
+                            .filter(|activation| activation.actor_id == actor_id);
+                        if let Some(activation) = recovered_activation {
+                            workflow_activation = Some(activation);
+                        } else {
+                            match workflow::commit_workflow_command(
+                                self,
+                                actor_id,
+                                msg.behavior_id,
+                                payload.clone(),
+                            ) {
+                                Ok(activation) => {
+                                    workflow_activation = Some(activation);
+                                }
+                                Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                                    // Atomic history has not begun and this
+                                    // backend explicitly cannot provide RFC
+                                    // 0022 transactions. Preserve the existing
+                                    // compiled-workflow compatibility path.
+                                    let seq = self.next_sequence(actor_id);
+                                    match self.persistence.append_journal(
+                                        actor_id,
+                                        JournalEntry {
+                                            sequence: seq,
+                                            behavior_id: msg.behavior_id,
+                                            payload,
+                                        },
+                                    ) {
+                                        Ok(()) => {
+                                            workflow_activation =
+                                                Some(WorkflowActivationId::new(actor_id, seq));
+                                            if let Some(actor) = self.actors.get_mut(&actor_id) {
+                                                actor.current_workflow_activation =
+                                                    workflow_activation;
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                actor_id,
+                                                %error,
+                                                "nulang-workflow: refusing compiled command execution after legacy durable admission failed"
+                                            );
+                                            self.current_actor = None;
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        actor_id,
+                                        %error,
+                                        "nulang-workflow: refusing compiled command execution after atomic durable admission failed"
+                                    );
+                                    self.current_actor = None;
+                                    return;
                                 }
                             }
                         }
-                        Err(error) if self.actor_is_workflow(actor_id) => {
-                            tracing::error!(
-                                actor_id,
-                                %error,
-                                "nulang-workflow: refusing command execution after durable admission failed"
-                            );
-                            self.current_actor = None;
-                            return;
+                    } else {
+                        let seq = self.next_sequence(actor_id);
+                        match self.persistence.append_journal(
+                            actor_id,
+                            JournalEntry {
+                                sequence: seq,
+                                behavior_id: msg.behavior_id,
+                                payload,
+                            },
+                        ) {
+                            Ok(()) => {
+                                if self.actor_is_workflow(actor_id) {
+                                    workflow_activation =
+                                        Some(WorkflowActivationId::new(actor_id, seq));
+                                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+                                        actor.current_workflow_activation = workflow_activation;
+                                    }
+                                }
+                            }
+                            Err(error) if self.actor_is_workflow(actor_id) => {
+                                tracing::error!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-workflow: refusing command execution after durable admission failed"
+                                );
+                                self.current_actor = None;
+                                return;
+                            }
+                            Err(_) => {}
                         }
-                        Err(_) => {}
                     }
                 }
                 let payload = msg.payload.clone();
@@ -4216,39 +4340,60 @@ impl Runtime {
                 self.suspend_enabled = saved_suspend;
                 match result {
                     Ok(_) => {
-                        self.checkpoint_actor(actor_id);
+                        if !self.actor_is_workflow(actor_id) {
+                            self.checkpoint_actor(actor_id);
+                        }
                         processed = true;
                     }
                     Err(crate::types::NuError::Suspended(_)) => {
                         // The step yielded waiting for a signal or a
                         // background LLM call. Do not mark it completed, do
                         // not run compensations, and do not checkpoint the
-                        // partially-mutated durable state: persist only the
-                        // suspension marker so recovery can re-drive the
-                        // step from its last pre-suspend checkpoint.
+                        // partially-mutated durable state. Atomic workflows
+                        // recover unfinished activation identity from the
+                        // command/terminal history; legacy workflows keep the
+                        // compatibility suspension marker.
                         self.persist_suspension_marker(actor_id);
                         processed = false;
                     }
                     Err(e) => {
-                        self.checkpoint_actor(actor_id);
-                        // A workflow step failed: record the failure (durable
-                        // StepFailed event — SPEC2 §10 known-issue #5: step
-                        // failures were silent, exit 0, no diagnostic), then
-                        // run saga compensations for previously completed
-                        // steps in reverse order.
-                        if self.actor_is_workflow(actor_id) {
-                            let seq = self.next_sequence(actor_id);
-                            let step_name = self.step_name_for(actor_id, behavior_idx);
-                            let _ = self.persistence.append_workflow_event(
+                        if let Some(failure) = self.take_workflow_persistence_failure(actor_id) {
+                            self.recover_after_workflow_persistence_failure(
                                 actor_id,
-                                WorkflowEvent::StepFailed {
-                                    sequence: seq,
-                                    activation: workflow_activation,
-                                    step_name,
-                                    error: format!("{}", e),
-                                },
+                                &failure,
+                                "bytecode-turn",
                             );
+                            self.current_actor = None;
+                            return;
+                        }
+
+                        if self.actor_is_workflow(actor_id) {
+                            let step_name = self.step_name_for(actor_id, behavior_idx);
+                            if let Err(error) = workflow::persist_step_failed(
+                                self,
+                                actor_id,
+                                workflow_activation,
+                                step_name,
+                                format!("{}", e),
+                            ) {
+                                tracing::error!(
+                                    actor_id,
+                                    %error,
+                                    "nulang-workflow: terminal failure transition failed; discarding activation"
+                                );
+                                self.actors.remove(&actor_id);
+                                if self.recover_actor(actor_id).is_none() {
+                                    tracing::error!(
+                                        actor_id,
+                                        "nulang-workflow: actor recovery failed after terminal failure transition failure"
+                                    );
+                                }
+                                self.current_actor = None;
+                                return;
+                            }
                             self.run_saga_compensation(actor_id, behavior_idx);
+                        } else {
+                            self.checkpoint_actor(actor_id);
                         }
                         processed = false;
                     }
@@ -4272,39 +4417,23 @@ impl Runtime {
                 }
 
                 let step_name = self.step_name_for(actor_id, behavior_idx);
-                if atomic_workflow_turn {
-                    if let Err(error) = workflow::commit_step_completed(
-                        self,
+                if let Err(error) =
+                    workflow::persist_step_completed(self, actor_id, workflow_activation, step_name)
+                {
+                    tracing::error!(
                         actor_id,
-                        workflow_activation,
-                        step_name,
-                    ) {
+                        %error,
+                        "nulang-workflow: terminal durable transition failed; discarding activation"
+                    );
+                    self.actors.remove(&actor_id);
+                    if self.recover_actor(actor_id).is_none() {
                         tracing::error!(
                             actor_id,
-                            %error,
-                            "nulang-workflow: terminal durable transition failed; discarding activation"
+                            "nulang-workflow: actor recovery failed after terminal durable transition failure"
                         );
-                        self.actors.remove(&actor_id);
-                        if self.recover_actor(actor_id).is_none() {
-                            tracing::error!(
-                                actor_id,
-                                "nulang-workflow: actor recovery failed after terminal durable transition failure"
-                            );
-                        }
-                        self.current_actor = None;
-                        return;
                     }
-                } else {
-                    let seq = self.next_sequence(actor_id);
-                    let _ = self.persistence.append_workflow_event(
-                        actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            activation: workflow_activation,
-                            step_name,
-                        },
-                    );
-                    self.checkpoint_actor(actor_id);
+                    self.current_actor = None;
+                    return;
                 }
             }
             let actor = match self.actors.get_mut(&actor_id) {
@@ -4337,8 +4466,36 @@ impl Runtime {
             .unwrap_or(false)
     }
 
-    fn actor_is_workflow(&self, actor_id: u64) -> bool {
+    pub(crate) fn actor_is_workflow(&self, actor_id: u64) -> bool {
         workflow::actor_is_workflow(self, actor_id)
+    }
+
+    pub(crate) fn take_workflow_persistence_failure(&mut self, actor_id: u64) -> Option<String> {
+        self.actors
+            .get_mut(&actor_id)
+            .and_then(|actor| actor.workflow_persistence_failure.take())
+    }
+
+    pub(crate) fn recover_after_workflow_persistence_failure(
+        &mut self,
+        actor_id: u64,
+        failure: &str,
+        context: &str,
+    ) {
+        tracing::error!(
+            actor_id,
+            failure,
+            context,
+            "nulang-workflow: aborting partial activation after durable persistence failure"
+        );
+        self.actors.remove(&actor_id);
+        if self.recover_actor(actor_id).is_none() {
+            tracing::error!(
+                actor_id,
+                context,
+                "nulang-workflow: actor recovery failed after durable persistence failure"
+            );
+        }
     }
 
     #[cfg(feature = "ai-runtime")]
@@ -4787,6 +4944,11 @@ impl Runtime {
             return;
         }
         self.restore_suspended_workflow_activation(actor_id, suspended.activation);
+        let behavior_idx = suspended.behavior_idx;
+        let activation = suspended.activation;
+        let step_name = suspended.step_name.clone();
+        let mut persistence_failure: Option<String> = None;
+        let mut resume_error: Option<String> = None;
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -4819,16 +4981,14 @@ impl Runtime {
                                 actor.set_state_field("step_index", Value::int(n + 1));
                             }
                         }
-                        let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        if let Err(error) = workflow::persist_step_completed(
+                            &mut *self_ptr,
                             actor_id,
-                            crate::runtime::WorkflowEvent::StepCompleted {
-                                sequence: seq,
-                                activation: suspended.activation,
-                                step_name: suspended.step_name.clone(),
-                            },
-                        );
-                        (*self_ptr).checkpoint_actor(actor_id);
+                            activation,
+                            step_name.clone(),
+                        ) {
+                            persistence_failure = Some(error.to_string());
+                        }
                     }
                 }
                 Err(crate::types::NuError::Suspended(_)) => {
@@ -4846,9 +5006,8 @@ impl Runtime {
                         }
                     }
                 }
-                Err(e) => {
-                    // VM error during resume - log and clean up.
-                    tracing::warn!("Timer.sleep resume error for actor {}: {:?}", actor_id, e);
+                Err(error) => {
+                    resume_error = Some(error.to_string());
                     if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                         actor.suspended_execution = None;
                     }
@@ -4856,6 +5015,30 @@ impl Runtime {
             }
             (*self_ptr).vm_exec_end();
         }
+
+        if let Some(failure) =
+            persistence_failure.or_else(|| self.take_workflow_persistence_failure(actor_id))
+        {
+            self.recover_after_workflow_persistence_failure(actor_id, &failure, "timer-resume");
+            return;
+        }
+
+        if let Some(error) = resume_error {
+            if self.actor_is_workflow(actor_id) {
+                if let Err(commit_error) =
+                    workflow::persist_step_failed(self, actor_id, activation, step_name, error)
+                {
+                    self.recover_after_workflow_persistence_failure(
+                        actor_id,
+                        &commit_error.to_string(),
+                        "timer-resume-failure",
+                    );
+                    return;
+                }
+                self.run_saga_compensation(actor_id, behavior_idx);
+            }
+        }
+
         // Re-enqueue so the scheduler can continue processing the actor.
         self.enqueue_actor(actor_id);
     }
@@ -4883,6 +5066,11 @@ impl Runtime {
         }
 
         self.restore_suspended_workflow_activation(actor_id, suspended.activation);
+        let behavior_idx = suspended.behavior_idx;
+        let activation = suspended.activation;
+        let step_name = suspended.step_name.clone();
+        let mut persistence_failure: Option<String> = None;
+        let mut resume_error: Option<String> = None;
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -4915,16 +5103,14 @@ impl Runtime {
                                 actor.set_state_field("step_index", Value::int(n + 1));
                             }
                         }
-                        let seq = (*self_ptr).next_sequence(actor_id);
-                        let _ = (*self_ptr).persistence.append_workflow_event(
+                        if let Err(error) = workflow::persist_step_completed(
+                            &mut *self_ptr,
                             actor_id,
-                            WorkflowEvent::StepCompleted {
-                                sequence: seq,
-                                activation: suspended.activation,
-                                step_name: suspended.step_name,
-                            },
-                        );
-                        (*self_ptr).checkpoint_actor(actor_id);
+                            activation,
+                            step_name.clone(),
+                        ) {
+                            persistence_failure = Some(error.to_string());
+                        }
                     }
                 }
                 Err(crate::types::NuError::Suspended(VmSuspension::ReceiveWait)) => {
@@ -4968,9 +5154,10 @@ impl Runtime {
                         }
                     }
                 }
-                // Other errors: the wait is over; the send-path result is
-                // discarded anyway, matching step_actor semantics.
-                Err(_) => (*self_ptr).clear_receive_wait(actor_id),
+                Err(error) => {
+                    (*self_ptr).clear_receive_wait(actor_id);
+                    resume_error = Some(error.to_string());
+                }
             }
             // End the VM-execution window only after any suspend-state
             // re-capture above: draining deferred wakes runs other actors
@@ -4979,6 +5166,30 @@ impl Runtime {
             // wakes of other actors are not lost when THIS one suspends.
             (*self_ptr).vm_exec_end();
         }
+
+        if let Some(failure) =
+            persistence_failure.or_else(|| self.take_workflow_persistence_failure(actor_id))
+        {
+            self.recover_after_workflow_persistence_failure(actor_id, &failure, "receive-resume");
+            return;
+        }
+
+        if let Some(error) = resume_error {
+            if self.actor_is_workflow(actor_id) {
+                if let Err(commit_error) =
+                    workflow::persist_step_failed(self, actor_id, activation, step_name, error)
+                {
+                    self.recover_after_workflow_persistence_failure(
+                        actor_id,
+                        &commit_error.to_string(),
+                        "receive-resume-failure",
+                    );
+                    return;
+                }
+                self.run_saga_compensation(actor_id, behavior_idx);
+            }
+        }
+
         // The suspension resolved (completed or failed): if messages queued
         // up while the behavior was suspended, schedule the actor to drain
         // them - step_actor leaves mail untouched while a suspension is live.
@@ -5049,6 +5260,20 @@ impl Runtime {
     /// last pre-step checkpoint.  A no-op when the actor has no snapshot
     /// yet - without one there is nothing to recover anyway.
     fn persist_suspension_marker(&mut self, actor_id: u64) {
+        // Atomic activations no longer need to mutate the safe snapshot to
+        // advertise suspension: recovery identifies unfinished work from the
+        // admitted command and absence of a terminal transition. Writing the
+        // marker through save_snapshot here would cross back onto a legacy
+        // path after the RFC 0022 tail has begun.
+        match workflow::workflow_has_atomic_tail(self, actor_id) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(actor_id, %error, "nulang-workflow: refusing legacy suspension-marker write after atomic-tail read failed");
+                return;
+            }
+        }
+
         let waiting_signal = match self.actors.get(&actor_id) {
             Some(actor) if actor.persistent => actor.waiting_signal.clone(),
             _ => return,

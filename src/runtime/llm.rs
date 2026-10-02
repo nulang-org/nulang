@@ -135,7 +135,6 @@ use super::{
     BytecodeRuntimeCallbacks, Runtime,
 };
 use crate::primitives::ActorRole;
-use crate::runtime::persistence::WorkflowEvent;
 use crate::vm::Value;
 
 /// Drain completed background LLM calls and resume any actors waiting for
@@ -444,6 +443,11 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
     }
 
     rt.restore_suspended_workflow_activation(actor_id, suspended.activation);
+    let behavior_idx = suspended.behavior_idx;
+    let activation = suspended.activation;
+    let step_name = suspended.step_name.clone();
+    let mut persistence_failure: Option<String> = None;
+    let mut resume_error: Option<String> = None;
     let self_ptr: *mut Runtime = rt;
     unsafe {
         let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -473,16 +477,14 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                             actor.set_state_field("step_index", Value::int(n + 1));
                         }
                     }
-                    let seq = (*self_ptr).next_sequence(actor_id);
-                    let _ = (*self_ptr).persistence.append_workflow_event(
+                    if let Err(error) = super::workflow::persist_step_completed(
+                        &mut *self_ptr,
                         actor_id,
-                        WorkflowEvent::StepCompleted {
-                            sequence: seq,
-                            activation: suspended.activation,
-                            step_name: suspended.step_name,
-                        },
-                    );
-                    (*self_ptr).checkpoint_actor(actor_id);
+                        activation,
+                        step_name.clone(),
+                    ) {
+                        persistence_failure = Some(error.to_string());
+                    }
                 }
             }
             Err(crate::types::NuError::Suspended(_)) => {
@@ -508,9 +510,9 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
                     (*self_ptr).maybe_schedule_receive_wait(actor_id, receive_timeout);
                 }
             }
-            // Other errors: the send-path result is discarded anyway,
-            // matching step_actor semantics.
-            Err(_) => {}
+            Err(error) => {
+                resume_error = Some(error.to_string());
+            }
         }
         // End the VM-execution window only after any suspend-state
         // re-capture above: draining deferred wakes runs other actors
@@ -519,6 +521,30 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         // wakes of other actors are not lost when THIS one suspends.
         (*self_ptr).vm_exec_end();
     }
+
+    if let Some(failure) =
+        persistence_failure.or_else(|| rt.take_workflow_persistence_failure(actor_id))
+    {
+        rt.recover_after_workflow_persistence_failure(actor_id, &failure, "llm-resume");
+        return;
+    }
+
+    if let Some(error) = resume_error {
+        if rt.actor_is_workflow(actor_id) {
+            if let Err(commit_error) =
+                super::workflow::persist_step_failed(rt, actor_id, activation, step_name, error)
+            {
+                rt.recover_after_workflow_persistence_failure(
+                    actor_id,
+                    &commit_error.to_string(),
+                    "llm-resume-failure",
+                );
+                return;
+            }
+            rt.run_saga_compensation(actor_id, behavior_idx);
+        }
+    }
+
     // The suspension resolved (completed or failed): if messages queued
     // up while the behavior was suspended, schedule the actor to drain
     // them — step_actor leaves mail untouched while a suspension is live.

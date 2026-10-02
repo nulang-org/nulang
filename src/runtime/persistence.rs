@@ -369,8 +369,9 @@ impl WorkflowEvent {
     /// same ordinal model in later #836 slices.
     pub fn replay_id(&self) -> Option<WorkflowReplayEventId> {
         match self {
-            WorkflowEvent::TimerSet { replay_id, .. }
-            | WorkflowEvent::Custom { replay_id, .. } => *replay_id,
+            WorkflowEvent::TimerSet { replay_id, .. } | WorkflowEvent::Custom { replay_id, .. } => {
+                *replay_id
+            }
             _ => None,
         }
     }
