@@ -28,7 +28,7 @@ jobs:
       - name: Focused connect-failure regression
         run: cargo test --locked --no-default-features --features tcp test_tcp_connect_failure_is_observable_and_not_retried --lib
       - name: Focused distribution tests
-        run: cargo test --locked --no-default-features --lib distribution::
+        run: "cargo test --locked --no-default-features --lib distribution::"
       - name: Remove transfer scaffolding
         run: |
           rm .github/apply-1180.py
