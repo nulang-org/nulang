@@ -50,9 +50,7 @@ fn supervisor_reports_unknown_worker_for_explicit_routing() {
     let team = SupervisorTeam::new().worker("researcher", 10, "find evidence");
     let mut runtime = TrackingRuntime::default();
 
-    let err = team
-        .delegate(&mut runtime, "missing", "task")
-        .unwrap_err();
+    let err = team.delegate(&mut runtime, "missing", "task").unwrap_err();
     assert!(err.contains("Worker missing not found"));
     assert!(runtime.calls.is_empty());
 }
