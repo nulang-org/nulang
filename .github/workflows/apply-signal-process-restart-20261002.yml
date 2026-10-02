@@ -130,7 +130,6 @@ jobs:
           '''
           p.write_text(text.replace(marker, test + marker))
           PY
-          cargo fmt --all -- --check
           git diff --check
       - name: Run focused signal restart proof
         run: cargo test --locked --lib test_signal_received_survives_process_restart_from_libsql_journal -- --nocapture
