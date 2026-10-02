@@ -48,6 +48,22 @@ impl Worker for ProbeWorker {
     }
 }
 
+struct VariableWorker;
+
+impl Worker for VariableWorker {
+    fn agent_id(&self) -> &str {
+        "variable"
+    }
+
+    fn execute(&self, task: &Task) -> Task {
+        let sleep_ms = if task.description == "slow" { 80 } else { 10 };
+        thread::sleep(Duration::from_millis(sleep_ms));
+        let mut completed = task.clone();
+        completed.status = TaskStatus::Completed;
+        completed
+    }
+}
+
 #[test]
 fn admission_pool_enforces_named_resources_and_releases() {
     let capacity = ResourceVector::new().with("worker", 2).with("browser", 1);
@@ -100,6 +116,27 @@ fn scatter_runs_real_work_concurrently_and_preserves_input_order() {
         .all(|item| item.task.status == TaskStatus::Completed));
     assert!(report.metrics.critical_path_micros > 0);
     assert!(report.metrics.total_worker_micros >= report.metrics.critical_path_micros);
+}
+
+#[test]
+fn scatter_backfills_a_freed_slot_before_a_slow_sibling_finishes() {
+    let goal_id = Uuid::new_v4();
+    let scheduler = SwarmScheduler::new(ResourceVector::new().with("worker", 2)).unwrap();
+    let items = vec![
+        WorkItem::new(task(goal_id, "slow")),
+        WorkItem::new(task(goal_id, "quick-one")),
+        WorkItem::new(task(goal_id, "quick-two")),
+    ];
+
+    let report = scheduler.scatter(&VariableWorker, items).unwrap();
+    let slow = &report.reports[0];
+    let quick_two = &report.reports[2];
+
+    assert!(
+        quick_two.started_offset_micros < slow.completed_offset_micros,
+        "third task should backfill the quick task's released slot before the slow task completes"
+    );
+    assert!(report.metrics.wall_time_micros < report.metrics.total_worker_micros);
 }
 
 #[test]
