@@ -208,18 +208,10 @@ struct SourceSite {
 fn source_sites_for_mir(module: &mir::Module) -> Vec<SourceSite> {
     let mut sites = Vec::new();
     for function in &module.functions {
-        collect_source_sites(
-            &mut sites,
-            ExecutionSiteOwnerKind::Function,
-            function,
-        );
+        collect_source_sites(&mut sites, ExecutionSiteOwnerKind::Function, function);
     }
     for behavior in &module.behaviors {
-        collect_source_sites(
-            &mut sites,
-            ExecutionSiteOwnerKind::Behavior,
-            behavior,
-        );
+        collect_source_sites(&mut sites, ExecutionSiteOwnerKind::Behavior, behavior);
     }
     sites
 }
@@ -229,8 +221,7 @@ fn collect_source_sites(
     owner_kind: ExecutionSiteOwnerKind,
     function: &mir::Function,
 ) {
-    let line_table: BTreeMap<(BlockId, usize), u32> =
-        function.line_table.iter().copied().collect();
+    let line_table: BTreeMap<(BlockId, usize), u32> = function.line_table.iter().copied().collect();
 
     for block in &function.blocks {
         for (stmt_index, stmt) in block.stmts.iter().enumerate() {
@@ -347,7 +338,10 @@ impl fmt::Display for ExecutionSiteMapError {
                 "semantic/source effect-site counts differ: {semantic_sites} vs {source_sites}"
             ),
             Self::SiteMetadataMismatch { index } => {
-                write!(f, "semantic/source effect-site metadata differs at index {index}")
+                write!(
+                    f,
+                    "semantic/source effect-site metadata differs at index {index}"
+                )
             }
             Self::InvalidOwnerName(id) => write!(f, "execution site {id} has an empty owner name"),
             Self::InvalidEffectOperation(id) => {
@@ -436,7 +430,10 @@ mod tests {
         let first = ExecutionSiteMap::from_mir_module(&mir_module(12), &artifact(), None).unwrap();
         let second = ExecutionSiteMap::from_mir_module(&mir_module(99), &artifact(), None).unwrap();
 
-        assert_eq!(first.sites[0].semantic_site_id, second.sites[0].semantic_site_id);
+        assert_eq!(
+            first.sites[0].semantic_site_id,
+            second.sites[0].semantic_site_id
+        );
         assert_eq!(first.sites[0].line, Some(12));
         assert_eq!(second.sites[0].line, Some(99));
     }
