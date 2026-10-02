@@ -42,6 +42,11 @@ jobs:
         run: |
           cargo test --locked --no-default-features --lib memtable_rotation_tests
           cargo test --locked --no-default-features --test nudb_memtable_rotation
+      - name: SSTable and manifest contract
+        run: |
+          cargo test --locked --no-default-features --lib database::sstable::tests
+          cargo test --locked --no-default-features --lib database::manifest::tests
+          cargo test --locked --no-default-features --test nudb_sstable_flush
       - name: Storage interruption matrix
         run: cargo test --locked --no-default-features --lib database::interruption::tests
       - name: Existing NulangDB storage contracts

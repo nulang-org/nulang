@@ -360,6 +360,19 @@ impl MemoryTablet {
         self.immutables.len()
     }
 
+    pub(crate) fn oldest_immutable_rows(&self) -> Option<Vec<TabletSnapshotRow>> {
+        self.immutables.first().map(|memtable| {
+            memtable
+                .rows
+                .iter()
+                .map(|(key, versions)| TabletSnapshotRow {
+                    key: key.clone(),
+                    versions: versions.clone(),
+                })
+                .collect()
+        })
+    }
+
     /// Freeze the mutable generation when it reaches the configured byte target.
     /// Empty generations are never emitted. A zero threshold behaves as one byte.
     pub fn rotate_memtable_if_bytes_at_least(&mut self, min_bytes: usize) -> bool {

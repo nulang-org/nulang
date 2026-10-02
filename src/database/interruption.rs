@@ -28,6 +28,14 @@ pub(crate) enum StorageInterruptionPoint {
     CheckpointAfterTempSync,
     CheckpointAfterRename,
     CheckpointAfterDirectorySync,
+    SstableAfterTempWrite,
+    SstableAfterTempSync,
+    SstableAfterRename,
+    SstableAfterDirectorySync,
+    ManifestAfterTempWrite,
+    ManifestAfterTempSync,
+    ManifestAfterRename,
+    ManifestAfterDirectorySync,
     WalReclaimAfterReplacementWrite,
     WalReclaimAfterReplacementSync,
     WalReclaimAfterRename,
@@ -106,6 +114,10 @@ mod tests {
         let _ = fs::remove_file(&checkpoint);
         let _ = fs::remove_file(appended(&checkpoint, ".tmp"));
         let _ = fs::remove_file(appended(wal_path, ".reclaim.tmp"));
+        let manifest = wal_path.with_extension("manifest");
+        let _ = fs::remove_file(&manifest);
+        let _ = fs::remove_file(appended(&manifest, ".tmp"));
+        let _ = fs::remove_dir_all(wal_path.with_extension("sstables"));
     }
 
     fn commit_put(tablet: &mut WalBackedTablet, value: &[u8]) {
@@ -299,6 +311,78 @@ mod tests {
             assert_eq!(reopened.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
             cleanup(&wal_path);
         }
+    }
+
+    #[test]
+    fn sstable_and_manifest_flush_interruption_matrix_keeps_wal_authoritative() {
+        for (point, manifest_published) in [
+            (StorageInterruptionPoint::SstableAfterTempWrite, false),
+            (StorageInterruptionPoint::SstableAfterTempSync, false),
+            (StorageInterruptionPoint::SstableAfterRename, false),
+            (StorageInterruptionPoint::SstableAfterDirectorySync, false),
+            (StorageInterruptionPoint::ManifestAfterTempWrite, false),
+            (StorageInterruptionPoint::ManifestAfterTempSync, false),
+            (StorageInterruptionPoint::ManifestAfterRename, true),
+            (StorageInterruptionPoint::ManifestAfterDirectorySync, true),
+        ] {
+            let wal_path = temp_wal("sstable_flush");
+            cleanup(&wal_path);
+            let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+            commit_put(&mut tablet, b"v1");
+            let bytes = tablet.mutable_memtable_bytes();
+            assert!(tablet.rotate_memtable_if_bytes_at_least(bytes));
+
+            let result = with_interruption(point, || tablet.flush_oldest_immutable_to_sstable());
+            assert!(
+                result.is_err(),
+                "{point:?} must interrupt flush publication"
+            );
+            drop(tablet);
+
+            assert_eq!(
+                wal_path.with_extension("manifest").exists(),
+                manifest_published,
+                "unexpected manifest state after {point:?}"
+            );
+
+            let reopened = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+            assert_eq!(reopened.current_sequence(), 1);
+            assert_eq!(reopened.read_latest(b"k"), Some(&b"v1"[..]));
+            cleanup(&wal_path);
+        }
+    }
+
+    #[test]
+    fn renamed_orphan_sstable_is_verified_and_reused_on_retry() {
+        let wal_path = temp_wal("sstable_orphan_retry");
+        cleanup(&wal_path);
+
+        let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+        commit_put(&mut tablet, b"v1");
+        let bytes = tablet.mutable_memtable_bytes();
+        assert!(tablet.rotate_memtable_if_bytes_at_least(bytes));
+
+        let result = with_interruption(StorageInterruptionPoint::SstableAfterRename, || {
+            tablet.flush_oldest_immutable_to_sstable()
+        });
+        assert!(result.is_err());
+        assert!(!wal_path.with_extension("manifest").exists());
+        let sstable_dir = wal_path.with_extension("sstables");
+        assert_eq!(fs::read_dir(&sstable_dir).unwrap().count(), 1);
+        drop(tablet);
+
+        let mut reopened = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+        assert_eq!(reopened.current_sequence(), 1);
+        let replay_bytes = reopened.mutable_memtable_bytes();
+        assert!(reopened.rotate_memtable_if_bytes_at_least(replay_bytes));
+        assert!(reopened.flush_oldest_immutable_to_sstable().unwrap());
+        assert_eq!(reopened.durable_sstable_count().unwrap(), 1);
+
+        let wal = FileWal::open(&wal_path).unwrap();
+        assert_eq!(wal.base_sequence(), 0);
+        assert_eq!(wal.records().len(), 1);
+        drop(wal);
+        cleanup(&wal_path);
     }
 
     #[test]
