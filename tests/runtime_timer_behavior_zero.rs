@@ -1,3 +1,4 @@
+// Regression coverage for #1239: behavior id 0 is valid; lookup failure remains None.
 use std::cell::RefCell;
 use std::rc::Rc;
 
