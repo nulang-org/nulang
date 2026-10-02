@@ -29,9 +29,16 @@ jobs:
 
           path = Path('src/package/commands.rs')
           old = path.read_text(encoding='utf-8')
-          target = '    nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;\n'
+          fn_marker = 'fn cmd_build_wasm() -> NuResult<()> {'
+          next_marker = '\n/// `nula run`: build, then execute the entry point.'
+          prefix, found, tail = old.partition(fn_marker)
+          assert found, 'cmd_build_wasm function not found'
+          body, found_next, suffix = tail.partition(next_marker)
+          assert found_next, 'cmd_build_wasm end marker not found'
+
+          target = 'nulang_exe(&["--backend", "wasm-aot", "--out", &wasm_path_str, &entry_str])?;'
           replacement = (
-              '    let caps = capability_args();\n'
+              'let caps = capability_args();\n'
               '    let cap_refs: Vec<&str> = caps.iter().map(|s| s.as_str()).collect();\n'
               '    nulang_exe(\n'
               '        &[\n'
@@ -39,10 +46,11 @@ jobs:
               '            &cap_refs[..],\n'
               '        ]\n'
               '        .concat(),\n'
-              '    )?;\n'
+              '    )?;'
           )
-          assert old.count(target) == 1, 'expected exactly one current-main build-wasm invocation'
-          path.write_text(old.replace(target, replacement, 1), encoding='utf-8')
+          assert body.count(target) == 1, 'expected exactly one build-wasm compiler invocation inside cmd_build_wasm'
+          body = body.replace(target, replacement, 1)
+          path.write_text(prefix + found + body + found_next + suffix, encoding='utf-8')
 
       - name: Add changelog entry
         shell: python
