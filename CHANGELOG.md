@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Controlled runtime-shard scaling harness on current main — 2026-10-01
+- **A diagnostic runner measures fixed total same-shard message work across 1/2/4/8 runtime shards.** Actor/message setup and worker-thread creation are excluded from the timed region; the harness reports throughput, ns/message, speedup, parallel efficiency, and host parallelism.
+- **This establishes a best-case multicore runtime ceiling, not a cross-shard or distributed benchmark.** Publishable scaling claims still require controlled hardware and recorded CPU topology.
+
 ### Faster tier-2 promotion for native loop regions — 2026-09-30
 - **JIT-compiled regions with an internal back-edge now promote from the low-latency Cranelift tier on their first compiled re-entry.** A single native loop entry can perform arbitrarily many back-edge iterations, so the previous 10,000-entry tier-2 counter could leave genuinely hot loops on first-tier code indefinitely.
 - **Straight-line and already-optimized regions retain the existing tier-2 threshold.** The policy change is limited to first-tier internal loops so cold or call-heavy code does not pay unnecessary optimized-compilation latency.
@@ -180,6 +184,11 @@ version + migration.*
   `GOVERNANCE.md`.
 
 ## Stable tier
+
+### Zero-copy non-reentrant JIT register entry — 2026-09-24
+- **Cranelift regions that cannot re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
+- **Compiled-region metadata now records whether native execution may grow or replace the VM frame stack.** Regions containing helper-backed direct calls retain the detached register snapshot because re-entrant interpreter calls may reallocate `VM::frames`; typed, SIMD, and scalar non-call regions use the direct-frame path.
+- **The direct-frame path does not install the raw `JIT_VM` pointer.** String-aware helpers receive a separate immutable pointer to the active `CodeModule`, preserving interned-string comparison/concatenation without aliasing the mutably exposed frame registers. Alternate JIT backends default to the conservative re-entry classification, and regression coverage pins both the direct-call fallback and hot string semantics.
 
 ### Backend-neutral JIT region planning — 2026-09-24
 - **Native compilation eligibility is now separated from Cranelift code generation.** `src/jit/region_planner.rs` owns region boundaries, non-suspending direct-call folding, recursion safety, cached per-module analyses, and type metadata production.

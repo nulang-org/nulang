@@ -105,6 +105,11 @@ struct CompiledRegion {
     len: usize,
     tier: CompilationTier,
     optimization: CodegenOptimization,
+    /// True when this region can invoke a helper that re-enters the VM frame
+    /// stack. Such regions must execute against detached register storage:
+    /// pushing an interpreter frame can reallocate `VM::frames`, invalidating
+    /// a raw pointer into the caller's in-place register array.
+    requires_vm_reentry: bool,
     /// Wall-clock time spent in the compiler for the currently installed
     /// version of this region. This is intentionally per-region observability,
     /// not a benchmark substitute.
@@ -206,6 +211,7 @@ impl JitSession {
             region_len,
             CompilationTier::Baseline,
             CodegenOptimization::Fast,
+            false,
             0,
         );
     }
@@ -218,6 +224,7 @@ impl JitSession {
         region_len: usize,
         tier: CompilationTier,
         optimization: CodegenOptimization,
+        requires_vm_reentry: bool,
         compile_time_ns: u64,
     ) {
         if module_idx >= self.compiled.len() {
@@ -254,6 +261,7 @@ impl JitSession {
             len: region_len,
             tier,
             optimization,
+            requires_vm_reentry,
             compile_time_ns,
         });
     }
@@ -487,6 +495,7 @@ impl JitSession {
                     num_instrs,
                     CompilationTier::Baseline,
                     CodegenOptimization::Fast,
+                    !native_calls.is_empty(),
                     Self::elapsed_ns(started),
                 );
                 Some(std::mem::transmute(ptr))
@@ -550,6 +559,7 @@ impl JitSession {
                     num_instrs,
                     CompilationTier::Typed,
                     CodegenOptimization::Fast,
+                    false,
                     Self::elapsed_ns(started),
                 );
                 self.typed_regions.insert((module_idx, start_offset));
@@ -593,6 +603,7 @@ impl JitSession {
                     num_instrs,
                     CompilationTier::Baseline,
                     CodegenOptimization::Optimized,
+                    !native_calls.is_empty(),
                     Self::elapsed_ns(started),
                 );
                 Some(std::mem::transmute(ptr))
@@ -633,6 +644,7 @@ impl JitSession {
                     num_instrs,
                     CompilationTier::Typed,
                     CodegenOptimization::Optimized,
+                    false,
                     Self::elapsed_ns(started),
                 );
                 self.typed_regions.insert((module_idx, start_offset));
@@ -761,6 +773,7 @@ impl JitSession {
                     num_instrs,
                     CompilationTier::Simd,
                     CodegenOptimization::Optimized,
+                    false,
                     Self::elapsed_ns(started),
                 );
                 Some(std::mem::transmute(ptr))
@@ -816,6 +829,7 @@ impl JitSession {
                     num_instrs,
                     CompilationTier::Simd,
                     CodegenOptimization::Optimized,
+                    false,
                     Self::elapsed_ns(started),
                 );
                 Some(std::mem::transmute(ptr))
@@ -896,6 +910,12 @@ impl crate::backends::JitBackend for JitSession {
 
     fn compiled_region_len(&self, module_idx: usize, pc: usize) -> Option<usize> {
         self.compiled_entry(module_idx, pc).map(|region| region.len)
+    }
+
+    fn compiled_region_requires_vm_reentry(&self, module_idx: usize, pc: usize) -> bool {
+        self.compiled_entry(module_idx, pc)
+            .map(|region| region.requires_vm_reentry)
+            .unwrap_or(true)
     }
 
     fn compiled_count(&self) -> usize {
