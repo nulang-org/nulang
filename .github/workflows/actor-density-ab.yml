@@ -1,0 +1,80 @@
+name: Actor density A/B
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Git ref or SHA to compare against
+        required: false
+        default: main
+      actors:
+        description: Actors per process-isolated probe
+        required: false
+        default: '10000'
+      runs:
+        description: Measured paired runs
+        required: false
+        default: '5'
+      warmup:
+        description: Warm-up paired runs
+        required: false
+        default: '1'
+  pull_request:
+    paths:
+      - '.github/workflows/actor-density-ab.yml'
+      - 'scripts/actor_density_ab_bench.py'
+      - 'scripts/tests/test_actor_density_ab_bench.py'
+      - 'examples/actor_density.rs'
+      - 'src/runtime/actor.rs'
+      - 'src/runtime/spawn.rs'
+      - 'src/runtime/mod.rs'
+
+concurrency:
+  group: actor-density-ab-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: Exact base vs candidate actor density
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test density comparator
+        run: python3 -m unittest scripts/tests/test_actor_density_ab_bench.py
+
+      - name: Run exact-base density A/B
+        env:
+          BASE_REF: "${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.base_ref }}"
+          ACTORS: "${{ github.event_name == 'pull_request' && '10000' || inputs.actors }}"
+          RUNS: "${{ github.event_name == 'pull_request' && '5' || inputs.runs }}"
+          WARMUP: "${{ github.event_name == 'pull_request' && '1' || inputs.warmup }}"
+        run: |
+          python3 scripts/actor_density_ab_bench.py \
+            --base-ref "$BASE_REF" \
+            --actors "$ACTORS" \
+            --runs "$RUNS" \
+            --warmup "$WARMUP" \
+            --cpu-mode single \
+            --no-default-features \
+            --output actor-density-ab.json
+
+      - name: Publish comparison summary
+        if: always() && hashFiles('actor-density-ab.json') != ''
+        run: |
+          {
+            echo '## Actor density exact-base A/B'
+            echo
+            echo '```json'
+            jq '.comparison' actor-density-ab.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
