@@ -1,0 +1,105 @@
+name: JIT native leaf zero-overhead TDD
+
+on:
+  push:
+    branches:
+      - perf/jit-native-leaf-fast-path
+    paths:
+      - .github/workflows/tmp-jit-native-leaf-zero-overhead-tdd.yml
+
+permissions:
+  contents: write
+
+jobs:
+  tdd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: perf/jit-native-leaf-fast-path
+          fetch-depth: 0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: RED - prove call-free compiled regions install leaf dispatch today
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          runtime = Path('src/jit/runtime.rs')
+          text = runtime.read_text()
+          setter = '''pub(crate) fn set_jit_leaf_calls(calls: &[(usize, *const u8, u8, usize)], constants: *const u64) {\n    JIT_LEAF_CALLS.with(|slot| {\n'''
+          setter_with_probe = '''pub(crate) fn set_jit_leaf_calls(calls: &[(usize, *const u8, u8, usize)], constants: *const u64) {\n    #[cfg(test)]\n    JIT_LEAF_SETUP_COUNT.with(|count| count.set(count.get().saturating_add(1)));\n    JIT_LEAF_CALLS.with(|slot| {\n'''
+          assert setter in text
+          text = text.replace(setter, setter_with_probe, 1)
+
+          anchor = '''pub unsafe fn set_jit_vm(vm: *mut crate::vm::VM, module_idx: usize) {\n'''
+          helpers = '''#[cfg(test)]\nthread_local! {\n    static JIT_LEAF_SETUP_COUNT: Cell<usize> = const { Cell::new(0) };\n}\n\n#[cfg(test)]\npub(crate) fn reset_jit_leaf_setup_count() {\n    JIT_LEAF_SETUP_COUNT.with(|count| count.set(0));\n}\n\n#[cfg(test)]\npub(crate) fn jit_leaf_setup_count() -> usize {\n    JIT_LEAF_SETUP_COUNT.with(|count| count.get())\n}\n\n'''
+          assert anchor in text
+          runtime.write_text(text.replace(anchor, helpers + anchor, 1))
+
+          tests = Path('src/jit/tests.rs')
+          text = tests.read_text()
+          anchor = '''#[test]\nfn test_jit_direct_call_compiles_leaf_callee_natively_and_preserves_caller_regs() {\n'''
+          test = '''#[test]\nfn test_jit_call_free_region_skips_leaf_dispatch_setup() {\n    use crate::hir_lower::lower_module;\n    use crate::lexer::Lexer;\n    use crate::mir_codegen::compile_mir;\n    use crate::mir_lower::lower_module as lower_mir;\n    use crate::parser::Parser;\n    use crate::typechecker::TypeChecker;\n    use crate::vm::VM;\n\n    let source = r#"\n        fn main() -> Int {\n            var sum = 0;\n            var i = 0;\n            while i < 20000 {\n                sum = sum + i;\n                i = i + 1\n            };\n            sum\n        }\n    "#;\n    let tokens = Lexer::new(source).lex().expect("lex");\n    let ast = Parser::new(tokens).parse_module().expect("parse");\n    let mut tc = TypeChecker::new();\n    tc.check_module(&ast).expect("typecheck");\n    let hir = lower_module(&ast, &tc.inferred_decl_types);\n    let mut mir = lower_mir(&hir).expect("mir");\n    let module = compile_mir(&mut mir, "jit_call_free_leaf_dispatch").expect("codegen");\n\n    super::runtime::reset_jit_leaf_setup_count();\n    let mut vm = VM::new();\n    vm.load_module(module);\n    let result = vm.run().expect("JIT should run");\n\n    assert_eq!(result.as_int(), Some(199_990_000));\n    assert!(\n        vm.jit_compile_stats().fast_compiles >= 1,\n        "regression must execute at least one compiled region"\n    );\n    assert_eq!(\n        super::runtime::jit_leaf_setup_count(),\n        0,\n        "call-free compiled regions must not install native leaf dispatch"\n    );\n}\n\n'''
+          assert anchor in text
+          tests.write_text(text.replace(anchor, test + anchor, 1))
+          PY
+
+          set +e
+          cargo test --locked --lib test_jit_call_free_region_skips_leaf_dispatch_setup \
+            > /tmp/red.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/red.log
+          test "$status" -ne 0
+          grep -q 'call-free compiled regions must not install native leaf dispatch' /tmp/red.log
+      - name: GREEN - bypass leaf dispatch for non-reentrant regions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          mod = Path('src/jit/mod.rs')
+          text = mod.read_text()
+          old = '''        let Some(func) = (unsafe { self.get_compiled(module_idx, pc) }) else {\n            return crate::backends::TieredAction::Interpret;\n        };\n        let leaf_calls: Vec<(usize, *const u8, u8, usize)> = self\n'''
+          new = '''        let Some(region) = self.compiled_entry(module_idx, pc) else {\n            return crate::backends::TieredAction::Interpret;\n        };\n        let func: JitFunctionPtr = unsafe { std::mem::transmute(region.ptr) };\n\n        if !region.requires_vm_reentry {\n            func(regs.as_mut_ptr(), constants.as_ptr());\n            return crate::backends::TieredAction::RanJit;\n        }\n\n        let leaf_calls: Vec<(usize, *const u8, u8, usize)> = self\n'''
+          assert old in text
+          mod.write_text(text.replace(old, new, 1))
+
+          runtime = Path('src/jit/runtime.rs')
+          text = runtime.read_text()
+          old = '''pub extern "C" fn nulang_jit_direct_call(\n'''
+          new = '''pub unsafe extern "C" fn nulang_jit_direct_call(\n'''
+          assert old in text
+          runtime.write_text(text.replace(old, new, 1))
+          PY
+      - name: Validate focused regression and JIT suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          git diff --check
+          cargo check --locked --all-features
+          cargo test --locked --lib test_jit_call_free_region_skips_leaf_dispatch_setup
+          cargo test --locked --lib jit::tests -- --test-threads=1
+      - name: Validate default Clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Commit validated fix and remove temporary workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/tmp-jit-native-leaf-zero-overhead-tdd.yml
+          git config user.name "nulang-maintenance"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/jit/mod.rs src/jit/runtime.rs src/jit/tests.rs .github/workflows/tmp-jit-native-leaf-zero-overhead-tdd.yml
+          git commit -m "perf(jit): skip leaf dispatch for call-free regions"
+          git push origin HEAD:perf/jit-native-leaf-fast-path
