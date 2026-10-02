@@ -1140,8 +1140,12 @@ impl crate::vm::ActorVmCallbacks for RuntimeVmCallbacks {
                     return crate::vm::PerformAsyncResult::Ready(None);
                 }
                 if ms > 0 {
-                    rt.timer_wheel
-                        .timer_sleep_wake(std::time::Duration::from_millis(ms), actor_id);
+                    let now = rt.now();
+                    rt.timer_wheel.timer_sleep_wake_at(
+                        now,
+                        std::time::Duration::from_millis(ms),
+                        actor_id,
+                    );
                 }
                 crate::vm::PerformAsyncResult::Pending
             }
@@ -2104,8 +2108,12 @@ impl crate::vm::ActorVmCallbacks for BytecodeRuntimeCallbacks {
                         return PerformAsyncResult::Ready(None);
                     }
                     if ms > 0 {
-                        rt.timer_wheel
-                            .timer_sleep_wake(std::time::Duration::from_millis(ms), self.actor_id);
+                        let now = rt.now();
+                        rt.timer_wheel.timer_sleep_wake_at(
+                            now,
+                            std::time::Duration::from_millis(ms),
+                            self.actor_id,
+                        );
                     }
                 }
                 PerformAsyncResult::Pending

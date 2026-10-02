@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Virtual-clock-safe workflow sleep wakeups — 2026-10-02
+- **Single-argument `Timer.sleep(ms)` wakeups now schedule against the runtime's logical clock instead of a fresh wall-clock timestamp.** Virtual-clock tests and deterministic runtimes therefore cannot miss a wake when host execution stalls between clock installation and timer registration.
+- **The workflow regression now forces wall time past the sleep duration before scheduling,** proving that advancing virtual time alone resumes the suspended step and records `StepCompleted`.
+
 ### Controlled runtime-shard scaling harness on current main — 2026-10-01
 - **A diagnostic runner measures fixed total same-shard message work across 1/2/4/8 runtime shards.** Actor/message setup and worker-thread creation are excluded from the timed region; the harness reports throughput, ns/message, speedup, parallel efficiency, and host parallelism.
 - **This establishes a best-case multicore runtime ceiling, not a cross-shard or distributed benchmark.** Publishable scaling claims still require controlled hardware and recorded CPU topology.
