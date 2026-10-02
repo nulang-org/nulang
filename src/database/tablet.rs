@@ -103,11 +103,6 @@ impl TabletDescriptor {
         self.ownership_epoch
     }
 
-    /// Plan a deterministic range split.
-    ///
-    /// Child ranges exactly cover the source range and share a fresh ownership
-    /// epoch. One child may intentionally retain the source tablet id, which is
-    /// useful for implementations that keep the left-hand lineage stable.
     pub fn plan_split(
         &self,
         split_key: &[u8],
@@ -124,11 +119,9 @@ impl TabletDescriptor {
                 proposed: child_epoch,
             });
         }
-
         let (left_range, right_range) = self.range.split_at(split_key)?;
         let left = Self::new(left_id, left_range, child_epoch)?;
         let right = Self::new(right_id, right_range, child_epoch)?;
-
         Ok(TabletSplitPlan {
             source: self.clone(),
             split_key: split_key.to_vec(),
@@ -138,7 +131,6 @@ impl TabletDescriptor {
     }
 }
 
-/// Pure metadata describing one source tablet split into two children.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabletSplitPlan {
     pub source: TabletDescriptor,
@@ -147,7 +139,6 @@ pub struct TabletSplitPlan {
     pub right: TabletDescriptor,
 }
 
-/// One mutation staged for a tablet commit.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TabletMutation {
     Put { key: Vec<u8>, value: Vec<u8> },
@@ -162,12 +153,6 @@ impl TabletMutation {
     }
 }
 
-/// Immutable, prevalidated tablet write descriptor.
-///
-/// This is not a WAL record or consensus protocol. It is the admission
-/// contract immediately above those layers: ownership epoch, predecessor
-/// sequence, and key-range membership must all be valid before storage work is
-/// scheduled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabletWrite {
     tablet_id: TabletId,
@@ -209,11 +194,9 @@ impl TabletWrite {
         {
             return Err(TabletError::KeyOutsideTabletRange);
         }
-
         let sequence = expected_previous_sequence
             .checked_add(1)
             .ok_or(TabletError::SequenceOverflow)?;
-
         Ok(Self {
             tablet_id: descriptor.id,
             ownership_epoch: descriptor.ownership_epoch,
@@ -223,28 +206,13 @@ impl TabletWrite {
         })
     }
 
-    pub fn tablet_id(&self) -> TabletId {
-        self.tablet_id
-    }
-
-    pub fn ownership_epoch(&self) -> u64 {
-        self.ownership_epoch
-    }
-
-    pub fn sequence(&self) -> u64 {
-        self.sequence
-    }
-
-    pub fn expected_previous_sequence(&self) -> u64 {
-        self.expected_previous_sequence
-    }
-
-    pub fn mutations(&self) -> &[TabletMutation] {
-        &self.mutations
-    }
+    pub fn tablet_id(&self) -> TabletId { self.tablet_id }
+    pub fn ownership_epoch(&self) -> u64 { self.ownership_epoch }
+    pub fn sequence(&self) -> u64 { self.sequence }
+    pub fn expected_previous_sequence(&self) -> u64 { self.expected_previous_sequence }
+    pub fn mutations(&self) -> &[TabletMutation] { &self.mutations }
 }
 
-/// One committed value version in the in-memory MVCC prototype.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct VersionedValue {
     pub(crate) sequence: u64,
@@ -270,40 +238,26 @@ struct Memtable {
 }
 
 impl Memtable {
-    fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
-    fn estimated_bytes(&self) -> usize {
-        self.estimated_bytes
-    }
-
+    fn is_empty(&self) -> bool { self.rows.is_empty() }
+    fn estimated_bytes(&self) -> usize { self.estimated_bytes }
     fn push_version(&mut self, key: Vec<u8>, version: VersionedValue) {
         self.estimated_bytes = self
             .estimated_bytes
             .saturating_add(estimated_version_bytes(&key, &version));
         self.rows.entry(key).or_default().push(version);
     }
-
     fn version_at(&self, key: &[u8], snapshot: u64) -> Option<&VersionedValue> {
         self.rows.get(key).and_then(|versions| {
-            versions
-                .iter()
-                .rev()
-                .find(|version| version.sequence <= snapshot)
+            versions.iter().rev().find(|version| version.sequence <= snapshot)
         })
     }
-
     fn from_rows(rows: BTreeMap<Vec<u8>, Vec<VersionedValue>>) -> Self {
         let estimated_bytes = rows.iter().fold(0usize, |total, (key, versions)| {
             versions.iter().fold(total, |subtotal, version| {
                 subtotal.saturating_add(estimated_version_bytes(key, version))
             })
         });
-        Self {
-            rows,
-            estimated_bytes,
-        }
+        Self { rows, estimated_bytes }
     }
 }
 
@@ -317,18 +271,11 @@ fn estimated_version_bytes(key: &[u8], version: &VersionedValue) -> usize {
         .saturating_add(value_bytes)
 }
 
-/// Minimal single-node MVCC tablet used to prove transaction semantics before
-/// introducing WAL and replication.
-///
-/// The structure is deliberately ordinary local computation rather than an
-/// actor-per-key design. A future tablet actor can own this state while reads,
-/// version lookup, and mutation application stay in the local hot path.
 #[derive(Debug, Clone)]
 pub struct MemoryTablet {
     descriptor: TabletDescriptor,
     current_sequence: u64,
     mutable: Memtable,
-    /// Frozen generations ordered from oldest to newest.
     immutables: Vec<Memtable>,
 }
 
@@ -342,26 +289,24 @@ impl MemoryTablet {
         }
     }
 
-    pub fn descriptor(&self) -> &TabletDescriptor {
-        &self.descriptor
+    pub fn descriptor(&self) -> &TabletDescriptor { &self.descriptor }
+    pub fn current_sequence(&self) -> u64 { self.current_sequence }
+    pub fn mutable_memtable_bytes(&self) -> usize { self.mutable.estimated_bytes() }
+    pub fn immutable_memtable_count(&self) -> usize { self.immutables.len() }
+
+    pub(crate) fn oldest_immutable_rows(&self) -> Option<Vec<TabletSnapshotRow>> {
+        self.immutables.first().map(|memtable| {
+            memtable
+                .rows
+                .iter()
+                .map(|(key, versions)| TabletSnapshotRow {
+                    key: key.clone(),
+                    versions: versions.clone(),
+                })
+                .collect()
+        })
     }
 
-    pub fn current_sequence(&self) -> u64 {
-        self.current_sequence
-    }
-
-    /// Estimated logical bytes currently held in the mutable generation.
-    /// This is an admission/rotation metric, not allocator accounting.
-    pub fn mutable_memtable_bytes(&self) -> usize {
-        self.mutable.estimated_bytes()
-    }
-
-    pub fn immutable_memtable_count(&self) -> usize {
-        self.immutables.len()
-    }
-
-    /// Freeze the mutable generation when it reaches the configured byte target.
-    /// Empty generations are never emitted. A zero threshold behaves as one byte.
     pub fn rotate_memtable_if_bytes_at_least(&mut self, min_bytes: usize) -> bool {
         if self.mutable.is_empty() || self.mutable.estimated_bytes() < min_bytes.max(1) {
             return false;
@@ -375,9 +320,7 @@ impl MemoryTablet {
         let mut rows: BTreeMap<Vec<u8>, Vec<VersionedValue>> = BTreeMap::new();
         for memtable in self.immutables.iter().chain(std::iter::once(&self.mutable)) {
             for (key, versions) in &memtable.rows {
-                rows.entry(key.clone())
-                    .or_default()
-                    .extend(versions.clone());
+                rows.entry(key.clone()).or_default().extend(versions.clone());
             }
         }
         TabletSnapshotState {
@@ -398,7 +341,6 @@ impl MemoryTablet {
             if !descriptor.range.contains(&row.key) {
                 return Err(TabletError::KeyOutsideTabletRange);
             }
-
             let mut previous = 0_u64;
             for version in &row.versions {
                 if version.sequence == 0
@@ -413,12 +355,7 @@ impl MemoryTablet {
                 return Err(TabletError::InvalidSnapshotHistory);
             }
         }
-
-        let immutables = if rows.is_empty() {
-            Vec::new()
-        } else {
-            vec![Memtable::from_rows(rows)]
-        };
+        let immutables = if rows.is_empty() { Vec::new() } else { vec![Memtable::from_rows(rows)] };
         Ok(Self {
             descriptor,
             current_sequence: state.current_sequence,
@@ -442,17 +379,10 @@ impl MemoryTablet {
         )
     }
 
-    /// Validate a prepared write against the tablet's current ownership and
-    /// committed tail without mutating state.
     pub(crate) fn validate_write(&self, write: &TabletWrite) -> Result<(), TabletError> {
         self.validate_write_at_sequence(write, self.current_sequence)
     }
 
-    /// Validate a prepared write against a projected committed sequence.
-    ///
-    /// Group commit uses this to validate a complete consecutive batch before
-    /// any WAL bytes are emitted. The tablet itself is not mutated until the
-    /// entire batch has crossed its durability boundary.
     pub(crate) fn validate_write_at_sequence(
         &self,
         write: &TabletWrite,
@@ -489,7 +419,6 @@ impl MemoryTablet {
         {
             return Err(TabletError::KeyOutsideTabletRange);
         }
-
         let next_sequence = committed_sequence
             .checked_add(1)
             .ok_or(TabletError::SequenceOverflow)?;
@@ -499,36 +428,20 @@ impl MemoryTablet {
                 expected_previous: write.expected_previous_sequence,
             });
         }
-
         Ok(())
     }
 
-    /// Atomically apply one prevalidated write to the in-memory MVCC state.
-    ///
-    /// All ownership, predecessor, and key-range checks happen before the
-    /// first row version is appended, so a rejected batch leaves the tablet
-    /// unchanged.
     pub fn commit(&mut self, write: TabletWrite) -> Result<u64, TabletError> {
         self.validate_write(&write)?;
         Ok(self.publish_validated(write))
     }
 
-    /// Publish a write after `validate_write` has succeeded.
-    ///
-    /// This operation is intentionally infallible so a WAL-backed coordinator
-    /// can perform all fallible validation before fsync, then publish the
-    /// already-durable write without creating an ambiguous commit result.
     pub(crate) fn publish_validated(&mut self, write: TabletWrite) -> u64 {
         let sequence = write.sequence;
         self.apply_mutations(sequence, write.mutations);
         sequence
     }
 
-    /// Replay one already checksummed/validated WAL record into MVCC state.
-    ///
-    /// WAL replay intentionally does not re-check historical ownership epochs:
-    /// an older owner epoch is valid history. It does re-check sequence order
-    /// and current tablet range before mutating state.
     pub(crate) fn replay_committed(
         &mut self,
         sequence: u64,
@@ -557,7 +470,6 @@ impl MemoryTablet {
         {
             return Err(TabletError::KeyOutsideTabletRange);
         }
-
         self.apply_mutations(sequence, mutations);
         Ok(())
     }
@@ -568,27 +480,17 @@ impl MemoryTablet {
                 TabletMutation::Put { key, value } => {
                     self.mutable.push_version(
                         key,
-                        VersionedValue {
-                            sequence,
-                            value: Some(value),
-                        },
+                        VersionedValue { sequence, value: Some(value) },
                     );
                 }
                 TabletMutation::Delete { key } => {
-                    self.mutable.push_version(
-                        key,
-                        VersionedValue {
-                            sequence,
-                            value: None,
-                        },
-                    );
+                    self.mutable.push_version(key, VersionedValue { sequence, value: None });
                 }
             }
         }
         self.current_sequence = sequence;
     }
 
-    /// Read one key at an already committed snapshot sequence.
     pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
         if snapshot > self.current_sequence {
             return Err(TabletError::SnapshotAhead {
@@ -599,7 +501,6 @@ impl MemoryTablet {
         if !self.descriptor.range.contains(key) {
             return Err(TabletError::KeyOutsideTabletRange);
         }
-
         let version = self.mutable.version_at(key, snapshot).or_else(|| {
             self.immutables
                 .iter()
@@ -609,50 +510,26 @@ impl MemoryTablet {
         Ok(version.and_then(|version| version.value.as_deref()))
     }
 
-    /// Read the newest committed value. Out-of-range keys route as absent;
-    /// callers that need a routing error can use `read_at`.
     pub fn read_latest(&self, key: &[u8]) -> Option<&[u8]> {
         self.read_at(key, self.current_sequence).ok().flatten()
     }
 }
 
-/// Invariant failures detected before a tablet operation reaches storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TabletError {
     InvalidTabletId,
     InvalidKeyRange,
     InvalidOwnershipEpoch,
     SplitKeyOutsideInterior,
-    WrongTablet {
-        expected: TabletId,
-        presented: TabletId,
-    },
+    WrongTablet { expected: TabletId, presented: TabletId },
     DuplicateChildTablet,
-    EpochNotAdvanced {
-        current: u64,
-        proposed: u64,
-    },
-    StaleEpoch {
-        current: u64,
-        presented: u64,
-    },
-    UnknownEpoch {
-        current: u64,
-        presented: u64,
-    },
-    SequenceMismatch {
-        committed: u64,
-        expected_previous: u64,
-    },
+    EpochNotAdvanced { current: u64, proposed: u64 },
+    StaleEpoch { current: u64, presented: u64 },
+    UnknownEpoch { current: u64, presented: u64 },
+    SequenceMismatch { committed: u64, expected_previous: u64 },
     SequenceOverflow,
-    RecoveredSequenceMismatch {
-        expected: u64,
-        presented: u64,
-    },
-    SnapshotAhead {
-        committed: u64,
-        requested: u64,
-    },
+    RecoveredSequenceMismatch { expected: u64, presented: u64 },
+    SnapshotAhead { committed: u64, requested: u64 },
     InvalidSnapshotHistory,
     KeyOutsideTabletRange,
 }
@@ -663,59 +540,18 @@ impl fmt::Display for TabletError {
             Self::InvalidTabletId => f.write_str("tablet id must be non-zero"),
             Self::InvalidKeyRange => f.write_str("tablet key range must have start < end"),
             Self::InvalidOwnershipEpoch => f.write_str("tablet ownership epoch must be non-zero"),
-            Self::SplitKeyOutsideInterior => {
-                f.write_str("tablet split key must be strictly inside the source range")
-            }
-            Self::WrongTablet {
-                expected,
-                presented,
-            } => write!(
-                f,
-                "tablet write targets tablet {}; expected {}",
-                presented.get(),
-                expected.get()
-            ),
+            Self::SplitKeyOutsideInterior => f.write_str("tablet split key must be strictly inside the source range"),
+            Self::WrongTablet { expected, presented } => write!(f, "tablet write targets tablet {}; expected {}", presented.get(), expected.get()),
             Self::DuplicateChildTablet => f.write_str("tablet split children must have distinct ids"),
-            Self::EpochNotAdvanced { current, proposed } => write!(
-                f,
-                "tablet split epoch {proposed} must be newer than current epoch {current}"
-            ),
-            Self::StaleEpoch { current, presented } => write!(
-                f,
-                "stale tablet ownership epoch {presented}; current epoch is {current}"
-            ),
-            Self::UnknownEpoch { current, presented } => write!(
-                f,
-                "unrecognized future tablet ownership epoch {presented}; current epoch is {current}"
-            ),
-            Self::SequenceMismatch {
-                committed,
-                expected_previous,
-            } => write!(
-                f,
-                "tablet predecessor {expected_previous} does not match committed sequence {committed}"
-            ),
+            Self::EpochNotAdvanced { current, proposed } => write!(f, "tablet split epoch {proposed} must be newer than current epoch {current}"),
+            Self::StaleEpoch { current, presented } => write!(f, "stale tablet ownership epoch {presented}; current epoch is {current}"),
+            Self::UnknownEpoch { current, presented } => write!(f, "unrecognized future tablet ownership epoch {presented}; current epoch is {current}"),
+            Self::SequenceMismatch { committed, expected_previous } => write!(f, "tablet predecessor {expected_previous} does not match committed sequence {committed}"),
             Self::SequenceOverflow => f.write_str("tablet sequence overflow"),
-            Self::RecoveredSequenceMismatch {
-                expected,
-                presented,
-            } => write!(
-                f,
-                "recovered tablet sequence {presented} does not match expected sequence {expected}"
-            ),
-            Self::SnapshotAhead {
-                committed,
-                requested,
-            } => write!(
-                f,
-                "snapshot {requested} is ahead of committed tablet sequence {committed}"
-            ),
-            Self::InvalidSnapshotHistory => {
-                f.write_str("tablet snapshot contains invalid MVCC version history")
-            }
-            Self::KeyOutsideTabletRange => {
-                f.write_str("tablet mutation key falls outside the owned key range")
-            }
+            Self::RecoveredSequenceMismatch { expected, presented } => write!(f, "recovered tablet sequence {presented} does not match expected sequence {expected}"),
+            Self::SnapshotAhead { committed, requested } => write!(f, "snapshot {requested} is ahead of committed tablet sequence {committed}"),
+            Self::InvalidSnapshotHistory => f.write_str("tablet snapshot contains invalid MVCC version history"),
+            Self::KeyOutsideTabletRange => f.write_str("tablet mutation key falls outside the owned key range"),
         }
     }
 }
@@ -734,10 +570,7 @@ mod memtable_rotation_tests {
     }
 
     fn put(key: &[u8], value: &[u8]) -> TabletMutation {
-        TabletMutation::Put {
-            key: key.to_vec(),
-            value: value.to_vec(),
-        }
+        TabletMutation::Put { key: key.to_vec(), value: value.to_vec() }
     }
 
     #[test]
@@ -750,7 +583,6 @@ mod memtable_rotation_tests {
         assert!(tablet.rotate_memtable_if_bytes_at_least(bytes));
         let w2 = tablet.prepare_write(1, 1, vec![put(b"k", b"v2")]).unwrap();
         tablet.commit(w2).unwrap();
-
         assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
         assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
         assert_eq!(tablet.immutable_memtable_count(), 1);
@@ -778,18 +610,10 @@ mod memtable_rotation_tests {
         tablet.rotate_memtable_if_bytes_at_least(bytes);
         let w2 = tablet.prepare_write(1, 1, vec![put(b"k", b"v2")]).unwrap();
         tablet.commit(w2).unwrap();
-
         let state = tablet.snapshot_state();
         assert_eq!(state.current_sequence, 2);
         assert_eq!(state.rows.len(), 1);
-        assert_eq!(
-            state.rows[0]
-                .versions
-                .iter()
-                .map(|v| v.sequence)
-                .collect::<Vec<_>>(),
-            vec![1, 2]
-        );
+        assert_eq!(state.rows[0].versions.iter().map(|v| v.sequence).collect::<Vec<_>>(), vec![1, 2]);
     }
 
     #[test]
@@ -803,7 +627,6 @@ mod memtable_rotation_tests {
             .prepare_write(1, 1, vec![TabletMutation::Delete { key: b"k".to_vec() }])
             .unwrap();
         tablet.commit(delete).unwrap();
-
         assert_eq!(tablet.read_latest(b"k"), None);
         assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
     }
