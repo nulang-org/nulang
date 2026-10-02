@@ -32,6 +32,7 @@ pub mod compat;
 pub mod compiler_identity;
 pub mod content_identity;
 pub mod core_vm;
+pub mod cost_model;
 #[cfg(feature = "native-codegen")]
 pub mod cranelift_utils;
 pub mod dap;
@@ -72,6 +73,7 @@ pub mod mir_wasm;
 pub mod mir_wasm_simd;
 #[cfg(feature = "native-codegen")]
 pub mod native_abi;
+pub mod noalloc;
 #[cfg(feature = "otel")]
 pub mod observability;
 pub mod package;

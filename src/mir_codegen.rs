@@ -351,6 +351,23 @@ impl MirCodegen {
         // treat main as the entry point (matching the legacy compiler).
         let effective_main = main_idx.or(user_main_idx);
 
+        // Validate source-level @noalloc against optimized emitted bytecode.
+        // The cost model also follows statically resolved direct calls
+        // transitively and fails closed for unresolved/closure calls.
+        if let Err(violations) = crate::noalloc::validate_noalloc_contracts(mir, &self.module) {
+            let details = violations
+                .iter()
+                .map(|violation| {
+                    format!("@noalloc fn '{}': {}", violation.function, violation.reason)
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(compile_err(
+                format!("noalloc contract violation: {}", details),
+                Span::default(),
+            ));
+        }
+
         // Actor behaviors compile through the exact same machinery as
         // ordinary functions, but land in CodeModule.behaviors instead of
         // function_table — Spawn/Send/Ask reference them by index there,
@@ -3324,6 +3341,7 @@ mod tests {
                 effect: crate::types::EffectRow::empty(),
                 cap: crate::types::Capability::Ref,
                 placement: None,
+                no_alloc: false,
                 body: {
                     let mut b = crate::hir::Body::new();
                     b.push(crate::hir::Stmt::Let {
@@ -3368,6 +3386,7 @@ mod tests {
             effect: crate::types::EffectRow::empty(),
             cap: crate::types::Capability::Ref,
             placement: None,
+            no_alloc: false,
             body: {
                 let mut b = crate::hir::Body::new();
                 b.set_terminator(crate::hir::Terminator::Yield(crate::hir::Operand::Var(
@@ -3399,6 +3418,7 @@ mod tests {
             effect: crate::types::EffectRow::empty(),
             cap: crate::types::Capability::Ref,
             placement: None,
+            no_alloc: false,
             body: {
                 let mut b = crate::hir::Body::new();
                 b.set_terminator(crate::hir::Terminator::Yield(crate::hir::Operand::Var(
@@ -3643,6 +3663,140 @@ mod optimize_tests {
 
     fn has_opcode(module: &CodeModule, op: OpCode) -> bool {
         module.instructions.iter().any(|i| i.opcode == op)
+    }
+
+    #[test]
+    fn test_noalloc_pure_function_compiles() {
+        let source = r#"
+@noalloc
+fn add(a: Int, b: Int) -> Int { a + b }
+
+fn main() -> Int { add(20, 22) }
+"#;
+        let module = compile_source(source).expect("pure @noalloc function should compile");
+        assert!(
+            module.debug_functions.iter().any(|f| f.name == "add"),
+            "expected add in compiled module"
+        );
+    }
+
+    #[test]
+    fn test_noalloc_rejects_direct_heap_allocation() {
+        let source = r#"
+@noalloc
+fn make() { [1, 2, 3] }
+
+fn main() -> Int { 0 }
+"#;
+        let err = compile_source(source)
+            .expect_err("@noalloc function with an array allocation must fail")
+            .to_string();
+        assert!(
+            err.contains("noalloc contract violation") && err.contains("ArrAlloc"),
+            "unexpected @noalloc diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn test_noalloc_rejects_transitive_allocating_callee() {
+        let source = r#"
+fn make() { [1, 2] }
+
+@noalloc
+fn wrapper() { make() }
+
+fn main() -> Int { 0 }
+"#;
+        let err = compile_source(source)
+            .expect_err("@noalloc must be transitive across direct calls")
+            .to_string();
+        assert!(
+            err.contains("wrapper") && err.contains("make"),
+            "unexpected transitive @noalloc diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn test_noalloc_rejects_indirect_call_target() {
+        let source = r#"
+@noalloc
+fn apply(f, x) { f(x) }
+
+fn main() -> Int { 0 }
+"#;
+        let err = compile_source(source)
+            .expect_err("@noalloc must fail closed for indirect calls")
+            .to_string();
+        assert!(
+            err.contains("indirect/closure call target cannot be proven allocation-free"),
+            "unexpected indirect-call @noalloc diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn test_noalloc_rejects_polymorphic_addition_that_may_concatenate_strings() {
+        let source = r#"
+@noalloc
+fn add(a, b) { a + b }
+
+fn main() -> Int { add(20, 22) }
+"#;
+        let err = compile_source(source)
+            .expect_err("@noalloc must reject IAdd when operand types are not proven numeric")
+            .to_string();
+        assert!(
+            err.contains("dynamic addition may allocate a string"),
+            "unexpected polymorphic-add diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn test_noalloc_rejects_string_equality_until_vm_comparison_is_borrowed() {
+        let source = r#"
+@noalloc
+fn same(a: String, b: String) -> Bool { a == b }
+
+fn main() -> Int { 0 }
+"#;
+        let err = compile_source(source)
+            .expect_err(
+                "@noalloc must reject SCmpEq while VM comparison materializes owned strings",
+            )
+            .to_string();
+        assert!(
+            err.contains("string comparison may allocate"),
+            "unexpected string-equality diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn test_noalloc_rejects_contract_panic_path() {
+        let source = r#"
+@noalloc
+fn positive(x: Int) -> Int requires x > 0 { x }
+
+fn main() -> Int { positive(1) }
+"#;
+        let err = compile_source(source)
+            .expect_err("@noalloc must reject runtime panic formatting")
+            .to_string();
+        assert!(
+            err.contains("panic/error formatting may allocate"),
+            "unexpected panic diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn test_noalloc_allows_pure_direct_recursion() {
+        let source = r#"
+@noalloc
+fn countdown(n: Int) -> Int {
+    if n == 0 then 0 else countdown(n - 1)
+}
+
+fn main() -> Int { countdown(4) }
+"#;
+        compile_source(source).expect("pure direct recursion should satisfy @noalloc");
     }
 
     #[test]
