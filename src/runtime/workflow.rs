@@ -30,7 +30,7 @@ pub(crate) fn actor_is_workflow(rt: &Runtime, actor_id: u64) -> bool {
         .unwrap_or(false)
 }
 
-fn current_custom_event_replay_id(
+fn current_workflow_replay_id(
     rt: &mut Runtime,
     actor_id: u64,
 ) -> Option<WorkflowReplayEventId> {
@@ -48,7 +48,7 @@ fn current_custom_event_replay_id(
     ))
 }
 
-fn advance_custom_event_replay_id(
+fn advance_workflow_replay_id(
     rt: &mut Runtime,
     actor_id: u64,
     committed: WorkflowReplayEventId,
@@ -69,10 +69,28 @@ fn advance_custom_event_replay_id(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CustomEventReplayDisposition {
+enum ReplayDisposition {
     Append,
     Consume,
     Conflict,
+}
+
+fn committed_replay_event(
+    rt: &Runtime,
+    actor_id: u64,
+    replay_id: WorkflowReplayEventId,
+) -> Result<Option<WorkflowEvent>, ()> {
+    let mut committed = None;
+    for workflow_event in rt.persistence.read_workflow_events(actor_id) {
+        if workflow_event.replay_id() != Some(replay_id) {
+            continue;
+        }
+        if committed.is_some() {
+            return Err(());
+        }
+        committed = Some(workflow_event);
+    }
+    Ok(committed)
 }
 
 fn custom_event_replay_disposition(
@@ -81,34 +99,35 @@ fn custom_event_replay_disposition(
     replay_id: WorkflowReplayEventId,
     event: &str,
     payload: &[PersistedValue],
-) -> CustomEventReplayDisposition {
-    let mut committed: Option<(String, Vec<PersistedValue>)> = None;
-
-    for workflow_event in rt.persistence.read_workflow_events(actor_id) {
-        let WorkflowEvent::Custom {
-            replay_id: Some(existing_id),
-            name,
-            args,
-            ..
-        } = workflow_event
-        else {
-            continue;
-        };
-        if existing_id != replay_id {
-            continue;
+) -> ReplayDisposition {
+    match committed_replay_event(rt, actor_id, replay_id) {
+        Ok(None) => ReplayDisposition::Append,
+        Ok(Some(WorkflowEvent::Custom { name, args, .. }))
+            if name == event && args.as_slice() == payload =>
+        {
+            ReplayDisposition::Consume
         }
-        if committed.is_some() {
-            return CustomEventReplayDisposition::Conflict;
-        }
-        committed = Some((name, args));
+        Ok(Some(_)) | Err(()) => ReplayDisposition::Conflict,
     }
+}
 
-    match committed {
-        None => CustomEventReplayDisposition::Append,
-        Some((name, args)) if name == event && args.as_slice() == payload => {
-            CustomEventReplayDisposition::Consume
+fn timer_set_replay_disposition(
+    rt: &Runtime,
+    actor_id: u64,
+    replay_id: WorkflowReplayEventId,
+    name: &str,
+    duration_ms: u64,
+) -> ReplayDisposition {
+    match committed_replay_event(rt, actor_id, replay_id) {
+        Ok(None) => ReplayDisposition::Append,
+        Ok(Some(WorkflowEvent::TimerSet {
+            name: committed_name,
+            duration_ms: committed_duration_ms,
+            ..
+        })) if committed_name == name && committed_duration_ms == duration_ms => {
+            ReplayDisposition::Consume
         }
-        Some(_) => CustomEventReplayDisposition::Conflict,
+        Ok(Some(_)) | Err(()) => ReplayDisposition::Conflict,
     }
 }
 // ---------------------------------------------------------------------------
@@ -440,14 +459,14 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                 .iter()
                 .map(|v| PersistedValue::from_value_resolved(v, module))
                 .collect();
-            let replay_id = current_custom_event_replay_id(rt, actor_id);
+            let replay_id = current_workflow_replay_id(rt, actor_id);
             let mut should_checkpoint = false;
             if let Some(replay_id) = replay_id {
                 match custom_event_replay_disposition(rt, actor_id, replay_id, event, &payload) {
-                    CustomEventReplayDisposition::Consume => {
-                        advance_custom_event_replay_id(rt, actor_id, replay_id);
+                    ReplayDisposition::Consume => {
+                        advance_workflow_replay_id(rt, actor_id, replay_id);
                     }
-                    CustomEventReplayDisposition::Conflict => {
+                    ReplayDisposition::Conflict => {
                         tracing::error!(
                             actor_id,
                             activation_actor_id = replay_id.activation.actor_id,
@@ -457,7 +476,7 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                             "nulang-workflow: replay identity conflicts with committed custom event; refusing durable mutation"
                         );
                     }
-                    CustomEventReplayDisposition::Append => {
+                    ReplayDisposition::Append => {
                         let appended = rt
                             .persistence
                             .append_workflow_event(
@@ -476,7 +495,7 @@ pub(crate) fn emit_event(rt: &mut Runtime, actor_id: u64, event: &str, args: &[V
                             // re-execute the command and consume this exact
                             // replay identity instead of treating partial state
                             // as completed progress.
-                            advance_custom_event_replay_id(rt, actor_id, replay_id);
+                            advance_workflow_replay_id(rt, actor_id, replay_id);
                         }
                     }
                 }
@@ -510,12 +529,49 @@ pub(crate) fn append_timer_set(
     actor_id: u64,
     name: &str,
     duration_ms: u64,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
+    if let Some(replay_id) = current_workflow_replay_id(rt, actor_id) {
+        match timer_set_replay_disposition(rt, actor_id, replay_id, name, duration_ms) {
+            ReplayDisposition::Consume => {
+                advance_workflow_replay_id(rt, actor_id, replay_id);
+                return Ok(false);
+            }
+            ReplayDisposition::Conflict => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "workflow timer replay identity conflicts with committed event: activation {}:{} ordinal {}",
+                        replay_id.activation.actor_id,
+                        replay_id.activation.command_sequence,
+                        replay_id.ordinal
+                    ),
+                ));
+            }
+            ReplayDisposition::Append => {
+                let seq = next_sequence(rt, actor_id);
+                rt.persistence.append_workflow_event(
+                    actor_id,
+                    WorkflowEvent::TimerSet {
+                        sequence: seq,
+                        replay_id: Some(replay_id),
+                        name: name.to_string(),
+                        duration_ms,
+                    },
+                )?;
+                // TimerSet is an intermediate record for an open activation.
+                // Keep the last completed snapshot unchanged so crash recovery
+                // re-executes the command and consumes this exact identity.
+                advance_workflow_replay_id(rt, actor_id, replay_id);
+                return Ok(true);
+            }
+        }
+    }
+
     let seq = next_sequence(rt, actor_id);
     rt.persistence
         .append_timer_set(actor_id, seq, name.to_string(), duration_ms)?;
     try_checkpoint_actor(rt, actor_id)?;
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn append_timer_fired(
@@ -633,12 +689,17 @@ pub(crate) fn schedule_workflow_timer(
     name: &str,
     duration_ms: u64,
 ) -> std::io::Result<()> {
-    if actor_is_workflow(rt, actor_id) {
-        // Never arm a live timer if its durable TimerSet/checkpoint failed.
-        // Recovery can only reason about timers that were durably recorded.
-        append_timer_set(rt, actor_id, name, duration_ms)?;
+    let should_arm = if actor_is_workflow(rt, actor_id) {
+        // Never arm a live timer if its durable preparation failed. During
+        // activation replay, a matching committed TimerSet is consumed and
+        // recovery already owns the live timer reconstructed from history.
+        append_timer_set(rt, actor_id, name, duration_ms)?
+    } else {
+        true
+    };
+    if should_arm {
+        rt.rearm_timer(actor_id, name, duration_ms);
     }
-    rt.rearm_timer(actor_id, name, duration_ms);
     Ok(())
 }
 
