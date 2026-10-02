@@ -1,0 +1,42 @@
+name: Apply delivery failure outcomes 1180
+
+on:
+  push:
+    branches:
+      - fix/delivery-failure-outcomes-1180
+
+permissions:
+  contents: write
+
+jobs:
+  apply-validated-patch:
+    if: ${{ !contains(github.event.head_commit.message, '[applied-1180]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply patch
+        run: python3 .github/apply-1180.py
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Check no-default
+        run: cargo check --locked --no-default-features
+      - name: Check TCP transport
+        run: cargo check --locked --no-default-features --features tcp
+      - name: Focused connect-failure regression
+        run: cargo test --locked --no-default-features --features tcp test_tcp_connect_failure_is_observable_and_not_retried --lib
+      - name: Focused distribution tests
+        run: cargo test --locked --no-default-features --lib distribution::
+      - name: Remove transfer scaffolding
+        run: |
+          rm .github/apply-1180.py
+          rm .github/workflows/apply-delivery-failure-outcomes-1180.yml
+      - name: Commit clean implementation
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/runtime/network.rs src/runtime/distributed.rs docs/DELIVERY_SEMANTICS.md .github/apply-1180.py .github/workflows/apply-delivery-failure-outcomes-1180.yml
+          git commit -m "fix(distribution): surface remote delivery failures [applied-1180]"
+          git push origin HEAD:fix/delivery-failure-outcomes-1180
