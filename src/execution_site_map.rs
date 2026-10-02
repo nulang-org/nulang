@@ -8,9 +8,12 @@
 //! of semantic identity.
 
 use crate::artifact_identity::ArtifactIdentityManifest;
-use crate::bytecode::CodeModule;
+use crate::bytecode::{CodeModule, OpCode};
+use crate::content_identity::{ArtifactId, SemanticId, SourceId};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fmt;
+use std::str::FromStr;
 
 pub const EXECUTION_SITE_MAP_SCHEMA: &str = "nulang.execution-sites/v0alpha1";
 
@@ -43,22 +46,163 @@ pub struct ExecutionSite {
 }
 
 impl ExecutionSiteMap {
+    /// Build a source-link map from compiler-owned artifact metadata.
+    ///
+    /// The semantic site ID is copied from `CodeModule::effect_sites`; source
+    /// lines are presentation metadata looked up through `CodeModule::line_at`.
+    /// The constructor fails closed if an effect-site entry points outside the
+    /// artifact or at a non-effect opcode.
     pub fn from_code_module(
-        _module: &CodeModule,
-        _artifact: &ArtifactIdentityManifest,
-        _source_path: Option<String>,
+        module: &CodeModule,
+        artifact: &ArtifactIdentityManifest,
+        source_path: Option<String>,
     ) -> Result<Self, ExecutionSiteMapError> {
-        todo!("implemented after the contract tests")
+        if module.name.trim().is_empty() {
+            return Err(ExecutionSiteMapError::InvalidModule(
+                "module name must not be empty".to_string(),
+            ));
+        }
+        if source_path
+            .as_deref()
+            .is_some_and(|path| path.trim().is_empty())
+        {
+            return Err(ExecutionSiteMapError::InvalidSourcePath);
+        }
+
+        let mut sites = Vec::with_capacity(module.effect_sites.len());
+        for site in &module.effect_sites {
+            let instruction = module.instructions.get(site.pc).ok_or(
+                ExecutionSiteMapError::InvalidSitePc {
+                    pc: site.pc,
+                    instruction_count: module.instructions.len(),
+                },
+            )?;
+            if !matches!(
+                instruction.opcode,
+                OpCode::Perform | OpCode::PerformDirect | OpCode::PerformAsync
+            ) {
+                return Err(ExecutionSiteMapError::InvalidEffectOpcode { pc: site.pc });
+            }
+
+            sites.push(ExecutionSite {
+                pc: site.pc,
+                semantic_site_id: hex::encode(site.id),
+                effect_operation: site.effect_operation.clone(),
+                line: module.line_at(site.pc),
+            });
+        }
+
+        let mut map = Self {
+            schema: EXECUTION_SITE_MAP_SCHEMA.to_string(),
+            source_id: artifact.source_id().map(|id| id.to_string()),
+            semantic_id: artifact.semantic_id().to_string(),
+            artifact_id: artifact.artifact_id().to_string(),
+            module: module.name.clone(),
+            source_path,
+            sites,
+        };
+        map.normalize();
+        map.validate()?;
+        Ok(map)
     }
 
+    /// Serialize canonical human-readable JSON for sidecar/tooling use.
     pub fn to_json(&self) -> Result<Vec<u8>, ExecutionSiteMapError> {
-        let _ = self;
-        todo!("implemented after the contract tests")
+        let mut normalized = self.clone();
+        normalized.normalize();
+        normalized.validate()?;
+        serde_json::to_vec_pretty(&normalized).map_err(ExecutionSiteMapError::from)
     }
 
-    pub fn from_json(_bytes: &[u8]) -> Result<Self, ExecutionSiteMapError> {
-        todo!("implemented after the contract tests")
+    /// Parse untrusted site-map JSON and fail closed on malformed identities,
+    /// duplicate sites, invalid source locations, or an unsupported schema.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, ExecutionSiteMapError> {
+        let mut map: Self = serde_json::from_slice(bytes).map_err(ExecutionSiteMapError::from)?;
+        map.normalize();
+        map.validate()?;
+        Ok(map)
     }
+
+    fn normalize(&mut self) {
+        for site in &mut self.sites {
+            site.semantic_site_id.make_ascii_lowercase();
+        }
+        self.sites.sort_by_key(|site| site.pc);
+    }
+
+    fn validate(&self) -> Result<(), ExecutionSiteMapError> {
+        if self.schema != EXECUTION_SITE_MAP_SCHEMA {
+            return Err(ExecutionSiteMapError::UnsupportedSchema(
+                self.schema.clone(),
+            ));
+        }
+        if let Some(source_id) = &self.source_id {
+            parse_identity::<SourceId>("source_id", source_id)?;
+        }
+        parse_identity::<SemanticId>("semantic_id", &self.semantic_id)?;
+        parse_identity::<ArtifactId>("artifact_id", &self.artifact_id)?;
+
+        if self.module.trim().is_empty() {
+            return Err(ExecutionSiteMapError::InvalidModule(
+                "module name must not be empty".to_string(),
+            ));
+        }
+        if self
+            .source_path
+            .as_deref()
+            .is_some_and(|path| path.trim().is_empty())
+        {
+            return Err(ExecutionSiteMapError::InvalidSourcePath);
+        }
+
+        let mut pcs = BTreeSet::new();
+        let mut ids = BTreeSet::new();
+        for site in &self.sites {
+            if !pcs.insert(site.pc) {
+                return Err(ExecutionSiteMapError::DuplicatePc(site.pc));
+            }
+            validate_site_id(&site.semantic_site_id)?;
+            if !ids.insert(site.semantic_site_id.clone()) {
+                return Err(ExecutionSiteMapError::DuplicateSiteId(
+                    site.semantic_site_id.clone(),
+                ));
+            }
+            if site.effect_operation.trim().is_empty() {
+                return Err(ExecutionSiteMapError::InvalidEffectOperation { pc: site.pc });
+            }
+            if let Some(line) = site.line {
+                if line == 0 {
+                    return Err(ExecutionSiteMapError::InvalidLine(line));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn parse_identity<T>(field: &'static str, value: &str) -> Result<T, ExecutionSiteMapError>
+where
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    value
+        .parse::<T>()
+        .map_err(|error| ExecutionSiteMapError::InvalidIdentity {
+            field,
+            message: error.to_string(),
+        })
+}
+
+fn validate_site_id(value: &str) -> Result<(), ExecutionSiteMapError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ExecutionSiteMapError::InvalidSiteId(value.to_string()));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +222,9 @@ pub enum ExecutionSiteMapError {
     InvalidEffectOpcode {
         pc: usize,
     },
+    InvalidEffectOperation {
+        pc: usize,
+    },
     InvalidSiteId(String),
     DuplicatePc(usize),
     DuplicateSiteId(String),
@@ -86,7 +233,34 @@ pub enum ExecutionSiteMapError {
 
 impl fmt::Display for ExecutionSiteMapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Json(message) => write!(f, "invalid execution-site map JSON: {message}"),
+            Self::UnsupportedSchema(schema) => {
+                write!(f, "unsupported execution-site map schema {schema}")
+            }
+            Self::InvalidIdentity { field, message } => {
+                write!(f, "invalid {field} in execution-site map: {message}")
+            }
+            Self::InvalidModule(message) => write!(f, "invalid module: {message}"),
+            Self::InvalidSourcePath => write!(f, "source path must not be empty"),
+            Self::InvalidSitePc {
+                pc,
+                instruction_count,
+            } => write!(
+                f,
+                "execution site pc {pc} is outside artifact instruction count {instruction_count}"
+            ),
+            Self::InvalidEffectOpcode { pc } => {
+                write!(f, "execution site pc {pc} does not point at an effect opcode")
+            }
+            Self::InvalidEffectOperation { pc } => {
+                write!(f, "execution site pc {pc} has an empty effect operation")
+            }
+            Self::InvalidSiteId(id) => write!(f, "invalid semantic execution-site id {id}"),
+            Self::DuplicatePc(pc) => write!(f, "duplicate execution site pc {pc}"),
+            Self::DuplicateSiteId(id) => write!(f, "duplicate semantic execution-site id {id}"),
+            Self::InvalidLine(line) => write!(f, "source lines are one-indexed; got {line}"),
+        }
     }
 }
 
@@ -154,12 +328,8 @@ mod tests {
 
     #[test]
     fn rejects_metadata_that_points_at_a_non_effect_opcode() {
-        let error = ExecutionSiteMap::from_code_module(
-            &code_module(OpCode::Move),
-            &artifact(),
-            None,
-        )
-        .expect_err("invalid site metadata must fail closed");
+        let error = ExecutionSiteMap::from_code_module(&code_module(OpCode::Move), &artifact(), None)
+            .expect_err("invalid site metadata must fail closed");
 
         assert_eq!(error, ExecutionSiteMapError::InvalidEffectOpcode { pc: 2 });
     }
@@ -208,5 +378,20 @@ mod tests {
             ExecutionSiteMap::from_json(&bytes),
             Err(ExecutionSiteMapError::DuplicateSiteId(_))
         ));
+    }
+
+    #[test]
+    fn parser_normalizes_uppercase_site_ids() {
+        let map = ExecutionSiteMap::from_code_module(
+            &code_module(OpCode::PerformAsync),
+            &artifact(),
+            None,
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(map).unwrap();
+        value["sites"][0]["semantic_site_id"] = serde_json::Value::String("AB".repeat(32));
+
+        let parsed = ExecutionSiteMap::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(parsed.sites[0].semantic_site_id, "ab".repeat(32));
     }
 }
