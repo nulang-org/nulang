@@ -1,0 +1,22 @@
+name: Validate restacked sqlite feature
+
+on:
+  push:
+    branches:
+      - automation/validate-sqlite-feature-20261002
+
+jobs:
+  sqlite-feature:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 421d6a7dce37ea7114ce0fb29bd646438ea03ede
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prove exact candidate
+        run: |
+          test "$(git rev-parse HEAD)" = 421d6a7dce37ea7114ce0fb29bd646438ea03ede
+          cargo check --locked --no-default-features --features sqlite --all-targets
+          cargo test --locked --no-default-features --features sqlite --lib libsql_atomic_transition -- --nocapture
+          cargo test --locked --no-default-features --features sqlite --lib test_libsql_store -- --nocapture
