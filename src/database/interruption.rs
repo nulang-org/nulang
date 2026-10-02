@@ -28,6 +28,14 @@ pub(crate) enum StorageInterruptionPoint {
     CheckpointAfterTempSync,
     CheckpointAfterRename,
     CheckpointAfterDirectorySync,
+    SstableAfterTempWrite,
+    SstableAfterTempSync,
+    SstableAfterRename,
+    SstableAfterDirectorySync,
+    ManifestAfterTempWrite,
+    ManifestAfterTempSync,
+    ManifestAfterRename,
+    ManifestAfterDirectorySync,
     WalReclaimAfterReplacementWrite,
     WalReclaimAfterReplacementSync,
     WalReclaimAfterRename,
@@ -106,6 +114,10 @@ mod tests {
         let _ = fs::remove_file(&checkpoint);
         let _ = fs::remove_file(appended(&checkpoint, ".tmp"));
         let _ = fs::remove_file(appended(wal_path, ".reclaim.tmp"));
+        let manifest = wal_path.with_extension("manifest");
+        let _ = fs::remove_file(&manifest);
+        let _ = fs::remove_file(appended(&manifest, ".tmp"));
+        let _ = fs::remove_dir_all(wal_path.with_extension("sstables"));
     }
 
     fn commit_put(tablet: &mut WalBackedTablet, value: &[u8]) {
@@ -155,7 +167,6 @@ mod tests {
             let wal_path = temp_wal("binary_batch");
             cleanup(&wal_path);
             let writes = batch_writes();
-
             let mut wal = BinaryBatchWal::open(&wal_path).unwrap();
             let result = with_interruption(point, || wal.append_batch(&writes));
             assert!(result.is_err(), "{point:?} must interrupt the append");
@@ -165,13 +176,8 @@ mod tests {
                 "live batch WAL must require reopen after {point:?}"
             );
             drop(wal);
-
             let reopened = BinaryBatchWal::open(&wal_path).unwrap();
-            assert_eq!(
-                reopened.last_sequence(),
-                expected_sequence,
-                "unexpected recovered sequence after {point:?}"
-            );
+            assert_eq!(reopened.last_sequence(), expected_sequence);
             cleanup(&wal_path);
         }
     }
@@ -188,35 +194,15 @@ mod tests {
             let wal_path = temp_wal("wal_batch");
             cleanup(&wal_path);
             let writes = batch_writes();
-
             let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
             let result = with_interruption(point, || tablet.commit_batch(writes));
-            assert!(result.is_err(), "{point:?} must interrupt the group commit");
-
+            assert!(result.is_err());
             let retry_sequence = tablet.current_sequence();
-            let retry = tablet
-                .prepare_write(
-                    7,
-                    retry_sequence,
-                    vec![TabletMutation::Put {
-                        key: b"retry".to_vec(),
-                        value: b"blocked".to_vec(),
-                    }],
-                )
-                .unwrap();
-            assert_eq!(
-                tablet.commit(retry).unwrap_err(),
-                WalBackedError::Wal(WalError::Poisoned),
-                "live tablet must require reopen after {point:?}"
-            );
+            let retry = tablet.prepare_write(7, retry_sequence, vec![TabletMutation::Put { key: b"retry".to_vec(), value: b"blocked".to_vec() }]).unwrap();
+            assert_eq!(tablet.commit(retry).unwrap_err(), WalBackedError::Wal(WalError::Poisoned));
             drop(tablet);
-
             let reopened = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
-            assert_eq!(
-                reopened.current_sequence(),
-                expected_sequence,
-                "unexpected recovered sequence after {point:?}"
-            );
+            assert_eq!(reopened.current_sequence(), expected_sequence);
             cleanup(&wal_path);
         }
     }
@@ -231,34 +217,14 @@ mod tests {
         ] {
             let wal_path = temp_wal("wal");
             cleanup(&wal_path);
-
             let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
-            let write = tablet
-                .prepare_write(
-                    7,
-                    0,
-                    vec![TabletMutation::Put {
-                        key: b"k".to_vec(),
-                        value: b"v1".to_vec(),
-                    }],
-                )
-                .unwrap();
-
+            let write = tablet.prepare_write(7, 0, vec![TabletMutation::Put { key: b"k".to_vec(), value: b"v1".to_vec() }]).unwrap();
             let result = with_interruption(point, || tablet.commit(write));
-            assert!(result.is_err(), "{point:?} must interrupt the commit");
+            assert!(result.is_err());
             drop(tablet);
-
             let mut reopened = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
-            assert_eq!(
-                reopened.current_sequence(),
-                expected_sequence,
-                "unexpected recovered sequence after {point:?}"
-            );
-            assert_eq!(
-                reopened.read_latest(b"k"),
-                (expected_sequence == 1).then_some(&b"v1"[..])
-            );
-
+            assert_eq!(reopened.current_sequence(), expected_sequence);
+            assert_eq!(reopened.read_latest(b"k"), (expected_sequence == 1).then_some(&b"v1"[..]));
             commit_put(&mut reopened, b"next");
             assert_eq!(reopened.current_sequence(), expected_sequence + 1);
             cleanup(&wal_path);
@@ -275,24 +241,13 @@ mod tests {
         ] {
             let wal_path = temp_wal("checkpoint");
             cleanup(&wal_path);
-
             let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
             commit_put(&mut tablet, b"v1");
             commit_put(&mut tablet, b"v2");
-
             let result = with_interruption(point, || tablet.publish_checkpoint());
-            assert!(
-                result.is_err(),
-                "{point:?} must interrupt checkpoint publication"
-            );
+            assert!(result.is_err());
             drop(tablet);
-
-            assert_eq!(
-                wal_path.with_extension("checkpoint").exists(),
-                checkpoint_published,
-                "unexpected canonical checkpoint state after {point:?}"
-            );
-
+            assert_eq!(wal_path.with_extension("checkpoint").exists(), checkpoint_published);
             let reopened = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
             assert_eq!(reopened.current_sequence(), 2);
             assert_eq!(reopened.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
@@ -302,64 +257,89 @@ mod tests {
     }
 
     #[test]
+    fn sstable_and_manifest_flush_interruption_matrix_keeps_wal_authoritative() {
+        for (point, manifest_published) in [
+            (StorageInterruptionPoint::SstableAfterTempWrite, false),
+            (StorageInterruptionPoint::SstableAfterTempSync, false),
+            (StorageInterruptionPoint::SstableAfterRename, false),
+            (StorageInterruptionPoint::SstableAfterDirectorySync, false),
+            (StorageInterruptionPoint::ManifestAfterTempWrite, false),
+            (StorageInterruptionPoint::ManifestAfterTempSync, false),
+            (StorageInterruptionPoint::ManifestAfterRename, true),
+            (StorageInterruptionPoint::ManifestAfterDirectorySync, true),
+        ] {
+            let wal_path = temp_wal("sstable_flush");
+            cleanup(&wal_path);
+            let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+            commit_put(&mut tablet, b"v1");
+            let bytes = tablet.mutable_memtable_bytes();
+            assert!(tablet.rotate_memtable_if_bytes_at_least(bytes));
+            let result = with_interruption(point, || tablet.flush_oldest_immutable_to_sstable());
+            assert!(result.is_err(), "{point:?} must interrupt flush publication");
+            drop(tablet);
+            assert_eq!(wal_path.with_extension("manifest").exists(), manifest_published);
+            let reopened = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+            assert_eq!(reopened.current_sequence(), 1);
+            assert_eq!(reopened.read_latest(b"k"), Some(&b"v1"[..]));
+            cleanup(&wal_path);
+        }
+    }
+
+    #[test]
+    fn renamed_orphan_sstable_is_verified_and_reused_on_retry() {
+        let wal_path = temp_wal("sstable_orphan_retry");
+        cleanup(&wal_path);
+        let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+        commit_put(&mut tablet, b"v1");
+        let bytes = tablet.mutable_memtable_bytes();
+        assert!(tablet.rotate_memtable_if_bytes_at_least(bytes));
+        let result = with_interruption(StorageInterruptionPoint::SstableAfterRename, || tablet.flush_oldest_immutable_to_sstable());
+        assert!(result.is_err());
+        assert!(!wal_path.with_extension("manifest").exists());
+        let sstable_dir = wal_path.with_extension("sstables");
+        assert_eq!(fs::read_dir(&sstable_dir).unwrap().count(), 1);
+        drop(tablet);
+        let mut reopened = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
+        assert_eq!(reopened.current_sequence(), 1);
+        let replay_bytes = reopened.mutable_memtable_bytes();
+        assert!(reopened.rotate_memtable_if_bytes_at_least(replay_bytes));
+        assert!(reopened.flush_oldest_immutable_to_sstable().unwrap());
+        assert_eq!(reopened.durable_sstable_count().unwrap(), 1);
+        let wal = FileWal::open(&wal_path).unwrap();
+        assert_eq!(wal.base_sequence(), 0);
+        assert_eq!(wal.records().len(), 1);
+        drop(wal);
+        cleanup(&wal_path);
+    }
+
+    #[test]
     fn wal_reclamation_interruption_matrix_preserves_checkpoint_and_sequence_chain() {
         for (point, expected_base_sequence, expected_records) in [
-            (
-                StorageInterruptionPoint::WalReclaimAfterReplacementWrite,
-                0,
-                2,
-            ),
-            (
-                StorageInterruptionPoint::WalReclaimAfterReplacementSync,
-                0,
-                2,
-            ),
+            (StorageInterruptionPoint::WalReclaimAfterReplacementWrite, 0, 2),
+            (StorageInterruptionPoint::WalReclaimAfterReplacementSync, 0, 2),
             (StorageInterruptionPoint::WalReclaimAfterRename, 2, 0),
             (StorageInterruptionPoint::WalReclaimAfterDirectorySync, 2, 0),
         ] {
             let wal_path = temp_wal("reclaim");
             cleanup(&wal_path);
-
             let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
             commit_put(&mut tablet, b"v1");
             commit_put(&mut tablet, b"v2");
-
             let result = with_interruption(point, || tablet.checkpoint());
-            assert!(result.is_err(), "{point:?} must interrupt WAL reclamation");
-
+            assert!(result.is_err());
             let sequence = tablet.current_sequence();
-            let retry = tablet
-                .prepare_write(
-                    7,
-                    sequence,
-                    vec![TabletMutation::Put {
-                        key: b"k".to_vec(),
-                        value: b"must-not-commit".to_vec(),
-                    }],
-                )
-                .unwrap();
-            assert_eq!(
-                tablet.commit(retry).unwrap_err(),
-                WalBackedError::Wal(WalError::Poisoned),
-                "live tablet must require reopen after {point:?}"
-            );
+            let retry = tablet.prepare_write(7, sequence, vec![TabletMutation::Put { key: b"k".to_vec(), value: b"must-not-commit".to_vec() }]).unwrap();
+            assert_eq!(tablet.commit(retry).unwrap_err(), WalBackedError::Wal(WalError::Poisoned));
             drop(tablet);
-
-            assert!(
-                wal_path.with_extension("checkpoint").exists(),
-                "checkpoint must already be durable before WAL reclamation"
-            );
-
+            assert!(wal_path.with_extension("checkpoint").exists());
             let wal = FileWal::open(&wal_path).unwrap();
             assert_eq!(wal.base_sequence(), expected_base_sequence);
             assert_eq!(wal.records().len(), expected_records);
             drop(wal);
-
             let mut reopened = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
             assert_eq!(reopened.current_sequence(), 2);
             assert_eq!(reopened.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
             assert_eq!(reopened.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
-
             commit_put(&mut reopened, b"v3");
             assert_eq!(reopened.current_sequence(), 3);
             cleanup(&wal_path);
