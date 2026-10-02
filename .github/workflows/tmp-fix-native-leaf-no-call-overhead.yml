@@ -74,15 +74,16 @@ jobs:
           assert old in text
           path.write_text(text.replace(old, new, 1))
           PY
-      - name: Validate fix
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo fmt --all -- --check
-          git diff --check
-          cargo check --locked --no-default-features --features native-codegen
-          cargo test --locked --no-default-features --features native-codegen --lib jit::tests -- --test-threads=1
-          cargo clippy --locked --all-targets -- -D clippy::correctness
+      - name: Validate format
+        run: cargo fmt --all -- --check
+      - name: Validate diff hygiene
+        run: git diff --check
+      - name: Validate native-codegen check
+        run: cargo check --locked --no-default-features --features native-codegen
+      - name: Validate JIT tests
+        run: cargo test --locked --no-default-features --features native-codegen --lib jit::tests -- --test-threads=1
+      - name: Validate default-feature Clippy correctness
+        run: cargo clippy --locked --all-targets -- -D clippy::correctness
       - name: Commit source changes
         shell: bash
         run: |
