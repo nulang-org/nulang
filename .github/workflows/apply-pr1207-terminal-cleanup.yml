@@ -34,25 +34,9 @@ jobs:
 
           mod = Path('src/runtime/mod.rs')
           text = mod.read_text()
-          anchor = '''    fn restore_suspended_workflow_activation(
-              &mut self,
-              actor_id: u64,
-              activation: Option<WorkflowActivationId>,
-          ) {
-              let Some(actor) = self.actors.get_mut(&actor_id) else {
-                  return;
-              };
-              actor.current_workflow_activation = activation;
-              if let Some(activation) = activation {
-                  if actor.workflow_replay_activation != Some(activation) {
-                      actor.workflow_replay_activation = Some(activation);
-                      actor.workflow_replay_event_ordinal = 0;
-                  }
-              }
-          }
-          '''
-          replacement = anchor + '''
-              /// Clear replay state only after the matching workflow activation reaches a
+          marker = '    /// Resume an actor that yielded at a JIT safepoint.\n'
+          assert text.count(marker) == 1, text.count(marker)
+          helper = '''    /// Clear replay state only after the matching workflow activation reaches a
               /// durable terminal boundary. A persistence failure must leave the replay
               /// identity intact so recovery can resume from committed history.
               pub(crate) fn clear_terminal_workflow_activation(
@@ -72,115 +56,55 @@ jobs:
                       actor.workflow_replay_event_ordinal = 0;
                   }
               }
+
           '''
-          assert text.count(anchor) == 1, text.count(anchor)
-          mod.write_text(text.replace(anchor, replacement))
+          text = text.replace(marker, helper + marker)
+          mod.write_text(text)
 
           workflow = Path('src/runtime/workflow.rs')
           text = workflow.read_text()
-          old_completed = '''pub(crate) fn persist_step_completed(
-              rt: &mut Runtime,
-              actor_id: u64,
-              activation: Option<WorkflowActivationId>,
-              step_name: String,
-          ) -> std::io::Result<()> {
-              if workflow_has_atomic_tail(rt, actor_id)? {
-                  return commit_step_completed(rt, actor_id, activation, step_name);
-              }
 
-              let sequence = next_sequence(rt, actor_id);
-              rt.persistence.append_workflow_event(
-                  actor_id,
-                  WorkflowEvent::StepCompleted {
-                      sequence,
-                      activation,
-                      step_name,
-                  },
-              )?;
-              try_checkpoint_actor(rt, actor_id)
-          }
-          '''
-          new_completed = '''pub(crate) fn persist_step_completed(
-              rt: &mut Runtime,
-              actor_id: u64,
-              activation: Option<WorkflowActivationId>,
-              step_name: String,
-          ) -> std::io::Result<()> {
-              if workflow_has_atomic_tail(rt, actor_id)? {
-                  commit_step_completed(rt, actor_id, activation, step_name)?;
-              } else {
-                  let sequence = next_sequence(rt, actor_id);
-                  rt.persistence.append_workflow_event(
-                      actor_id,
-                      WorkflowEvent::StepCompleted {
-                          sequence,
-                          activation,
-                          step_name,
-                      },
-                  )?;
-                  try_checkpoint_actor(rt, actor_id)?;
-              }
+          completed_start = text.index('pub(crate) fn persist_step_completed(')
+          failed_start = text.index('pub(crate) fn persist_step_failed(', completed_start)
+          completed = text[completed_start:failed_start]
+          old_atomic = '        return commit_step_completed(rt, actor_id, activation, step_name);\n'
+          assert completed.count(old_atomic) == 1, completed.count(old_atomic)
+          completed = completed.replace(
+              old_atomic,
+              '        commit_step_completed(rt, actor_id, activation, step_name)?;\n'
+              '        rt.clear_terminal_workflow_activation(actor_id, activation);\n'
+              '        return Ok(());\n',
+          )
+          old_tail = '    try_checkpoint_actor(rt, actor_id)\n}\n\n'
+          assert completed.count(old_tail) == 1, completed.count(old_tail)
+          completed = completed.replace(
+              old_tail,
+              '    try_checkpoint_actor(rt, actor_id)?;\n'
+              '    rt.clear_terminal_workflow_activation(actor_id, activation);\n'
+              '    Ok(())\n}\n\n',
+          )
+          text = text[:completed_start] + completed + text[failed_start:]
 
-              rt.clear_terminal_workflow_activation(actor_id, activation);
-              Ok(())
-          }
-          '''
-          assert text.count(old_completed) == 1, text.count(old_completed)
-          text = text.replace(old_completed, new_completed)
-
-          old_failed = '''pub(crate) fn persist_step_failed(
-              rt: &mut Runtime,
-              actor_id: u64,
-              activation: Option<WorkflowActivationId>,
-              step_name: String,
-              error: String,
-          ) -> std::io::Result<()> {
-              if workflow_has_atomic_tail(rt, actor_id)? {
-                  return commit_step_failed(rt, actor_id, activation, step_name, error);
-              }
-
-              let sequence = next_sequence(rt, actor_id);
-              rt.persistence.append_workflow_event(
-                  actor_id,
-                  WorkflowEvent::StepFailed {
-                      sequence,
-                      activation,
-                      step_name,
-                      error,
-                  },
-              )?;
-              try_checkpoint_actor(rt, actor_id)
-          }
-          '''
-          new_failed = '''pub(crate) fn persist_step_failed(
-              rt: &mut Runtime,
-              actor_id: u64,
-              activation: Option<WorkflowActivationId>,
-              step_name: String,
-              error: String,
-          ) -> std::io::Result<()> {
-              if workflow_has_atomic_tail(rt, actor_id)? {
-                  commit_step_failed(rt, actor_id, activation, step_name, error)?;
-              } else {
-                  let sequence = next_sequence(rt, actor_id);
-                  rt.persistence.append_workflow_event(
-                      actor_id,
-                      WorkflowEvent::StepFailed {
-                          sequence,
-                          activation,
-                          step_name,
-                          error,
-                      },
-                  )?;
-                  try_checkpoint_actor(rt, actor_id)?;
-              }
-
-              rt.clear_terminal_workflow_activation(actor_id, activation);
-              Ok(())
-          }
-          '''
-          assert text.count(old_failed) == 1, text.count(old_failed)
-          workflow.write_text(text.replace(old_failed, new_failed))
+          failed_start = text.index('pub(crate) fn persist_step_failed(')
+          next_fn = text.index('\npub(crate) fn ', failed_start + 1)
+          failed = text[failed_start:next_fn]
+          old_atomic = '        return commit_step_failed(rt, actor_id, activation, step_name, error);\n'
+          assert failed.count(old_atomic) == 1, failed.count(old_atomic)
+          failed = failed.replace(
+              old_atomic,
+              '        commit_step_failed(rt, actor_id, activation, step_name, error)?;\n'
+              '        rt.clear_terminal_workflow_activation(actor_id, activation);\n'
+              '        return Ok(());\n',
+          )
+          old_tail = '    try_checkpoint_actor(rt, actor_id)\n}\n'
+          assert failed.count(old_tail) == 1, failed.count(old_tail)
+          failed = failed.replace(
+              old_tail,
+              '    try_checkpoint_actor(rt, actor_id)?;\n'
+              '    rt.clear_terminal_workflow_activation(actor_id, activation);\n'
+              '    Ok(())\n}\n',
+          )
+          workflow.write_text(text[:failed_start] + failed + text[next_fn:])
           PY
 
           cargo fmt --all
