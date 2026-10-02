@@ -55,9 +55,7 @@ pub enum AdmissionError {
     DuplicateLease { task_id: Uuid },
     #[error("task {task_id} appears more than once in the scatter set")]
     DuplicateTask { task_id: Uuid },
-    #[error(
-        "resource {resource} request {requested} exceeds total scheduler capacity {capacity}"
-    )]
+    #[error("resource {resource} request {requested} exceeds total scheduler capacity {capacity}")]
     ExceedsCapacity {
         resource: String,
         requested: u32,
@@ -309,7 +307,8 @@ impl SwarmScheduler {
                                 let task_id = task.id;
                                 let started_offset_micros = micros(run_started.elapsed());
                                 let execution_started = Instant::now();
-                                let execution = catch_unwind(AssertUnwindSafe(|| worker.execute(&task)));
+                                let execution =
+                                    catch_unwind(AssertUnwindSafe(|| worker.execute(&task)));
                                 let elapsed_micros = micros(execution_started.elapsed());
                                 let completed_offset_micros = micros(run_started.elapsed());
 
@@ -326,10 +325,7 @@ impl SwarmScheduler {
                                             completed_offset_micros,
                                         },
                                     },
-                                    Err(_) => Completion::Panicked {
-                                        task_id,
-                                        lease,
-                                    },
+                                    Err(_) => Completion::Panicked { task_id, lease },
                                 };
                                 let _ = tx.send(message);
                             });
