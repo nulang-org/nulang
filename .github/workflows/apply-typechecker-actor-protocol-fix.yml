@@ -1,0 +1,44 @@
+name: Apply typechecker actor protocol fix
+
+on:
+  push:
+    branches:
+      - fix/typechecker-actor-protocol-current-main
+    paths:
+      - .tmp/typechecker-actor-protocol.patch
+      - .github/workflows/apply-typechecker-actor-protocol-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-validated-patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply exact locally validated patch
+        run: |
+          git apply --check .tmp/typechecker-actor-protocol.patch
+          git apply .tmp/typechecker-actor-protocol.patch
+          rm .tmp/typechecker-actor-protocol.patch
+          rm .github/workflows/apply-typechecker-actor-protocol-fix.yml
+
+      - name: Verify focused semantic gates
+        run: |
+          cargo fmt --all -- --check
+          cargo check --locked --no-default-features
+          cargo test --no-default-features typechecker::tests:: --lib
+          cargo test --no-default-features actor_protocol --lib
+          git diff --check
+
+      - name: Publish clean implementation commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/typechecker.rs .tmp/typechecker-actor-protocol.patch .github/workflows/apply-typechecker-actor-protocol-fix.yml
+          git commit -m "fix(typechecker): enforce concrete actor protocols"
+          git push origin HEAD:fix/typechecker-actor-protocol-current-main
