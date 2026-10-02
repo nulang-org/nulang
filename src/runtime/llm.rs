@@ -443,6 +443,7 @@ pub(crate) fn resume_suspended_llm_step(rt: &mut Runtime, actor_id: u64) {
         return;
     }
 
+    rt.restore_suspended_workflow_activation(actor_id, suspended.activation);
     let self_ptr: *mut Runtime = rt;
     unsafe {
         let vm = (*self_ptr).vm.as_mut().unwrap();

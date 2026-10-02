@@ -1276,6 +1276,26 @@ impl Runtime {
         }
     }
 
+    /// Restore the accepted workflow activation before resuming suspended bytecode.
+    /// The actor already owns the activation-local custom-event cursor, so a
+    /// resume of the same activation must not reset its next ordinal.
+    fn restore_suspended_workflow_activation(
+        &mut self,
+        actor_id: u64,
+        activation: Option<WorkflowActivationId>,
+    ) {
+        let Some(actor) = self.actors.get_mut(&actor_id) else {
+            return;
+        };
+        actor.current_workflow_activation = activation;
+        if let Some(activation) = activation {
+            if actor.workflow_replay_activation != Some(activation) {
+                actor.workflow_replay_activation = Some(activation);
+                actor.workflow_replay_event_ordinal = 0;
+            }
+        }
+    }
+
     /// Resume an actor that yielded at a JIT safepoint.
     ///
     /// Mirrors the structure of `resume_suspended_llm_step` but without
@@ -1296,6 +1316,7 @@ impl Runtime {
             return;
         }
 
+        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -1619,6 +1640,7 @@ impl Runtime {
             return;
         }
 
+        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
         let behavior_idx = suspended.behavior_idx;
         let step_name = suspended.step_name;
         let self_ptr: *mut Runtime = self;
@@ -4760,6 +4782,7 @@ impl Runtime {
             self.enqueue_actor(actor_id);
             return;
         }
+        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();
@@ -4855,6 +4878,7 @@ impl Runtime {
             return;
         }
 
+        self.restore_suspended_workflow_activation(actor_id, suspended.activation);
         let self_ptr: *mut Runtime = self;
         unsafe {
             let vm = (*self_ptr).vm.as_mut().unwrap();

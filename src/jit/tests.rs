@@ -979,6 +979,59 @@ fn test_jit_compile_bitwise_ops() {
 }
 
 #[test]
+fn test_jit_region_reentry_metadata_tracks_direct_calls() {
+    let mut plain = make_jit();
+    let plain_instructions = vec![
+        Instruction::new3(OpCode::IAdd, 0, 1, 2),
+        Instruction::new3(OpCode::IAdd, 2, 1, 2),
+        Instruction::new0(OpCode::Halt),
+    ];
+    unsafe {
+        plain.compile_region(
+            0,
+            0,
+            plain_instructions.len(),
+            &plain_instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("plain region should compile");
+    assert!(
+        !plain
+            .compiled_entry(0, 0)
+            .expect("plain cache entry")
+            .requires_vm_reentry,
+        "regions without VM-reentrant helpers should be eligible for direct frame registers"
+    );
+
+    let mut calling = make_jit();
+    let call_instructions = vec![
+        Instruction::new3(OpCode::Call, 254, 1, 0),
+        Instruction::new0(OpCode::Nop),
+        Instruction::new0(OpCode::Halt),
+    ];
+    let mut native_calls = std::collections::HashMap::new();
+    native_calls.insert(0usize, 0usize);
+    unsafe {
+        calling.compile_region(
+            0,
+            0,
+            call_instructions.len(),
+            &call_instructions,
+            &native_calls,
+        )
+    }
+    .expect("direct-call region should compile");
+    assert!(
+        calling
+            .compiled_entry(0, 0)
+            .expect("direct-call cache entry")
+            .requires_vm_reentry,
+        "helper-backed direct calls must retain detached register storage"
+    );
+}
+
+#[test]
 fn test_jit_compile_fneg() {
     let mut jit = make_jit();
     let instructions = vec![
@@ -1746,6 +1799,7 @@ fn test_tier2_counter_increments() {
         5,
         CompilationTier::Simd,
         CodegenOptimization::Optimized,
+        false,
         0,
     );
 
@@ -1782,6 +1836,7 @@ fn test_tier2_counters_are_per_session() {
         3,
         CompilationTier::Simd,
         CodegenOptimization::Optimized,
+        false,
         0,
     );
     jit_b.store_compiled_with_metadata(
@@ -1791,6 +1846,7 @@ fn test_tier2_counters_are_per_session() {
         3,
         CompilationTier::Simd,
         CodegenOptimization::Optimized,
+        false,
         0,
     );
 
@@ -1803,6 +1859,61 @@ fn test_tier2_counters_are_per_session() {
     assert!(
         jit_b.tier2_counters.get(&(0, 200)).is_none(),
         "session B should have no counter since we never called record_tier2 on it"
+    );
+}
+
+#[test]
+fn test_loop_region_promotes_on_first_compiled_reentry() {
+    let mut module = CodeModule::new("tier2_loop_reentry");
+    module.emit(Instruction::new1(OpCode::Const0, 0));
+    module.emit(Instruction::new1(OpCode::Const1, 1));
+    module.emit(Instruction::new3(OpCode::IAdd, 0, 1, 0));
+    module.emit(Instruction::new3(OpCode::ICmpLt, 0, 1, 2));
+    let back: i16 = -2; // pc4 -> pc2, an internal loop back-edge.
+    module.emit(Instruction::new3(
+        OpCode::JmpT,
+        2,
+        ((back as u16) >> 8) as u8,
+        (back as u16 & 0xFF) as u8,
+    ));
+    module.emit(Instruction::new0(OpCode::Halt));
+    module.entry_point = Some(0);
+
+    let mut jit = make_jit();
+    let start = 2;
+    let len = 3;
+    unsafe {
+        jit.compile_region(
+            0,
+            start,
+            len,
+            &module.instructions,
+            &std::collections::HashMap::new(),
+        )
+    }
+    .expect("loop region should compile");
+
+    assert_eq!(
+        jit.compiled_optimization(0, start),
+        Some(CodegenOptimization::Fast),
+        "first-tier compilation should still minimize startup latency"
+    );
+
+    // One compiled re-entry can represent an arbitrarily large amount of
+    // native loop work because the back-edge remains inside the region.
+    // Requiring 10k region entries therefore leaves hot loops stranded on
+    // the low-optimization Cranelift tier.
+    jit.record_tier2_and_maybe_promote(0, start, &module);
+
+    assert_eq!(
+        jit.compiled_optimization(0, start),
+        Some(CodegenOptimization::Optimized),
+        "an internal-loop region should promote on its first compiled re-entry"
+    );
+    assert_eq!(
+        jit.tier2_counters.get(&(0, start)).copied(),
+        Some(0),
+        "successful loop promotion should reset the tier-2 counter"
     );
 }
 
@@ -1914,6 +2025,7 @@ fn test_tier2_replaces_typed_region_with_simd_code() {
         module.instructions.len(),
         CompilationTier::Typed,
         CodegenOptimization::Optimized,
+        false,
         0,
     );
     jit.typed_regions.insert((0, 0));

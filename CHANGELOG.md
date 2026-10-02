@@ -4,6 +4,10 @@
 - **Native leaf callees run against an isolated register buffer and copy back only the return value.** Caller registers are preserved, nested JIT thread-local state is saved across interpreter fallback, and leaf errors continue through the existing pending-error path.
 - **The existing `call_loop` JIT telemetry improves from the repository-history ~10.57 ms baseline to a 1.56 ms median warm run in a 20-run fixed-host probe (~6.8× faster), while all 55 focused JIT tests pass.**
 
+### Faster tier-2 promotion for native loop regions — 2026-09-30
+- **JIT-compiled regions with an internal back-edge now promote from the low-latency Cranelift tier on their first compiled re-entry.** A single native loop entry can perform arbitrarily many back-edge iterations, so the previous 10,000-entry tier-2 counter could leave genuinely hot loops on first-tier code indefinitely.
+- **Straight-line and already-optimized regions retain the existing tier-2 threshold.** The policy change is limited to first-tier internal loops so cold or call-heavy code does not pay unnecessary optimized-compilation latency.
+
 ### Durable actor activation epochs — 2026-09-30
 - **Durable fencing identity now survives checkpoint, recovery, migration, and node-loss takeover.** Live actors own a canonical `activation_epoch`; snapshots persist it, legacy snapshots default explicitly to initial epoch 1, and every restore path hydrates the exact persisted value.
 - **Node-loss recovery no longer duplicates epoch ownership in `respawn_opted`.** The opt-in registry is membership-only; shadow replication and directory announcements derive epochs from the live actor, failover persists the bumped epoch before announcing ownership, and graceful goodbye captures a deterministic actor/epoch manifest before reaping.
@@ -181,6 +185,11 @@ version + migration.*
   `GOVERNANCE.md`.
 
 ## Stable tier
+
+### Zero-copy non-reentrant JIT register entry — 2026-09-24
+- **Cranelift regions that cannot re-enter the VM now execute directly against the active frame's 256-register array**, eliminating the previous 2 KiB snapshot before native entry and 2 KiB copy-back afterward. `Value` is explicitly `repr(transparent)` over `u64` so the native register ABI has a documented layout guarantee.
+- **Compiled-region metadata now records whether native execution may grow or replace the VM frame stack.** Regions containing helper-backed direct calls retain the detached register snapshot because re-entrant interpreter calls may reallocate `VM::frames`; typed, SIMD, and scalar non-call regions use the direct-frame path.
+- **The direct-frame path does not install the raw `JIT_VM` pointer.** String-aware helpers receive a separate immutable pointer to the active `CodeModule`, preserving interned-string comparison/concatenation without aliasing the mutably exposed frame registers. Alternate JIT backends default to the conservative re-entry classification, and regression coverage pins both the direct-call fallback and hot string semantics.
 
 ### Backend-neutral JIT region planning — 2026-09-24
 - **Native compilation eligibility is now separated from Cranelift code generation.** `src/jit/region_planner.rs` owns region boundaries, non-suspending direct-call folding, recursion safety, cached per-module analyses, and type metadata production.
