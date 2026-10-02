@@ -11,12 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: 949cb45a075d6d54493f9ae88d691ccd8a40a50b
+          ref: 65c47f46f3898905e91b51e16c212093f52a9acc
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - name: Prove exact candidate
         run: |
-          test "$(git rev-parse HEAD)" = 949cb45a075d6d54493f9ae88d691ccd8a40a50b
+          test "$(git rev-parse HEAD)" = 65c47f46f3898905e91b51e16c212093f52a9acc
           cargo check --locked --no-default-features --features sqlite --all-targets
           cargo test --locked --no-default-features --features sqlite --lib libsql_atomic_transition -- --nocapture
           cargo test --locked --no-default-features --features sqlite --lib test_libsql_store -- --nocapture
