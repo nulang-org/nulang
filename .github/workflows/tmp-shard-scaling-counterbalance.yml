@@ -1,0 +1,130 @@
+name: Refine shard scaling measurement order
+
+on:
+  push:
+    branches:
+      - perf/shard-scaling-counterbalanced-order
+    paths:
+      - .github/workflows/tmp-shard-scaling-counterbalance.yml
+
+permissions:
+  contents: write
+
+jobs:
+  refine:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: perf/shard-scaling-counterbalanced-order
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add failing order-balance regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/bin/nulang_shard_bench.rs')
+          text = path.read_text()
+          needle = '''    #[test]\n    fn two_shards_process_the_exact_fixed_workload() {'''
+          test = '''    #[test]\n    fn measurement_order_counterbalances_baseline_position_over_full_cycle() {\n        let shard_counts = vec![1, 2, 4, 8];\n        let positions = (1..=8)\n            .map(|iteration| {\n                super::measurement_order(&shard_counts, iteration)\n                    .iter()\n                    .position(|&shards| shards == 1)\n                    .unwrap()\n            })\n            .collect::<Vec<_>>();\n\n        for position in 0..shard_counts.len() {\n            assert_eq!(\n                positions.iter().filter(|&&seen| seen == position).count(),\n                2,\n                "the 1-shard baseline must occupy each measurement position equally"\n            );\n        }\n        assert_ne!(\n            super::measurement_order(&shard_counts, 1),\n            super::measurement_order(&shard_counts, 2),\n            "adjacent repetitions must not preserve the same thermal/load order"\n        );\n    }\n\n'''
+          assert needle in text
+          path.write_text(text.replace(needle, test + needle, 1))
+          PY
+          set +e
+          cargo test --locked --release --no-default-features --features savina-bench \
+            --bin nulang-shard-bench measurement_order_counterbalances_baseline_position_over_full_cycle \
+            -- --exact > /tmp/red.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/red.log
+          test "$status" -ne 0
+          grep -q measurement_order /tmp/red.log
+
+      - name: Implement counterbalanced ordering
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          bench = Path('src/bin/nulang_shard_bench.rs')
+          text = bench.read_text()
+          anchor = '\nfn spawn_counter_for_shard('
+          implementation = '''\n/// Deterministically counterbalance measurement order across repetitions.\n///\n/// Repetitions are grouped into forward/reverse pairs. Each pair rotates the\n/// configured shard list by one position before applying the direction. Over\n/// `2 * shard_counts.len()` repetitions every shard count occupies every\n/// measurement position equally, reducing first-order thermal/load bias.\nfn measurement_order(shard_counts: &[usize], iteration: u32) -> Vec<usize> {\n    assert!(!shard_counts.is_empty(), "shard_counts must not be empty");\n    assert!(iteration >= 1, "iteration is 1-based");\n\n    let mut order = shard_counts.to_vec();\n    let pair = (iteration as usize - 1) / 2;\n    let offset = pair % order.len();\n    order.rotate_left(offset);\n    if iteration % 2 == 0 {\n        order.reverse();\n    }\n    order\n}\n\n'''
+          assert anchor in text
+          text = text.replace(anchor, implementation + 'fn spawn_counter_for_shard(', 1)
+          text = text.replace('--repeat 5 --format jsonl', '--repeat 8 --format jsonl', 1)
+          text = text.replace('let mut repeat = 5u32;', 'let mut repeat = 8u32;', 1)
+          old = '''    for iteration in 1..=config.repeat {\n        let measurements: Vec<Measurement> = config\n            .shard_counts\n            .iter()\n            .map(|&shards| run_independent(shards, config.messages))\n            .collect();'''
+          new = '''    for iteration in 1..=config.repeat {\n        let order = measurement_order(&config.shard_counts, iteration);\n        let measurements: Vec<Measurement> = order\n            .iter()\n            .map(|&shards| run_independent(shards, config.messages))\n            .collect();'''
+          assert old in text
+          bench.write_text(text.replace(old, new, 1))
+
+          workflow = Path('.github/workflows/shard-scaling-bench.yml')
+          text = workflow.read_text()
+          text = text.replace("default: '5'", "default: '8'", 1)
+          text = text.replace("inputs.repeat || '5'", "inputs.repeat || '8'", 1)
+          workflow.write_text(text)
+
+          readme = Path('benchmarks/README.md')
+          text = readme.read_text()
+          text = text.replace('--shards 1,2,4,8 --messages 200000 --repeat 5 --format jsonl', '--shards 1,2,4,8 --messages 200000 --repeat 8 --format jsonl', 1)
+          marker = '''This workload is deliberately **same-shard and independent**. It measures the\nruntime's parallel ceiling, not cross-shard messaging, contention, or network\ntransport.'''
+          replacement = marker + ''' Repetitions use a deterministic rotated forward/reverse\norder; with the default four shard counts, eight repetitions place every shard\ncount in every measurement position twice, reducing first-order thermal/load\nbias.'''
+          assert marker in text
+          readme.write_text(text.replace(marker, replacement, 1))
+
+          changelog = Path('CHANGELOG.md')
+          text = changelog.read_text()
+          heading = '# Nulang Changelog\n'
+          entry = '''### Counterbalanced shard-scaling measurement order — 2026-10-02\n- **Shard-scaling repetitions now rotate and reverse measurement order instead of always running 1/2/4/8.** Across the default eight repetitions, each shard count occupies each measurement position twice, reducing first-order thermal and shared-host load bias while preserving fixed total work.\n- **The default scaling sweep is eight repetitions.** This completes one full counterbalancing cycle for the default four shard counts; controlled hardware remains required for publishable multicore claims.\n\n'''
+          assert text.startswith(heading)
+          assert 'Counterbalanced shard-scaling measurement order' not in text
+          changelog.write_text(text.replace(heading, heading + entry, 1))
+          PY
+
+      - name: Validate green implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo test --locked --release --no-default-features --features savina-bench \
+            --bin nulang-shard-bench
+          cargo check --locked --no-default-features --features savina-bench \
+            --bin nulang-shard-bench
+          cargo run --locked --release --no-default-features --features savina-bench \
+            --bin nulang-shard-bench -- \
+            --shards 1,2,4,8 --messages 20000 --repeat 2 --format jsonl \
+            > /tmp/shard-smoke.jsonl
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          rows = [json.loads(line) for line in Path('/tmp/shard-smoke.jsonl').read_text().splitlines() if line.strip().startswith('{')]
+          assert len(rows) == 8, rows
+          for iteration in (1, 2):
+              current = [row for row in rows if row['iteration'] == iteration]
+              assert {row['shards'] for row in current} == {1, 2, 4, 8}
+              assert all(row['messages'] == 20000 for row in current)
+          assert [row['shards'] for row in rows if row['iteration'] == 1] == [1, 2, 4, 8]
+          assert [row['shards'] for row in rows if row['iteration'] == 2] == [8, 4, 2, 1]
+          PY
+          git diff --check
+
+      - name: Commit green result and remove temporary workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/tmp-shard-scaling-counterbalance.yml
+          git add -A
+          git config user.name "nulang-maintenance"
+          git config user.email "actions@users.noreply.github.com"
+          git commit -m "perf(bench): counterbalance shard scaling order"
+          git push origin HEAD:perf/shard-scaling-counterbalanced-order
