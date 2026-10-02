@@ -932,6 +932,10 @@ fn delivery_failure_code(reason: &str) -> i64 {
         "target actor not found" => 4,
         "object ref unresolvable" => 6,
         "object intern failed on receiver" => 7,
+        "transport connect failed" => 8,
+        "transport write failed" => 9,
+        "transport sender stopped" => 10,
+        "transport payload invalid" => 11,
         _ => 5,
     }
 }
@@ -1051,6 +1055,12 @@ pub fn process_network_packets(
     cluster: &mut ClusterState,
     resolver: &mut AddressResolver,
 ) {
+    for failure in transport.take_delivery_failures() {
+        if let Packet::ActorMessage { sender_actor, .. } = &failure.packet {
+            notify_delivery_failed(runtime, *sender_actor, failure.kind.reason());
+        }
+    }
+
     let packets = transport.receive();
     for incoming in packets {
         match incoming.packet {
