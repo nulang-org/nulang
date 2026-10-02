@@ -3973,7 +3973,11 @@ fn test_custom_workflow_replay_consumes_matching_committed_event() {
         .into_iter()
         .filter(|event| matches!(event, WorkflowEvent::Custom { .. }))
         .collect();
-    assert_eq!(custom.len(), 1, "replay must consume the committed event instead of appending a duplicate");
+    assert_eq!(
+        custom.len(),
+        1,
+        "replay must consume the committed event instead of appending a duplicate"
+    );
     assert_eq!(
         rt.actors
             .get(&actor_id)
@@ -4011,7 +4015,11 @@ fn test_custom_workflow_replay_rejects_conflicting_committed_event_identity() {
         .into_iter()
         .filter(|event| matches!(event, WorkflowEvent::Custom { .. }))
         .collect();
-    assert_eq!(custom.len(), 1, "a conflicting replay identity must not mutate durable history");
+    assert_eq!(
+        custom.len(),
+        1,
+        "a conflicting replay identity must not mutate durable history"
+    );
     assert_eq!(
         rt.actors
             .get(&actor_id)
@@ -4122,7 +4130,8 @@ fn test_committed_custom_event_keeps_pre_command_snapshot_safe_for_replay() {
         })
         .collect();
     assert_eq!(
-        matching.len(), 1,
+        matching.len(),
+        1,
         "recovery replay must consume the already-committed custom event without duplicating it"
     );
 }
@@ -4202,10 +4211,93 @@ fn test_timer_set_replay_consumes_matching_committed_preparation() {
     );
 }
 
+#[cfg(feature = "sqlite")]
+#[test]
+fn test_timer_set_replay_survives_process_restart_without_duplicate_preparation_or_rearm() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "nulang-workflow-timer-crash-{}-{nonce}",
+        std::process::id()
+    ));
+    let db_path = dir.join("workflow.db");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut rt = Runtime::new();
+    rt.persistence = Box::new(LibsqlStore::new(&db_path).unwrap());
+    let actor_id = rt.spawn_workflow_actor("ReplayTimerCrash", Box::new(Vec::new), HashMap::new());
+    declare_test_behavior(&mut rt, actor_id, "next");
+    let behavior_id = rt.behavior_id_for(actor_id, "next").unwrap();
+    let activation =
+        workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new()).unwrap();
+
+    rt.schedule_workflow_timer(actor_id, "wake", 250).unwrap();
+    assert_eq!(
+        rt.persistence
+            .read_timer_events(actor_id)
+            .into_iter()
+            .filter(|event| matches!(event, WorkflowEvent::TimerSet { .. }))
+            .count(),
+        1
+    );
+
+    drop(rt);
+
+    let mut recovered = Runtime::new();
+    recovered.persistence = Box::new(LibsqlStore::new(&db_path).unwrap());
+    assert_eq!(recovered.recover_actor(actor_id), Some(actor_id));
+    assert_eq!(
+        recovered
+            .actors
+            .get(&actor_id)
+            .unwrap()
+            .current_workflow_activation,
+        Some(activation),
+        "restart recovery must keep the command activation open after durable TimerSet"
+    );
+
+    let live_timers_before_replay = recovered.timer_wheel.len();
+    recovered
+        .schedule_workflow_timer(actor_id, "wake", 250)
+        .unwrap();
+
+    assert_eq!(
+        recovered
+            .persistence
+            .read_timer_events(actor_id)
+            .into_iter()
+            .filter(|event| matches!(event, WorkflowEvent::TimerSet { .. }))
+            .count(),
+        1,
+        "restart replay must consume the committed TimerSet instead of duplicating history"
+    );
+    assert_eq!(
+        recovered.timer_wheel.len(),
+        live_timers_before_replay,
+        "restart replay must not arm an additional live timer for committed preparation"
+    );
+    assert_eq!(
+        recovered
+            .actors
+            .get(&actor_id)
+            .unwrap()
+            .workflow_replay_event_ordinal,
+        1,
+        "restart replay must consume the same activation-local TimerSet identity"
+    );
+
+    drop(recovered);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_timer_set_replay_rejects_cross_type_identity_collision() {
     let mut rt = Runtime::new();
-    let actor_id = rt.spawn_workflow_actor("ReplayTimerConflict", Box::new(Vec::new), HashMap::new());
+    let actor_id =
+        rt.spawn_workflow_actor("ReplayTimerConflict", Box::new(Vec::new), HashMap::new());
     let activation = WorkflowActivationId::new(actor_id, 91);
 
     rt.actors
