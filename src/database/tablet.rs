@@ -360,6 +360,44 @@ impl MemoryTablet {
         self.immutables.len()
     }
 
+    pub(crate) fn install_recovered_sstable_rows(
+        &mut self,
+        rows: &[TabletSnapshotRow],
+        max_sequence: u64,
+    ) -> Result<(), TabletError> {
+        if max_sequence <= self.current_sequence {
+            return Ok(());
+        }
+        let mut recovered = BTreeMap::new();
+        let floor = self.current_sequence;
+        for row in rows {
+            if !self.descriptor.range.contains(&row.key) {
+                return Err(TabletError::KeyOutsideTabletRange);
+            }
+            let versions: Vec<VersionedValue> = row
+                .versions
+                .iter()
+                .filter(|version| version.sequence > floor)
+                .cloned()
+                .collect();
+            if versions
+                .iter()
+                .any(|version| version.sequence > max_sequence)
+            {
+                return Err(TabletError::InvalidSnapshotHistory);
+            }
+            if !versions.is_empty() {
+                recovered.insert(row.key.clone(), versions);
+            }
+        }
+        if recovered.is_empty() {
+            return Err(TabletError::InvalidSnapshotHistory);
+        }
+        self.immutables.push(Memtable::from_rows(recovered));
+        self.current_sequence = max_sequence;
+        Ok(())
+    }
+
     pub(crate) fn oldest_immutable_rows(&self) -> Option<Vec<TabletSnapshotRow>> {
         self.immutables.first().map(|memtable| {
             memtable
