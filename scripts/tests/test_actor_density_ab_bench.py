@@ -84,6 +84,22 @@ class ComparisonTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "paired sample count changed"):
             actor_density_ab_bench.paired_lower_is_better([1.0, 2.0], [1.0])
 
+    def test_comparisons_treat_zero_rss_delta_as_unavailable(self):
+        samples = {
+            "base": {
+                "construct": [{"ns_per_actor": 100.0, "rss_bytes_per_actor": 0.0, "actor_struct_bytes": 2800, "actor_count": 10000}],
+                "idle": [{"ns_per_actor": 200.0, "rss_bytes_per_actor": 4000.0, "actor_struct_bytes": 2800, "actor_count": 10000}],
+            },
+            "candidate": {
+                "construct": [{"ns_per_actor": 90.0, "rss_bytes_per_actor": 0.0, "actor_struct_bytes": 2400, "actor_count": 10000}],
+                "idle": [{"ns_per_actor": 180.0, "rss_bytes_per_actor": 3600.0, "actor_struct_bytes": 2400, "actor_count": 10000}],
+            },
+        }
+
+        result = actor_density_ab_bench.comparisons(samples)
+        self.assertIsNone(result["construct"]["rss"])
+        self.assertIsNotNone(result["idle"]["rss"])
+
     def test_measurement_order_counterbalances_variant_and_mode_order(self):
         self.assertEqual(
             [("base", "construct"), ("base", "idle"), ("candidate", "construct"), ("candidate", "idle")],
