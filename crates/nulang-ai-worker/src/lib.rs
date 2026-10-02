@@ -1,5 +1,12 @@
 //! Worker agents execute assigned tasks.
 
+mod scheduler;
+
+pub use scheduler::{
+    AdmissionError, AdmissionLease, AdmissionPool, ResourceVector, ScatterMetrics, ScatterReport,
+    SwarmScheduler, WorkItem, WorkerReport,
+};
+
 use chrono::Utc;
 use nulang_ai_core::{Task, TaskStatus};
 
