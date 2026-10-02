@@ -32,34 +32,57 @@ fn cleanup(path: &PathBuf) {
     let _ = fs::remove_dir_all(path.with_extension("sstables"));
 }
 
-#[test]
-fn immutable_flush_is_durable_idempotent_and_does_not_reclaim_wal() {
-    let path = temp_wal();
-    cleanup(&path);
-    let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+fn commit_put(tablet: &mut WalBackedTablet, key: &[u8], value: &[u8]) {
+    let sequence = tablet.current_sequence();
     let write = tablet
         .prepare_write(
             1,
-            0,
+            sequence,
             vec![TabletMutation::Put {
-                key: b"k".to_vec(),
-                value: b"v1".to_vec(),
+                key: key.to_vec(),
+                value: value.to_vec(),
             }],
         )
         .unwrap();
     tablet.commit(write).unwrap();
-    let bytes = tablet.mutable_memtable_bytes();
-    assert!(tablet.rotate_memtable_if_bytes_at_least(bytes));
+}
 
+fn commit_delete(tablet: &mut WalBackedTablet, key: &[u8]) {
+    let sequence = tablet.current_sequence();
+    let write = tablet
+        .prepare_write(
+            1,
+            sequence,
+            vec![TabletMutation::Delete { key: key.to_vec() }],
+        )
+        .unwrap();
+    tablet.commit(write).unwrap();
+}
+
+fn flush_current(tablet: &mut WalBackedTablet) {
+    let bytes = tablet.mutable_memtable_bytes();
+    assert!(bytes > 0);
+    assert!(tablet.rotate_memtable_if_bytes_at_least(bytes));
     assert!(tablet.flush_oldest_immutable_to_sstable().unwrap());
-    assert_eq!(tablet.durable_sstable_count().unwrap(), 1);
-    assert!(!tablet.flush_oldest_immutable_to_sstable().unwrap());
+}
+
+#[test]
+fn immutable_flush_is_durable_idempotent_evicts_memory_and_does_not_reclaim_wal() {
+    let path = temp_wal();
+    cleanup(&path);
+    let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+    commit_put(&mut tablet, b"k", b"v1");
+    flush_current(&mut tablet);
+
     assert_eq!(tablet.durable_sstable_count().unwrap(), 1);
     assert_eq!(
         tablet.immutable_memtable_count(),
-        1,
-        "flush does not evict until SSTable serving recovery exists"
+        0,
+        "a manifest-published SSTable should own the flushed generation"
     );
+    assert_eq!(tablet.read_latest(b"k"), Some(&b"v1"[..]));
+    assert!(!tablet.flush_oldest_immutable_to_sstable().unwrap());
+    assert_eq!(tablet.durable_sstable_count().unwrap(), 1);
 
     let wal = FileWal::open(&path).unwrap();
     assert_eq!(wal.base_sequence(), 0);
@@ -69,7 +92,37 @@ fn immutable_flush_is_durable_idempotent_and_does_not_reclaim_wal() {
 
     let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert_eq!(reopened.current_sequence(), 1);
+    assert_eq!(reopened.immutable_memtable_count(), 0);
     assert_eq!(reopened.read_latest(b"k"), Some(&b"v1"[..]));
     assert_eq!(reopened.durable_sstable_count().unwrap(), 1);
+    cleanup(&path);
+}
+
+#[test]
+fn newer_mutable_value_masks_flushed_sstable_value() {
+    let path = temp_wal();
+    cleanup(&path);
+    let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+    commit_put(&mut tablet, b"k", b"v1");
+    flush_current(&mut tablet);
+    commit_put(&mut tablet, b"k", b"v2");
+
+    assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
+    assert_eq!(tablet.read_latest(b"k"), Some(&b"v2"[..]));
+    cleanup(&path);
+}
+
+#[test]
+fn newer_mutable_tombstone_masks_flushed_sstable_value() {
+    let path = temp_wal();
+    cleanup(&path);
+    let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+    commit_put(&mut tablet, b"k", b"v1");
+    flush_current(&mut tablet);
+    commit_delete(&mut tablet, b"k");
+
+    assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
+    assert_eq!(tablet.read_at(b"k", 2).unwrap(), None);
+    assert_eq!(tablet.read_latest(b"k"), None);
     cleanup(&path);
 }
