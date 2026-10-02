@@ -1,0 +1,126 @@
+name: Apply timer crash replay proof
+
+on:
+  push:
+    branches:
+      - automation/apply-timer-crash-proof-20261001
+
+permissions:
+  contents: write
+
+jobs:
+  test-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: test/workflow-timer-crash-replay-20261001
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Add crash/recovery regression
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/runtime/tests.rs')
+          text = p.read_text()
+          marker = '#[test]\nfn test_timer_set_replay_rejects_cross_type_identity_collision() {'
+          assert text.count(marker) == 1, text.count(marker)
+          test = r'''#[test]
+          fn test_timer_set_replay_survives_process_restart_without_duplicate_preparation_or_rearm() {
+              let nonce = std::time::SystemTime::now()
+                  .duration_since(std::time::UNIX_EPOCH)
+                  .unwrap()
+                  .as_nanos();
+              let path = std::env::temp_dir().join(format!(
+                  "nulang-workflow-timer-crash-{}-{nonce}",
+                  std::process::id()
+              ));
+              let _ = std::fs::remove_dir_all(&path);
+
+              let mut rt = Runtime::new();
+              rt.persistence = Box::new(JsonFileStore::new(&path).unwrap());
+              let actor_id =
+                  rt.spawn_workflow_actor("ReplayTimerCrash", Box::new(Vec::new), HashMap::new());
+              declare_test_behavior(&mut rt, actor_id, "next");
+              let behavior_id = rt.behavior_id_for(actor_id, "next").unwrap();
+              let activation =
+                  workflow::commit_workflow_command(&mut rt, actor_id, behavior_id, Vec::new())
+                      .unwrap();
+
+              rt.schedule_workflow_timer(actor_id, "wake", 250).unwrap();
+              assert_eq!(
+                  rt.persistence
+                      .read_timer_events(actor_id)
+                      .into_iter()
+                      .filter(|event| matches!(event, WorkflowEvent::TimerSet { .. }))
+                      .count(),
+                  1
+              );
+
+              drop(rt);
+
+              let mut recovered = Runtime::new();
+              recovered.persistence = Box::new(JsonFileStore::new(&path).unwrap());
+              assert_eq!(recovered.recover_actor(actor_id), Some(actor_id));
+              assert_eq!(
+                  recovered
+                      .actors
+                      .get(&actor_id)
+                      .unwrap()
+                      .current_workflow_activation,
+                  Some(activation),
+                  "restart recovery must keep the command activation open after durable TimerSet"
+              );
+
+              let live_timers_before_replay = recovered.timer_wheel.len();
+              recovered
+                  .schedule_workflow_timer(actor_id, "wake", 250)
+                  .unwrap();
+
+              assert_eq!(
+                  recovered
+                      .persistence
+                      .read_timer_events(actor_id)
+                      .into_iter()
+                      .filter(|event| matches!(event, WorkflowEvent::TimerSet { .. }))
+                      .count(),
+                  1,
+                  "restart replay must consume the committed TimerSet instead of duplicating history"
+              );
+              assert_eq!(
+                  recovered.timer_wheel.len(),
+                  live_timers_before_replay,
+                  "restart replay must not arm an additional live timer for committed preparation"
+              );
+              assert_eq!(
+                  recovered
+                      .actors
+                      .get(&actor_id)
+                      .unwrap()
+                      .workflow_replay_event_ordinal,
+                  1,
+                  "restart replay must consume the same activation-local TimerSet identity"
+              );
+
+              let _ = std::fs::remove_dir_all(&path);
+          }
+
+          '''
+          p.write_text(text.replace(marker, test + marker))
+          PY
+          cargo fmt --all
+          git diff --check
+      - name: Run focused RED/GREEN gate
+        run: cargo test --locked --no-default-features --lib test_timer_set_replay_survives_process_restart_without_duplicate_preparation_or_rearm -- --nocapture
+      - name: Run timer replay regressions
+        run: cargo test --locked --no-default-features --lib timer_set_replay -- --nocapture
+      - name: Publish test slice
+        shell: bash
+        run: |
+          git config user.name 'nlc-ci'
+          git config user.email 'nlc-ci@users.noreply.github.com'
+          git add src/runtime/tests.rs
+          git diff --cached --check
+          git commit -m 'test(workflow): prove timer replay across process restart'
+          git push origin HEAD:test/workflow-timer-crash-replay-20261001
