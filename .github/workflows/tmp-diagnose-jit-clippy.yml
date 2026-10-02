@@ -1,0 +1,42 @@
+name: Diagnose native-leaf Clippy
+
+on:
+  push:
+    branches:
+      - diag/jit-native-leaf-clippy
+    paths:
+      - .github/workflows/tmp-diagnose-jit-clippy.yml
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: diag/jit-native-leaf-clippy
+          fetch-depth: 0
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-dev
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+          components: clippy
+      - name: Capture exact failing Clippy command
+        shell: bash
+        run: |
+          set +e
+          cargo clippy --locked --all-targets -- -D clippy::correctness > clippy-default.log 2>&1
+          status=$?
+          set -e
+          printf '\nexit_status=%s\n' "$status" >> clippy-default.log
+          cat clippy-default.log
+          git config user.name "nulang-maintenance"
+          git config user.email "actions@users.noreply.github.com"
+          git add clippy-default.log
+          git commit -m "chore(ci): capture default clippy diagnostic"
+          git push origin HEAD:diag/jit-native-leaf-clippy
