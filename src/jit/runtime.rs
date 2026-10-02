@@ -616,6 +616,52 @@ thread_local! {
     static JIT_MODULE_IDX: Cell<usize> = const { Cell::new(NO_JIT_MODULE) };
 }
 
+#[derive(Clone, Copy)]
+struct JitLeafCallEntry {
+    func_idx: usize,
+    ptr: *const u8,
+    return_reg: u8,
+    required_args: usize,
+}
+
+thread_local! {
+    static JIT_LEAF_CALLS: std::cell::RefCell<Vec<JitLeafCallEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static JIT_LEAF_CONSTANTS: Cell<*const u64> = const { Cell::new(std::ptr::null()) };
+}
+
+pub(crate) fn set_jit_leaf_calls(calls: &[(usize, *const u8, u8, usize)], constants: *const u64) {
+    JIT_LEAF_CALLS.with(|slot| {
+        let mut entries = slot.borrow_mut();
+        entries.clear();
+        entries.extend(
+            calls.iter().map(
+                |&(func_idx, ptr, return_reg, required_args)| JitLeafCallEntry {
+                    func_idx,
+                    ptr,
+                    return_reg,
+                    required_args,
+                },
+            ),
+        );
+    });
+    JIT_LEAF_CONSTANTS.with(|slot| slot.set(constants));
+}
+
+pub(crate) fn clear_jit_leaf_calls() {
+    JIT_LEAF_CALLS.with(|slot| slot.borrow_mut().clear());
+    JIT_LEAF_CONSTANTS.with(|slot| slot.set(std::ptr::null()));
+}
+
+fn jit_leaf_call(func_idx: usize) -> Option<JitLeafCallEntry> {
+    JIT_LEAF_CALLS.with(|slot| {
+        slot.borrow()
+            .iter()
+            .copied()
+            .find(|entry| entry.func_idx == func_idx)
+    })
+}
+
 pub unsafe fn set_jit_vm(vm: *mut crate::vm::VM, module_idx: usize) {
     JIT_VM.with(|cell| cell.set(vm));
     JIT_MODULE_IDX.with(|cell| cell.set(module_idx));
@@ -693,6 +739,8 @@ struct JitThreadState {
     yield_pc: u64,
     branch_exit_pc: u64,
     pending_error: Option<String>,
+    leaf_calls: Vec<JitLeafCallEntry>,
+    leaf_constants: *const u64,
 }
 
 fn save_jit_thread_state() -> JitThreadState {
@@ -707,6 +755,8 @@ fn save_jit_thread_state() -> JitThreadState {
         JIT_BRANCH_EXIT_PC.with(|c| c.get()),
     );
     let pending_error = AOT_PENDING_ERROR.with(|e| e.borrow().clone());
+    let leaf_calls = JIT_LEAF_CALLS.with(|slot| slot.borrow().clone());
+    let leaf_constants = JIT_LEAF_CONSTANTS.with(|slot| slot.get());
     JitThreadState {
         vm,
         module_idx,
@@ -715,6 +765,8 @@ fn save_jit_thread_state() -> JitThreadState {
         yield_pc,
         branch_exit_pc,
         pending_error,
+        leaf_calls,
+        leaf_constants,
     }
 }
 
@@ -728,6 +780,8 @@ fn restore_jit_thread_state(s: JitThreadState) {
     JIT_YIELD_PC.with(|c| c.set(s.yield_pc));
     JIT_BRANCH_EXIT_PC.with(|c| c.set(s.branch_exit_pc));
     AOT_PENDING_ERROR.with(|e| *e.borrow_mut() = s.pending_error);
+    JIT_LEAF_CALLS.with(|slot| *slot.borrow_mut() = s.leaf_calls);
+    JIT_LEAF_CONSTANTS.with(|slot| slot.set(s.leaf_constants));
 }
 
 /// Run a provably-non-suspending callee (function-table index `func_idx`) to
@@ -757,9 +811,59 @@ pub extern "C" fn nulang_jit_direct_call(
         set_jit_pending_vm_error("JIT direct call with no active VM".to_string());
         return 1;
     }
+    let func_idx = func_idx as usize;
+    let argc = argc.max(0) as usize;
+    let dst = dst.max(0) as usize;
+
+    if dst < 256 {
+        if let Some(leaf) = jit_leaf_call(func_idx) {
+            if argc >= leaf.required_args {
+                let mut callee_regs = std::mem::MaybeUninit::<[u64; 256]>::uninit();
+                let callee_ptr = callee_regs.as_mut_ptr() as *mut u64;
+                let copied = argc.min(256);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(regs, callee_ptr, copied);
+                }
+
+                // A nested leaf call is part of the enclosing native region's
+                // reduction. Do not consume a second safepoint budget or leak
+                // branch/yield markers from the callee back into the caller.
+                let saved_safepoint = JIT_SAFEPOINT_PTR.with(|slot| {
+                    let old = slot.get();
+                    slot.set(std::ptr::null_mut());
+                    old
+                });
+                let saved_yield = JIT_YIELD_PC.with(|slot| slot.replace(u64::MAX));
+                let saved_branch = JIT_BRANCH_EXIT_PC.with(|slot| slot.replace(u64::MAX));
+                let saved_aot_error = AOT_PENDING_ERROR.with(|slot| slot.borrow_mut().take());
+
+                let constants = JIT_LEAF_CONSTANTS.with(|slot| slot.get());
+                let func: extern "C" fn(*mut u64, *const u64) =
+                    unsafe { std::mem::transmute(leaf.ptr) };
+                func(callee_ptr, constants);
+
+                let leaf_error = AOT_PENDING_ERROR.with(|slot| slot.borrow_mut().take());
+                AOT_PENDING_ERROR.with(|slot| *slot.borrow_mut() = saved_aot_error);
+                JIT_SAFEPOINT_PTR.with(|slot| slot.set(saved_safepoint));
+                JIT_YIELD_PC.with(|slot| slot.set(saved_yield));
+                JIT_BRANCH_EXIT_PC.with(|slot| slot.set(saved_branch));
+
+                if let Some(msg) = leaf_error {
+                    set_jit_pending_vm_error(msg);
+                    return 1;
+                }
+
+                unsafe {
+                    *regs.add(dst) = *callee_ptr.add(leaf.return_reg as usize);
+                }
+                return 0;
+            }
+        }
+    }
+
     let vm = unsafe { &mut *vm_ptr };
     let saved = save_jit_thread_state();
-    let status = vm.jit_direct_call(regs, func_idx as usize, argc as usize, dst as usize);
+    let status = vm.jit_direct_call(regs, func_idx, argc, dst);
     restore_jit_thread_state(saved);
     status
 }

@@ -652,6 +652,167 @@ fn test_jit_direct_call_loop_tiers_up() {
 }
 
 #[test]
+fn test_jit_direct_call_compiles_leaf_callee_natively_and_preserves_caller_regs() {
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    let source = r#"
+        fn add(x: Int, y: Int) -> Int { x + y }
+        fn main() -> Int {
+            var sentinel = 123456;
+            var sum = 0;
+            var i = 0;
+            while i < 20000 {
+                sum = add(sum, 1);
+                i = i + 1
+            };
+            sentinel + sum
+        }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_native_leaf_call").expect("codegen");
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interpreter should run");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let actual = jit_vm.run().expect("JIT should run");
+
+    assert_eq!(
+        actual.as_int(),
+        expected.as_int(),
+        "native leaf direct calls must preserve caller registers"
+    );
+    assert_eq!(expected.as_int(), Some(143456));
+
+    let stats = jit_vm.jit_compile_stats();
+    assert_eq!(
+        stats.fast_compiles, 2,
+        "the hot loop and its simple direct leaf callee should each receive one fast native compilation"
+    );
+    assert_eq!(
+        stats.optimized_compiles, 0,
+        "the first execution should not require a tier-2 compile for this regression"
+    );
+}
+
+#[test]
+fn test_jit_native_leaf_direct_calls_support_0_1_4_and_8_args() {
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    let source = r#"
+        fn f0() -> Int { 7 }
+        fn f1(a: Int) -> Int { a + 1 }
+        fn f4(a: Int, b: Int, c: Int, d: Int) -> Int { a + b + c + d }
+        fn f8(a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int) -> Int {
+            a + b + c + d + e + f + g + h
+        }
+        fn main() -> Int {
+            var sum = 0;
+            var i = 0;
+            while i < 2000 {
+                sum = sum + f0();
+                sum = sum + f1(1);
+                sum = sum + f4(1, 2, 3, 4);
+                sum = sum + f8(1, 2, 3, 4, 5, 6, 7, 8);
+                i = i + 1
+            };
+            sum
+        }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_native_leaf_arities").expect("codegen");
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interpreter should run");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let actual = jit_vm.run().expect("JIT should run");
+
+    assert_eq!(actual.as_int(), expected.as_int());
+    assert_eq!(expected.as_int(), Some(110_000));
+    assert_eq!(
+        jit_vm.jit_compile_stats().fast_compiles,
+        5,
+        "the outer loop plus four eligible leaf callees should compile natively"
+    );
+}
+
+#[test]
+fn test_jit_direct_call_branchy_leaf_keeps_interpreter_fallback() {
+    use crate::hir_lower::lower_module;
+    use crate::lexer::Lexer;
+    use crate::mir_codegen::compile_mir;
+    use crate::mir_lower::lower_module as lower_mir;
+    use crate::parser::Parser;
+    use crate::typechecker::TypeChecker;
+    use crate::vm::VM;
+
+    let source = r#"
+        fn choose(x: Int) -> Int {
+            if x < 0 then { 1 } else { x + 1 }
+        }
+        fn main() -> Int {
+            var sum = 0;
+            var i = 0;
+            while i < 20000 {
+                sum = choose(sum);
+                i = i + 1
+            };
+            sum
+        }
+    "#;
+    let tokens = Lexer::new(source).lex().expect("lex");
+    let ast = Parser::new(tokens).parse_module().expect("parse");
+    let mut tc = TypeChecker::new();
+    tc.check_module(&ast).expect("typecheck");
+    let hir = lower_module(&ast, &tc.inferred_decl_types);
+    let mut mir = lower_mir(&hir).expect("mir");
+    let module = compile_mir(&mut mir, "jit_branchy_leaf_fallback").expect("codegen");
+
+    let mut interp = VM::new_without_jit();
+    interp.load_module(module.clone());
+    let expected = interp.run().expect("interpreter should run");
+
+    let mut jit_vm = VM::new();
+    jit_vm.load_module(module);
+    let actual = jit_vm.run().expect("JIT should run");
+
+    assert_eq!(actual.as_int(), expected.as_int());
+    assert_eq!(expected.as_int(), Some(20000));
+    assert_eq!(
+        jit_vm.jit_compile_stats().fast_compiles,
+        1,
+        "branchy callees are outside the first native-leaf envelope and must keep the interpreter fallback"
+    );
+}
+
+#[test]
 fn branchy_hot_loop_compiles_a_native_region() {
     use crate::hir_lower::lower_module;
     use crate::lexer::Lexer;

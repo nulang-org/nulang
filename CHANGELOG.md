@@ -1,4 +1,9 @@
 # Nulang Changelog
+### Native fast path for simple JIT direct calls — 2026-09-30
+- **Hot direct calls to simple, non-suspending, non-recursive leaf functions can now execute as native JIT callees instead of re-entering the interpreter.** Eligible callees are intentionally limited to straight-line scalar register code with an explicit return; branchy, effectful, recursive, indirect, heap/actor, and otherwise unsupported callees retain the existing safe fallback.
+- **Native leaf callees run against an isolated register buffer and copy back only the return value.** Caller registers are preserved, nested JIT thread-local state is saved across interpreter fallback, and leaf errors continue through the existing pending-error path.
+- **The existing `call_loop` JIT telemetry improves from the repository-history ~10.57 ms baseline to a 1.56 ms median warm run in a 20-run fixed-host probe (~6.8× faster), while all 55 focused JIT tests pass.**
+
 ### Faster tier-2 promotion for native loop regions — 2026-09-30
 - **JIT-compiled regions with an internal back-edge now promote from the low-latency Cranelift tier on their first compiled re-entry.** A single native loop entry can perform arbitrarily many back-edge iterations, so the previous 10,000-entry tier-2 counter could leave genuinely hot loops on first-tier code indefinitely.
 - **Straight-line and already-optimized regions retain the existing tier-2 threshold.** The policy change is limited to first-tier internal loops so cold or call-heavy code does not pay unnecessary optimized-compilation latency.
