@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Package WASM capability forwarding — 2026-10-02
+- **`nula build-wasm` now forwards manifest-declared `[package].capabilities` to the compiler just like normal package build and run paths.** Resource-gated WASM packages therefore retain the package authority declared in `Nulang.toml` instead of failing compilation because the AOT invocation silently dropped `--with` grants.
+- **A `wasm-backend` integration regression pins the boundary with a `net`-gated `Http.get` package and requires the expected `.wasm` artifact.** No new capability syntax or backend-specific authority model is introduced.
+
 ### Controlled runtime-shard scaling harness on current main — 2026-10-01
 - **A diagnostic runner measures fixed total same-shard message work across 1/2/4/8 runtime shards.** Actor/message setup and worker-thread creation are excluded from the timed region; the harness reports throughput, ns/message, speedup, parallel efficiency, and host parallelism.
 - **This establishes a best-case multicore runtime ceiling, not a cross-shard or distributed benchmark.** Publishable scaling claims still require controlled hardware and recorded CPU topology.
