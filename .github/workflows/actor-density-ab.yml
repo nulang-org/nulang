@@ -27,7 +27,6 @@ on:
       - 'examples/actor_density.rs'
       - 'src/runtime/actor.rs'
       - 'src/runtime/spawn.rs'
-      - 'src/runtime/mod.rs'
 
 concurrency:
   group: actor-density-ab-${{ github.ref }}
