@@ -159,13 +159,16 @@ fn scarce_named_resource_limits_parallelism_even_with_free_workers() {
 }
 
 #[test]
-fn scheduler_fails_closed_when_a_request_can_never_fit() {
+fn scheduler_fails_closed_before_starting_any_work_when_one_request_can_never_fit() {
     let goal_id = Uuid::new_v4();
     let worker = ProbeWorker::new(1);
     let scheduler = SwarmScheduler::new(ResourceVector::new().with("worker", 2)).unwrap();
-    let item = WorkItem::new(task(goal_id, "too-large")).require("worker", 3);
+    let items = vec![
+        WorkItem::new(task(goal_id, "valid")),
+        WorkItem::new(task(goal_id, "too-large")).require("worker", 3),
+    ];
 
-    let err = scheduler.scatter(&worker, vec![item]).unwrap_err();
+    let err = scheduler.scatter(&worker, items).unwrap_err();
     assert!(matches!(
         err,
         AdmissionError::ExceedsCapacity {
@@ -174,4 +177,5 @@ fn scheduler_fails_closed_when_a_request_can_never_fit() {
             capacity: 2,
         } if resource == "worker"
     ));
+    assert_eq!(worker.peak(), 0, "preflight must prevent partial execution");
 }
