@@ -26,20 +26,23 @@ jobs:
           text = p.read_text()
           marker = '#[test]\nfn test_timer_set_replay_rejects_cross_type_identity_collision() {'
           assert text.count(marker) == 1, text.count(marker)
-          test = r'''#[test]
+          test = r'''#[cfg(feature = "sqlite")]
+          #[test]
           fn test_timer_set_replay_survives_process_restart_without_duplicate_preparation_or_rearm() {
               let nonce = std::time::SystemTime::now()
                   .duration_since(std::time::UNIX_EPOCH)
                   .unwrap()
                   .as_nanos();
-              let path = std::env::temp_dir().join(format!(
+              let dir = std::env::temp_dir().join(format!(
                   "nulang-workflow-timer-crash-{}-{nonce}",
                   std::process::id()
               ));
-              let _ = std::fs::remove_dir_all(&path);
+              let db_path = dir.join("workflow.db");
+              let _ = std::fs::remove_dir_all(&dir);
+              std::fs::create_dir_all(&dir).unwrap();
 
               let mut rt = Runtime::new();
-              rt.persistence = Box::new(JsonFileStore::new(&path).unwrap());
+              rt.persistence = Box::new(LibsqlStore::new(&db_path).unwrap());
               let actor_id =
                   rt.spawn_workflow_actor("ReplayTimerCrash", Box::new(Vec::new), HashMap::new());
               declare_test_behavior(&mut rt, actor_id, "next");
@@ -61,7 +64,7 @@ jobs:
               drop(rt);
 
               let mut recovered = Runtime::new();
-              recovered.persistence = Box::new(JsonFileStore::new(&path).unwrap());
+              recovered.persistence = Box::new(LibsqlStore::new(&db_path).unwrap());
               assert_eq!(recovered.recover_actor(actor_id), Some(actor_id));
               assert_eq!(
                   recovered
@@ -103,7 +106,8 @@ jobs:
                   "restart replay must consume the same activation-local TimerSet identity"
               );
 
-              let _ = std::fs::remove_dir_all(&path);
+              drop(recovered);
+              let _ = std::fs::remove_dir_all(&dir);
           }
 
           '''
@@ -112,9 +116,9 @@ jobs:
           cargo fmt --all
           git diff --check
       - name: Run focused RED/GREEN gate
-        run: cargo test --locked --no-default-features --lib test_timer_set_replay_survives_process_restart_without_duplicate_preparation_or_rearm -- --nocapture
+        run: cargo test --locked --no-default-features --features sqlite --lib test_timer_set_replay_survives_process_restart_without_duplicate_preparation_or_rearm -- --nocapture
       - name: Run timer replay regressions
-        run: cargo test --locked --no-default-features --lib timer_set_replay -- --nocapture
+        run: cargo test --locked --no-default-features --features sqlite --lib timer_set_replay -- --nocapture
       - name: Publish test slice
         shell: bash
         run: |
