@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = ROOT.parent
 SCRIPT = ROOT / "check_architecture_boundaries.py"
 
 spec = importlib.util.spec_from_file_location("check_architecture_boundaries", SCRIPT)
@@ -21,6 +22,11 @@ class CloudControlBoundaryTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
         return tmp, root
+
+    def test_current_repository_respects_boundary(self):
+        self.assertEqual(
+            [], check_architecture_boundaries.validate_repository(REPOSITORY_ROOT)
+        )
 
     def test_allows_frozen_migration_crate_outside_active_workspace(self):
         tmp, root = self._write_repo(
