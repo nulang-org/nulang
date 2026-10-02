@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Concrete actor behavior protocol enforcement — 2026-10-02
+- **Concrete `Actor` send/ask inference now enforces declared behavior signatures inside type inference.** Unknown concrete behaviors and incompatible annotated arguments are rejected even when the AST actor-protocol pre-pass is bypassed, and typed `ask` returns the declared behavior result type.
+- **Compatibility remains explicit.** Unspecified local protocol types and opaque/dynamic actor protocols stay permissive, while explicit `ActorRef<P>` behavior semantics remain unchanged.
+
 ### Controlled runtime-shard scaling harness on current main — 2026-10-01
 - **A diagnostic runner measures fixed total same-shard message work across 1/2/4/8 runtime shards.** Actor/message setup and worker-thread creation are excluded from the timed region; the harness reports throughput, ns/message, speedup, parallel efficiency, and host parallelism.
 - **This establishes a best-case multicore runtime ceiling, not a cross-shard or distributed benchmark.** Publishable scaling claims still require controlled hardware and recorded CPU topology.
