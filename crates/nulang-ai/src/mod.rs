@@ -1,5 +1,5 @@
 //! AI runtime types for Nulang — LLM clients, memory, pipelines, debates,
-//! supervisor teams, and usage tracking.
+//! supervisor teams, durable orchestration state, and usage tracking.
 //!
 //! This crate provides the provider-agnostic request/response types, an async
 //! LLM client trait, and higher-level orchestration patterns (pipeline, debate,
@@ -10,6 +10,7 @@ pub mod client;
 pub mod debate;
 pub mod memory;
 pub mod mock;
+pub mod orchestration;
 pub mod pipeline;
 pub mod procedural_memory;
 pub mod providers;
@@ -24,6 +25,9 @@ pub use client::{complete_sync, LlmClient};
 pub use debate::{Debate, DebateRuntime, Participant, Stance};
 pub use memory::{EpisodicMemory, Turn};
 pub use mock::MockLlmClient;
+pub use orchestration::{
+    ProgressEvent, ProgressLedger, TaskLedger, TaskRecord, TaskStatus,
+};
 pub use pipeline::{Pipeline, PipelineRuntime, PipelineStage};
 pub use procedural_memory::{Pattern, ProceduralMemory};
 pub use providers::ollama::OllamaClient;
