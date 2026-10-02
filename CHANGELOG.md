@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Observable remote actor delivery failures — 2026-10-02
+- **Ordinary remote actor sends now have an explicit best-effort / at-most-once transport contract.** Connect failures, ambiguous write failures, stopped senders, and invalid wire payloads produce observable asynchronous delivery-failure outcomes instead of disappearing only into logs.
+- **Ambiguous TCP writes are never retried blindly.** ACK sequence numbers are not treated as a reliability guarantee without outbound retention and receiver deduplication; stronger retry/effect guarantees remain the durable workflow layer's responsibility.
+
 ### Controlled runtime-shard scaling harness on current main — 2026-10-01
 - **A diagnostic runner measures fixed total same-shard message work across 1/2/4/8 runtime shards.** Actor/message setup and worker-thread creation are excluded from the timed region; the harness reports throughput, ns/message, speedup, parallel efficiency, and host parallelism.
 - **This establishes a best-case multicore runtime ceiling, not a cross-shard or distributed benchmark.** Publishable scaling claims still require controlled hardware and recorded CPU topology.
