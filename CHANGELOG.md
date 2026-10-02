@@ -1,4 +1,8 @@
 # Nulang Changelog
+### Counterbalanced runtime-shard measurement order — 2026-10-02
+- **Repeated shard-scaling runs now rotate forward and reverse shard-count orders instead of always measuring 1/2/4/8 in the same sequence.** Across an eight-repeat four-shard run, every shard count receives equal exposure to each ordinal measurement position.
+- **The benchmark keeps fixed total work and reports each iteration in actual execution order.** This reduces systematic warmup/thermal/order bias without changing runtime scheduling or shard semantics.
+
 ### Controlled runtime-shard scaling harness on current main — 2026-10-01
 - **A diagnostic runner measures fixed total same-shard message work across 1/2/4/8 runtime shards.** Actor/message setup and worker-thread creation are excluded from the timed region; the harness reports throughput, ns/message, speedup, parallel efficiency, and host parallelism.
 - **This establishes a best-case multicore runtime ceiling, not a cross-shard or distributed benchmark.** Publishable scaling claims still require controlled hardware and recorded CPU topology.
