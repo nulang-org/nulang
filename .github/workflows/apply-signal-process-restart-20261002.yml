@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: test/workflow-signal-process-restart-20261002
+          ref: test/workflow-signal-restart-on-atomic-tail-20261002
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - name: Add full process-restart signal regression
@@ -143,4 +143,4 @@ jobs:
           git add src/runtime/tests.rs
           git diff --cached --check
           git commit -m 'test(workflow): prove signal recovery across process restart'
-          git push origin HEAD:test/workflow-signal-process-restart-20261002
+          git push origin HEAD:test/workflow-signal-restart-on-atomic-tail-20261002
