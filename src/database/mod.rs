@@ -7,8 +7,8 @@
 pub mod checkpoint;
 pub mod lsm;
 pub mod managed_lsm;
-pub mod store;
 pub(crate) mod sstable;
+pub mod store;
 pub mod tablet;
 pub mod wal;
 
