@@ -5,6 +5,9 @@
 //! assembly in Nulang source. Backends are expected to lower these semantic
 //! operations to the cheapest target instruction sequence available.
 
+use crate::bytecode::Constant;
+use crate::mir::LocalId;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntegerIntrinsic {
     Popcount,
@@ -18,6 +21,60 @@ pub enum IntegerIntrinsic {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntrinsicEffect {
     Pure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirIntrinsic {
+    pub op: IntegerIntrinsic,
+    pub args: Vec<LocalId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntrinsicError {
+    WrongArity {
+        intrinsic: IntegerIntrinsic,
+        expected: usize,
+        actual: usize,
+    },
+}
+
+impl std::fmt::Display for IntrinsicError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongArity {
+                intrinsic,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "intrinsic '{}' expects {expected} argument(s), got {actual}",
+                intrinsic.stable_name()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for IntrinsicError {}
+
+impl MirIntrinsic {
+    pub fn new(op: IntegerIntrinsic, args: Vec<LocalId>) -> Result<Self, IntrinsicError> {
+        if args.len() != op.arity() {
+            return Err(IntrinsicError::WrongArity {
+                intrinsic: op,
+                expected: op.arity(),
+                actual: args.len(),
+            });
+        }
+        Ok(Self { op, args })
+    }
+
+    /// Fold the intrinsic when every MIR operand is available as an integer
+    /// constant. Non-integer constants deliberately decline folding rather
+    /// than inventing coercion semantics.
+    pub fn fold_constants(&self, args: &[Constant]) -> Option<Constant> {
+        let _ = args;
+        todo!("RED: fold MirIntrinsic constants")
+    }
 }
 
 impl IntegerIntrinsic {
@@ -83,6 +140,23 @@ impl IntegerIntrinsic {
     }
 }
 
+#[cfg(feature = "native-codegen")]
+pub fn lower_cranelift_i64(
+    builder: &mut cranelift_frontend::FunctionBuilder<'_>,
+    intrinsic: IntegerIntrinsic,
+    args: &[cranelift::prelude::Value],
+) -> Result<cranelift::prelude::Value, IntrinsicError> {
+    let _ = (builder, args);
+    if args.len() != intrinsic.arity() {
+        return Err(IntrinsicError::WrongArity {
+            intrinsic,
+            expected: intrinsic.arity(),
+            actual: args.len(),
+        });
+    }
+    todo!("RED: lower integer intrinsic to Cranelift")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +212,104 @@ mod tests {
         assert_eq!(IntegerIntrinsic::Popcount.fold_i64(&[]), None);
         assert_eq!(IntegerIntrinsic::Popcount.fold_i64(&[1, 2]), None);
         assert_eq!(IntegerIntrinsic::RotateLeft.fold_i64(&[1]), None);
+    }
+
+    #[test]
+    fn mir_intrinsic_validates_arity_and_folds_integer_constants() {
+        let call = MirIntrinsic::new(
+            IntegerIntrinsic::RotateLeft,
+            vec![LocalId(0), LocalId(1)],
+        )
+        .unwrap();
+        assert_eq!(
+            call.fold_constants(&[Constant::Int(1), Constant::Int(65)]),
+            Some(Constant::Int(2))
+        );
+        assert_eq!(
+            call.fold_constants(&[Constant::Int(1), Constant::Bool(true)]),
+            None
+        );
+
+        let err = MirIntrinsic::new(IntegerIntrinsic::Popcount, vec![]).unwrap_err();
+        assert_eq!(
+            err,
+            IntrinsicError::WrongArity {
+                intrinsic: IntegerIntrinsic::Popcount,
+                expected: 1,
+                actual: 0,
+            }
+        );
+    }
+}
+
+#[cfg(all(test, feature = "native-codegen"))]
+mod native_tests {
+    use super::*;
+    use cranelift::codegen::ir::{types, AbiParam, Function, InstBuilder};
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+    fn render_lowering(intrinsic: IntegerIntrinsic) -> String {
+        let mut function = Function::new();
+        for _ in 0..intrinsic.arity() {
+            function.signature.params.push(AbiParam::new(types::I64));
+        }
+        function.signature.returns.push(AbiParam::new(types::I64));
+
+        let mut context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut function, &mut context);
+        let block = builder.create_block();
+        builder.switch_to_block(block);
+        builder.append_block_params_for_function_params(block);
+        let args = builder.block_params(block).to_vec();
+        let result = lower_cranelift_i64(&mut builder, intrinsic, &args).unwrap();
+        builder.ins().return_(&[result]);
+        builder.seal_all_blocks();
+        builder.finalize();
+        function.display().to_string()
+    }
+
+    #[test]
+    fn cranelift_lowering_uses_native_integer_instructions() {
+        let cases = [
+            (IntegerIntrinsic::Popcount, "popcnt"),
+            (IntegerIntrinsic::LeadingZeros, "clz"),
+            (IntegerIntrinsic::TrailingZeros, "ctz"),
+            (IntegerIntrinsic::RotateLeft, "rotl"),
+            (IntegerIntrinsic::RotateRight, "rotr"),
+            (IntegerIntrinsic::ByteSwap, "bswap"),
+        ];
+
+        for (intrinsic, opcode) in cases {
+            let clif = render_lowering(intrinsic);
+            assert!(
+                clif.contains(opcode),
+                "{} should lower to Cranelift {opcode}; CLIF:\n{clif}",
+                intrinsic.stable_name()
+            );
+        }
+    }
+
+    #[test]
+    fn cranelift_lowering_rejects_wrong_arity() {
+        let mut function = Function::new();
+        function.signature.params.push(AbiParam::new(types::I64));
+        function.signature.returns.push(AbiParam::new(types::I64));
+        let mut context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut function, &mut context);
+        let block = builder.create_block();
+        builder.switch_to_block(block);
+        builder.append_block_params_for_function_params(block);
+        let args = builder.block_params(block).to_vec();
+
+        let err = lower_cranelift_i64(&mut builder, IntegerIntrinsic::RotateLeft, &args)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            IntrinsicError::WrongArity {
+                intrinsic: IntegerIntrinsic::RotateLeft,
+                expected: 2,
+                actual: 1,
+            }
+        );
     }
 }
