@@ -57,6 +57,25 @@ class PerformanceCrownTests(unittest.TestCase):
         self.assertTrue(any("requires at least one baseline" in error for error in errors))
         self.assertTrue(any("requires measurement_mode=controlled" in error for error in errors))
 
+    def test_end_to_end_evidence_requires_runner_but_is_not_claim_ready(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            (root / "benches").mkdir()
+            (root / "benches" / "dist_bench.rs").write_text("// benchmark\n")
+            manifest = self.make_manifest()
+            bench = manifest["domains"][2]["benchmarks"][0]
+            bench.update(
+                {
+                    "status": "end_to_end",
+                    "runner": "benches/dist_bench.rs",
+                    "baselines": ["go", "erlang"],
+                    "measurement_mode": "criterion",
+                }
+            )
+            self.assertEqual([], performance_crown.validate_manifest(manifest, root))
+            row = next(row for row in performance_crown.rows(manifest) if row["id"] == bench["id"])
+            self.assertFalse(row["claim_ready"])
+
     def test_existing_runner_must_resolve_inside_repo(self):
         manifest = self.make_manifest()
         errors = performance_crown.validate_manifest(manifest, pathlib.Path("/definitely/missing"))
