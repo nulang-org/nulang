@@ -1,0 +1,142 @@
+name: Apply WASM intrinsic lowering
+
+on:
+  push:
+    paths:
+      - .github/workflows/intrinsic-wasm-green.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: codex/mir-inspection-surface
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Integrate WASM intrinsics
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("src/mir_wasm.rs")
+          text = path.read_text()
+
+          marker = "    // ── RValue compilation ─────────────────────────────────────────\n\n"
+          if text.count(marker) != 1:
+              raise SystemExit(f"RValue compilation marker count: {text.count(marker)}")
+
+          helpers = r'''    /// Push one MIR integer local as a sign-extended raw i64. WASM locals
+    /// carry Nulang's tagged Int48 representation, so native integer ops must
+    /// never run directly on the tag bits.
+    fn emit_unbox_int48(&self, body: &mut Function, local: &LocalId, func: &mir::Function) {
+        body.instruction(&Instruction::LocalGet(self.mir_local(local, func)));
+        body.instruction(&Instruction::I64Const(value_layout::PAYLOAD_MASK as i64));
+        body.instruction(&Instruction::I64And);
+        // Sign-extend bit 47 without a helper call: move it to bit 63 then
+        // arithmetic-shift it back into place.
+        body.instruction(&Instruction::I64Const(16));
+        body.instruction(&Instruction::I64Shl);
+        body.instruction(&Instruction::I64Const(16));
+        body.instruction(&Instruction::I64ShrS);
+    }
+
+    /// Convert a raw i64 result on the WASM operand stack back to Nulang Int48.
+    fn emit_tag_int48(&self, body: &mut Function) {
+        body.instruction(&Instruction::I64Const(value_layout::PAYLOAD_MASK as i64));
+        body.instruction(&Instruction::I64And);
+        body.instruction(&Instruction::I64Const(value_layout::TAG_INT as i64));
+        body.instruction(&Instruction::I64Or);
+    }
+
+    /// Lower the compiler-owned pure integer intrinsic directly to WASM
+    /// integer instructions. The operation receives sign-extended raw i64
+    /// operands and leaves one tagged Int48 result on the stack.
+    fn compile_intrinsic(
+        &self,
+        body: &mut Function,
+        intrinsic: &crate::compiler_intrinsics::MirIntrinsic,
+        func: &mir::Function,
+    ) {
+        use crate::compiler_intrinsics::IntegerIntrinsic;
+
+        match intrinsic.op {
+            IntegerIntrinsic::Popcount => {
+                self.emit_unbox_int48(body, &intrinsic.args[0], func);
+                body.instruction(&Instruction::I64Popcnt);
+            }
+            IntegerIntrinsic::LeadingZeros => {
+                self.emit_unbox_int48(body, &intrinsic.args[0], func);
+                body.instruction(&Instruction::I64Clz);
+            }
+            IntegerIntrinsic::TrailingZeros => {
+                self.emit_unbox_int48(body, &intrinsic.args[0], func);
+                body.instruction(&Instruction::I64Ctz);
+            }
+            IntegerIntrinsic::RotateLeft => {
+                self.emit_unbox_int48(body, &intrinsic.args[0], func);
+                self.emit_unbox_int48(body, &intrinsic.args[1], func);
+                body.instruction(&Instruction::I64Rotl);
+            }
+            IntegerIntrinsic::RotateRight => {
+                self.emit_unbox_int48(body, &intrinsic.args[0], func);
+                self.emit_unbox_int48(body, &intrinsic.args[1], func);
+                body.instruction(&Instruction::I64Rotr);
+            }
+            IntegerIntrinsic::ByteSwap => {
+                // WebAssembly has no scalar i64 byte-swap opcode. Build the
+                // exact bswap semantics from shifts/masks while keeping the
+                // operation allocation- and host-call-free. Each term is one
+                // source byte moved to its reversed position, ORed together.
+                for byte in 0u32..8 {
+                    self.emit_unbox_int48(body, &intrinsic.args[0], func);
+                    let src_shift = byte * 8;
+                    if src_shift != 0 {
+                        body.instruction(&Instruction::I64Const(i64::from(src_shift)));
+                        body.instruction(&Instruction::I64ShrU);
+                    }
+                    body.instruction(&Instruction::I64Const(0xff));
+                    body.instruction(&Instruction::I64And);
+                    let dst_shift = (7 - byte) * 8;
+                    if dst_shift != 0 {
+                        body.instruction(&Instruction::I64Const(i64::from(dst_shift)));
+                        body.instruction(&Instruction::I64Shl);
+                    }
+                    if byte != 0 {
+                        body.instruction(&Instruction::I64Or);
+                    }
+                }
+            }
+        }
+        self.emit_tag_int48(body);
+    }
+
+'''
+          text = text.replace(marker, helpers + marker, 1)
+
+          old = """            RValue::Unary(op, a) => {\n                self.compile_unary(body, *op, a, func);\n            }\n            RValue::StrConcat(a, b) => {\n"""
+          new = """            RValue::Unary(op, a) => {\n                self.compile_unary(body, *op, a, func);\n            }\n            RValue::Intrinsic(intrinsic) => {\n                self.compile_intrinsic(body, intrinsic, func);\n            }\n            RValue::StrConcat(a, b) => {\n"""
+          if text.count(old) != 1:
+              raise SystemExit(f"intrinsic match anchor count: {text.count(old)}")
+          path.write_text(text.replace(old, new, 1))
+      - name: Format
+        run: cargo fmt --all
+      - name: Check wasm feature
+        run: cargo check --locked --features wasm-backend
+      - name: Test executable WASM intrinsics
+        run: cargo test --locked --features wasm-backend --test compiler_intrinsics_wasm --test compiler_intrinsics_mir
+      - name: Commit integration
+        run: |
+          git config user.name "chatgpt-codex-connector[bot]"
+          git config user.email "199175422+chatgpt-codex-connector[bot]@users.noreply.github.com"
+          git add src/mir_wasm.rs tests/compiler_intrinsics_wasm.rs
+          git diff --cached --check
+          git commit -m "feat(wasm): lower MIR integer intrinsics directly"
+          git push origin HEAD:codex/mir-inspection-surface
