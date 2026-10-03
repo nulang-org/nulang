@@ -18,11 +18,9 @@ jobs:
           ref: feat/nudb-sstable-v2-serving
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
       - name: Patch fail-closed serving reads
-        shell: python
         run: |
+          python - <<'PY'
           from pathlib import Path
 
           path = Path('src/database/store.rs')
@@ -77,8 +75,8 @@ jobs:
               raise SystemExit('display anchor mismatch')
           text = text.replace(old, new)
           path.write_text(text)
-      - name: Format
-        run: cargo fmt --all
+          PY
+          cargo fmt --all
       - name: Run serving regressions
         run: cargo test --locked --no-default-features --lib database::sstable_v2_serving_regression_tests
       - name: Commit fix and remove temporary workflow
@@ -86,6 +84,6 @@ jobs:
           rm .github/workflows/nudb-serving-conflict-fix.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/database/store.rs src/database/mod.rs src/database/sstable_v2_serving_regression_tests.rs .github/workflows/nudb-serving-conflict-fix.yml
+          git add -A src/database/store.rs src/database/mod.rs src/database/sstable_v2_serving_regression_tests.rs .github/workflows/nudb-serving-conflict-fix.yml
           git commit -m "fix(database): fail closed on serving conflicts"
           git push origin HEAD:feat/nudb-sstable-v2-serving
