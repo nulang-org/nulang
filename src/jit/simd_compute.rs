@@ -62,7 +62,7 @@ impl fmt::Display for SimdComputePlanError {
                 f,
                 "SIMD region marks its trip count as runtime-derived but has no ArrLen register binding"
             ),
-            Self::Schedule(error) => error.fmt(f),
+            Self::Schedule(error) => write!(f, "{error}"),
         }
     }
 }
