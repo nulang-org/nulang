@@ -38,10 +38,7 @@ impl IntegerIntrinsic {
     pub const fn arity(self) -> usize {
         match self {
             Self::RotateLeft | Self::RotateRight => 2,
-            Self::Popcount
-            | Self::LeadingZeros
-            | Self::TrailingZeros
-            | Self::ByteSwap => 1,
+            Self::Popcount | Self::LeadingZeros | Self::TrailingZeros | Self::ByteSwap => 1,
         }
     }
 
@@ -93,7 +90,10 @@ mod tests {
     #[test]
     fn names_and_arity_are_stable() {
         assert_eq!(IntegerIntrinsic::Popcount.stable_name(), "int.popcount");
-        assert_eq!(IntegerIntrinsic::RotateLeft.stable_name(), "int.rotate_left");
+        assert_eq!(
+            IntegerIntrinsic::RotateLeft.stable_name(),
+            "int.rotate_left"
+        );
         assert_eq!(IntegerIntrinsic::Popcount.arity(), 1);
         assert_eq!(IntegerIntrinsic::RotateLeft.arity(), 2);
     }
