@@ -12,9 +12,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use super::manifest::{
-    Manifest, ManifestEntry, ManifestError, SstableFormat, SstableIntegrity,
-};
+use super::manifest::{Manifest, ManifestEntry, ManifestError, SstableFormat, SstableIntegrity};
 use super::sstable::{self, SstableError};
 use super::sstable_v2::{write_sstable_v2, SstableV2, SstableV2Error};
 use super::tablet::{TabletDescriptor, TabletSnapshotRow, VersionedValue};
@@ -189,6 +187,8 @@ fn load_manifest_rows(
                 || metadata.checksum != expected_checksum
                 || metadata.tablet_id != descriptor.id().get()
                 || metadata.ownership_epoch > descriptor.ownership_epoch()
+                || !descriptor.range().contains(&metadata.min_key)
+                || !descriptor.range().contains(&metadata.max_key)
             {
                 return Err(CompactionError::ManifestSstableMismatch(
                     entry.file_name.clone(),
@@ -210,6 +210,8 @@ fn load_manifest_rows(
                 || metadata.footer_checksum != expected_checksum
                 || metadata.tablet_id != descriptor.id().get()
                 || metadata.ownership_epoch > descriptor.ownership_epoch()
+                || !descriptor.range().contains(&metadata.min_key)
+                || !descriptor.range().contains(&metadata.max_key)
             {
                 return Err(CompactionError::ManifestSstableMismatch(
                     entry.file_name.clone(),
@@ -259,10 +261,14 @@ fn validate_replacement(
         || metadata.row_count as usize != rows.len()
         || metadata.min_key.as_slice() != rows.first().unwrap().key.as_slice()
         || metadata.max_key.as_slice() != rows.last().unwrap().key.as_slice()
+        || !descriptor.range().contains(&metadata.min_key)
+        || !descriptor.range().contains(&metadata.max_key)
     {
         return Err(CompactionError::ReplacementMismatch(file_name.to_owned()));
     }
-    let decoded = table.snapshot_rows().map_err(CompactionError::from_v2)?;
+    let decoded = table
+        .snapshot_rows()
+        .map_err(CompactionError::from_v2)?;
     if decoded != rows {
         return Err(CompactionError::ReplacementMismatch(file_name.to_owned()));
     }
@@ -323,14 +329,20 @@ impl fmt::Display for CompactionError {
                 write!(f, "NuDB compaction replacement history does not match {file}")
             }
             Self::SnapshotConflict { sequence } => {
-                write!(f, "NuDB compaction found conflicting MVCC values at sequence {sequence}")
+                write!(
+                    f,
+                    "NuDB compaction found conflicting MVCC values at sequence {sequence}"
+                )
             }
             Self::ConcurrentManifestChange => {
                 f.write_str("NuDB compaction source manifest changed before publication")
             }
             Self::EmptyHistory => f.write_str("NuDB compaction source history is empty"),
             Self::Serialization(error) => {
-                write!(f, "NuDB compaction identity serialization failed: {error}")
+                write!(
+                    f,
+                    "NuDB compaction identity serialization failed: {error}"
+                )
             }
         }
     }
