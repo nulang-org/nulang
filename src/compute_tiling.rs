@@ -17,6 +17,8 @@ pub struct VectorTilePlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputeTileError {
+    ZeroVectorBytes,
+    ZeroVectorLanes,
     BudgetTooSmall {
         target_bytes: u64,
         min_vector_bytes: u64,
@@ -27,6 +29,8 @@ pub enum ComputeTileError {
 impl fmt::Display for ComputeTileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ZeroVectorBytes => write!(f, "vector loop plan has a zero-byte vector width"),
+            Self::ZeroVectorLanes => write!(f, "vector loop plan has zero lanes"),
             Self::BudgetTooSmall {
                 target_bytes,
                 min_vector_bytes,
@@ -144,6 +148,28 @@ mod tests {
                 target_bytes: 8,
                 min_vector_bytes: 16,
             })
+        );
+    }
+
+    #[test]
+    fn rejects_public_plan_with_zero_vector_bytes() {
+        let mut plan = fixed_plan();
+        plan.min_vector_bytes = 0;
+
+        assert_eq!(
+            plan_vector_tile(plan, 64),
+            Err(ComputeTileError::ZeroVectorBytes)
+        );
+    }
+
+    #[test]
+    fn rejects_public_plan_with_zero_vector_lanes() {
+        let mut plan = fixed_plan();
+        plan.width = PlannedVectorWidth::Fixed(0);
+
+        assert_eq!(
+            plan_vector_tile(plan, 64),
+            Err(ComputeTileError::ZeroVectorLanes)
         );
     }
 }
