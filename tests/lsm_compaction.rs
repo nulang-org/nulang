@@ -213,3 +213,109 @@ fn tablet_rejects_snapshots_below_the_compacted_retention_floor() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn range_scan_merges_tables_memtable_versions_and_tombstones_in_key_order() {
+    let dir = temp_dir("range_scan");
+    let _ = fs::remove_dir_all(&dir);
+
+    let mut storage = ManagedLsmStorage::open(&dir).unwrap();
+    storage.apply_committed(
+        1,
+        vec![put(b"a", b"a1"), put(b"c", b"c1"), put(b"e", b"e1")],
+    );
+    storage.flush().unwrap().unwrap();
+    storage.apply_committed(
+        2,
+        vec![
+            put(b"b", b"b2"),
+            put(b"c", b"c2"),
+            put(b"d", b"d2"),
+            TabletMutation::Delete { key: b"e".to_vec() },
+        ],
+    );
+    storage.flush().unwrap().unwrap();
+    storage.apply_committed(3, vec![put(b"c", b"c3")]);
+
+    assert_eq!(
+        storage.scan_at(b"a", Some(b"f"), 1, 10).unwrap(),
+        vec![
+            (b"a".to_vec(), b"a1".to_vec()),
+            (b"c".to_vec(), b"c1".to_vec()),
+            (b"e".to_vec(), b"e1".to_vec()),
+        ]
+    );
+    assert_eq!(
+        storage.scan_at(b"b", Some(b"e"), 2, 10).unwrap(),
+        vec![
+            (b"b".to_vec(), b"b2".to_vec()),
+            (b"c".to_vec(), b"c2".to_vec()),
+            (b"d".to_vec(), b"d2".to_vec()),
+        ]
+    );
+    assert_eq!(
+        storage.scan_at(b"a", None, 3, 2).unwrap(),
+        vec![
+            (b"a".to_vec(), b"a1".to_vec()),
+            (b"b".to_vec(), b"b2".to_vec()),
+        ]
+    );
+    assert_eq!(storage.read_at(b"c", 3), Some(&b"c3"[..]));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn range_scan_rejects_collected_and_future_snapshots() {
+    let dir = temp_dir("range_scan_fence");
+    let _ = fs::remove_dir_all(&dir);
+
+    let mut storage = ManagedLsmStorage::open(&dir).unwrap();
+    storage.apply_committed(1, vec![put(b"a", b"a1")]);
+    storage.flush().unwrap().unwrap();
+    storage.apply_committed(2, vec![put(b"a", b"a2")]);
+    storage.flush().unwrap().unwrap();
+    storage.compact_all(2).unwrap();
+
+    assert_eq!(
+        storage.scan_at(b"a", None, 1, 10).unwrap_err(),
+        ManagedLsmError::SnapshotCollected {
+            oldest_readable: 2,
+            requested: 1,
+        }
+    );
+    assert_eq!(
+        storage.scan_at(b"a", None, 3, 10).unwrap_err(),
+        ManagedLsmError::SnapshotAhead {
+            committed: 2,
+            requested: 3,
+        }
+    );
+    assert!(storage.scan_at(b"a", None, 2, 0).unwrap().is_empty());
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn orphan_generations_are_never_reused_after_reopen() {
+    let dir = temp_dir("orphan_generation");
+    let _ = fs::remove_dir_all(&dir);
+
+    {
+        let mut storage = ManagedLsmStorage::open(&dir).unwrap();
+        storage.apply_committed(1, vec![put(b"k", b"v1")]);
+        assert_eq!(storage.flush().unwrap().unwrap().generation, 1);
+    }
+
+    let orphan = dir.join("nudb-sst-00000000000000000099.sst");
+    fs::write(&orphan, b"interrupted unpublished table").unwrap();
+
+    let mut reopened = ManagedLsmStorage::open(&dir).unwrap();
+    reopened.apply_committed(2, vec![put(b"k", b"v2")]);
+    let flushed = reopened.flush().unwrap().unwrap();
+    assert_eq!(flushed.generation, 100);
+    assert!(orphan.exists());
+    assert_eq!(reopened.read_at(b"k", 2), Some(&b"v2"[..]));
+
+    let _ = fs::remove_dir_all(&dir);
+}
