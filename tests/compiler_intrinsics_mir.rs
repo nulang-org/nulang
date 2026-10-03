@@ -23,9 +23,7 @@ fn constant_intrinsic_folds_before_bytecode_codegen() {
     builder.assign(value, RValue::Const(Constant::Int(0b1011)));
     builder.assign(
         result,
-        RValue::Intrinsic(
-            MirIntrinsic::new(IntegerIntrinsic::Popcount, vec![value]).unwrap(),
-        ),
+        RValue::Intrinsic(MirIntrinsic::new(IntegerIntrinsic::Popcount, vec![value]).unwrap()),
     );
     builder.terminate(Terminator::Return(Some(result)));
     let mut module = module_with(builder.build());
@@ -53,9 +51,7 @@ fn unused_nonconstant_intrinsic_is_dead_code() {
     let answer = builder.add_temp(Type::int());
     builder.assign(
         dead,
-        RValue::Intrinsic(
-            MirIntrinsic::new(IntegerIntrinsic::Popcount, vec![input]).unwrap(),
-        ),
+        RValue::Intrinsic(MirIntrinsic::new(IntegerIntrinsic::Popcount, vec![input]).unwrap()),
     );
     builder.assign(answer, RValue::Const(Constant::Int(42)));
     builder.terminate(Terminator::Return(Some(answer)));
@@ -83,15 +79,19 @@ fn live_nonconstant_intrinsic_fails_closed_in_bytecode_codegen() {
     let result = builder.add_temp(Type::int());
     builder.assign(
         result,
-        RValue::Intrinsic(
-            MirIntrinsic::new(IntegerIntrinsic::Popcount, vec![input]).unwrap(),
-        ),
+        RValue::Intrinsic(MirIntrinsic::new(IntegerIntrinsic::Popcount, vec![input]).unwrap()),
     );
     builder.terminate(Terminator::Return(Some(result)));
     let mut module = module_with(builder.build());
 
     let error = nulang::mir_codegen::compile_mir(&mut module, "intrinsic-test").unwrap_err();
     let message = error.to_string();
-    assert!(message.contains("compiler intrinsic"), "unexpected error: {message}");
-    assert!(message.contains("int.popcount"), "unexpected error: {message}");
+    assert!(
+        message.contains("compiler intrinsic"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("int.popcount"),
+        "unexpected error: {message}"
+    );
 }
