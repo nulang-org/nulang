@@ -411,6 +411,23 @@ impl MemoryTablet {
         })
     }
 
+    /// Remove exactly the oldest frozen generation after its durable SSTable
+    /// has been published. Newer immutable generations and mutable state are
+    /// left untouched.
+    pub(crate) fn pop_oldest_immutable_rows(&mut self) -> Option<Vec<TabletSnapshotRow>> {
+        if self.immutables.is_empty() {
+            return None;
+        }
+        let memtable = self.immutables.remove(0);
+        Some(
+            memtable
+                .rows
+                .into_iter()
+                .map(|(key, versions)| TabletSnapshotRow { key, versions })
+                .collect(),
+        )
+    }
+
     /// Freeze the mutable generation when it reaches the configured byte target.
     /// Empty generations are never emitted. A zero threshold behaves as one byte.
     pub fn rotate_memtable_if_bytes_at_least(&mut self, min_bytes: usize) -> bool {
@@ -639,8 +656,13 @@ impl MemoryTablet {
         self.current_sequence = sequence;
     }
 
-    /// Read one key at an already committed snapshot sequence.
-    pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
+    /// Return the newest resident MVCC version visible at `snapshot`, retaining
+    /// tombstone identity for callers that merge memory with durable sources.
+    pub(crate) fn visible_version_at(
+        &self,
+        key: &[u8],
+        snapshot: u64,
+    ) -> Result<Option<&VersionedValue>, TabletError> {
         if snapshot > self.current_sequence {
             return Err(TabletError::SnapshotAhead {
                 committed: self.current_sequence,
@@ -651,13 +673,19 @@ impl MemoryTablet {
             return Err(TabletError::KeyOutsideTabletRange);
         }
 
-        let version = self.mutable.version_at(key, snapshot).or_else(|| {
+        Ok(self.mutable.version_at(key, snapshot).or_else(|| {
             self.immutables
                 .iter()
                 .rev()
                 .find_map(|memtable| memtable.version_at(key, snapshot))
-        });
-        Ok(version.and_then(|version| version.value.as_deref()))
+        }))
+    }
+
+    /// Read one key at an already committed snapshot sequence.
+    pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
+        Ok(self
+            .visible_version_at(key, snapshot)?
+            .and_then(|version| version.value.as_deref()))
     }
 
     /// Read the newest committed value. Out-of-range keys route as absent;
@@ -857,6 +885,34 @@ mod memtable_rotation_tests {
 
         assert_eq!(tablet.read_latest(b"k"), None);
         assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
+        let visible = tablet.visible_version_at(b"k", 2).unwrap().unwrap();
+        assert_eq!(visible.sequence, 2);
+        assert!(visible.value.is_none());
+    }
+
+    #[test]
+    fn popping_oldest_immutable_preserves_newer_generations_and_mutable_state() {
+        let mut tablet = MemoryTablet::new(descriptor());
+        let w1 = tablet.prepare_write(1, 0, vec![put(b"k", b"v1")]).unwrap();
+        tablet.commit(w1).unwrap();
+        let bytes = tablet.mutable_memtable_bytes();
+        tablet.rotate_memtable_if_bytes_at_least(bytes);
+
+        let w2 = tablet.prepare_write(1, 1, vec![put(b"k", b"v2")]).unwrap();
+        tablet.commit(w2).unwrap();
+        let bytes = tablet.mutable_memtable_bytes();
+        tablet.rotate_memtable_if_bytes_at_least(bytes);
+
+        let w3 = tablet.prepare_write(1, 2, vec![put(b"k", b"v3")]).unwrap();
+        tablet.commit(w3).unwrap();
+
+        let popped = tablet.pop_oldest_immutable_rows().unwrap();
+        assert_eq!(popped.len(), 1);
+        assert_eq!(popped[0].versions.len(), 1);
+        assert_eq!(popped[0].versions[0].sequence, 1);
+        assert_eq!(tablet.immutable_memtable_count(), 1);
+        assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
+        assert_eq!(tablet.read_latest(b"k"), Some(&b"v3"[..]));
     }
 }
 
