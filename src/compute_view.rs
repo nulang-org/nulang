@@ -52,7 +52,6 @@ impl std::error::Error for ComputeViewError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComputeViewPlanError {
-    NotImplemented,
     AxisOutOfBounds { axis: usize, rank: usize },
     Ir(ComputeIrError),
     Planner(ComputePlannerError),
@@ -61,7 +60,6 @@ pub enum ComputeViewPlanError {
 impl fmt::Display for ComputeViewPlanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotImplemented => write!(f, "symbolic buffer view planning is not implemented"),
             Self::AxisOutOfBounds { axis, rank } => {
                 write!(f, "vector axis {axis} is outside buffer view rank {rank}")
             }
@@ -148,13 +146,60 @@ impl BufferView {
     }
 }
 
+/// Plan a vector loop over a buffer whose shape may contain symbolic extents.
+///
+/// The existing static planner remains the source of truth for vector width,
+/// tails, alignment, step validation, element compatibility, and contiguous
+/// access. This adapter constructs a conservative one-dimensional surrogate for
+/// the selected axis, then refines only whether a separate runtime bounds check
+/// is required. A loop whose dynamic extent is exactly the same symbol as the
+/// buffer axis extent is already bounded by construction when it starts at 0.
 pub fn plan_vector_view(
-    _view: &BufferView,
-    _axis: usize,
-    _iteration: IterationSpace,
-    _vector: VectorType,
+    view: &BufferView,
+    axis: usize,
+    iteration: IterationSpace,
+    vector: VectorType,
 ) -> Result<VectorLoopPlan, ComputeViewPlanError> {
-    Err(ComputeViewPlanError::NotImplemented)
+    if axis >= view.rank() {
+        return Err(ComputeViewPlanError::AxisOutOfBounds {
+            axis,
+            rank: view.rank(),
+        });
+    }
+
+    let view_extent = view.shape()[axis];
+    let surrogate_extent = match view_extent {
+        ShapeExtent::Static(extent) => extent,
+        ShapeExtent::Dynamic(_) => match iteration.extent {
+            LoopExtent::Static(_) if iteration.step == 1 && iteration.start >= 0 => iteration
+                .end_exclusive()
+                .map_err(ComputePlannerError::from)?
+                .expect("static iteration spaces have a concrete end")
+                as u64,
+            _ => 1,
+        },
+    };
+
+    let surrogate = Layout::from_parts(
+        view.element(),
+        vec![surrogate_extent],
+        vec![view.strides()[axis]],
+        view.alignment(),
+    )?;
+    let mut plan = plan_vector_loop(&surrogate, 0, iteration, vector)?;
+    plan.axis = axis;
+
+    plan.requires_runtime_bounds_check = match (view_extent, iteration.extent) {
+        (ShapeExtent::Static(_), _) => plan.requires_runtime_bounds_check,
+        (ShapeExtent::Dynamic(view_id), LoopExtent::Dynamic(loop_id))
+            if view_id == loop_id && iteration.start == 0 =>
+        {
+            false
+        }
+        (ShapeExtent::Dynamic(_), _) => true,
+    };
+
+    Ok(plan)
 }
 
 #[cfg(test)]
