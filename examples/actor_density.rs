@@ -15,8 +15,11 @@
 
 use nulang::bytecode::CodeModule;
 use nulang::iso_arena::IsoArena;
-use nulang::runtime::{Actor, ActorHeap, FlightRecorder, Mailbox, OrcaGc, Runtime, TraceEntry};
-use nulang::vm::Value;
+use nulang::runtime::{
+    Actor, ActorHeap, FlightRecorder, HibernationState, Mailbox, OrcaGc, Runtime,
+    SuspendedExecution, TraceEntry,
+};
+use nulang::vm::{Value, VM};
 use std::hint::black_box;
 use std::mem::size_of;
 use std::time::Instant;
@@ -37,6 +40,39 @@ fn resident_bytes() -> Option<u64> {
 fn print_layout() {
     println!("actor_struct_bytes={}", size_of::<Actor>());
     println!("code_module_struct_bytes={}", size_of::<CodeModule>());
+    println!(
+        "optional_code_module_inline_bytes={}",
+        size_of::<Option<CodeModule>>()
+    );
+    println!(
+        "optional_code_module_boxed_bytes={}",
+        size_of::<Option<Box<CodeModule>>>()
+    );
+    println!("vm_struct_bytes={}", size_of::<VM>());
+    println!(
+        "suspended_execution_struct_bytes={}",
+        size_of::<SuspendedExecution>()
+    );
+    println!(
+        "optional_suspended_execution_inline_bytes={}",
+        size_of::<Option<SuspendedExecution>>()
+    );
+    println!(
+        "optional_suspended_execution_boxed_bytes={}",
+        size_of::<Option<Box<SuspendedExecution>>>()
+    );
+    println!(
+        "hibernation_state_struct_bytes={}",
+        size_of::<HibernationState>()
+    );
+    println!(
+        "optional_hibernation_state_inline_bytes={}",
+        size_of::<Option<HibernationState>>()
+    );
+    println!(
+        "optional_hibernation_state_boxed_bytes={}",
+        size_of::<Option<Box<HibernationState>>>()
+    );
     println!("iso_arena_struct_bytes={}", size_of::<IsoArena>());
     println!("mailbox_struct_bytes={}", size_of::<Mailbox>());
     println!("actor_heap_struct_bytes={}", size_of::<ActorHeap>());
