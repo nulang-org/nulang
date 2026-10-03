@@ -15,7 +15,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::checkpoint::{self, CheckpointError};
-use super::manifest::{Manifest, ManifestEntry, ManifestError};
+use super::manifest::{
+    Manifest, ManifestEntry, ManifestError, SstableFormat, SstableIntegrity,
+};
 use super::sstable::{self, SstableError};
 use super::sstable_indexed::IndexedSstable;
 use super::tablet::{
@@ -53,6 +55,20 @@ impl WalBackedTablet {
         let manifest = Manifest::load_or_empty(&manifest_path, descriptor.id().get())?;
         let mut sstables = Vec::with_capacity(manifest.entries().len());
         for entry in manifest.entries() {
+            if entry.format != SstableFormat::V1 {
+                return Err(WalBackedError::ManifestSstableMismatch(
+                    entry.file_name.clone(),
+                ));
+            }
+            let expected_checksum = match entry.integrity {
+                SstableIntegrity::WholePayloadBlake3(checksum) => checksum,
+                SstableIntegrity::FooterBlake3(_) => {
+                    return Err(WalBackedError::ManifestSstableMismatch(
+                        entry.file_name.clone(),
+                    ));
+                }
+            };
+
             let path = sstable_dir.join(&entry.file_name);
             let table = IndexedSstable::open(&path)?;
             let metadata = table.metadata();
@@ -63,7 +79,7 @@ impl WalBackedTablet {
                 || metadata.row_count != entry.row_count
                 || metadata.min_key != entry.min_key
                 || metadata.max_key != entry.max_key
-                || metadata.checksum != entry.checksum
+                || metadata.checksum != expected_checksum
                 || metadata.file_name != entry.file_name
             {
                 return Err(WalBackedError::ManifestSstableMismatch(
@@ -194,7 +210,8 @@ impl WalBackedTablet {
             row_count: metadata.row_count,
             min_key: metadata.min_key.clone(),
             max_key: metadata.max_key.clone(),
-            checksum: metadata.checksum,
+            format: SstableFormat::V1,
+            integrity: SstableIntegrity::WholePayloadBlake3(metadata.checksum),
         };
         let inserted = manifest.register(entry)?;
         if inserted {
