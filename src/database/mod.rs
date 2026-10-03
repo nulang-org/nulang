@@ -5,6 +5,7 @@
 //! inner storage and query loops remain ordinary local computation.
 
 pub mod checkpoint;
+pub mod compaction;
 pub mod manifest;
 pub mod owner;
 pub mod sstable;
@@ -21,6 +22,10 @@ mod fallible_read_tests;
 mod interruption;
 #[cfg(test)]
 mod manifest_v2_tests;
+#[cfg(test)]
+mod sstable_compaction_regression_tests;
+#[cfg(test)]
+mod sstable_compaction_tests;
 #[cfg(test)]
 mod sstable_indexed_tests;
 #[cfg(test)]
