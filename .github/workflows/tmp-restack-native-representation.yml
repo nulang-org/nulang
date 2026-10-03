@@ -33,12 +33,38 @@ jobs:
           cargo fmt --all
           git diff --check
       - name: Validate focused representation contract
+        id: validate
+        continue-on-error: true
+        shell: bash
         run: |
-          set -euo pipefail
-          cargo test --locked --no-default-features native_abi::tests -- --test-threads=1
-          cargo check --locked --no-default-features
-          cargo clippy --locked --no-default-features --lib -- -D warnings
+          set +e
+          set -o pipefail
+          cargo test --locked --no-default-features native_abi::tests -- --test-threads=1 2>&1 | tee native-repr-test.log
+          test_status=${PIPESTATUS[0]}
+          cargo check --locked --no-default-features 2>&1 | tee native-repr-check.log
+          check_status=${PIPESTATUS[0]}
+          cargo clippy --locked --no-default-features --lib -- -D warnings 2>&1 | tee native-repr-clippy.log
+          clippy_status=${PIPESTATUS[0]}
+          printf 'test=%s\ncheck=%s\nclippy=%s\n' "$test_status" "$check_status" "$clippy_status" | tee native-repr-status.txt
+          if [ "$test_status" -ne 0 ] || [ "$check_status" -ne 0 ] || [ "$clippy_status" -ne 0 ]; then
+            exit 1
+          fi
+      - name: Upload representation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-representation-diagnostics
+          path: |
+            native-repr-test.log
+            native-repr-check.log
+            native-repr-clippy.log
+            native-repr-status.txt
+          if-no-files-found: error
+      - name: Fail on representation validation
+        if: steps.validate.outcome == 'failure'
+        run: exit 1
       - name: Commit current-main restack
+        if: steps.validate.outcome == 'success'
         run: |
           set -euo pipefail
           rm .github/workflows/tmp-restack-native-representation.yml
