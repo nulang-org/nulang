@@ -1,0 +1,42 @@
+name: Temporary NuDB v2 serving range fix
+
+on:
+  push:
+    branches:
+      - feat/nudb-sstable-v2-serving
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/nudb-sstable-v2-serving
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Apply descriptor-range validation
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src/database/store.rs')
+          text = path.read_text()
+          old = '''                || metadata.tablet_id != descriptor.id().get()\n                || metadata.ownership_epoch > descriptor.ownership_epoch()\n            {'''
+          new = '''                || metadata.tablet_id != descriptor.id().get()\n                || metadata.ownership_epoch > descriptor.ownership_epoch()\n                || !descriptor.range().contains(&metadata.min_key)\n                || !descriptor.range().contains(&metadata.max_key)\n            {'''
+          count = text.count(old)
+          if count != 2:
+              raise SystemExit(f'expected exactly 2 serving validation sites, found {count}')
+          path.write_text(text.replace(old, new))
+          PY
+          cargo fmt --all
+      - name: Commit fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/database/store.rs src/database/sstable_v2_serving_tests.rs
+          git diff --cached --quiet && exit 0
+          git commit -m "fix(database): reject out-of-range serving tables"
+          git push origin HEAD:feat/nudb-sstable-v2-serving
