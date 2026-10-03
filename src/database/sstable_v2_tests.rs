@@ -59,6 +59,75 @@ fn test_v2_footer_metadata_and_point_reads_match_written_rows() {
     let _ = fs::remove_file(path);
 }
 
+#[test]
+fn test_v2_snapshot_rows_reconstruct_complete_mvcc_history() {
+    let path = temp_path("snapshot-rows");
+    let _ = fs::remove_file(&path);
+    let rows = vec![
+        TabletSnapshotRow {
+            key: b"alpha".to_vec(),
+            versions: vec![
+                VersionedValue {
+                    sequence: 1,
+                    value: Some(b"one".to_vec()),
+                },
+                VersionedValue {
+                    sequence: 3,
+                    value: Some(b"three".to_vec()),
+                },
+                VersionedValue {
+                    sequence: 5,
+                    value: None,
+                },
+            ],
+        },
+        TabletSnapshotRow {
+            key: b"beta".to_vec(),
+            versions: vec![
+                VersionedValue {
+                    sequence: 2,
+                    value: Some(b"two".to_vec()),
+                },
+                VersionedValue {
+                    sequence: 4,
+                    value: Some(b"four".to_vec()),
+                },
+            ],
+        },
+    ];
+
+    write_sstable_v2(&path, 42, 7, &rows).unwrap();
+    let table = SstableV2::open(&path).unwrap();
+    assert_eq!(table.snapshot_rows().unwrap(), rows);
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn test_v2_snapshot_rows_validate_every_block_before_checkpoint_use() {
+    let path = temp_path("snapshot-corruption");
+    let _ = fs::remove_file(&path);
+    let rows = many_rows();
+    write_sstable_v2(&path, 42, 7, &rows).unwrap();
+
+    let table = SstableV2::open(&path).unwrap();
+    let last_block = table.block_count_for_test() - 1;
+    let corrupt_range = table.block_payload_range_for_test(last_block).unwrap();
+    drop(table);
+
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[corrupt_range.start] ^= 0x40;
+    fs::write(&path, bytes).unwrap();
+
+    let table = SstableV2::open(&path).unwrap();
+    assert_eq!(
+        table.snapshot_rows().unwrap_err(),
+        SstableV2Error::BlockChecksumMismatch(last_block)
+    );
+
+    let _ = fs::remove_file(path);
+}
+
 #[cfg(unix)]
 #[test]
 fn test_v2_mmap_survives_unlink_and_still_serves_borrowed_values() {
