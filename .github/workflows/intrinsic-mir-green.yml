@@ -1,0 +1,141 @@
+name: Apply MIR intrinsic integration
+
+on:
+  push:
+    paths:
+      - .github/workflows/intrinsic-mir-green.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: codex/mir-inspection-surface
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+      - name: Integrate MIR intrinsics
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, found {count}: {old[:80]!r}")
+              p.write_text(text.replace(old, new, 1))
+
+          # Bytecode codegen: a live nonconstant compiler intrinsic must never
+          # silently become an effect, FFI call, or bogus opcode.
+          replace_once(
+              "src/mir_codegen.rs",
+              "            mir::RValue::StringEq(l, r) => {\n",
+              "            mir::RValue::Intrinsic(intrinsic) => {\n"
+              "                return Err(compile_err(\n"
+              "                    format!(\n"
+              "                        \"compiler intrinsic '{}' is not supported by the bytecode backend\",\n"
+              "                        intrinsic.op.stable_name()\n"
+              "                    ),\n"
+              "                    Span::default(),\n"
+              "                ));\n"
+              "            }\n"
+              "            mir::RValue::StringEq(l, r) => {\n",
+          )
+
+          # Optimizer: fold an intrinsic only when every operand is a known
+          # constant. MirIntrinsic::fold_constants owns Int48 canonicalization.
+          replace_once(
+              "src/mir_codegen.rs",
+              "        RValue::StrConcat(a, b) => match (const_locals.get(&a), const_locals.get(&b)) {\n",
+              "        RValue::Intrinsic(intrinsic) => {\n"
+              "            let constants = intrinsic\n"
+              "                .args\n"
+              "                .iter()\n"
+              "                .map(|arg| const_locals.get(arg).cloned())\n"
+              "                .collect::<Option<Vec<_>>>();\n"
+              "            match constants.and_then(|args| intrinsic.fold_constants(&args)) {\n"
+              "                Some(value) => RValue::Const(value),\n"
+              "                None => RValue::Intrinsic(intrinsic),\n"
+              "            }\n"
+              "        }\n"
+              "        RValue::StrConcat(a, b) => match (const_locals.get(&a), const_locals.get(&b)) {\n",
+          )
+
+          # DCE/read analysis: intrinsics are pure, but their operands are reads.
+          replace_once(
+              "src/mir_codegen.rs",
+              "        RValue::ArrayLit(xs) | RValue::Tuple(xs) => {\n",
+              "        RValue::Intrinsic(intrinsic) => {\n"
+              "            for x in &intrinsic.args {\n"
+              "                out.insert(*x);\n"
+              "            }\n"
+              "        }\n"
+              "        RValue::ArrayLit(xs) | RValue::Tuple(xs) => {\n",
+          )
+          replace_once(
+              "src/mir_codegen.rs",
+              "        StringEq(l, r) => {\n",
+              "        Intrinsic(intrinsic) => {\n"
+              "            for a in &intrinsic.args {\n"
+              "                ro(&mut out, *a);\n"
+              "            }\n"
+              "        }\n"
+              "        StringEq(l, r) => {\n",
+          )
+
+          # Inlining must see and remap every intrinsic operand.
+          replace_once(
+              "src/mir_inline.rs",
+              "        RValue::StringEq(a, b) => *a == local || *b == local,\n",
+              "        RValue::Intrinsic(intrinsic) => intrinsic.args.iter().any(|a| *a == local),\n"
+              "        RValue::StringEq(a, b) => *a == local || *b == local,\n",
+          )
+          replace_once(
+              "src/mir_inline.rs",
+              "        RValue::StringEq(a, b) => RValue::StringEq(remap_local(*a, remap), remap_local(*b, remap)),\n",
+              "        RValue::Intrinsic(intrinsic) => {\n"
+              "            RValue::Intrinsic(crate::compiler_intrinsics::MirIntrinsic {\n"
+              "                op: intrinsic.op,\n"
+              "                args: remap_locals(&intrinsic.args, remap),\n"
+              "            })\n"
+              "        }\n"
+              "        RValue::StringEq(a, b) => RValue::StringEq(remap_local(*a, remap), remap_local(*b, remap)),\n",
+          )
+
+          # MIR lowering's use counts feed capture/rewriting correctness.
+          replace_once(
+              "src/mir_lower.rs",
+              "        Binary(_, l, r) | StringEq(l, r) | StrConcat(l, r) => {\n",
+              "        Intrinsic(intrinsic) => out.extend(intrinsic.args.iter().copied()),\n"
+              "        Binary(_, l, r) | StringEq(l, r) | StrConcat(l, r) => {\n",
+          )
+
+          # Preserve all existing semantic-identity tags; append a new tag 33.
+          replace_once(
+              "src/semantic_identity.rs",
+              "            RValue::StringEq(left, right) => {\n",
+              "            RValue::Intrinsic(intrinsic) => {\n"
+              "                self.byte(33);\n"
+              "                self.string(intrinsic.op.stable_name());\n"
+              "                self.locals(&intrinsic.args, ids);\n"
+              "            }\n"
+              "            RValue::StringEq(left, right) => {\n",
+          )
+      - name: Format
+        run: cargo fmt --all
+      - name: Commit integration
+        run: |
+          git config user.name "chatgpt-codex-connector[bot]"
+          git config user.email "199175422+chatgpt-codex-connector[bot]@users.noreply.github.com"
+          git add src/mir_codegen.rs src/mir_inline.rs src/mir_lower.rs src/semantic_identity.rs tests/compiler_intrinsics_mir.rs
+          git diff --cached --check
+          git commit -m "feat(compiler): integrate intrinsics into MIR optimization"
+          git push origin HEAD:codex/mir-inspection-surface
