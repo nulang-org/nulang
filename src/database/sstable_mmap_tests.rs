@@ -17,7 +17,7 @@ fn temp_path(name: &str) -> PathBuf {
 
 #[cfg(unix)]
 #[test]
-fn indexed_sstable_uses_mmap_backing_without_changing_borrowed_reads() {
+fn test_indexed_sstable_mmap_survives_unlink_and_preserves_borrowed_reads() {
     let path = temp_path("backing");
     let _ = fs::remove_file(&path);
     let rows = vec![TabletSnapshotRow {
@@ -31,6 +31,7 @@ fn indexed_sstable_uses_mmap_backing_without_changing_borrowed_reads() {
 
     let indexed = IndexedSstable::open(&path).unwrap();
     assert!(indexed.is_memory_mapped_for_test());
+    fs::remove_file(&path).unwrap();
     assert_eq!(
         indexed.version_at(b"alpha", 1),
         Some(IndexedVersion {
@@ -38,6 +39,4 @@ fn indexed_sstable_uses_mmap_backing_without_changing_borrowed_reads() {
             value: Some(rows[0].versions[0].value.as_deref().unwrap()),
         })
     );
-
-    let _ = fs::remove_file(path);
 }
