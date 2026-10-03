@@ -50,21 +50,25 @@ jobs:
         env:
           REPEAT: "${{ github.event_name == 'pull_request' && '1' || inputs.repeat || '5' }}"
         run: |
+          set -o pipefail
           cargo run --locked --release \
             --no-default-features \
             --features native-codegen \
             --bin nulang-jit-bench -- \
             --format jsonl --repeat "$REPEAT" | tee jit-codegen-results.jsonl
+          test -s jit-codegen-results.jsonl
 
       - name: Run clean compiler telemetry workloads
         env:
           REPEAT: "${{ github.event_name == 'pull_request' && '1' || inputs.repeat || '5' }}"
         run: |
+          set -o pipefail
           cargo run --locked --release \
             --no-default-features \
             --features native-codegen \
-            --bin nulang-compile-bench -- \
+            --bin nulang_compile_bench -- \
             --format jsonl --repeat "$REPEAT" | tee clean-compile-results.jsonl
+          test -s clean-compile-results.jsonl
 
       - name: Upload JIT telemetry
         uses: actions/upload-artifact@v7
