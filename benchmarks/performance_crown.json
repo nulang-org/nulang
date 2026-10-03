@@ -1,0 +1,119 @@
+{
+  "schema": 1,
+  "purpose": "Coverage contract for evidence needed to evaluate Nulang performance across local, concurrent, distributed, durable, and application workloads. This is not a leaderboard.",
+  "domains": [
+    {
+      "id": "local",
+      "benchmarks": [
+        {
+          "id": "local.hot_loop_jit",
+          "status": "microbenchmark",
+          "metric": "latency_ns",
+          "runner": "benches/jit_bench.rs",
+          "baselines": [],
+          "measurement_mode": "criterion"
+        },
+        {
+          "id": "local.jit_aot_crossover",
+          "status": "microbenchmark",
+          "metric": "speedup_ratio",
+          "runner": "scripts/nulang_ab_bench.py",
+          "baselines": [],
+          "measurement_mode": "same_runner_ab"
+        }
+      ]
+    },
+    {
+      "id": "concurrent",
+      "benchmarks": [
+        {
+          "id": "concurrent.savina_messaging",
+          "status": "comparative",
+          "metric": "messages_per_second",
+          "runner": "scripts/cross_runtime_bench.py",
+          "baselines": ["rust", "go", "erlang"],
+          "measurement_mode": "controlled"
+        },
+        {
+          "id": "concurrent.local_actor_hot_path",
+          "status": "microbenchmark",
+          "metric": "nanoseconds_per_message",
+          "runner": "benches/actor_bench.rs",
+          "baselines": [],
+          "measurement_mode": "criterion"
+        }
+      ]
+    },
+    {
+      "id": "distributed",
+      "benchmarks": [
+        {
+          "id": "distributed.nul0_codec",
+          "status": "microbenchmark",
+          "metric": "latency_ns",
+          "runner": "benches/dist_bench.rs",
+          "baselines": [],
+          "measurement_mode": "criterion"
+        },
+        {
+          "id": "distributed.remote_message_roundtrip",
+          "status": "planned",
+          "metric": "roundtrip_latency_ns",
+          "runner": null,
+          "baselines": ["go", "erlang"],
+          "measurement_mode": "planned"
+        }
+      ]
+    },
+    {
+      "id": "durable",
+      "benchmarks": [
+        {
+          "id": "durable.snapshot_and_journal",
+          "status": "microbenchmark",
+          "metric": "latency_ns",
+          "runner": "benches/persist_bench.rs",
+          "baselines": [],
+          "measurement_mode": "criterion"
+        },
+        {
+          "id": "durable.atomic_transition",
+          "status": "planned",
+          "metric": "transitions_per_second",
+          "runner": null,
+          "baselines": ["temporal", "restatedev"],
+          "measurement_mode": "planned"
+        }
+      ]
+    },
+    {
+      "id": "application",
+      "benchmarks": [
+        {
+          "id": "application.http_service",
+          "status": "planned",
+          "metric": "requests_per_second_p99_latency",
+          "runner": null,
+          "baselines": ["go", "rust"],
+          "measurement_mode": "planned"
+        },
+        {
+          "id": "application.distributed_kv",
+          "status": "planned",
+          "metric": "operations_per_second_p99_latency",
+          "runner": null,
+          "baselines": ["go", "rust"],
+          "measurement_mode": "planned"
+        },
+        {
+          "id": "application.durable_workflow_service",
+          "status": "planned",
+          "metric": "workflow_steps_per_second_p99_latency",
+          "runner": null,
+          "baselines": ["temporal", "restatedev"],
+          "measurement_mode": "planned"
+        }
+      ]
+    }
+  ]
+}
