@@ -17,83 +17,66 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Confirm regressions are RED before the fix
-        shell: bash
-        run: |
-          set +e
-          cargo test --locked --test distributed_runtime_spawn_trait -- --nocapture 2>&1 | tee /tmp/pr1235-red.log
-          status=${PIPESTATUS[0]}
-          set -e
-          if [ "$status" -eq 0 ]; then
-            echo "expected the regression suite to fail before the production fix"
-            exit 1
-          fi
-          grep -Fq "the trait must return the id of a real local actor" /tmp/pr1235-red.log
-          grep -Fq "the trait must preserve the supplied initial state" /tmp/pr1235-red.log
-          grep -Fq "the local trait path must install and execute the requested spawnable behavior" /tmp/pr1235-red.log
+      - name: Confirm validated RED inputs are unchanged
+        run: git diff --exit-code b3f749b4ce92ed9a3e868190ea94c5f76d6bab8e HEAD -- src/runtime/distributed.rs tests/distributed_runtime_spawn_trait.rs
 
-      - name: Apply exact local-spawn fix
+      - name: Apply impl-scoped local-spawn fix
         shell: python
         run: |
           from pathlib import Path
 
           path = Path("src/runtime/distributed.rs")
           source = path.read_text()
-          old = '''    fn spawn_on_node(
-              &mut self,
-              _transport: &mut dyn NetworkTransport,
-              node: NodeId,
-              _behavior_name: &str,
-              _initial_state: Vec<(String, Value)>,
-          ) -> ActorAddress {
-              // The trait method doesn't receive cluster/resolver, so we can
-              // only handle local spawns here. For remote spawns, use the
-              // `spawn_on_node` free function which takes all components.
-              if node == NodeId::LOCAL {
-                  // Local spawn would need the behavior_name and initial_state.
-                  // This is a limitation of the trait API — use the free function.
-                  ActorAddress::local(0)
-              } else {
-                  // Cannot determine if node is local without resolver.
-                  // Return a placeholder; callers should use the free function.
-                  ActorAddress::remote(node, 0)
-              }
-          }
-          '''
-          new = '''    fn spawn_on_node(
-              &mut self,
-              _transport: &mut dyn NetworkTransport,
-              node: NodeId,
-              behavior_name: &str,
-              initial_state: Vec<(String, Value)>,
-          ) -> ActorAddress {
-              // This trait method has enough context for a real local spawn. Remote
-              // spawn still requires the free function's cluster/resolver inputs.
-              if node == NodeId::LOCAL {
-                  let handler = self
-                      .runtime
-                      .spawnable_behaviors
-                      .get(behavior_name)
-                      .copied();
-                  let id = self
-                      .runtime
-                      .spawn_actor(Box::new(move || initial_state));
-                  if let Some(handler) = handler {
-                      if let Some(actor) = self.runtime.actors.get_mut(&id) {
-                          actor.register_behavior(behavior_name.to_string(), handler);
-                      }
-                  }
-                  ActorAddress::local(id)
-              } else {
-                  // Remote failure/placeholder semantics are tracked separately in #1238.
-                  ActorAddress::remote(node, 0)
-              }
-          }
-          '''
-          count = source.count(old)
-          if count != 1:
-              raise SystemExit(f"expected exactly one trait spawn_on_node body, found {count}")
-          path.write_text(source.replace(old, new, 1))
+          impl_marker = "impl<'a> DistributedRuntime for DistributedRuntimeImpl<'a> {"
+          impl_start = source.index(impl_marker)
+          method_start = source.index("    fn spawn_on_node(\n", impl_start)
+          impl_end_marker = "\n}\n\n// ---------------------------------------------------------------------------\n// Free functions"
+          method_end = source.index(impl_end_marker, method_start)
+          old_method = source[method_start:method_end]
+
+          required_old_fragments = (
+              "_behavior_name: &str",
+              "_initial_state: Vec<(String, Value)>",
+              "ActorAddress::local(0)",
+              "ActorAddress::remote(node, 0)",
+          )
+          missing = [fragment for fragment in required_old_fragments if fragment not in old_method]
+          if missing:
+              raise SystemExit(f"unexpected local-spawn method shape; missing {missing!r}")
+
+          new_method = (
+              "    fn spawn_on_node(\n"
+              "        &mut self,\n"
+              "        _transport: &mut dyn NetworkTransport,\n"
+              "        node: NodeId,\n"
+              "        behavior_name: &str,\n"
+              "        initial_state: Vec<(String, Value)>,\n"
+              "    ) -> ActorAddress {\n"
+              "        // This trait method has enough context for a real local spawn. Remote\n"
+              "        // spawn still requires the free function's cluster/resolver inputs.\n"
+              "        if node == NodeId::LOCAL {\n"
+              "            let handler = self\n"
+              "                .runtime\n"
+              "                .spawnable_behaviors\n"
+              "                .get(behavior_name)\n"
+              "                .copied();\n"
+              "            let id = self\n"
+              "                .runtime\n"
+              "                .spawn_actor(Box::new(move || initial_state));\n"
+              "            if let Some(handler) = handler {\n"
+              "                if let Some(actor) = self.runtime.actors.get_mut(&id) {\n"
+              "                    actor.register_behavior(behavior_name.to_string(), handler);\n"
+              "                }\n"
+              "            }\n"
+              "            ActorAddress::local(id)\n"
+              "        } else {\n"
+              "            // Remote failure/placeholder semantics are tracked separately in #1238.\n"
+              "            ActorAddress::remote(node, 0)\n"
+              "        }\n"
+              "    }"
+          )
+
+          path.write_text(source[:method_start] + new_method + source[method_end:])
 
       - name: Focused regressions are GREEN
         run: cargo test --locked --test distributed_runtime_spawn_trait -- --nocapture
