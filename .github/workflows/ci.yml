@@ -397,7 +397,6 @@ jobs:
           # Full history lets the regression checker order those samples by
           # Git commit time instead of unreliable filesystem mtimes.
           fetch-depth: 0
-
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y python3-dev
 
@@ -495,10 +494,12 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Only the canonical Criterion snapshot belongs in rolling history.
-          # Regression manifests and paired A/B reports are diagnostic artifacts,
-          # not collect_bench_results-compatible history inputs.
-          git add "benchmarks/${{ github.sha }}.json"
+          # Stage every canonical Criterion snapshot restored from history plus
+          # the current result. Diagnostic regression/A/B JSON uses non-SHA
+          # filenames and is intentionally excluded.
+          find benchmarks -maxdepth 1 -type f -regextype posix-extended \
+            -regex 'benchmarks/[0-9a-f]{40}\.json' -print0 | \
+            xargs -0 --no-run-if-empty git add --
           git diff --staged --quiet || git commit -m "bench: record results for ${{ github.sha }} [skip ci]"
           git push --force-with-lease origin "HEAD:refs/heads/${BENCH_HISTORY_BRANCH}"
 
