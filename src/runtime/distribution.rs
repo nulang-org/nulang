@@ -17,6 +17,12 @@ use tracing::warn;
 /// `ActorAddress::remote` sends; the reverse index is best-effort on top.
 const REMOTE_REFS_MAX: usize = 10_000;
 
+/// Maximum complete Fabric subscription snapshot accepted by the existing
+/// FAB0 gossip decoder. Keep this independent from the 256-entry membership
+/// gossip budget: Fabric snapshots are authoritative all-or-nothing state and
+/// the wire format already supports a larger compatibility window.
+const FABRIC_GOSSIP_MAX_ENTRIES: usize = 4096;
+
 /// A message sent to a spawn@node placeholder before its SpawnResponse
 /// arrived. The payload is ALREADY in wire form — string ids rewritten to
 /// table indices, contents captured in `string_table` — so the flush on
@@ -331,11 +337,12 @@ pub(crate) fn process_network(rt: &mut Runtime) {
                 rt.fabric_remove_remote_node(NodeId(node.0));
             }
             ClusterAction::SendGossip { targets } => {
-                // Fabric snapshots are authoritative only when complete.
-                // An oversized local routing set therefore omits the Fabric
-                // extension for this round instead of advertising a partial
-                // replacement that would delete live remote routes.
-                let fabric = rt.fabric_advertisements(GOSSIP_PAYLOAD_MAX_ENTRIES).ok();
+                // Fabric snapshots are authoritative only when complete. Keep
+                // their budget independent from compact membership gossip: the
+                // existing FAB0 decoder already accepts 4096 entries, so using
+                // that window removes the historical 256-entry sender cliff
+                // without changing the wire layout seen by older peers.
+                let fabric = rt.fabric_advertisements(FABRIC_GOSSIP_MAX_ENTRIES).ok();
                 if let (Some(transport), Some(cluster)) =
                     (&mut rt.distributed.transport, &rt.distributed.cluster)
                 {
