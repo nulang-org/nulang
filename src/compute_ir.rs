@@ -424,10 +424,7 @@ impl ComputeRegion {
         for op in &self.ops {
             match *op {
                 ComputeOp::ParallelFor { .. } => {}
-                ComputeOp::Tile {
-                    loop_id,
-                    tile_size,
-                } => {
+                ComputeOp::Tile { loop_id, tile_size } => {
                     require_loop(&loops, loop_id)?;
                     if tile_size == 0 {
                         return Err(ComputeIrError::ZeroTileSize(loop_id));
@@ -573,7 +570,10 @@ impl fmt::Display for ComputeIrError {
         match self {
             Self::ZeroVectorWidth => write!(f, "vector width must contain at least one lane"),
             Self::InvalidAlignment(alignment) => {
-                write!(f, "alignment must be a non-zero power of two, got {alignment}")
+                write!(
+                    f,
+                    "alignment must be a non-zero power of two, got {alignment}"
+                )
             }
             Self::LayoutRankMismatch {
                 shape_rank,
@@ -613,7 +613,9 @@ impl fmt::Display for ComputeIrError {
                 f,
                 "{buffer} in {memory:?} memory is not visible to {scope:?} scope"
             ),
-            Self::SelfCopy(buffer) => write!(f, "async copy source and destination are both {buffer}"),
+            Self::SelfCopy(buffer) => {
+                write!(f, "async copy source and destination are both {buffer}")
+            }
             Self::ZeroCopySize => write!(f, "async copy must move at least one byte"),
             Self::CopyOutOfBounds {
                 buffer,
@@ -623,7 +625,9 @@ impl fmt::Display for ComputeIrError {
                 f,
                 "async copy requests {requested} bytes from {buffer}, which has {available} bytes"
             ),
-            Self::LaneBarrier => write!(f, "a lane-scoped barrier cannot synchronize another worker"),
+            Self::LaneBarrier => {
+                write!(f, "a lane-scoped barrier cannot synchronize another worker")
+            }
         }
     }
 }
