@@ -10,6 +10,7 @@
 //! snapshot lifetime depend on one call stack.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Debug, Default)]
@@ -40,6 +41,21 @@ impl SnapshotRegistry {
             sequence,
             active: true,
         }
+    }
+
+    /// Pin a snapshot only when it is not newer than committed tablet state.
+    pub fn pin_at_or_before(
+        &self,
+        requested: u64,
+        committed: u64,
+    ) -> Result<SnapshotPin, SnapshotError> {
+        if requested > committed {
+            return Err(SnapshotError::FutureSnapshot {
+                requested,
+                committed,
+            });
+        }
+        Ok(self.pin(requested))
     }
 
     /// The oldest sequence still needed by any active snapshot reader.
@@ -119,6 +135,27 @@ impl Drop for SnapshotPin {
         self.release_once();
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotError {
+    FutureSnapshot { requested: u64, committed: u64 },
+}
+
+impl fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FutureSnapshot {
+                requested,
+                committed,
+            } => write!(
+                f,
+                "snapshot sequence {requested} is newer than committed sequence {committed}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
 
 fn lock_state(inner: &Mutex<SnapshotState>) -> MutexGuard<'_, SnapshotState> {
     inner

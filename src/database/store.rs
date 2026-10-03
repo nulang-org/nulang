@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use super::checkpoint::{self, CheckpointError};
 use super::manifest::{Manifest, ManifestEntry, ManifestError};
+use super::snapshot::{SnapshotError, SnapshotPin, SnapshotRegistry};
 use super::sstable::{self, SstableError};
 use super::sstable_indexed::IndexedSstable;
 use super::tablet::{
@@ -27,6 +28,7 @@ use super::wal::{FileWal, WalError};
 #[derive(Debug)]
 pub struct WalBackedTablet {
     tablet: MemoryTablet,
+    snapshots: SnapshotRegistry,
     sstables: Vec<IndexedSstable>,
     wal: FileWal,
     checkpoint_path: PathBuf,
@@ -89,6 +91,7 @@ impl WalBackedTablet {
         wal.replay_after_checkpoint(&mut tablet)?;
         Ok(Self {
             tablet,
+            snapshots: SnapshotRegistry::new(),
             sstables,
             wal,
             checkpoint_path,
@@ -103,6 +106,27 @@ impl WalBackedTablet {
 
     pub fn current_sequence(&self) -> u64 {
         self.tablet.current_sequence()
+    }
+
+    /// Pin the current committed sequence for the lifetime of the returned guard.
+    pub fn pin_snapshot(&self) -> SnapshotPin {
+        self.snapshots.pin(self.current_sequence())
+    }
+
+    /// Pin one historical snapshot that is not newer than committed tablet state.
+    pub fn pin_snapshot_at(&self, sequence: u64) -> Result<SnapshotPin, SnapshotError> {
+        self.snapshots
+            .pin_at_or_before(sequence, self.current_sequence())
+    }
+
+    /// Oldest snapshot sequence still held by a live reader.
+    pub fn oldest_live_snapshot(&self) -> Option<u64> {
+        self.snapshots.oldest_live_snapshot()
+    }
+
+    /// Conservative floor future MVCC compaction may use for this tablet.
+    pub fn snapshot_retention_floor(&self) -> u64 {
+        self.snapshots.retention_floor(self.current_sequence())
     }
 
     /// Estimated logical bytes in the active mutable memtable.
