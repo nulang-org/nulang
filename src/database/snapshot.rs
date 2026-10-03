@@ -11,13 +11,16 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 #[derive(Debug, Default)]
 struct SnapshotState {
     counts: BTreeMap<u64, usize>,
     active_count: usize,
 }
+
+type RegistryDirectory = BTreeMap<PathBuf, Weak<Mutex<SnapshotState>>>;
 
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotRegistry {
@@ -27,6 +30,24 @@ pub struct SnapshotRegistry {
 impl SnapshotRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Reuse one process-local registry for all tablet coordinators opening the
+    /// same WAL path. A live pin therefore survives closing and reopening the
+    /// coordinator instead of silently disappearing from the GC floor.
+    pub fn shared_for_storage_path(path: impl AsRef<Path>) -> Self {
+        let key = storage_registry_key(path.as_ref());
+        let directory = registry_directory();
+        let mut entries = lock_directory(directory);
+        entries.retain(|_, weak| weak.strong_count() != 0);
+
+        if let Some(inner) = entries.get(&key).and_then(Weak::upgrade) {
+            return Self { inner };
+        }
+
+        let inner = Arc::new(Mutex::new(SnapshotState::default()));
+        entries.insert(key, Arc::downgrade(&inner));
+        Self { inner }
     }
 
     /// Pin one snapshot sequence until the returned guard is released or dropped.
@@ -156,6 +177,29 @@ impl fmt::Display for SnapshotError {
 }
 
 impl std::error::Error for SnapshotError {}
+
+fn registry_directory() -> &'static Mutex<RegistryDirectory> {
+    static DIRECTORY: OnceLock<Mutex<RegistryDirectory>> = OnceLock::new();
+    DIRECTORY.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn storage_registry_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    })
+}
+
+fn lock_directory(directory: &Mutex<RegistryDirectory>) -> MutexGuard<'_, RegistryDirectory> {
+    directory
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn lock_state(inner: &Mutex<SnapshotState>) -> MutexGuard<'_, SnapshotState> {
     inner
