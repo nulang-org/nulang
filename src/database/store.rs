@@ -14,7 +14,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::checkpoint::{self, CheckpointError};
-use super::tablet::{MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite};
+use super::tablet::{
+    MemoryTablet, MvccGcStats, TabletDescriptor, TabletError, TabletMutation, TabletWrite,
+};
 use super::wal::{FileWal, WalError};
 
 #[derive(Debug)]
@@ -53,6 +55,10 @@ impl WalBackedTablet {
         self.tablet.current_sequence()
     }
 
+    pub fn oldest_readable_sequence(&self) -> u64 {
+        self.tablet.oldest_readable_sequence()
+    }
+
     pub fn prepare_write(
         &self,
         presented_epoch: u64,
@@ -76,6 +82,15 @@ impl WalBackedTablet {
 
     pub fn read_latest(&self, key: &[u8]) -> Option<&[u8]> {
         self.tablet.read_latest(key)
+    }
+
+    /// Reclaim obsolete in-memory MVCC versions.
+    ///
+    /// The resulting retention floor becomes crash-durable when a subsequent
+    /// checkpoint is published. Until then, WAL recovery may conservatively
+    /// reconstruct older history after a restart.
+    pub fn collect_garbage(&mut self, safe_point: u64) -> Result<MvccGcStats, TabletError> {
+        self.tablet.collect_garbage(safe_point)
     }
 
     /// Atomically publish a checkpoint without reclaiming the WAL.
