@@ -47,12 +47,18 @@ fn wal_backed_commit_survives_restart_and_rebuilds_mvcc() {
         tablet.commit(write).unwrap();
 
         assert_eq!(tablet.current_sequence(), 1);
-        assert_eq!(tablet.read_latest(b"k"), Some(&b"value"[..]));
+        assert_eq!(
+            tablet.read_latest(b"k").unwrap().as_deref(),
+            Some(&b"value"[..])
+        );
     }
 
     let tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert_eq!(tablet.current_sequence(), 1);
-    assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"value"[..]));
+    assert_eq!(
+        tablet.read_at(b"k", 1).unwrap().as_deref(),
+        Some(&b"value"[..])
+    );
 
     let _ = fs::remove_file(path);
 }
