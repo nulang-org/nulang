@@ -52,7 +52,9 @@ jobs:
           cargo test --locked --no-default-features --test nudb_sstable_block_cache
           cargo test --locked --no-default-features --test nudb_l0_compaction
       - name: Storage interruption matrix
-        run: cargo test --locked --no-default-features --lib database::interruption::tests
+        run: |
+          cargo test --locked --no-default-features --lib database::interruption::tests
+          cargo test --locked --no-default-features --lib database::compaction_tests
       - name: Existing NulangDB storage contracts
         run: |
           cargo test --locked --no-default-features --test tablet_foundation
