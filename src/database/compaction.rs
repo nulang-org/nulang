@@ -1,12 +1,12 @@
-//! Offline SSTable compaction for NuDB tablets.
+//! Offline SSTable compaction and reclamation for NuDB tablets.
 //!
-//! This module deliberately starts with an offline authority transition. Callers
-//! must quiesce the tablet before invoking compaction so no writer can publish a
-//! competing manifest while the replacement is being built. The compactor keeps
-//! every MVCC version and tombstone; snapshot-aware garbage collection is a later
-//! policy layer.
+//! These maintenance primitives deliberately start with an offline authority
+//! transition. Callers must quiesce the tablet before invoking them so no writer
+//! can publish a competing manifest while compaction or cleanup is in progress.
+//! Compaction keeps every MVCC version and tombstone; snapshot-aware garbage
+//! collection is a later policy layer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -168,6 +168,61 @@ pub fn compact_tablet_sstables_to_v2(
     Ok(true)
 }
 
+/// Remove regular `*.sst` files that are not referenced by the durable manifest.
+///
+/// The manifest is fully loaded and validated before directory scanning starts,
+/// so a corrupt authority file cannot cause cleanup to guess which SSTables are
+/// live. The SSTable directory is tablet-specific; non-SST files and directories
+/// are ignored. Unlike compaction's post-publication best-effort cleanup, this
+/// explicit maintenance operation reports I/O failures to its caller.
+///
+/// This operation is also offline. Running it concurrently with a flush can race
+/// a newly durable SSTable before its manifest publication.
+pub fn reclaim_orphan_sstables(
+    descriptor: &TabletDescriptor,
+    wal_path: impl AsRef<Path>,
+) -> Result<usize, CompactionError> {
+    let wal_path = wal_path.as_ref();
+    let manifest_path = wal_path.with_extension("manifest");
+    let sstable_dir = wal_path.with_extension("sstables");
+
+    // Fail closed on manifest corruption before touching the directory.
+    let manifest = Manifest::load_or_empty(&manifest_path, descriptor.id().get())?;
+    let live: BTreeSet<&str> = manifest
+        .entries()
+        .iter()
+        .map(|entry| entry.file_name.as_str())
+        .collect();
+
+    let directory = match fs::read_dir(&sstable_dir) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+
+    let mut removed = 0_usize;
+    for entry in directory {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if live.contains(file_name) || !file_name.ends_with(".sst") {
+            continue;
+        }
+        fs::remove_file(entry.path())?;
+        removed += 1;
+    }
+
+    if removed != 0 {
+        sync_directory(&sstable_dir)?;
+    }
+    Ok(removed)
+}
+
 fn load_manifest_rows(
     entry: &ManifestEntry,
     sstable_dir: &Path,
@@ -281,6 +336,10 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactionError {
+    Io {
+        kind: io::ErrorKind,
+        message: String,
+    },
     Manifest(ManifestError),
     Sstable(SstableError),
     SstableV2(String),
@@ -295,6 +354,15 @@ pub enum CompactionError {
 impl CompactionError {
     fn from_v2(error: SstableV2Error) -> Self {
         Self::SstableV2(error.to_string())
+    }
+}
+
+impl From<io::Error> for CompactionError {
+    fn from(error: io::Error) -> Self {
+        Self::Io {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
     }
 }
 
@@ -313,6 +381,9 @@ impl From<SstableError> for CompactionError {
 impl fmt::Display for CompactionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Io { kind, message } => {
+                write!(f, "NuDB compaction I/O failure ({kind:?}): {message}")
+            }
             Self::Manifest(error) => write!(f, "NuDB compaction manifest failure: {error}"),
             Self::Sstable(error) => write!(f, "NuDB compaction SSTable v1 failure: {error}"),
             Self::SstableV2(error) => write!(f, "NuDB compaction SSTable v2 failure: {error}"),
