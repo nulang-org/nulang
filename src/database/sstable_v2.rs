@@ -1,21 +1,23 @@
 //! NuDB SSTable v2 codec with independently checksummed data blocks.
 //!
 //! V2 is intentionally separate from the serving path while its format contract
-//! stabilizes. Opening a table reads and validates only the fixed header, trailer,
-//! and checksummed footer/index. Data blocks are read and checksummed lazily on
-//! point lookup, so corruption in an untouched block does not force a full-table
-//! scan at open.
+//! stabilizes. Opening a table validates only the fixed header, trailer, and
+//! checksummed footer/index. On Unix the immutable file is memory mapped, so data
+//! pages remain demand-paged; point lookup validates only the candidate block and
+//! returns values borrowed directly from the immutable backing.
 
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
 #[cfg(not(unix))]
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Seek;
+use std::io::{self, Read, Write};
 use std::ops::Range;
 #[cfg(unix)]
-use std::os::unix::fs::FileExt;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::{ptr, slice};
 
 use super::tablet::{TabletSnapshotRow, VersionedValue};
 
@@ -52,10 +54,10 @@ pub(crate) struct SstableV2Metadata {
     pub(crate) file_name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OwnedVersion {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SstableV2Version<'a> {
     pub(crate) sequence: u64,
-    pub(crate) value: Option<Vec<u8>>,
+    pub(crate) value: Option<&'a [u8]>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,8 +79,116 @@ struct SequenceRun {
 }
 
 #[derive(Debug)]
+enum SstableBacking {
+    #[cfg(unix)]
+    Mapped(ReadOnlyMmap),
+    #[cfg(not(unix))]
+    Owned(Vec<u8>),
+}
+
+impl SstableBacking {
+    fn open(file: &mut File, len: usize) -> Result<Self, SstableV2Error> {
+        #[cfg(unix)]
+        {
+            Ok(Self::Mapped(ReadOnlyMmap::map(file, len)?))
+        }
+
+        #[cfg(not(unix))]
+        {
+            file.rewind()?;
+            let mut bytes = vec![0_u8; len];
+            file.read_exact(&mut bytes)?;
+            let mut trailing = [0_u8; 1];
+            if file.read(&mut trailing)? != 0 {
+                return Err(SstableV2Error::InvalidLength);
+            }
+            Ok(Self::Owned(bytes))
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            #[cfg(unix)]
+            Self::Mapped(mapped) => mapped.as_slice(),
+            #[cfg(not(unix))]
+            Self::Owned(bytes) => bytes,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_memory_mapped(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self, Self::Mapped(_))
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct ReadOnlyMmap {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+#[cfg(unix)]
+impl ReadOnlyMmap {
+    fn map(file: &File, len: usize) -> io::Result<Self> {
+        if len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot mmap an empty NuDB SSTable v2",
+            ));
+        }
+
+        // SAFETY: the mapping is read-only/private, the descriptor is valid for
+        // this call, and `ReadOnlyMmap` owns the mapping until `Drop`. Published
+        // NuDB SSTables are immutable and are never truncated or mutated in place.
+        let ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { ptr, len })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr..ptr+len` is the live read-only mapping created above,
+        // and the returned slice cannot outlive `self`.
+        unsafe { slice::from_raw_parts(self.ptr.cast::<u8>(), self.len) }
+    }
+}
+
+// SAFETY: the mapping is immutable for its entire lifetime. Sharing or moving
+// the descriptor only shares read-only bytes; unmapping happens once in Drop.
+#[cfg(unix)]
+unsafe impl Send for ReadOnlyMmap {}
+#[cfg(unix)]
+unsafe impl Sync for ReadOnlyMmap {}
+
+#[cfg(unix)]
+impl Drop for ReadOnlyMmap {
+    fn drop(&mut self) {
+        // SAFETY: this exact mapping was created by `mmap` and is released once.
+        let _ = unsafe { libc::munmap(self.ptr, self.len) };
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct SstableV2 {
-    file: File,
+    backing: SstableBacking,
     metadata: SstableV2Metadata,
     blocks: Vec<BlockIndex>,
     sequence_runs: Vec<SequenceRun>,
@@ -88,32 +198,34 @@ pub(crate) struct SstableV2 {
 
 impl SstableV2 {
     pub(crate) fn open(path: &Path) -> Result<Self, SstableV2Error> {
-        let file = File::open(path)?;
-        let file_len = file.metadata()?.len();
-        if file_len > MAX_FILE_BYTES as u64 {
+        let mut file = File::open(path)?;
+        let file_len_u64 = file.metadata()?.len();
+        if file_len_u64 > MAX_FILE_BYTES as u64 {
             return Err(SstableV2Error::TooLarge(
-                usize::try_from(file_len).unwrap_or(usize::MAX),
+                usize::try_from(file_len_u64).unwrap_or(usize::MAX),
             ));
         }
-        if file_len < (HEADER_BYTES + TRAILER_BYTES) as u64 {
+        let file_len =
+            usize::try_from(file_len_u64).map_err(|_| SstableV2Error::TooLarge(usize::MAX))?;
+        if file_len < HEADER_BYTES + TRAILER_BYTES {
             return Err(SstableV2Error::InvalidLength);
         }
 
-        let mut header = [0_u8; HEADER_BYTES];
-        read_exact_at(&file, 0, &mut header)?;
-        if &header[..8] != SSTABLE_MAGIC {
+        let backing = SstableBacking::open(&mut file, file_len)?;
+        let bytes = backing.as_slice();
+
+        if &bytes[..8] != SSTABLE_MAGIC {
             return Err(SstableV2Error::InvalidHeader);
         }
-        let version = u16::from_le_bytes(header[8..10].try_into().unwrap());
+        let version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
         if version != SSTABLE_VERSION {
             return Err(SstableV2Error::UnsupportedVersion(version));
         }
 
         let trailer_offset = file_len
-            .checked_sub(TRAILER_BYTES as u64)
+            .checked_sub(TRAILER_BYTES)
             .ok_or(SstableV2Error::InvalidLength)?;
-        let mut trailer = [0_u8; TRAILER_BYTES];
-        read_exact_at(&file, trailer_offset, &mut trailer)?;
+        let trailer = &bytes[trailer_offset..file_len];
         if &trailer[36..44] != TRAILER_MAGIC {
             return Err(SstableV2Error::InvalidFooter);
         }
@@ -122,21 +234,22 @@ impl SstableV2 {
             return Err(SstableV2Error::InvalidFooter);
         }
         let footer_start = trailer_offset
-            .checked_sub(footer_len as u64)
+            .checked_sub(footer_len)
             .ok_or(SstableV2Error::InvalidLength)?;
-        if footer_start < HEADER_BYTES as u64 {
+        if footer_start < HEADER_BYTES {
             return Err(SstableV2Error::InvalidLength);
         }
 
-        let mut footer = vec![0_u8; footer_len];
-        read_exact_at(&file, footer_start, &mut footer)?;
+        let footer = &bytes[footer_start..trailer_offset];
         let mut expected_footer_checksum = [0_u8; 32];
         expected_footer_checksum.copy_from_slice(&trailer[4..36]);
-        if expected_footer_checksum != *blake3::hash(&footer).as_bytes() {
+        if expected_footer_checksum != *blake3::hash(footer).as_bytes() {
             return Err(SstableV2Error::FooterChecksumMismatch);
         }
 
-        let decoded = decode_footer(&footer, footer_start)?;
+        let footer_start_u64 =
+            u64::try_from(footer_start).map_err(|_| SstableV2Error::InvalidLength)?;
+        let decoded = decode_footer(footer, footer_start_u64)?;
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -146,7 +259,7 @@ impl SstableV2 {
             .map_err(|_| SstableV2Error::TooManyBlocks(decoded.blocks.len()))?;
 
         Ok(Self {
-            file,
+            backing,
             metadata: SstableV2Metadata {
                 tablet_id: decoded.tablet_id,
                 ownership_epoch: decoded.ownership_epoch,
@@ -161,7 +274,7 @@ impl SstableV2 {
             },
             blocks: decoded.blocks,
             sequence_runs: decoded.sequence_runs,
-            footer_start,
+            footer_start: footer_start_u64,
             footer_len,
         })
     }
@@ -174,7 +287,7 @@ impl SstableV2 {
         &self,
         key: &[u8],
         snapshot: u64,
-    ) -> Result<Option<OwnedVersion>, SstableV2Error> {
+    ) -> Result<Option<SstableV2Version<'_>>, SstableV2Error> {
         if snapshot < self.metadata.min_sequence
             || key < self.metadata.min_key.as_slice()
             || key > self.metadata.max_key.as_slice()
@@ -193,24 +306,36 @@ impl SstableV2 {
             return Ok(None);
         }
 
-        let mut framed_len = [0_u8; 4];
-        let frame_offset = block
+        let frame_offset_u64 = block
             .payload_offset
             .checked_sub(4)
             .ok_or(SstableV2Error::InvalidBlock(block_index))?;
-        read_exact_at(&self.file, frame_offset, &mut framed_len)?;
-        if u32::from_le_bytes(framed_len) != block.payload_len {
+        let frame_offset = usize::try_from(frame_offset_u64)
+            .map_err(|_| SstableV2Error::InvalidBlock(block_index))?;
+        let frame_end = frame_offset
+            .checked_add(4)
+            .ok_or(SstableV2Error::InvalidBlock(block_index))?;
+        let payload_start = usize::try_from(block.payload_offset)
+            .map_err(|_| SstableV2Error::InvalidBlock(block_index))?;
+        let payload_end = payload_start
+            .checked_add(block.payload_len as usize)
+            .ok_or(SstableV2Error::InvalidBlock(block_index))?;
+        let bytes = self.backing.as_slice();
+        let framed_len = bytes
+            .get(frame_offset..frame_end)
+            .ok_or(SstableV2Error::InvalidBlock(block_index))?;
+        if u32::from_le_bytes(framed_len.try_into().unwrap()) != block.payload_len {
             return Err(SstableV2Error::InvalidBlock(block_index));
         }
 
-        let payload_len = block.payload_len as usize;
-        let mut payload = vec![0_u8; payload_len];
-        read_exact_at(&self.file, block.payload_offset, &mut payload)?;
-        if block.checksum != *blake3::hash(&payload).as_bytes() {
+        let payload = bytes
+            .get(payload_start..payload_end)
+            .ok_or(SstableV2Error::InvalidBlock(block_index))?;
+        if block.checksum != *blake3::hash(payload).as_bytes() {
             return Err(SstableV2Error::BlockChecksumMismatch(block_index));
         }
 
-        decode_block_lookup(&payload, block, block_index, key, snapshot)
+        decode_block_lookup(payload, block, block_index, key, snapshot)
     }
 
     pub(crate) fn has_contiguous_sequence_coverage_after(&self, floor: u64) -> bool {
@@ -241,6 +366,11 @@ impl SstableV2 {
     pub(crate) fn footer_range_for_test(&self) -> Range<usize> {
         let start = self.footer_start as usize;
         start..start + self.footer_len
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_memory_mapped_for_test(&self) -> bool {
+        self.backing.is_memory_mapped()
     }
 }
 
@@ -617,37 +747,34 @@ fn decode_footer(footer: &[u8], footer_start: u64) -> Result<DecodedFooter, Ssta
     })
 }
 
-fn decode_block_lookup(
-    payload: &[u8],
+fn decode_block_lookup<'a>(
+    payload: &'a [u8],
     block: &BlockIndex,
     block_index: usize,
     key: &[u8],
     snapshot: u64,
-) -> Result<Option<OwnedVersion>, SstableV2Error> {
+) -> Result<Option<SstableV2Version<'a>>, SstableV2Error> {
     let mut cursor = Cursor::new(payload);
-    let mut previous_key: Option<Vec<u8>> = None;
-    let mut first_key = Vec::new();
-    let mut last_key = Vec::new();
+    let mut previous_key: Option<&[u8]> = None;
+    let mut first_key: Option<&[u8]> = None;
+    let mut last_key: Option<&[u8]> = None;
     let mut min_sequence = u64::MAX;
     let mut max_sequence = 0_u64;
     let mut result = None;
 
     for row_index in 0..block.row_count {
-        let row_key = cursor.bytes(MAX_KEY_BYTES)?;
+        let row_key = cursor.borrowed_bytes(MAX_KEY_BYTES)?;
         if row_key.is_empty() {
             return Err(SstableV2Error::InvalidBlock(block_index));
         }
-        if previous_key
-            .as_ref()
-            .is_some_and(|previous| previous.as_slice() >= row_key.as_slice())
-        {
+        if previous_key.is_some_and(|previous| previous >= row_key) {
             return Err(SstableV2Error::InvalidBlock(block_index));
         }
         if row_index == 0 {
-            first_key = row_key.clone();
+            first_key = Some(row_key);
         }
-        last_key.clone_from(&row_key);
-        previous_key = Some(row_key.clone());
+        last_key = Some(row_key);
+        previous_key = Some(row_key);
 
         let version_count = cursor.u32()? as usize;
         if version_count == 0 || version_count > MAX_VERSIONS_PER_ROW {
@@ -666,21 +793,21 @@ fn decode_block_lookup(
             previous_sequence = version.sequence;
             min_sequence = min_sequence.min(version.sequence);
             max_sequence = max_sequence.max(version.sequence);
-            if row_key.as_slice() == key && version.sequence <= snapshot {
-                visible = Some(OwnedVersion {
+            if row_key == key && version.sequence <= snapshot {
+                visible = Some(SstableV2Version {
                     sequence: version.sequence,
-                    value: version.value.map(ToOwned::to_owned),
+                    value: version.value,
                 });
             }
         }
-        if row_key.as_slice() == key {
+        if row_key == key {
             result = visible;
         }
     }
 
     if cursor.remaining() != 0
-        || first_key != block.first_key
-        || last_key != block.last_key
+        || first_key != Some(block.first_key.as_slice())
+        || last_key != Some(block.last_key.as_slice())
         || min_sequence != block.min_sequence
         || max_sequence != block.max_sequence
     {
@@ -841,36 +968,17 @@ impl<'a> Cursor<'a> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
 
-    fn bytes(&mut self, max: usize) -> Result<Vec<u8>, SstableV2Error> {
+    fn borrowed_bytes(&mut self, max: usize) -> Result<&'a [u8], SstableV2Error> {
         let len = self.u32()? as usize;
         if len > max || len > self.remaining() {
             return Err(SstableV2Error::InvalidLength);
         }
-        Ok(self.take(len)?.to_vec())
+        self.take(len)
     }
-}
 
-#[cfg(unix)]
-fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-    let mut filled = 0_usize;
-    while filled < buf.len() {
-        let read = file.read_at(&mut buf[filled..], offset + filled as u64)?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "short NuDB SSTable v2 read",
-            ));
-        }
-        filled += read;
+    fn bytes(&mut self, max: usize) -> Result<Vec<u8>, SstableV2Error> {
+        Ok(self.borrowed_bytes(max)?.to_vec())
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-    let mut clone = file.try_clone()?;
-    clone.seek(SeekFrom::Start(offset))?;
-    clone.read_exact(buf)
 }
 
 fn appended_path(path: &Path, suffix: &str) -> PathBuf {
