@@ -5,6 +5,7 @@
 //! a function must retain a boxed ABI/body. Backends may become more capable
 //! over time without changing this semantic boundary contract.
 
+use crate::ast::BinOp;
 use crate::mir;
 use crate::native_abi::{NativeBoundary, NativeValueRepr};
 
@@ -14,6 +15,7 @@ use crate::native_abi::{NativeBoundary, NativeValueRepr};
 pub enum NativePlanConstraint {
     RuntimeBoundary(NativeBoundary),
     TaggedHeapValue,
+    TaggedRuntimeValue,
     CapturedClosure,
     DynamicCall,
     CrossFunctionCall,
@@ -33,21 +35,191 @@ pub struct NativeFunctionPlan {
 impl NativeFunctionPlan {
     /// Build a conservative representation plan from typed MIR.
     ///
-    /// RED phase: the real analysis is implemented in the following commit.
+    /// The plan distinguishes *representation knowledge* from *backend
+    /// eligibility*. A Float local is recorded as `F64` even though today's
+    /// AOT whole-function fast path only accepts raw Int parameters/results.
+    /// Runtime boundaries and operations that can materialize tagged/nil/heap
+    /// values are recorded as constraints instead of erasing type knowledge.
     pub fn for_function(func: &mir::Function) -> Self {
+        let locals: Vec<NativeValueRepr> = func
+            .locals
+            .iter()
+            .map(|local| NativeBoundary::Internal.representation_for(&local.ty))
+            .collect();
+
+        let repr_for_local = |id: mir::LocalId| {
+            locals
+                .get(id.0 as usize)
+                .copied()
+                .unwrap_or(NativeValueRepr::Tagged)
+        };
+
+        let params = func
+            .params
+            .iter()
+            .copied()
+            .map(repr_for_local)
+            .collect();
+        let captures = func
+            .captures
+            .iter()
+            .copied()
+            .map(repr_for_local)
+            .collect();
+        let ret = func
+            .ret
+            .as_ref()
+            .map(|ty| NativeBoundary::Internal.representation_for(ty));
+
+        let mut constraints = Vec::new();
+        let mut push_constraint = |constraint: NativePlanConstraint| {
+            if !constraints.contains(&constraint) {
+                constraints.push(constraint);
+            }
+        };
+
+        if !func.captures.is_empty() {
+            push_constraint(NativePlanConstraint::CapturedClosure);
+        }
+
+        // Calls through locals created by an uncaptured closure are statically
+        // targetable, but still cross a function ABI. The module-level planner
+        // must prove the callee uses the same raw ABI before that call can be
+        // admitted to an unboxed caller.
+        let mut direct_closure_locals = std::collections::HashSet::new();
+        for block in &func.blocks {
+            for stmt in &block.stmts {
+                if let mir::Stmt::Assign {
+                    dst,
+                    op: mir::RValue::Closure { captures, .. },
+                } = stmt
+                {
+                    if captures.is_empty() {
+                        direct_closure_locals.insert(*dst);
+                    } else {
+                        push_constraint(NativePlanConstraint::CapturedClosure);
+                    }
+                }
+            }
+        }
+
+        for block in &func.blocks {
+            for stmt in &block.stmts {
+                match stmt {
+                    mir::Stmt::Assign { op, .. } => match op {
+                        mir::RValue::Binary(BinOp::Div | BinOp::Mod | BinOp::Pow, ..) => {
+                            push_constraint(NativePlanConstraint::NullableArithmetic);
+                        }
+                        mir::RValue::ArrayLit(_)
+                        | mir::RValue::ArrayLoad { .. }
+                        | mir::RValue::ArrayLen(_)
+                        | mir::RValue::Record(_)
+                        | mir::RValue::Tuple(_)
+                        | mir::RValue::RecordUpdate { .. }
+                        | mir::RValue::LoadFieldNamed { .. }
+                        | mir::RValue::LoadFieldPos { .. } => {
+                            push_constraint(NativePlanConstraint::TaggedHeapValue);
+                        }
+                        mir::RValue::FFICall { .. } => {
+                            push_constraint(NativePlanConstraint::RuntimeBoundary(
+                                NativeBoundary::Ffi,
+                            ));
+                        }
+                        mir::RValue::Perform { .. } | mir::RValue::PerformAsync { .. } => {
+                            push_constraint(NativePlanConstraint::RuntimeBoundary(
+                                NativeBoundary::EffectRuntime,
+                            ));
+                        }
+                        mir::RValue::SignalWait { .. } => {
+                            push_constraint(NativePlanConstraint::RuntimeBoundary(
+                                NativeBoundary::DurableRuntime,
+                            ));
+                        }
+                        mir::RValue::Spawn { .. }
+                        | mir::RValue::Send { .. }
+                        | mir::RValue::Ask { .. }
+                        | mir::RValue::Receive
+                        | mir::RValue::ReceiveMatch { .. }
+                        | mir::RValue::ReceiveWait { .. }
+                        | mir::RValue::ReceiveCommit
+                        | mir::RValue::Migrate { .. }
+                        | mir::RValue::SelfRef
+                        | mir::RValue::StateGet { .. } => {
+                            push_constraint(NativePlanConstraint::RuntimeBoundary(
+                                NativeBoundary::ActorRuntime,
+                            ));
+                        }
+                        mir::RValue::Resume(_) => {
+                            push_constraint(NativePlanConstraint::RuntimeBoundary(
+                                NativeBoundary::EffectRuntime,
+                            ));
+                        }
+                        mir::RValue::CapabilityCheck { .. } => {
+                            push_constraint(NativePlanConstraint::TaggedRuntimeValue);
+                        }
+                        mir::RValue::Closure { captures, .. } if !captures.is_empty() => {
+                            push_constraint(NativePlanConstraint::CapturedClosure);
+                        }
+                        mir::RValue::Call { func: target, .. } => {
+                            push_constraint(NativePlanConstraint::CrossFunctionCall);
+                            if let mir::FuncRef::Local(local) = target {
+                                if !direct_closure_locals.contains(local) {
+                                    push_constraint(NativePlanConstraint::DynamicCall);
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    mir::Stmt::StoreFieldNamed { .. } | mir::Stmt::ArrayStore { .. } => {
+                        push_constraint(NativePlanConstraint::TaggedHeapValue);
+                    }
+                    mir::Stmt::EnterHandle { .. } | mir::Stmt::PopHandler => {
+                        push_constraint(NativePlanConstraint::RuntimeBoundary(
+                            NativeBoundary::EffectRuntime,
+                        ));
+                    }
+                    mir::Stmt::Emit { .. } => {
+                        push_constraint(NativePlanConstraint::RuntimeBoundary(
+                            NativeBoundary::DurableRuntime,
+                        ));
+                    }
+                    mir::Stmt::StateSet { .. } => {
+                        push_constraint(NativePlanConstraint::RuntimeBoundary(
+                            NativeBoundary::ActorRuntime,
+                        ));
+                    }
+                    mir::Stmt::ParallelMarker { .. } => {}
+                }
+            }
+
+            if matches!(block.terminator, mir::Terminator::Resume(_)) {
+                push_constraint(NativePlanConstraint::RuntimeBoundary(
+                    NativeBoundary::EffectRuntime,
+                ));
+            }
+        }
+
         Self {
-            params: vec![NativeValueRepr::Tagged; func.params.len()],
-            captures: vec![NativeValueRepr::Tagged; func.captures.len()],
-            locals: vec![NativeValueRepr::Tagged; func.locals.len()],
-            ret: func.ret.as_ref().map(|_| NativeValueRepr::Tagged),
-            constraints: vec![NativePlanConstraint::TaggedHeapValue],
+            params,
+            captures,
+            locals,
+            ret,
+            constraints,
         }
     }
 
     /// Whether today's AOT integer fast path can safely use raw i64 arguments
-    /// and results for this function.
+    /// and results for this function in isolation.
+    ///
+    /// A module-level ABI planner must additionally prove every call edge is
+    /// raw-compatible before removing `CrossFunctionCall`; until then direct
+    /// inter-function calls stay boxed rather than passing raw integers into a
+    /// tagged callee by accident.
     pub fn supports_unboxed_int_path(&self) -> bool {
-        false
+        self.constraints.is_empty()
+            && self.captures.is_empty()
+            && self.params.iter().all(|repr| *repr == NativeValueRepr::I64)
+            && matches!(self.ret, None | Some(NativeValueRepr::I64))
     }
 }
 
