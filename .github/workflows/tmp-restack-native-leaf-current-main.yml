@@ -1,0 +1,140 @@
+name: Restack native leaf fast path on current main
+
+on:
+  push:
+    branches:
+      - perf/jit-native-leaf-current-main-20261003-v2
+    paths:
+      - .github/workflows/tmp-restack-native-leaf-current-main.yml
+
+permissions:
+  contents: write
+
+jobs:
+  restack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: perf/jit-native-leaf-current-main-20261003-v2
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt,clippy
+
+      - name: Port native-leaf source delta from reviewed branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin perf/jit-native-leaf-fast-path --no-tags
+          git diff 1ff51aaa81aabc04c564a966540c571c8aa91678 d6f068bd93f286bb2548b39cf82369eac7ba2f45 -- \
+            src/jit/mod.rs src/jit/region_planner.rs src/jit/runtime.rs src/jit/tests.rs \
+            > /tmp/native-leaf.patch
+          test -s /tmp/native-leaf.patch
+          git apply --3way /tmp/native-leaf.patch
+          git diff --check
+
+      - name: RED - prove call-free regions still install leaf dispatch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          runtime = Path('src/jit/runtime.rs')
+          text = runtime.read_text(encoding='utf-8')
+          anchor = 'use std::cell::{Cell, UnsafeCell};\n'
+          assert anchor in text
+          text = text.replace(
+              anchor,
+              anchor + '#[cfg(test)]\nuse std::sync::atomic::{AtomicUsize, Ordering};\n',
+              1,
+          )
+          setter = 'pub(crate) fn set_jit_leaf_calls(calls: &[(usize, *const u8, u8, usize)], constants: *const u64) {\n'
+          assert setter in text
+          instrumentation = '''#[cfg(test)]\nstatic JIT_LEAF_TABLE_INSTALLS: AtomicUsize = AtomicUsize::new(0);\n\n#[cfg(test)]\npub(crate) fn reset_jit_leaf_table_installs_for_test() {\n    JIT_LEAF_TABLE_INSTALLS.store(0, Ordering::Relaxed);\n}\n\n#[cfg(test)]\npub(crate) fn jit_leaf_table_installs_for_test() -> usize {\n    JIT_LEAF_TABLE_INSTALLS.load(Ordering::Relaxed)\n}\n\n'''
+          text = text.replace(setter, instrumentation + setter, 1)
+          text = text.replace(
+              setter,
+              setter + '    #[cfg(test)]\n    JIT_LEAF_TABLE_INSTALLS.fetch_add(1, Ordering::Relaxed);\n',
+              1,
+          )
+          runtime.write_text(text, encoding='utf-8')
+
+          tests = Path('src/jit/tests.rs')
+          text = tests.read_text(encoding='utf-8')
+          anchor = 'fn make_jit() -> JitSession {\n'
+          assert anchor in text
+          test = '''extern "C" fn noop_jit_region(_regs: *mut u64, _constants: *const u64) {}\n\n#[test]\nfn call_free_compiled_execution_skips_leaf_table_install() {\n    let mut jit = make_jit();\n    jit.store_compiled(0, 0, noop_jit_region as *const u8, 1);\n    crate::jit::runtime::reset_jit_leaf_table_installs_for_test();\n    let mut regs = [0u64; 256];\n    let action = crate::backends::JitBackend::execute_compiled(\n        &mut jit, 0, 0, &mut regs, &[],\n    );\n    assert_eq!(action, crate::backends::TieredAction::RanJit);\n    assert_eq!(\n        crate::jit::runtime::jit_leaf_table_installs_for_test(),\n        0,\n        "call-free compiled regions must not install or allocate native-leaf dispatch state"\n    );\n}\n\n'''
+          tests.write_text(text.replace(anchor, test + anchor, 1), encoding='utf-8')
+          PY
+          cargo fmt --all
+          set +e
+          cargo test --locked --no-default-features --features native-codegen --lib \
+            jit::tests::call_free_compiled_execution_skips_leaf_table_install -- --exact \
+            > /tmp/red.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/red.log
+          test "$status" -ne 0
+          grep -q 'call-free compiled regions must not install' /tmp/red.log
+
+      - name: GREEN - bypass leaf dispatch on call-free compiled regions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          mod = Path('src/jit/mod.rs')
+          text = mod.read_text(encoding='utf-8')
+          old = '''        let Some(func) = (unsafe { self.get_compiled(module_idx, pc) }) else {\n            return crate::backends::TieredAction::Interpret;\n        };\n        let leaf_calls: Vec<(usize, *const u8, u8, usize)> = self\n'''
+          new = '''        let Some(region) = self.compiled_entry(module_idx, pc) else {\n            return crate::backends::TieredAction::Interpret;\n        };\n        let func: JitFunctionPtr = unsafe { std::mem::transmute(region.ptr) };\n\n        // Regions that cannot re-enter the VM cannot issue direct-call helpers.\n        // Preserve the pre-native-leaf hot path: no map scan, temporary Vec,\n        // or leaf-dispatch TLS install for ordinary compiled execution.\n        if !region.requires_vm_reentry {\n            func(regs.as_mut_ptr(), constants.as_ptr());\n            return crate::backends::TieredAction::RanJit;\n        }\n\n        let leaf_calls: Vec<(usize, *const u8, u8, usize)> = self\n'''
+          assert text.count(old) == 1, 'unexpected execute_compiled shape after source port'
+          mod.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          runtime = Path('src/jit/runtime.rs')
+          text = runtime.read_text(encoding='utf-8')
+          old = 'pub extern "C" fn nulang_jit_direct_call(\n'
+          new = 'pub unsafe extern "C" fn nulang_jit_direct_call(\n'
+          assert text.count(old) == 1
+          runtime.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+          cargo fmt --all
+
+      - name: Validate focused JIT behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          cargo fmt --all -- --check
+          cargo check --locked --no-default-features --features native-codegen
+          cargo test --locked --no-default-features --features native-codegen --lib \
+            jit::tests::call_free_compiled_execution_skips_leaf_table_install -- --exact
+          cargo test --locked --no-default-features --features native-codegen --lib \
+            test_jit_direct_call_compiles_leaf_callee_natively_and_preserves_caller_regs
+          cargo test --locked --no-default-features --features native-codegen --lib \
+            test_jit_direct_call_branchy_leaf_keeps_interpreter_fallback
+
+      - name: Validate full JIT suite
+        run: cargo test --locked --no-default-features --features native-codegen --lib jit::tests -- --test-threads=1
+
+      - name: Validate default-feature Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Commit validated current-main restack
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/tmp-restack-native-leaf-current-main.yml
+          git config user.name "nulang-maintenance"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/jit/mod.rs src/jit/region_planner.rs src/jit/runtime.rs src/jit/tests.rs \
+            .github/workflows/tmp-restack-native-leaf-current-main.yml
+          git diff --cached --check
+          git commit -m "perf(jit): execute simple direct leaf calls natively"
+          git push origin HEAD:perf/jit-native-leaf-current-main-20261003-v2
