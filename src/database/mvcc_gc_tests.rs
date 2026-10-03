@@ -1,7 +1,7 @@
 use super::mvcc_gc::{
-    plan_versions_for_floor, retain_versions_for_floor, MvccRetentionError,
+    plan_rows_for_floor, plan_versions_for_floor, retain_versions_for_floor, MvccRetentionError,
 };
-use super::tablet::VersionedValue;
+use super::tablet::{TabletSnapshotRow, VersionedValue};
 
 fn put(sequence: u64, value: &[u8]) -> VersionedValue {
     VersionedValue {
@@ -14,6 +14,13 @@ fn tombstone(sequence: u64) -> VersionedValue {
     VersionedValue {
         sequence,
         value: None,
+    }
+}
+
+fn row(key: &[u8], versions: Vec<VersionedValue>) -> TabletSnapshotRow {
+    TabletSnapshotRow {
+        key: key.to_vec(),
+        versions,
     }
 }
 
@@ -165,6 +172,58 @@ fn tombstone_barrier_prevents_resurrection_from_stale_lower_authority() {
         visible_across_authorities(plan.retained(), plan.obsolete(), 10),
         None
     );
+}
+
+#[test]
+fn row_plan_prunes_each_key_independently_and_reports_exact_statistics() {
+    let rows = vec![
+        row(
+            b"a",
+            vec![put(1, b"a1"), put(4, b"a4"), tombstone(7), put(10, b"a10")],
+        ),
+        row(b"b", vec![put(2, b"b2"), put(8, b"b8")]),
+        row(b"c", vec![tombstone(3)]),
+    ];
+
+    let plan = plan_rows_for_floor(&rows, 9).unwrap();
+    assert_eq!(
+        plan.rows(),
+        &[
+            row(b"a", vec![tombstone(7), put(10, b"a10")]),
+            row(b"b", vec![put(8, b"b8")]),
+            row(b"c", vec![tombstone(3)]),
+        ]
+    );
+    assert_eq!(plan.stats().row_count(), 3);
+    assert_eq!(plan.stats().versions_before(), 7);
+    assert_eq!(plan.stats().versions_retained(), 4);
+    assert_eq!(plan.stats().versions_obsolete(), 3);
+    assert_eq!(plan.stats().tombstone_barriers(), 2);
+}
+
+#[test]
+fn row_plan_at_floor_zero_is_a_noop_with_zero_obsolete_versions() {
+    let rows = vec![
+        row(b"a", vec![put(1, b"a1"), tombstone(3)]),
+        row(b"b", vec![put(2, b"b2")]),
+    ];
+
+    let plan = plan_rows_for_floor(&rows, 0).unwrap();
+    assert_eq!(plan.rows(), rows.as_slice());
+    assert_eq!(plan.stats().versions_before(), 3);
+    assert_eq!(plan.stats().versions_retained(), 3);
+    assert_eq!(plan.stats().versions_obsolete(), 0);
+}
+
+#[test]
+fn row_plan_accepts_an_empty_row_set_as_an_empty_maintenance_plan() {
+    let plan = plan_rows_for_floor(&[], 5).unwrap();
+    assert!(plan.rows().is_empty());
+    assert_eq!(plan.stats().row_count(), 0);
+    assert_eq!(plan.stats().versions_before(), 0);
+    assert_eq!(plan.stats().versions_retained(), 0);
+    assert_eq!(plan.stats().versions_obsolete(), 0);
+    assert_eq!(plan.stats().tombstone_barriers(), 0);
 }
 
 #[test]
