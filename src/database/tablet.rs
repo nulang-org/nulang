@@ -360,6 +360,7 @@ impl MemoryTablet {
         self.immutables.len()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn install_recovered_sstable_rows(
         &mut self,
         rows: &[TabletSnapshotRow],
@@ -722,7 +723,7 @@ pub enum TabletError {
     },
     SequenceMismatch {
         committed: u64,
-        expected_previous_sequence: u64,
+        expected_previous: u64,
     },
     SequenceOverflow,
     RecoveredSequenceMismatch {
@@ -770,10 +771,10 @@ impl fmt::Display for TabletError {
             ),
             Self::SequenceMismatch {
                 committed,
-                expected_previous_sequence,
+                expected_previous,
             } => write!(
                 f,
-                "tablet predecessor {expected_previous_sequence} does not match committed sequence {committed}"
+                "tablet predecessor {expected_previous} does not match committed sequence {committed}"
             ),
             Self::SequenceOverflow => f.write_str("tablet sequence overflow"),
             Self::RecoveredSequenceMismatch {
