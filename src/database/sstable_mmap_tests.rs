@@ -33,7 +33,7 @@ fn test_indexed_sstable_mmap_survives_unlink_and_preserves_borrowed_reads() {
     assert!(indexed.is_memory_mapped_for_test());
     fs::remove_file(&path).unwrap();
     assert_eq!(
-        indexed.version_at(b"alpha", 1),
+        indexed.version_at(b"alpha", 1).unwrap(),
         Some(IndexedVersion {
             sequence: 1,
             value: Some(rows[0].versions[0].value.as_deref().unwrap()),
