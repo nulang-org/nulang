@@ -21,8 +21,9 @@ use super::tablet::{TabletDescriptor, TabletSnapshotRow, VersionedValue};
 ///
 /// This is intentionally offline: the caller must ensure no live tablet owner is
 /// publishing writes, flushes, or manifest changes for `wal_path` during the call.
-/// A single already-v2 table is a no-op; a single v1 table is rewritten so legacy
-/// formats can be retired incrementally.
+/// A single already-v2 table is a no-op only after that authority has been fully
+/// validated; a single v1 table is rewritten so legacy formats can be retired
+/// incrementally.
 ///
 /// Durability ordering:
 ///
@@ -49,11 +50,6 @@ pub fn compact_tablet_sstables_to_v2(
     if source_manifest.entries().is_empty() {
         return Ok(false);
     }
-    if source_manifest.entries().len() == 1
-        && source_manifest.entries()[0].format == SstableFormat::V2
-    {
-        return Ok(false);
-    }
 
     let source_names: Vec<String> = source_manifest
         .entries()
@@ -65,6 +61,12 @@ pub fn compact_tablet_sstables_to_v2(
     for entry in source_manifest.entries() {
         let rows = load_manifest_rows(entry, &sstable_dir, descriptor)?;
         merge_snapshot_rows(&mut merged, &rows)?;
+    }
+
+    if source_manifest.entries().len() == 1
+        && source_manifest.entries()[0].format == SstableFormat::V2
+    {
+        return Ok(false);
     }
 
     let rows: Vec<TabletSnapshotRow> = merged
