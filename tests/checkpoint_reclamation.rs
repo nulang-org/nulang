@@ -68,9 +68,12 @@ fn checkpoint_reclaims_wal_prefix_and_restart_restores_mvcc_history() {
     {
         let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
         assert_eq!(tablet.current_sequence(), 3);
-        assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
-        assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
-        assert_eq!(tablet.read_latest(b"other"), Some(&b"x"[..]));
+        assert_eq!(tablet.read_at(b"k", 1).unwrap().as_deref(), Some(&b"v1"[..]));
+        assert_eq!(tablet.read_at(b"k", 2).unwrap().as_deref(), Some(&b"v2"[..]));
+        assert_eq!(
+            tablet.read_latest(b"other").unwrap().as_deref(),
+            Some(&b"x"[..])
+        );
 
         commit_put(&mut tablet, b"k", b"v4");
         assert_eq!(tablet.current_sequence(), 4);
@@ -78,9 +81,18 @@ fn checkpoint_reclaims_wal_prefix_and_restart_restores_mvcc_history() {
 
     let reopened = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
     assert_eq!(reopened.current_sequence(), 4);
-    assert_eq!(reopened.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
-    assert_eq!(reopened.read_at(b"k", 3).unwrap(), Some(&b"v2"[..]));
-    assert_eq!(reopened.read_at(b"k", 4).unwrap(), Some(&b"v4"[..]));
+    assert_eq!(
+        reopened.read_at(b"k", 1).unwrap().as_deref(),
+        Some(&b"v1"[..])
+    );
+    assert_eq!(
+        reopened.read_at(b"k", 3).unwrap().as_deref(),
+        Some(&b"v2"[..])
+    );
+    assert_eq!(
+        reopened.read_at(b"k", 4).unwrap().as_deref(),
+        Some(&b"v4"[..])
+    );
 
     let _ = fs::remove_file(&wal_path);
     let _ = fs::remove_file(&checkpoint);
@@ -104,8 +116,8 @@ fn published_checkpoint_is_usable_even_when_wal_prefix_was_not_reclaimed() {
     // rewrite/reclamation step. Recovery must not double-apply records 1..2.
     let tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
     assert_eq!(tablet.current_sequence(), 2);
-    assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
-    assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
+    assert_eq!(tablet.read_at(b"k", 1).unwrap().as_deref(), Some(&b"v1"[..]));
+    assert_eq!(tablet.read_at(b"k", 2).unwrap().as_deref(), Some(&b"v2"[..]));
 
     let _ = fs::remove_file(&wal_path);
     let _ = fs::remove_file(&checkpoint);
