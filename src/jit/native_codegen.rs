@@ -71,10 +71,8 @@ impl CraneliftCodegen {
     pub(crate) fn new() -> Option<Self> {
         let baseline = NativeOptimizationProfile::Fast.cranelift_settings();
         let optimized = NativeOptimizationProfile::Optimized.cranelift_settings();
-        let baseline_module =
-            Self::new_module(baseline.opt_level, baseline.regalloc_algorithm)?;
-        let optimized_module =
-            Self::new_module(optimized.opt_level, optimized.regalloc_algorithm)?;
+        let baseline_module = Self::new_module(baseline.opt_level, baseline.regalloc_algorithm)?;
+        let optimized_module = Self::new_module(optimized.opt_level, optimized.regalloc_algorithm)?;
         let baseline_ctx = baseline_module.make_context();
         let optimized_ctx = optimized_module.make_context();
 
