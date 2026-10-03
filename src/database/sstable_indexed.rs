@@ -7,8 +7,12 @@
 
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read, Seek};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::Path;
+#[cfg(unix)]
+use std::{ptr, slice};
 
 use super::sstable::{SstableError, SstableMetadata};
 
@@ -17,6 +21,8 @@ use super::sstable::{SstableError, SstableMetadata};
 // from the canonical writer/decoder in `sstable`.
 const SSTABLE_MAGIC: &[u8; 8] = b"NUDBSST1";
 const SSTABLE_VERSION: u16 = 1;
+const SSTABLE_HEADER_BYTES: usize = 8 + 2 + 4;
+const SSTABLE_CHECKSUM_BYTES: usize = 32;
 const MAX_SSTABLE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_ROWS: usize = 4_000_000;
 const MAX_VERSIONS_PER_ROW: usize = 65_536;
@@ -33,9 +39,120 @@ struct BlockIndex {
 }
 
 #[derive(Debug)]
+enum SstableBacking {
+    #[cfg(unix)]
+    Mapped(ReadOnlyMmap),
+    #[cfg(not(unix))]
+    Owned(Vec<u8>),
+}
+
+impl SstableBacking {
+    fn open(file: &mut File, len: usize) -> Result<Self, SstableError> {
+        #[cfg(unix)]
+        {
+            Ok(Self::Mapped(ReadOnlyMmap::map(file, len)?))
+        }
+
+        #[cfg(not(unix))]
+        {
+            file.rewind()?;
+            let mut bytes = vec![0_u8; len];
+            file.read_exact(&mut bytes)?;
+            let mut trailing = [0_u8; 1];
+            if file.read(&mut trailing)? != 0 {
+                return Err(SstableError::TrailingBytes);
+            }
+            Ok(Self::Owned(bytes))
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            #[cfg(unix)]
+            Self::Mapped(mapped) => mapped.as_slice(),
+            #[cfg(not(unix))]
+            Self::Owned(bytes) => bytes,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_memory_mapped(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self, Self::Mapped(_))
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct ReadOnlyMmap {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+#[cfg(unix)]
+impl ReadOnlyMmap {
+    fn map(file: &File, len: usize) -> io::Result<Self> {
+        if len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot mmap an empty NuDB SSTable",
+            ));
+        }
+
+        // SAFETY: the mapping is read-only/private, the descriptor is valid for
+        // this call, and `ReadOnlyMmap` owns the mapping until `Drop`. NuDB
+        // SSTables are immutable after publication; the storage engine never
+        // truncates or mutates a manifest-referenced SSTable in place.
+        let ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { ptr, len })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr..ptr+len` is the live read-only mapping created above,
+        // and the returned slice cannot outlive `self`.
+        unsafe { slice::from_raw_parts(self.ptr.cast::<u8>(), self.len) }
+    }
+}
+
+// SAFETY: the mapping is immutable for its entire lifetime. Sharing or moving
+// the descriptor only shares read-only bytes; unmapping happens once in Drop.
+#[cfg(unix)]
+unsafe impl Send for ReadOnlyMmap {}
+#[cfg(unix)]
+unsafe impl Sync for ReadOnlyMmap {}
+
+#[cfg(unix)]
+impl Drop for ReadOnlyMmap {
+    fn drop(&mut self) {
+        // SAFETY: this exact mapping was created by `mmap` and is released once.
+        let _ = unsafe { libc::munmap(self.ptr, self.len) };
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct IndexedSstable {
     metadata: SstableMetadata,
-    payload: Vec<u8>,
+    backing: SstableBacking,
+    payload_start: usize,
+    payload_len: usize,
     blocks: Vec<BlockIndex>,
 }
 
@@ -62,19 +179,52 @@ impl IndexedSstable {
         if payload_len > MAX_SSTABLE_BYTES {
             return Err(SstableError::TooLarge(payload_len));
         }
-        let mut payload = vec![0_u8; payload_len];
-        file.read_exact(&mut payload)?;
-        let mut checksum = [0_u8; 32];
-        file.read_exact(&mut checksum)?;
-        if checksum != *blake3::hash(&payload).as_bytes() {
-            return Err(SstableError::ChecksumMismatch);
+        let payload_start = SSTABLE_HEADER_BYTES;
+        let payload_end = payload_start
+            .checked_add(payload_len)
+            .ok_or(SstableError::InvalidLength)?;
+        let expected_file_len = payload_end
+            .checked_add(SSTABLE_CHECKSUM_BYTES)
+            .ok_or(SstableError::InvalidLength)?;
+        let actual_file_len = usize::try_from(file.metadata()?.len())
+            .map_err(|_| SstableError::TooLarge(payload_len))?;
+        if actual_file_len < expected_file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated NuDB SSTable",
+            )
+            .into());
         }
-        let mut trailing = [0_u8; 1];
-        if file.read(&mut trailing)? != 0 {
+        if actual_file_len > expected_file_len {
             return Err(SstableError::TrailingBytes);
         }
 
-        let indexed = index_payload(&payload)?;
+        let backing = SstableBacking::open(&mut file, expected_file_len)?;
+        let bytes = backing.as_slice();
+
+        // Revalidate framing from the mapped/owned bytes themselves rather than
+        // trusting the preliminary header read. This keeps format validation
+        // tied to the exact bytes that will serve reads.
+        if &bytes[..8] != SSTABLE_MAGIC {
+            return Err(SstableError::InvalidHeader);
+        }
+        let mapped_version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
+        if mapped_version != SSTABLE_VERSION {
+            return Err(SstableError::UnsupportedVersion(mapped_version));
+        }
+        let mapped_payload_len = u32::from_le_bytes(bytes[10..14].try_into().unwrap()) as usize;
+        if mapped_payload_len != payload_len {
+            return Err(SstableError::InvalidLength);
+        }
+
+        let payload = &bytes[payload_start..payload_end];
+        let mut checksum = [0_u8; 32];
+        checksum.copy_from_slice(&bytes[payload_end..expected_file_len]);
+        if checksum != *blake3::hash(payload).as_bytes() {
+            return Err(SstableError::ChecksumMismatch);
+        }
+
+        let indexed = index_payload(payload)?;
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -95,7 +245,9 @@ impl IndexedSstable {
                 checksum,
                 file_name,
             },
-            payload,
+            backing,
+            payload_start,
+            payload_len,
             blocks: indexed.blocks,
         })
     }
@@ -124,9 +276,10 @@ impl IndexedSstable {
             return true;
         }
 
+        let payload = self.payload();
         let mut sequences = BTreeSet::new();
         for block in &self.blocks {
-            let Some(mut cursor) = Cursor::at(&self.payload, block.rows_start) else {
+            let Some(mut cursor) = Cursor::at(payload, block.rows_start) else {
                 return false;
             };
             for _ in 0..block.row_count {
@@ -168,8 +321,13 @@ impl IndexedSstable {
         false
     }
 
+    fn payload(&self) -> &[u8] {
+        let end = self.payload_start + self.payload_len;
+        &self.backing.as_slice()[self.payload_start..end]
+    }
+
     fn first_key<'a>(&'a self, block: &BlockIndex) -> &'a [u8] {
-        &self.payload[block.first_key_start..block.first_key_end]
+        &self.payload()[block.first_key_start..block.first_key_end]
     }
 
     fn version_at_in_block<'a>(
@@ -178,7 +336,7 @@ impl IndexedSstable {
         key: &[u8],
         snapshot: u64,
     ) -> Option<IndexedVersion<'a>> {
-        let mut cursor = Cursor::at(&self.payload, block.rows_start)?;
+        let mut cursor = Cursor::at(self.payload(), block.rows_start)?;
         for _ in 0..block.row_count {
             let key_len = cursor.u32().ok()? as usize;
             let row_key = cursor.take(key_len).ok()?;
@@ -210,6 +368,11 @@ impl IndexedSstable {
     #[cfg(test)]
     fn block_count(&self) -> usize {
         self.blocks.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_memory_mapped_for_test(&self) -> bool {
+        self.backing.is_memory_mapped()
     }
 }
 
