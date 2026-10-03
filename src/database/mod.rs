@@ -20,6 +20,8 @@ mod fallible_read_tests;
 #[cfg(test)]
 mod interruption;
 #[cfg(test)]
+mod manifest_v2_tests;
+#[cfg(test)]
 mod sstable_indexed_tests;
 #[cfg(test)]
 mod sstable_mmap_tests;
