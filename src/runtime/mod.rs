@@ -4628,7 +4628,14 @@ impl Runtime {
     /// Re-arm a timer from the durable journal without appending a new event.
     /// Used during recovery to restore timers that have not yet fired.
     pub(crate) fn rearm_timer(&mut self, actor_id: u64, name: &str, duration_ms: u64) {
-        let behavior_id = self.behavior_id_for(actor_id, "__timer_fired").unwrap_or(0);
+        let Some(behavior_id) = self.behavior_id_for(actor_id, "__timer_fired") else {
+            tracing::warn!(
+                actor_id,
+                timer_name = name,
+                "refusing to re-arm workflow timer without __timer_fired behavior"
+            );
+            return;
+        };
         self.timer_wheel.send_after_with_context(
             std::time::Duration::from_millis(duration_ms),
             actor_id,

@@ -8534,3 +8534,44 @@ fn workflow_timer_fire_is_not_delivered_when_durable_fire_append_fails() {
 
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn workflow_timer_rearm_accepts_valid_behavior_zero() {
+    let mut rt = Runtime::new();
+    let actor_id = rt
+        .try_spawn_workflow_actor(
+            "timer_zero",
+            Box::new(|| vec![]),
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+
+    assert_eq!(rt.behavior_id_for(actor_id, "__timer_fired"), Some(0));
+    rt.rearm_timer(actor_id, "wake", 10);
+
+    assert_eq!(
+        rt.timer_wheel.len(),
+        1,
+        "valid __timer_fired behavior id zero must be re-armed",
+    );
+}
+
+#[test]
+fn workflow_timer_rearm_rejects_missing_handler_without_aliasing_behavior_zero() {
+    let mut rt = Runtime::new();
+    let actor_id = rt.spawn_actor(Box::new(|| vec![]));
+    rt.actors
+        .get_mut(&actor_id)
+        .unwrap()
+        .register_behavior("first", |_actor, _args| {});
+
+    assert_eq!(rt.behavior_id_for(actor_id, "first"), Some(0));
+    assert_eq!(rt.behavior_id_for(actor_id, "__timer_fired"), None);
+
+    rt.rearm_timer(actor_id, "wake", 10);
+
+    assert!(
+        rt.timer_wheel.is_empty(),
+        "missing __timer_fired must not alias behavior zero",
+    );
+}
