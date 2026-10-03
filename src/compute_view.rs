@@ -3,8 +3,9 @@
 
 use std::fmt;
 
-use crate::compute_ir::{Layout, ScalarType};
-use crate::compute_schedule::DynamicExtentId;
+use crate::compute_ir::{ComputeIrError, Layout, ScalarType, VectorType};
+use crate::compute_planner::{plan_vector_loop, ComputePlannerError, VectorLoopPlan};
+use crate::compute_schedule::{DynamicExtentId, IterationSpace, LoopExtent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShapeExtent {
@@ -48,6 +49,41 @@ impl fmt::Display for ComputeViewError {
 }
 
 impl std::error::Error for ComputeViewError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComputeViewPlanError {
+    NotImplemented,
+    AxisOutOfBounds { axis: usize, rank: usize },
+    Ir(ComputeIrError),
+    Planner(ComputePlannerError),
+}
+
+impl fmt::Display for ComputeViewPlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotImplemented => write!(f, "symbolic buffer view planning is not implemented"),
+            Self::AxisOutOfBounds { axis, rank } => {
+                write!(f, "vector axis {axis} is outside buffer view rank {rank}")
+            }
+            Self::Ir(error) => write!(f, "{error}"),
+            Self::Planner(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ComputeViewPlanError {}
+
+impl From<ComputeIrError> for ComputeViewPlanError {
+    fn from(error: ComputeIrError) -> Self {
+        Self::Ir(error)
+    }
+}
+
+impl From<ComputePlannerError> for ComputeViewPlanError {
+    fn from(error: ComputePlannerError) -> Self {
+        Self::Planner(error)
+    }
+}
 
 impl BufferView {
     pub fn from_parts(
@@ -112,9 +148,23 @@ impl BufferView {
     }
 }
 
+pub fn plan_vector_view(
+    _view: &BufferView,
+    _axis: usize,
+    _iteration: IterationSpace,
+    _vector: VectorType,
+) -> Result<VectorLoopPlan, ComputeViewPlanError> {
+    Err(ComputeViewPlanError::NotImplemented)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compute_ir::{LocalityScope, ScalarType, VectorType, VectorWidth};
+
+    fn fixed_f32x4() -> VectorType {
+        VectorType::new(ScalarType::F32, VectorWidth::fixed(4).unwrap())
+    }
 
     #[test]
     fn creates_symbolic_one_dimensional_view() {
@@ -173,6 +223,121 @@ mod tests {
                 3,
             ),
             Err(ComputeViewError::InvalidAlignment(3))
+        );
+    }
+
+    #[test]
+    fn shared_dynamic_extent_elides_redundant_bounds_check() {
+        let extent = DynamicExtentId(5);
+        let view = BufferView::from_parts(
+            ScalarType::F32,
+            vec![ShapeExtent::Dynamic(extent)],
+            vec![1],
+            4,
+        )
+        .unwrap();
+        let iteration = IterationSpace::new(
+            0,
+            LoopExtent::Dynamic(extent),
+            1,
+            LocalityScope::Lane,
+        )
+        .unwrap();
+
+        let plan = plan_vector_view(&view, 0, iteration, fixed_f32x4()).unwrap();
+
+        assert_eq!(plan.vector_iterations, None);
+        assert_eq!(plan.scalar_tail, None);
+        assert!(plan.requires_runtime_tail);
+        assert!(!plan.requires_runtime_bounds_check);
+    }
+
+    #[test]
+    fn different_dynamic_extents_keep_runtime_bounds_check() {
+        let view = BufferView::from_parts(
+            ScalarType::F32,
+            vec![ShapeExtent::Dynamic(DynamicExtentId(5))],
+            vec![1],
+            4,
+        )
+        .unwrap();
+        let iteration = IterationSpace::new(
+            0,
+            LoopExtent::Dynamic(DynamicExtentId(6)),
+            1,
+            LocalityScope::Lane,
+        )
+        .unwrap();
+
+        let plan = plan_vector_view(&view, 0, iteration, fixed_f32x4()).unwrap();
+
+        assert!(plan.requires_runtime_bounds_check);
+        assert!(plan.requires_runtime_tail);
+    }
+
+    #[test]
+    fn static_iteration_over_dynamic_view_has_exact_tail_but_runtime_bounds_check() {
+        let view = BufferView::from_parts(
+            ScalarType::F32,
+            vec![ShapeExtent::Dynamic(DynamicExtentId(5))],
+            vec![1],
+            4,
+        )
+        .unwrap();
+        let iteration = IterationSpace::new(
+            0,
+            LoopExtent::Static(10),
+            1,
+            LocalityScope::Lane,
+        )
+        .unwrap();
+
+        let plan = plan_vector_view(&view, 0, iteration, fixed_f32x4()).unwrap();
+
+        assert_eq!(plan.vector_iterations, Some(2));
+        assert_eq!(plan.scalar_tail, Some(2));
+        assert!(plan.requires_runtime_bounds_check);
+        assert!(!plan.requires_runtime_tail);
+    }
+
+    #[test]
+    fn static_view_delegates_to_static_layout_rules() {
+        let layout = Layout::row_major(ScalarType::F32, vec![10]).unwrap();
+        let view = BufferView::from_layout(&layout);
+        let iteration = IterationSpace::new(
+            0,
+            LoopExtent::Static(10),
+            1,
+            LocalityScope::Lane,
+        )
+        .unwrap();
+
+        let from_view = plan_vector_view(&view, 0, iteration, fixed_f32x4()).unwrap();
+        let from_layout = plan_vector_loop(&layout, 0, iteration, fixed_f32x4()).unwrap();
+
+        assert_eq!(from_view, from_layout);
+    }
+
+    #[test]
+    fn rejects_axis_outside_symbolic_view_rank() {
+        let view = BufferView::from_parts(
+            ScalarType::F32,
+            vec![ShapeExtent::Dynamic(DynamicExtentId(1))],
+            vec![1],
+            4,
+        )
+        .unwrap();
+        let iteration = IterationSpace::new(
+            0,
+            LoopExtent::Dynamic(DynamicExtentId(1)),
+            1,
+            LocalityScope::Lane,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan_vector_view(&view, 1, iteration, fixed_f32x4()),
+            Err(ComputeViewPlanError::AxisOutOfBounds { axis: 1, rank: 1 })
         );
     }
 }
