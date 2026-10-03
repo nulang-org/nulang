@@ -306,6 +306,36 @@ impl SstableV2 {
             return Ok(None);
         }
 
+        let payload = self.validated_block_payload(block_index, block)?;
+        decode_block_lookup(payload, block, block_index, key, snapshot)
+    }
+
+    /// Decode a complete validated MVCC image for checkpoint composition.
+    /// Unlike point reads, this intentionally checks every block before any
+    /// decoded history is accepted as checkpoint input.
+    pub(crate) fn snapshot_rows(&self) -> Result<Vec<TabletSnapshotRow>, SstableV2Error> {
+        let mut rows = Vec::with_capacity(self.metadata.row_count as usize);
+        for (block_index, block) in self.blocks.iter().enumerate() {
+            let payload = self.validated_block_payload(block_index, block)?;
+            rows.extend(decode_block_rows(payload, block, block_index)?);
+        }
+        if rows.len() != self.metadata.row_count as usize {
+            return Err(SstableV2Error::InvalidHistory);
+        }
+        validate_rows(&rows)?;
+        if rows.first().map(|row| row.key.as_slice()) != Some(self.metadata.min_key.as_slice())
+            || rows.last().map(|row| row.key.as_slice()) != Some(self.metadata.max_key.as_slice())
+        {
+            return Err(SstableV2Error::InvalidHistory);
+        }
+        Ok(rows)
+    }
+
+    fn validated_block_payload<'a>(
+        &'a self,
+        block_index: usize,
+        block: &BlockIndex,
+    ) -> Result<&'a [u8], SstableV2Error> {
         let frame_offset_u64 = block
             .payload_offset
             .checked_sub(4)
@@ -334,8 +364,7 @@ impl SstableV2 {
         if block.checksum != *blake3::hash(payload).as_bytes() {
             return Err(SstableV2Error::BlockChecksumMismatch(block_index));
         }
-
-        decode_block_lookup(payload, block, block_index, key, snapshot)
+        Ok(payload)
     }
 
     pub(crate) fn has_contiguous_sequence_coverage_after(&self, floor: u64) -> bool {
@@ -814,6 +843,73 @@ fn decode_block_lookup<'a>(
         return Err(SstableV2Error::InvalidBlock(block_index));
     }
     Ok(result)
+}
+
+fn decode_block_rows(
+    payload: &[u8],
+    block: &BlockIndex,
+    block_index: usize,
+) -> Result<Vec<TabletSnapshotRow>, SstableV2Error> {
+    let mut cursor = Cursor::new(payload);
+    let mut previous_key: Option<&[u8]> = None;
+    let mut first_key: Option<&[u8]> = None;
+    let mut last_key: Option<&[u8]> = None;
+    let mut min_sequence = u64::MAX;
+    let mut max_sequence = 0_u64;
+    let mut rows = Vec::with_capacity(block.row_count as usize);
+
+    for row_index in 0..block.row_count {
+        let row_key = cursor.borrowed_bytes(MAX_KEY_BYTES)?;
+        if row_key.is_empty() {
+            return Err(SstableV2Error::InvalidBlock(block_index));
+        }
+        if previous_key.is_some_and(|previous| previous >= row_key) {
+            return Err(SstableV2Error::InvalidBlock(block_index));
+        }
+        if row_index == 0 {
+            first_key = Some(row_key);
+        }
+        last_key = Some(row_key);
+        previous_key = Some(row_key);
+
+        let version_count = cursor.u32()? as usize;
+        if version_count == 0 || version_count > MAX_VERSIONS_PER_ROW {
+            return Err(SstableV2Error::InvalidBlock(block_index));
+        }
+        if version_count > cursor.remaining() / 9 {
+            return Err(SstableV2Error::InvalidBlock(block_index));
+        }
+
+        let mut previous_sequence = 0_u64;
+        let mut versions = Vec::with_capacity(version_count);
+        for _ in 0..version_count {
+            let version = read_version(&mut cursor)?;
+            if version.sequence == 0 || version.sequence <= previous_sequence {
+                return Err(SstableV2Error::InvalidBlock(block_index));
+            }
+            previous_sequence = version.sequence;
+            min_sequence = min_sequence.min(version.sequence);
+            max_sequence = max_sequence.max(version.sequence);
+            versions.push(VersionedValue {
+                sequence: version.sequence,
+                value: version.value.map(ToOwned::to_owned),
+            });
+        }
+        rows.push(TabletSnapshotRow {
+            key: row_key.to_vec(),
+            versions,
+        });
+    }
+
+    if cursor.remaining() != 0
+        || first_key != Some(block.first_key.as_slice())
+        || last_key != Some(block.last_key.as_slice())
+        || min_sequence != block.min_sequence
+        || max_sequence != block.max_sequence
+    {
+        return Err(SstableV2Error::InvalidBlock(block_index));
+    }
+    Ok(rows)
 }
 
 struct BorrowedVersion<'a> {
