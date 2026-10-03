@@ -8,6 +8,7 @@ pub mod checkpoint;
 pub mod manifest;
 pub mod owner;
 pub mod sstable;
+pub(crate) mod sstable_indexed;
 pub mod store;
 pub mod tablet;
 pub mod wal;
