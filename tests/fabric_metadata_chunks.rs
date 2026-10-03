@@ -64,7 +64,10 @@ fn out_of_order_chunks_publish_only_after_complete_snapshot() {
     assert_eq!(completed.owner, 11);
     assert_eq!(completed.generation, 9);
     assert_eq!(completed.payload, bytes);
-    assert_eq!(assembler.latest_generation(FabricMetadataKind::Subscriptions, 11), Some(9));
+    assert_eq!(
+        assembler.latest_generation(FabricMetadataKind::Subscriptions, 11),
+        Some(9)
+    );
 }
 
 #[test]
@@ -109,6 +112,7 @@ fn conflicting_duplicate_chunk_fails_closed() {
         Err(MetadataAssemblyError::ConflictingChunk)
     );
     assert_eq!(assembler.inflight_snapshot_count(), 0);
+    assert_eq!(assembler.inflight_bytes(), 0);
 }
 
 #[test]
@@ -133,7 +137,9 @@ fn newer_generation_supersedes_incomplete_older_generation() {
     let mut assembler = FabricMetadataAssembler::new(16 * 1024, 16);
 
     assert!(assembler.push(old[0].clone()).unwrap().is_none());
+    assert_eq!(assembler.inflight_bytes(), old[0].payload.len());
     assert!(assembler.push(fresh[1].clone()).unwrap().is_none());
+    assert_eq!(assembler.inflight_bytes(), fresh[1].payload.len());
 
     assert_eq!(
         assembler.push(old[1].clone()),
@@ -146,7 +152,11 @@ fn newer_generation_supersedes_incomplete_older_generation() {
             assert_eq!(result.unwrap().payload, fresh_bytes);
         }
     }
-    assert_eq!(assembler.latest_generation(FabricMetadataKind::Subscriptions, 44), Some(11));
+    assert_eq!(
+        assembler.latest_generation(FabricMetadataKind::Subscriptions, 44),
+        Some(11)
+    );
+    assert_eq!(assembler.inflight_bytes(), 0);
 }
 
 #[test]
@@ -171,8 +181,12 @@ fn corrupted_snapshot_hash_never_becomes_visible() {
         assembler.push(chunks[last].clone()),
         Err(MetadataAssemblyError::SnapshotHashMismatch)
     );
-    assert_eq!(assembler.latest_generation(FabricMetadataKind::Services, 55), None);
+    assert_eq!(
+        assembler.latest_generation(FabricMetadataKind::Services, 55),
+        None
+    );
     assert_eq!(assembler.inflight_snapshot_count(), 0);
+    assert_eq!(assembler.inflight_bytes(), 0);
 }
 
 #[test]
@@ -187,6 +201,7 @@ fn invalid_or_oversized_chunks_are_rejected_before_allocation_growth() {
         Err(MetadataAssemblyError::SnapshotTooLarge)
     );
     assert_eq!(assembler.inflight_snapshot_count(), 0);
+    assert_eq!(assembler.inflight_bytes(), 0);
 
     let invalid = FabricMetadataChunk {
         owner: 66,
@@ -200,6 +215,138 @@ fn invalid_or_oversized_chunks_are_rejected_before_allocation_growth() {
     assert_eq!(
         assembler.push(invalid),
         Err(MetadataAssemblyError::InvalidChunk)
+    );
+}
+
+#[test]
+fn global_inflight_snapshot_count_is_bounded() {
+    let mut assembler = FabricMetadataAssembler::with_limits(4096, 8, 2, 8192);
+    for owner in [1, 2] {
+        let chunks = chunk_snapshot(
+            FabricMetadataKind::Subscriptions,
+            owner,
+            1,
+            &payload(1600),
+            800,
+        )
+        .unwrap();
+        assert!(assembler.push(chunks[0].clone()).unwrap().is_none());
+    }
+    assert_eq!(assembler.inflight_snapshot_count(), 2);
+
+    let third = chunk_snapshot(
+        FabricMetadataKind::Subscriptions,
+        3,
+        1,
+        &payload(1600),
+        800,
+    )
+    .unwrap();
+    assert_eq!(
+        assembler.push(third[0].clone()),
+        Err(MetadataAssemblyError::TooManyInflightSnapshots)
+    );
+    assert_eq!(assembler.inflight_snapshot_count(), 2);
+}
+
+#[test]
+fn global_inflight_byte_budget_is_bounded() {
+    let mut assembler = FabricMetadataAssembler::with_limits(4096, 8, 8, 1200);
+    let first = chunk_snapshot(
+        FabricMetadataKind::Subscriptions,
+        1,
+        1,
+        &payload(1600),
+        800,
+    )
+    .unwrap();
+    let second = chunk_snapshot(
+        FabricMetadataKind::Subscriptions,
+        2,
+        1,
+        &payload(1600),
+        800,
+    )
+    .unwrap();
+
+    assert!(assembler.push(first[0].clone()).unwrap().is_none());
+    assert_eq!(assembler.inflight_bytes(), 800);
+    assert_eq!(
+        assembler.push(second[0].clone()),
+        Err(MetadataAssemblyError::InflightBytesExceeded)
+    );
+    assert_eq!(assembler.inflight_snapshot_count(), 1);
+    assert_eq!(assembler.inflight_bytes(), 800);
+}
+
+#[test]
+fn deterministic_pruning_reclaims_abandoned_assemblies() {
+    let mut assembler = FabricMetadataAssembler::with_limits(4096, 8, 8, 8192);
+    let first = chunk_snapshot(
+        FabricMetadataKind::Subscriptions,
+        10,
+        1,
+        &payload(1600),
+        800,
+    )
+    .unwrap();
+    let second = chunk_snapshot(
+        FabricMetadataKind::Services,
+        20,
+        1,
+        &payload(1600),
+        800,
+    )
+    .unwrap();
+
+    assert!(assembler
+        .push_at(first[0].clone(), 100)
+        .unwrap()
+        .is_none());
+    assert!(assembler
+        .push_at(second[0].clone(), 200)
+        .unwrap()
+        .is_none());
+    assert_eq!(assembler.inflight_bytes(), 1600);
+
+    assert_eq!(assembler.prune_inflight_before(150), 1);
+    assert_eq!(assembler.inflight_snapshot_count(), 1);
+    assert_eq!(assembler.inflight_bytes(), 800);
+    assert_eq!(assembler.prune_inflight_before(201), 1);
+    assert_eq!(assembler.inflight_snapshot_count(), 0);
+    assert_eq!(assembler.inflight_bytes(), 0);
+}
+
+#[test]
+fn discard_owner_clears_inflight_state_and_generation_watermark() {
+    let mut assembler = FabricMetadataAssembler::with_limits(4096, 8, 8, 8192);
+    let completed = chunk_snapshot(
+        FabricMetadataKind::Subscriptions,
+        88,
+        4,
+        b"complete",
+        1024,
+    )
+    .unwrap();
+    assert!(assembler.push(completed[0].clone()).unwrap().is_some());
+
+    let partial = chunk_snapshot(
+        FabricMetadataKind::Services,
+        88,
+        5,
+        &payload(1600),
+        800,
+    )
+    .unwrap();
+    assert!(assembler.push(partial[0].clone()).unwrap().is_none());
+    assert_eq!(assembler.inflight_bytes(), 800);
+
+    assembler.discard_owner(88);
+    assert_eq!(assembler.inflight_snapshot_count(), 0);
+    assert_eq!(assembler.inflight_bytes(), 0);
+    assert_eq!(
+        assembler.latest_generation(FabricMetadataKind::Subscriptions, 88),
+        None
     );
 }
 
