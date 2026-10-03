@@ -1069,7 +1069,7 @@ impl Type {
                     t.collect_ref_free_vars(acc)
                 }
             }),
-            Type::Array(t) => t.collect_ref_free_vars(acc),
+            Type::Array(t) => t.collect_free_vars(acc),
             Type::Actor { state, behavior } => {
                 state.collect_ref_free_vars(acc);
                 behavior.collect_ref_free_vars(acc);
