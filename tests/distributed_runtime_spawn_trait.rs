@@ -1,5 +1,6 @@
 use nulang::runtime::{
-    Actor, DeterministicNetworkTransport, DistributedRuntime, DistributedRuntimeImpl, NodeId, Runtime,
+    Actor, DeterministicNetworkTransport, DistributedRuntime, DistributedRuntimeImpl, NodeId,
+    Runtime,
 };
 use nulang::vm::Value;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
