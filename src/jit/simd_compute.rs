@@ -13,7 +13,7 @@ use cranelift_jit::JITModule;
 
 use crate::bytecode::Instruction;
 use crate::compute_ir::{Layout, LocalityScope, ScalarType, VectorType, VectorWidth};
-use crate::compute_planner::{ComputePlannerError, VectorLoopPlan};
+use crate::compute_planner::{plan_vector_loop, ComputePlannerError, VectorLoopPlan};
 use crate::compute_policy::{
     assess_vectorization, ComputePolicyError, VectorizationDecision, VectorizationPolicy,
 };
@@ -171,9 +171,11 @@ impl SimdComputePlan {
 
     pub(crate) fn vectorization_decision(
         self,
-        _policy: VectorizationPolicy,
+        policy: VectorizationPolicy,
     ) -> Result<Option<VectorizationDecision>, ComputePolicyError> {
-        Ok(None)
+        self.vector_loop
+            .map(|loop_plan| assess_vectorization(loop_plan, policy))
+            .transpose()
     }
 
     /// Materialize the legacy analyzer structure expected by the current
@@ -212,10 +214,23 @@ impl SimdComputePlan {
 }
 
 fn static_vector_loop_plan(
-    _vector_type: VectorType,
-    _iteration: Option<IterationSpace>,
+    vector_type: VectorType,
+    iteration: Option<IterationSpace>,
 ) -> Result<Option<VectorLoopPlan>, SimdComputePlanError> {
-    Ok(None)
+    let Some(iteration) = iteration else {
+        return Ok(None);
+    };
+    let LoopExtent::Static(count) = iteration.extent else {
+        return Ok(None);
+    };
+
+    let layout = Layout::row_major(vector_type.element, vec![count]).map_err(|_| {
+        SimdComputePlanError::StaticLayoutSizeOverflow {
+            count,
+            element: vector_type.element,
+        }
+    })?;
+    Ok(Some(plan_vector_loop(&layout, 0, iteration, vector_type)?))
 }
 
 const fn scalar_type(elem_type: SimdElemType) -> ScalarType {
