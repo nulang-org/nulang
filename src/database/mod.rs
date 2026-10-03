@@ -6,6 +6,7 @@
 
 pub mod checkpoint;
 pub mod manifest;
+pub mod mvcc_gc;
 pub mod owner;
 pub mod snapshot;
 pub mod sstable;
@@ -20,6 +21,8 @@ pub mod wal_batch;
 mod fallible_read_tests;
 #[cfg(test)]
 mod interruption;
+#[cfg(test)]
+mod mvcc_gc_tests;
 #[cfg(test)]
 mod snapshot_tests;
 #[cfg(test)]
