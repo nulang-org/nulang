@@ -95,8 +95,6 @@ impl WalBackedTablet {
         let sstable_cache = Arc::new(Mutex::new(SstableBlockCache::new(sstable_cache_bytes)));
 
         let mut manifest = Manifest::load_or_empty(&manifest_path, descriptor.id().get())?;
-        retire_obsolete_sstables(&mut manifest, &manifest_path, &sstable_dir)?;
-
         let mut sstables = Vec::new();
         for entry in manifest.entries() {
             let path = sstable_dir.join(&entry.file_name);
@@ -142,6 +140,13 @@ impl WalBackedTablet {
             sstables.push(table);
         }
         wal.replay_after_checkpoint(&mut tablet)?;
+
+        // Obsolete files are only garbage after the complete authoritative
+        // replacement + WAL recovery chain has been validated. This preserves
+        // the source artifacts as a forensic/recovery fallback if the new
+        // manifest entry is corrupt or cannot establish a valid sequence chain.
+        retire_obsolete_sstables(&mut manifest, &manifest_path, &sstable_dir)?;
+
         Ok(Self {
             tablet,
             wal,
