@@ -31,6 +31,8 @@ mod sstable_indexed_tests;
 #[cfg(test)]
 mod sstable_mmap_tests;
 #[cfg(test)]
+mod sstable_v2_serving_regression_tests;
+#[cfg(test)]
 mod sstable_v2_serving_tests;
 #[cfg(test)]
 mod sstable_v2_tests;

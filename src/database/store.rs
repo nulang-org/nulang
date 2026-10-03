@@ -319,6 +319,10 @@ impl WalBackedTablet {
                 found = true;
                 best_sequence = candidate.sequence;
                 best_value = candidate.value;
+            } else if candidate.sequence == best_sequence && candidate.value != best_value {
+                return Err(WalBackedError::ReadConflict {
+                    sequence: best_sequence,
+                });
             }
         }
 
@@ -406,6 +410,8 @@ fn open_manifest_sstable(
                 || metadata.file_name != entry.file_name
                 || metadata.tablet_id != descriptor.id().get()
                 || metadata.ownership_epoch > descriptor.ownership_epoch()
+                || !descriptor.range().contains(&metadata.min_key)
+                || !descriptor.range().contains(&metadata.max_key)
             {
                 return Err(WalBackedError::ManifestSstableMismatch(
                     entry.file_name.clone(),
@@ -427,6 +433,8 @@ fn open_manifest_sstable(
                 || metadata.file_name != entry.file_name
                 || metadata.tablet_id != descriptor.id().get()
                 || metadata.ownership_epoch > descriptor.ownership_epoch()
+                || !descriptor.range().contains(&metadata.min_key)
+                || !descriptor.range().contains(&metadata.max_key)
             {
                 return Err(WalBackedError::ManifestSstableMismatch(
                     entry.file_name.clone(),
@@ -528,6 +536,7 @@ pub enum WalBackedError {
     NoImmutableMemtable,
     FlushIdentity(String),
     ManifestSstableMismatch(String),
+    ReadConflict { sequence: u64 },
     SnapshotCompositionConflict { sequence: u64 },
 }
 
@@ -581,6 +590,10 @@ impl fmt::Display for WalBackedError {
             Self::ManifestSstableMismatch(file) => {
                 write!(f, "manifest metadata does not match SSTable {file}")
             }
+            Self::ReadConflict { sequence } => write!(
+                f,
+                "conflicting MVCC values while reading at sequence {sequence}"
+            ),
             Self::SnapshotCompositionConflict { sequence } => write!(
                 f,
                 "conflicting MVCC values while composing checkpoint at sequence {sequence}"
