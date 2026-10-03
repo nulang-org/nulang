@@ -10,6 +10,7 @@
 //!
 //! No fallible validation is performed after the WAL acknowledges durability.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -17,7 +18,10 @@ use super::checkpoint::{self, CheckpointError};
 use super::manifest::{Manifest, ManifestEntry, ManifestError};
 use super::sstable::{self, SstableError};
 use super::sstable_indexed::IndexedSstable;
-use super::tablet::{MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite};
+use super::tablet::{
+    MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletSnapshotRow,
+    TabletSnapshotState, TabletWrite, VersionedValue,
+};
 use super::wal::{FileWal, WalError};
 
 #[derive(Debug)]
@@ -290,12 +294,48 @@ impl WalBackedTablet {
         self.read_at(key, self.tablet.current_sequence())
     }
 
-    /// Atomically publish a checkpoint without reclaiming the WAL.
+    fn checkpoint_state(&self) -> Result<TabletSnapshotState, WalBackedError> {
+        let resident = self.tablet.snapshot_state();
+        let mut merged: BTreeMap<Vec<u8>, BTreeMap<u64, Option<Vec<u8>>>> = BTreeMap::new();
+
+        for indexed in &self.sstables {
+            let path = self.sstable_dir.join(&indexed.metadata().file_name);
+            let table = sstable::Sstable::open(&path)?;
+            if table.metadata() != indexed.metadata() {
+                return Err(WalBackedError::ManifestSstableMismatch(
+                    indexed.metadata().file_name.clone(),
+                ));
+            }
+            merge_snapshot_rows(&mut merged, table.rows())?;
+        }
+        merge_snapshot_rows(&mut merged, &resident.rows)?;
+
+        let rows = merged
+            .into_iter()
+            .map(|(key, versions)| TabletSnapshotRow {
+                key,
+                versions: versions
+                    .into_iter()
+                    .map(|(sequence, value)| VersionedValue { sequence, value })
+                    .collect(),
+            })
+            .collect();
+
+        Ok(TabletSnapshotState {
+            current_sequence: self.tablet.current_sequence(),
+            rows,
+        })
+    }
+
+    /// Atomically publish a self-contained checkpoint without reclaiming the WAL.
     ///
-    /// This is a valid crash state and is intentionally public so operators can
-    /// separate checkpoint publication from later space reclamation.
+    /// The checkpoint materializes both resident MVCC state and all active
+    /// manifest-backed SSTable history before it can authorize WAL reclamation.
     pub fn publish_checkpoint(&self) -> Result<(), WalBackedError> {
-        checkpoint::write_checkpoint(&self.checkpoint_path, &self.tablet)?;
+        let state = self.checkpoint_state()?;
+        let checkpoint_tablet =
+            MemoryTablet::restore_snapshot(self.tablet.descriptor().clone(), state)?;
+        checkpoint::write_checkpoint(&self.checkpoint_path, &checkpoint_tablet)?;
         Ok(())
     }
 
@@ -308,6 +348,29 @@ impl WalBackedTablet {
         self.wal.reclaim_through(self.tablet.current_sequence())?;
         Ok(())
     }
+}
+
+fn merge_snapshot_rows(
+    merged: &mut BTreeMap<Vec<u8>, BTreeMap<u64, Option<Vec<u8>>>>,
+    rows: &[TabletSnapshotRow],
+) -> Result<(), WalBackedError> {
+    for row in rows {
+        let versions = merged.entry(row.key.clone()).or_default();
+        for version in &row.versions {
+            match versions.get(&version.sequence) {
+                Some(existing) if existing != &version.value => {
+                    return Err(WalBackedError::SnapshotCompositionConflict {
+                        sequence: version.sequence,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    versions.insert(version.sequence, version.value.clone());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn advance_recovered_sequence(tablet: &mut MemoryTablet, sequence: u64) -> Result<(), TabletError> {
@@ -331,6 +394,7 @@ pub enum WalBackedError {
     NoImmutableMemtable,
     FlushIdentity(String),
     ManifestSstableMismatch(String),
+    SnapshotCompositionConflict { sequence: u64 },
 }
 
 impl From<TabletError> for WalBackedError {
@@ -376,6 +440,10 @@ impl fmt::Display for WalBackedError {
             Self::ManifestSstableMismatch(file) => {
                 write!(f, "manifest metadata does not match SSTable {file}")
             }
+            Self::SnapshotCompositionConflict { sequence } => write!(
+                f,
+                "conflicting MVCC values while composing checkpoint at sequence {sequence}"
+            ),
         }
     }
 }
