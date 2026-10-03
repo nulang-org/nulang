@@ -9,23 +9,63 @@
 //! - the single newest version `< F`, when one exists, as the baseline visible
 //!   to snapshots at/after `F` until a newer version supersedes it.
 //!
-//! Tombstones follow the same rule and are never removed specially here. Dropping
-//! a baseline tombstone requires proof that no lower durable authority can still
-//! contain a masked value, which belongs to a later compaction-level policy.
+//! Every obsolete version is therefore strictly older than the first retained
+//! barrier version. That barrier is the cross-authority safety property: stale
+//! copies of obsolete versions cannot outrank it for any snapshot at/above the
+//! floor. If the barrier is a tombstone, the tombstone remains present and keeps
+//! stale lower-authority values masked.
 
 use std::fmt;
 
 use super::tablet::VersionedValue;
 
-pub fn retain_versions_for_floor(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MvccRetentionPlan {
+    retained: Vec<VersionedValue>,
+    obsolete: Vec<VersionedValue>,
+    barrier_sequence: u64,
+}
+
+impl MvccRetentionPlan {
+    pub fn retained(&self) -> &[VersionedValue] {
+        &self.retained
+    }
+
+    pub fn obsolete(&self) -> &[VersionedValue] {
+        &self.obsolete
+    }
+
+    pub fn barrier_sequence(&self) -> u64 {
+        self.barrier_sequence
+    }
+
+    pub fn into_retained(self) -> Vec<VersionedValue> {
+        self.retained
+    }
+}
+
+pub fn plan_versions_for_floor(
     versions: &[VersionedValue],
     floor: u64,
-) -> Result<Vec<VersionedValue>, MvccRetentionError> {
+) -> Result<MvccRetentionPlan, MvccRetentionError> {
     validate_history(versions)?;
 
     let first_at_or_above = versions.partition_point(|version| version.sequence < floor);
     let retained_start = first_at_or_above.saturating_sub(1);
-    Ok(versions[retained_start..].to_vec())
+    let barrier_sequence = versions[retained_start].sequence;
+
+    Ok(MvccRetentionPlan {
+        retained: versions[retained_start..].to_vec(),
+        obsolete: versions[..retained_start].to_vec(),
+        barrier_sequence,
+    })
+}
+
+pub fn retain_versions_for_floor(
+    versions: &[VersionedValue],
+    floor: u64,
+) -> Result<Vec<VersionedValue>, MvccRetentionError> {
+    Ok(plan_versions_for_floor(versions, floor)?.into_retained())
 }
 
 fn validate_history(versions: &[VersionedValue]) -> Result<(), MvccRetentionError> {
