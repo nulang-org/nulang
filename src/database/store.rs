@@ -13,6 +13,8 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -27,6 +29,8 @@ use super::tablet::{
     TabletSnapshotState, TabletWrite, VersionedValue,
 };
 use super::wal::{FileWal, WalError};
+
+const L0_COMPACTION_TRIGGER: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TabletSstableCacheStats {
@@ -90,7 +94,9 @@ impl WalBackedTablet {
         let checkpoint_floor = tablet.current_sequence();
         let sstable_cache = Arc::new(Mutex::new(SstableBlockCache::new(sstable_cache_bytes)));
 
-        let manifest = Manifest::load_or_empty(&manifest_path, descriptor.id().get())?;
+        let mut manifest = Manifest::load_or_empty(&manifest_path, descriptor.id().get())?;
+        retire_obsolete_sstables(&mut manifest, &manifest_path, &sstable_dir)?;
+
         let mut sstables = Vec::new();
         for entry in manifest.entries() {
             let path = sstable_dir.join(&entry.file_name);
@@ -247,17 +253,7 @@ impl WalBackedTablet {
         };
 
         let metadata = table.metadata().clone();
-        let entry = ManifestEntry {
-            file_name: metadata.file_name.clone(),
-            tablet_id: metadata.tablet_id,
-            ownership_epoch: metadata.ownership_epoch,
-            min_sequence: metadata.min_sequence,
-            max_sequence: metadata.max_sequence,
-            row_count: metadata.row_count,
-            min_key: metadata.min_key.clone(),
-            max_key: metadata.max_key.clone(),
-            checksum: metadata.checksum,
-        };
+        let entry = manifest_entry_from_metadata(&metadata);
         let inserted = manifest.register(entry)?;
         if inserted {
             manifest.publish(&self.manifest_path)?;
@@ -272,18 +268,7 @@ impl WalBackedTablet {
             .any(|existing| existing.metadata().file_name == metadata.file_name)
         {
             self.sstables.push(table);
-            self.sstables.sort_by(|a, b| {
-                (
-                    a.metadata().min_sequence,
-                    a.metadata().max_sequence,
-                    &a.metadata().file_name,
-                )
-                    .cmp(&(
-                        b.metadata().min_sequence,
-                        b.metadata().max_sequence,
-                        &b.metadata().file_name,
-                    ))
-            });
+            sort_sstables(&mut self.sstables);
         }
         let evicted = self.tablet.evict_oldest_immutable();
         debug_assert!(evicted, "oldest immutable disappeared after durable flush");
@@ -294,6 +279,101 @@ impl WalBackedTablet {
         let manifest =
             Manifest::load_or_empty(&self.manifest_path, self.tablet.descriptor().id().get())?;
         Ok(manifest.entries().len())
+    }
+
+    /// Compact the oldest four active L0 SSTables into one immutable SSTable.
+    ///
+    /// This is physical compaction only: every MVCC version and tombstone is
+    /// preserved. The replacement SSTable becomes authoritative only when the
+    /// manifest atomically replaces all source entries. Source deletion happens
+    /// afterwards and is protected by persisted obsolete-file intent.
+    pub fn compact_l0_once(&mut self) -> Result<bool, WalBackedError> {
+        if self.sstables.len() < L0_COMPACTION_TRIGGER {
+            return Ok(false);
+        }
+
+        let sources = &self.sstables[..L0_COMPACTION_TRIGGER];
+        let source_files = sources
+            .iter()
+            .map(|table| table.metadata().file_name.clone())
+            .collect::<Vec<_>>();
+        let mut merged: BTreeMap<Vec<u8>, BTreeMap<u64, Option<Vec<u8>>>> = BTreeMap::new();
+        for table in sources {
+            let rows = table.read_all_rows()?;
+            merge_snapshot_rows(&mut merged, &rows)?;
+        }
+        let rows = merged_rows(merged);
+        let min_sequence = rows
+            .iter()
+            .flat_map(|row| row.versions.iter())
+            .map(|version| version.sequence)
+            .min()
+            .ok_or(WalBackedError::EmptyCompaction)?;
+        let max_sequence = rows
+            .iter()
+            .flat_map(|row| row.versions.iter())
+            .map(|version| version.sequence)
+            .max()
+            .ok_or(WalBackedError::EmptyCompaction)?;
+        let identity = serde_json::to_vec(&rows)
+            .map_err(|error| WalBackedError::FlushIdentity(error.to_string()))?;
+        let digest = blake3::hash(&identity).to_hex();
+        let file_name = format!(
+            "tablet-{}-l0-{}-{}-{}.sst",
+            self.tablet.descriptor().id().get(),
+            min_sequence,
+            max_sequence,
+            &digest.as_str()[..16]
+        );
+        let path = self.sstable_dir.join(&file_name);
+        let expected = sstable::expected_metadata(
+            file_name.clone(),
+            self.tablet.descriptor().id().get(),
+            self.tablet.descriptor().ownership_epoch(),
+            &rows,
+        )?;
+
+        let replacement = if path.exists() {
+            let existing =
+                sstable::Sstable::open_with_cache(&path, Arc::clone(&self.sstable_cache))?;
+            if existing.metadata() != &expected {
+                return Err(WalBackedError::Sstable(SstableError::ExistingFileMismatch(
+                    file_name.clone(),
+                )));
+            }
+            existing
+        } else {
+            sstable::write_sstable(
+                &path,
+                self.tablet.descriptor().id().get(),
+                self.tablet.descriptor().ownership_epoch(),
+                &rows,
+            )?;
+            let written =
+                sstable::Sstable::open_with_cache(&path, Arc::clone(&self.sstable_cache))?;
+            if written.metadata() != &expected {
+                return Err(WalBackedError::Sstable(SstableError::ExistingFileMismatch(
+                    file_name.clone(),
+                )));
+            }
+            written
+        };
+
+        let replacement_metadata = replacement.metadata().clone();
+        let replacement_entry = manifest_entry_from_metadata(&replacement_metadata);
+        let mut manifest =
+            Manifest::load_or_empty(&self.manifest_path, self.tablet.descriptor().id().get())?;
+        manifest.replace_entries(&source_files, replacement_entry)?;
+        manifest.publish(&self.manifest_path)?;
+
+        // The manifest replacement above is the logical commit point. From now
+        // on the source tables are garbage even if physical retirement fails.
+        self.sstables.drain(..L0_COMPACTION_TRIGGER);
+        self.sstables.push(replacement);
+        sort_sstables(&mut self.sstables);
+
+        retire_obsolete_sstables(&mut manifest, &self.manifest_path, &self.sstable_dir)?;
+        Ok(true)
     }
 
     pub fn prepare_write(
@@ -390,16 +470,7 @@ impl WalBackedTablet {
         }
         merge_snapshot_rows(&mut merged, &memory.rows)?;
 
-        let rows = merged
-            .into_iter()
-            .map(|(key, versions)| TabletSnapshotRow {
-                key,
-                versions: versions
-                    .into_iter()
-                    .map(|(sequence, value)| VersionedValue { sequence, value })
-                    .collect(),
-            })
-            .collect();
+        let rows = merged_rows(merged);
         Ok(TabletSnapshotState {
             current_sequence: self.tablet.current_sequence(),
             rows,
@@ -429,6 +500,84 @@ impl WalBackedTablet {
         self.wal.reclaim_through(self.tablet.current_sequence())?;
         Ok(())
     }
+}
+
+fn manifest_entry_from_metadata(metadata: &super::sstable::SstableMetadata) -> ManifestEntry {
+    ManifestEntry {
+        file_name: metadata.file_name.clone(),
+        tablet_id: metadata.tablet_id,
+        ownership_epoch: metadata.ownership_epoch,
+        min_sequence: metadata.min_sequence,
+        max_sequence: metadata.max_sequence,
+        row_count: metadata.row_count,
+        min_key: metadata.min_key.clone(),
+        max_key: metadata.max_key.clone(),
+        checksum: metadata.checksum,
+    }
+}
+
+fn sort_sstables(sstables: &mut [Sstable]) {
+    sstables.sort_by(|a, b| {
+        (
+            a.metadata().min_sequence,
+            a.metadata().max_sequence,
+            &a.metadata().file_name,
+        )
+            .cmp(&(
+                b.metadata().min_sequence,
+                b.metadata().max_sequence,
+                &b.metadata().file_name,
+            ))
+    });
+}
+
+fn merged_rows(
+    merged: BTreeMap<Vec<u8>, BTreeMap<u64, Option<Vec<u8>>>>,
+) -> Vec<TabletSnapshotRow> {
+    merged
+        .into_iter()
+        .map(|(key, versions)| TabletSnapshotRow {
+            key,
+            versions: versions
+                .into_iter()
+                .map(|(sequence, value)| VersionedValue { sequence, value })
+                .collect(),
+        })
+        .collect()
+}
+
+fn retire_obsolete_sstables(
+    manifest: &mut Manifest,
+    manifest_path: &Path,
+    sstable_dir: &Path,
+) -> Result<(), WalBackedError> {
+    if manifest.obsolete_files().is_empty() {
+        return Ok(());
+    }
+
+    for file_name in manifest.obsolete_files().to_vec() {
+        match fs::remove_file(sstable_dir.join(&file_name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ManifestError::from(error).into()),
+        }
+    }
+    sync_directory(sstable_dir).map_err(ManifestError::from)?;
+    manifest.clear_obsolete_files();
+    manifest.publish(manifest_path)?;
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if path.exists() {
+            File::open(path)?.sync_all()?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn merge_snapshot_rows(
@@ -462,6 +611,7 @@ pub enum WalBackedError {
     Manifest(ManifestError),
     Sstable(SstableError),
     NoImmutableMemtable,
+    EmptyCompaction,
     FlushIdentity(String),
     ManifestSstableMismatch(String),
     SnapshotCompositionConflict { sequence: u64 },
@@ -506,6 +656,7 @@ impl fmt::Display for WalBackedError {
             Self::Manifest(error) => write!(f, "tablet manifest failure: {error}"),
             Self::Sstable(error) => write!(f, "tablet SSTable failure: {error}"),
             Self::NoImmutableMemtable => f.write_str("no immutable memtable is available to flush"),
+            Self::EmptyCompaction => f.write_str("L0 compaction produced no MVCC rows"),
             Self::FlushIdentity(message) => write!(f, "failed to derive flush identity: {message}"),
             Self::ManifestSstableMismatch(file) => {
                 write!(f, "manifest metadata does not match SSTable {file}")
