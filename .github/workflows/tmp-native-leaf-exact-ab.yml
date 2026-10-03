@@ -1,0 +1,79 @@
+name: Native leaf exact-base A/B
+
+on:
+  push:
+    branches:
+      - perf/jit-native-leaf-current-main-ab
+    paths:
+      - .github/workflows/tmp-native-leaf-exact-ab.yml
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate A/B harness
+        run: python3 -m unittest scripts/tests/test_nulang_ab_bench.py
+
+      - name: Run exact-base same-CPU paired A/B
+        run: |
+          python3 scripts/nulang_ab_bench.py \
+            --base-ref 4968b097c302bc122b338e9f61a92039240b4060 \
+            --runs 8 \
+            --warmup 1 \
+            --cpu-mode single \
+            --output native-leaf-ab-results.json \
+            --no-default-features \
+            --features native-codegen
+
+      - name: Print promotion-critical results
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path('native-leaf-ab-results.json')
+          if not path.exists():
+              raise SystemExit('A/B result file was not produced')
+          report = json.loads(path.read_text())
+          paired = report.get('paired_comparison', {})
+          critical = [
+              'ab/jit_warm_call_loop_100k',
+              'ab/jit_warm_hot_loop_100k',
+              'ab/enqueue_payload_1',
+              'ab/aot_actor_drain',
+          ]
+          for name in critical:
+              row = paired.get(name)
+              if not row:
+                  print(f'{name}: missing')
+                  continue
+              print(
+                  f"{name}: speedup={row['median_speedup_x']:.4f}x "
+                  f"latency_delta={row['median_latency_change_pct']:+.2f}% "
+                  f"ci95=[{row['speedup_ci95_lower']:.4f}, {row['speedup_ci95_upper']:.4f}] "
+                  f"pairs={row['pairs']}"
+              )
+          PY
+
+      - name: Upload A/B results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: native-leaf-exact-ab
+          path: native-leaf-ab-results.json
+          if-no-files-found: error
