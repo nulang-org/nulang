@@ -335,13 +335,8 @@ impl WalBackedTablet {
         Ok(if found { best_value } else { None })
     }
 
-    /// Read the newest committed value while preserving storage failures.
-    /// Out-of-range keys retain the historical `read_latest` behavior and route
-    /// as absent rather than as a tablet-range error.
+    /// Read the newest committed value while preserving storage and routing failures.
     pub fn read_latest(&self, key: &[u8]) -> Result<Option<&[u8]>, WalBackedError> {
-        if !self.tablet.descriptor().range().contains(key) {
-            return Ok(None);
-        }
         self.read_at(key, self.tablet.current_sequence())
     }
 
