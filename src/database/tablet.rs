@@ -253,9 +253,70 @@ impl TabletWrite {
 pub trait MvccStorage: fmt::Debug {
     fn current_sequence(&self) -> u64;
 
+    /// Oldest snapshot for which this engine can still return a correct result.
+    /// Engines that do not reclaim history may use the default sequence zero.
+    fn oldest_readable_sequence(&self) -> u64 {
+        0
+    }
+
     fn apply_committed(&mut self, sequence: u64, mutations: Vec<TabletMutation>);
 
     fn read_at(&self, key: &[u8], snapshot: u64) -> Option<&[u8]>;
+}
+
+/// Optional lifecycle contract for engines that can reclaim obsolete MVCC state.
+pub trait GarbageCollectingMvccStorage: MvccStorage {
+    fn collect_garbage(&mut self, safe_point: u64) -> MvccGcStats;
+}
+
+/// Observable result of one MVCC garbage-collection pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MvccGcStats {
+    pub safe_point: u64,
+    pub versions_removed: usize,
+    pub keys_removed: usize,
+}
+
+/// Tracks snapshots that must remain readable while transactions or scans run.
+///
+/// A caller normally keeps one tracker per tablet/transaction domain. Reference
+/// counts allow multiple readers to pin the same snapshot independently.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotTracker {
+    active: BTreeMap<u64, usize>,
+}
+
+impl SnapshotTracker {
+    pub fn pin<S: MvccStorage>(
+        &mut self,
+        tablet: &Tablet<S>,
+        snapshot: u64,
+    ) -> Result<(), TabletError> {
+        tablet.validate_snapshot(snapshot)?;
+        *self.active.entry(snapshot).or_default() += 1;
+        Ok(())
+    }
+
+    pub fn unpin(&mut self, snapshot: u64) -> bool {
+        let Some(count) = self.active.get_mut(&snapshot) else {
+            return false;
+        };
+        if *count > 1 {
+            *count -= 1;
+        } else {
+            self.active.remove(&snapshot);
+        }
+        true
+    }
+
+    /// The oldest active snapshot, or the current committed sequence when no
+    /// reader is pinning history. This is the highest safe GC floor.
+    pub fn safe_point(&self, current_sequence: u64) -> u64 {
+        self.active
+            .first_key_value()
+            .map(|(snapshot, _)| *snapshot)
+            .unwrap_or(current_sequence)
+    }
 }
 
 /// One committed value version in the in-memory MVCC prototype.
@@ -274,6 +335,8 @@ pub(crate) struct TabletSnapshotRow {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TabletSnapshotState {
     pub(crate) current_sequence: u64,
+    #[serde(default)]
+    pub(crate) oldest_readable_sequence: u64,
     pub(crate) rows: Vec<TabletSnapshotRow>,
 }
 
@@ -285,12 +348,17 @@ pub(crate) struct TabletSnapshotState {
 #[derive(Debug, Clone, Default)]
 pub struct MemoryMvccStorage {
     current_sequence: u64,
+    oldest_readable_sequence: u64,
     rows: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
 }
 
 impl MvccStorage for MemoryMvccStorage {
     fn current_sequence(&self) -> u64 {
         self.current_sequence
+    }
+
+    fn oldest_readable_sequence(&self) -> u64 {
+        self.oldest_readable_sequence
     }
 
     fn apply_committed(&mut self, sequence: u64, mutations: Vec<TabletMutation>) {
@@ -325,10 +393,57 @@ impl MvccStorage for MemoryMvccStorage {
     }
 }
 
+impl GarbageCollectingMvccStorage for MemoryMvccStorage {
+    fn collect_garbage(&mut self, safe_point: u64) -> MvccGcStats {
+        let safe_point = safe_point.max(self.oldest_readable_sequence);
+        let mut versions_removed = 0_usize;
+        let mut keys_to_remove = Vec::new();
+
+        for (key, versions) in &mut self.rows {
+            let first_newer = versions.partition_point(|version| version.sequence <= safe_point);
+            let Some(anchor_index) = first_newer.checked_sub(1) else {
+                continue;
+            };
+
+            let anchor_is_tombstone = versions[anchor_index].value.is_none();
+            let has_newer_versions = first_newer < versions.len();
+
+            // If absence is already established at the safe point and nothing
+            // newer exists, every retained reader sees this key as absent.
+            if anchor_is_tombstone && !has_newer_versions {
+                versions_removed += versions.len();
+                keys_to_remove.push(key.clone());
+                continue;
+            }
+
+            // Keep exactly one anchor at-or-before the safe point plus every
+            // newer version. The anchor determines the value visible at the
+            // safe point itself.
+            if anchor_index > 0 {
+                versions_removed += anchor_index;
+                versions.drain(..anchor_index);
+            }
+        }
+
+        let keys_removed = keys_to_remove.len();
+        for key in keys_to_remove {
+            self.rows.remove(&key);
+        }
+        self.oldest_readable_sequence = safe_point;
+
+        MvccGcStats {
+            safe_point,
+            versions_removed,
+            keys_removed,
+        }
+    }
+}
+
 impl MemoryMvccStorage {
     fn snapshot_state(&self) -> TabletSnapshotState {
         TabletSnapshotState {
             current_sequence: self.current_sequence,
+            oldest_readable_sequence: self.oldest_readable_sequence,
             rows: self
                 .rows
                 .iter()
@@ -341,6 +456,10 @@ impl MemoryMvccStorage {
     }
 
     fn restore_snapshot(state: TabletSnapshotState) -> Result<Self, TabletError> {
+        if state.oldest_readable_sequence > state.current_sequence {
+            return Err(TabletError::InvalidSnapshotHistory);
+        }
+
         let mut rows = BTreeMap::new();
         for row in state.rows {
             let mut previous = 0_u64;
@@ -360,6 +479,7 @@ impl MemoryMvccStorage {
 
         Ok(Self {
             current_sequence: state.current_sequence,
+            oldest_readable_sequence: state.oldest_readable_sequence,
             rows,
         })
     }
@@ -419,6 +539,10 @@ impl<S: MvccStorage> Tablet<S> {
 
     pub fn current_sequence(&self) -> u64 {
         self.storage.current_sequence()
+    }
+
+    pub fn oldest_readable_sequence(&self) -> u64 {
+        self.storage.oldest_readable_sequence()
     }
 
     pub fn prepare_write(
@@ -485,6 +609,24 @@ impl<S: MvccStorage> Tablet<S> {
         Ok(())
     }
 
+    fn validate_snapshot(&self, snapshot: u64) -> Result<(), TabletError> {
+        let committed_sequence = self.current_sequence();
+        if snapshot > committed_sequence {
+            return Err(TabletError::SnapshotAhead {
+                committed: committed_sequence,
+                requested: snapshot,
+            });
+        }
+        let oldest_readable = self.oldest_readable_sequence();
+        if snapshot < oldest_readable {
+            return Err(TabletError::SnapshotCollected {
+                oldest_readable,
+                requested: snapshot,
+            });
+        }
+        Ok(())
+    }
+
     /// Atomically apply one prevalidated write to the local MVCC state.
     ///
     /// All ownership, predecessor, and key-range checks happen before the
@@ -544,15 +686,9 @@ impl<S: MvccStorage> Tablet<S> {
         Ok(())
     }
 
-    /// Read one key at an already committed snapshot sequence.
+    /// Read one key at an already committed and retained snapshot sequence.
     pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
-        let committed_sequence = self.current_sequence();
-        if snapshot > committed_sequence {
-            return Err(TabletError::SnapshotAhead {
-                committed: committed_sequence,
-                requested: snapshot,
-            });
-        }
+        self.validate_snapshot(snapshot)?;
         if !self.descriptor.range.contains(key) {
             return Err(TabletError::KeyOutsideTabletRange);
         }
@@ -564,6 +700,23 @@ impl<S: MvccStorage> Tablet<S> {
     /// callers that need a routing error can use `read_at`.
     pub fn read_latest(&self, key: &[u8]) -> Option<&[u8]> {
         self.read_at(key, self.current_sequence()).ok().flatten()
+    }
+}
+
+impl<S: GarbageCollectingMvccStorage> Tablet<S> {
+    /// Reclaim versions that cannot affect reads at or above `safe_point`.
+    ///
+    /// The safe point never moves backwards. A caller should normally derive it
+    /// from `SnapshotTracker::safe_point` after pinning every active reader.
+    pub fn collect_garbage(&mut self, safe_point: u64) -> Result<MvccGcStats, TabletError> {
+        let committed_sequence = self.current_sequence();
+        if safe_point > committed_sequence {
+            return Err(TabletError::SnapshotAhead {
+                committed: committed_sequence,
+                requested: safe_point,
+            });
+        }
+        Ok(self.storage.collect_garbage(safe_point))
     }
 }
 
@@ -602,6 +755,10 @@ pub enum TabletError {
     },
     SnapshotAhead {
         committed: u64,
+        requested: u64,
+    },
+    SnapshotCollected {
+        oldest_readable: u64,
         requested: u64,
     },
     InvalidSnapshotHistory,
@@ -660,6 +817,13 @@ impl fmt::Display for TabletError {
             } => write!(
                 f,
                 "snapshot {requested} is ahead of committed tablet sequence {committed}"
+            ),
+            Self::SnapshotCollected {
+                oldest_readable,
+                requested,
+            } => write!(
+                f,
+                "snapshot {requested} is older than retained MVCC history starting at {oldest_readable}"
             ),
             Self::InvalidSnapshotHistory => {
                 f.write_str("tablet snapshot contains invalid MVCC version history")
