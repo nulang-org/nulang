@@ -121,11 +121,7 @@ fn limited_scan_counts_live_rows_not_tombstoned_candidates() {
     let mut storage = ManagedLsmStorage::open(&dir).unwrap();
     storage.apply_committed(
         1,
-        vec![
-            put(b"a", b"a1"),
-            put(b"b", b"b1"),
-            put(b"c", b"c1"),
-        ],
+        vec![put(b"a", b"a1"), put(b"b", b"b1"), put(b"c", b"c1")],
     );
     storage.flush().unwrap().unwrap();
     storage.apply_committed(
