@@ -1,9 +1,10 @@
-//! Crash-safe manifest for durable NuDB SSTable flush artifacts.
+//! Crash-safe manifest for durable NuDB SSTable artifacts.
 //!
-//! The manifest is intentionally not yet part of tablet recovery. It records
-//! files that have crossed their own durability boundary so a later recovery
-//! slice can promote them without changing today's WAL/checkpoint authority.
+//! The manifest is the authority for immutable SSTables. Compaction publishes
+//! a replacement entry and persisted obsolete-file intent in one atomic
+//! manifest update; physical source-file retirement is retried until durable.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -31,12 +32,15 @@ struct DiskManifest {
     version: u16,
     tablet_id: u64,
     entries: Vec<ManifestEntry>,
+    #[serde(default)]
+    obsolete_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Manifest {
     tablet_id: u64,
     entries: Vec<ManifestEntry>,
+    obsolete_files: Vec<String>,
 }
 
 impl Manifest {
@@ -44,6 +48,7 @@ impl Manifest {
         Self {
             tablet_id,
             entries: Vec::new(),
+            obsolete_files: Vec::new(),
         }
     }
 
@@ -85,10 +90,11 @@ impl Manifest {
                 presented: disk.tablet_id,
             });
         }
-        validate_entries(tablet_id, &disk.entries)?;
+        validate_manifest(tablet_id, &disk.entries, &disk.obsolete_files)?;
         Ok(Self {
             tablet_id,
             entries: disk.entries,
+            obsolete_files: disk.obsolete_files,
         })
     }
 
@@ -96,8 +102,15 @@ impl Manifest {
         &self.entries
     }
 
+    pub(crate) fn obsolete_files(&self) -> &[String] {
+        &self.obsolete_files
+    }
+
     pub(crate) fn register(&mut self, entry: ManifestEntry) -> Result<bool, ManifestError> {
         validate_entry(self.tablet_id, &entry)?;
+        if self.obsolete_files.iter().any(|name| name == &entry.file_name) {
+            return Err(ManifestError::ActiveObsoleteOverlap(entry.file_name));
+        }
         if let Some(existing) = self
             .entries
             .iter()
@@ -109,22 +122,65 @@ impl Manifest {
             return Err(ManifestError::ConflictingEntry(entry.file_name));
         }
         self.entries.push(entry);
-        self.entries.sort_by(|a, b| {
-            (a.min_sequence, a.max_sequence, &a.file_name).cmp(&(
-                b.min_sequence,
-                b.max_sequence,
-                &b.file_name,
-            ))
-        });
+        sort_entries(&mut self.entries);
         Ok(true)
     }
 
+    /// Atomically describe a compaction result before any source file is
+    /// physically retired. Every source must currently be authoritative.
+    pub(crate) fn replace_entries(
+        &mut self,
+        source_files: &[String],
+        replacement: ManifestEntry,
+    ) -> Result<(), ManifestError> {
+        validate_entry(self.tablet_id, &replacement)?;
+        if source_files.is_empty() {
+            return Err(ManifestError::EmptyReplacementSet);
+        }
+        let source_set: BTreeSet<&str> = source_files.iter().map(String::as_str).collect();
+        if source_set.len() != source_files.len() {
+            return Err(ManifestError::DuplicateReplacementSource);
+        }
+        for source in &source_set {
+            validate_file_name(source)?;
+            if !self.entries.iter().any(|entry| entry.file_name == *source) {
+                return Err(ManifestError::MissingReplacementSource((*source).to_owned()));
+            }
+        }
+        if !source_set.contains(replacement.file_name.as_str())
+            && self
+                .entries
+                .iter()
+                .any(|entry| entry.file_name == replacement.file_name)
+        {
+            return Err(ManifestError::ConflictingEntry(replacement.file_name));
+        }
+
+        self.entries
+            .retain(|entry| !source_set.contains(entry.file_name.as_str()));
+        self.entries.push(replacement.clone());
+        sort_entries(&mut self.entries);
+
+        for source in source_files {
+            if source != &replacement.file_name && !self.obsolete_files.contains(source) {
+                self.obsolete_files.push(source.clone());
+            }
+        }
+        self.obsolete_files.sort();
+        validate_manifest(self.tablet_id, &self.entries, &self.obsolete_files)
+    }
+
+    pub(crate) fn clear_obsolete_files(&mut self) {
+        self.obsolete_files.clear();
+    }
+
     pub(crate) fn publish(&self, path: &Path) -> Result<(), ManifestError> {
-        validate_entries(self.tablet_id, &self.entries)?;
+        validate_manifest(self.tablet_id, &self.entries, &self.obsolete_files)?;
         let disk = DiskManifest {
             version: MANIFEST_VERSION,
             tablet_id: self.tablet_id,
             entries: self.entries.clone(),
+            obsolete_files: self.obsolete_files.clone(),
         };
         let payload = serde_json::to_vec(&disk)
             .map_err(|error| ManifestError::Serialization(error.to_string()))?;
@@ -171,13 +227,55 @@ impl Manifest {
     }
 }
 
+fn sort_entries(entries: &mut [ManifestEntry]) {
+    entries.sort_by(|a, b| {
+        (a.min_sequence, a.max_sequence, &a.file_name).cmp(&(
+            b.min_sequence,
+            b.max_sequence,
+            &b.file_name,
+        ))
+    });
+}
+
+fn validate_manifest(
+    tablet_id: u64,
+    entries: &[ManifestEntry],
+    obsolete_files: &[String],
+) -> Result<(), ManifestError> {
+    validate_entries(tablet_id, entries)?;
+    let active: BTreeSet<&str> = entries.iter().map(|entry| entry.file_name.as_str()).collect();
+    let mut obsolete = BTreeSet::new();
+    for file_name in obsolete_files {
+        validate_file_name(file_name)?;
+        if !obsolete.insert(file_name.as_str()) {
+            return Err(ManifestError::DuplicateObsoleteFile(file_name.clone()));
+        }
+        if active.contains(file_name.as_str()) {
+            return Err(ManifestError::ActiveObsoleteOverlap(file_name.clone()));
+        }
+    }
+    Ok(())
+}
+
 fn validate_entries(tablet_id: u64, entries: &[ManifestEntry]) -> Result<(), ManifestError> {
-    let mut names = std::collections::BTreeSet::new();
+    let mut names = BTreeSet::new();
     for entry in entries {
         validate_entry(tablet_id, entry)?;
         if !names.insert(entry.file_name.as_str()) {
             return Err(ManifestError::DuplicateEntry(entry.file_name.clone()));
         }
+    }
+    Ok(())
+}
+
+fn validate_file_name(file_name: &str) -> Result<(), ManifestError> {
+    if file_name.is_empty()
+        || file_name.contains('/')
+        || file_name.contains('\\')
+        || file_name == "."
+        || file_name == ".."
+    {
+        return Err(ManifestError::InvalidFileName(file_name.to_owned()));
     }
     Ok(())
 }
@@ -189,14 +287,7 @@ fn validate_entry(tablet_id: u64, entry: &ManifestEntry) -> Result<(), ManifestE
             presented: entry.tablet_id,
         });
     }
-    if entry.file_name.is_empty()
-        || entry.file_name.contains('/')
-        || entry.file_name.contains('\\')
-        || entry.file_name == "."
-        || entry.file_name == ".."
-    {
-        return Err(ManifestError::InvalidFileName(entry.file_name.clone()));
-    }
+    validate_file_name(&entry.file_name)?;
     if entry.ownership_epoch == 0
         || entry.min_sequence == 0
         || entry.max_sequence < entry.min_sequence
@@ -213,6 +304,7 @@ fn appended_path(path: &Path, suffix: &str) -> PathBuf {
     value.push(suffix);
     PathBuf::from(value)
 }
+
 fn sync_parent_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -246,8 +338,14 @@ pub enum ManifestError {
     InvalidEntry(String),
     DuplicateEntry(String),
     ConflictingEntry(String),
+    EmptyReplacementSet,
+    DuplicateReplacementSource,
+    MissingReplacementSource(String),
+    DuplicateObsoleteFile(String),
+    ActiveObsoleteOverlap(String),
     Serialization(String),
 }
+
 impl From<io::Error> for ManifestError {
     fn from(error: io::Error) -> Self {
         Self::Io {
@@ -256,6 +354,7 @@ impl From<io::Error> for ManifestError {
         }
     }
 }
+
 impl fmt::Display for ManifestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "NuDB manifest error: {self:?}")
@@ -268,7 +367,9 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
+
     static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
+
     fn temp_path() -> PathBuf {
         std::env::temp_dir().join(format!(
             "nulang_nudb_manifest_{}_{}.manifest",
@@ -276,19 +377,21 @@ mod tests {
             NEXT_TEST.fetch_add(1, Ordering::Relaxed)
         ))
     }
+
     fn entry(name: &str, checksum: u8) -> ManifestEntry {
         ManifestEntry {
             file_name: name.to_owned(),
             tablet_id: 42,
             ownership_epoch: 7,
-            min_sequence: 1,
-            max_sequence: 3,
-            row_count: 2,
+            min_sequence: checksum as u64,
+            max_sequence: checksum as u64,
+            row_count: 1,
             min_key: b"a".to_vec(),
             max_key: b"z".to_vec(),
             checksum: [checksum; 32],
         }
     }
+
     #[test]
     fn publish_load_and_deduplicate_entries() {
         let path = temp_path();
@@ -301,8 +404,44 @@ mod tests {
         let reopened = Manifest::load_or_empty(&path, 42).unwrap();
         assert_eq!(reopened.entries().len(), 1);
         assert_eq!(reopened.entries()[0].file_name, "0001.sst");
+        assert!(reopened.obsolete_files().is_empty());
         let _ = fs::remove_file(path);
     }
+
+    #[test]
+    fn replacement_is_atomic_with_obsolete_intent() {
+        let path = temp_path();
+        let _ = fs::remove_file(&path);
+        let mut manifest = Manifest::empty(42);
+        for sequence in 1..=4 {
+            manifest
+                .register(entry(&format!("{sequence:04}.sst"), sequence))
+                .unwrap();
+        }
+        let sources = (1..=4)
+            .map(|sequence| format!("{sequence:04}.sst"))
+            .collect::<Vec<_>>();
+        let mut replacement = entry("compact.sst", 9);
+        replacement.min_sequence = 1;
+        replacement.max_sequence = 4;
+        manifest.replace_entries(&sources, replacement).unwrap();
+        manifest.publish(&path).unwrap();
+
+        let reopened = Manifest::load_or_empty(&path, 42).unwrap();
+        assert_eq!(reopened.entries().len(), 1);
+        assert_eq!(reopened.entries()[0].file_name, "compact.sst");
+        assert_eq!(reopened.obsolete_files(), sources.as_slice());
+
+        let mut cleared = reopened;
+        cleared.clear_obsolete_files();
+        cleared.publish(&path).unwrap();
+        assert!(Manifest::load_or_empty(&path, 42)
+            .unwrap()
+            .obsolete_files()
+            .is_empty());
+        let _ = fs::remove_file(path);
+    }
+
     #[test]
     fn duplicate_name_with_different_identity_fails_closed() {
         let mut manifest = Manifest::empty(42);
@@ -312,6 +451,7 @@ mod tests {
             ManifestError::ConflictingEntry("0001.sst".to_owned())
         );
     }
+
     #[test]
     fn checksum_corruption_fails_closed() {
         let path = temp_path();
