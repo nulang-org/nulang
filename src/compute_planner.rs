@@ -158,7 +158,10 @@ pub fn plan_vector_loop(
     let (vector_iterations, scalar_tail, requires_runtime_tail, requires_runtime_bounds_check) =
         match iteration.extent {
             LoopExtent::Static(count) => {
-                let end = start + count;
+                let end = iteration
+                    .end_exclusive()?
+                    .expect("static iteration spaces have a concrete end")
+                    as u64;
                 if end > axis_extent {
                     return Err(ComputePlannerError::StaticRangeOutOfBounds {
                         axis,
