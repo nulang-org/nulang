@@ -208,10 +208,7 @@ impl NativeFunctionPlan {
     pub fn supports_unboxed_int_path(&self) -> bool {
         self.constraints.is_empty()
             && self.captures.is_empty()
-            && self
-                .params
-                .iter()
-                .all(|repr| *repr == NativeValueRepr::I64)
+            && self.params.iter().all(|repr| *repr == NativeValueRepr::I64)
             && matches!(self.ret, None | Some(NativeValueRepr::I64))
     }
 }
