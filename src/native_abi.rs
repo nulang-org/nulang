@@ -81,6 +81,7 @@ pub type NativeActorEntry = unsafe extern "C" fn(*mut NativeActorContext) -> u32
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Type;
 
     #[test]
     fn native_actor_context_has_stable_field_order() {
@@ -106,5 +107,57 @@ mod tests {
             assert_eq!(NativeActorStatus::from_raw(status as u32), Some(status));
         }
         assert_eq!(NativeActorStatus::from_raw(u32::MAX), None);
+    }
+
+    #[test]
+    fn typed_internal_values_have_explicit_native_representations() {
+        assert_eq!(NativeValueRepr::for_type(&Type::int()), NativeValueRepr::I64);
+        assert_eq!(
+            NativeValueRepr::for_type(&Type::float()),
+            NativeValueRepr::F64
+        );
+        assert_eq!(
+            NativeValueRepr::for_type(&Type::bool()),
+            NativeValueRepr::Bool
+        );
+        assert_eq!(
+            NativeValueRepr::for_type(&Type::string()),
+            NativeValueRepr::Tagged
+        );
+    }
+
+    #[test]
+    fn runtime_boundaries_force_boxed_values() {
+        for boundary in [
+            NativeBoundary::ActorRuntime,
+            NativeBoundary::EffectRuntime,
+            NativeBoundary::DurableRuntime,
+            NativeBoundary::Ffi,
+        ] {
+            assert_eq!(
+                boundary.representation_for(&Type::int()),
+                NativeValueRepr::Tagged
+            );
+            assert_eq!(
+                boundary.representation_for(&Type::float()),
+                NativeValueRepr::Tagged
+            );
+        }
+    }
+
+    #[test]
+    fn internal_boundary_preserves_typed_native_representation() {
+        assert_eq!(
+            NativeBoundary::Internal.representation_for(&Type::int()),
+            NativeValueRepr::I64
+        );
+        assert_eq!(
+            NativeBoundary::Internal.representation_for(&Type::float()),
+            NativeValueRepr::F64
+        );
+        assert_eq!(
+            NativeBoundary::Internal.representation_for(&Type::bool()),
+            NativeValueRepr::Bool
+        );
     }
 }
