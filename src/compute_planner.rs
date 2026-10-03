@@ -52,7 +52,6 @@ pub struct VectorLoopPlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputePlannerError {
-    NotImplemented,
     AxisOutOfBounds { axis: usize, rank: usize },
     ElementTypeMismatch {
         layout: ScalarType,
@@ -72,7 +71,6 @@ pub enum ComputePlannerError {
 impl fmt::Display for ComputePlannerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotImplemented => write!(f, "layout-aware vector planning is not implemented"),
             Self::AxisOutOfBounds { axis, rank } => {
                 write!(f, "vector axis {axis} is outside layout rank {rank}")
             }
@@ -104,13 +102,101 @@ impl fmt::Display for ComputePlannerError {
 
 impl std::error::Error for ComputePlannerError {}
 
+/// Validate a layout/iteration/vector combination and derive the information a
+/// backend needs to construct its vector loop.
+///
+/// This function answers *legality and partitioning*, not profitability. A
+/// backend or cost model may still decide that a legal vector loop is too small
+/// to be worth lowering.
 pub fn plan_vector_loop(
-    _layout: &Layout,
-    _axis: usize,
-    _iteration: IterationSpace,
-    _vector: VectorType,
+    layout: &Layout,
+    axis: usize,
+    iteration: IterationSpace,
+    vector: VectorType,
 ) -> Result<VectorLoopPlan, ComputePlannerError> {
-    Err(ComputePlannerError::NotImplemented)
+    if axis >= layout.rank() {
+        return Err(ComputePlannerError::AxisOutOfBounds {
+            axis,
+            rank: layout.rank(),
+        });
+    }
+
+    if layout.element() != vector.element {
+        return Err(ComputePlannerError::ElementTypeMismatch {
+            layout: layout.element(),
+            vector: vector.element,
+        });
+    }
+
+    if iteration.step != 1 {
+        return Err(ComputePlannerError::UnsupportedStep(iteration.step));
+    }
+
+    if iteration.start < 0 {
+        return Err(ComputePlannerError::NegativeStart(iteration.start));
+    }
+
+    let stride = layout.strides()[axis];
+    if stride != 1 {
+        return Err(ComputePlannerError::NonContiguousAxis { axis, stride });
+    }
+
+    let start = iteration.start as u64;
+    let axis_extent = layout.shape()[axis];
+    let width = PlannedVectorWidth::from(vector.width);
+    let min_lanes = u64::from(width.min_lanes());
+    let min_vector_bytes = u64::from(vector.element.byte_width()) * min_lanes;
+
+    let (vector_iterations, scalar_tail, requires_runtime_tail, requires_runtime_bounds_check) =
+        match iteration.extent {
+            LoopExtent::Static(count) => {
+                let end = start + count;
+                if end > axis_extent {
+                    return Err(ComputePlannerError::StaticRangeOutOfBounds {
+                        axis,
+                        start,
+                        end,
+                        axis_extent,
+                    });
+                }
+
+                if width.is_scalable() {
+                    (None, None, true, false)
+                } else {
+                    (
+                        Some(count / min_lanes),
+                        Some((count % min_lanes) as u16),
+                        false,
+                        false,
+                    )
+                }
+            }
+            LoopExtent::Dynamic(_) => (None, None, true, true),
+        };
+
+    // `Layout::alignment` is the guaranteed base-pointer alignment. A fixed
+    // vector load is guaranteed aligned only when both the base guarantee and
+    // the byte offset of the first logical element are multiples of the vector
+    // byte width. For scalable vectors the eventual register width is target
+    // dependent, so no stronger guarantee is claimed here.
+    let start_is_vector_aligned = if width.is_scalable() {
+        false
+    } else {
+        let start_offset_bytes = start * u64::from(vector.element.byte_width());
+        u64::from(layout.alignment()) % min_vector_bytes == 0
+            && start_offset_bytes % min_vector_bytes == 0
+    };
+
+    Ok(VectorLoopPlan {
+        axis,
+        width,
+        min_vector_bytes,
+        vector_iterations,
+        scalar_tail,
+        requires_runtime_tail,
+        requires_runtime_bounds_check,
+        start_is_vector_aligned,
+    })
 }
 
 #[cfg(test)]
