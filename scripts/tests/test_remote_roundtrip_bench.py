@@ -65,7 +65,10 @@ class RemoteRoundTripBenchTests(unittest.TestCase):
         self.assertEqual("/usr/bin/erlc", compile_command[0])
         self.assertIn("remote_roundtrip_baseline.erl", compile_command[-1])
         self.assertEqual("/usr/bin/erl", commands["erlang"][0])
-        self.assertIn("remote_roundtrip_baseline:run(1000, 100)", commands["erlang"])
+        self.assertIn(
+            "remote_roundtrip_baseline:run(1000, 100)",
+            " ".join(commands["erlang"]),
+        )
         self.assertNotIn("escript", " ".join(commands["erlang"]))
 
 
