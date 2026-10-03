@@ -75,11 +75,11 @@ fn flushed_sstable_remains_visible_after_resident_memtable_eviction() {
     flush_current(&mut tablet);
 
     assert_eq!(tablet.immutable_memtable_count(), 0);
-    assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
+    assert_eq!(tablet.read_at(b"k", 1).unwrap().as_deref(), Some(&b"v1"[..]));
 
     commit_put(&mut tablet, b"k", b"v2");
-    assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
-    assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
+    assert_eq!(tablet.read_at(b"k", 1).unwrap().as_deref(), Some(&b"v1"[..]));
+    assert_eq!(tablet.read_at(b"k", 2).unwrap().as_deref(), Some(&b"v2"[..]));
     cleanup(&path);
 }
 
@@ -95,9 +95,9 @@ fn newer_sstable_tombstone_wins_without_hiding_older_snapshot() {
     flush_current(&mut tablet);
 
     assert_eq!(tablet.immutable_memtable_count(), 0);
-    assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
+    assert_eq!(tablet.read_at(b"k", 1).unwrap().as_deref(), Some(&b"v1"[..]));
     assert_eq!(tablet.read_at(b"k", 2).unwrap(), None);
-    assert_eq!(tablet.read_latest(b"k"), None);
+    assert_eq!(tablet.read_latest(b"k").unwrap(), None);
     cleanup(&path);
 }
 
@@ -114,7 +114,10 @@ fn reopen_serves_manifest_sstable_without_rehydrating_memtable() {
     let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert_eq!(reopened.current_sequence(), 1);
     assert_eq!(reopened.immutable_memtable_count(), 0);
-    assert_eq!(reopened.read_latest(b"k"), Some(&b"v1"[..]));
+    assert_eq!(
+        reopened.read_latest(b"k").unwrap().as_deref(),
+        Some(&b"v1"[..])
+    );
     cleanup(&path);
 }
 
@@ -135,7 +138,13 @@ fn checkpoint_composes_sstable_and_memory_before_wal_reclamation() {
 
     let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert_eq!(reopened.current_sequence(), 2);
-    assert_eq!(reopened.read_latest(b"a"), Some(&b"from-sstable"[..]));
-    assert_eq!(reopened.read_latest(b"b"), Some(&b"from-memtable"[..]));
+    assert_eq!(
+        reopened.read_latest(b"a").unwrap().as_deref(),
+        Some(&b"from-sstable"[..])
+    );
+    assert_eq!(
+        reopened.read_latest(b"b").unwrap().as_deref(),
+        Some(&b"from-memtable"[..])
+    );
     cleanup(&path);
 }
