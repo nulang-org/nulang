@@ -212,6 +212,11 @@ name = "nulang-shard-bench"
 path = "src/bin/nulang_shard_bench.rs"
 required-features = ["savina-bench"]
 
+[[bin]]
+name = "nulang-remote-roundtrip"
+path = "src/bin/nulang_remote_roundtrip.rs"
+required-features = ["tcp"]
+
 [profile.release]
 opt-level = 3
 lto = true
