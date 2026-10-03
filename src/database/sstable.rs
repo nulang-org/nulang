@@ -348,8 +348,7 @@ impl Sstable {
         let min_sequence = read_u64(data, &mut cursor, path)?;
         let max_sequence = read_u64(data, &mut cursor, path)?;
         let key_count = read_count_u64(data, &mut cursor, path, "key count")?;
-        let declared_version_count =
-            read_count_u64(data, &mut cursor, path, "version count")?;
+        let declared_version_count = read_count_u64(data, &mut cursor, path, "version count")?;
         if generation == 0 || min_sequence == 0 || min_sequence > max_sequence {
             return Err(SstableError::CorruptTable {
                 path: path.to_path_buf(),
