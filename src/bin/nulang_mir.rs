@@ -48,6 +48,11 @@ where
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--phase=") {
+            phase = parse_phase(value)?;
+            continue;
+        }
+
         match arg.as_str() {
             "--phase" => {
                 let value = args
@@ -60,9 +65,6 @@ where
                 if input.replace(arg).is_some() {
                     return Err("only one input file may be supplied".to_string());
                 }
-            }
-            _ if arg.starts_with("--phase=") => {
-                phase = parse_phase(&arg["--phase=".len()..])?;
             }
             _ if arg.starts_with('-') => return Err(format!("unknown option '{arg}'")),
             _ => {
@@ -86,8 +88,9 @@ fn usage() -> &'static str {
 
 fn read_input(path: Option<&str>) -> Result<String, String> {
     match path {
-        Some(path) if path != "-" => fs::read_to_string(path)
-            .map_err(|error| format!("failed to read '{path}': {error}")),
+        Some(path) if path != "-" => {
+            fs::read_to_string(path).map_err(|error| format!("failed to read '{path}': {error}"))
+        }
         _ => {
             let mut source = String::new();
             io::stdin()
@@ -135,7 +138,11 @@ fn render_function(out: &mut String, function: &mir::Function) {
         .map(|id| format!("%{}", id.0))
         .collect::<Vec<_>>()
         .join(", ");
-    let _ = writeln!(out, "\nfn {}({params}) -> {:?} {{", function.name, function.ret);
+    let _ = writeln!(
+        out,
+        "\nfn {}({params}) -> {:?} {{",
+        function.name, function.ret
+    );
 
     for block in &function.blocks {
         let _ = writeln!(out, "  bb{}:", block.id.0);
@@ -284,7 +291,10 @@ mod tests {
                 })
             })
         });
-        assert!(before_has_binary, "lowering should expose the unfused binary op");
+        assert!(
+            before_has_binary,
+            "lowering should expose the unfused binary op"
+        );
 
         nulang::mir_codegen::compile_mir(&mut module, "mir-inspect-test")
             .expect("MIR optimizer/codegen must succeed");
