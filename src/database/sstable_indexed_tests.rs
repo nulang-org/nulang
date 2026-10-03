@@ -15,7 +15,7 @@ fn temp_path(name: &str) -> PathBuf {
 }
 
 #[test]
-fn declared_payload_length_is_rejected_before_read_allocation_when_file_is_truncated() {
+fn test_declared_payload_length_is_rejected_before_read_allocation_when_file_is_truncated() {
     let path = temp_path("declared-length");
     let _ = fs::remove_file(&path);
 
@@ -25,7 +25,10 @@ fn declared_payload_length_is_rejected_before_read_allocation_when_file_is_trunc
     bytes.extend_from_slice(&4096_u32.to_le_bytes());
     fs::write(&path, bytes).unwrap();
 
-    assert_eq!(IndexedSstable::open(&path).unwrap_err(), SstableError::InvalidLength);
+    assert_eq!(
+        IndexedSstable::open(&path).unwrap_err(),
+        SstableError::InvalidLength
+    );
 
     let _ = fs::remove_file(path);
 }
