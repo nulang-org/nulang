@@ -14,4 +14,6 @@ pub mod wal;
 pub mod wal_batch;
 
 #[cfg(test)]
+mod compaction_tests;
+#[cfg(test)]
 mod interruption;
