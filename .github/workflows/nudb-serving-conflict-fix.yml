@@ -1,0 +1,91 @@
+name: Temporary NuDB serving conflict fix
+
+on:
+  push:
+    branches:
+      - feat/nudb-sstable-v2-serving
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/nudb-sstable-v2-serving
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Patch fail-closed serving reads
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path('src/database/store.rs')
+          text = path.read_text()
+
+          old = '''            if !found || candidate.sequence > best_sequence {
+              found = true;
+              best_sequence = candidate.sequence;
+              best_value = candidate.value;
+          }
+'''
+          new = '''            if !found || candidate.sequence > best_sequence {
+              found = true;
+              best_sequence = candidate.sequence;
+              best_value = candidate.value;
+          } else if candidate.sequence == best_sequence && candidate.value != best_value {
+              return Err(WalBackedError::ReadConflict {
+                  sequence: best_sequence,
+              });
+          }
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one read winner block, found {text.count(old)}')
+          text = text.replace(old, new)
+
+          old = '''    ManifestSstableMismatch(String),
+    SnapshotCompositionConflict { sequence: u64 },
+'''
+          new = '''    ManifestSstableMismatch(String),
+    ReadConflict { sequence: u64 },
+    SnapshotCompositionConflict { sequence: u64 },
+'''
+          if text.count(old) != 1:
+              raise SystemExit('error enum anchor mismatch')
+          text = text.replace(old, new)
+
+          old = '''            Self::ManifestSstableMismatch(file) => {
+              write!(f, "manifest metadata does not match SSTable {file}")
+          }
+          Self::SnapshotCompositionConflict { sequence } => write!(
+'''
+          new = '''            Self::ManifestSstableMismatch(file) => {
+              write!(f, "manifest metadata does not match SSTable {file}")
+          }
+          Self::ReadConflict { sequence } => write!(
+              f,
+              "conflicting MVCC values while reading at sequence {sequence}"
+          ),
+          Self::SnapshotCompositionConflict { sequence } => write!(
+'''
+          if text.count(old) != 1:
+              raise SystemExit('display anchor mismatch')
+          text = text.replace(old, new)
+          path.write_text(text)
+      - name: Format
+        run: cargo fmt --all
+      - name: Run serving regressions
+        run: cargo test --locked --no-default-features --lib database::sstable_v2_serving_regression_tests
+      - name: Commit fix and remove temporary workflow
+        run: |
+          rm .github/workflows/nudb-serving-conflict-fix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/database/store.rs src/database/mod.rs src/database/sstable_v2_serving_regression_tests.rs .github/workflows/nudb-serving-conflict-fix.yml
+          git commit -m "fix(database): fail closed on serving conflicts"
+          git push origin HEAD:feat/nudb-sstable-v2-serving
