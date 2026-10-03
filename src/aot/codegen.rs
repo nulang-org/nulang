@@ -462,6 +462,7 @@ fn stmt_rvalue_uses(op: &mir::RValue) -> Vec<mir::LocalId> {
             out.push(*a);
             out.push(*b);
         }
+        mir::RValue::Intrinsic(intrinsic) => out.extend_from_slice(&intrinsic.args),
         mir::RValue::StringEq(a, b) | mir::RValue::StrConcat(a, b) => {
             out.push(*a);
             out.push(*b);
@@ -2400,6 +2401,42 @@ fn compile_rvalue(
 
         mir::RValue::Unary(op, operand) => {
             compile_unary(builder, *op, *operand, type_meta, helpers, local_vals, mode)
+        }
+
+        mir::RValue::Intrinsic(intrinsic) => {
+            let args = intrinsic
+                .args
+                .iter()
+                .map(|id| {
+                    let reg = mir::FunctionBuilder::LOCAL_BASE + id.0;
+                    local_vals.get(&reg).copied().ok_or_else(|| {
+                        AotCompileError::Internal(format!(
+                            "intrinsic arg local {} uninitialized",
+                            id.0
+                        ))
+                    })
+                })
+                .collect::<AotResult<Vec<_>>>()?;
+            let representation = match mode {
+                CompileMode::Boxed => {
+                    crate::compiler_intrinsics::NativeIntegerRepresentation::TaggedInt48
+                }
+                CompileMode::Unboxed => {
+                    crate::compiler_intrinsics::NativeIntegerRepresentation::RawI64
+                }
+            };
+            crate::compiler_intrinsics::lower_cranelift_integer(
+                builder,
+                intrinsic.op,
+                &args,
+                representation,
+            )
+            .map_err(|e| {
+                AotCompileError::Internal(format!(
+                    "invalid compiler intrinsic '{}': {e}",
+                    intrinsic.op.stable_name()
+                ))
+            })
         }
 
         mir::RValue::Call { func, args } => {

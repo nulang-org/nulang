@@ -1006,6 +1006,15 @@ impl MirCodegen {
                     }
                 }
             }
+            mir::RValue::Intrinsic(intrinsic) => {
+                return Err(compile_err(
+                    format!(
+                        "compiler intrinsic '{}' is not supported by the bytecode backend",
+                        intrinsic.op.stable_name()
+                    ),
+                    Span::default(),
+                ));
+            }
             mir::RValue::StringEq(l, r) => {
                 let _rl = self.local_reg(*l);
                 let _rr = self.local_reg(*r);
@@ -1785,6 +1794,17 @@ fn fold_rvalue(
                 }
             }
         }
+        RValue::Intrinsic(intrinsic) => {
+            let constants = intrinsic
+                .args
+                .iter()
+                .map(|arg| const_locals.get(arg).cloned())
+                .collect::<Option<Vec<_>>>();
+            match constants.and_then(|args| intrinsic.fold_constants(&args)) {
+                Some(value) => RValue::Const(value),
+                None => RValue::Intrinsic(intrinsic),
+            }
+        }
         RValue::StrConcat(a, b) => match (const_locals.get(&a), const_locals.get(&b)) {
             (Some(CString(sa)), Some(CString(sb))) => RValue::Const(CString(sa.clone() + sb)),
             _ => RValue::StrConcat(a, b),
@@ -2172,6 +2192,11 @@ fn rvalue_reads(rv: &mir::RValue, out: &mut HashSet<mir::LocalId>) {
             out.insert(*arr);
             out.insert(*idx);
         }
+        RValue::Intrinsic(intrinsic) => {
+            for x in &intrinsic.args {
+                out.insert(*x);
+            }
+        }
         RValue::ArrayLit(xs) | RValue::Tuple(xs) => {
             for x in xs {
                 out.insert(*x);
@@ -2385,6 +2410,11 @@ fn rvalue_uses(op: &mir::RValue) -> Vec<(usize, UseKind)> {
         Binary(_, l, r) => {
             ro(&mut out, *l);
             ro(&mut out, *r);
+        }
+        Intrinsic(intrinsic) => {
+            for a in &intrinsic.args {
+                ro(&mut out, *a);
+            }
         }
         StringEq(l, r) => {
             ro(&mut out, *l);

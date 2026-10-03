@@ -2654,6 +2654,7 @@ fn rvalue_use_locals(op: &mir::RValue, out: &mut Vec<mir::LocalId>) {
             out.push(*idx);
         }
         ArrayLit(elems) | Tuple(elems) => out.extend(elems.iter().copied()),
+        Intrinsic(intrinsic) => out.extend(intrinsic.args.iter().copied()),
         Binary(_, l, r) | StringEq(l, r) | StrConcat(l, r) => {
             out.push(*l);
             out.push(*r);
