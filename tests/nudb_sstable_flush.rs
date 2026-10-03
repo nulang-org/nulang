@@ -66,6 +66,12 @@ fn flush_current(tablet: &mut WalBackedTablet) {
     assert!(tablet.flush_oldest_immutable_to_sstable().unwrap());
 }
 
+fn rotate_current(tablet: &mut WalBackedTablet) {
+    let bytes = tablet.mutable_memtable_bytes();
+    assert!(bytes > 0);
+    assert!(tablet.rotate_memtable_if_bytes_at_least(bytes));
+}
+
 #[test]
 fn immutable_flush_is_durable_idempotent_evicts_memory_and_does_not_reclaim_wal() {
     let path = temp_wal();
@@ -95,6 +101,35 @@ fn immutable_flush_is_durable_idempotent_evicts_memory_and_does_not_reclaim_wal(
     assert_eq!(reopened.immutable_memtable_count(), 0);
     assert_eq!(reopened.read_latest(b"k"), Some(&b"v1"[..]));
     assert_eq!(reopened.durable_sstable_count().unwrap(), 1);
+    cleanup(&path);
+}
+
+#[test]
+fn flush_evicts_only_the_oldest_generation_with_newer_memory_still_live() {
+    let path = temp_wal();
+    cleanup(&path);
+    let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+
+    commit_put(&mut tablet, b"k", b"v1");
+    rotate_current(&mut tablet);
+    commit_put(&mut tablet, b"k", b"v2");
+    rotate_current(&mut tablet);
+    commit_put(&mut tablet, b"k", b"v3");
+    assert_eq!(tablet.immutable_memtable_count(), 2);
+
+    assert!(tablet.flush_oldest_immutable_to_sstable().unwrap());
+    assert_eq!(tablet.immutable_memtable_count(), 1);
+    assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
+    assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
+    assert_eq!(tablet.read_latest(b"k"), Some(&b"v3"[..]));
+
+    assert!(tablet.flush_oldest_immutable_to_sstable().unwrap());
+    assert_eq!(tablet.immutable_memtable_count(), 0);
+    assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
+    assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
+    assert_eq!(tablet.read_latest(b"k"), Some(&b"v3"[..]));
+    assert_eq!(tablet.durable_sstable_count().unwrap(), 2);
+
     cleanup(&path);
 }
 
