@@ -18,6 +18,7 @@ use super::checkpoint::{self, CheckpointError};
 use super::manifest::{Manifest, ManifestEntry, ManifestError, SstableFormat, SstableIntegrity};
 use super::sstable::{self, SstableError};
 use super::sstable_indexed::IndexedSstable;
+use super::sstable_v2::{write_sstable_v2, SstableV2, SstableV2Error};
 use super::tablet::{
     MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletSnapshotRow,
     TabletSnapshotState, TabletWrite, VersionedValue,
@@ -25,9 +26,84 @@ use super::tablet::{
 use super::wal::{FileWal, WalError};
 
 #[derive(Debug)]
+enum ServingSstable {
+    V1(IndexedSstable),
+    V2(SstableV2),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ServingVersion<'a> {
+    sequence: u64,
+    value: Option<&'a [u8]>,
+}
+
+impl ServingSstable {
+    fn file_name(&self) -> &str {
+        match self {
+            Self::V1(table) => &table.metadata().file_name,
+            Self::V2(table) => &table.metadata().file_name,
+        }
+    }
+
+    fn max_sequence(&self) -> u64 {
+        match self {
+            Self::V1(table) => table.metadata().max_sequence,
+            Self::V2(table) => table.metadata().max_sequence,
+        }
+    }
+
+    fn has_contiguous_sequence_coverage_after(&self, floor: u64) -> bool {
+        match self {
+            Self::V1(table) => table.has_contiguous_sequence_coverage_after(floor),
+            Self::V2(table) => table.has_contiguous_sequence_coverage_after(floor),
+        }
+    }
+
+    fn version_at(
+        &self,
+        key: &[u8],
+        snapshot: u64,
+    ) -> Result<Option<ServingVersion<'_>>, WalBackedError> {
+        match self {
+            Self::V1(table) => Ok(table
+                .version_at(key, snapshot)?
+                .map(|version| ServingVersion {
+                    sequence: version.sequence,
+                    value: version.value,
+                })),
+            Self::V2(table) => Ok(table
+                .version_at(key, snapshot)
+                .map_err(WalBackedError::from_sstable_v2)?
+                .map(|version| ServingVersion {
+                    sequence: version.sequence,
+                    value: version.value,
+                })),
+        }
+    }
+
+    fn snapshot_rows(&self, sstable_dir: &Path) -> Result<Vec<TabletSnapshotRow>, WalBackedError> {
+        match self {
+            Self::V1(indexed) => {
+                let path = sstable_dir.join(&indexed.metadata().file_name);
+                let table = sstable::Sstable::open(&path)?;
+                if table.metadata() != indexed.metadata() {
+                    return Err(WalBackedError::ManifestSstableMismatch(
+                        indexed.metadata().file_name.clone(),
+                    ));
+                }
+                Ok(table.rows().to_vec())
+            }
+            Self::V2(table) => table
+                .snapshot_rows()
+                .map_err(WalBackedError::from_sstable_v2),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct WalBackedTablet {
     tablet: MemoryTablet,
-    sstables: Vec<IndexedSstable>,
+    sstables: Vec<ServingSstable>,
     wal: FileWal,
     checkpoint_path: PathBuf,
     manifest_path: PathBuf,
@@ -53,48 +129,12 @@ impl WalBackedTablet {
         let manifest = Manifest::load_or_empty(&manifest_path, descriptor.id().get())?;
         let mut sstables = Vec::with_capacity(manifest.entries().len());
         for entry in manifest.entries() {
-            if entry.format != SstableFormat::V1 {
-                return Err(WalBackedError::ManifestSstableMismatch(
-                    entry.file_name.clone(),
-                ));
-            }
-            let expected_checksum = match entry.integrity {
-                SstableIntegrity::WholePayloadBlake3(checksum) => checksum,
-                SstableIntegrity::FooterBlake3(_) => {
-                    return Err(WalBackedError::ManifestSstableMismatch(
-                        entry.file_name.clone(),
-                    ));
-                }
-            };
-            let path = sstable_dir.join(&entry.file_name);
-            let table = IndexedSstable::open(&path)?;
-            let metadata = table.metadata();
-            if metadata.tablet_id != entry.tablet_id
-                || metadata.ownership_epoch != entry.ownership_epoch
-                || metadata.min_sequence != entry.min_sequence
-                || metadata.max_sequence != entry.max_sequence
-                || metadata.row_count != entry.row_count
-                || metadata.min_key != entry.min_key
-                || metadata.max_key != entry.max_key
-                || metadata.checksum != expected_checksum
-                || metadata.file_name != entry.file_name
-            {
-                return Err(WalBackedError::ManifestSstableMismatch(
-                    entry.file_name.clone(),
-                ));
-            }
-            if metadata.tablet_id != descriptor.id().get()
-                || metadata.ownership_epoch > descriptor.ownership_epoch()
-            {
-                return Err(WalBackedError::ManifestSstableMismatch(
-                    entry.file_name.clone(),
-                ));
-            }
-
-            if metadata.max_sequence > tablet.current_sequence()
+            let table = open_manifest_sstable(entry, &sstable_dir, &descriptor)?;
+            let max_sequence = table.max_sequence();
+            if max_sequence > tablet.current_sequence()
                 && table.has_contiguous_sequence_coverage_after(tablet.current_sequence())
             {
-                advance_recovered_sequence(&mut tablet, metadata.max_sequence)?;
+                advance_recovered_sequence(&mut tablet, max_sequence)?;
             }
             sstables.push(table);
         }
@@ -134,10 +174,10 @@ impl WalBackedTablet {
         self.tablet.rotate_memtable_if_bytes_at_least(min_bytes)
     }
 
-    /// Durably flush the oldest frozen memtable to an immutable SSTable and
-    /// publish a manifest entry. Once the manifest is durable and the compact
-    /// encoded SSTable reader is installed, exactly that frozen generation is
-    /// evicted while newer immutable and mutable state stays resident.
+    /// Durably flush the oldest frozen memtable to an immutable v2 SSTable and
+    /// publish a format-explicit manifest entry. Once the manifest is durable
+    /// and the mmap-backed reader is installed, exactly that frozen generation
+    /// is evicted while newer immutable and mutable state stays resident.
     pub fn flush_oldest_immutable_to_sstable(&mut self) -> Result<bool, WalBackedError> {
         let Some(rows) = self.tablet.oldest_immutable_rows() else {
             return Ok(false);
@@ -158,7 +198,7 @@ impl WalBackedTablet {
             .map_err(|error| WalBackedError::FlushIdentity(error.to_string()))?;
         let digest = blake3::hash(&identity).to_hex();
         let file_name = format!(
-            "tablet-{}-{}-{}-{}.sst",
+            "tablet-{}-{}-{}-v2-{}.sst",
             self.tablet.descriptor().id().get(),
             min_sequence,
             max_sequence,
@@ -168,35 +208,22 @@ impl WalBackedTablet {
         let mut manifest =
             Manifest::load_or_empty(&self.manifest_path, self.tablet.descriptor().id().get())?;
         let path = self.sstable_dir.join(&file_name);
-        let expected = sstable::expected_metadata(
-            file_name.clone(),
-            self.tablet.descriptor().id().get(),
-            self.tablet.descriptor().ownership_epoch(),
-            &rows,
-        )?;
 
         if path.exists() {
-            let existing = IndexedSstable::open(&path)?;
-            if existing.metadata() != &expected {
-                return Err(WalBackedError::Sstable(SstableError::ExistingFileMismatch(
-                    file_name.clone(),
-                )));
-            }
+            let existing = SstableV2::open(&path).map_err(WalBackedError::from_sstable_v2)?;
+            validate_v2_flush_identity(&existing, self.tablet.descriptor(), &file_name, &rows)?;
         } else {
-            sstable::write_sstable(
+            write_sstable_v2(
                 &path,
                 self.tablet.descriptor().id().get(),
                 self.tablet.descriptor().ownership_epoch(),
                 &rows,
-            )?;
+            )
+            .map_err(WalBackedError::from_sstable_v2)?;
         }
 
-        let table = IndexedSstable::open(&path)?;
-        if table.metadata() != &expected {
-            return Err(WalBackedError::Sstable(SstableError::ExistingFileMismatch(
-                file_name.clone(),
-            )));
-        }
+        let table = SstableV2::open(&path).map_err(WalBackedError::from_sstable_v2)?;
+        validate_v2_flush_identity(&table, self.tablet.descriptor(), &file_name, &rows)?;
         let metadata = table.metadata().clone();
         let entry = ManifestEntry {
             file_name: metadata.file_name.clone(),
@@ -207,8 +234,8 @@ impl WalBackedTablet {
             row_count: metadata.row_count,
             min_key: metadata.min_key.clone(),
             max_key: metadata.max_key.clone(),
-            format: SstableFormat::V1,
-            integrity: SstableIntegrity::WholePayloadBlake3(metadata.checksum),
+            format: SstableFormat::V2,
+            integrity: SstableIntegrity::FooterBlake3(metadata.footer_checksum),
         };
         let inserted = manifest.register(entry)?;
         if inserted {
@@ -218,9 +245,9 @@ impl WalBackedTablet {
         if !self
             .sstables
             .iter()
-            .any(|existing| existing.metadata().file_name == metadata.file_name)
+            .any(|existing| existing.file_name() == metadata.file_name)
         {
-            self.sstables.push(table);
+            self.sstables.push(ServingSstable::V2(table));
         }
 
         let evicted = self.tablet.pop_oldest_immutable_rows();
@@ -292,6 +319,10 @@ impl WalBackedTablet {
                 found = true;
                 best_sequence = candidate.sequence;
                 best_value = candidate.value;
+            } else if candidate.sequence == best_sequence && candidate.value != best_value {
+                return Err(WalBackedError::ReadConflict {
+                    sequence: best_sequence,
+                });
             }
         }
 
@@ -312,15 +343,9 @@ impl WalBackedTablet {
         let resident = self.tablet.snapshot_state();
         let mut merged: BTreeMap<Vec<u8>, BTreeMap<u64, Option<Vec<u8>>>> = BTreeMap::new();
 
-        for indexed in &self.sstables {
-            let path = self.sstable_dir.join(&indexed.metadata().file_name);
-            let table = sstable::Sstable::open(&path)?;
-            if table.metadata() != indexed.metadata() {
-                return Err(WalBackedError::ManifestSstableMismatch(
-                    indexed.metadata().file_name.clone(),
-                ));
-            }
-            merge_snapshot_rows(&mut merged, table.rows())?;
+        for table in &self.sstables {
+            let rows = table.snapshot_rows(&self.sstable_dir)?;
+            merge_snapshot_rows(&mut merged, &rows)?;
         }
         merge_snapshot_rows(&mut merged, &resident.rows)?;
 
@@ -364,6 +389,108 @@ impl WalBackedTablet {
     }
 }
 
+fn open_manifest_sstable(
+    entry: &ManifestEntry,
+    sstable_dir: &Path,
+    descriptor: &TabletDescriptor,
+) -> Result<ServingSstable, WalBackedError> {
+    let path = sstable_dir.join(&entry.file_name);
+    match (entry.format, entry.integrity) {
+        (SstableFormat::V1, SstableIntegrity::WholePayloadBlake3(expected_checksum)) => {
+            let table = IndexedSstable::open(&path)?;
+            let metadata = table.metadata();
+            if metadata.tablet_id != entry.tablet_id
+                || metadata.ownership_epoch != entry.ownership_epoch
+                || metadata.min_sequence != entry.min_sequence
+                || metadata.max_sequence != entry.max_sequence
+                || metadata.row_count != entry.row_count
+                || metadata.min_key != entry.min_key
+                || metadata.max_key != entry.max_key
+                || metadata.checksum != expected_checksum
+                || metadata.file_name != entry.file_name
+                || metadata.tablet_id != descriptor.id().get()
+                || metadata.ownership_epoch > descriptor.ownership_epoch()
+                || !descriptor.range().contains(&metadata.min_key)
+                || !descriptor.range().contains(&metadata.max_key)
+            {
+                return Err(WalBackedError::ManifestSstableMismatch(
+                    entry.file_name.clone(),
+                ));
+            }
+            Ok(ServingSstable::V1(table))
+        }
+        (SstableFormat::V2, SstableIntegrity::FooterBlake3(expected_checksum)) => {
+            let table = SstableV2::open(&path).map_err(WalBackedError::from_sstable_v2)?;
+            let metadata = table.metadata();
+            if metadata.tablet_id != entry.tablet_id
+                || metadata.ownership_epoch != entry.ownership_epoch
+                || metadata.min_sequence != entry.min_sequence
+                || metadata.max_sequence != entry.max_sequence
+                || metadata.row_count != entry.row_count
+                || metadata.min_key != entry.min_key
+                || metadata.max_key != entry.max_key
+                || metadata.footer_checksum != expected_checksum
+                || metadata.file_name != entry.file_name
+                || metadata.tablet_id != descriptor.id().get()
+                || metadata.ownership_epoch > descriptor.ownership_epoch()
+                || !descriptor.range().contains(&metadata.min_key)
+                || !descriptor.range().contains(&metadata.max_key)
+            {
+                return Err(WalBackedError::ManifestSstableMismatch(
+                    entry.file_name.clone(),
+                ));
+            }
+            Ok(ServingSstable::V2(table))
+        }
+        _ => Err(WalBackedError::ManifestSstableMismatch(
+            entry.file_name.clone(),
+        )),
+    }
+}
+
+fn validate_v2_flush_identity(
+    table: &SstableV2,
+    descriptor: &TabletDescriptor,
+    file_name: &str,
+    rows: &[TabletSnapshotRow],
+) -> Result<(), WalBackedError> {
+    let metadata = table.metadata();
+    let min_sequence = rows
+        .iter()
+        .flat_map(|row| row.versions.iter())
+        .map(|version| version.sequence)
+        .min()
+        .ok_or(WalBackedError::NoImmutableMemtable)?;
+    let max_sequence = rows
+        .iter()
+        .flat_map(|row| row.versions.iter())
+        .map(|version| version.sequence)
+        .max()
+        .ok_or(WalBackedError::NoImmutableMemtable)?;
+    if metadata.file_name != file_name
+        || metadata.tablet_id != descriptor.id().get()
+        || metadata.ownership_epoch != descriptor.ownership_epoch()
+        || metadata.min_sequence != min_sequence
+        || metadata.max_sequence != max_sequence
+        || metadata.row_count as usize != rows.len()
+        || metadata.min_key.as_slice() != rows.first().unwrap().key.as_slice()
+        || metadata.max_key.as_slice() != rows.last().unwrap().key.as_slice()
+    {
+        return Err(WalBackedError::SstableV2(format!(
+            "existing SSTable v2 metadata does not match flush identity for {file_name}"
+        )));
+    }
+    let decoded = table
+        .snapshot_rows()
+        .map_err(WalBackedError::from_sstable_v2)?;
+    if decoded != rows {
+        return Err(WalBackedError::SstableV2(format!(
+            "existing SSTable v2 history does not match flush identity for {file_name}"
+        )));
+    }
+    Ok(())
+}
+
 fn merge_snapshot_rows(
     merged: &mut BTreeMap<Vec<u8>, BTreeMap<u64, Option<Vec<u8>>>>,
     rows: &[TabletSnapshotRow],
@@ -405,10 +532,18 @@ pub enum WalBackedError {
     Checkpoint(CheckpointError),
     Manifest(ManifestError),
     Sstable(SstableError),
+    SstableV2(String),
     NoImmutableMemtable,
     FlushIdentity(String),
     ManifestSstableMismatch(String),
+    ReadConflict { sequence: u64 },
     SnapshotCompositionConflict { sequence: u64 },
+}
+
+impl WalBackedError {
+    fn from_sstable_v2(error: SstableV2Error) -> Self {
+        Self::SstableV2(error.to_string())
+    }
 }
 
 impl From<TabletError> for WalBackedError {
@@ -449,11 +584,16 @@ impl fmt::Display for WalBackedError {
             Self::Checkpoint(error) => write!(f, "tablet checkpoint failure: {error}"),
             Self::Manifest(error) => write!(f, "tablet manifest failure: {error}"),
             Self::Sstable(error) => write!(f, "tablet SSTable failure: {error}"),
+            Self::SstableV2(error) => write!(f, "tablet SSTable v2 failure: {error}"),
             Self::NoImmutableMemtable => f.write_str("no immutable memtable is available to flush"),
             Self::FlushIdentity(message) => write!(f, "failed to derive flush identity: {message}"),
             Self::ManifestSstableMismatch(file) => {
                 write!(f, "manifest metadata does not match SSTable {file}")
             }
+            Self::ReadConflict { sequence } => write!(
+                f,
+                "conflicting MVCC values while reading at sequence {sequence}"
+            ),
             Self::SnapshotCompositionConflict { sequence } => write!(
                 f,
                 "conflicting MVCC values while composing checkpoint at sequence {sequence}"

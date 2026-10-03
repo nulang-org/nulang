@@ -91,7 +91,7 @@ fn sstable_baseline_and_newer_wal_records_compose_without_duplicate_history() {
 }
 
 #[test]
-fn corrupt_manifest_referenced_sstable_fails_reopen_closed() {
+fn corrupt_v2_data_block_opens_from_footer_but_fails_the_touched_read_closed() {
     let path = temp_wal("corrupt_table");
     cleanup(&path);
     let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
@@ -105,9 +105,10 @@ fn corrupt_manifest_referenced_sstable_fails_reopen_closed() {
     bytes[20] ^= 0x40;
     fs::write(&table_path, bytes).unwrap();
 
+    let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert!(matches!(
-        WalBackedTablet::open(descriptor(), &path),
-        Err(WalBackedError::Sstable(_))
+        reopened.read_latest(b"k"),
+        Err(WalBackedError::SstableV2(_))
     ));
     cleanup(&path);
 }
