@@ -9,9 +9,9 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
 #[cfg(not(unix))]
 use std::io::Seek;
+use std::io::{self, Read, Write};
 use std::ops::Range;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -205,8 +205,8 @@ impl SstableV2 {
                 usize::try_from(file_len_u64).unwrap_or(usize::MAX),
             ));
         }
-        let file_len = usize::try_from(file_len_u64)
-            .map_err(|_| SstableV2Error::TooLarge(usize::MAX))?;
+        let file_len =
+            usize::try_from(file_len_u64).map_err(|_| SstableV2Error::TooLarge(usize::MAX))?;
         if file_len < HEADER_BYTES + TRAILER_BYTES {
             return Err(SstableV2Error::InvalidLength);
         }
