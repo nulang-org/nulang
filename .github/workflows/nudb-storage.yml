@@ -45,6 +45,9 @@ jobs:
       - name: SSTable and manifest contract
         run: |
           cargo test --locked --no-default-features --lib database::sstable::tests
+          cargo test --locked --no-default-features --lib database::sstable_indexed::tests
+          cargo test --locked --no-default-features --lib database::sstable_indexed_tests
+          cargo test --locked --no-default-features --lib database::sstable_mmap_tests
           cargo test --locked --no-default-features --lib database::manifest::tests
           cargo test --locked --no-default-features --test nudb_sstable_flush
           cargo test --locked --no-default-features --test nudb_sstable_recovery
