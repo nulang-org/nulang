@@ -290,4 +290,37 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn lowering_region_uses_compute_plan_as_authority() {
+        let mut input = region(SimdElemType::Int64, SimdWidth::Width4);
+        input.trip_count_hint = Some(99);
+        input.arr_len_reg = None;
+
+        let extent = DynamicExtentId(3);
+        let plan = SimdComputePlan {
+            vector_type: VectorType::new(ScalarType::I64, VectorWidth::fixed(2).unwrap()),
+            iteration: Some(
+                IterationSpace::new(
+                    0,
+                    LoopExtent::Dynamic(extent),
+                    1,
+                    LocalityScope::Lane,
+                )
+                .unwrap(),
+            ),
+            trip_count: SimdTripCountBinding::RuntimeArrayLen {
+                extent,
+                register: 11,
+            },
+        };
+
+        let lowering = plan
+            .lowering_region(&input)
+            .expect("compute plan should normalize the legacy lowering input");
+
+        assert_eq!(lowering.width, SimdWidth::Width2);
+        assert_eq!(lowering.trip_count_hint, Some(0));
+        assert_eq!(lowering.arr_len_reg, Some(11));
+    }
 }
