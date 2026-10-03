@@ -17,14 +17,18 @@ const MANIFEST_VERSION_V1: u16 = 1;
 const MANIFEST_VERSION_V2: u16 = 2;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SstableFormat {
     V1,
     V2,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
 #[serde(tag = "kind", content = "checksum", rename_all = "snake_case")]
 pub(crate) enum SstableIntegrity {
     WholePayloadBlake3([u8; 32]),
@@ -275,8 +279,10 @@ fn validate_entry(tablet_id: u64, entry: &ManifestEntry) -> Result<(), ManifestE
     }
     if !matches!(
         (entry.format, entry.integrity),
-        (SstableFormat::V1, SstableIntegrity::WholePayloadBlake3(_))
-            | (SstableFormat::V2, SstableIntegrity::FooterBlake3(_))
+        (
+            SstableFormat::V1,
+            SstableIntegrity::WholePayloadBlake3(_)
+        ) | (SstableFormat::V2, SstableIntegrity::FooterBlake3(_))
     ) {
         return Err(ManifestError::IntegrityKindMismatch(
             entry.file_name.clone(),

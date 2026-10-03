@@ -1,4 +1,6 @@
-use super::manifest::{Manifest, ManifestEntry, ManifestError, SstableFormat, SstableIntegrity};
+use super::manifest::{
+    Manifest, ManifestEntry, ManifestError, SstableFormat, SstableIntegrity,
+};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
@@ -93,8 +95,7 @@ fn legacy_v1_manifest_decodes_as_explicit_v1_whole_payload_integrity() {
     .unwrap();
     let mut file = File::create(&path).unwrap();
     file.write_all(b"NUDBMAN1").unwrap();
-    file.write_all(&(payload.len() as u32).to_le_bytes())
-        .unwrap();
+    file.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
     file.write_all(&payload).unwrap();
     file.write_all(blake3::hash(&payload).as_bytes()).unwrap();
     file.sync_data().unwrap();
