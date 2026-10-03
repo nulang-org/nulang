@@ -53,7 +53,7 @@ jobs:
               if sender_id == 0 {
                   return;
               }
-              if !runtime.actors.contains_key(&sender_id) {
+              if !runtime.actors.get(&sender_id).is_some() {
                   return;
               }
               let code = delivery_failure_code(reason);
@@ -65,7 +65,7 @@ jobs:
                   trace_id: None,
               };
               if let Some(actor) = runtime.actors.get_mut(&sender_id) {
-                  let _ = actor.mailbox.push_local(failure);
+                  let _ = actor.mailbox.push(failure);
               }
               runtime.enqueue_actor(sender_id);
           }
