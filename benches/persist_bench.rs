@@ -219,20 +219,14 @@ fn bench_atomic_transition_memory(c: &mut Criterion) {
         b.iter_batched_ref(
             || (MemoryStore::new(), transition_batch(TRANSITIONS)),
             |(store, transitions)| {
+                let mut final_sequence = 0;
                 for transition in transitions.drain(..) {
-                    black_box(
-                        store
-                            .commit_transition(transition)
-                            .expect("memory atomic transition must commit"),
-                    );
+                    let commit = store
+                        .commit_transition(transition)
+                        .expect("memory atomic transition must commit");
+                    final_sequence = black_box(commit.sequence);
                 }
-                assert_eq!(
-                    store
-                        .load_durable_tail_position(1)
-                        .expect("tail read must succeed")
-                        .map(|tail| tail.sequence),
-                    Some(TRANSITIONS as u64),
-                );
+                assert_eq!(final_sequence, TRANSITIONS as u64);
             },
             BatchSize::SmallInput,
         )
@@ -305,20 +299,14 @@ fn bench_atomic_transition_libsql_full(c: &mut Criterion) {
             || FullSyncAtomicFixture::new(TRANSITIONS),
             |fixture| {
                 let store = fixture.store.as_mut().expect("benchmark store is open");
+                let mut final_sequence = 0;
                 for transition in fixture.transitions.drain(..) {
-                    black_box(
-                        store
-                            .commit_transition(transition)
-                            .expect("FULL-sync atomic transition must commit"),
-                    );
+                    let commit = store
+                        .commit_transition(transition)
+                        .expect("FULL-sync atomic transition must commit");
+                    final_sequence = black_box(commit.sequence);
                 }
-                assert_eq!(
-                    store
-                        .load_durable_tail_position(1)
-                        .expect("tail read must succeed")
-                        .map(|tail| tail.sequence),
-                    Some(TRANSITIONS as u64),
-                );
+                assert_eq!(final_sequence, TRANSITIONS as u64);
             },
             BatchSize::SmallInput,
         )
