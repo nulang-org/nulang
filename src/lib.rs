@@ -48,6 +48,8 @@ pub mod effect_checker;
 pub mod ffi;
 #[path = "runtime/fabric_metadata.rs"]
 pub(crate) mod fabric_metadata;
+#[path = "runtime/fabric_subscription_gossip.rs"]
+pub(crate) mod fabric_subscription_gossip;
 #[path = "runtime/fabric_subscription_metadata.rs"]
 pub(crate) mod fabric_subscription_metadata;
 #[path = "runtime/fabric_subscription_snapshot.rs"]
