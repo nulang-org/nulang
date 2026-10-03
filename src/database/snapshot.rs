@@ -44,7 +44,10 @@ impl SnapshotRegistry {
 
     /// The oldest sequence still needed by any active snapshot reader.
     pub fn oldest_live_snapshot(&self) -> Option<u64> {
-        lock_state(&self.inner).counts.first_key_value().map(|(&sequence, _)| sequence)
+        lock_state(&self.inner)
+            .counts
+            .first_key_value()
+            .map(|(&sequence, _)| sequence)
     }
 
     /// Total number of active pins, including duplicate pins at one sequence.
@@ -87,18 +90,26 @@ impl SnapshotPin {
         }
 
         let mut state = lock_state(&self.inner);
-        match state.counts.get_mut(&self.sequence) {
-            Some(count) if *count > 1 => *count -= 1,
-            Some(_) => {
-                state.counts.remove(&self.sequence);
+        let should_remove = match state.counts.get_mut(&self.sequence) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                false
             }
+            Some(_) => true,
             None => {
-                debug_assert!(false, "snapshot pin released without a matching registry count");
+                debug_assert!(
+                    false,
+                    "snapshot pin released without a matching registry count"
+                );
                 self.active = false;
                 return;
             }
+        };
+        if should_remove {
+            state.counts.remove(&self.sequence);
         }
-        state.active_count = state.active_count.saturating_sub(1);
+        debug_assert!(state.active_count > 0);
+        state.active_count -= 1;
         self.active = false;
     }
 }
