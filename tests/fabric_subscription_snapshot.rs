@@ -26,7 +26,13 @@ fn codec() -> FabricSubscriptionSnapshotCodec {
 }
 
 fn assembler() -> FabricSubscriptionSnapshotAssembler {
-    FabricSubscriptionSnapshotAssembler::new(10_000, 4 * 1024 * 1024, 4096, 512, 16 * 1024 * 1024)
+    FabricSubscriptionSnapshotAssembler::new(
+        10_000,
+        4 * 1024 * 1024,
+        4096,
+        512,
+        16 * 1024 * 1024,
+    )
 }
 
 #[test]
@@ -45,7 +51,10 @@ fn more_than_fab0_limit_roundtrips_through_fab1_chunks() {
     for chunk in chunks.into_iter().rev() {
         let next = receiver.push(chunk).unwrap();
         if next.is_some() {
-            assert!(completed.is_none(), "one generation must publish exactly once");
+            assert!(
+                completed.is_none(),
+                "one generation must publish exactly once"
+            );
             completed = next;
         }
     }
@@ -67,7 +76,10 @@ fn incomplete_generation_never_exposes_partial_subscriptions() {
         assert_eq!(receiver.push(chunk).unwrap(), None);
     }
 
-    let complete = receiver.push(chunks.last().unwrap().clone()).unwrap().unwrap();
+    let complete = receiver
+        .push(chunks.last().unwrap().clone())
+        .unwrap()
+        .unwrap();
     assert_eq!(complete.subscriptions, subscriptions);
 }
 
@@ -119,7 +131,10 @@ fn newer_generation_supersedes_incomplete_older_generation_atomically() {
 #[test]
 fn wrong_metadata_kind_is_rejected_before_assembly() {
     let subscriptions = vec![entry(0)];
-    let mut chunk = codec().encode_chunks(51, 2, &subscriptions).unwrap().remove(0);
+    let mut chunk = codec()
+        .encode_chunks(51, 2, &subscriptions)
+        .unwrap()
+        .remove(0);
     chunk.kind = FabricMetadataKind::Services;
 
     let mut receiver = assembler();
