@@ -1,17 +1,16 @@
-#[path = "../src/runtime/fabric_metadata.rs"]
-mod fabric_metadata;
-#[path = "../src/runtime/fabric_metadata_wire.rs"]
-mod fabric_metadata_wire;
-
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fabric_metadata::{chunk_snapshot, FabricMetadataKind};
-use fabric_metadata_wire::encode_fab1_chunk;
-use nulang::runtime::{Actor, DeterministicNetworkTransport, NodeId, Packet, Runtime};
+use nulang::runtime::{
+    Actor, DeterministicNetworkTransport, FabricAdvertisement, FabricAdvertisementSnapshot, NodeId,
+    Packet, Runtime,
+};
 use nulang::vm::Value;
+
+const FAB1_TUNNEL_PATTERN: &str = "__nulang_fab1..metadata";
+const FAB1_TUNNEL_PREFIX: &str = "FAB1HEX:";
 
 fn noop(_actor: &mut Actor, _args: &[Value]) {}
 
@@ -48,40 +47,42 @@ fn gossip_round(sender: &mut Runtime, receiver: &mut Runtime) {
 }
 
 #[test]
-fn gossip_packet_roundtrip_preserves_additive_fab1_tail() {
-    let chunk = chunk_snapshot(
-        FabricMetadataKind::Subscriptions,
-        42,
-        9,
-        b"opaque-subscription-snapshot-bytes",
-        1024,
-    )
-    .unwrap()
-    .remove(0);
-    let encoded = encode_fab1_chunk(&chunk, 1024).unwrap();
-
+fn gossip_packet_roundtrip_preserves_reserved_fab1_tunnel_advertisement() {
+    let node_id = NodeId(42);
+    let tunnel = FabricAdvertisementSnapshot {
+        node_id,
+        generation: 9,
+        subscriptions: vec![FabricAdvertisement {
+            node_id,
+            // Deliberately invalid as a user subscription: an old peer rejects
+            // this complete snapshot instead of installing a bogus route.
+            pattern: FAB1_TUNNEL_PATTERN.to_string(),
+            actor_id: 1,
+            behavior: format!("{FAB1_TUNNEL_PREFIX}46414231"),
+            group: None,
+        }],
+    };
     let packet = Packet::Gossip {
         members: vec![],
         directory: vec![],
-        fabric: None,
-        fabric_chunk: Some(encoded.clone()),
+        fabric: Some(tunnel.clone()),
     };
+
     let bytes = packet.to_bytes(77);
-    let (sequence, decoded) = Packet::from_bytes(&bytes).expect("FAB1 Gossip packet should decode");
+    let (sequence, decoded) = Packet::from_bytes(&bytes).expect("FAB1 tunnel Gossip should decode");
     assert_eq!(sequence, 77);
     assert_eq!(decoded, packet);
 
-    match decoded {
-        Packet::Gossip {
-            fabric,
-            fabric_chunk,
-            ..
-        } => {
-            assert!(fabric.is_none());
-            assert_eq!(fabric_chunk, Some(encoded));
-        }
-        other => panic!("expected Gossip packet, got {other:?}"),
-    }
+    let mut runtime = Runtime::new();
+    let target = runtime.spawn_actor(Box::new(Vec::new));
+    runtime
+        .actors
+        .get_mut(&target)
+        .unwrap()
+        .register_behavior("handle", noop);
+    assert!(runtime
+        .fabric_subscribe(FAB1_TUNNEL_PATTERN, target, "handle")
+        .is_err());
 }
 
 #[test]
