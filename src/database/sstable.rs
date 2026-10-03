@@ -5,7 +5,6 @@
 //! remain mutually readable. Bloom filters and the sparse block index are
 //! reconstructed on open; they accelerate reads without changing durable bytes.
 
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -662,3 +661,58 @@ impl fmt::Display for SstableError {
 }
 
 impl std::error::Error for SstableError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn indexed_rows(count: usize) -> BTreeMap<Vec<u8>, Vec<VersionedValue>> {
+        (0..count)
+            .map(|index| {
+                (
+                    format!("k{index:03}").into_bytes(),
+                    vec![VersionedValue {
+                        sequence: 1,
+                        value: Some(format!("v{index:03}").into_bytes()),
+                    }],
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bloom_filter_never_rejects_inserted_keys() {
+        let rows = indexed_rows(150);
+        let table = Sstable::from_rows(1, 1, 1, &rows).unwrap();
+
+        for key in rows.keys() {
+            assert!(table.bloom.may_contain(key));
+            assert!(table.visible_version(key, 1).is_some());
+        }
+    }
+
+    #[test]
+    fn sparse_block_index_enters_ranges_across_block_boundaries() {
+        let rows = indexed_rows(150);
+        let table = Sstable::from_rows(1, 1, 1, &rows).unwrap();
+
+        let keys: Vec<&[u8]> = table
+            .range_rows(b"k063", Some(b"k067"))
+            .iter()
+            .map(|row| row.key.as_slice())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                &b"k063"[..],
+                &b"k064"[..],
+                &b"k065"[..],
+                &b"k066"[..]
+            ]
+        );
+        assert_eq!(
+            table.visible_version(b"k064", 1).unwrap().value.as_deref(),
+            Some(&b"v064"[..])
+        );
+    }
+}
