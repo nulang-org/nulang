@@ -46,6 +46,15 @@ fn gossip_round(sender: &mut Runtime, receiver: &mut Runtime) {
     receiver.process_network();
 }
 
+fn drive_until_remote_count(sender: &mut Runtime, receiver: &mut Runtime, expected: usize) {
+    for _ in 0..64 {
+        if receiver.fabric_remote_subscription_count() == expected {
+            return;
+        }
+        gossip_round(sender, receiver);
+    }
+}
+
 #[test]
 fn gossip_packet_roundtrip_preserves_reserved_fab1_tunnel_advertisement() {
     let node_id = NodeId(42);
@@ -86,7 +95,7 @@ fn gossip_packet_roundtrip_preserves_reserved_fab1_tunnel_advertisement() {
 }
 
 #[test]
-fn oversized_fabric_snapshot_is_installed_only_after_complete_fab1_generation() {
+fn crossing_fab0_limit_preserves_old_routes_until_complete_fab1_generation() {
     let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let addr_a: SocketAddr = "127.0.0.1:32501".parse().unwrap();
     let addr_b: SocketAddr = "127.0.0.1:32502".parse().unwrap();
@@ -115,32 +124,48 @@ fn oversized_fabric_snapshot_is_installed_only_after_complete_fab1_generation() 
         .unwrap()
         .register_behavior("handle", noop);
 
-    const SUBSCRIPTIONS: usize = 4100;
-    for index in 0..SUBSCRIPTIONS {
+    const FAB0_LIMIT: usize = 4096;
+    const FINAL_SUBSCRIPTIONS: usize = 4100;
+
+    // First converge the largest generation representable by the legacy
+    // complete FAB0 snapshot path.
+    for index in 0..FAB0_LIMIT {
         assert!(sender
             .fabric_subscribe(&format!("chunked.tenant-{index:04}.created"), target, "handle")
             .unwrap());
     }
-    assert!(sender.fabric_advertisements(4096).is_err());
+    drive_until_remote_count(&mut sender, &mut receiver, FAB0_LIMIT);
+    assert_eq!(receiver.fabric_remote_subscription_count(), FAB0_LIMIT);
 
-    // A single bounded chunk must never become a partial authoritative routing
-    // generation on the receiver.
-    gossip_round(&mut sender, &mut receiver);
-    assert_eq!(receiver.fabric_remote_subscription_count(), 0);
-
-    // Repeated gossip rounds rotate the generation's chunks. Only the final
-    // verified chunk makes the complete 4,100-route snapshot visible.
-    for _ in 0..64 {
-        if receiver.fabric_remote_subscription_count() == SUBSCRIPTIONS {
-            break;
-        }
-        gossip_round(&mut sender, &mut receiver);
+    // Cross the compatibility boundary. This new generation must use FAB1.
+    for index in FAB0_LIMIT..FINAL_SUBSCRIPTIONS {
+        assert!(sender
+            .fabric_subscribe(&format!("chunked.tenant-{index:04}.created"), target, "handle")
+            .unwrap());
     }
-    assert_eq!(receiver.fabric_remote_subscription_count(), SUBSCRIPTIONS);
+    assert!(sender.fabric_advertisements(FAB0_LIMIT).is_err());
 
-    let report = receiver
+    // A single bounded FAB1 chunk must not delete the previously committed
+    // 4,096-route generation or expose any prefix of the 4,100-route one.
+    gossip_round(&mut sender, &mut receiver);
+    assert_eq!(receiver.fabric_remote_subscription_count(), FAB0_LIMIT);
+    let old_report = receiver
+        .fabric_publish_report("chunked.tenant-4095.created", &[])
+        .unwrap();
+    assert_eq!(old_report.selected, 1);
+    assert_eq!(old_report.forwarded_remote, 1);
+
+    // Repeated rounds rotate every chunk. The routing table changes only once
+    // the complete 4,100-route generation verifies.
+    drive_until_remote_count(&mut sender, &mut receiver, FINAL_SUBSCRIPTIONS);
+    assert_eq!(
+        receiver.fabric_remote_subscription_count(),
+        FINAL_SUBSCRIPTIONS
+    );
+
+    let new_report = receiver
         .fabric_publish_report("chunked.tenant-4099.created", &[])
         .unwrap();
-    assert_eq!(report.selected, 1);
-    assert_eq!(report.forwarded_remote, 1);
+    assert_eq!(new_report.selected, 1);
+    assert_eq!(new_report.forwarded_remote, 1);
 }
