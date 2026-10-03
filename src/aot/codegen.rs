@@ -20,7 +20,7 @@ pub use implementation::{
 /// wrapper also assumes an Int return, so unit/void functions must stay boxed.
 pub fn is_all_int(func: &crate::mir::Function) -> bool {
     let returns_int = matches!(
-        func.ret,
+        func.ret.as_ref(),
         Some(crate::types::Type::Primitive(
             crate::types::PrimitiveType::Int
         ))
