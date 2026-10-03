@@ -36,10 +36,22 @@ fn render_tagged_lowering(intrinsic: IntegerIntrinsic) -> String {
 fn tagged_lowering_unboxes_uses_native_instruction_and_reboxes() {
     let clif = render_tagged_lowering(IntegerIntrinsic::Popcount);
 
-    assert!(clif.contains("popcnt"), "CLIF should retain native popcnt:\n{clif}");
-    assert!(clif.contains("band"), "CLIF should mask Int48 payload bits:\n{clif}");
-    assert!(clif.contains("select"), "CLIF should sign-extend Int48 inputs:\n{clif}");
-    assert!(clif.contains("bor"), "CLIF should re-apply TAG_INT:\n{clif}");
+    assert!(
+        clif.contains("popcnt"),
+        "CLIF should retain native popcnt:\n{clif}"
+    );
+    assert!(
+        clif.contains("band"),
+        "CLIF should mask Int48 payload bits:\n{clif}"
+    );
+    assert!(
+        clif.contains("select"),
+        "CLIF should sign-extend Int48 inputs:\n{clif}"
+    );
+    assert!(
+        clif.contains("bor"),
+        "CLIF should re-apply TAG_INT:\n{clif}"
+    );
 }
 
 #[test]
@@ -66,5 +78,8 @@ fn raw_lowering_stays_representation_free() {
     let clif = function.display().to_string();
 
     assert!(clif.contains("popcnt"));
-    assert!(!clif.contains("select"), "raw lowering must not sign-extend/tag:\n{clif}");
+    assert!(
+        !clif.contains("select"),
+        "raw lowering must not sign-extend/tag:\n{clif}"
+    );
 }
