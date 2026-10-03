@@ -1,9 +1,9 @@
 //! Adapter between the bytecode SIMD analyzer and backend-neutral compute IR.
 //!
 //! The bytecode analyzer still owns register-level pattern metadata while the
-//! portable compute IR owns the canonical scalar/vector type vocabulary. This
-//! bridge lets native lowering adopt that shared representation incrementally
-//! without changing vectorization heuristics or runtime trip-count bindings.
+//! portable compute layers own canonical vector types and iteration spaces.
+//! Runtime bindings stay in this adapter so bytecode register IDs never leak
+//! into backend-neutral scheduling metadata.
 
 use std::fmt;
 
@@ -12,13 +12,30 @@ use cranelift_frontend::FunctionBuilderContext;
 use cranelift_jit::JITModule;
 
 use crate::bytecode::Instruction;
-use crate::compute_ir::{ScalarType, VectorType, VectorWidth};
+use crate::compute_ir::{LocalityScope, ScalarType, VectorType, VectorWidth};
+use crate::compute_schedule::{
+    ComputeScheduleError, DynamicExtentId, IterationSpace, LoopExtent,
+};
 use crate::jit::simd_analyzer::{SimdElemType, SimdRegion, SimdWidth};
 use crate::jit::simd_compiler;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SimdTripCountBinding {
+    Static(u64),
+    RuntimeArrayLen {
+        extent: DynamicExtentId,
+        register: u8,
+    },
+    /// The analyzer did not recover a trip count. Existing Cranelift lowering
+    /// deliberately keeps its scalar fallback for this case.
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SimdComputePlan {
     pub(crate) vector_type: VectorType,
+    pub(crate) iteration: Option<IterationSpace>,
+    pub(crate) trip_count: SimdTripCountBinding,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +44,8 @@ pub(crate) enum SimdComputePlanError {
         analyzer_lanes: u16,
         element_lanes: u16,
     },
+    MissingRuntimeExtentBinding,
+    Schedule(ComputeScheduleError),
 }
 
 impl fmt::Display for SimdComputePlanError {
@@ -39,11 +58,22 @@ impl fmt::Display for SimdComputePlanError {
                 f,
                 "SIMD analyzer width {analyzer_lanes} does not match element-derived width {element_lanes}"
             ),
+            Self::MissingRuntimeExtentBinding => write!(
+                f,
+                "SIMD region marks its trip count as runtime-derived but has no ArrLen register binding"
+            ),
+            Self::Schedule(error) => write!(f, "{error}"),
         }
     }
 }
 
 impl std::error::Error for SimdComputePlanError {}
+
+impl From<ComputeScheduleError> for SimdComputePlanError {
+    fn from(error: ComputeScheduleError) -> Self {
+        Self::Schedule(error)
+    }
+}
 
 impl SimdComputePlan {
     pub(crate) fn from_region(region: &SimdRegion) -> Result<Self, SimdComputePlanError> {
@@ -63,7 +93,39 @@ impl SimdComputePlan {
             .expect("SIMD analyzer only exposes non-zero fixed widths");
         let vector_type = VectorType::new(scalar_type(region.elem_type), width);
 
-        Ok(Self { vector_type })
+        let (iteration, trip_count) = match (region.trip_count_hint, region.arr_len_reg) {
+            (Some(0), Some(register)) => {
+                let extent = DynamicExtentId(0);
+                let iteration = IterationSpace::new(
+                    0,
+                    LoopExtent::Dynamic(extent),
+                    1,
+                    LocalityScope::Lane,
+                )?;
+                (
+                    Some(iteration),
+                    SimdTripCountBinding::RuntimeArrayLen { extent, register },
+                )
+            }
+            (Some(0), None) => return Err(SimdComputePlanError::MissingRuntimeExtentBinding),
+            (Some(count), _) => {
+                let count = count as u64;
+                let iteration = IterationSpace::new(
+                    0,
+                    LoopExtent::Static(count),
+                    1,
+                    LocalityScope::Lane,
+                )?;
+                (Some(iteration), SimdTripCountBinding::Static(count))
+            }
+            (None, _) => (None, SimdTripCountBinding::Unavailable),
+        };
+
+        Ok(Self {
+            vector_type,
+            iteration,
+            trip_count,
+        })
     }
 }
 
@@ -92,8 +154,9 @@ pub(crate) fn compile_simd_region(
     instructions: &[Instruction],
     region: &SimdRegion,
 ) -> Result<*const u8, String> {
-    // Fail closed if the legacy analyzer and portable compute type contract
-    // diverge. Cranelift lowering remains unchanged in this migration slice.
+    // Fail closed if the legacy analyzer and portable compute contracts
+    // diverge. Cranelift lowering remains unchanged in this migration slice;
+    // its existing scalar fallback still handles an unavailable trip count.
     let plan = SimdComputePlan::from_region(region).map_err(|error| error.to_string())?;
     debug_assert_eq!(
         plan.vector_type.width.min_lanes(),
@@ -154,6 +217,64 @@ mod tests {
 
         assert_eq!(plan.vector_type.element, ScalarType::F32);
         assert_eq!(plan.vector_type.width, VectorWidth::fixed(4).unwrap());
+    }
+
+    #[test]
+    fn maps_static_trip_count_to_static_iteration_space() {
+        let plan = SimdComputePlan::from_region(&region(SimdElemType::Int64, SimdWidth::Width2))
+            .expect("static trip count should normalize");
+        let iteration = plan.iteration.expect("static iteration space");
+
+        assert_eq!(iteration.extent, LoopExtent::Static(16));
+        assert_eq!(iteration.end_exclusive().unwrap(), Some(16));
+        assert_eq!(plan.trip_count, SimdTripCountBinding::Static(16));
+    }
+
+    #[test]
+    fn maps_runtime_arr_len_to_symbolic_dynamic_extent() {
+        let mut input = region(SimdElemType::Float64, SimdWidth::Width2);
+        input.trip_count_hint = Some(0);
+        input.arr_len_reg = Some(9);
+
+        let plan = SimdComputePlan::from_region(&input).expect("runtime extent should normalize");
+        let iteration = plan.iteration.expect("dynamic iteration space");
+
+        assert_eq!(
+            iteration.extent,
+            LoopExtent::Dynamic(DynamicExtentId(0))
+        );
+        assert_eq!(iteration.end_exclusive().unwrap(), None);
+        assert_eq!(
+            plan.trip_count,
+            SimdTripCountBinding::RuntimeArrayLen {
+                extent: DynamicExtentId(0),
+                register: 9,
+            }
+        );
+    }
+
+    #[test]
+    fn preserves_scalar_fallback_when_trip_count_is_unavailable() {
+        let mut input = region(SimdElemType::Int64, SimdWidth::Width2);
+        input.trip_count_hint = None;
+        input.arr_len_reg = None;
+
+        let plan = SimdComputePlan::from_region(&input).expect("unknown extent is not invalid");
+
+        assert_eq!(plan.iteration, None);
+        assert_eq!(plan.trip_count, SimdTripCountBinding::Unavailable);
+    }
+
+    #[test]
+    fn rejects_runtime_trip_count_without_arr_len_binding() {
+        let mut input = region(SimdElemType::Int64, SimdWidth::Width2);
+        input.trip_count_hint = Some(0);
+        input.arr_len_reg = None;
+
+        assert_eq!(
+            SimdComputePlan::from_region(&input),
+            Err(SimdComputePlanError::MissingRuntimeExtentBinding)
+        );
     }
 
     #[test]
