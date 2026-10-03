@@ -55,7 +55,11 @@ fn commit_put(tablet: &mut WalBackedTablet, key: &[u8], value: &[u8]) {
 fn commit_delete(tablet: &mut WalBackedTablet, key: &[u8]) {
     let sequence = tablet.current_sequence();
     let write = tablet
-        .prepare_write(1, sequence, vec![TabletMutation::Delete { key: key.to_vec() }])
+        .prepare_write(
+            1,
+            sequence,
+            vec![TabletMutation::Delete { key: key.to_vec() }],
+        )
         .unwrap();
     tablet.commit(write).unwrap();
 }
@@ -263,9 +267,7 @@ fn compaction_conflict_fails_before_manifest_replacement() {
             integrity: SstableIntegrity::FooterBlake3(right.footer_checksum),
         })
         .unwrap();
-    manifest
-        .publish(&path.with_extension("manifest"))
-        .unwrap();
+    manifest.publish(&path.with_extension("manifest")).unwrap();
 
     assert_eq!(
         compact_tablet_sstables_to_v2(&descriptor(), &path).unwrap_err(),

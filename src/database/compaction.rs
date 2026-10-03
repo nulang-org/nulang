@@ -266,9 +266,7 @@ fn validate_replacement(
     {
         return Err(CompactionError::ReplacementMismatch(file_name.to_owned()));
     }
-    let decoded = table
-        .snapshot_rows()
-        .map_err(CompactionError::from_v2)?;
+    let decoded = table.snapshot_rows().map_err(CompactionError::from_v2)?;
     if decoded != rows {
         return Err(CompactionError::ReplacementMismatch(file_name.to_owned()));
     }
@@ -326,7 +324,10 @@ impl fmt::Display for CompactionError {
                 write!(f, "NuDB compaction manifest metadata does not match {file}")
             }
             Self::ReplacementMismatch(file) => {
-                write!(f, "NuDB compaction replacement history does not match {file}")
+                write!(
+                    f,
+                    "NuDB compaction replacement history does not match {file}"
+                )
             }
             Self::SnapshotConflict { sequence } => {
                 write!(
@@ -339,10 +340,7 @@ impl fmt::Display for CompactionError {
             }
             Self::EmptyHistory => f.write_str("NuDB compaction source history is empty"),
             Self::Serialization(error) => {
-                write!(
-                    f,
-                    "NuDB compaction identity serialization failed: {error}"
-                )
+                write!(f, "NuDB compaction identity serialization failed: {error}")
             }
         }
     }
