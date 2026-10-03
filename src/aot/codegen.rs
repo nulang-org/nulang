@@ -16,11 +16,17 @@ pub use implementation::{
 /// Conservative whole-function eligibility for the current raw-Int AOT path.
 ///
 /// Function-local planning intentionally rejects cross-function calls until the
-/// module-level ABI planner is wired into AOT dispatch. That prevents raw Int
-/// arguments from flowing through the boxed function table and also excludes
-/// unit returns from the current Int-only boxing wrapper.
+/// module-level ABI planner is wired into AOT dispatch. The current boxing
+/// wrapper also assumes an Int return, so unit/void functions must stay boxed.
 pub fn is_all_int(func: &crate::mir::Function) -> bool {
-    crate::native_plan::NativeFunctionPlan::for_function(func).supports_unboxed_int_path()
+    let returns_int = matches!(
+        func.ret,
+        Some(crate::types::Type::Primitive(
+            crate::types::PrimitiveType::Int
+        ))
+    );
+    returns_int
+        && crate::native_plan::NativeFunctionPlan::for_function(func).supports_unboxed_int_path()
 }
 
 #[cfg(test)]
