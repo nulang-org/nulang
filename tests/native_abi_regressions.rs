@@ -69,9 +69,7 @@ fn unboxed_caller_does_not_pass_raw_int_to_boxed_callee() {
     module.functions.push(callee.build());
 
     let compiled = AotModule::compile(&module).expect("native direct-call fixture should compile");
-    let raw = compiled
-        .run()
-        .expect("native direct-call fixture should run");
+    let raw = compiled.run().expect("native direct-call fixture should run");
     // SAFETY: this is a raw value produced by this process's AOT backend.
     let value = unsafe { Value::from_raw(raw) };
 

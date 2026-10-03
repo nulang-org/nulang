@@ -13,7 +13,11 @@ on:
       - 'src/backends/mod.rs'
       - 'src/jit/**'
       - 'src/vm.rs'
+      - 'src/native_optimization.rs'
+      - 'src/native_module_plan.rs'
+      - 'src/native_call_table.rs'
       - 'src/bin/nulang_jit_bench.rs'
+      - 'src/bin/nulang_compile_bench.rs'
       - 'benchmarks/JIT_CODEGEN.md'
       - 'Cargo.toml'
 
@@ -46,15 +50,36 @@ jobs:
         env:
           REPEAT: "${{ github.event_name == 'pull_request' && '1' || inputs.repeat || '5' }}"
         run: |
+          set -o pipefail
           cargo run --locked --release \
             --no-default-features \
             --features native-codegen \
             --bin nulang-jit-bench -- \
             --format jsonl --repeat "$REPEAT" | tee jit-codegen-results.jsonl
+          test -s jit-codegen-results.jsonl
+
+      - name: Run clean compiler telemetry workloads
+        env:
+          REPEAT: "${{ github.event_name == 'pull_request' && '1' || inputs.repeat || '5' }}"
+        run: |
+          set -o pipefail
+          cargo run --locked --release \
+            --no-default-features \
+            --features native-codegen \
+            --bin nulang_compile_bench -- \
+            --format jsonl --repeat "$REPEAT" | tee clean-compile-results.jsonl
+          test -s clean-compile-results.jsonl
 
       - name: Upload JIT telemetry
         uses: actions/upload-artifact@v7
         with:
           name: jit-codegen-results-${{ github.sha }}
           path: jit-codegen-results.jsonl
+          if-no-files-found: error
+
+      - name: Upload clean compiler telemetry
+        uses: actions/upload-artifact@v7
+        with:
+          name: clean-compile-results-${{ github.sha }}
+          path: clean-compile-results.jsonl
           if-no-files-found: error
