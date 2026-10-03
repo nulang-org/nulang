@@ -39,6 +39,28 @@ fn empty_array_cannot_be_made_directly_self_referential() {
 }
 
 #[test]
+fn mutually_recursive_arrays_are_rejected() {
+    // Two distinct arrays can form a cycle only if their element types satisfy
+    // mutually recursive constraints: A = [B] and B = [A]. The occurs check
+    // must reject that indirect infinite type just as it rejects T = [T].
+    let result = typecheck(
+        r#"
+        fn main() {
+            let left = []
+            let right = []
+            left[0] = right
+            right[0] = left
+        }
+        "#,
+    );
+
+    assert!(
+        result.is_err(),
+        "mutually recursive structural array types must be rejected"
+    );
+}
+
+#[test]
 fn concrete_array_cannot_store_itself_as_an_element() {
     // Even without relying on an unconstrained empty-array element variable,
     // an ordinary typed array cannot be stored into an element slot of a
