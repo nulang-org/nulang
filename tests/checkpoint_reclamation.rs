@@ -70,7 +70,7 @@ fn checkpoint_reclaims_wal_prefix_and_restart_restores_mvcc_history() {
         assert_eq!(tablet.current_sequence(), 3);
         assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
         assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
-        assert_eq!(tablet.read_latest(b"other"), Some(&b"x"[..]));
+        assert_eq!(tablet.read_latest(b"other").unwrap(), Some(&b"x"[..]));
 
         commit_put(&mut tablet, b"k", b"v4");
         assert_eq!(tablet.current_sequence(), 4);
