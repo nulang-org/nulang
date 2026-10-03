@@ -9,6 +9,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
+#[path = "fabric_metadata.rs"]
+pub(crate) mod fabric_metadata;
+#[path = "fabric_metadata_wire.rs"]
+pub(crate) mod fabric_metadata_wire;
+
+use self::fabric_metadata::{
+    chunk_snapshot, FabricMetadataAssembler, FabricMetadataChunk, FabricMetadataChunkCursor,
+    FabricMetadataKind, MetadataAssemblyError,
+};
+use self::fabric_metadata_wire::{decode_fab1_chunk, encode_fab1_chunk};
 use crate::runtime::cluster::{ClusterState, NodeId};
 use crate::runtime::fabric_stream_cluster::FabricStreamReplicationState;
 use crate::runtime::network::NetworkTransport;
@@ -16,6 +26,14 @@ use crate::runtime::{
     ActorAddress, AddressResolver, FileFabricStreamStore, MessageAdmission, Runtime,
 };
 use crate::vm::Value;
+
+pub(crate) const FABRIC_METADATA_CHUNK_BYTES: usize = 8 * 1024;
+pub(crate) const FABRIC_METADATA_MAX_CHUNKS: u32 = 2048;
+const FABRIC_METADATA_MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+const FABRIC_METADATA_MAX_INFLIGHT_SNAPSHOTS: usize = 64;
+const FABRIC_METADATA_MAX_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
+const FABRIC_METADATA_PRUNE_INTERVAL: u64 = 256;
+const FABRIC_METADATA_ACTIVITY_WINDOW: u64 = 4096;
 
 /// Cluster advertisement for one ephemeral Fabric subscription.
 ///
@@ -491,6 +509,133 @@ fn pattern_matches(pattern: &str, topic: &str) -> bool {
     t == topic_tokens.len()
 }
 
+#[derive(Debug)]
+struct FabricSubscriptionChunkCache {
+    owner: NodeId,
+    generation: u64,
+    chunks: Vec<FabricMetadataChunk>,
+}
+
+fn write_metadata_string(bytes: &mut Vec<u8>, value: &str) -> Result<(), String> {
+    let len = u32::try_from(value.len())
+        .map_err(|_| "Fabric metadata string exceeds u32 length".to_string())?;
+    bytes.extend_from_slice(&len.to_be_bytes());
+    bytes.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn read_metadata_u32(bytes: &[u8], offset: &mut usize) -> Result<u32, String> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| "Fabric metadata offset overflow".to_string())?;
+    let raw: [u8; 4] = bytes
+        .get(*offset..end)
+        .ok_or_else(|| "truncated Fabric metadata u32".to_string())?
+        .try_into()
+        .map_err(|_| "invalid Fabric metadata u32".to_string())?;
+    *offset = end;
+    Ok(u32::from_be_bytes(raw))
+}
+
+fn read_metadata_u64(bytes: &[u8], offset: &mut usize) -> Result<u64, String> {
+    let end = offset
+        .checked_add(8)
+        .ok_or_else(|| "Fabric metadata offset overflow".to_string())?;
+    let raw: [u8; 8] = bytes
+        .get(*offset..end)
+        .ok_or_else(|| "truncated Fabric metadata u64".to_string())?
+        .try_into()
+        .map_err(|_| "invalid Fabric metadata u64".to_string())?;
+    *offset = end;
+    Ok(u64::from_be_bytes(raw))
+}
+
+fn read_metadata_string(bytes: &[u8], offset: &mut usize) -> Result<String, String> {
+    let len = read_metadata_u32(bytes, offset)? as usize;
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| "Fabric metadata string offset overflow".to_string())?;
+    let raw = bytes
+        .get(*offset..end)
+        .ok_or_else(|| "truncated Fabric metadata string".to_string())?;
+    let value = std::str::from_utf8(raw)
+        .map_err(|_| "Fabric metadata string is not valid UTF-8".to_string())?
+        .to_string();
+    *offset = end;
+    Ok(value)
+}
+
+fn encode_subscription_snapshot(snapshot: &FabricAdvertisementSnapshot) -> Result<Vec<u8>, String> {
+    let count = u32::try_from(snapshot.subscriptions.len())
+        .map_err(|_| "Fabric metadata subscription count exceeds u32".to_string())?;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&count.to_be_bytes());
+    for advertisement in &snapshot.subscriptions {
+        if advertisement.node_id != snapshot.node_id {
+            return Err("Fabric metadata snapshot contains a mismatched node id".to_string());
+        }
+        write_metadata_string(&mut bytes, &advertisement.pattern)?;
+        bytes.extend_from_slice(&advertisement.actor_id.to_be_bytes());
+        write_metadata_string(&mut bytes, &advertisement.behavior)?;
+        match &advertisement.group {
+            Some(group) => {
+                bytes.push(1);
+                write_metadata_string(&mut bytes, group)?;
+            }
+            None => bytes.push(0),
+        }
+        if bytes.len() > FABRIC_METADATA_MAX_SNAPSHOT_BYTES {
+            return Err(format!(
+                "Fabric metadata snapshot exceeds {} bytes",
+                FABRIC_METADATA_MAX_SNAPSHOT_BYTES
+            ));
+        }
+    }
+    Ok(bytes)
+}
+
+fn decode_subscription_snapshot(
+    owner: NodeId,
+    generation: u64,
+    bytes: &[u8],
+) -> Result<FabricAdvertisementSnapshot, String> {
+    if bytes.len() > FABRIC_METADATA_MAX_SNAPSHOT_BYTES {
+        return Err("Fabric metadata snapshot exceeds receiver limit".to_string());
+    }
+    let mut offset = 0usize;
+    let count = read_metadata_u32(bytes, &mut offset)? as usize;
+    let mut subscriptions = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        let pattern = read_metadata_string(bytes, &mut offset)?;
+        let actor_id = read_metadata_u64(bytes, &mut offset)?;
+        let behavior = read_metadata_string(bytes, &mut offset)?;
+        let flag = *bytes
+            .get(offset)
+            .ok_or_else(|| "truncated Fabric metadata group flag".to_string())?;
+        offset += 1;
+        let group = match flag {
+            0 => None,
+            1 => Some(read_metadata_string(bytes, &mut offset)?),
+            _ => return Err("invalid Fabric metadata group flag".to_string()),
+        };
+        subscriptions.push(FabricAdvertisement {
+            node_id: owner,
+            pattern,
+            actor_id,
+            behavior,
+            group,
+        });
+    }
+    if offset != bytes.len() {
+        return Err("Fabric metadata snapshot has trailing bytes".to_string());
+    }
+    Ok(FabricAdvertisementSnapshot {
+        node_id: owner,
+        generation,
+        subscriptions,
+    })
+}
+
 /// Distributed-subsystem state owned by [`Runtime`].
 #[derive(Default)]
 pub struct DistributedContext {
@@ -506,6 +651,10 @@ pub struct DistributedContext {
     // avoids divergent generations when subscriptions are registered from
     // different shards.
     fabric_generation: Option<Arc<AtomicU64>>,
+    fabric_metadata_assembler: Option<FabricMetadataAssembler>,
+    fabric_metadata_cursor: FabricMetadataChunkCursor,
+    fabric_subscription_chunks: Option<FabricSubscriptionChunkCache>,
+    fabric_metadata_activity_tick: u64,
     /// Optional durable local stream store. Stream replication is layered on
     /// top later; this first slice owns the append log and replay cursors.
     pub(crate) fabric_streams: Option<FileFabricStreamStore>,
@@ -621,6 +770,10 @@ impl Runtime {
                 }
                 Ok(FabricControl::RemoveRemoteNode(node_id)) => {
                     let _ = self.distributed.fabric.remove_remote_node(node_id);
+                    if let Some(assembler) = self.distributed.fabric_metadata_assembler.as_mut() {
+                        assembler.discard_owner(node_id.0);
+                    }
+                    self.distributed.fabric_metadata_cursor.discard_owner(node_id.0);
                     applied += 1;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -731,6 +884,142 @@ impl Runtime {
             .local_snapshot(node_id, generation, limit)
     }
 
+    /// Return the next bounded FAB1 chunk for this node's current complete
+    /// subscription generation. Repeated calls rotate indefinitely so lossy
+    /// gossip eventually retransmits every chunk.
+    pub(crate) fn fabric_next_advertisement_chunk_bytes(
+        &mut self,
+    ) -> Result<Option<Vec<u8>>, String> {
+        self.fabric_sync();
+        let node_id = self.distributed.node_id.ok_or_else(|| {
+            "Fabric metadata chunks require distribution to be enabled".to_string()
+        })?;
+        let generation = self.fabric_current_generation();
+        if generation == 0 {
+            return Ok(None);
+        }
+
+        let refresh = self
+            .distributed
+            .fabric_subscription_chunks
+            .as_ref()
+            .is_none_or(|cache| cache.owner != node_id || cache.generation != generation);
+        if refresh {
+            let snapshot = self
+                .distributed
+                .fabric
+                .local_snapshot(node_id, generation, usize::MAX)?;
+            let payload = encode_subscription_snapshot(&snapshot)?;
+            let chunks = chunk_snapshot(
+                FabricMetadataKind::Subscriptions,
+                node_id.0,
+                generation,
+                &payload,
+                FABRIC_METADATA_CHUNK_BYTES,
+            )
+            .map_err(|error| format!("Fabric metadata chunking failed: {error:?}"))?;
+            if chunks.len() > FABRIC_METADATA_MAX_CHUNKS as usize {
+                return Err(format!(
+                    "Fabric metadata snapshot requires {} chunks, exceeding limit {}",
+                    chunks.len(),
+                    FABRIC_METADATA_MAX_CHUNKS
+                ));
+            }
+            self.distributed.fabric_subscription_chunks = Some(FabricSubscriptionChunkCache {
+                owner: node_id,
+                generation,
+                chunks,
+            });
+        }
+
+        let selected = {
+            let context = &mut self.distributed;
+            let chunks = &context
+                .fabric_subscription_chunks
+                .as_ref()
+                .expect("Fabric metadata chunk cache must exist")
+                .chunks;
+            context
+                .fabric_metadata_cursor
+                .next(chunks)
+                .map_err(|error| format!("Fabric metadata scheduling failed: {error:?}"))?
+                .clone()
+        };
+        encode_fab1_chunk(&selected, FABRIC_METADATA_CHUNK_BYTES)
+            .map(Some)
+            .map_err(|error| format!("Fabric metadata wire encoding failed: {error:?}"))
+    }
+
+    /// Accept one additive FAB1 metadata tail from `from_node`. Partial
+    /// generations are retained but never exposed through the routing table;
+    /// only a fully reassembled and hash-verified subscription generation is
+    /// handed to the existing authoritative replacement path.
+    pub(crate) fn fabric_accept_remote_metadata_chunk_bytes(
+        &mut self,
+        from_node: NodeId,
+        bytes: &[u8],
+    ) -> Result<usize, String> {
+        let (chunk, consumed) = decode_fab1_chunk(
+            bytes,
+            FABRIC_METADATA_CHUNK_BYTES,
+            FABRIC_METADATA_MAX_CHUNKS,
+        )
+        .map_err(|error| format!("invalid FAB1 metadata tail: {error:?}"))?;
+        if consumed != bytes.len() {
+            return Err("FAB1 metadata tail contains unexpected trailing bytes".to_string());
+        }
+        if chunk.owner != from_node.0 {
+            return Err(format!(
+                "FAB1 owner mismatch: transport sender {}, metadata owner {}",
+                from_node.0, chunk.owner
+            ));
+        }
+        if chunk.kind != FabricMetadataKind::Subscriptions {
+            return Err("unsupported FAB1 metadata kind on subscription path".to_string());
+        }
+
+        self.distributed.fabric_metadata_activity_tick = self
+            .distributed
+            .fabric_metadata_activity_tick
+            .wrapping_add(1);
+        let activity_tick = self.distributed.fabric_metadata_activity_tick;
+        let completed = {
+            let assembler = self
+                .distributed
+                .fabric_metadata_assembler
+                .get_or_insert_with(|| {
+                    FabricMetadataAssembler::with_limits(
+                        FABRIC_METADATA_MAX_SNAPSHOT_BYTES,
+                        FABRIC_METADATA_MAX_CHUNKS,
+                        FABRIC_METADATA_MAX_INFLIGHT_SNAPSHOTS,
+                        FABRIC_METADATA_MAX_INFLIGHT_BYTES,
+                    )
+                });
+            if activity_tick % FABRIC_METADATA_PRUNE_INTERVAL == 0 {
+                assembler.prune_inflight_before(
+                    activity_tick.saturating_sub(FABRIC_METADATA_ACTIVITY_WINDOW),
+                );
+            }
+            match assembler.push_at(chunk, activity_tick) {
+                Ok(completed) => completed,
+                Err(MetadataAssemblyError::StaleGeneration) => return Ok(0),
+                Err(error) => {
+                    return Err(format!("FAB1 metadata assembly failed: {error:?}"));
+                }
+            }
+        };
+
+        let Some(completed) = completed else {
+            return Ok(0);
+        };
+        let snapshot = decode_subscription_snapshot(
+            from_node,
+            completed.generation,
+            &completed.payload,
+        )?;
+        self.fabric_replace_remote_advertisements(snapshot)
+    }
+
     /// Apply a complete remote subscription snapshot for one cluster node.
     ///
     /// Older or duplicate generations are ignored. Every advertisement must
@@ -785,6 +1074,10 @@ impl Runtime {
     /// node with the same NodeId to begin a fresh sequence.
     pub fn fabric_remove_remote_node(&mut self, node_id: NodeId) -> usize {
         self.fabric_sync();
+        if let Some(assembler) = self.distributed.fabric_metadata_assembler.as_mut() {
+            assembler.discard_owner(node_id.0);
+        }
+        self.distributed.fabric_metadata_cursor.discard_owner(node_id.0);
         let (removed, generation_removed) = self.distributed.fabric.remove_remote_node(node_id);
         if removed > 0 || generation_removed {
             self.fabric_broadcast_control(FabricControl::RemoveRemoteNode(node_id));
