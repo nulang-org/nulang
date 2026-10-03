@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 pub(crate) mod fabric_metadata;
 #[path = "fabric_metadata_wire.rs"]
 pub(crate) mod fabric_metadata_wire;
+#[path = "fabric_metadata_tunnel.rs"]
+pub(crate) mod fabric_metadata_tunnel;
 
 use self::fabric_metadata::{
     chunk_snapshot, FabricMetadataAssembler, FabricMetadataChunk, FabricMetadataChunkCursor,
@@ -1031,6 +1033,9 @@ impl Runtime {
         snapshot: FabricAdvertisementSnapshot,
     ) -> Result<usize, String> {
         self.fabric_sync();
+        if let Some(result) = self.fabric_try_accept_advertisement_tunnel(&snapshot) {
+            return result;
+        }
         if !self.distributed.enabled || self.distributed.node_id.is_none() {
             return Err("Fabric remote advertisements require distribution to be enabled".into());
         }
