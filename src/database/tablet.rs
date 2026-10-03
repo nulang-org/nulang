@@ -1,8 +1,8 @@
 //! Range-tablet ownership and write-fencing primitives.
 //!
-//! This module is deliberately storage-engine agnostic. It defines the
-//! invariants a future NuDB storage engine can enforce before mapping accepted
-//! writes onto WAL/MVCC/Raft machinery.
+//! This module keeps tablet ownership/transaction invariants separate from the
+//! local MVCC storage implementation. Actors may eventually own and coordinate
+//! tablets, while storage-engine hot paths remain ordinary local computation.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -244,6 +244,20 @@ impl TabletWrite {
     }
 }
 
+/// Local MVCC state contract beneath tablet ownership and durability.
+///
+/// `apply_committed` is deliberately infallible. A WAL-backed coordinator
+/// validates and durably records a write before calling it, so a storage engine
+/// implementation must not introduce a second fallible commit point after the
+/// durable acknowledgement boundary.
+pub trait MvccStorage: fmt::Debug {
+    fn current_sequence(&self) -> u64;
+
+    fn apply_committed(&mut self, sequence: u64, mutations: Vec<TabletMutation>);
+
+    fn read_at(&self, key: &[u8], snapshot: u64) -> Option<&[u8]>;
+}
+
 /// One committed value version in the in-memory MVCC prototype.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct VersionedValue {
@@ -263,37 +277,56 @@ pub(crate) struct TabletSnapshotState {
     pub(crate) rows: Vec<TabletSnapshotRow>,
 }
 
-/// Minimal single-node MVCC tablet used to prove transaction semantics before
-/// introducing WAL and replication.
+/// Reference MVCC engine used by the single-node NuDB prototype.
 ///
-/// The structure is deliberately ordinary local computation rather than an
-/// actor-per-key design. A future tablet actor can own this state while reads,
-/// version lookup, and mutation application stay in the local hot path.
-#[derive(Debug, Clone)]
-pub struct MemoryTablet {
-    descriptor: TabletDescriptor,
+/// This keeps the existing B-tree representation intentionally simple while
+/// making its contract replaceable by a future memtable/SSTable engine without
+/// changing tablet fencing, WAL ordering, or replication semantics.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryMvccStorage {
     current_sequence: u64,
     rows: BTreeMap<Vec<u8>, Vec<VersionedValue>>,
 }
 
-impl MemoryTablet {
-    pub fn new(descriptor: TabletDescriptor) -> Self {
-        Self {
-            descriptor,
-            current_sequence: 0,
-            rows: BTreeMap::new(),
-        }
-    }
-
-    pub fn descriptor(&self) -> &TabletDescriptor {
-        &self.descriptor
-    }
-
-    pub fn current_sequence(&self) -> u64 {
+impl MvccStorage for MemoryMvccStorage {
+    fn current_sequence(&self) -> u64 {
         self.current_sequence
     }
 
-    pub(crate) fn snapshot_state(&self) -> TabletSnapshotState {
+    fn apply_committed(&mut self, sequence: u64, mutations: Vec<TabletMutation>) {
+        debug_assert_eq!(sequence, self.current_sequence.saturating_add(1));
+        for mutation in mutations {
+            match mutation {
+                TabletMutation::Put { key, value } => {
+                    self.rows.entry(key).or_default().push(VersionedValue {
+                        sequence,
+                        value: Some(value),
+                    });
+                }
+                TabletMutation::Delete { key } => {
+                    self.rows.entry(key).or_default().push(VersionedValue {
+                        sequence,
+                        value: None,
+                    });
+                }
+            }
+        }
+        self.current_sequence = sequence;
+    }
+
+    fn read_at(&self, key: &[u8], snapshot: u64) -> Option<&[u8]> {
+        self.rows.get(key).and_then(|versions| {
+            versions
+                .iter()
+                .rev()
+                .find(|version| version.sequence <= snapshot)
+                .and_then(|version| version.value.as_deref())
+        })
+    }
+}
+
+impl MemoryMvccStorage {
+    fn snapshot_state(&self) -> TabletSnapshotState {
         TabletSnapshotState {
             current_sequence: self.current_sequence,
             rows: self
@@ -307,16 +340,9 @@ impl MemoryTablet {
         }
     }
 
-    pub(crate) fn restore_snapshot(
-        descriptor: TabletDescriptor,
-        state: TabletSnapshotState,
-    ) -> Result<Self, TabletError> {
+    fn restore_snapshot(state: TabletSnapshotState) -> Result<Self, TabletError> {
         let mut rows = BTreeMap::new();
         for row in state.rows {
-            if !descriptor.range.contains(&row.key) {
-                return Err(TabletError::KeyOutsideTabletRange);
-            }
-
             let mut previous = 0_u64;
             for version in &row.versions {
                 if version.sequence == 0
@@ -333,10 +359,66 @@ impl MemoryTablet {
         }
 
         Ok(Self {
-            descriptor,
             current_sequence: state.current_sequence,
             rows,
         })
+    }
+}
+
+/// A range tablet parameterized by its local MVCC storage engine.
+///
+/// The tablet owns routing, ownership-epoch fencing, predecessor sequencing,
+/// and range validation. The storage implementation owns only local MVCC state
+/// access and infallible publication of an already-committed mutation batch.
+#[derive(Debug, Clone)]
+pub struct Tablet<S = MemoryMvccStorage> {
+    descriptor: TabletDescriptor,
+    storage: S,
+}
+
+/// Backwards-compatible name for the existing in-memory tablet.
+pub type MemoryTablet = Tablet<MemoryMvccStorage>;
+
+impl Tablet<MemoryMvccStorage> {
+    pub fn new(descriptor: TabletDescriptor) -> Self {
+        Self::with_storage(descriptor, MemoryMvccStorage::default())
+    }
+
+    pub(crate) fn snapshot_state(&self) -> TabletSnapshotState {
+        self.storage.snapshot_state()
+    }
+
+    pub(crate) fn restore_snapshot(
+        descriptor: TabletDescriptor,
+        state: TabletSnapshotState,
+    ) -> Result<Self, TabletError> {
+        if state
+            .rows
+            .iter()
+            .any(|row| !descriptor.range.contains(&row.key))
+        {
+            return Err(TabletError::KeyOutsideTabletRange);
+        }
+
+        let storage = MemoryMvccStorage::restore_snapshot(state)?;
+        Ok(Self::with_storage(descriptor, storage))
+    }
+}
+
+impl<S: MvccStorage> Tablet<S> {
+    pub fn with_storage(descriptor: TabletDescriptor, storage: S) -> Self {
+        Self {
+            descriptor,
+            storage,
+        }
+    }
+
+    pub fn descriptor(&self) -> &TabletDescriptor {
+        &self.descriptor
+    }
+
+    pub fn current_sequence(&self) -> u64 {
+        self.storage.current_sequence()
     }
 
     pub fn prepare_write(
@@ -349,7 +431,7 @@ impl MemoryTablet {
             &self.descriptor,
             presented_epoch,
             expected_previous_sequence,
-            self.current_sequence,
+            self.current_sequence(),
             mutations,
         )
     }
@@ -375,9 +457,10 @@ impl MemoryTablet {
                 presented: write.ownership_epoch,
             });
         }
-        if write.expected_previous_sequence != self.current_sequence {
+        let committed_sequence = self.current_sequence();
+        if write.expected_previous_sequence != committed_sequence {
             return Err(TabletError::SequenceMismatch {
-                committed: self.current_sequence,
+                committed: committed_sequence,
                 expected_previous: write.expected_previous_sequence,
             });
         }
@@ -389,13 +472,12 @@ impl MemoryTablet {
             return Err(TabletError::KeyOutsideTabletRange);
         }
 
-        let next_sequence = self
-            .current_sequence
+        let next_sequence = committed_sequence
             .checked_add(1)
             .ok_or(TabletError::SequenceOverflow)?;
         if write.sequence != next_sequence {
             return Err(TabletError::SequenceMismatch {
-                committed: self.current_sequence,
+                committed: committed_sequence,
                 expected_previous: write.expected_previous_sequence,
             });
         }
@@ -403,11 +485,11 @@ impl MemoryTablet {
         Ok(())
     }
 
-    /// Atomically apply one prevalidated write to the in-memory MVCC state.
+    /// Atomically apply one prevalidated write to the local MVCC state.
     ///
     /// All ownership, predecessor, and key-range checks happen before the
-    /// first row version is appended, so a rejected batch leaves the tablet
-    /// unchanged.
+    /// storage engine sees the mutation batch, so a rejected batch leaves the
+    /// engine unchanged.
     pub fn commit(&mut self, write: TabletWrite) -> Result<u64, TabletError> {
         self.validate_write(&write)?;
         Ok(self.publish_validated(write))
@@ -420,7 +502,7 @@ impl MemoryTablet {
     /// already-durable write without creating an ambiguous commit result.
     pub(crate) fn publish_validated(&mut self, write: TabletWrite) -> u64 {
         let sequence = write.sequence;
-        self.apply_mutations(sequence, write.mutations);
+        self.storage.apply_committed(sequence, write.mutations);
         sequence
     }
 
@@ -435,14 +517,14 @@ impl MemoryTablet {
         expected_previous_sequence: u64,
         mutations: Vec<TabletMutation>,
     ) -> Result<(), TabletError> {
-        if expected_previous_sequence != self.current_sequence {
+        let committed_sequence = self.current_sequence();
+        if expected_previous_sequence != committed_sequence {
             return Err(TabletError::SequenceMismatch {
-                committed: self.current_sequence,
+                committed: committed_sequence,
                 expected_previous: expected_previous_sequence,
             });
         }
-        let expected_sequence = self
-            .current_sequence
+        let expected_sequence = committed_sequence
             .checked_add(1)
             .ok_or(TabletError::SequenceOverflow)?;
         if sequence != expected_sequence {
@@ -458,35 +540,16 @@ impl MemoryTablet {
             return Err(TabletError::KeyOutsideTabletRange);
         }
 
-        self.apply_mutations(sequence, mutations);
+        self.storage.apply_committed(sequence, mutations);
         Ok(())
-    }
-
-    fn apply_mutations(&mut self, sequence: u64, mutations: Vec<TabletMutation>) {
-        for mutation in mutations {
-            match mutation {
-                TabletMutation::Put { key, value } => {
-                    self.rows.entry(key).or_default().push(VersionedValue {
-                        sequence,
-                        value: Some(value),
-                    });
-                }
-                TabletMutation::Delete { key } => {
-                    self.rows.entry(key).or_default().push(VersionedValue {
-                        sequence,
-                        value: None,
-                    });
-                }
-            }
-        }
-        self.current_sequence = sequence;
     }
 
     /// Read one key at an already committed snapshot sequence.
     pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
-        if snapshot > self.current_sequence {
+        let committed_sequence = self.current_sequence();
+        if snapshot > committed_sequence {
             return Err(TabletError::SnapshotAhead {
-                committed: self.current_sequence,
+                committed: committed_sequence,
                 requested: snapshot,
             });
         }
@@ -494,19 +557,13 @@ impl MemoryTablet {
             return Err(TabletError::KeyOutsideTabletRange);
         }
 
-        Ok(self.rows.get(key).and_then(|versions| {
-            versions
-                .iter()
-                .rev()
-                .find(|version| version.sequence <= snapshot)
-                .and_then(|version| version.value.as_deref())
-        }))
+        Ok(self.storage.read_at(key, snapshot))
     }
 
     /// Read the newest committed value. Out-of-range keys route as absent;
     /// callers that need a routing error can use `read_at`.
     pub fn read_latest(&self, key: &[u8]) -> Option<&[u8]> {
-        self.read_at(key, self.current_sequence).ok().flatten()
+        self.read_at(key, self.current_sequence()).ok().flatten()
     }
 }
 
