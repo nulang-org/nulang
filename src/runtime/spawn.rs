@@ -247,7 +247,6 @@ fn try_spawn_actor_with_id(
             return Err(error);
         }
     }
-    rt.enqueue_actor(id);
     Ok(id)
 }
 
