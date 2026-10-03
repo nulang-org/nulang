@@ -398,6 +398,15 @@ impl MemoryTablet {
         Ok(())
     }
 
+    /// Advance the committed recovery tail after an external immutable tier has
+    /// proven contiguous sequence coverage. The immutable rows themselves stay
+    /// outside the in-memory tablet and are served by the owning coordinator.
+    pub(crate) fn advance_recovered_sequence(&mut self, max_sequence: u64) {
+        if max_sequence > self.current_sequence {
+            self.current_sequence = max_sequence;
+        }
+    }
+
     pub(crate) fn oldest_immutable_rows(&self) -> Option<Vec<TabletSnapshotRow>> {
         self.immutables.first().map(|memtable| {
             memtable
@@ -409,6 +418,17 @@ impl MemoryTablet {
                 })
                 .collect()
         })
+    }
+
+    /// Drop the oldest frozen generation after an external durable serving tier
+    /// has been published. Callers must establish durability before invoking
+    /// this infallible in-memory retirement step.
+    pub(crate) fn evict_oldest_immutable(&mut self) -> bool {
+        if self.immutables.is_empty() {
+            return false;
+        }
+        self.immutables.remove(0);
+        true
     }
 
     /// Freeze the mutable generation when it reaches the configured byte target.
@@ -639,8 +659,11 @@ impl MemoryTablet {
         self.current_sequence = sequence;
     }
 
-    /// Read one key at an already committed snapshot sequence.
-    pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
+    pub(crate) fn version_at(
+        &self,
+        key: &[u8],
+        snapshot: u64,
+    ) -> Result<Option<&VersionedValue>, TabletError> {
         if snapshot > self.current_sequence {
             return Err(TabletError::SnapshotAhead {
                 committed: self.current_sequence,
@@ -651,13 +674,19 @@ impl MemoryTablet {
             return Err(TabletError::KeyOutsideTabletRange);
         }
 
-        let version = self.mutable.version_at(key, snapshot).or_else(|| {
+        Ok(self.mutable.version_at(key, snapshot).or_else(|| {
             self.immutables
                 .iter()
                 .rev()
                 .find_map(|memtable| memtable.version_at(key, snapshot))
-        });
-        Ok(version.and_then(|version| version.value.as_deref()))
+        }))
+    }
+
+    /// Read one key at an already committed snapshot sequence.
+    pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
+        Ok(self
+            .version_at(key, snapshot)?
+            .and_then(|version| version.value.as_deref()))
     }
 
     /// Read the newest committed value. Out-of-range keys route as absent;
@@ -693,7 +722,7 @@ pub enum TabletError {
     },
     SequenceMismatch {
         committed: u64,
-        expected_previous: u64,
+        expected_previous_sequence: u64,
     },
     SequenceOverflow,
     RecoveredSequenceMismatch {
@@ -741,10 +770,10 @@ impl fmt::Display for TabletError {
             ),
             Self::SequenceMismatch {
                 committed,
-                expected_previous,
+                expected_previous_sequence,
             } => write!(
                 f,
-                "tablet predecessor {expected_previous} does not match committed sequence {committed}"
+                "tablet predecessor {expected_previous_sequence} does not match committed sequence {committed}"
             ),
             Self::SequenceOverflow => f.write_str("tablet sequence overflow"),
             Self::RecoveredSequenceMismatch {
