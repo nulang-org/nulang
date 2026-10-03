@@ -82,7 +82,10 @@ fn tablet_can_use_a_storage_engine_behind_the_mvcc_contract() {
         .unwrap();
     tablet.commit(second).unwrap();
 
-    assert_eq!(tablet.read_at(b"k", first_snapshot).unwrap(), Some(&b"v1"[..]));
+    assert_eq!(
+        tablet.read_at(b"k", first_snapshot).unwrap(),
+        Some(&b"v1"[..])
+    );
     assert_eq!(tablet.read_latest(b"k"), Some(&b"v2"[..]));
 }
 
