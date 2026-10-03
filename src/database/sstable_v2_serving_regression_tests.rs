@@ -51,8 +51,7 @@ fn v1_manifest_entry_outside_descriptor_range_fails_closed() {
     let sstable_dir = path.with_extension("sstables");
     fs::create_dir_all(&sstable_dir).unwrap();
     let table_path = sstable_dir.join("outside-v1.sst");
-    let metadata = sstable::write_sstable(&table_path, 907, 1, &row(b"zz", 1, b"outside"))
-        .unwrap();
+    let metadata = sstable::write_sstable(&table_path, 907, 1, &row(b"zz", 1, b"outside")).unwrap();
 
     let mut manifest = Manifest::empty(907);
     manifest
