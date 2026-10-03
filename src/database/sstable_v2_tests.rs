@@ -1,4 +1,4 @@
-use super::sstable_v2::{write_sstable_v2, OwnedVersion, SstableV2, SstableV2Error};
+use super::sstable_v2::{write_sstable_v2, SstableV2, SstableV2Error};
 use super::tablet::{TabletSnapshotRow, VersionedValue};
 use std::fs;
 use std::path::PathBuf;
@@ -37,12 +37,15 @@ fn test_v2_footer_metadata_and_point_reads_match_written_rows() {
 
     assert_eq!(table.metadata(), &written);
     assert!(table.block_count_for_test() > 1);
+    let first = table.version_at(b"key-0000", 1).unwrap().unwrap();
+    assert_eq!(first.sequence, 1);
+    assert_eq!(first.value.unwrap(), &[b'x'; 64]);
+
+    let repeated = table.version_at(b"key-0000", 1).unwrap().unwrap();
     assert_eq!(
-        table.version_at(b"key-0000", 1).unwrap(),
-        Some(OwnedVersion {
-            sequence: 1,
-            value: Some(vec![b'x'; 64]),
-        })
+        first.value.unwrap().as_ptr(),
+        repeated.value.unwrap().as_ptr(),
+        "v2 point reads should borrow the immutable backing rather than allocate values"
     );
     assert_eq!(
         table
@@ -54,6 +57,22 @@ fn test_v2_footer_metadata_and_point_reads_match_written_rows() {
     );
 
     let _ = fs::remove_file(path);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_v2_mmap_survives_unlink_and_still_serves_borrowed_values() {
+    let path = temp_path("mmap-unlink");
+    let _ = fs::remove_file(&path);
+    write_sstable_v2(&path, 42, 7, &many_rows()).unwrap();
+
+    let table = SstableV2::open(&path).unwrap();
+    assert!(table.is_memory_mapped_for_test());
+    fs::remove_file(&path).unwrap();
+
+    let version = table.version_at(b"key-0512", 513).unwrap().unwrap();
+    assert_eq!(version.sequence, 513);
+    assert_eq!(version.value.unwrap(), &[b'x'; 64]);
 }
 
 #[test]
