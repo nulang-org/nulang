@@ -47,7 +47,7 @@ fn wal_backed_commit_survives_restart_and_rebuilds_mvcc() {
         tablet.commit(write).unwrap();
 
         assert_eq!(tablet.current_sequence(), 1);
-        assert_eq!(tablet.read_latest(b"k"), Some(&b"value"[..]));
+        assert_eq!(tablet.read_latest(b"k").unwrap(), Some(&b"value"[..]));
     }
 
     let tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
