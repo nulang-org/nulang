@@ -33,6 +33,22 @@ fn distributed_runtime(
     runtime
 }
 
+fn drive_gossip_until(
+    sender: &mut Runtime,
+    receiver: &mut Runtime,
+    expected_remote_subscriptions: usize,
+) {
+    for _ in 0..8 {
+        if receiver.fabric_remote_subscription_count() == expected_remote_subscriptions {
+            return;
+        }
+        sender.advance_time(Duration::from_millis(600));
+        receiver.advance_time(Duration::from_millis(600));
+        sender.process_network();
+        receiver.process_network();
+    }
+}
+
 #[test]
 fn automatic_gossip_converges_more_than_legacy_256_subscription_sender_cap() {
     let bus = Arc::new(parking_lot::Mutex::new(HashMap::new()));
@@ -72,11 +88,7 @@ fn automatic_gossip_converges_more_than_legacy_256_subscription_sender_cap() {
     // gossip should use that compatibility window rather than disappearing.
     assert!(b.fabric_advertisements(256).is_err());
 
-    b.advance_time(Duration::from_millis(600));
-    a.advance_time(Duration::from_millis(600));
-    b.process_network();
-    a.process_network();
-
+    drive_gossip_until(&mut b, &mut a, SUBSCRIPTIONS);
     assert_eq!(a.fabric_remote_subscription_count(), SUBSCRIPTIONS);
 
     let report = a
@@ -84,4 +96,27 @@ fn automatic_gossip_converges_more_than_legacy_256_subscription_sender_cap() {
         .unwrap();
     assert_eq!(report.selected, 1);
     assert_eq!(report.forwarded_remote, 1);
+}
+
+#[test]
+fn complete_snapshot_export_still_fails_closed_above_fab0_decoder_bound() {
+    let mut runtime = Runtime::new();
+    let target = runtime.spawn_actor(Box::new(Vec::new));
+    runtime
+        .actors
+        .get_mut(&target)
+        .unwrap()
+        .register_behavior("handle", noop);
+
+    for index in 0..4097 {
+        let pattern = format!("s.{index}");
+        assert!(runtime
+            .fabric_subscribe(&pattern, target, "handle")
+            .unwrap());
+    }
+
+    // Until FAB1 is wired into Packet::Gossip, the compatibility bridge must
+    // never manufacture a partial authoritative FAB0 replacement above the
+    // decoder's existing complete-snapshot bound.
+    assert!(runtime.fabric_advertisements(4096).is_err());
 }
