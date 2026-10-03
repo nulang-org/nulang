@@ -153,14 +153,44 @@ impl IntegerIntrinsic {
     }
 }
 
+#[cfg(feature = "native-codegen")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeIntegerRepresentation {
+    /// Operands/results are already ordinary sign-extended i64 values.
+    RawI64,
+    /// Operands/results use Nulang's TAG_INT + signed 48-bit payload layout.
+    TaggedInt48,
+}
+
+/// Lower an integer intrinsic while making the caller's value representation
+/// explicit. Tagged Nulang integers are unboxed through the shared Int48
+/// sign-extension helper, lowered with the same raw intrinsic operation, then
+/// re-tagged with the shared payload-mask helper.
+#[cfg(feature = "native-codegen")]
+pub fn lower_cranelift_integer(
+    builder: &mut cranelift_frontend::FunctionBuilder<'_>,
+    intrinsic: IntegerIntrinsic,
+    args: &[cranelift::prelude::Value],
+    representation: NativeIntegerRepresentation,
+) -> Result<cranelift::prelude::Value, IntrinsicError> {
+    match representation {
+        NativeIntegerRepresentation::RawI64 => lower_cranelift_i64(builder, intrinsic, args),
+        NativeIntegerRepresentation::TaggedInt48 => {
+            let raw_args = args
+                .iter()
+                .map(|arg| crate::cranelift_utils::emit_sext48(builder, *arg))
+                .collect::<Vec<_>>();
+            let raw = lower_cranelift_i64(builder, intrinsic, &raw_args)?;
+            Ok(crate::cranelift_utils::emit_tag_int(builder, raw))
+        }
+    }
+}
+
 /// Lower one raw-i64 intrinsic directly to Cranelift IR.
 ///
 /// This function deliberately operates on raw i64 values rather than Nulang's
-/// NaN-tagged runtime representation. Native/AOT callers are responsible for
-/// unboxing integer operands before calling and re-boxing the result when the
-/// surrounding function uses the boxed ABI. Keeping representation handling
-/// outside this primitive gives every native caller the same instruction-level
-/// semantics while avoiding hidden allocations or runtime calls here.
+/// tagged runtime representation. Prefer [`lower_cranelift_integer`] at a
+/// backend boundary where the representation may be boxed.
 #[cfg(feature = "native-codegen")]
 pub fn lower_cranelift_i64(
     builder: &mut cranelift_frontend::FunctionBuilder<'_>,
