@@ -88,7 +88,7 @@ cache-server = ["tcp", "dep:mio"]
 ureq = ["dep:ureq"]
 # RocksDB persistence backend (production-grade LSM-tree storage).
 rocksdb = ["dep:rocksdb"]
-# PostgreSQL persistence backend (production-grade relational storage). Sync wrapper over tokio-postgres.
+# PostgreSQL persistence backend (production-grade relational storage).
 postgres = ["dep:postgres"]
 # Differential fuzzing driver binary (src/bin/nula_difffuzz.rs).
 difffuzz = ["native-codegen"]
@@ -146,7 +146,7 @@ opentelemetry_sdk = { version = "0.24", optional = true, features = ["rt-tokio",
 
 # Python interop (optional, see [features])
 pyo3 = { version = "0.29", features = ["auto-initialize", "py-clone"], optional = true }
-# libSQL persistence backend (LibsqlStore + remote Turso support). Only
+# libSQL persistence backend (libsqlStore + remote Turso support). Only
 # `core` (local SQLite) + `remote` (hrana/HTTP Turso access, what
 # `Builder::new_remote` uses) + `tls` are needed -- default-features also
 # pulls `replication`/`sync` (embedded-replica gRPC sync via tonic/axum),
@@ -155,7 +155,7 @@ pyo3 = { version = "0.29", features = ["auto-initialize", "py-clone"], optional 
 libsql = { version = "0.10.0-pre.4", optional = true, default-features = false, features = ["core", "remote", "tls"] }
 # RocksDB persistence backend (feature `rocksdb`).
 rocksdb = { version = "0.21", optional = true, default-features = false }
-# PostgreSQL persistence backend (production-grade relational storage). Sync wrapper over tokio-postgres.
+# PostgreSQL persistence backend (feature `postgres`). Sync wrapper over tokio-postgres.
 postgres = { version = "0.19", optional = true }
 # Native library loading (optional, see [features])
 libloading = { version = "0.8", optional = true }
