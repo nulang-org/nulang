@@ -918,8 +918,17 @@ pub(crate) fn notify_delivery_failed(runtime: &mut Runtime, sender_id: u64, reas
         return;
     }
     let code = delivery_failure_code(reason);
-    let fail_payload = vec![Value::int(code), Value::nil()];
-    runtime.send_message_by_id(sender_id, 0, &fail_payload);
+    let failure = Message {
+        behavior_id: 0,
+        payload: MessagePayload::from_slice(&[Value::int(code), Value::nil()]),
+        sender: 0,
+        priority: MessagePriority::System,
+        trace_id: None,
+    };
+    if let Some(actor) = runtime.actors.get_mut(&sender_id) {
+        let _ = actor.mailbox.push(failure);
+    }
+    runtime.enqueue_actor(sender_id);
 }
 
 /// Map a delivery-failure reason string to an integer code.
