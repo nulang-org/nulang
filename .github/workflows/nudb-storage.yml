@@ -44,6 +44,7 @@ jobs:
           cargo test --locked --no-default-features --test nudb_memtable_rotation
       - name: SSTable and manifest contract
         run: |
+          cargo test --locked --no-default-features --lib database::fallible_read_tests
           cargo test --locked --no-default-features --lib database::sstable::tests
           cargo test --locked --no-default-features --lib database::sstable_indexed::tests
           cargo test --locked --no-default-features --lib database::sstable_indexed_tests
