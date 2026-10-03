@@ -10,7 +10,7 @@
 //! NUL0 framing live at their existing boundaries; this primitive only owns the
 //! transport-independent convergence invariant.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Logical metadata namespace carried by Fabric convergence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -58,6 +58,15 @@ pub enum MetadataAssemblyError {
     SnapshotTooLarge,
     InflightBytesExceeded,
     SnapshotHashMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataScheduleError {
+    EmptySnapshot,
+    IncompleteSnapshot,
+    MixedSnapshot,
+    StaleGeneration,
+    ConflictingGeneration,
 }
 
 /// Split one complete encoded snapshot into bounded chunks.
@@ -111,6 +120,96 @@ pub fn chunk_snapshot(
         });
     }
     Ok(chunks)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MetadataCursorState {
+    generation: u64,
+    snapshot_hash: [u8; 32],
+    chunk_count: u32,
+    next_index: u32,
+}
+
+/// Deterministic sender-side rotation over a complete metadata snapshot.
+///
+/// Gossip is lossy by design. Repeated calls therefore cycle through every
+/// chunk forever instead of treating one pass as delivery confirmation. A
+/// newer generation resets immediately to chunk zero, while conflicting bytes
+/// under the same generation fail closed.
+#[derive(Debug, Default)]
+pub struct FabricMetadataChunkCursor {
+    cursors: HashMap<(FabricMetadataKind, u64), MetadataCursorState>,
+}
+
+impl FabricMetadataChunkCursor {
+    pub fn next<'a>(
+        &mut self,
+        chunks: &'a [FabricMetadataChunk],
+    ) -> Result<&'a FabricMetadataChunk, MetadataScheduleError> {
+        let first = chunks.first().ok_or(MetadataScheduleError::EmptySnapshot)?;
+        if first.generation == 0 || first.chunk_count == 0 {
+            return Err(MetadataScheduleError::MixedSnapshot);
+        }
+        if chunks.len() != first.chunk_count as usize {
+            return Err(MetadataScheduleError::IncompleteSnapshot);
+        }
+
+        let mut seen = HashSet::with_capacity(chunks.len());
+        for chunk in chunks {
+            if chunk.owner != first.owner
+                || chunk.kind != first.kind
+                || chunk.generation != first.generation
+                || chunk.snapshot_hash != first.snapshot_hash
+                || chunk.chunk_count != first.chunk_count
+                || chunk.chunk_index >= chunk.chunk_count
+            {
+                return Err(MetadataScheduleError::MixedSnapshot);
+            }
+            if !seen.insert(chunk.chunk_index) {
+                return Err(MetadataScheduleError::MixedSnapshot);
+            }
+        }
+        if seen.len() != first.chunk_count as usize {
+            return Err(MetadataScheduleError::IncompleteSnapshot);
+        }
+
+        let key = (first.kind, first.owner);
+        let target_index = match self.cursors.get(&key).copied() {
+            Some(current) if first.generation < current.generation => {
+                return Err(MetadataScheduleError::StaleGeneration);
+            }
+            Some(current) if first.generation == current.generation => {
+                if first.snapshot_hash != current.snapshot_hash
+                    || first.chunk_count != current.chunk_count
+                {
+                    return Err(MetadataScheduleError::ConflictingGeneration);
+                }
+                current.next_index
+            }
+            Some(_) | None => 0,
+        };
+
+        let selected = chunks
+            .iter()
+            .find(|chunk| chunk.chunk_index == target_index)
+            .ok_or(MetadataScheduleError::IncompleteSnapshot)?;
+        let next_index = (target_index + 1) % first.chunk_count;
+        self.cursors.insert(
+            key,
+            MetadataCursorState {
+                generation: first.generation,
+                snapshot_hash: first.snapshot_hash,
+                chunk_count: first.chunk_count,
+                next_index,
+            },
+        );
+        Ok(selected)
+    }
+
+    pub fn discard_owner(&mut self, owner: u64) {
+        self.cursors
+            .retain(|(_, cursor_owner), _| *cursor_owner != owner);
+    }
 }
 
 #[derive(Debug)]
