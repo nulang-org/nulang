@@ -17,7 +17,7 @@
 
 use std::fmt;
 
-use super::tablet::VersionedValue;
+use super::tablet::{TabletSnapshotRow, VersionedValue};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MvccRetentionPlan {
@@ -44,6 +44,57 @@ impl MvccRetentionPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MvccGcStats {
+    row_count: usize,
+    versions_before: usize,
+    versions_retained: usize,
+    versions_obsolete: usize,
+    tombstone_barriers: usize,
+}
+
+impl MvccGcStats {
+    pub fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    pub fn versions_before(&self) -> usize {
+        self.versions_before
+    }
+
+    pub fn versions_retained(&self) -> usize {
+        self.versions_retained
+    }
+
+    pub fn versions_obsolete(&self) -> usize {
+        self.versions_obsolete
+    }
+
+    pub fn tombstone_barriers(&self) -> usize {
+        self.tombstone_barriers
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MvccRowRetentionPlan {
+    rows: Vec<TabletSnapshotRow>,
+    stats: MvccGcStats,
+}
+
+impl MvccRowRetentionPlan {
+    pub fn rows(&self) -> &[TabletSnapshotRow] {
+        &self.rows
+    }
+
+    pub fn stats(&self) -> MvccGcStats {
+        self.stats
+    }
+
+    pub fn into_rows(self) -> Vec<TabletSnapshotRow> {
+        self.rows
+    }
+}
+
 pub fn plan_versions_for_floor(
     versions: &[VersionedValue],
     floor: u64,
@@ -66,6 +117,41 @@ pub fn retain_versions_for_floor(
     floor: u64,
 ) -> Result<Vec<VersionedValue>, MvccRetentionError> {
     Ok(plan_versions_for_floor(versions, floor)?.into_retained())
+}
+
+pub fn plan_rows_for_floor(
+    rows: &[TabletSnapshotRow],
+    floor: u64,
+) -> Result<MvccRowRetentionPlan, MvccRetentionError> {
+    let mut retained_rows = Vec::with_capacity(rows.len());
+    let mut stats = MvccGcStats {
+        row_count: rows.len(),
+        ..MvccGcStats::default()
+    };
+
+    for row in rows {
+        let plan = plan_versions_for_floor(&row.versions, floor)?;
+        stats.versions_before += row.versions.len();
+        stats.versions_retained += plan.retained().len();
+        stats.versions_obsolete += plan.obsolete().len();
+        if plan.retained().first().is_some_and(|version| version.value.is_none()) {
+            stats.tombstone_barriers += 1;
+        }
+        retained_rows.push(TabletSnapshotRow {
+            key: row.key.clone(),
+            versions: plan.into_retained(),
+        });
+    }
+
+    debug_assert_eq!(
+        stats.versions_before,
+        stats.versions_retained + stats.versions_obsolete
+    );
+
+    Ok(MvccRowRetentionPlan {
+        rows: retained_rows,
+        stats,
+    })
 }
 
 fn validate_history(versions: &[VersionedValue]) -> Result<(), MvccRetentionError> {
