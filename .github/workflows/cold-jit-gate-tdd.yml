@@ -22,76 +22,82 @@ jobs:
           vm_path = Path("src/vm.rs")
           vm = vm_path.read_text(encoding="utf-8")
 
-          helper_anchor = '''    /// Attempt JIT execution for the current PC.
-          ///
-          /// Returns `true` if the JIT executed a compiled region and advanced the
-          /// PC — the caller should return `Ok(())` immediately.
-          #[cfg(feature = "native-codegen")]
-          fn try_jit_execute(&mut self, frame_idx: usize) -> bool {
-          '''
-          helper_replacement = '''    #[cfg(feature = "native-codegen")]
-          #[inline(always)]
-          fn jit_candidate_for_frame(&self, frame_idx: usize) -> bool {
-              let frame = &self.frames[frame_idx];
-              self.jit_candidate_pcs
-                  .get(frame.module_idx)
-                  .and_then(|row| row.get(frame.pc))
-                  .copied()
-                  .unwrap_or(false)
-          }
-
-          /// Attempt JIT execution for a PC already classified as a JIT candidate.
-          ///
-          /// Returns `true` if the JIT executed a compiled region and advanced the
-          /// PC — the caller should return `Ok(())` immediately.
-          #[cfg(feature = "native-codegen")]
-          fn try_jit_execute(&mut self, frame_idx: usize) -> bool {
-          '''
+          helper_anchor = (
+              "    /// Attempt JIT execution for the current PC.\n"
+              "    ///\n"
+              "    /// Returns `true` if the JIT executed a compiled region and advanced the\n"
+              "    /// PC — the caller should return `Ok(())` immediately.\n"
+              "    #[cfg(feature = \"native-codegen\")]\n"
+              "    fn try_jit_execute(&mut self, frame_idx: usize) -> bool {\n"
+          )
+          helper_replacement = (
+              "    #[cfg(feature = \"native-codegen\")]\n"
+              "    #[inline(always)]\n"
+              "    fn jit_candidate_for_frame(&self, frame_idx: usize) -> bool {\n"
+              "        let frame = &self.frames[frame_idx];\n"
+              "        self.jit_candidate_pcs\n"
+              "            .get(frame.module_idx)\n"
+              "            .and_then(|row| row.get(frame.pc))\n"
+              "            .copied()\n"
+              "            .unwrap_or(false)\n"
+              "    }\n\n"
+              "    /// Attempt JIT execution for a PC already classified as a JIT candidate.\n"
+              "    ///\n"
+              "    /// Returns `true` if the JIT executed a compiled region and advanced the\n"
+              "    /// PC — the caller should return `Ok(())` immediately.\n"
+              "    #[cfg(feature = \"native-codegen\")]\n"
+              "    fn try_jit_execute(&mut self, frame_idx: usize) -> bool {\n"
+          )
           assert vm.count(helper_anchor) == 1, "unexpected try_jit_execute anchor"
           vm = vm.replace(helper_anchor, helper_replacement, 1)
 
-          candidate_block = '''
-              // Most PCs can never be profitable JIT region entries. Avoid backend
-              // dispatch and hot-counter mutation entirely for those instructions.
-              if !self
-                  .jit_candidate_pcs
-                  .get(module_idx)
-                  .and_then(|row| row.get(pc))
-                  .copied()
-                  .unwrap_or(false)
-              {
-                  return false;
-              }
-          '''
+          candidate_block = (
+              "\n"
+              "        // Most PCs can never be profitable JIT region entries. Avoid backend\n"
+              "        // dispatch and hot-counter mutation entirely for those instructions.\n"
+              "        if !self\n"
+              "            .jit_candidate_pcs\n"
+              "            .get(module_idx)\n"
+              "            .and_then(|row| row.get(pc))\n"
+              "            .copied()\n"
+              "            .unwrap_or(false)\n"
+              "        {\n"
+              "            return false;\n"
+              "        }\n"
+          )
           assert vm.count(candidate_block) == 1, "unexpected candidate block count"
           vm = vm.replace(candidate_block, "\n", 1)
 
-          step_gate = '''        if self.debug_hook.is_none()
-              && self.jit_session.is_some()
-              && self.try_jit_execute(frame_idx)
-          '''
-          step_gate_replacement = '''        if self.debug_hook.is_none()
-              && self.jit_session.is_some()
-              && self.jit_candidate_for_frame(frame_idx)
-              && self.try_jit_execute(frame_idx)
-          '''
+          step_gate = (
+              "        if self.debug_hook.is_none()\n"
+              "            && self.jit_session.is_some()\n"
+              "            && self.try_jit_execute(frame_idx)\n"
+          )
+          step_gate_replacement = (
+              "        if self.debug_hook.is_none()\n"
+              "            && self.jit_session.is_some()\n"
+              "            && self.jit_candidate_for_frame(frame_idx)\n"
+              "            && self.try_jit_execute(frame_idx)\n"
+          )
           assert vm.count(step_gate) == 1, "unexpected step JIT gate count"
           vm = vm.replace(step_gate, step_gate_replacement, 1)
           vm_path.write_text(vm, encoding="utf-8")
 
           bench_path = Path("benches/interp_bench.rs")
           bench = bench_path.read_text(encoding="utf-8")
-          old_comment = '''/// A loop below HOT_THRESHOLD (500 < 1000 iterations), so no region ever
-          /// tiers up. Comparing JIT-enabled (`VM::new`) vs JIT-disabled
-          /// (`new_without_jit`) on identical source quantifies the per-instruction
-          /// JIT-probe overhead the default path pays on cold code (two FxHashMap
-          /// lookups per step: `is_compiled` + `record_and_check_hot`).
-          '''
-          new_comment = '''/// A loop below HOT_THRESHOLD (500 < 1000 iterations), so no region ever
-          /// tiers up. Comparing JIT-enabled (`VM::new`) vs JIT-disabled
-          /// (`new_without_jit`) on identical source quantifies the residual cold-code
-          /// cost of candidate classification and hotness probing on JIT-enabled VMs.
-          '''
+          old_comment = (
+              "/// A loop below HOT_THRESHOLD (500 < 1000 iterations), so no region ever\n"
+              "/// tiers up. Comparing JIT-enabled (`VM::new`) vs JIT-disabled\n"
+              "/// (`new_without_jit`) on identical source quantifies the per-instruction\n"
+              "/// JIT-probe overhead the default path pays on cold code (two FxHashMap\n"
+              "/// lookups per step: `is_compiled` + `record_and_check_hot`).\n"
+          )
+          new_comment = (
+              "/// A loop below HOT_THRESHOLD (500 < 1000 iterations), so no region ever\n"
+              "/// tiers up. Comparing JIT-enabled (`VM::new`) vs JIT-disabled\n"
+              "/// (`new_without_jit`) on identical source quantifies the residual cold-code\n"
+              "/// cost of candidate classification and hotness probing on JIT-enabled VMs.\n"
+          )
           assert bench.count(old_comment) == 1, "unexpected cold JIT benchmark comment"
           bench = bench.replace(old_comment, new_comment, 1)
           bench_path.write_text(bench, encoding="utf-8")
