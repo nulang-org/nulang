@@ -80,8 +80,8 @@ impl IndexedSstable {
             .and_then(|name| name.to_str())
             .ok_or(SstableError::InvalidFileName)?
             .to_owned();
-        let row_count =
-            u32::try_from(indexed.row_count).map_err(|_| SstableError::TooManyRows(indexed.row_count))?;
+        let row_count = u32::try_from(indexed.row_count)
+            .map_err(|_| SstableError::TooManyRows(indexed.row_count))?;
 
         Ok(Self {
             metadata: SstableMetadata {
@@ -534,10 +534,7 @@ mod tests {
                 value: Some(&vec![b'x'; 32]),
             })
         );
-        assert_eq!(
-            indexed.version_at(b"key-0512", 513).unwrap().sequence,
-            513
-        );
+        assert_eq!(indexed.version_at(b"key-0512", 513).unwrap().sequence, 513);
         assert_eq!(
             indexed.version_at(b"key-1023", 1024).unwrap().sequence,
             1024
