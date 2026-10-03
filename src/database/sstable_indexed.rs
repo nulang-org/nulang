@@ -189,11 +189,7 @@ impl IndexedSstable {
         let actual_file_len = usize::try_from(file.metadata()?.len())
             .map_err(|_| SstableError::TooLarge(payload_len))?;
         if actual_file_len < expected_file_len {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated NuDB SSTable",
-            )
-            .into());
+            return Err(SstableError::InvalidLength);
         }
         if actual_file_len > expected_file_len {
             return Err(SstableError::TrailingBytes);
