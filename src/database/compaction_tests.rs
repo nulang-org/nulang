@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::interruption::{with_interruption, StorageInterruptionPoint};
-use super::store::WalBackedTablet;
+use super::store::{WalBackedError, WalBackedTablet};
 use super::tablet::{KeyRange, TabletDescriptor, TabletId, TabletMutation};
 
 static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
@@ -72,15 +72,22 @@ fn build_four_tables(path: &Path) -> WalBackedTablet {
     tablet
 }
 
-fn sstable_file_count(path: &Path) -> usize {
-    fs::read_dir(path.with_extension("sstables"))
+fn sstable_paths(path: &Path) -> Vec<PathBuf> {
+    let mut paths = fs::read_dir(path.with_extension("sstables"))
         .map(|entries| {
             entries
                 .filter_map(Result::ok)
-                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sst"))
-                .count()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "sst"))
+                .collect::<Vec<_>>()
         })
-        .unwrap_or(0)
+        .unwrap_or_default();
+    paths.sort();
+    paths
+}
+
+fn sstable_file_count(path: &Path) -> usize {
+    sstable_paths(path).len()
 }
 
 fn assert_history(tablet: &WalBackedTablet) {
@@ -138,12 +145,48 @@ fn compaction_interrupted_after_manifest_rename_recovers_replacement_authority()
     drop(tablet);
 
     // Rename is the manifest commit point. Reopen sees the replacement as
-    // authoritative, consumes persisted obsolete-file intent, fsyncs source
-    // retirement, and clears the intent before admitting the serving set.
+    // authoritative, validates the complete recovery chain, then consumes
+    // persisted obsolete-file intent and clears it durably.
     let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert_eq!(reopened.current_sequence(), 4);
     assert_eq!(reopened.durable_sstable_count().unwrap(), 1);
     assert_eq!(sstable_file_count(&path), 1);
     assert_history(&reopened);
+    cleanup(&path);
+}
+
+#[test]
+fn corrupt_committed_replacement_does_not_delete_source_fallbacks() {
+    let path = temp_wal("corrupt_replacement");
+    cleanup(&path);
+    let mut tablet = build_four_tables(&path);
+    let source_paths = sstable_paths(&path);
+    assert_eq!(source_paths.len(), 4);
+
+    let result = with_interruption(StorageInterruptionPoint::ManifestAfterRename, || {
+        tablet.compact_l0_once()
+    });
+    assert!(result.is_err());
+    drop(tablet);
+
+    let all_paths = sstable_paths(&path);
+    assert_eq!(all_paths.len(), 5);
+    let replacement = all_paths
+        .iter()
+        .find(|candidate| !source_paths.contains(candidate))
+        .expect("replacement SSTable must exist after manifest rename");
+    let mut bytes = fs::read(replacement).unwrap();
+    bytes[20] ^= 0x40;
+    fs::write(replacement, bytes).unwrap();
+
+    assert!(matches!(
+        WalBackedTablet::open(descriptor(), &path),
+        Err(WalBackedError::Sstable(_))
+    ));
+    assert_eq!(sstable_file_count(&path), 5);
+    for source in &source_paths {
+        assert!(source.exists(), "source SSTable was retired before replacement validation");
+    }
+
     cleanup(&path);
 }
