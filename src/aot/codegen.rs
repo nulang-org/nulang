@@ -8,7 +8,10 @@
 #[path = "codegen_impl.rs"]
 mod implementation;
 
-pub use implementation::*;
+pub use implementation::{
+    compile_actor_entry_wrapper, compile_boxing_wrapper, compile_mir_function_body,
+    AotCompileError, AotContext, AotResult, CompileMode,
+};
 
 /// Conservative whole-function eligibility for the current raw-Int AOT path.
 ///
