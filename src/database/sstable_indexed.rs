@@ -23,6 +23,7 @@ const MAX_VERSIONS_PER_ROW: usize = 65_536;
 const MAX_KEY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_VALUE_BYTES: usize = 64 * 1024 * 1024;
 const TARGET_BLOCK_BYTES: usize = 16 * 1024;
+const SSTABLE_FIXED_BYTES: u64 = 8 + 2 + 4 + 32;
 
 #[derive(Debug, Clone)]
 struct BlockIndex {
@@ -61,6 +62,12 @@ impl IndexedSstable {
         let payload_len = read_u32(&mut file)? as usize;
         if payload_len > MAX_SSTABLE_BYTES {
             return Err(SstableError::TooLarge(payload_len));
+        }
+        let minimum_file_len = SSTABLE_FIXED_BYTES
+            .checked_add(payload_len as u64)
+            .ok_or(SstableError::InvalidLength)?;
+        if file.metadata()?.len() < minimum_file_len {
+            return Err(SstableError::InvalidLength);
         }
         let mut payload = vec![0_u8; payload_len];
         file.read_exact(&mut payload)?;
