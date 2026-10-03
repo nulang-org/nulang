@@ -9,6 +9,7 @@ pub mod manifest;
 pub mod owner;
 pub mod sstable;
 pub(crate) mod sstable_indexed;
+pub(crate) mod sstable_v2;
 pub mod store;
 pub mod tablet;
 pub mod wal;
@@ -20,3 +21,5 @@ mod interruption;
 mod sstable_indexed_tests;
 #[cfg(test)]
 mod sstable_mmap_tests;
+#[cfg(test)]
+mod sstable_v2_tests;
