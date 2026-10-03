@@ -23,6 +23,8 @@ mod interruption;
 #[cfg(test)]
 mod manifest_v2_tests;
 #[cfg(test)]
+mod sstable_compaction_regression_tests;
+#[cfg(test)]
 mod sstable_compaction_tests;
 #[cfg(test)]
 mod sstable_indexed_tests;
