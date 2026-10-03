@@ -10,7 +10,7 @@ use std::env;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use nulang::effect_checker::{CapContext, CapabilityAnalyzer, EffectChecker};
+use nulang::effect_checker::EffectChecker;
 use nulang::lexer::Lexer;
 use nulang::parser::Parser;
 use nulang::typechecker::TypeChecker;
@@ -95,59 +95,6 @@ fn elapsed_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// Run the capability phase for the declaration shapes exercised by this
-/// benchmark suite and return the number of expression bodies visited.
-///
-/// This intentionally mirrors the CLI's function/actor capability work rather
-/// than timing only top-level functions. Actor workloads therefore include
-/// behavior bodies, state defaults, and explicit init expressions.
-fn check_capabilities(decls: &[nulang::ast::Decl]) -> usize {
-    let mut analyzer = CapabilityAnalyzer::new();
-    let base_ctx = CapContext::new();
-    let mut bodies = 0usize;
-
-    for decl in nulang::effect_checker::flatten_decls(decls) {
-        match decl {
-            nulang::ast::Decl::Function { body, params, .. } => {
-                let ctx = base_ctx.with_params(params);
-                analyzer
-                    .infer_cap(&ctx, body)
-                    .expect("compile bench: capability check failed");
-                bodies += 1;
-            }
-            nulang::ast::Decl::Actor {
-                behaviors,
-                state_fields,
-                init,
-                ..
-            } => {
-                for behavior in behaviors {
-                    let ctx = base_ctx.with_params(&behavior.params);
-                    analyzer
-                        .infer_cap(&ctx, &behavior.body)
-                        .expect("compile bench: actor behavior capability check failed");
-                    bodies += 1;
-                }
-                for (_, _, _, default) in state_fields {
-                    analyzer
-                        .infer_cap(&base_ctx, default)
-                        .expect("compile bench: actor state capability check failed");
-                    bodies += 1;
-                }
-                for (_, expr) in init {
-                    analyzer
-                        .infer_cap(&base_ctx, expr)
-                        .expect("compile bench: actor init capability check failed");
-                    bodies += 1;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    bodies
-}
-
 fn measure_compile(workload: Workload) -> Measurement {
     let total_started = Instant::now();
 
@@ -178,7 +125,8 @@ fn measure_compile(workload: Workload) -> Measurement {
     let effect_check = started.elapsed();
 
     let started = Instant::now();
-    let capability_bodies = check_capabilities(&ast.decls);
+    let capability_summary = nulang::capability_analysis::analyze_module_capabilities(&ast.decls)
+        .expect("compile bench: capability check failed");
     let capability_check = started.elapsed();
 
     let started = Instant::now();
@@ -200,7 +148,7 @@ fn measure_compile(workload: Workload) -> Measurement {
         workload: workload.name,
         source_bytes: workload.source.len(),
         instructions: module.instructions.len(),
-        capability_bodies,
+        capability_bodies: capability_summary.bodies_checked,
         phases: PhaseTimes {
             lex,
             parse,
@@ -387,9 +335,11 @@ mod tests {
             .expect("actor benchmark workload");
         let tokens = Lexer::new(actor.source).lex().expect("actor lex");
         let ast = Parser::new(tokens).parse_module().expect("actor parse");
+        let summary = nulang::capability_analysis::analyze_module_capabilities(&ast.decls)
+            .expect("actor capability analysis");
 
         assert!(
-            check_capabilities(&ast.decls) >= 4,
+            summary.bodies_checked >= 4,
             "actor workload must time function, behavior, and state capability analysis"
         );
     }
