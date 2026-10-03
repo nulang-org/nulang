@@ -5170,7 +5170,7 @@ impl Runtime {
             } else {
                 let idx = vm.modules.len();
                 vm.load_module(
-                    module_to_load.expect("module must exist when bytecode_module_idx is absent"),
+                    *module_to_load.expect("module must exist when bytecode_module_idx is absent"),
                 );
                 if let Some(actor) = (*self_ptr).actors.get_mut(&actor_id) {
                     actor.bytecode_module_idx = Some(idx);
@@ -5684,7 +5684,7 @@ impl Runtime {
         }
         // Restore bytecode metadata registered for recovery.
         if let Some((module, offsets, comp_offsets)) = self.recovery_modules.get(&actor_id) {
-            actor.bytecode_module = Some(module.clone());
+            actor.bytecode_module = Some(Box::new(module.clone()));
             actor.bytecode_offsets = offsets.clone();
             actor.compensation_offsets = comp_offsets.clone();
         }
@@ -5906,7 +5906,7 @@ impl Runtime {
             actor.activation_epoch = snapshot.activation_epoch;
             actor.waiting_signal = snapshot.waiting_signal.clone();
             actor.install_authority_manifest(&authority_manifest);
-            actor.bytecode_module = Some(module.clone());
+            actor.bytecode_module = Some(Box::new(module.clone()));
             actor.bytecode_offsets = module
                 .behaviors
                 .iter()
@@ -5967,7 +5967,7 @@ impl Runtime {
         actor.activation_epoch = snapshot.activation_epoch;
         actor.waiting_signal = snapshot.waiting_signal.clone();
         actor.install_authority_manifest(&authority_manifest);
-        actor.bytecode_module = Some(module.clone());
+        actor.bytecode_module = Some(Box::new(module.clone()));
         actor.bytecode_offsets = offsets;
         actor.compensation_offsets = compensation_offsets;
         Self::restore_state_models_from_snapshot(&mut actor, Some(meta), snapshot);
@@ -6060,7 +6060,7 @@ impl Runtime {
         } else {
             let mut actor = Actor::new(stable_actor_id, grain_id.actor_name(), 0);
             actor.persistent = true;
-            actor.bytecode_module = Some(grain_type.module.clone());
+            actor.bytecode_module = Some(Box::new(grain_type.module.clone()));
             actor.bytecode_offsets = grain_type.bytecode_offsets.clone();
             actor.compensation_offsets = grain_type.compensation_offsets.clone();
             actor.state_models = grain_type
@@ -6930,7 +6930,7 @@ impl Runtime {
                 .iter()
                 .map(|entry| (entry.name.clone(), entry.handler_fn))
                 .collect(),
-            bytecode_module: actor.bytecode_module.clone(),
+            bytecode_module: actor.bytecode_module.as_deref().cloned(),
             bytecode_offsets: actor.bytecode_offsets.clone(),
             compensation_offsets: actor.compensation_offsets.clone(),
             persistent: actor.persistent,
@@ -7387,7 +7387,7 @@ impl Runtime {
         let module = match self
             .actors
             .get(&actor_id)
-            .and_then(|a| a.bytecode_module.clone())
+            .and_then(|a| a.bytecode_module.as_deref().cloned())
             .or_else(|| {
                 self.recovery_modules
                     .get(&actor_id)
