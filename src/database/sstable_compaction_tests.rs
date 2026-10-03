@@ -128,7 +128,12 @@ fn compact_mixed_v1_v2_tables_preserves_full_mvcc_history_and_recovery() {
     assert_eq!(manifest.entries().len(), 1);
     assert_eq!(manifest.entries()[0].format, SstableFormat::V2);
     assert!(manifest.entries()[0].file_name.contains("-compact-v2-"));
-    assert_eq!(fs::read_dir(path.with_extension("sstables")).unwrap().count(), 1);
+    assert_eq!(
+        fs::read_dir(path.with_extension("sstables"))
+            .unwrap()
+            .count(),
+        1
+    );
 
     let mut wal = FileWal::open(&path).unwrap();
     wal.reclaim_through(3).unwrap();
@@ -258,7 +263,9 @@ fn compaction_conflict_fails_before_manifest_replacement() {
             integrity: SstableIntegrity::FooterBlake3(right.footer_checksum),
         })
         .unwrap();
-    manifest.publish(&path.with_extension("manifest")).unwrap();
+    manifest
+        .publish(&path.with_extension("manifest"))
+        .unwrap();
 
     assert_eq!(
         compact_tablet_sstables_to_v2(&descriptor(), &path).unwrap_err(),
@@ -268,6 +275,38 @@ fn compaction_conflict_fails_before_manifest_replacement() {
     assert_eq!(manifest_after.entries().len(), 2);
     assert!(sstable_dir.join("left-v1.sst").exists());
     assert!(sstable_dir.join("right-v2.sst").exists());
+
+    cleanup(&path);
+}
+
+#[test]
+fn compaction_rejects_source_outside_descriptor_range_before_manifest_replacement() {
+    let path = temp_wal("out-of-range");
+    cleanup(&path);
+
+    install_v1_manifest(
+        &path,
+        "out-of-range-v1.sst",
+        &[TabletSnapshotRow {
+            key: b"zz".to_vec(),
+            versions: vec![VersionedValue {
+                sequence: 1,
+                value: Some(b"outside".to_vec()),
+            }],
+        }],
+    );
+
+    assert_eq!(
+        compact_tablet_sstables_to_v2(&descriptor(), &path).unwrap_err(),
+        CompactionError::ManifestSstableMismatch("out-of-range-v1.sst".to_owned())
+    );
+    let manifest_after = Manifest::load_or_empty(&path.with_extension("manifest"), 906).unwrap();
+    assert_eq!(manifest_after.entries().len(), 1);
+    assert_eq!(manifest_after.entries()[0].file_name, "out-of-range-v1.sst");
+    assert!(path
+        .with_extension("sstables")
+        .join("out-of-range-v1.sst")
+        .exists());
 
     cleanup(&path);
 }
