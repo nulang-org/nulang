@@ -23,7 +23,6 @@ pub(crate) struct SimdComputePlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SimdComputePlanError {
-    NotImplemented,
     WidthMismatch {
         analyzer_lanes: u16,
         element_lanes: u16,
@@ -33,7 +32,6 @@ pub(crate) enum SimdComputePlanError {
 impl fmt::Display for SimdComputePlanError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotImplemented => write!(f, "SIMD compute IR normalization is not implemented"),
             Self::WidthMismatch {
                 analyzer_lanes,
                 element_lanes,
@@ -48,8 +46,41 @@ impl fmt::Display for SimdComputePlanError {
 impl std::error::Error for SimdComputePlanError {}
 
 impl SimdComputePlan {
-    pub(crate) fn from_region(_region: &SimdRegion) -> Result<Self, SimdComputePlanError> {
-        Err(SimdComputePlanError::NotImplemented)
+    pub(crate) fn from_region(region: &SimdRegion) -> Result<Self, SimdComputePlanError> {
+        let analyzer_lanes = analyzer_lanes(region.width);
+        let element_lanes = region.elem_type.lane_count() as u16;
+        if analyzer_lanes != element_lanes {
+            return Err(SimdComputePlanError::WidthMismatch {
+                analyzer_lanes,
+                element_lanes,
+            });
+        }
+
+        // Current bytecode SIMD analysis only produces non-zero fixed widths.
+        // Keep the checked compute-IR constructor as the authority so future
+        // scalable/target-selected widths cannot silently bypass validation.
+        let width = VectorWidth::fixed(analyzer_lanes)
+            .expect("SIMD analyzer only exposes non-zero fixed widths");
+        let vector_type = VectorType::new(scalar_type(region.elem_type), width);
+
+        Ok(Self { vector_type })
+    }
+}
+
+const fn scalar_type(elem_type: SimdElemType) -> ScalarType {
+    match elem_type {
+        SimdElemType::Int64 => ScalarType::I64,
+        SimdElemType::Float64 => ScalarType::F64,
+        SimdElemType::Int32 => ScalarType::I32,
+        SimdElemType::Float32 => ScalarType::F32,
+    }
+}
+
+const fn analyzer_lanes(width: SimdWidth) -> u16 {
+    match width {
+        SimdWidth::Width2 => 2,
+        SimdWidth::Width4 => 4,
+        SimdWidth::Width8 => 8,
     }
 }
 
@@ -61,7 +92,14 @@ pub(crate) fn compile_simd_region(
     instructions: &[Instruction],
     region: &SimdRegion,
 ) -> Result<*const u8, String> {
-    let _plan = SimdComputePlan::from_region(region).map_err(|error| error.to_string())?;
+    // Fail closed if the legacy analyzer and portable compute type contract
+    // diverge. Cranelift lowering remains unchanged in this migration slice.
+    let plan = SimdComputePlan::from_region(region).map_err(|error| error.to_string())?;
+    debug_assert_eq!(
+        plan.vector_type.width.min_lanes(),
+        region.elem_type.lane_count() as u16
+    );
+
     simd_compiler::compile_simd_region(
         module,
         builder_context,
