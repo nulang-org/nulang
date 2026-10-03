@@ -60,7 +60,10 @@ fn immutable_flush_is_durable_idempotent_serving_and_does_not_reclaim_wal() {
         0,
         "manifest-published SSTable should serve reads without retaining a duplicate memtable"
     );
-    assert_eq!(tablet.read_latest(b"k"), Some(&b"v1"[..]));
+    assert_eq!(
+        tablet.read_latest(b"k").unwrap().as_deref(),
+        Some(&b"v1"[..])
+    );
 
     let wal = FileWal::open(&path).unwrap();
     assert_eq!(wal.base_sequence(), 0);
@@ -70,7 +73,10 @@ fn immutable_flush_is_durable_idempotent_serving_and_does_not_reclaim_wal() {
 
     let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert_eq!(reopened.current_sequence(), 1);
-    assert_eq!(reopened.read_latest(b"k"), Some(&b"v1"[..]));
+    assert_eq!(
+        reopened.read_latest(b"k").unwrap().as_deref(),
+        Some(&b"v1"[..])
+    );
     assert_eq!(reopened.immutable_memtable_count(), 0);
     assert_eq!(reopened.durable_sstable_count().unwrap(), 1);
     cleanup(&path);
