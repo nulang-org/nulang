@@ -107,7 +107,7 @@ fn corrupt_manifest_referenced_sstable_fails_reopen_closed() {
 
     assert!(matches!(
         WalBackedTablet::open(descriptor(), &path),
-        Err(WalBackedError::Sstable(_))
+        Err(WalBackedError::Sstable(_)) | Err(WalBackedError::SstableV2(_))
     ));
     cleanup(&path);
 }
