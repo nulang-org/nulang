@@ -101,3 +101,88 @@ fn normal_nested_arrays_remain_well_typed() {
         result.err()
     );
 }
+
+#[test]
+fn empty_array_binding_is_monomorphic_after_first_store() {
+    // Arrays are mutable storage. Once one store constrains the element type,
+    // later uses of the same binding must observe that same element type.
+    let result = typecheck(
+        r#"
+        fn main() {
+            let xs = []
+            xs[0] = 1
+            xs[0] = "string"
+        }
+        "#,
+    );
+
+    assert!(
+        result.is_err(),
+        "one mutable array binding must not be instantiated at incompatible element types"
+    );
+}
+
+#[test]
+fn independent_empty_array_bindings_do_not_share_type_variables() {
+    let result = typecheck(
+        r#"
+        fn main() {
+            let ints = []
+            let strings = []
+            ints[0] = 1
+            strings[0] = "string"
+            0
+        }
+        "#,
+    );
+
+    assert!(
+        result.is_ok(),
+        "independent mutable arrays should infer independently: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn array_factory_remains_polymorphic_per_call() {
+    // The function value itself is generalized. Each invocation allocates a
+    // distinct mutable array, so each returned array may acquire its own
+    // monomorphic element type without sharing storage typing across calls.
+    let result = typecheck(
+        r#"
+        fn main() {
+            let make = fn() { [] }
+            let ints = make()
+            let strings = make()
+            ints[0] = 1
+            strings[0] = "string"
+            0
+        }
+        "#,
+    );
+
+    assert!(
+        result.is_ok(),
+        "array-producing functions should remain polymorphic per call: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn aliasing_empty_array_does_not_regain_polymorphism() {
+    let result = typecheck(
+        r#"
+        fn main() {
+            let xs = []
+            let alias = xs
+            xs[0] = 1
+            alias[0] = "string"
+        }
+        "#,
+    );
+
+    assert!(
+        result.is_err(),
+        "aliases of one mutable array must retain one shared element type"
+    );
+}
