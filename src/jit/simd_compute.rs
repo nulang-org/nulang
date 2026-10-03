@@ -377,6 +377,7 @@ mod tests {
 
         let plan = SimdComputePlan::from_region(&input).expect("runtime extent should normalize");
         let iteration = plan.iteration.expect("dynamic iteration space");
+        let vector_loop = plan.vector_loop.expect("runtime extent should produce a vector loop plan");
 
         assert_eq!(
             iteration.extent,
@@ -390,7 +391,33 @@ mod tests {
                 register: 9,
             }
         );
-        assert_eq!(plan.vector_loop, None);
+        assert_eq!(vector_loop.vector_iterations, None);
+        assert_eq!(vector_loop.scalar_tail, None);
+        assert!(vector_loop.requires_runtime_tail);
+        assert!(!vector_loop.requires_runtime_bounds_check);
+    }
+
+    #[test]
+    fn runtime_arr_len_plan_gets_profitability_guard() {
+        let mut input = region(SimdElemType::Float64, SimdWidth::Width2);
+        input.trip_count_hint = Some(0);
+        input.arr_len_reg = Some(9);
+
+        let plan = SimdComputePlan::from_region(&input).unwrap();
+        let policy = VectorizationPolicy::new(4, 64, false, true).unwrap();
+        let decision = plan
+            .vectorization_decision(policy)
+            .unwrap()
+            .expect("runtime plan should have a policy decision");
+        let VectorizationDecision::Vectorize(execution) = decision else {
+            panic!("expected runtime vectorization");
+        };
+
+        assert_eq!(execution.tile.vectors_per_tile, 4);
+        assert_eq!(
+            execution.profitability_guard,
+            ProfitabilityGuard::FixedElementsAtLeast(8)
+        );
     }
 
     #[test]
