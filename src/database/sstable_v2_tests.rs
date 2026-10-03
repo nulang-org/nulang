@@ -1,4 +1,7 @@
-use super::sstable_v2::{write_sstable_v2, OwnedVersion, SstableV2, SstableV2Error};
+use super::sstable_v2::{
+    write_sstable_v2, write_sstable_v2_with_coverage, OwnedVersion, SequenceCoverageRun, SstableV2,
+    SstableV2Error,
+};
 use super::tablet::{TabletSnapshotRow, VersionedValue};
 use std::fs;
 use std::path::PathBuf;
@@ -135,4 +138,102 @@ fn test_v2_footer_preserves_recovery_sequence_coverage_without_block_scan() {
     assert!(table.has_contiguous_sequence_coverage_after(3));
 
     let _ = fs::remove_file(path);
+}
+
+#[test]
+fn test_v2_explicit_coverage_can_outlive_pruned_mvcc_versions() {
+    let path = temp_path("gc-coverage");
+    let _ = fs::remove_file(&path);
+    let rows = vec![
+        TabletSnapshotRow {
+            key: b"alpha".to_vec(),
+            versions: vec![VersionedValue {
+                sequence: 3,
+                value: None,
+            }],
+        },
+        TabletSnapshotRow {
+            key: b"beta".to_vec(),
+            versions: vec![VersionedValue {
+                sequence: 5,
+                value: Some(b"five".to_vec()),
+            }],
+        },
+    ];
+    let coverage = [SequenceCoverageRun::new(1, 5).unwrap()];
+
+    let written = write_sstable_v2_with_coverage(&path, 42, 7, &rows, &coverage).unwrap();
+    assert_eq!(written.min_sequence, 1);
+    assert_eq!(written.max_sequence, 5);
+
+    let table = SstableV2::open(&path).unwrap();
+    assert!(table.has_contiguous_sequence_coverage_after(0));
+    assert_eq!(table.version_at(b"alpha", 2).unwrap(), None);
+    assert_eq!(
+        table.version_at(b"alpha", 3).unwrap(),
+        Some(OwnedVersion {
+            sequence: 3,
+            value: None,
+        })
+    );
+    assert_eq!(
+        table.version_at(b"beta", 5).unwrap(),
+        Some(OwnedVersion {
+            sequence: 5,
+            value: Some(b"five".to_vec()),
+        })
+    );
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn test_v2_explicit_coverage_must_include_every_retained_version_sequence() {
+    let path = temp_path("invalid-gc-coverage");
+    let _ = fs::remove_file(&path);
+    let rows = vec![TabletSnapshotRow {
+        key: b"alpha".to_vec(),
+        versions: vec![VersionedValue {
+            sequence: 3,
+            value: Some(b"three".to_vec()),
+        }],
+    }];
+    let coverage = [SequenceCoverageRun::new(1, 2).unwrap()];
+
+    assert_eq!(
+        write_sstable_v2_with_coverage(&path, 42, 7, &rows, &coverage).unwrap_err(),
+        SstableV2Error::SequenceNotCovered(3)
+    );
+    assert!(!path.exists());
+}
+
+#[test]
+fn test_v2_sequence_coverage_runs_are_nonzero_ordered_and_nonoverlapping() {
+    assert_eq!(
+        SequenceCoverageRun::new(0, 2).unwrap_err(),
+        SstableV2Error::InvalidSequenceCoverage
+    );
+    assert_eq!(
+        SequenceCoverageRun::new(4, 3).unwrap_err(),
+        SstableV2Error::InvalidSequenceCoverage
+    );
+
+    let path = temp_path("overlap-coverage");
+    let _ = fs::remove_file(&path);
+    let rows = vec![TabletSnapshotRow {
+        key: b"alpha".to_vec(),
+        versions: vec![VersionedValue {
+            sequence: 3,
+            value: Some(b"three".to_vec()),
+        }],
+    }];
+    let coverage = [
+        SequenceCoverageRun::new(1, 3).unwrap(),
+        SequenceCoverageRun::new(3, 5).unwrap(),
+    ];
+    assert_eq!(
+        write_sstable_v2_with_coverage(&path, 42, 7, &rows, &coverage).unwrap_err(),
+        SstableV2Error::InvalidSequenceCoverage
+    );
+    assert!(!path.exists());
 }
