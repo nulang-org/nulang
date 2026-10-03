@@ -87,11 +87,65 @@ struct Measurement {
     workload: &'static str,
     source_bytes: usize,
     instructions: usize,
+    capability_bodies: usize,
     phases: PhaseTimes,
 }
 
 fn elapsed_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Run the capability phase for the declaration shapes exercised by this
+/// benchmark suite and return the number of expression bodies visited.
+///
+/// This intentionally mirrors the CLI's function/actor capability work rather
+/// than timing only top-level functions. Actor workloads therefore include
+/// behavior bodies, state defaults, and explicit init expressions.
+fn check_capabilities(decls: &[nulang::ast::Decl]) -> usize {
+    let mut analyzer = CapabilityAnalyzer::new();
+    let base_ctx = CapContext::new();
+    let mut bodies = 0usize;
+
+    for decl in nulang::effect_checker::flatten_decls(decls) {
+        match decl {
+            nulang::ast::Decl::Function { body, params, .. } => {
+                let ctx = base_ctx.with_params(params);
+                analyzer
+                    .infer_cap(&ctx, body)
+                    .expect("compile bench: capability check failed");
+                bodies += 1;
+            }
+            nulang::ast::Decl::Actor {
+                behaviors,
+                state_fields,
+                init,
+                ..
+            } => {
+                for behavior in behaviors {
+                    let ctx = base_ctx.with_params(&behavior.params);
+                    analyzer
+                        .infer_cap(&ctx, &behavior.body)
+                        .expect("compile bench: actor behavior capability check failed");
+                    bodies += 1;
+                }
+                for (_, _, _, default) in state_fields {
+                    analyzer
+                        .infer_cap(&base_ctx, default)
+                        .expect("compile bench: actor state capability check failed");
+                    bodies += 1;
+                }
+                for (_, expr) in init {
+                    analyzer
+                        .infer_cap(&base_ctx, expr)
+                        .expect("compile bench: actor init capability check failed");
+                    bodies += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    bodies
 }
 
 fn measure_compile(workload: Workload) -> Measurement {
@@ -124,15 +178,7 @@ fn measure_compile(workload: Workload) -> Measurement {
     let effect_check = started.elapsed();
 
     let started = Instant::now();
-    let mut cap_analyzer = CapabilityAnalyzer::new();
-    let cap_ctx = CapContext::new();
-    for decl in nulang::effect_checker::flatten_decls(&ast.decls) {
-        if let nulang::ast::Decl::Function { body, .. } = decl {
-            cap_analyzer
-                .infer_cap(&cap_ctx, body)
-                .expect("compile bench: capability check failed");
-        }
-    }
+    let capability_bodies = check_capabilities(&ast.decls);
     let capability_check = started.elapsed();
 
     let started = Instant::now();
@@ -154,6 +200,7 @@ fn measure_compile(workload: Workload) -> Measurement {
         workload: workload.name,
         source_bytes: workload.source.len(),
         instructions: module.instructions.len(),
+        capability_bodies,
         phases: PhaseTimes {
             lex,
             parse,
@@ -173,11 +220,12 @@ fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
     match format {
         OutputFormat::Human => {
             println!(
-                "[compile] {} iteration={} source={}B bytecode={} total={:.3}ms accounted={:.3}ms",
+                "[compile] {} iteration={} source={}B bytecode={} cap_bodies={} total={:.3}ms accounted={:.3}ms",
                 measurement.workload,
                 iteration,
                 measurement.source_bytes,
                 measurement.instructions,
+                measurement.capability_bodies,
                 p.total.as_secs_f64() * 1_000.0,
                 p.accounted().as_secs_f64() * 1_000.0,
             );
@@ -197,13 +245,14 @@ fn emit(measurement: &Measurement, iteration: u32, format: OutputFormat) {
             println!(
                 "{}",
                 json!({
-                    "schema": 1,
+                    "schema": 2,
                     "runtime": "nulang",
                     "suite": "clean-compile",
                     "workload": measurement.workload,
                     "iteration": iteration,
                     "source_bytes": measurement.source_bytes,
                     "bytecode_instructions": measurement.instructions,
+                    "capability_bodies": measurement.capability_bodies,
                     "total_ns": elapsed_ns(p.total),
                     "accounted_ns": elapsed_ns(p.accounted()),
                     "phases": {
@@ -286,7 +335,7 @@ fn parse_args() -> Result<Option<Config>, String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: nulang-compile-bench [--format human|jsonl] [--workload NAME] [--repeat N] [--list]"
+        "Usage: nulang_compile_bench [--format human|jsonl] [--workload NAME] [--repeat N] [--list]"
     );
 }
 
@@ -327,6 +376,22 @@ mod tests {
     fn benchmark_covers_distinct_frontend_shapes() {
         let names: Vec<_> = WORKLOADS.iter().map(|workload| workload.name).collect();
         assert_eq!(names, vec!["tiny", "numeric", "actor"]);
+    }
+
+    #[test]
+    fn actor_workload_includes_actor_capability_bodies() {
+        let actor = WORKLOADS
+            .iter()
+            .find(|workload| workload.name == "actor")
+            .copied()
+            .expect("actor benchmark workload");
+        let tokens = Lexer::new(actor.source).lex().expect("actor lex");
+        let ast = Parser::new(tokens).parse_module().expect("actor parse");
+
+        assert!(
+            check_capabilities(&ast.decls) >= 4,
+            "actor workload must time function, behavior, and state capability analysis"
+        );
     }
 
     #[test]
