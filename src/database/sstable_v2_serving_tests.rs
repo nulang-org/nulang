@@ -136,10 +136,7 @@ fn explicit_v1_manifest_entries_remain_recoverable_after_v2_activation() {
 
     let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert_eq!(reopened.current_sequence(), 1);
-    assert_eq!(
-        reopened.read_latest(b"k").unwrap(),
-        Some(&b"legacy-v1"[..])
-    );
+    assert_eq!(reopened.read_latest(b"k").unwrap(), Some(&b"legacy-v1"[..]));
 
     cleanup(&path);
 }

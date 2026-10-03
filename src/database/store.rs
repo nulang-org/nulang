@@ -15,9 +15,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::checkpoint::{self, CheckpointError};
-use super::manifest::{
-    Manifest, ManifestEntry, ManifestError, SstableFormat, SstableIntegrity,
-};
+use super::manifest::{Manifest, ManifestEntry, ManifestError, SstableFormat, SstableIntegrity};
 use super::sstable::{self, SstableError};
 use super::sstable_indexed::IndexedSstable;
 use super::sstable_v2::{write_sstable_v2, SstableV2, SstableV2Error};
@@ -67,10 +65,12 @@ impl ServingSstable {
         snapshot: u64,
     ) -> Result<Option<ServingVersion<'_>>, WalBackedError> {
         match self {
-            Self::V1(table) => Ok(table.version_at(key, snapshot)?.map(|version| ServingVersion {
-                sequence: version.sequence,
-                value: version.value,
-            })),
+            Self::V1(table) => Ok(table
+                .version_at(key, snapshot)?
+                .map(|version| ServingVersion {
+                    sequence: version.sequence,
+                    value: version.value,
+                })),
             Self::V2(table) => Ok(table
                 .version_at(key, snapshot)
                 .map_err(WalBackedError::from_sstable_v2)?
@@ -211,12 +211,7 @@ impl WalBackedTablet {
 
         if path.exists() {
             let existing = SstableV2::open(&path).map_err(WalBackedError::from_sstable_v2)?;
-            validate_v2_flush_identity(
-                &existing,
-                self.tablet.descriptor(),
-                &file_name,
-                &rows,
-            )?;
+            validate_v2_flush_identity(&existing, self.tablet.descriptor(), &file_name, &rows)?;
         } else {
             write_sstable_v2(
                 &path,
@@ -228,12 +223,7 @@ impl WalBackedTablet {
         }
 
         let table = SstableV2::open(&path).map_err(WalBackedError::from_sstable_v2)?;
-        validate_v2_flush_identity(
-            &table,
-            self.tablet.descriptor(),
-            &file_name,
-            &rows,
-        )?;
+        validate_v2_flush_identity(&table, self.tablet.descriptor(), &file_name, &rows)?;
         let metadata = table.metadata().clone();
         let entry = ManifestEntry {
             file_name: metadata.file_name.clone(),
@@ -416,6 +406,8 @@ fn open_manifest_sstable(
                 || metadata.file_name != entry.file_name
                 || metadata.tablet_id != descriptor.id().get()
                 || metadata.ownership_epoch > descriptor.ownership_epoch()
+                || !descriptor.range().contains(&metadata.min_key)
+                || !descriptor.range().contains(&metadata.max_key)
             {
                 return Err(WalBackedError::ManifestSstableMismatch(
                     entry.file_name.clone(),
@@ -437,6 +429,8 @@ fn open_manifest_sstable(
                 || metadata.file_name != entry.file_name
                 || metadata.tablet_id != descriptor.id().get()
                 || metadata.ownership_epoch > descriptor.ownership_epoch()
+                || !descriptor.range().contains(&metadata.min_key)
+                || !descriptor.range().contains(&metadata.max_key)
             {
                 return Err(WalBackedError::ManifestSstableMismatch(
                     entry.file_name.clone(),
