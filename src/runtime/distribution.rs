@@ -337,12 +337,23 @@ pub(crate) fn process_network(rt: &mut Runtime) {
                 rt.fabric_remove_remote_node(NodeId(node.0));
             }
             ClusterAction::SendGossip { targets } => {
-                // Fabric snapshots are authoritative only when complete. Keep
-                // their budget independent from compact membership gossip: the
-                // existing FAB0 decoder already accepts 4096 entries, so using
-                // that window removes the historical 256-entry sender cliff
-                // without changing the wire layout seen by older peers.
-                let fabric = rt.fabric_advertisements(FABRIC_GOSSIP_MAX_ENTRIES).ok();
+                // Prefer the legacy complete snapshot while it fits the FAB0
+                // decoder's rolling-compatibility window. Above that window,
+                // carry one bounded binary FAB1 chunk per gossip round inside
+                // the reserved fail-closed FAB0 tunnel.
+                let fabric = match rt.fabric_advertisements(FABRIC_GOSSIP_MAX_ENTRIES) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(_) => match rt.fabric_next_advertisement_tunnel() {
+                        Ok(tunnel) => tunnel,
+                        Err(error) => {
+                            warn!(
+                                %error,
+                                "nulang-fabric: unable to encode chunked gossip metadata"
+                            );
+                            None
+                        }
+                    },
+                };
                 if let (Some(transport), Some(cluster)) =
                     (&mut rt.distributed.transport, &rt.distributed.cluster)
                 {
