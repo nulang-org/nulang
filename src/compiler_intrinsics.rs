@@ -2,7 +2,8 @@
 //!
 //! Intrinsics live above Cranelift/WASM/native lowering. They describe
 //! operations the optimizer can reason about without exposing target-specific
-//! assembly in Nulang source.
+//! assembly in Nulang source. Backends are expected to lower these semantic
+//! operations to the cheapest target instruction sequence available.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntegerIntrinsic {
@@ -20,24 +21,68 @@ pub enum IntrinsicEffect {
 }
 
 impl IntegerIntrinsic {
-    pub fn stable_name(self) -> &'static str {
-        todo!("implemented after the RED tests")
+    /// Stable compiler-owned name. These names are intentionally independent
+    /// of any backend opcode spelling so Cranelift, WASM, and future codegens
+    /// can share the same semantic contract.
+    pub const fn stable_name(self) -> &'static str {
+        match self {
+            Self::Popcount => "int.popcount",
+            Self::LeadingZeros => "int.leading_zeros",
+            Self::TrailingZeros => "int.trailing_zeros",
+            Self::RotateLeft => "int.rotate_left",
+            Self::RotateRight => "int.rotate_right",
+            Self::ByteSwap => "int.byte_swap",
+        }
     }
 
-    pub fn arity(self) -> usize {
-        todo!("implemented after the RED tests")
+    pub const fn arity(self) -> usize {
+        match self {
+            Self::RotateLeft | Self::RotateRight => 2,
+            Self::Popcount
+            | Self::LeadingZeros
+            | Self::TrailingZeros
+            | Self::ByteSwap => 1,
+        }
     }
 
-    pub fn effect(self) -> IntrinsicEffect {
-        todo!("implemented after the RED tests")
+    /// All first-wave integer intrinsics are referentially transparent. This
+    /// lets MIR optimizers fold, CSE, reorder, or discard them when their
+    /// result is provably unused.
+    pub const fn effect(self) -> IntrinsicEffect {
+        let _ = self;
+        IntrinsicEffect::Pure
     }
 
-    pub fn may_trap(self) -> bool {
-        todo!("implemented after the RED tests")
+    /// These bit operations are total over every i64 bit pattern. Rotation
+    /// counts are masked to 0..63, giving every backend one explicit semantic
+    /// rule rather than inheriting ISA-specific shift behavior.
+    pub const fn may_trap(self) -> bool {
+        let _ = self;
+        false
     }
 
-    pub fn fold_i64(self, _args: &[i64]) -> Option<i64> {
-        todo!("implemented after the RED tests")
+    /// Evaluate an intrinsic at compile time when every operand is constant.
+    /// Returns `None` only when the caller supplied the wrong arity.
+    pub fn fold_i64(self, args: &[i64]) -> Option<i64> {
+        if args.len() != self.arity() {
+            return None;
+        }
+
+        let value = args[0];
+        Some(match self {
+            Self::Popcount => i64::from(value.count_ones()),
+            Self::LeadingZeros => i64::from(value.leading_zeros()),
+            Self::TrailingZeros => i64::from(value.trailing_zeros()),
+            Self::RotateLeft => {
+                let amount = (args[1] as u64 & 63) as u32;
+                (value as u64).rotate_left(amount) as i64
+            }
+            Self::RotateRight => {
+                let amount = (args[1] as u64 & 63) as u32;
+                (value as u64).rotate_right(amount) as i64
+            }
+            Self::ByteSwap => value.swap_bytes(),
+        })
     }
 }
 
@@ -79,6 +124,13 @@ mod tests {
             IntegerIntrinsic::ByteSwap.fold_i64(&[0x0102_0304_0506_0708]),
             Some(0x0807_0605_0403_0201)
         );
+    }
+
+    #[test]
+    fn rotation_counts_have_explicit_modulo_64_semantics() {
+        assert_eq!(IntegerIntrinsic::RotateLeft.fold_i64(&[1, 64]), Some(1));
+        assert_eq!(IntegerIntrinsic::RotateLeft.fold_i64(&[1, 65]), Some(2));
+        assert_eq!(IntegerIntrinsic::RotateRight.fold_i64(&[2, -1]), Some(4));
     }
 
     #[test]
