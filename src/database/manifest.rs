@@ -1,17 +1,35 @@
 //! Crash-safe manifest for durable NuDB SSTable flush artifacts.
 //!
-//! The manifest is intentionally not yet part of tablet recovery. It records
-//! files that have crossed their own durability boundary so a later recovery
-//! slice can promote them without changing today's WAL/checkpoint authority.
+//! Manifest v2 makes the SSTable format and integrity contract explicit. Legacy
+//! `NUDBMAN1` files remain readable and are translated in memory to v1 entries
+//! with whole-payload BLAKE3 integrity. New publications use `NUDBMAN2` and can
+//! describe both v1 whole-payload and v2 footer integrity without overloading one
+//! checksum field with two different meanings.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-const MANIFEST_MAGIC: &[u8; 8] = b"NUDBMAN1";
-const MANIFEST_VERSION: u16 = 1;
+const MANIFEST_MAGIC_V1: &[u8; 8] = b"NUDBMAN1";
+const MANIFEST_MAGIC_V2: &[u8; 8] = b"NUDBMAN2";
+const MANIFEST_VERSION_V1: u16 = 1;
+const MANIFEST_VERSION_V2: u16 = 2;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SstableFormat {
+    V1,
+    V2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "checksum", rename_all = "snake_case")]
+pub(crate) enum SstableIntegrity {
+    WholePayloadBlake3([u8; 32]),
+    FooterBlake3([u8; 32]),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ManifestEntry {
@@ -23,11 +41,49 @@ pub(crate) struct ManifestEntry {
     pub(crate) row_count: u32,
     pub(crate) min_key: Vec<u8>,
     pub(crate) max_key: Vec<u8>,
-    pub(crate) checksum: [u8; 32],
+    pub(crate) format: SstableFormat,
+    pub(crate) integrity: SstableIntegrity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct DiskManifest {
+struct LegacyManifestEntry {
+    file_name: String,
+    tablet_id: u64,
+    ownership_epoch: u64,
+    min_sequence: u64,
+    max_sequence: u64,
+    row_count: u32,
+    min_key: Vec<u8>,
+    max_key: Vec<u8>,
+    checksum: [u8; 32],
+}
+
+impl From<LegacyManifestEntry> for ManifestEntry {
+    fn from(entry: LegacyManifestEntry) -> Self {
+        Self {
+            file_name: entry.file_name,
+            tablet_id: entry.tablet_id,
+            ownership_epoch: entry.ownership_epoch,
+            min_sequence: entry.min_sequence,
+            max_sequence: entry.max_sequence,
+            row_count: entry.row_count,
+            min_key: entry.min_key,
+            max_key: entry.max_key,
+            format: SstableFormat::V1,
+            integrity: SstableIntegrity::WholePayloadBlake3(entry.checksum),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct DiskManifestV1 {
+    version: u16,
+    tablet_id: u64,
+    entries: Vec<LegacyManifestEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct DiskManifestV2 {
     version: u16,
     tablet_id: u64,
     entries: Vec<ManifestEntry>,
@@ -54,7 +110,7 @@ impl Manifest {
         let mut file = File::open(path)?;
         let mut magic = [0_u8; 8];
         file.read_exact(&mut magic)?;
-        if &magic != MANIFEST_MAGIC {
+        if &magic != MANIFEST_MAGIC_V1 && &magic != MANIFEST_MAGIC_V2 {
             return Err(ManifestError::InvalidHeader);
         }
         let mut length = [0_u8; 4];
@@ -74,22 +130,34 @@ impl Manifest {
         if file.read(&mut trailing)? != 0 {
             return Err(ManifestError::TrailingBytes);
         }
-        let disk: DiskManifest = serde_json::from_slice(&payload)
-            .map_err(|error| ManifestError::Serialization(error.to_string()))?;
-        if disk.version != MANIFEST_VERSION {
-            return Err(ManifestError::UnsupportedVersion(disk.version));
-        }
-        if disk.tablet_id != tablet_id {
+
+        let (presented_tablet_id, entries) = if &magic == MANIFEST_MAGIC_V1 {
+            let disk: DiskManifestV1 = serde_json::from_slice(&payload)
+                .map_err(|error| ManifestError::Serialization(error.to_string()))?;
+            if disk.version != MANIFEST_VERSION_V1 {
+                return Err(ManifestError::UnsupportedVersion(disk.version));
+            }
+            (
+                disk.tablet_id,
+                disk.entries.into_iter().map(ManifestEntry::from).collect(),
+            )
+        } else {
+            let disk: DiskManifestV2 = serde_json::from_slice(&payload)
+                .map_err(|error| ManifestError::Serialization(error.to_string()))?;
+            if disk.version != MANIFEST_VERSION_V2 {
+                return Err(ManifestError::UnsupportedVersion(disk.version));
+            }
+            (disk.tablet_id, disk.entries)
+        };
+
+        if presented_tablet_id != tablet_id {
             return Err(ManifestError::TabletMismatch {
                 expected: tablet_id,
-                presented: disk.tablet_id,
+                presented: presented_tablet_id,
             });
         }
-        validate_entries(tablet_id, &disk.entries)?;
-        Ok(Self {
-            tablet_id,
-            entries: disk.entries,
-        })
+        validate_entries(tablet_id, &entries)?;
+        Ok(Self { tablet_id, entries })
     }
 
     pub(crate) fn entries(&self) -> &[ManifestEntry] {
@@ -121,8 +189,8 @@ impl Manifest {
 
     pub(crate) fn publish(&self, path: &Path) -> Result<(), ManifestError> {
         validate_entries(self.tablet_id, &self.entries)?;
-        let disk = DiskManifest {
-            version: MANIFEST_VERSION,
+        let disk = DiskManifestV2 {
+            version: MANIFEST_VERSION_V2,
             tablet_id: self.tablet_id,
             entries: self.entries.clone(),
         };
@@ -143,7 +211,7 @@ impl Manifest {
             .truncate(true)
             .write(true)
             .open(&temp)?;
-        file.write_all(MANIFEST_MAGIC)?;
+        file.write_all(MANIFEST_MAGIC_V2)?;
         file.write_all(&(payload.len() as u32).to_le_bytes())?;
         file.write_all(&payload)?;
         file.write_all(blake3::hash(&payload).as_bytes())?;
@@ -205,6 +273,15 @@ fn validate_entry(tablet_id: u64, entry: &ManifestEntry) -> Result<(), ManifestE
     {
         return Err(ManifestError::InvalidEntry(entry.file_name.clone()));
     }
+    if !matches!(
+        (entry.format, entry.integrity),
+        (SstableFormat::V1, SstableIntegrity::WholePayloadBlake3(_))
+            | (SstableFormat::V2, SstableIntegrity::FooterBlake3(_))
+    ) {
+        return Err(ManifestError::IntegrityKindMismatch(
+            entry.file_name.clone(),
+        ));
+    }
     Ok(())
 }
 
@@ -213,6 +290,7 @@ fn appended_path(path: &Path, suffix: &str) -> PathBuf {
     value.push(suffix);
     PathBuf::from(value)
 }
+
 fn sync_parent_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -244,10 +322,12 @@ pub enum ManifestError {
     },
     InvalidFileName(String),
     InvalidEntry(String),
+    IntegrityKindMismatch(String),
     DuplicateEntry(String),
     ConflictingEntry(String),
     Serialization(String),
 }
+
 impl From<io::Error> for ManifestError {
     fn from(error: io::Error) -> Self {
         Self::Io {
@@ -256,11 +336,13 @@ impl From<io::Error> for ManifestError {
         }
     }
 }
+
 impl fmt::Display for ManifestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "NuDB manifest error: {self:?}")
     }
 }
+
 impl std::error::Error for ManifestError {}
 
 #[cfg(test)]
@@ -268,7 +350,9 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
+
     static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
+
     fn temp_path() -> PathBuf {
         std::env::temp_dir().join(format!(
             "nulang_nudb_manifest_{}_{}.manifest",
@@ -276,6 +360,7 @@ mod tests {
             NEXT_TEST.fetch_add(1, Ordering::Relaxed)
         ))
     }
+
     fn entry(name: &str, checksum: u8) -> ManifestEntry {
         ManifestEntry {
             file_name: name.to_owned(),
@@ -286,9 +371,11 @@ mod tests {
             row_count: 2,
             min_key: b"a".to_vec(),
             max_key: b"z".to_vec(),
-            checksum: [checksum; 32],
+            format: SstableFormat::V1,
+            integrity: SstableIntegrity::WholePayloadBlake3([checksum; 32]),
         }
     }
+
     #[test]
     fn publish_load_and_deduplicate_entries() {
         let path = temp_path();
@@ -301,8 +388,14 @@ mod tests {
         let reopened = Manifest::load_or_empty(&path, 42).unwrap();
         assert_eq!(reopened.entries().len(), 1);
         assert_eq!(reopened.entries()[0].file_name, "0001.sst");
+        assert_eq!(reopened.entries()[0].format, SstableFormat::V1);
+        assert_eq!(
+            reopened.entries()[0].integrity,
+            SstableIntegrity::WholePayloadBlake3([1; 32])
+        );
         let _ = fs::remove_file(path);
     }
+
     #[test]
     fn duplicate_name_with_different_identity_fails_closed() {
         let mut manifest = Manifest::empty(42);
@@ -312,6 +405,7 @@ mod tests {
             ManifestError::ConflictingEntry("0001.sst".to_owned())
         );
     }
+
     #[test]
     fn checksum_corruption_fails_closed() {
         let path = temp_path();
