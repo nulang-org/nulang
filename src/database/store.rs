@@ -260,14 +260,14 @@ impl WalBackedTablet {
         Ok(projected_sequence)
     }
 
-    pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
+    pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, WalBackedError> {
         let resident_version = self.tablet.visible_version_at(key, snapshot)?;
         let mut best_sequence = resident_version.map_or(0, |version| version.sequence);
         let mut best_value = resident_version.and_then(|version| version.value.as_deref());
         let mut found = resident_version.is_some();
 
         for table in &self.sstables {
-            let Some(candidate) = table.version_at(key, snapshot) else {
+            let Some(candidate) = table.version_at(key, snapshot)? else {
                 continue;
             };
             if !found || candidate.sequence > best_sequence {
@@ -280,10 +280,14 @@ impl WalBackedTablet {
         Ok(if found { best_value } else { None })
     }
 
-    pub fn read_latest(&self, key: &[u8]) -> Option<&[u8]> {
+    /// Read the newest committed value while preserving storage failures.
+    /// Out-of-range keys retain the historical `read_latest` behavior and route
+    /// as absent rather than as a tablet-range error.
+    pub fn read_latest(&self, key: &[u8]) -> Result<Option<&[u8]>, WalBackedError> {
+        if !self.tablet.descriptor().range().contains(key) {
+            return Ok(None);
+        }
         self.read_at(key, self.tablet.current_sequence())
-            .ok()
-            .flatten()
     }
 
     /// Atomically publish a checkpoint without reclaiming the WAL.
