@@ -2,8 +2,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use nulang::database::lsm::LsmStorage;
 use nulang::database::managed_lsm::{ManagedLsmError, ManagedLsmStorage};
-use nulang::database::tablet::{MvccStorage, TabletMutation};
+use nulang::database::tablet::{
+    KeyRange, MvccStorage, Tablet, TabletDescriptor, TabletError, TabletId, TabletMutation,
+};
 
 static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
 
@@ -13,6 +16,15 @@ fn temp_dir(name: &str) -> PathBuf {
         std::process::id(),
         NEXT_TEST.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+fn descriptor() -> TabletDescriptor {
+    TabletDescriptor::new(
+        TabletId::new(81).unwrap(),
+        KeyRange::new(b"a".to_vec(), Some(b"z".to_vec())).unwrap(),
+        1,
+    )
+    .unwrap()
 }
 
 fn put(key: &[u8], value: &[u8]) -> TabletMutation {
@@ -149,6 +161,55 @@ fn compaction_rejects_unflushed_commits() {
             flushed_sequence: 1,
         }
     );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn managed_storage_bootstraps_existing_sstable_directories() {
+    let dir = temp_dir("legacy_bootstrap");
+    let _ = fs::remove_dir_all(&dir);
+
+    {
+        let mut legacy = LsmStorage::open(&dir).unwrap();
+        legacy.apply_committed(1, vec![put(b"k", b"v1")]);
+        legacy.flush().unwrap().unwrap();
+        legacy.apply_committed(2, vec![put(b"k", b"v2")]);
+        legacy.flush().unwrap().unwrap();
+    }
+
+    assert!(!dir.join("MANIFEST").exists());
+    let managed = ManagedLsmStorage::open(&dir).unwrap();
+    assert_eq!(managed.current_sequence(), 2);
+    assert_eq!(managed.table_count(), 2);
+    assert_eq!(managed.read_at(b"k", 1), Some(&b"v1"[..]));
+    assert_eq!(managed.read_at(b"k", 2), Some(&b"v2"[..]));
+    assert!(dir.join("MANIFEST").exists());
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tablet_rejects_snapshots_below_the_compacted_retention_floor() {
+    let dir = temp_dir("retention_fence");
+    let _ = fs::remove_dir_all(&dir);
+
+    let mut storage = ManagedLsmStorage::open(&dir).unwrap();
+    storage.apply_committed(1, vec![put(b"k", b"v1")]);
+    storage.flush().unwrap().unwrap();
+    storage.apply_committed(2, vec![put(b"k", b"v2")]);
+    storage.flush().unwrap().unwrap();
+    storage.compact_all(2).unwrap();
+
+    let tablet = Tablet::with_storage(descriptor(), storage);
+    assert_eq!(
+        tablet.read_at(b"k", 1).unwrap_err(),
+        TabletError::SnapshotCollected {
+            oldest_readable: 2,
+            requested: 1,
+        }
+    );
+    assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
 
     let _ = fs::remove_dir_all(&dir);
 }
