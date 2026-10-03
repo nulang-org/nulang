@@ -7,9 +7,9 @@
 
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{self, Read};
 #[cfg(not(unix))]
 use std::io::Seek;
+use std::io::{self, Read};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::Path;
@@ -340,7 +340,8 @@ impl IndexedSstable {
         key: &[u8],
         snapshot: u64,
     ) -> Result<Option<IndexedVersion<'a>>, SstableError> {
-        let mut cursor = Cursor::at(self.payload(), block.rows_start).ok_or(SstableError::InvalidLength)?;
+        let mut cursor =
+            Cursor::at(self.payload(), block.rows_start).ok_or(SstableError::InvalidLength)?;
         for _ in 0..block.row_count {
             let key_len = cursor.u32()? as usize;
             if key_len == 0 || key_len > MAX_KEY_BYTES || key_len > cursor.remaining() {
