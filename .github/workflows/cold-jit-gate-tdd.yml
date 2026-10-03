@@ -1,0 +1,17 @@
+name: Cold JIT gate TDD
+
+on:
+  push:
+    branches:
+      - perf/cold-jit-probe-call-gate-20261003
+
+permissions:
+  contents: write
+
+jobs:
+  focused-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run cold JIT gate regression
+        run: python3 -m unittest scripts.tests.test_jit_cold_probe_gate
