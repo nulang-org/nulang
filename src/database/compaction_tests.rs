@@ -149,9 +149,9 @@ fn compaction_interrupted_after_manifest_rename_recovers_replacement_authority()
     assert!(result.is_err());
     drop(tablet);
 
-    // Rename is the manifest commit point. Reopen sees the replacement as
-    // authoritative, validates the complete recovery chain, then consumes
-    // persisted obsolete-file intent and clears it durably.
+    // The manifest rename is the logical compaction commit point. Reopen sees
+    // the replacement as authoritative, validates the complete recovery chain,
+    // then consumes persisted obsolete-file intent and clears it durably.
     let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert_eq!(reopened.current_sequence(), 4);
     assert_eq!(reopened.durable_sstable_count().unwrap(), 1);
