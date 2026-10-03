@@ -15,16 +15,15 @@ use std::path::{Path, PathBuf};
 
 use super::checkpoint::{self, CheckpointError};
 use super::manifest::{Manifest, ManifestEntry, ManifestError};
-use super::sstable::{self, Sstable, SstableError};
-use super::tablet::{
-    MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite, VersionedValue,
-};
+use super::sstable::{self, SstableError};
+use super::sstable_indexed::IndexedSstable;
+use super::tablet::{MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite};
 use super::wal::{FileWal, WalError};
 
 #[derive(Debug)]
 pub struct WalBackedTablet {
     tablet: MemoryTablet,
-    sstables: Vec<Sstable>,
+    sstables: Vec<IndexedSstable>,
     wal: FileWal,
     checkpoint_path: PathBuf,
     manifest_path: PathBuf,
@@ -33,8 +32,8 @@ pub struct WalBackedTablet {
 
 impl WalBackedTablet {
     /// Open a tablet and reconstruct its MVCC state from durable storage.
-    /// Manifest-referenced SSTables remain serving sources instead of being
-    /// copied back into immutable memtables.
+    /// Manifest-referenced SSTables remain compact encoded serving sources
+    /// instead of being copied back into immutable memtables.
     pub fn open(
         descriptor: TabletDescriptor,
         wal_path: impl AsRef<Path>,
@@ -51,7 +50,7 @@ impl WalBackedTablet {
         let mut sstables = Vec::with_capacity(manifest.entries().len());
         for entry in manifest.entries() {
             let path = sstable_dir.join(&entry.file_name);
-            let table = sstable::Sstable::open(&path)?;
+            let table = IndexedSstable::open(&path)?;
             let metadata = table.metadata();
             if metadata.tablet_id != entry.tablet_id
                 || metadata.ownership_epoch != entry.ownership_epoch
@@ -119,8 +118,8 @@ impl WalBackedTablet {
     }
 
     /// Durably flush the oldest frozen memtable to an immutable SSTable and
-    /// publish a manifest entry. Once the manifest is durable and the SSTable
-    /// is installed as a serving source, exactly that frozen generation is
+    /// publish a manifest entry. Once the manifest is durable and the compact
+    /// encoded SSTable reader is installed, exactly that frozen generation is
     /// evicted while newer immutable and mutable state stays resident.
     pub fn flush_oldest_immutable_to_sstable(&mut self) -> Result<bool, WalBackedError> {
         let Some(rows) = self.tablet.oldest_immutable_rows() else {
@@ -160,7 +159,7 @@ impl WalBackedTablet {
         )?;
 
         if path.exists() {
-            let existing = sstable::Sstable::open(&path)?;
+            let existing = IndexedSstable::open(&path)?;
             if existing.metadata() != &expected {
                 return Err(WalBackedError::Sstable(SstableError::ExistingFileMismatch(
                     file_name.clone(),
@@ -175,7 +174,7 @@ impl WalBackedTablet {
             )?;
         }
 
-        let table = sstable::Sstable::open(&path)?;
+        let table = IndexedSstable::open(&path)?;
         if table.metadata() != &expected {
             return Err(WalBackedError::Sstable(SstableError::ExistingFileMismatch(
                 file_name.clone(),
@@ -268,13 +267,13 @@ impl WalBackedTablet {
         let mut found = resident_version.is_some();
 
         for table in &self.sstables {
-            let Some(candidate) = sstable_version_at(table, key, snapshot) else {
+            let Some(candidate) = table.version_at(key, snapshot) else {
                 continue;
             };
             if !found || candidate.sequence > best_sequence {
                 found = true;
                 best_sequence = candidate.sequence;
-                best_value = candidate.value.as_deref();
+                best_value = candidate.value;
             }
         }
 
@@ -316,30 +315,6 @@ fn advance_recovered_sequence(tablet: &mut MemoryTablet, sequence: u64) -> Resul
     state.current_sequence = sequence;
     *tablet = MemoryTablet::restore_snapshot(descriptor, state)?;
     Ok(())
-}
-
-fn sstable_version_at<'a>(
-    table: &'a Sstable,
-    key: &[u8],
-    snapshot: u64,
-) -> Option<&'a VersionedValue> {
-    let metadata = table.metadata();
-    if snapshot < metadata.min_sequence
-        || key < metadata.min_key.as_slice()
-        || key > metadata.max_key.as_slice()
-    {
-        return None;
-    }
-
-    let index = table
-        .rows()
-        .binary_search_by(|row| row.key.as_slice().cmp(key))
-        .ok()?;
-    table.rows()[index]
-        .versions
-        .iter()
-        .rev()
-        .find(|version| version.sequence <= snapshot)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
