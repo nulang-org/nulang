@@ -155,7 +155,7 @@ pyo3 = { version = "0.29", features = ["auto-initialize", "py-clone"], optional 
 libsql = { version = "0.10.0-pre.4", optional = true, default-features = false, features = ["core", "remote", "tls"] }
 # RocksDB persistence backend (feature `rocksdb`).
 rocksdb = { version = "0.21", optional = true, default-features = false }
-# PostgreSQL persistence backend (feature `postgres`). Sync wrapper over tokio-postgres.
+# PostgreSQL persistence backend (production-grade relational storage). Sync wrapper over tokio-postgres.
 postgres = { version = "0.19", optional = true }
 # Native library loading (optional, see [features])
 libloading = { version = "0.8", optional = true }
@@ -165,7 +165,7 @@ libffi = { version = "5", optional = true }
 nulang-ai = { path = "crates/nulang-ai", version = "0.1.0", optional = true }
 nulang-ai-local = { path = "crates/nulang-ai-local", version = "0.1.0", optional = true }
 uuid = { version = "1", features = ["serde", "v4"], optional = true }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json"], optional = true }
 wasm-encoder = { version = "0.220", optional = true }
 # Borsh serialization for the WASM component boundary (optional, see [features])
 borsh = { version = "1.5", optional = true, features = ["derive"] }
