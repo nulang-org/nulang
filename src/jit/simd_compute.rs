@@ -44,6 +44,13 @@ pub(crate) enum SimdComputePlanError {
         analyzer_lanes: u16,
         element_lanes: u16,
     },
+    ElementTypeMismatch {
+        analyzer: ScalarType,
+        planned: ScalarType,
+    },
+    UnsupportedScalableLowering,
+    UnsupportedLoweringWidth(u16),
+    StaticTripCountTooLarge(u64),
     MissingRuntimeExtentBinding,
     Schedule(ComputeScheduleError),
 }
@@ -58,6 +65,19 @@ impl fmt::Display for SimdComputePlanError {
                 f,
                 "SIMD analyzer width {analyzer_lanes} does not match element-derived width {element_lanes}"
             ),
+            Self::ElementTypeMismatch { analyzer, planned } => write!(
+                f,
+                "SIMD analyzer element type {analyzer:?} does not match compute plan type {planned:?}"
+            ),
+            Self::UnsupportedScalableLowering => {
+                write!(f, "Cranelift SIMD lowering does not yet support scalable vectors")
+            }
+            Self::UnsupportedLoweringWidth(lanes) => {
+                write!(f, "Cranelift SIMD lowering does not support {lanes} lanes")
+            }
+            Self::StaticTripCountTooLarge(count) => {
+                write!(f, "static SIMD trip count {count} does not fit usize")
+            }
             Self::MissingRuntimeExtentBinding => write!(
                 f,
                 "SIMD region marks its trip count as runtime-derived but has no ArrLen register binding"
@@ -127,6 +147,40 @@ impl SimdComputePlan {
             trip_count,
         })
     }
+
+    /// Materialize the legacy analyzer structure expected by the current
+    /// Cranelift emitter, but overwrite every lowering decision already owned
+    /// by the compute plan. This keeps register/pattern metadata in the legacy
+    /// structure while making portable compute metadata authoritative.
+    pub(crate) fn lowering_region(
+        self,
+        region: &SimdRegion,
+    ) -> Result<SimdRegion, SimdComputePlanError> {
+        let analyzer_element = scalar_type(region.elem_type);
+        if analyzer_element != self.vector_type.element {
+            return Err(SimdComputePlanError::ElementTypeMismatch {
+                analyzer: analyzer_element,
+                planned: self.vector_type.element,
+            });
+        }
+
+        let width = lowering_width(self.vector_type.width)?;
+        let (trip_count_hint, arr_len_reg) = match self.trip_count {
+            SimdTripCountBinding::Static(count) => {
+                let count = usize::try_from(count)
+                    .map_err(|_| SimdComputePlanError::StaticTripCountTooLarge(count))?;
+                (Some(count), None)
+            }
+            SimdTripCountBinding::RuntimeArrayLen { register, .. } => (Some(0), Some(register)),
+            SimdTripCountBinding::Unavailable => (None, None),
+        };
+
+        let mut lowering = region.clone();
+        lowering.width = width;
+        lowering.trip_count_hint = trip_count_hint;
+        lowering.arr_len_reg = arr_len_reg;
+        Ok(lowering)
+    }
 }
 
 const fn scalar_type(elem_type: SimdElemType) -> ScalarType {
@@ -146,6 +200,19 @@ const fn analyzer_lanes(width: SimdWidth) -> u16 {
     }
 }
 
+fn lowering_width(width: VectorWidth) -> Result<SimdWidth, SimdComputePlanError> {
+    if width.is_scalable() {
+        return Err(SimdComputePlanError::UnsupportedScalableLowering);
+    }
+
+    match width.min_lanes() {
+        2 => Ok(SimdWidth::Width2),
+        4 => Ok(SimdWidth::Width4),
+        8 => Ok(SimdWidth::Width8),
+        lanes => Err(SimdComputePlanError::UnsupportedLoweringWidth(lanes)),
+    }
+}
+
 pub(crate) fn compile_simd_region(
     module: &mut JITModule,
     builder_context: &mut FunctionBuilderContext,
@@ -154,14 +221,10 @@ pub(crate) fn compile_simd_region(
     instructions: &[Instruction],
     region: &SimdRegion,
 ) -> Result<*const u8, String> {
-    // Fail closed if the legacy analyzer and portable compute contracts
-    // diverge. Cranelift lowering remains unchanged in this migration slice;
-    // its existing scalar fallback still handles an unavailable trip count.
     let plan = SimdComputePlan::from_region(region).map_err(|error| error.to_string())?;
-    debug_assert_eq!(
-        plan.vector_type.width.min_lanes(),
-        region.elem_type.lane_count() as u16
-    );
+    let lowering_region = plan
+        .lowering_region(region)
+        .map_err(|error| error.to_string())?;
 
     simd_compiler::compile_simd_region(
         module,
@@ -169,7 +232,7 @@ pub(crate) fn compile_simd_region(
         ctx,
         func_name,
         instructions,
-        region,
+        &lowering_region,
     )
     .map_err(|error| format!("{error:?}"))
 }
@@ -288,6 +351,54 @@ mod tests {
                 analyzer_lanes: 4,
                 element_lanes: 2,
             }
+        );
+    }
+
+    #[test]
+    fn lowering_region_uses_compute_plan_as_authority() {
+        let mut input = region(SimdElemType::Int64, SimdWidth::Width4);
+        input.trip_count_hint = Some(99);
+        input.arr_len_reg = None;
+
+        let extent = DynamicExtentId(3);
+        let plan = SimdComputePlan {
+            vector_type: VectorType::new(ScalarType::I64, VectorWidth::fixed(2).unwrap()),
+            iteration: Some(
+                IterationSpace::new(
+                    0,
+                    LoopExtent::Dynamic(extent),
+                    1,
+                    LocalityScope::Lane,
+                )
+                .unwrap(),
+            ),
+            trip_count: SimdTripCountBinding::RuntimeArrayLen {
+                extent,
+                register: 11,
+            },
+        };
+
+        let lowering = plan
+            .lowering_region(&input)
+            .expect("compute plan should normalize the legacy lowering input");
+
+        assert_eq!(lowering.width, SimdWidth::Width2);
+        assert_eq!(lowering.trip_count_hint, Some(0));
+        assert_eq!(lowering.arr_len_reg, Some(11));
+    }
+
+    #[test]
+    fn lowering_region_rejects_scalable_vectors_until_backend_support_exists() {
+        let input = region(SimdElemType::Int64, SimdWidth::Width2);
+        let plan = SimdComputePlan {
+            vector_type: VectorType::new(ScalarType::I64, VectorWidth::scalable(2).unwrap()),
+            iteration: None,
+            trip_count: SimdTripCountBinding::Unavailable,
+        };
+
+        assert_eq!(
+            plan.lowering_region(&input),
+            Err(SimdComputePlanError::UnsupportedScalableLowering)
         );
     }
 }
