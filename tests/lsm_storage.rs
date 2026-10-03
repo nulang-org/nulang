@@ -90,6 +90,30 @@ fn reads_choose_the_newest_visible_version_across_tables_and_memtable() {
 }
 
 #[test]
+fn flush_persists_sequence_advancement_from_empty_commits() {
+    let dir = temp_dir("empty_commit");
+    let _ = fs::remove_dir_all(&dir);
+
+    {
+        let mut storage = LsmStorage::open(&dir).unwrap();
+        storage.apply_committed(1, vec![put(b"k", b"v1")]);
+        storage.flush().unwrap().unwrap();
+
+        storage.apply_committed(2, Vec::new());
+        let flushed = storage.flush().unwrap().expect("sequence advanced");
+        assert_eq!(flushed.min_sequence, 2);
+        assert_eq!(flushed.max_sequence, 2);
+        assert_eq!(flushed.version_count, 0);
+    }
+
+    let reopened = LsmStorage::open(&dir).unwrap();
+    assert_eq!(reopened.current_sequence(), 2);
+    assert_eq!(reopened.read_at(b"k", 2), Some(&b"v1"[..]));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn empty_flush_is_a_noop() {
     let dir = temp_dir("empty_flush");
     let _ = fs::remove_dir_all(&dir);
