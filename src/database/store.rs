@@ -91,7 +91,7 @@ impl WalBackedTablet {
         wal.replay_after_checkpoint(&mut tablet)?;
         Ok(Self {
             tablet,
-            snapshots: SnapshotRegistry::new(),
+            snapshots: SnapshotRegistry::shared_for_storage_path(wal_path),
             sstables,
             wal,
             checkpoint_path,
