@@ -4,6 +4,8 @@
 //! the caller and every callee on a direct edge must agree on representation.
 //! This module proves those edges before a backend may select an unboxed ABI.
 
+use std::collections::VecDeque;
+
 use crate::mir;
 use crate::native_abi::NativeValueRepr;
 use crate::native_plan::{NativeFunctionPlan, NativePlanConstraint};
@@ -26,11 +28,13 @@ impl NativeModulePlan {
     ///
     /// A function starts as a candidate only when its own body is compatible
     /// with the current integer fast path. `CrossFunctionCall` is the sole
-    /// function-local constraint that may be discharged here. We then iterate
-    /// to a fixed point: every direct callee must itself remain raw-compatible,
-    /// and each call site's argument/result representations must exactly match
-    /// the callee ABI. This admits recursive SCCs without allowing raw values
-    /// to leak into the boxed function table.
+    /// function-local constraint that may be discharged here. Direct edges are
+    /// validated once, then boxed/incompatible callees invalidate their callers
+    /// through reverse edges. Eligibility only ever transitions true -> false,
+    /// so this reaches the same greatest fixed point in O(functions + calls)
+    /// propagation instead of rescanning every function on every round.
+    /// Compatible recursive SCCs remain eligible because no member is
+    /// invalidated unless an intrinsic or outgoing boundary requires boxing.
     pub fn for_module(module: &mir::Module) -> Self {
         let functions: Vec<NativeFunctionPlan> = module
             .functions
@@ -47,29 +51,54 @@ impl NativeModulePlan {
 
         let mut unboxed_int_functions: Vec<bool> =
             functions.iter().map(is_local_raw_int_candidate).collect();
+        let mut reverse_callers = vec![Vec::new(); functions.len()];
+        let mut invalid = VecDeque::new();
 
-        loop {
-            let previous = unboxed_int_functions.clone();
+        // Intrinsically boxed functions are the initial invalidation frontier.
+        for (idx, eligible) in unboxed_int_functions.iter().copied().enumerate() {
+            if !eligible {
+                invalid.push_back(idx);
+            }
+        }
 
-            for (caller_idx, sites) in call_sites.iter().enumerate() {
-                if !previous[caller_idx] {
-                    unboxed_int_functions[caller_idx] = false;
-                    continue;
-                }
-
-                unboxed_int_functions[caller_idx] = sites.iter().all(|site| {
-                    let Some(callee_plan) = functions.get(site.callee) else {
-                        return false;
-                    };
-                    previous.get(site.callee).copied().unwrap_or(false)
-                        && site.args == callee_plan.params
-                        && callee_plan.ret == Some(site.result)
-                        && site.result == NativeValueRepr::I64
-                });
+        // Validate representation compatibility independently of callee
+        // eligibility, and build reverse dependency edges for every caller
+        // that is still locally eligible. A currently boxed callee will then
+        // invalidate those callers through the queue below.
+        for (caller_idx, sites) in call_sites.iter().enumerate() {
+            if !unboxed_int_functions[caller_idx] {
+                continue;
             }
 
-            if unboxed_int_functions == previous {
-                break;
+            let compatible = sites.iter().all(|site| {
+                let Some(callee_plan) = functions.get(site.callee) else {
+                    return false;
+                };
+                site.args == callee_plan.params
+                    && callee_plan.ret == Some(site.result)
+                    && site.result == NativeValueRepr::I64
+            });
+
+            if !compatible {
+                unboxed_int_functions[caller_idx] = false;
+                invalid.push_back(caller_idx);
+                continue;
+            }
+
+            for site in sites {
+                reverse_callers[site.callee].push(caller_idx);
+            }
+        }
+
+        // Eligibility is monotonic. Once a callee is boxed, every otherwise
+        // raw-compatible caller must box as well; each reverse edge therefore
+        // needs to be processed at most once when its callee becomes invalid.
+        while let Some(callee_idx) = invalid.pop_front() {
+            for &caller_idx in &reverse_callers[callee_idx] {
+                if unboxed_int_functions[caller_idx] {
+                    unboxed_int_functions[caller_idx] = false;
+                    invalid.push_back(caller_idx);
+                }
             }
         }
 
@@ -179,6 +208,21 @@ mod tests {
         builder.build()
     }
 
+    fn int_forwarder(name: String, callee: usize) -> mir::Function {
+        let mut builder = FunctionBuilder::new(name, Some(Type::int()));
+        let x = builder.add_param("x", Type::int());
+        let out = builder.add_temp(Type::int());
+        builder.assign(
+            out,
+            RValue::Call {
+                func: FuncRef::Index(callee),
+                args: vec![x],
+            },
+        );
+        builder.terminate(Terminator::Return(Some(out)));
+        builder.build()
+    }
+
     #[test]
     fn admits_pure_int_leaf() {
         let mut module = Module::new("leaf");
@@ -259,6 +303,38 @@ mod tests {
 
         assert!(!plan.is_unboxed_int_function(0));
         assert!(!plan.is_unboxed_int_function(1));
+    }
+
+    #[test]
+    fn boxed_leaf_invalidates_long_direct_call_chain() {
+        const DEPTH: usize = 64;
+        let mut module = Module::new("long-boxed-chain");
+        for idx in 0..DEPTH - 1 {
+            module
+                .functions
+                .push(int_forwarder(format!("f{idx}"), idx + 1));
+        }
+
+        let mut leaf = FunctionBuilder::new("ffi_leaf", Some(Type::int()));
+        let x = leaf.add_param("x", Type::int());
+        let out = leaf.add_temp(Type::int());
+        leaf.assign(
+            out,
+            RValue::FFICall {
+                idx: 0,
+                args: vec![x],
+            },
+        );
+        leaf.terminate(Terminator::Return(Some(out)));
+        module.functions.push(leaf.build());
+
+        let plan = NativeModulePlan::for_module(&module);
+        for idx in 0..DEPTH {
+            assert!(
+                !plan.is_unboxed_int_function(idx),
+                "boxed leaf must invalidate transitive caller f{idx}"
+            );
+        }
     }
 
     #[test]
