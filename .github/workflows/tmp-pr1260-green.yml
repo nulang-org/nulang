@@ -32,11 +32,10 @@ jobs:
           count = source.count(old)
           if count != 1:
               raise SystemExit(f"unexpected collect_ref_free_vars array arm count: {count}")
-          path.write_text(source.replace(old, new, 1))
-
-          changed = path.read_text()
-          if changed.count(new) != 1:
-              raise SystemExit("guarded array value-restriction patch was not applied exactly once")
+          changed = source.replace(old, new, 1)
+          if old in changed:
+              raise SystemExit("guarded array value-restriction patch left the old arm behind")
+          path.write_text(changed)
 
       - name: Verify production diff is one-line scoped
         shell: bash
