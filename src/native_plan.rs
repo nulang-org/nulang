@@ -201,6 +201,10 @@ impl NativeFunctionPlan {
     /// Whether today's AOT integer fast path can safely use raw i64 arguments
     /// and results for this function in isolation.
     ///
+    /// The current boxed entry wrapper always tags the raw return as Int, so a
+    /// unit/void function cannot use this path: its native body returns tagged
+    /// nil, which the wrapper would otherwise retag as integer zero.
+    ///
     /// A module-level ABI planner must additionally prove every call edge is
     /// raw-compatible before removing `CrossFunctionCall`; until then direct
     /// inter-function calls stay boxed rather than passing raw integers into a
@@ -209,7 +213,7 @@ impl NativeFunctionPlan {
         self.constraints.is_empty()
             && self.captures.is_empty()
             && self.params.iter().all(|repr| *repr == NativeValueRepr::I64)
-            && matches!(self.ret, None | Some(NativeValueRepr::I64))
+            && self.ret == Some(NativeValueRepr::I64)
     }
 }
 
@@ -237,6 +241,18 @@ mod tests {
         assert_eq!(plan.ret, Some(NativeValueRepr::I64));
         assert!(plan.constraints.is_empty());
         assert!(plan.supports_unboxed_int_path());
+    }
+
+    #[test]
+    fn unit_return_is_not_supported_by_current_int_wrapper() {
+        let mut builder = FunctionBuilder::new("unit", None);
+        builder.add_param("x", Type::int());
+        builder.terminate(Terminator::Return(None));
+        let plan = NativeFunctionPlan::for_function(&builder.build());
+
+        assert_eq!(plan.ret, None);
+        assert!(plan.constraints.is_empty());
+        assert!(!plan.supports_unboxed_int_path());
     }
 
     #[test]
