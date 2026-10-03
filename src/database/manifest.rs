@@ -108,7 +108,11 @@ impl Manifest {
 
     pub(crate) fn register(&mut self, entry: ManifestEntry) -> Result<bool, ManifestError> {
         validate_entry(self.tablet_id, &entry)?;
-        if self.obsolete_files.iter().any(|name| name == &entry.file_name) {
+        if self
+            .obsolete_files
+            .iter()
+            .any(|name| name == &entry.file_name)
+        {
             return Err(ManifestError::ActiveObsoleteOverlap(entry.file_name));
         }
         if let Some(existing) = self
@@ -144,7 +148,9 @@ impl Manifest {
         for source in &source_set {
             validate_file_name(source)?;
             if !self.entries.iter().any(|entry| entry.file_name == *source) {
-                return Err(ManifestError::MissingReplacementSource((*source).to_owned()));
+                return Err(ManifestError::MissingReplacementSource(
+                    (*source).to_owned(),
+                ));
             }
         }
         if !source_set.contains(replacement.file_name.as_str())
@@ -243,7 +249,10 @@ fn validate_manifest(
     obsolete_files: &[String],
 ) -> Result<(), ManifestError> {
     validate_entries(tablet_id, entries)?;
-    let active: BTreeSet<&str> = entries.iter().map(|entry| entry.file_name.as_str()).collect();
+    let active: BTreeSet<&str> = entries
+        .iter()
+        .map(|entry| entry.file_name.as_str())
+        .collect();
     let mut obsolete = BTreeSet::new();
     for file_name in obsolete_files {
         validate_file_name(file_name)?;

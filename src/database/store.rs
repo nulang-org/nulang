@@ -21,8 +21,7 @@ use std::sync::{Arc, Mutex};
 use super::checkpoint::{self, CheckpointError};
 use super::manifest::{Manifest, ManifestEntry, ManifestError};
 use super::sstable::{
-    self, Sstable, SstableBlockCache, SstableCacheStats, SstableError,
-    DEFAULT_BLOCK_CACHE_BYTES,
+    self, Sstable, SstableBlockCache, SstableCacheStats, SstableError, DEFAULT_BLOCK_CACHE_BYTES,
 };
 use super::tablet::{
     MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletSnapshotRow,
@@ -458,10 +457,7 @@ impl WalBackedTablet {
             .map(Cow::Borrowed))
     }
 
-    pub fn read_latest<'a>(
-        &'a self,
-        key: &[u8],
-    ) -> Result<Option<Cow<'a, [u8]>>, WalBackedError> {
+    pub fn read_latest<'a>(&'a self, key: &[u8]) -> Result<Option<Cow<'a, [u8]>>, WalBackedError> {
         self.read_at(key, self.tablet.current_sequence())
     }
 

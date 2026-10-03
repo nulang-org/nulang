@@ -108,7 +108,12 @@ fn l0_compaction_merges_four_tables_preserves_mvcc_and_retires_sources() {
     cleanup(&path);
 
     let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
-    for value in [b"v1".as_slice(), b"v2".as_slice(), b"v3".as_slice(), b"v4".as_slice()] {
+    for value in [
+        b"v1".as_slice(),
+        b"v2".as_slice(),
+        b"v3".as_slice(),
+        b"v4".as_slice(),
+    ] {
         commit_put(&mut tablet, b"k", value);
         flush_current(&mut tablet);
     }
@@ -167,17 +172,35 @@ fn l0_compaction_preserves_tombstones_and_later_reinsertion() {
     flush_current(&mut tablet);
 
     assert!(tablet.compact_l0_once().unwrap());
-    assert_eq!(tablet.read_at(b"k", 1).unwrap().as_deref(), Some(&b"v1"[..]));
-    assert_eq!(tablet.read_at(b"k", 2).unwrap().as_deref(), Some(&b"v2"[..]));
+    assert_eq!(
+        tablet.read_at(b"k", 1).unwrap().as_deref(),
+        Some(&b"v1"[..])
+    );
+    assert_eq!(
+        tablet.read_at(b"k", 2).unwrap().as_deref(),
+        Some(&b"v2"[..])
+    );
     assert_eq!(tablet.read_at(b"k", 3).unwrap(), None);
-    assert_eq!(tablet.read_at(b"k", 4).unwrap().as_deref(), Some(&b"v4"[..]));
+    assert_eq!(
+        tablet.read_at(b"k", 4).unwrap().as_deref(),
+        Some(&b"v4"[..])
+    );
 
     drop(tablet);
     let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
-    assert_eq!(reopened.read_at(b"k", 1).unwrap().as_deref(), Some(&b"v1"[..]));
-    assert_eq!(reopened.read_at(b"k", 2).unwrap().as_deref(), Some(&b"v2"[..]));
+    assert_eq!(
+        reopened.read_at(b"k", 1).unwrap().as_deref(),
+        Some(&b"v1"[..])
+    );
+    assert_eq!(
+        reopened.read_at(b"k", 2).unwrap().as_deref(),
+        Some(&b"v2"[..])
+    );
     assert_eq!(reopened.read_at(b"k", 3).unwrap(), None);
-    assert_eq!(reopened.read_at(b"k", 4).unwrap().as_deref(), Some(&b"v4"[..]));
+    assert_eq!(
+        reopened.read_at(b"k", 4).unwrap().as_deref(),
+        Some(&b"v4"[..])
+    );
     cleanup(&path);
 }
 
@@ -206,10 +229,22 @@ fn compacted_table_recovers_after_the_covered_wal_prefix_is_reclaimed() {
     let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert_eq!(reopened.current_sequence(), 4);
     assert_eq!(reopened.durable_sstable_count().unwrap(), 1);
-    assert_eq!(reopened.read_latest(b"a").unwrap().as_deref(), Some(&b"one"[..]));
-    assert_eq!(reopened.read_latest(b"b").unwrap().as_deref(), Some(&b"two"[..]));
-    assert_eq!(reopened.read_latest(b"c").unwrap().as_deref(), Some(&b"three"[..]));
-    assert_eq!(reopened.read_latest(b"d").unwrap().as_deref(), Some(&b"four"[..]));
+    assert_eq!(
+        reopened.read_latest(b"a").unwrap().as_deref(),
+        Some(&b"one"[..])
+    );
+    assert_eq!(
+        reopened.read_latest(b"b").unwrap().as_deref(),
+        Some(&b"two"[..])
+    );
+    assert_eq!(
+        reopened.read_latest(b"c").unwrap().as_deref(),
+        Some(&b"three"[..])
+    );
+    assert_eq!(
+        reopened.read_latest(b"d").unwrap().as_deref(),
+        Some(&b"four"[..])
+    );
 
     cleanup(&path);
 }

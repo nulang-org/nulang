@@ -64,7 +64,12 @@ fn flush_current(tablet: &mut WalBackedTablet) {
 
 fn build_four_tables(path: &Path) -> WalBackedTablet {
     let mut tablet = WalBackedTablet::open(descriptor(), path).unwrap();
-    for value in [b"v1".as_slice(), b"v2".as_slice(), b"v3".as_slice(), b"v4".as_slice()] {
+    for value in [
+        b"v1".as_slice(),
+        b"v2".as_slice(),
+        b"v3".as_slice(),
+        b"v4".as_slice(),
+    ] {
         commit_put(&mut tablet, value);
         flush_current(&mut tablet);
     }
@@ -185,7 +190,10 @@ fn corrupt_committed_replacement_does_not_delete_source_fallbacks() {
     ));
     assert_eq!(sstable_file_count(&path), 5);
     for source in &source_paths {
-        assert!(source.exists(), "source SSTable was retired before replacement validation");
+        assert!(
+            source.exists(),
+            "source SSTable was retired before replacement validation"
+        );
     }
 
     cleanup(&path);

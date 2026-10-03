@@ -274,7 +274,11 @@ impl Sstable {
             return Err(SstableError::TrailingBytes);
         }
 
-        let min_sequence = sequences.iter().next().copied().ok_or(SstableError::InvalidHistory)?;
+        let min_sequence = sequences
+            .iter()
+            .next()
+            .copied()
+            .ok_or(SstableError::InvalidHistory)?;
         let max_sequence = sequences
             .iter()
             .next_back()
@@ -374,7 +378,9 @@ impl Sstable {
         key: &[u8],
         snapshot: u64,
     ) -> Result<Option<Vec<u8>>, SstableError> {
-        Ok(self.version_at(key, snapshot)?.and_then(|version| version.value))
+        Ok(self
+            .version_at(key, snapshot)?
+            .and_then(|version| version.value))
     }
 
     pub(crate) fn read_all_rows(&self) -> Result<Vec<TabletSnapshotRow>, SstableError> {
@@ -689,7 +695,10 @@ impl<'a> PayloadReader<'a> {
     }
 
     fn finish_block(&mut self) -> Result<[u8; 32], SstableError> {
-        let hasher = self.block_hasher.take().ok_or(SstableError::InvalidHistory)?;
+        let hasher = self
+            .block_hasher
+            .take()
+            .ok_or(SstableError::InvalidHistory)?;
         Ok(*hasher.finalize().as_bytes())
     }
 
@@ -939,12 +948,18 @@ mod tests {
         assert_eq!(metadata.row_count, 2);
         let table = Sstable::open(&path).unwrap();
         assert_eq!(table.tablet_id(), 42);
-        assert_eq!(table.get_at(b"alpha", 1).unwrap().as_deref(), Some(&b"one"[..]));
+        assert_eq!(
+            table.get_at(b"alpha", 1).unwrap().as_deref(),
+            Some(&b"one"[..])
+        );
         assert_eq!(
             table.get_at(b"alpha", 3).unwrap().as_deref(),
             Some(&b"three"[..])
         );
-        assert_eq!(table.get_at(b"beta", 3).unwrap().as_deref(), Some(&b"two"[..]));
+        assert_eq!(
+            table.get_at(b"beta", 3).unwrap().as_deref(),
+            Some(&b"two"[..])
+        );
         assert_eq!(table.get_at(b"beta", 4).unwrap(), None);
         assert_eq!(table.get_at(b"missing", 4).unwrap(), None);
         assert_eq!(table.read_all_rows().unwrap(), rows());
