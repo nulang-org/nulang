@@ -1,6 +1,7 @@
 use super::manifest::{Manifest, ManifestEntry, SstableFormat, SstableIntegrity};
 use super::sstable;
-use super::store::WalBackedTablet;
+use super::sstable_v2::write_sstable_v2;
+use super::store::{WalBackedError, WalBackedTablet};
 use super::tablet::{
     KeyRange, TabletDescriptor, TabletId, TabletMutation, TabletSnapshotRow, VersionedValue,
 };
@@ -139,6 +140,49 @@ fn explicit_v1_manifest_entries_remain_recoverable_after_v2_activation() {
         reopened.read_latest(b"k").unwrap(),
         Some(&b"legacy-v1"[..])
     );
+
+    cleanup(&path);
+}
+
+#[test]
+fn v2_manifest_entry_outside_descriptor_range_fails_closed() {
+    let path = temp_wal("v2-out-of-range");
+    cleanup(&path);
+
+    let rows = vec![TabletSnapshotRow {
+        key: b"zz".to_vec(),
+        versions: vec![VersionedValue {
+            sequence: 1,
+            value: Some(b"outside".to_vec()),
+        }],
+    }];
+    let sstable_dir = path.with_extension("sstables");
+    fs::create_dir_all(&sstable_dir).unwrap();
+    let table_path = sstable_dir.join("outside-v2.sst");
+    let metadata = write_sstable_v2(&table_path, 905, 1, &rows).unwrap();
+
+    let mut manifest = Manifest::empty(905);
+    manifest
+        .register(ManifestEntry {
+            file_name: metadata.file_name.clone(),
+            tablet_id: metadata.tablet_id,
+            ownership_epoch: metadata.ownership_epoch,
+            min_sequence: metadata.min_sequence,
+            max_sequence: metadata.max_sequence,
+            row_count: metadata.row_count,
+            min_key: metadata.min_key.clone(),
+            max_key: metadata.max_key.clone(),
+            format: SstableFormat::V2,
+            integrity: SstableIntegrity::FooterBlake3(metadata.footer_checksum),
+        })
+        .unwrap();
+    manifest.publish(&path.with_extension("manifest")).unwrap();
+
+    assert!(matches!(
+        WalBackedTablet::open(descriptor(), &path),
+        Err(WalBackedError::ManifestSstableMismatch(file)) if file == "outside-v2.sst"
+    ));
+    assert!(table_path.exists());
 
     cleanup(&path);
 }
