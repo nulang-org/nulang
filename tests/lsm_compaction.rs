@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nulang::database::lsm::{LsmError, LsmStorage};
+use nulang::database::managed_lsm::{ManagedLsmError, ManagedLsmStorage};
 use nulang::database::tablet::{MvccStorage, TabletMutation};
 
 static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
@@ -28,7 +28,7 @@ fn compaction_atomically_replaces_the_active_table_set_and_survives_restart() {
     let _ = fs::remove_dir_all(&dir);
 
     {
-        let mut storage = LsmStorage::open(&dir).unwrap();
+        let mut storage = ManagedLsmStorage::open(&dir).unwrap();
         storage.apply_committed(1, vec![put(b"k", b"v1")]);
         storage.flush().unwrap().unwrap();
         storage.apply_committed(2, vec![put(b"k", b"v2")]);
@@ -48,7 +48,7 @@ fn compaction_atomically_replaces_the_active_table_set_and_survives_restart() {
         assert!(dir.join("MANIFEST").exists());
     }
 
-    let reopened = LsmStorage::open(&dir).unwrap();
+    let reopened = ManagedLsmStorage::open(&dir).unwrap();
     assert_eq!(reopened.current_sequence(), 3);
     assert_eq!(reopened.oldest_readable_sequence(), 2);
     assert_eq!(reopened.table_count(), 1);
@@ -63,7 +63,7 @@ fn compaction_reclaims_a_terminal_tombstone() {
     let dir = temp_dir("tombstone");
     let _ = fs::remove_dir_all(&dir);
 
-    let mut storage = LsmStorage::open(&dir).unwrap();
+    let mut storage = ManagedLsmStorage::open(&dir).unwrap();
     storage.apply_committed(1, vec![put(b"k", b"value")]);
     storage.flush().unwrap().unwrap();
     storage.apply_committed(2, vec![TabletMutation::Delete { key: b"k".to_vec() }]);
@@ -75,7 +75,7 @@ fn compaction_reclaims_a_terminal_tombstone() {
     assert_eq!(storage.read_at(b"k", 2), None);
 
     drop(storage);
-    let reopened = LsmStorage::open(&dir).unwrap();
+    let reopened = ManagedLsmStorage::open(&dir).unwrap();
     assert_eq!(reopened.current_sequence(), 2);
     assert_eq!(reopened.oldest_readable_sequence(), 2);
     assert_eq!(reopened.read_at(b"k", 2), None);
@@ -89,7 +89,7 @@ fn manifest_ignores_an_unreferenced_sstable_from_an_interrupted_operation() {
     let _ = fs::remove_dir_all(&dir);
 
     {
-        let mut storage = LsmStorage::open(&dir).unwrap();
+        let mut storage = ManagedLsmStorage::open(&dir).unwrap();
         storage.apply_committed(1, vec![put(b"k", b"v1")]);
         storage.flush().unwrap().unwrap();
     }
@@ -97,7 +97,7 @@ fn manifest_ignores_an_unreferenced_sstable_from_an_interrupted_operation() {
     let orphan = dir.join("nudb-sst-00000000000000000099.sst");
     fs::write(&orphan, b"interrupted unpublished table").unwrap();
 
-    let reopened = LsmStorage::open(&dir).unwrap();
+    let reopened = ManagedLsmStorage::open(&dir).unwrap();
     assert_eq!(reopened.current_sequence(), 1);
     assert_eq!(reopened.table_count(), 1);
     assert_eq!(reopened.read_at(b"k", 1), Some(&b"v1"[..]));
@@ -111,7 +111,7 @@ fn corrupt_manifest_fails_closed() {
     let _ = fs::remove_dir_all(&dir);
 
     {
-        let mut storage = LsmStorage::open(&dir).unwrap();
+        let mut storage = ManagedLsmStorage::open(&dir).unwrap();
         storage.apply_committed(1, vec![put(b"k", b"v1")]);
         storage.flush().unwrap().unwrap();
     }
@@ -123,10 +123,10 @@ fn corrupt_manifest_fails_closed() {
     fs::write(&manifest, bytes).unwrap();
 
     assert!(matches!(
-        LsmStorage::open(&dir),
-        Err(LsmError::ManifestChecksumMismatch { .. })
-            | Err(LsmError::CorruptManifest { .. })
-            | Err(LsmError::UnsupportedManifestVersion { .. })
+        ManagedLsmStorage::open(&dir),
+        Err(ManagedLsmError::ManifestChecksumMismatch { .. })
+            | Err(ManagedLsmError::CorruptManifest { .. })
+            | Err(ManagedLsmError::UnsupportedManifestVersion { .. })
     ));
 
     let _ = fs::remove_dir_all(&dir);
@@ -137,14 +137,14 @@ fn compaction_rejects_unflushed_commits() {
     let dir = temp_dir("dirty_memtable");
     let _ = fs::remove_dir_all(&dir);
 
-    let mut storage = LsmStorage::open(&dir).unwrap();
+    let mut storage = ManagedLsmStorage::open(&dir).unwrap();
     storage.apply_committed(1, vec![put(b"k", b"v1")]);
     storage.flush().unwrap().unwrap();
     storage.apply_committed(2, vec![put(b"k", b"v2")]);
 
     assert_eq!(
         storage.compact_all(1).unwrap_err(),
-        LsmError::UnflushedStateForCompaction {
+        ManagedLsmError::UnflushedStateForCompaction {
             current_sequence: 2,
             flushed_sequence: 1,
         }
