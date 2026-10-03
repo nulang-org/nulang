@@ -351,6 +351,9 @@ impl WalBackedTablet {
         let mut disk_winner: Option<VersionedValue> = None;
 
         for table in self.sstables.iter().rev() {
+            if best_sequence.is_some_and(|sequence| table.metadata().max_sequence < sequence) {
+                continue;
+            }
             if let Some(candidate) = table.version_at(key, snapshot)? {
                 if best_sequence
                     .map(|sequence| candidate.sequence > sequence)
