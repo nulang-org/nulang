@@ -39,6 +39,21 @@ class ColdJitProbeGateTests(unittest.TestCase):
             "candidate classification belongs in step() so non-candidate instructions avoid the function call entirely",
         )
 
+    def test_minimal_build_has_false_candidate_fallback(self):
+        source = VM_RS.read_text(encoding="utf-8")
+        fallback = (
+            '#[cfg(not(feature = "native-codegen"))]\n'
+            '    #[inline(always)]\n'
+            '    fn jit_candidate_for_frame(&self, _frame_idx: usize) -> bool {\n'
+            '        false\n'
+            '    }'
+        )
+        self.assertIn(
+            fallback,
+            source,
+            "no-default-features builds need a candidate helper that always rejects JIT entry",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
