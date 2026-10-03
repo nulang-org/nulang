@@ -3569,6 +3569,12 @@ impl VM {
             .unwrap_or(false)
     }
 
+    #[cfg(not(feature = "native-codegen"))]
+    #[inline(always)]
+    fn jit_candidate_for_frame(&self, _frame_idx: usize) -> bool {
+        false
+    }
+
     /// Attempt JIT execution for a PC already classified as a JIT candidate.
     ///
     /// Returns `true` if the JIT executed a compiled region and advanced the
