@@ -1,7 +1,8 @@
+use super::compaction::{compact_tablet_sstables_to_v2, CompactionError};
 use super::manifest::{Manifest, ManifestEntry, SstableFormat, SstableIntegrity};
 use super::sstable;
 use super::sstable_v2::{write_sstable_v2, SstableV2};
-use super::store::{WalBackedError, WalBackedTablet};
+use super::store::WalBackedTablet;
 use super::tablet::{
     KeyRange, TabletDescriptor, TabletId, TabletMutation, TabletSnapshotRow, VersionedValue,
 };
@@ -112,18 +113,16 @@ fn compact_mixed_v1_v2_tables_preserves_full_mvcc_history_and_recovery() {
     wal.reclaim_through(1).unwrap();
     drop(wal);
 
-    let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
-    commit_put(&mut tablet, b"k", b"v2");
-    flush_current(&mut tablet);
-    commit_delete(&mut tablet, b"k");
-    flush_current(&mut tablet);
-    assert_eq!(tablet.durable_sstable_count().unwrap(), 3);
+    {
+        let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+        commit_put(&mut tablet, b"k", b"v2");
+        flush_current(&mut tablet);
+        commit_delete(&mut tablet, b"k");
+        flush_current(&mut tablet);
+        assert_eq!(tablet.durable_sstable_count().unwrap(), 3);
+    }
 
-    assert!(tablet.compact_sstables_to_v2().unwrap());
-    assert_eq!(tablet.durable_sstable_count().unwrap(), 1);
-    assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
-    assert_eq!(tablet.read_at(b"k", 2).unwrap(), Some(&b"v2"[..]));
-    assert_eq!(tablet.read_at(b"k", 3).unwrap(), None);
+    assert!(compact_tablet_sstables_to_v2(&descriptor(), &path).unwrap());
 
     let manifest = Manifest::load_or_empty(&path.with_extension("manifest"), 906).unwrap();
     assert_eq!(manifest.entries().len(), 1);
@@ -131,7 +130,6 @@ fn compact_mixed_v1_v2_tables_preserves_full_mvcc_history_and_recovery() {
     assert!(manifest.entries()[0].file_name.contains("-compact-v2-"));
     assert_eq!(fs::read_dir(path.with_extension("sstables")).unwrap().count(), 1);
 
-    drop(tablet);
     let mut wal = FileWal::open(&path).unwrap();
     wal.reclaim_through(3).unwrap();
     drop(wal);
@@ -169,8 +167,7 @@ fn compact_single_legacy_v1_table_rewrites_it_to_v2() {
     wal.reclaim_through(1).unwrap();
     drop(wal);
 
-    let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
-    assert!(tablet.compact_sstables_to_v2().unwrap());
+    assert!(compact_tablet_sstables_to_v2(&descriptor(), &path).unwrap());
 
     let manifest = Manifest::load_or_empty(&path.with_extension("manifest"), 906).unwrap();
     assert_eq!(manifest.entries().len(), 1);
@@ -179,10 +176,22 @@ fn compact_single_legacy_v1_table_rewrites_it_to_v2() {
         manifest.entries()[0].integrity,
         SstableIntegrity::FooterBlake3(_)
     ));
-    let compacted = SstableV2::open(&path.with_extension("sstables").join(&manifest.entries()[0].file_name))
-        .unwrap();
-    assert_eq!(compacted.snapshot_rows().unwrap()[0].versions[0].value.as_deref(), Some(&b"legacy"[..]));
-    assert!(!path.with_extension("sstables").join("legacy-only.sst").exists());
+    let compacted = SstableV2::open(
+        &path
+            .with_extension("sstables")
+            .join(&manifest.entries()[0].file_name),
+    )
+    .unwrap();
+    assert_eq!(
+        compacted.snapshot_rows().unwrap()[0].versions[0]
+            .value
+            .as_deref(),
+        Some(&b"legacy"[..])
+    );
+    assert!(!path
+        .with_extension("sstables")
+        .join("legacy-only.sst")
+        .exists());
 
     cleanup(&path);
 }
@@ -216,7 +225,8 @@ fn compaction_conflict_fails_before_manifest_replacement() {
             value: Some(b"right".to_vec()),
         }],
     }];
-    let left = sstable::write_sstable(&sstable_dir.join("left-v1.sst"), 906, 1, &left_rows).unwrap();
+    let left =
+        sstable::write_sstable(&sstable_dir.join("left-v1.sst"), 906, 1, &left_rows).unwrap();
     let right = write_sstable_v2(&sstable_dir.join("right-v2.sst"), 906, 1, &right_rows).unwrap();
 
     let mut manifest = Manifest::empty(906);
@@ -250,10 +260,9 @@ fn compaction_conflict_fails_before_manifest_replacement() {
         .unwrap();
     manifest.publish(&path.with_extension("manifest")).unwrap();
 
-    let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert_eq!(
-        tablet.compact_sstables_to_v2().unwrap_err(),
-        WalBackedError::SnapshotCompositionConflict { sequence: 1 }
+        compact_tablet_sstables_to_v2(&descriptor(), &path).unwrap_err(),
+        CompactionError::SnapshotConflict { sequence: 1 }
     );
     let manifest_after = Manifest::load_or_empty(&path.with_extension("manifest"), 906).unwrap();
     assert_eq!(manifest_after.entries().len(), 2);
