@@ -71,7 +71,7 @@ fn sstable_rejects_impossible_row_version_count_before_allocating_versions() {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let table = dir.join("nudb-sst-00000000000000000001.sst");
-    write_table(&table, 1, 4, &one_tombstone_row(4));
+    write_table(&table, 1, 1, &one_tombstone_row(4));
 
     assert!(matches!(
         LsmStorage::open(&dir),
@@ -119,7 +119,14 @@ fn limited_scan_counts_live_rows_not_tombstoned_candidates() {
     let _ = fs::remove_dir_all(&dir);
 
     let mut storage = ManagedLsmStorage::open(&dir).unwrap();
-    storage.apply_committed(1, vec![put(b"a", b"a1"), put(b"b", b"b1"), put(b"c", b"c1")]);
+    storage.apply_committed(
+        1,
+        vec![
+            put(b"a", b"a1"),
+            put(b"b", b"b1"),
+            put(b"c", b"c1"),
+        ],
+    );
     storage.flush().unwrap().unwrap();
     storage.apply_committed(
         2,
