@@ -115,6 +115,11 @@ impl ManagedLsmStorage {
         self.mutable.values().map(Vec::len).sum()
     }
 
+    /// Publish all committed state since the previous flush.
+    ///
+    /// The immutable table is durable before the manifest references it. If the
+    /// manifest update fails, the table is merely an orphan and the mutable
+    /// state remains intact for a retry.
     pub fn flush(&mut self) -> Result<Option<ManagedFlushResult>, ManagedLsmError> {
         if self.current_sequence == self.flushed_sequence {
             return Ok(None);
@@ -126,6 +131,9 @@ impl ManagedLsmStorage {
             .ok_or(ManagedLsmError::SequenceOverflow)?;
         let max_sequence = self.current_sequence;
         let generation = self.next_generation;
+        let following_generation = generation
+            .checked_add(1)
+            .ok_or(ManagedLsmError::GenerationOverflow)?;
         let table = ImmutableTable::from_rows(
             generation,
             min_sequence,
@@ -135,28 +143,28 @@ impl ManagedLsmStorage {
         let version_count = table.version_count;
         let path = table_path(&self.directory, generation);
 
-        // A failed prior publication may have left this generation orphaned.
-        // Because it is not named by the current manifest it is safe to replace.
         if path.exists() {
             fs::remove_file(&path).map_err(ManagedLsmError::io)?;
         }
         table.write_atomic(&path)?;
 
-        let mut generations: Vec<u64> = self.tables.iter().map(|table| table.generation).collect();
+        let mut generations: Vec<u64> = self
+            .tables
+            .iter()
+            .map(|active| active.generation)
+            .collect();
         generations.push(generation);
-        let manifest = Manifest {
+        Manifest {
             oldest_readable_sequence: self.oldest_readable_sequence,
             flushed_sequence: max_sequence,
             active_generations: generations,
-        };
-        manifest.write_atomic(&self.directory.join(MANIFEST_FILE))?;
+        }
+        .write_atomic(&self.directory.join(MANIFEST_FILE))?;
 
         self.tables.push(table);
         self.mutable.clear();
         self.flushed_sequence = max_sequence;
-        self.next_generation = generation
-            .checked_add(1)
-            .ok_or(ManagedLsmError::GenerationOverflow)?;
+        self.next_generation = following_generation;
 
         Ok(Some(ManagedFlushResult {
             generation,
@@ -167,12 +175,12 @@ impl ManagedLsmStorage {
         }))
     }
 
-    /// Merge every currently active immutable table and publish the replacement
-    /// table set through one atomic manifest swap.
+    /// Merge every active immutable table and atomically replace the active set.
     ///
-    /// Compaction is deliberately forbidden while committed mutations remain in
-    /// the mutable memtable. Call `flush` first so the table set represents a
-    /// complete durable sequence interval.
+    /// Compaction is forbidden while committed state remains in the mutable
+    /// memtable. Once the replacement manifest is published, cleanup failures
+    /// are reported in `CompactionResult` rather than returned as an operation
+    /// error, because the new table set is already authoritative at that point.
     pub fn compact_all(&mut self, safe_point: u64) -> Result<CompactionResult, ManagedLsmError> {
         if self.current_sequence != self.flushed_sequence {
             return Err(ManagedLsmError::UnflushedStateForCompaction {
@@ -196,12 +204,12 @@ impl ManagedLsmStorage {
             .collect();
 
         if self.current_sequence == 0 {
-            let manifest = Manifest {
+            Manifest {
                 oldest_readable_sequence: 0,
                 flushed_sequence: 0,
                 active_generations: Vec::new(),
-            };
-            manifest.write_atomic(&self.directory.join(MANIFEST_FILE))?;
+            }
+            .write_atomic(&self.directory.join(MANIFEST_FILE))?;
             return Ok(CompactionResult {
                 input_tables,
                 output_tables: 0,
@@ -209,18 +217,24 @@ impl ManagedLsmStorage {
                 versions_removed: 0,
                 keys_removed: 0,
                 obsolete_files_retained: 0,
+                cleanup_sync_failed: false,
             });
         }
 
+        let generation = self.next_generation;
+        let following_generation = generation
+            .checked_add(1)
+            .ok_or(ManagedLsmError::GenerationOverflow)?;
         let mut rows: BTreeMap<Vec<u8>, Vec<VersionedValue>> = BTreeMap::new();
         for table in &self.tables {
             for (key, versions) in &table.rows {
-                rows.entry(key.clone()).or_default().extend(versions.clone());
+                rows.entry(key.clone())
+                    .or_default()
+                    .extend(versions.iter().cloned());
             }
         }
 
         let (versions_removed, keys_removed) = collect_rows(&mut rows, target_safe_point);
-        let generation = self.next_generation;
         let replacement =
             ImmutableTable::from_rows(generation, 1, self.current_sequence, &rows)?;
         let replacement_path = table_path(&self.directory, generation);
@@ -229,22 +243,19 @@ impl ManagedLsmStorage {
         }
         replacement.write_atomic(&replacement_path)?;
 
-        let manifest = Manifest {
+        Manifest {
             oldest_readable_sequence: target_safe_point,
             flushed_sequence: self.current_sequence,
             active_generations: vec![generation],
-        };
-        manifest.write_atomic(&self.directory.join(MANIFEST_FILE))?;
+        }
+        .write_atomic(&self.directory.join(MANIFEST_FILE))?;
 
+        // Everything below this point is deliberately infallible with respect
+        // to the caller-visible compaction result: the manifest has committed.
         self.tables = vec![replacement];
         self.oldest_readable_sequence = target_safe_point;
-        self.next_generation = generation
-            .checked_add(1)
-            .ok_or(ManagedLsmError::GenerationOverflow)?;
+        self.next_generation = following_generation;
 
-        // Once the manifest names only the replacement table, old tables are
-        // unreachable after restart. Deletion is therefore cleanup, not part of
-        // the atomic correctness boundary.
         let mut obsolete_files_retained = 0_usize;
         for path in old_paths {
             if path == replacement_path {
@@ -256,7 +267,7 @@ impl ManagedLsmStorage {
                 Err(_) => obsolete_files_retained += 1,
             }
         }
-        sync_parent_directory(&replacement_path).map_err(ManagedLsmError::io)?;
+        let cleanup_sync_failed = sync_parent_directory(&replacement_path).is_err();
 
         Ok(CompactionResult {
             input_tables,
@@ -265,6 +276,7 @@ impl ManagedLsmStorage {
             versions_removed,
             keys_removed,
             obsolete_files_retained,
+            cleanup_sync_failed,
         })
     }
 }
@@ -335,6 +347,7 @@ pub struct CompactionResult {
     pub versions_removed: usize,
     pub keys_removed: usize,
     pub obsolete_files_retained: usize,
+    pub cleanup_sync_failed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -345,7 +358,9 @@ struct Manifest {
 }
 
 impl Manifest {
-    fn from_legacy_tables(discovered: &[(u64, PathBuf)]) -> Result<Self, ManagedLsmError> {
+    fn from_legacy_tables(
+        discovered: &[(u64, PathBuf)],
+    ) -> Result<Self, ManagedLsmError> {
         let mut expected_generation = 1_u64;
         let mut expected_min_sequence = 1_u64;
         let mut flushed_sequence = 0_u64;
@@ -419,7 +434,9 @@ impl Manifest {
             bytes.extend_from_slice(&generation.to_le_bytes());
         }
         if bytes.len().saturating_add(CHECKSUM_BYTES) > MAX_MANIFEST_BYTES {
-            return Err(ManagedLsmError::ManifestTooLarge(bytes.len() + CHECKSUM_BYTES));
+            return Err(ManagedLsmError::ManifestTooLarge(
+                bytes.len() + CHECKSUM_BYTES,
+            ));
         }
         let checksum = blake3::hash(&bytes);
         bytes.extend_from_slice(checksum.as_bytes());
@@ -618,7 +635,9 @@ impl ImmutableTable {
         }
 
         if bytes.len().saturating_add(CHECKSUM_BYTES) > MAX_TABLE_BYTES {
-            return Err(ManagedLsmError::TableTooLarge(bytes.len() + CHECKSUM_BYTES));
+            return Err(ManagedLsmError::TableTooLarge(
+                bytes.len() + CHECKSUM_BYTES,
+            ));
         }
         let checksum = blake3::hash(&bytes);
         bytes.extend_from_slice(checksum.as_bytes());
@@ -727,7 +746,7 @@ impl ImmutableTable {
                         return Err(ManagedLsmError::CorruptTable {
                             path: path.to_path_buf(),
                             reason: "invalid value tag".to_string(),
-                        })
+                        });
                     }
                 };
                 versions.push(VersionedValue { sequence, value });
@@ -799,7 +818,9 @@ fn visible_version<'a>(
     visible.checked_sub(1).map(|index| &versions[index])
 }
 
-fn discover_legacy_tables(directory: &Path) -> Result<Vec<(u64, PathBuf)>, ManagedLsmError> {
+fn discover_legacy_tables(
+    directory: &Path,
+) -> Result<Vec<(u64, PathBuf)>, ManagedLsmError> {
     let mut discovered = Vec::new();
     for entry in fs::read_dir(directory).map_err(ManagedLsmError::io)? {
         let entry = entry.map_err(ManagedLsmError::io)?;
@@ -823,7 +844,9 @@ fn validate_generations(generations: &[u64]) -> Result<(), String> {
     let mut previous = 0_u64;
     for generation in generations {
         if *generation == 0 || *generation <= previous {
-            return Err("active table generations must be non-zero and strictly increasing".into());
+            return Err(
+                "active table generations must be non-zero and strictly increasing".to_string(),
+            );
         }
         previous = *generation;
     }
@@ -886,18 +909,36 @@ fn take_table<'a>(
     })
 }
 
-fn read_table_u16(bytes: &[u8], cursor: &mut usize, path: &Path) -> Result<u16, ManagedLsmError> {
-    let raw: [u8; 2] = take_table(bytes, cursor, 2, path)?.try_into().expect("fixed width");
+fn read_table_u16(
+    bytes: &[u8],
+    cursor: &mut usize,
+    path: &Path,
+) -> Result<u16, ManagedLsmError> {
+    let raw: [u8; 2] = take_table(bytes, cursor, 2, path)?
+        .try_into()
+        .expect("fixed width");
     Ok(u16::from_le_bytes(raw))
 }
 
-fn read_table_u32(bytes: &[u8], cursor: &mut usize, path: &Path) -> Result<u32, ManagedLsmError> {
-    let raw: [u8; 4] = take_table(bytes, cursor, 4, path)?.try_into().expect("fixed width");
+fn read_table_u32(
+    bytes: &[u8],
+    cursor: &mut usize,
+    path: &Path,
+) -> Result<u32, ManagedLsmError> {
+    let raw: [u8; 4] = take_table(bytes, cursor, 4, path)?
+        .try_into()
+        .expect("fixed width");
     Ok(u32::from_le_bytes(raw))
 }
 
-fn read_table_u64(bytes: &[u8], cursor: &mut usize, path: &Path) -> Result<u64, ManagedLsmError> {
-    let raw: [u8; 8] = take_table(bytes, cursor, 8, path)?.try_into().expect("fixed width");
+fn read_table_u64(
+    bytes: &[u8],
+    cursor: &mut usize,
+    path: &Path,
+) -> Result<u64, ManagedLsmError> {
+    let raw: [u8; 8] = take_table(bytes, cursor, 8, path)?
+        .try_into()
+        .expect("fixed width");
     Ok(u64::from_le_bytes(raw))
 }
 
@@ -918,7 +959,9 @@ fn read_manifest_u16(
     cursor: &mut usize,
     path: &Path,
 ) -> Result<u16, ManagedLsmError> {
-    let raw: [u8; 2] = take_manifest(bytes, cursor, 2, path)?.try_into().expect("fixed width");
+    let raw: [u8; 2] = take_manifest(bytes, cursor, 2, path)?
+        .try_into()
+        .expect("fixed width");
     Ok(u16::from_le_bytes(raw))
 }
 
@@ -927,7 +970,9 @@ fn read_manifest_u64(
     cursor: &mut usize,
     path: &Path,
 ) -> Result<u64, ManagedLsmError> {
-    let raw: [u8; 8] = take_manifest(bytes, cursor, 8, path)?.try_into().expect("fixed width");
+    let raw: [u8; 8] = take_manifest(bytes, cursor, 8, path)?
+        .try_into()
+        .expect("fixed width");
     Ok(u64::from_le_bytes(raw))
 }
 
@@ -940,19 +985,50 @@ fn take_checked<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize) -> Option<&
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagedLsmError {
-    Io { kind: io::ErrorKind, message: String },
-    ChecksumMismatch { path: PathBuf },
-    CorruptTable { path: PathBuf, reason: String },
-    UnsupportedVersion { path: PathBuf, version: u16 },
-    ManifestChecksumMismatch { path: PathBuf },
-    CorruptManifest { path: PathBuf, reason: String },
-    UnsupportedManifestVersion { path: PathBuf, version: u16 },
-    GenerationGap { expected: u64, presented: u64 },
-    SequenceGap { expected: u64, presented: u64 },
+    Io {
+        kind: io::ErrorKind,
+        message: String,
+    },
+    ChecksumMismatch {
+        path: PathBuf,
+    },
+    CorruptTable {
+        path: PathBuf,
+        reason: String,
+    },
+    UnsupportedVersion {
+        path: PathBuf,
+        version: u16,
+    },
+    ManifestChecksumMismatch {
+        path: PathBuf,
+    },
+    CorruptManifest {
+        path: PathBuf,
+        reason: String,
+    },
+    UnsupportedManifestVersion {
+        path: PathBuf,
+        version: u16,
+    },
+    GenerationGap {
+        expected: u64,
+        presented: u64,
+    },
+    SequenceGap {
+        expected: u64,
+        presented: u64,
+    },
     SequenceOverflow,
     GenerationOverflow,
-    SafePointAhead { current_sequence: u64, safe_point: u64 },
-    UnflushedStateForCompaction { current_sequence: u64, flushed_sequence: u64 },
+    SafePointAhead {
+        current_sequence: u64,
+        safe_point: u64,
+    },
+    UnflushedStateForCompaction {
+        current_sequence: u64,
+        flushed_sequence: u64,
+    },
     KeyTooLarge(usize),
     ValueTooLarge(usize),
     TableTooLarge(usize),
@@ -995,17 +1071,26 @@ impl fmt::Display for ManagedLsmError {
                 "unsupported manifest version {version}: {}",
                 path.display()
             ),
-            Self::GenerationGap { expected, presented } => write!(
+            Self::GenerationGap {
+                expected,
+                presented,
+            } => write!(
                 f,
                 "immutable-table generation gap: expected {expected}, found {presented}"
             ),
-            Self::SequenceGap { expected, presented } => write!(
+            Self::SequenceGap {
+                expected,
+                presented,
+            } => write!(
                 f,
                 "immutable-table sequence gap: expected {expected}, found {presented}"
             ),
             Self::SequenceOverflow => f.write_str("managed LSM sequence overflow"),
             Self::GenerationOverflow => f.write_str("managed LSM generation overflow"),
-            Self::SafePointAhead { current_sequence, safe_point } => write!(
+            Self::SafePointAhead {
+                current_sequence,
+                safe_point,
+            } => write!(
                 f,
                 "compaction safe point {safe_point} is ahead of committed sequence {current_sequence}"
             ),
@@ -1016,10 +1101,18 @@ impl fmt::Display for ManagedLsmError {
                 f,
                 "cannot compact with unflushed commits: committed {current_sequence}, flushed {flushed_sequence}"
             ),
-            Self::KeyTooLarge(size) => write!(f, "immutable-table key is too large ({size} bytes)"),
-            Self::ValueTooLarge(size) => write!(f, "immutable-table value is too large ({size} bytes)"),
-            Self::TableTooLarge(size) => write!(f, "immutable table is too large ({size} bytes)"),
-            Self::ManifestTooLarge(size) => write!(f, "manifest is too large ({size} bytes)"),
+            Self::KeyTooLarge(size) => {
+                write!(f, "immutable-table key is too large ({size} bytes)")
+            }
+            Self::ValueTooLarge(size) => {
+                write!(f, "immutable-table value is too large ({size} bytes)")
+            }
+            Self::TableTooLarge(size) => {
+                write!(f, "immutable table is too large ({size} bytes)")
+            }
+            Self::ManifestTooLarge(size) => {
+                write!(f, "manifest is too large ({size} bytes)")
+            }
             Self::CorruptState(reason) => write!(f, "invalid managed LSM state: {reason}"),
         }
     }
