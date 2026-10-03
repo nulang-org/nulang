@@ -52,7 +52,7 @@ fn wal_backed_rotation_checkpoint_and_reopen_preserve_mvcc_history() {
     let w2 = tablet.prepare_write(1, 1, put(b"v2")).unwrap();
     tablet.commit(w2).unwrap();
     assert_eq!(tablet.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
-    assert_eq!(tablet.read_latest(b"k"), Some(&b"v2"[..]));
+    assert_eq!(tablet.read_latest(b"k").unwrap(), Some(&b"v2"[..]));
 
     tablet.checkpoint().unwrap();
     drop(tablet);
@@ -60,7 +60,7 @@ fn wal_backed_rotation_checkpoint_and_reopen_preserve_mvcc_history() {
     let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert_eq!(reopened.current_sequence(), 2);
     assert_eq!(reopened.read_at(b"k", 1).unwrap(), Some(&b"v1"[..]));
-    assert_eq!(reopened.read_latest(b"k"), Some(&b"v2"[..]));
+    assert_eq!(reopened.read_latest(b"k").unwrap(), Some(&b"v2"[..]));
     // Checkpoint restoration becomes one immutable baseline and leaves replay/new
     // writes in the mutable generation.
     assert_eq!(reopened.immutable_memtable_count(), 1);

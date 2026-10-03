@@ -16,6 +16,8 @@ pub mod wal;
 pub mod wal_batch;
 
 #[cfg(test)]
+mod fallible_read_tests;
+#[cfg(test)]
 mod interruption;
 #[cfg(test)]
 mod sstable_indexed_tests;

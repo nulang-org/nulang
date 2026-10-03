@@ -187,7 +187,7 @@ fn acknowledged_commit_survives_immediate_process_kill() {
 
     let tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
     assert_eq!(tablet.current_sequence(), 1);
-    assert_eq!(tablet.read_latest(b"k"), Some(&b"value"[..]));
+    assert_eq!(tablet.read_latest(b"k").unwrap(), Some(&b"value"[..]));
 
     cleanup(&wal_path);
 }
@@ -202,8 +202,8 @@ fn acknowledged_group_commit_survives_immediate_process_kill() {
 
     let tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
     assert_eq!(tablet.current_sequence(), 2);
-    assert_eq!(tablet.read_latest(b"k1"), Some(&b"value-1"[..]));
-    assert_eq!(tablet.read_latest(b"k2"), Some(&b"value-2"[..]));
+    assert_eq!(tablet.read_latest(b"k1").unwrap(), Some(&b"value-1"[..]));
+    assert_eq!(tablet.read_latest(b"k2").unwrap(), Some(&b"value-2"[..]));
 
     cleanup(&wal_path);
 }

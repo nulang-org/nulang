@@ -53,8 +53,8 @@ fn group_commit_publishes_consecutive_writes_after_one_durable_batch() {
             .unwrap();
         assert_eq!(committed, 2);
         assert_eq!(tablet.current_sequence(), 2);
-        assert_eq!(tablet.read_latest(b"a"), Some(&b"one"[..]));
-        assert_eq!(tablet.read_latest(b"b"), Some(&b"two"[..]));
+        assert_eq!(tablet.read_latest(b"a").unwrap(), Some(&b"one"[..]));
+        assert_eq!(tablet.read_latest(b"b").unwrap(), Some(&b"two"[..]));
     }
 
     let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
@@ -97,7 +97,7 @@ fn group_commit_prevalidates_the_entire_sequence_before_wal_mutation() {
             })
         );
         assert_eq!(tablet.current_sequence(), 0);
-        assert_eq!(tablet.read_latest(b"a"), None);
+        assert_eq!(tablet.read_latest(b"a").unwrap(), None);
     }
 
     let wal = FileWal::open(&path).unwrap();

@@ -111,16 +111,14 @@ impl TabletOwner {
         if self.state == TabletOwnerState::Faulted {
             return Err(TabletOwnerError::Faulted);
         }
-        self.tablet
-            .read_at(key, snapshot)
-            .map_err(TabletOwnerError::Tablet)
+        self.tablet.read_at(key, snapshot).map_err(map_read_error)
     }
 
     pub fn read_latest(&self, key: &[u8]) -> Result<Option<&[u8]>, TabletOwnerError> {
         if self.state == TabletOwnerState::Faulted {
             return Err(TabletOwnerError::Faulted);
         }
-        Ok(self.tablet.read_latest(key))
+        self.tablet.read_latest(key).map_err(map_read_error)
     }
 
     pub fn admit_write(
@@ -326,6 +324,13 @@ impl TabletOwner {
     }
 }
 
+fn map_read_error(error: WalBackedError) -> TabletOwnerError {
+    match error {
+        WalBackedError::Tablet(error) => TabletOwnerError::Tablet(error),
+        error => TabletOwnerError::ReadStorage(error),
+    }
+}
+
 fn estimated_write_bytes(write: &TabletWrite) -> usize {
     write.mutations().iter().fold(32usize, |total, mutation| {
         let bytes = match mutation {
@@ -393,6 +398,7 @@ pub enum TabletOwnerError {
     QueueEmpty,
     Faulted,
     Tablet(TabletError),
+    ReadStorage(WalBackedError),
     Storage {
         request_id: TabletRequestId,
         invalidated_request_ids: Vec<TabletRequestId>,
@@ -408,6 +414,7 @@ impl fmt::Display for TabletOwnerError {
                 f.write_str("tablet owner is faulted; reopen from durable state before retrying")
             }
             Self::Tablet(error) => write!(f, "tablet owner read rejected: {error}"),
+            Self::ReadStorage(error) => write!(f, "tablet owner durable read failure: {error}"),
             Self::Storage {
                 request_id,
                 invalidated_request_ids,

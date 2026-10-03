@@ -7,7 +7,9 @@
 
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{self, Read, Seek};
+#[cfg(not(unix))]
+use std::io::Seek;
+use std::io::{self, Read};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::Path;
@@ -252,18 +254,24 @@ impl IndexedSstable {
         &self.metadata
     }
 
-    pub(crate) fn version_at(&self, key: &[u8], snapshot: u64) -> Option<IndexedVersion<'_>> {
+    pub(crate) fn version_at(
+        &self,
+        key: &[u8],
+        snapshot: u64,
+    ) -> Result<Option<IndexedVersion<'_>>, SstableError> {
         if snapshot < self.metadata.min_sequence
             || key < self.metadata.min_key.as_slice()
             || key > self.metadata.max_key.as_slice()
         {
-            return None;
+            return Ok(None);
         }
 
         let insertion = self
             .blocks
             .partition_point(|block| self.first_key(block) <= key);
-        let block_index = insertion.checked_sub(1)?;
+        let Some(block_index) = insertion.checked_sub(1) else {
+            return Ok(None);
+        };
         self.version_at_in_block(&self.blocks[block_index], key, snapshot)
     }
 
@@ -331,34 +339,44 @@ impl IndexedSstable {
         block: &BlockIndex,
         key: &[u8],
         snapshot: u64,
-    ) -> Option<IndexedVersion<'a>> {
-        let mut cursor = Cursor::at(self.payload(), block.rows_start)?;
+    ) -> Result<Option<IndexedVersion<'a>>, SstableError> {
+        let mut cursor =
+            Cursor::at(self.payload(), block.rows_start).ok_or(SstableError::InvalidLength)?;
         for _ in 0..block.row_count {
-            let key_len = cursor.u32().ok()? as usize;
-            let row_key = cursor.take(key_len).ok()?;
-            let version_count = cursor.u32().ok()? as usize;
+            let key_len = cursor.u32()? as usize;
+            if key_len == 0 || key_len > MAX_KEY_BYTES || key_len > cursor.remaining() {
+                return Err(SstableError::InvalidLength);
+            }
+            let row_key = cursor.take(key_len)?;
+            let version_count = cursor.u32()? as usize;
+            if version_count == 0 || version_count > MAX_VERSIONS_PER_ROW {
+                return Err(SstableError::InvalidHistory);
+            }
+            if version_count > cursor.remaining() / 9 {
+                return Err(SstableError::InvalidLength);
+            }
 
             match row_key.cmp(key) {
-                std::cmp::Ordering::Greater => return None,
+                std::cmp::Ordering::Greater => return Ok(None),
                 std::cmp::Ordering::Equal => {
                     let mut visible = None;
                     for _ in 0..version_count {
-                        let version = read_version(&mut cursor).ok()?;
+                        let version = read_version(&mut cursor)?;
                         if version.sequence > snapshot {
                             break;
                         }
                         visible = Some(version);
                     }
-                    return visible;
+                    return Ok(visible);
                 }
                 std::cmp::Ordering::Less => {
                     for _ in 0..version_count {
-                        read_version(&mut cursor).ok()?;
+                        read_version(&mut cursor)?;
                     }
                 }
             }
         }
-        None
+        Ok(None)
     }
 
     #[cfg(test)]
@@ -629,27 +647,27 @@ mod tests {
         assert_eq!(indexed.metadata(), decoded.metadata());
 
         assert_eq!(
-            indexed.version_at(b"alpha", 1),
+            indexed.version_at(b"alpha", 1).unwrap(),
             Some(IndexedVersion {
                 sequence: 1,
                 value: Some(&b"one"[..]),
             })
         );
         assert_eq!(
-            indexed.version_at(b"alpha", 3),
+            indexed.version_at(b"alpha", 3).unwrap(),
             Some(IndexedVersion {
                 sequence: 3,
                 value: Some(&b"three"[..]),
             })
         );
         assert_eq!(
-            indexed.version_at(b"beta", 4),
+            indexed.version_at(b"beta", 4).unwrap(),
             Some(IndexedVersion {
                 sequence: 4,
                 value: None,
             })
         );
-        assert_eq!(indexed.version_at(b"missing", 4), None);
+        assert_eq!(indexed.version_at(b"missing", 4).unwrap(), None);
 
         let _ = fs::remove_file(path);
     }
@@ -687,15 +705,26 @@ mod tests {
         assert!(indexed.block_count() > 1);
         assert!(indexed.block_count() < rows.len());
         assert_eq!(
-            indexed.version_at(b"key-0000", 1),
+            indexed.version_at(b"key-0000", 1).unwrap(),
             Some(IndexedVersion {
                 sequence: 1,
                 value: Some(&vec![b'x'; 32]),
             })
         );
-        assert_eq!(indexed.version_at(b"key-0512", 513).unwrap().sequence, 513);
         assert_eq!(
-            indexed.version_at(b"key-1023", 1024).unwrap().sequence,
+            indexed
+                .version_at(b"key-0512", 513)
+                .unwrap()
+                .unwrap()
+                .sequence,
+            513
+        );
+        assert_eq!(
+            indexed
+                .version_at(b"key-1023", 1024)
+                .unwrap()
+                .unwrap()
+                .sequence,
             1024
         );
 

@@ -69,7 +69,7 @@ fn manifest_sstable_recovers_when_wal_prefix_has_been_reclaimed() {
 
     let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert_eq!(reopened.current_sequence(), 1);
-    assert_eq!(reopened.read_latest(b"k"), Some(&b"v1"[..]));
+    assert_eq!(reopened.read_latest(b"k").unwrap(), Some(&b"v1"[..]));
     cleanup(&path);
 }
 
