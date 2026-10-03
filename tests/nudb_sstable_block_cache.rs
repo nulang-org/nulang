@@ -96,6 +96,58 @@ fn reopened_sstable_starts_cold_and_cache_stays_within_one_tablet_budget() {
 }
 
 #[test]
+fn resident_newer_version_skips_older_sstable_io() {
+    let path = temp_wal("resident_prunes_older");
+    cleanup(&path);
+
+    {
+        let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
+        let first = tablet
+            .prepare_write(
+                1,
+                0,
+                vec![TabletMutation::Put {
+                    key: b"k000".to_vec(),
+                    value: b"cold".to_vec(),
+                }],
+            )
+            .unwrap();
+        tablet.commit(first).unwrap();
+        let bytes = tablet.mutable_memtable_bytes();
+        assert!(tablet.rotate_memtable_if_bytes_at_least(bytes));
+        assert!(tablet.flush_oldest_immutable_to_sstable().unwrap());
+
+        let newer = tablet
+            .prepare_write(
+                1,
+                1,
+                vec![TabletMutation::Put {
+                    key: b"k000".to_vec(),
+                    value: b"hot".to_vec(),
+                }],
+            )
+            .unwrap();
+        tablet.commit(newer).unwrap();
+    }
+
+    let tablet = WalBackedTablet::open_with_sstable_cache_bytes(descriptor(), &path, 72 * 1024)
+        .unwrap();
+    let before = tablet.sstable_cache_stats().unwrap();
+    assert_eq!(before.misses, 0);
+    assert_eq!(
+        tablet.read_latest(b"k000").unwrap().as_deref(),
+        Some(&b"hot"[..])
+    );
+    let after = tablet.sstable_cache_stats().unwrap();
+    assert_eq!(
+        after, before,
+        "an SSTable whose max sequence cannot beat the resident winner must not be read"
+    );
+
+    cleanup(&path);
+}
+
+#[test]
 fn checkpoint_scan_does_not_pollute_the_serving_cache() {
     let path = temp_wal("checkpoint_scan");
     cleanup(&path);
