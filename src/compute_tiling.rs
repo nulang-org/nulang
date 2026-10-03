@@ -17,7 +17,6 @@ pub struct VectorTilePlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputeTileError {
-    NotImplemented,
     BudgetTooSmall {
         target_bytes: u64,
         min_vector_bytes: u64,
@@ -28,7 +27,6 @@ pub enum ComputeTileError {
 impl fmt::Display for ComputeTileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotImplemented => write!(f, "vector tile planning is not implemented"),
             Self::BudgetTooSmall {
                 target_bytes,
                 min_vector_bytes,
@@ -43,11 +41,42 @@ impl fmt::Display for ComputeTileError {
 
 impl std::error::Error for ComputeTileError {}
 
+/// Choose a vector tile that fits within `target_tile_bytes`.
+///
+/// The budget is rounded down to a whole number of vectors. Fixed-width plans
+/// can expose an exact element count; scalable-width plans intentionally keep
+/// the element count unknown because the concrete lane count is target/runtime
+/// dependent.
 pub fn plan_vector_tile(
-    _loop_plan: VectorLoopPlan,
-    _target_tile_bytes: u64,
+    loop_plan: VectorLoopPlan,
+    target_tile_bytes: u64,
 ) -> Result<VectorTilePlan, ComputeTileError> {
-    Err(ComputeTileError::NotImplemented)
+    if target_tile_bytes < loop_plan.min_vector_bytes {
+        return Err(ComputeTileError::BudgetTooSmall {
+            target_bytes: target_tile_bytes,
+            min_vector_bytes: loop_plan.min_vector_bytes,
+        });
+    }
+
+    let vectors_per_tile = target_tile_bytes / loop_plan.min_vector_bytes;
+    let min_bytes_per_tile = vectors_per_tile
+        .checked_mul(loop_plan.min_vector_bytes)
+        .ok_or(ComputeTileError::ArithmeticOverflow)?;
+
+    let fixed_elements_per_tile = match loop_plan.width {
+        PlannedVectorWidth::Fixed(lanes) => Some(
+            vectors_per_tile
+                .checked_mul(u64::from(lanes))
+                .ok_or(ComputeTileError::ArithmeticOverflow)?,
+        ),
+        PlannedVectorWidth::ScalableMin(_) => None,
+    };
+
+    Ok(VectorTilePlan {
+        vectors_per_tile,
+        fixed_elements_per_tile,
+        min_bytes_per_tile,
+    })
 }
 
 #[cfg(test)]
