@@ -88,7 +88,7 @@ cache-server = ["tcp", "dep:mio"]
 ureq = ["dep:ureq"]
 # RocksDB persistence backend (production-grade LSM-tree storage).
 rocksdb = ["dep:rocksdb"]
-# PostgreSQL persistence backend (production-grade relational storage).
+# PostgreSQL persistence backend (production-grade relational storage). Sync wrapper over tokio-postgres.
 postgres = ["dep:postgres"]
 # Differential fuzzing driver binary (src/bin/nula_difffuzz.rs).
 difffuzz = ["native-codegen"]
@@ -165,7 +165,7 @@ libffi = { version = "5", optional = true }
 nulang-ai = { path = "crates/nulang-ai", version = "0.1.0", optional = true }
 nulang-ai-local = { path = "crates/nulang-ai-local", version = "0.1.0", optional = true }
 uuid = { version = "1", features = ["serde", "v4"], optional = true }
-reqwest = { version = "0.12", features = ["json"], optional = true }
+reqwest = { version = "0.12", features = ["json"] }
 wasm-encoder = { version = "0.220", optional = true }
 # Borsh serialization for the WASM component boundary (optional, see [features])
 borsh = { version = "1.5", optional = true, features = ["derive"] }
@@ -211,6 +211,11 @@ required-features = ["savina-bench"]
 name = "nulang-shard-bench"
 path = "src/bin/nulang_shard_bench.rs"
 required-features = ["savina-bench"]
+
+[[bin]]
+name = "nulang-remote-roundtrip"
+path = "src/bin/nulang_remote_roundtrip.rs"
+required-features = ["tcp"]
 
 [profile.release]
 opt-level = 3
