@@ -68,8 +68,14 @@ fn checkpoint_reclaims_wal_prefix_and_restart_restores_mvcc_history() {
     {
         let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
         assert_eq!(tablet.current_sequence(), 3);
-        assert_eq!(tablet.read_at(b"k", 1).unwrap().as_deref(), Some(&b"v1"[..]));
-        assert_eq!(tablet.read_at(b"k", 2).unwrap().as_deref(), Some(&b"v2"[..]));
+        assert_eq!(
+            tablet.read_at(b"k", 1).unwrap().as_deref(),
+            Some(&b"v1"[..])
+        );
+        assert_eq!(
+            tablet.read_at(b"k", 2).unwrap().as_deref(),
+            Some(&b"v2"[..])
+        );
         assert_eq!(
             tablet.read_latest(b"other").unwrap().as_deref(),
             Some(&b"x"[..])
@@ -116,8 +122,14 @@ fn published_checkpoint_is_usable_even_when_wal_prefix_was_not_reclaimed() {
     // rewrite/reclamation step. Recovery must not double-apply records 1..2.
     let tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
     assert_eq!(tablet.current_sequence(), 2);
-    assert_eq!(tablet.read_at(b"k", 1).unwrap().as_deref(), Some(&b"v1"[..]));
-    assert_eq!(tablet.read_at(b"k", 2).unwrap().as_deref(), Some(&b"v2"[..]));
+    assert_eq!(
+        tablet.read_at(b"k", 1).unwrap().as_deref(),
+        Some(&b"v1"[..])
+    );
+    assert_eq!(
+        tablet.read_at(b"k", 2).unwrap().as_deref(),
+        Some(&b"v2"[..])
+    );
 
     let _ = fs::remove_file(&wal_path);
     let _ = fs::remove_file(&checkpoint);

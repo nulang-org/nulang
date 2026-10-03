@@ -233,8 +233,14 @@ fn published_checkpoint_survives_kill_before_reclamation() {
 
     let tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
     assert_eq!(tablet.current_sequence(), 2);
-    assert_eq!(tablet.read_at(b"k", 1).unwrap().as_deref(), Some(&b"v1"[..]));
-    assert_eq!(tablet.read_at(b"k", 2).unwrap().as_deref(), Some(&b"v2"[..]));
+    assert_eq!(
+        tablet.read_at(b"k", 1).unwrap().as_deref(),
+        Some(&b"v1"[..])
+    );
+    assert_eq!(
+        tablet.read_at(b"k", 2).unwrap().as_deref(),
+        Some(&b"v2"[..])
+    );
 
     cleanup(&wal_path);
 }
@@ -255,7 +261,10 @@ fn reclaimed_wal_survives_immediate_process_kill() {
 
     let mut tablet = WalBackedTablet::open(descriptor(), &wal_path).unwrap();
     assert_eq!(tablet.current_sequence(), 2);
-    assert_eq!(tablet.read_at(b"k", 1).unwrap().as_deref(), Some(&b"v1"[..]));
+    assert_eq!(
+        tablet.read_at(b"k", 1).unwrap().as_deref(),
+        Some(&b"v1"[..])
+    );
 
     commit_put(&mut tablet, b"k", b"v3");
     assert_eq!(tablet.current_sequence(), 3);
