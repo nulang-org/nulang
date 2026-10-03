@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Validate and summarize Nulang's performance-coverage contract.
 
-The manifest separates existing microbenchmarks from controlled comparative
-benchmarks and explicit gaps. It is deliberately a coverage contract, not a
-leaderboard: comparative readiness says a workload is suitable for collecting
-cross-runtime evidence, not that Nulang wins it.
+The manifest separates existing microbenchmarks from end-to-end measurements,
+controlled comparative benchmarks, and explicit gaps. It is deliberately a
+coverage contract, not a leaderboard: comparative readiness says a workload is
+suitable for collecting cross-runtime evidence, not that Nulang wins it.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "benchmarks" / "performance_crown.json"
 REQUIRED_DOMAINS = ("local", "concurrent", "distributed", "durable", "application")
-ALLOWED_STATUS = {"microbenchmark", "comparative", "planned"}
+ALLOWED_STATUS = {"microbenchmark", "end_to_end", "comparative", "planned"}
 
 
 def rows(manifest: dict[str, Any]) -> list[dict[str, Any]]:
