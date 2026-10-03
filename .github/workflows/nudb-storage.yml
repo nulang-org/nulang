@@ -53,6 +53,7 @@ jobs:
           cargo test --locked --no-default-features --lib database::manifest_v2_tests
           cargo test --locked --no-default-features --lib database::sstable_v2_serving_tests
           cargo test --locked --no-default-features --lib database::sstable_compaction_tests
+          cargo test --locked --no-default-features --lib database::sstable_reclaim_tests
           cargo test --locked --no-default-features --test nudb_sstable_flush
           cargo test --locked --no-default-features --test nudb_sstable_recovery
       - name: Storage interruption matrix
