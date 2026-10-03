@@ -10,7 +10,6 @@
 //!
 //! No fallible validation is performed after the WAL acknowledges durability.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -18,21 +17,13 @@ use super::checkpoint::{self, CheckpointError};
 use super::manifest::{Manifest, ManifestEntry, ManifestError};
 use super::sstable::{self, Sstable, SstableError};
 use super::tablet::{
-    MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletSnapshotState, TabletWrite,
-    VersionedValue,
+    MemoryTablet, TabletDescriptor, TabletError, TabletMutation, TabletWrite, VersionedValue,
 };
 use super::wal::{FileWal, WalError};
-
-#[derive(Debug, Clone, Copy)]
-struct ResidentVersion {
-    sequence: u64,
-    tombstone: bool,
-}
 
 #[derive(Debug)]
 pub struct WalBackedTablet {
     tablet: MemoryTablet,
-    resident_versions: BTreeMap<Vec<u8>, Vec<ResidentVersion>>,
     sstables: Vec<Sstable>,
     wal: FileWal,
     checkpoint_path: PathBuf,
@@ -93,10 +84,8 @@ impl WalBackedTablet {
         }
 
         wal.replay_after_checkpoint(&mut tablet)?;
-        let resident_versions = resident_version_index(&tablet);
         Ok(Self {
             tablet,
-            resident_versions,
             sstables,
             wal,
             checkpoint_path,
@@ -130,10 +119,9 @@ impl WalBackedTablet {
     }
 
     /// Durably flush the oldest frozen memtable to an immutable SSTable and
-    /// publish a manifest entry. Once the manifest is durable, the SSTable is
-    /// installed as a serving source. The flushed generation is immediately
-    /// evicted when it is the only resident immutable and there is no newer
-    /// mutable state; more complex generation eviction remains a later slice.
+    /// publish a manifest entry. Once the manifest is durable and the SSTable
+    /// is installed as a serving source, exactly that frozen generation is
+    /// evicted while newer immutable and mutable state stays resident.
     pub fn flush_oldest_immutable_to_sstable(&mut self) -> Result<bool, WalBackedError> {
         let Some(rows) = self.tablet.oldest_immutable_rows() else {
             return Ok(false);
@@ -218,12 +206,8 @@ impl WalBackedTablet {
             self.sstables.push(table);
         }
 
-        if self.tablet.immutable_memtable_count() == 1
-            && self.tablet.mutable_memtable_bytes() == 0
-        {
-            clear_resident_rows_preserving_sequence(&mut self.tablet)?;
-            self.resident_versions.clear();
-        }
+        let evicted = self.tablet.pop_oldest_immutable_rows();
+        debug_assert_eq!(evicted.as_deref(), Some(rows.as_slice()));
 
         Ok(inserted)
     }
@@ -248,7 +232,6 @@ impl WalBackedTablet {
     pub fn commit(&mut self, write: TabletWrite) -> Result<u64, WalBackedError> {
         self.tablet.validate_write(&write)?;
         self.wal.append_write(&write)?;
-        index_write(&mut self.resident_versions, &write);
         Ok(self.tablet.publish_validated(write))
     }
 
@@ -273,32 +256,15 @@ impl WalBackedTablet {
 
         self.wal.append_batch(&writes)?;
         for write in writes {
-            index_write(&mut self.resident_versions, &write);
             self.tablet.publish_validated(write);
         }
         Ok(projected_sequence)
     }
 
     pub fn read_at(&self, key: &[u8], snapshot: u64) -> Result<Option<&[u8]>, TabletError> {
-        let resident_value = self.tablet.read_at(key, snapshot)?;
-        let resident_version = self
-            .resident_versions
-            .get(key)
-            .and_then(|versions| {
-                versions
-                    .iter()
-                    .rev()
-                    .find(|version| version.sequence <= snapshot)
-            });
-
+        let resident_version = self.tablet.visible_version_at(key, snapshot)?;
         let mut best_sequence = resident_version.map_or(0, |version| version.sequence);
-        let mut best_value = resident_version.and_then(|version| {
-            if version.tombstone {
-                None
-            } else {
-                resident_value
-            }
-        });
+        let mut best_value = resident_version.and_then(|version| version.value.as_deref());
         let mut found = resident_version.is_some();
 
         for table in &self.sstables {
@@ -341,62 +307,13 @@ impl WalBackedTablet {
     }
 }
 
-fn resident_version_index(tablet: &MemoryTablet) -> BTreeMap<Vec<u8>, Vec<ResidentVersion>> {
-    tablet
-        .snapshot_state()
-        .rows
-        .into_iter()
-        .map(|row| {
-            let versions = row
-                .versions
-                .into_iter()
-                .map(|version| ResidentVersion {
-                    sequence: version.sequence,
-                    tombstone: version.value.is_none(),
-                })
-                .collect();
-            (row.key, versions)
-        })
-        .collect()
-}
-
-fn index_write(
-    index: &mut BTreeMap<Vec<u8>, Vec<ResidentVersion>>,
-    write: &TabletWrite,
-) {
-    let sequence = write.sequence();
-    for mutation in write.mutations() {
-        let (key, tombstone) = match mutation {
-            TabletMutation::Put { key, .. } => (key, false),
-            TabletMutation::Delete { key } => (key, true),
-        };
-        index.entry(key.clone()).or_default().push(ResidentVersion {
-            sequence,
-            tombstone,
-        });
-    }
-}
-
-fn advance_recovered_sequence(
-    tablet: &mut MemoryTablet,
-    sequence: u64,
-) -> Result<(), TabletError> {
+fn advance_recovered_sequence(tablet: &mut MemoryTablet, sequence: u64) -> Result<(), TabletError> {
     if sequence <= tablet.current_sequence() {
         return Ok(());
     }
     let descriptor = tablet.descriptor().clone();
     let mut state = tablet.snapshot_state();
     state.current_sequence = sequence;
-    *tablet = MemoryTablet::restore_snapshot(descriptor, state)?;
-    Ok(())
-}
-
-fn clear_resident_rows_preserving_sequence(tablet: &mut MemoryTablet) -> Result<(), TabletError> {
-    let descriptor = tablet.descriptor().clone();
-    let state = TabletSnapshotState {
-        current_sequence: tablet.current_sequence(),
-        rows: Vec::new(),
-    };
     *tablet = MemoryTablet::restore_snapshot(descriptor, state)?;
     Ok(())
 }
