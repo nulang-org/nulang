@@ -33,7 +33,7 @@ fn cleanup(path: &PathBuf) {
 }
 
 #[test]
-fn immutable_flush_is_durable_idempotent_and_does_not_reclaim_wal() {
+fn immutable_flush_is_durable_idempotent_serving_and_does_not_reclaim_wal() {
     let path = temp_wal();
     cleanup(&path);
     let mut tablet = WalBackedTablet::open(descriptor(), &path).unwrap();
@@ -57,9 +57,10 @@ fn immutable_flush_is_durable_idempotent_and_does_not_reclaim_wal() {
     assert_eq!(tablet.durable_sstable_count().unwrap(), 1);
     assert_eq!(
         tablet.immutable_memtable_count(),
-        1,
-        "flush does not evict until SSTable serving recovery exists"
+        0,
+        "manifest-published SSTable should serve reads without retaining a duplicate memtable"
     );
+    assert_eq!(tablet.read_latest(b"k"), Some(&b"v1"[..]));
 
     let wal = FileWal::open(&path).unwrap();
     assert_eq!(wal.base_sequence(), 0);
@@ -70,6 +71,7 @@ fn immutable_flush_is_durable_idempotent_and_does_not_reclaim_wal() {
     let reopened = WalBackedTablet::open(descriptor(), &path).unwrap();
     assert_eq!(reopened.current_sequence(), 1);
     assert_eq!(reopened.read_latest(b"k"), Some(&b"v1"[..]));
+    assert_eq!(reopened.immutable_memtable_count(), 0);
     assert_eq!(reopened.durable_sstable_count().unwrap(), 1);
     cleanup(&path);
 }
