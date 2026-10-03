@@ -78,6 +78,9 @@ jobs:
 
           path.write_text(source[:method_start] + new_method + source[method_end:])
 
+      - name: Format patched files
+        run: cargo fmt --all
+
       - name: Focused regressions are GREEN
         run: cargo test --locked --test distributed_runtime_spawn_trait -- --nocapture
 
@@ -93,7 +96,7 @@ jobs:
           rm .github/workflows/tmp-pr1235-green.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/runtime/distributed.rs .github/workflows/tmp-pr1235-green.yml
+          git add src/runtime/distributed.rs tests/distributed_runtime_spawn_trait.rs .github/workflows/tmp-pr1235-green.yml
           git diff --cached --check
           git commit -m "fix(runtime): make local distributed trait spawn real actors"
           git push origin HEAD:tmp/pr1235-green-20261002
