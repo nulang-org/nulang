@@ -12,13 +12,16 @@ use cranelift_frontend::FunctionBuilderContext;
 use cranelift_jit::JITModule;
 
 use crate::bytecode::Instruction;
-use crate::compute_ir::{Layout, LocalityScope, ScalarType, VectorType, VectorWidth};
-use crate::compute_planner::{plan_vector_loop, ComputePlannerError, VectorLoopPlan};
+use crate::compute_ir::{LocalityScope, ScalarType, VectorType, VectorWidth};
+use crate::compute_planner::VectorLoopPlan;
 use crate::compute_policy::{
     assess_vectorization, ComputePolicyError, VectorizationDecision, VectorizationPolicy,
 };
 use crate::compute_schedule::{
     ComputeScheduleError, DynamicExtentId, IterationSpace, LoopExtent,
+};
+use crate::compute_view::{
+    plan_vector_view, BufferView, ComputeViewError, ComputeViewPlanError, ShapeExtent,
 };
 use crate::jit::simd_analyzer::{SimdElemType, SimdRegion, SimdWidth};
 use crate::jit::simd_compiler;
@@ -43,7 +46,7 @@ pub(crate) struct SimdComputePlan {
     pub(crate) vector_loop: Option<VectorLoopPlan>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SimdComputePlanError {
     WidthMismatch {
         analyzer_lanes: u16,
@@ -56,13 +59,10 @@ pub(crate) enum SimdComputePlanError {
     UnsupportedScalableLowering,
     UnsupportedLoweringWidth(u16),
     StaticTripCountTooLarge(u64),
-    StaticLayoutSizeOverflow {
-        count: u64,
-        element: ScalarType,
-    },
     MissingRuntimeExtentBinding,
     Schedule(ComputeScheduleError),
-    Planner(ComputePlannerError),
+    View(ComputeViewError),
+    ViewPlan(ComputeViewPlanError),
 }
 
 impl fmt::Display for SimdComputePlanError {
@@ -88,16 +88,13 @@ impl fmt::Display for SimdComputePlanError {
             Self::StaticTripCountTooLarge(count) => {
                 write!(f, "static SIMD trip count {count} does not fit usize")
             }
-            Self::StaticLayoutSizeOverflow { count, element } => write!(
-                f,
-                "static SIMD layout for {count} {element:?} elements overflows the portable layout domain"
-            ),
             Self::MissingRuntimeExtentBinding => write!(
                 f,
                 "SIMD region marks its trip count as runtime-derived but has no ArrLen register binding"
             ),
             Self::Schedule(error) => write!(f, "{error}"),
-            Self::Planner(error) => write!(f, "{error}"),
+            Self::View(error) => write!(f, "{error}"),
+            Self::ViewPlan(error) => write!(f, "{error}"),
         }
     }
 }
@@ -110,9 +107,15 @@ impl From<ComputeScheduleError> for SimdComputePlanError {
     }
 }
 
-impl From<ComputePlannerError> for SimdComputePlanError {
-    fn from(error: ComputePlannerError) -> Self {
-        Self::Planner(error)
+impl From<ComputeViewError> for SimdComputePlanError {
+    fn from(error: ComputeViewError) -> Self {
+        Self::View(error)
+    }
+}
+
+impl From<ComputeViewPlanError> for SimdComputePlanError {
+    fn from(error: ComputeViewPlanError) -> Self {
+        Self::ViewPlan(error)
     }
 }
 
@@ -159,7 +162,7 @@ impl SimdComputePlan {
             (None, _) => (None, SimdTripCountBinding::Unavailable),
         };
 
-        let vector_loop = static_vector_loop_plan(vector_type, iteration)?;
+        let vector_loop = vector_loop_plan(vector_type, iteration)?;
 
         Ok(Self {
             vector_type,
@@ -213,24 +216,26 @@ impl SimdComputePlan {
     }
 }
 
-fn static_vector_loop_plan(
+fn vector_loop_plan(
     vector_type: VectorType,
     iteration: Option<IterationSpace>,
 ) -> Result<Option<VectorLoopPlan>, SimdComputePlanError> {
     let Some(iteration) = iteration else {
         return Ok(None);
     };
-    let LoopExtent::Static(count) = iteration.extent else {
-        return Ok(None);
-    };
 
-    let layout = Layout::row_major(vector_type.element, vec![count]).map_err(|_| {
-        SimdComputePlanError::StaticLayoutSizeOverflow {
-            count,
-            element: vector_type.element,
-        }
-    })?;
-    Ok(Some(plan_vector_loop(&layout, 0, iteration, vector_type)?))
+    let shape_extent = match iteration.extent {
+        LoopExtent::Static(count) => ShapeExtent::Static(count),
+        LoopExtent::Dynamic(extent) => ShapeExtent::Dynamic(extent),
+    };
+    let view = BufferView::from_parts(
+        vector_type.element,
+        vec![shape_extent],
+        vec![1],
+        vector_type.element.byte_width() as u32,
+    )?;
+
+    Ok(Some(plan_vector_view(&view, 0, iteration, vector_type)?))
 }
 
 const fn scalar_type(elem_type: SimdElemType) -> ScalarType {
@@ -377,6 +382,9 @@ mod tests {
 
         let plan = SimdComputePlan::from_region(&input).expect("runtime extent should normalize");
         let iteration = plan.iteration.expect("dynamic iteration space");
+        let vector_loop = plan
+            .vector_loop
+            .expect("runtime extent should produce a vector loop plan");
 
         assert_eq!(
             iteration.extent,
@@ -390,7 +398,33 @@ mod tests {
                 register: 9,
             }
         );
-        assert_eq!(plan.vector_loop, None);
+        assert_eq!(vector_loop.vector_iterations, None);
+        assert_eq!(vector_loop.scalar_tail, None);
+        assert!(vector_loop.requires_runtime_tail);
+        assert!(!vector_loop.requires_runtime_bounds_check);
+    }
+
+    #[test]
+    fn runtime_arr_len_plan_gets_profitability_guard() {
+        let mut input = region(SimdElemType::Float64, SimdWidth::Width2);
+        input.trip_count_hint = Some(0);
+        input.arr_len_reg = Some(9);
+
+        let plan = SimdComputePlan::from_region(&input).unwrap();
+        let policy = VectorizationPolicy::new(4, 64, false, true).unwrap();
+        let decision = plan
+            .vectorization_decision(policy)
+            .unwrap()
+            .expect("runtime plan should have a policy decision");
+        let VectorizationDecision::Vectorize(execution) = decision else {
+            panic!("expected runtime vectorization");
+        };
+
+        assert_eq!(execution.tile.vectors_per_tile, 4);
+        assert_eq!(
+            execution.profitability_guard,
+            ProfitabilityGuard::FixedElementsAtLeast(8)
+        );
     }
 
     #[test]
