@@ -7,6 +7,7 @@
 pub mod checkpoint;
 pub mod manifest;
 pub mod owner;
+pub mod snapshot;
 pub mod sstable;
 pub(crate) mod sstable_indexed;
 pub(crate) mod sstable_v2;
@@ -19,6 +20,8 @@ pub mod wal_batch;
 mod fallible_read_tests;
 #[cfg(test)]
 mod interruption;
+#[cfg(test)]
+mod snapshot_tests;
 #[cfg(test)]
 mod sstable_indexed_tests;
 #[cfg(test)]
