@@ -2,7 +2,8 @@
 //!
 //! This module is intentionally format-compatible with `sstable`: the writer
 //! remains unchanged while the serving path stops requiring decoded row/value
-//! allocations to stay resident.
+//! allocations to stay resident. The index is block-granular rather than one
+//! entry per row so index memory scales with payload blocks, not key count.
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -21,20 +22,21 @@ const MAX_ROWS: usize = 4_000_000;
 const MAX_VERSIONS_PER_ROW: usize = 65_536;
 const MAX_KEY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_VALUE_BYTES: usize = 64 * 1024 * 1024;
+const TARGET_BLOCK_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
-struct RowIndex {
-    key_start: usize,
-    key_end: usize,
-    versions_start: usize,
-    version_count: usize,
+struct BlockIndex {
+    first_key_start: usize,
+    first_key_end: usize,
+    rows_start: usize,
+    row_count: usize,
 }
 
 #[derive(Debug)]
 pub(crate) struct IndexedSstable {
     metadata: SstableMetadata,
     payload: Vec<u8>,
-    rows: Vec<RowIndex>,
+    blocks: Vec<BlockIndex>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,18 +80,8 @@ impl IndexedSstable {
             .and_then(|name| name.to_str())
             .ok_or(SstableError::InvalidFileName)?
             .to_owned();
-        let min_key = indexed
-            .rows
-            .first()
-            .map(|row| payload[row.key_start..row.key_end].to_vec())
-            .unwrap_or_default();
-        let max_key = indexed
-            .rows
-            .last()
-            .map(|row| payload[row.key_start..row.key_end].to_vec())
-            .unwrap_or_default();
-        let row_count = u32::try_from(indexed.rows.len())
-            .map_err(|_| SstableError::TooManyRows(indexed.rows.len()))?;
+        let row_count =
+            u32::try_from(indexed.row_count).map_err(|_| SstableError::TooManyRows(indexed.row_count))?;
 
         Ok(Self {
             metadata: SstableMetadata {
@@ -98,13 +90,13 @@ impl IndexedSstable {
                 min_sequence: indexed.min_sequence,
                 max_sequence: indexed.max_sequence,
                 row_count,
-                min_key,
-                max_key,
+                min_key: indexed.min_key,
+                max_key: indexed.max_key,
                 checksum,
                 file_name,
             },
             payload,
-            rows: indexed.rows,
+            blocks: indexed.blocks,
         })
     }
 
@@ -120,21 +112,11 @@ impl IndexedSstable {
             return None;
         }
 
-        let index = self
-            .rows
-            .binary_search_by(|row| self.key(row).cmp(key))
-            .ok()?;
-        let row = &self.rows[index];
-        let mut cursor = Cursor::at(&self.payload, row.versions_start)?;
-        let mut visible = None;
-        for _ in 0..row.version_count {
-            let version = read_version(&mut cursor).ok()?;
-            if version.sequence > snapshot {
-                break;
-            }
-            visible = Some(version);
-        }
-        visible
+        let insertion = self
+            .blocks
+            .partition_point(|block| self.first_key(block) <= key);
+        let block_index = insertion.checked_sub(1)?;
+        self.version_at_in_block(&self.blocks[block_index], key, snapshot)
     }
 
     pub(crate) fn has_contiguous_sequence_coverage_after(&self, floor: u64) -> bool {
@@ -143,16 +125,27 @@ impl IndexedSstable {
         }
 
         let mut sequences = BTreeSet::new();
-        for row in &self.rows {
-            let Some(mut cursor) = Cursor::at(&self.payload, row.versions_start) else {
+        for block in &self.blocks {
+            let Some(mut cursor) = Cursor::at(&self.payload, block.rows_start) else {
                 return false;
             };
-            for _ in 0..row.version_count {
-                let Ok(version) = read_version(&mut cursor) else {
+            for _ in 0..block.row_count {
+                let Ok(key_len) = cursor.u32().map(|value| value as usize) else {
                     return false;
                 };
-                if version.sequence > floor {
-                    sequences.insert(version.sequence);
+                if cursor.take(key_len).is_err() {
+                    return false;
+                }
+                let Ok(version_count) = cursor.u32().map(|value| value as usize) else {
+                    return false;
+                };
+                for _ in 0..version_count {
+                    let Ok(version) = read_version(&mut cursor) else {
+                        return false;
+                    };
+                    if version.sequence > floor {
+                        sequences.insert(version.sequence);
+                    }
                 }
             }
         }
@@ -175,8 +168,48 @@ impl IndexedSstable {
         false
     }
 
-    fn key<'a>(&'a self, row: &RowIndex) -> &'a [u8] {
-        &self.payload[row.key_start..row.key_end]
+    fn first_key<'a>(&'a self, block: &BlockIndex) -> &'a [u8] {
+        &self.payload[block.first_key_start..block.first_key_end]
+    }
+
+    fn version_at_in_block<'a>(
+        &'a self,
+        block: &BlockIndex,
+        key: &[u8],
+        snapshot: u64,
+    ) -> Option<IndexedVersion<'a>> {
+        let mut cursor = Cursor::at(&self.payload, block.rows_start)?;
+        for _ in 0..block.row_count {
+            let key_len = cursor.u32().ok()? as usize;
+            let row_key = cursor.take(key_len).ok()?;
+            let version_count = cursor.u32().ok()? as usize;
+
+            match row_key.cmp(key) {
+                std::cmp::Ordering::Greater => return None,
+                std::cmp::Ordering::Equal => {
+                    let mut visible = None;
+                    for _ in 0..version_count {
+                        let version = read_version(&mut cursor).ok()?;
+                        if version.sequence > snapshot {
+                            break;
+                        }
+                        visible = Some(version);
+                    }
+                    return visible;
+                }
+                std::cmp::Ordering::Less => {
+                    for _ in 0..version_count {
+                        read_version(&mut cursor).ok()?;
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    fn block_count(&self) -> usize {
+        self.blocks.len()
     }
 }
 
@@ -185,7 +218,10 @@ struct IndexedPayload {
     ownership_epoch: u64,
     min_sequence: u64,
     max_sequence: u64,
-    rows: Vec<RowIndex>,
+    row_count: usize,
+    min_key: Vec<u8>,
+    max_key: Vec<u8>,
+    blocks: Vec<BlockIndex>,
 }
 
 fn index_payload(payload: &[u8]) -> Result<IndexedPayload, SstableError> {
@@ -200,15 +236,25 @@ fn index_payload(payload: &[u8]) -> Result<IndexedPayload, SstableError> {
         return Err(SstableError::TooManyRows(row_count));
     }
 
-    let mut rows = Vec::with_capacity(row_count);
+    let mut blocks = Vec::new();
     let mut previous_key: Option<(usize, usize)> = None;
+    let mut min_key = Vec::new();
+    let mut max_key = Vec::new();
     let mut min_sequence = u64::MAX;
     let mut max_sequence = 0_u64;
 
-    for _ in 0..row_count {
+    let mut block_rows_start = 0_usize;
+    let mut block_first_key = (0_usize, 0_usize);
+    let mut block_row_count = 0_usize;
+
+    for row_index in 0..row_count {
+        let row_start = cursor.position();
         let key_len = cursor.u32()? as usize;
-        if key_len == 0 || key_len > MAX_KEY_BYTES || key_len > cursor.remaining() {
+        if key_len == 0 || key_len > MAX_KEY_BYTES {
             return Err(SstableError::InvalidKey);
+        }
+        if key_len > cursor.remaining() {
+            return Err(SstableError::InvalidLength);
         }
         let key_start = cursor.position();
         cursor.take(key_len)?;
@@ -220,6 +266,16 @@ fn index_payload(payload: &[u8]) -> Result<IndexedPayload, SstableError> {
             }
         }
         previous_key = Some((key_start, key_end));
+        if row_index == 0 {
+            min_key.extend_from_slice(key);
+        }
+        max_key.clear();
+        max_key.extend_from_slice(key);
+
+        if block_row_count == 0 {
+            block_rows_start = row_start;
+            block_first_key = (key_start, key_end);
+        }
 
         let version_count = cursor.u32()? as usize;
         if version_count == 0 || version_count > MAX_VERSIONS_PER_ROW {
@@ -228,7 +284,6 @@ fn index_payload(payload: &[u8]) -> Result<IndexedPayload, SstableError> {
         if version_count > cursor.remaining() / 9 {
             return Err(SstableError::InvalidLength);
         }
-        let versions_start = cursor.position();
         let mut previous_sequence = 0_u64;
         for _ in 0..version_count {
             let version = read_version(&mut cursor)?;
@@ -240,11 +295,24 @@ fn index_payload(payload: &[u8]) -> Result<IndexedPayload, SstableError> {
             max_sequence = max_sequence.max(version.sequence);
         }
 
-        rows.push(RowIndex {
-            key_start,
-            key_end,
-            versions_start,
-            version_count,
+        block_row_count += 1;
+        if cursor.position().saturating_sub(block_rows_start) >= TARGET_BLOCK_BYTES {
+            blocks.push(BlockIndex {
+                first_key_start: block_first_key.0,
+                first_key_end: block_first_key.1,
+                rows_start: block_rows_start,
+                row_count: block_row_count,
+            });
+            block_row_count = 0;
+        }
+    }
+
+    if block_row_count != 0 {
+        blocks.push(BlockIndex {
+            first_key_start: block_first_key.0,
+            first_key_end: block_first_key.1,
+            rows_start: block_rows_start,
+            row_count: block_row_count,
         });
     }
 
@@ -257,7 +325,10 @@ fn index_payload(payload: &[u8]) -> Result<IndexedPayload, SstableError> {
         ownership_epoch,
         min_sequence,
         max_sequence,
-        rows,
+        row_count,
+        min_key,
+        max_key,
+        blocks,
     })
 }
 
@@ -434,6 +505,43 @@ mod tests {
         assert!(indexed.has_contiguous_sequence_coverage_after(0));
         assert!(indexed.has_contiguous_sequence_coverage_after(2));
         assert!(indexed.has_contiguous_sequence_coverage_after(4));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn logical_block_index_is_smaller_than_row_count_and_finds_boundary_keys() {
+        let path = temp_path("blocks");
+        let _ = fs::remove_file(&path);
+        let rows: Vec<TabletSnapshotRow> = (0_u64..1024)
+            .map(|index| TabletSnapshotRow {
+                key: format!("key-{index:04}").into_bytes(),
+                versions: vec![VersionedValue {
+                    sequence: index + 1,
+                    value: Some(vec![b'x'; 32]),
+                }],
+            })
+            .collect();
+        write_sstable(&path, 42, 7, &rows).unwrap();
+        let indexed = IndexedSstable::open(&path).unwrap();
+
+        assert!(indexed.block_count() > 1);
+        assert!(indexed.block_count() < rows.len());
+        assert_eq!(
+            indexed.version_at(b"key-0000", 1),
+            Some(IndexedVersion {
+                sequence: 1,
+                value: Some(&vec![b'x'; 32]),
+            })
+        );
+        assert_eq!(
+            indexed.version_at(b"key-0512", 513).unwrap().sequence,
+            513
+        );
+        assert_eq!(
+            indexed.version_at(b"key-1023", 1024).unwrap().sequence,
+            1024
+        );
 
         let _ = fs::remove_file(path);
     }
