@@ -57,11 +57,11 @@
         },
         {
           "id": "distributed.remote_message_roundtrip",
-          "status": "planned",
+          "status": "end_to_end",
           "metric": "roundtrip_latency_ns",
-          "runner": null,
+          "runner": "benches/dist_bench.rs",
           "baselines": ["go", "erlang"],
-          "measurement_mode": "planned"
+          "measurement_mode": "criterion"
         }
       ]
     },
